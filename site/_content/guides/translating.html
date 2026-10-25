@@ -1,0 +1,257 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; guides &middot; translating</div>
+  <h1>Translating the game</h1>
+  <p class="lede">A guide for translators, no programming needed: export the game's text from your own disc into a plain text file, write your translation next to each line, and apply the file back onto a copy of your disc - in your browser or on the command line. This page covers what you need, both paths, how much room each line has, and why a line can stay English. The technical details live in the <a href="../tooling/translation.html">translation reference</a>.</p>
+</header>
+
+<section class="doc-section" id="need">
+  <h2>What you need</h2>
+  <ul class="bullets">
+    <li><strong>Your own copy of Legend of Legaia (USA)</strong> (<code>SCUS-94254</code>) as a <code>.bin</code> image (Mode 2/2352), or its <code>.cue</code> sheet. Packs are keyed to the USA disc, so they do not apply to the European or Japanese discs. You can still <em>export</em> those discs to read their script next to yours: a Japanese export gives every line of the original Japanese dialog as readable text.</li>
+    <li><strong>A text editor</strong> that saves UTF-8 - Notepad++, VS Code, Kate, or TextEdit in plain-text mode. The pack is a YAML file: plain text with indentation.</li>
+    <li><strong>A way to apply the pack</strong>: the <a href="../tooling/rom-patcher.html">ROM patcher page</a>, which runs in your browser and uploads nothing, or the <code>legaia-patcher</code> program from a release archive (<a href="getting-started.html">getting started</a>).</li>
+    <li><strong>An emulator</strong> to play the result.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="how">
+  <h2>How a translation works</h2>
+  <p>The game's text is spread across the disc: item and spell names in the main program, dialog inside each scene's data, menu labels inside the menu code. The tools collect all of it into one file, a <strong>language pack</strong>. Each piece of text becomes one entry:</p>
+<pre><code>  - key: 'scus:str:0x80012260'    # where the text lives on the disc
+    context: 'item 0x79'          # a hint for you
+    source: 'Healing Berry'       # the English text
+    translation: ''               # you write here
+    budget: 13                    # how many bytes fit here</code></pre>
+  <p>You only ever edit <code>translation:</code>. Leave <code>key</code>, <code>source</code> and <code>budget</code> alone. An entry you leave empty stays English, so a half-finished pack is always playable.</p>
+  <p>The disc was never meant to be edited, so every piece of text has a fixed amount of room - its <strong>budget</strong>. How strict that is depends on the kind of text; <a href="#room">how much room a line has</a> explains it.</p>
+</section>
+
+<section class="doc-section" id="pack-shapes">
+  <h2>Working pack and shareable pack</h2>
+  <table>
+    <thead><tr><th>Pack</th><th>Contains</th><th>Share it?</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Working pack</strong></td><td>the English text from your disc (<code>source:</code>) beside your translations - the one you edit</td><td><strong>No</strong> - it holds the game's own script</td></tr>
+      <tr><td><strong>Shareable pack</strong></td><td>only your translations, each tied to its place on the disc by its <code>key</code></td><td>Yes - anyone who owns the disc can apply it</td></tr>
+    </tbody>
+  </table>
+  <p>You turn a working pack into a shareable one with <em>Make a shareable pack</em> on the ROM patcher page, or <code>translate strip</code> on the command line.</p>
+</section>
+
+<section class="doc-section" id="browser">
+  <h2>Path A &middot; in your browser</h2>
+  <p>The <a href="../tooling/rom-patcher.html">ROM patcher page</a> does everything in the tab. Your disc is read on your machine and never uploaded.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 860 150" role="img" aria-label="Translation loop: export a starter pack from your disc, edit translations in a text editor or the workbench, check against your disc, fix skipped lines and check again, then patch and download, and make a shareable pack">
+      <defs><marker id="tr-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="dg-node" x="10" y="20" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="85" y="44">Export</text><text class="dg-sub" x="85" y="62">working pack</text>
+      <rect class="dg-node" x="185" y="20" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="260" y="44">Edit</text><text class="dg-sub" x="260" y="62">translation: fields</text>
+      <rect class="dg-node-accent" x="360" y="20" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="435" y="44">Check</text><text class="dg-sub" x="435" y="62">nothing written</text>
+      <rect class="dg-node" x="535" y="20" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="610" y="44">Patch</text><text class="dg-sub" x="610" y="62">disc for your play</text>
+      <rect class="dg-node-ok" x="710" y="20" width="140" height="56" rx="5"/>
+      <text class="dg-label" x="780" y="44">Share</text><text class="dg-sub" x="780" y="62">pack, no English</text>
+      <path class="dg-edge" d="M160 48 L183 48" marker-end="url(#tr-arrow)"/>
+      <path class="dg-edge" d="M335 48 L358 48" marker-end="url(#tr-arrow)"/>
+      <path class="dg-edge" d="M510 48 L533 48" marker-end="url(#tr-arrow)"/>
+      <path class="dg-edge" d="M685 48 L708 48" marker-end="url(#tr-arrow)"/>
+      <path class="dg-edge-dim" d="M435 76 L435 115 L260 115 L260 80" marker-end="url(#tr-arrow)"/>
+      <text class="dg-edge-label" x="348" y="134" text-anchor="middle">skipped lines (.csv): fix and check again</text>
+    </svg>
+    <figcaption>The loop: export once, then edit and check until the skipped-lines list is short enough; only the stripped pack leaves your machine.</figcaption>
+  </figure>
+  <ol class="steps">
+    <li><b>Choose your disc</b><span>Under <em>Disc image</em>, then open the <em>Language</em> section at the top of the form.</span></li>
+    <li><b>Export a starter pack</b><span>With <em>Language</em> set to <em>None</em>, press <em>Export a starter pack from my disc</em>: you get <code>legaia_en.working.yaml</code>, every <code>translation:</code> empty. To continue an existing translation, choose that language (or <em>Import my own pack</em>) first - the button becomes <em>Export a working copy of this pack</em>.</span></li>
+    <li><b>Edit the pack</b><span>Set the <code>language:</code> line to your code (<code>fr</code>, <code>pt-BR</code>, ...), add yourself under <code>contributors:</code>, fill in <code>translation:</code> fields. The <a href="#markup">markup table</a> lists what to keep.</span></li>
+    <li><b>Load it</b><span>Set <em>Language</em> to <em>Import my own pack (.yaml)</em> and pick your file.</span></li>
+    <li><b>Check pack against my disc</b><span>Runs the whole import in memory and reports, per section, how many lines land and why the others would not. Nothing is written.</span></li>
+    <li><b>Fix skipped lines</b><span><em>Download skipped lines (.csv)</em>: one row per line with its <code>key</code>, a <code>reason</code> and the full <code>message</code>; see the <a href="#stayed-english">troubleshooting table</a>.</span></li>
+    <li><b>Patch</b><span>Optionally tick <em>Give translated dialog more room</em> (<a href="#more-room">below</a>), then <em>Patch &amp; download</em>. Combines with any randomizer options. The patched image is for your own play only.</span></li>
+    <li><b>Make a shareable pack</b><span><em>Make a shareable pack (.yaml, no English)</em> - the file to pass around.</span></li>
+  </ol>
+  <h3 id="workbench">Editing in the workbench</h3>
+  <p>Steps 3 to 7 can also happen on the <a href="../tooling/translation-workbench.html">translation workbench</a> page instead of in a text editor. Pick your disc there, then load a published pack, your own <code>.yaml</code>, or start fresh. The page is one working screen: a compact list of lines on the left (filter by section or status, search, and see how much of the pack is translated), and an editor on the right for the line you picked, holding its English, the other rows of its dialog box, a box for your translation and live feedback as you type:</p>
+  <ul class="bullets">
+    <li>its size in bytes against its room (for a name, also the free bytes it could move into), with any character the game cannot draw highlighted and the reason beside it, plus one-click fixes (fold the accents, or switch the pack to the accent font);</li>
+    <li>its width on screen in the game's own font, against the width its box or menu column allows, and a picture of the dialog box as the game draws it;</li>
+    <li>a moment after you stop typing, whether its scene still fits.</li>
+  </ul>
+  <p>Right under the translation box sit a character palette per language and a <em>Symbols</em> palette with every button and icon the game can draw inside text, taken from your own disc; click one to insert it at your cursor (see <a href="#buttons-and-icons">buttons and icons</a>). Beside the palette, <em>Accents</em> sets how accented letters reach the disc (see <a href="#accents">accents</a>); the list says how many lines still hold a character the game will not draw. <kbd>Ctrl+Enter</kbd> or <kbd>Alt+Down</kbd> moves to the next line, <kbd>Alt+Up</kbd> to the previous one. The collapsed <em>Space and budgets</em> section shows where the room is: per section, per name table, per menu pool, and every scene from the fullest down. Click a row to list its lines. <em>Check against my disc</em> runs the full check. Your edits are saved in the browser as you type, and the page offers to resume them next time. Download the working pack to keep your own copy, and the shareable pack to share. The workbench does not patch a disc; load the shareable pack on the ROM patcher page for that.</p>
+</section>
+
+<section class="doc-section" id="cli">
+  <h2>Path B &middot; on the command line</h2>
+  <p>The same work in six steps with <code>legaia-patcher</code>. A <code>.cue</code> works wherever a <code>.bin</code> does.</p>
+<ol class="steps">
+    <li><b>Export</b><span>the disc's text into a working pack (once).</span></li>
+    <li><b>Init</b><span>an empty pack for your language; <code>--resume site/lang/fr.yaml</code> starts from a published pack.</span></li>
+    <li><b>Translate</b><span>in your editor. Team? <code>init --chunk 500</code> splits the pack; <code>merge</code> puts the pieces back.</span></li>
+    <li><b>Stats</b><span>checks the pack against your disc; nothing is written.</span></li>
+    <li><b>Strip</b><span>makes the shareable pack.</span></li>
+    <li><b>Import</b><span>onto a copy of your disc, plus a PPF patch.</span></li>
+  </ol>
+  <div class="cli"><code>legaia-patcher translate export --input "Legend of Legaia (USA).bin" -o legaia_en.yaml</code></div>
+  <div class="cli"><code>legaia-patcher translate init --lang fr --from legaia_en.yaml --contributor "Your Name" -o legaia_fr.yaml</code></div>
+  <div class="cli"><code>legaia-patcher translate merge --base legaia_fr.yaml --pack legaia_fr.001.yaml --pack legaia_fr.002.yaml -o legaia_fr.yaml</code></div>
+  <div class="cli"><code>legaia-patcher translate stats --pack legaia_fr.yaml --input "Legend of Legaia (USA).bin"</code></div>
+  <div class="cli"><code>legaia-patcher translate strip --pack legaia_fr.yaml -o fr.yaml</code></div>
+  <div class="cli"><code>legaia-patcher translate import --input "Legend of Legaia (USA).bin" --pack legaia_fr.yaml --output legaia_fr.bin --patch legaia_fr.ppf</code></div>
+  <p><code>stats</code> and <code>import</code> print skipped lines grouped by reason; <code>--verbose</code> lists every line with its key. The tool never writes to your original image: <code>--output</code> is a new patched image for your own play, and <code>--patch</code> is a small PPF file that turns a clean disc into the translated one - a PPF is safe to share. Every flag: <a href="../tooling/translation.html#cli">CLI reference</a>.</p>
+</section>
+
+<section class="doc-section" id="room">
+  <h2>How much room does a line have?</h2>
+  <p>The <code>budget:</code> field is the number of <strong>bytes</strong> a translation may take in place. A plain letter is one byte; a markup token such as <code>{c1:00}</code> is two. What happens when you go over depends on the kind of text.</p>
+  <h3 id="names-room">Names</h3>
+  <p>Item, item-type, spell, art and accessory names (and their descriptions) sit one after another, each in a slot rounded up to a multiple of 4 bytes. So the spare room depends on how long the English happens to be: <code>Potion</code> has one spare byte, <code>Antidote</code> three, <code>Medicine</code> none. That is why two names of the same length can have different budgets.</p>
+  <p>A name longer than its slot <strong>moves automatically</strong>: the tools pack the names tighter, collect the bytes shorter translations give up, and place the longer names there. Nothing to switch on. It fails only when the whole table has run out of room (<code>no free run</code>) - then shorten that name or others in the same table.</p>
+  <p>Monster names grow their record instead, up to 15 bytes, the longest name the game already uses. Party names (9 bytes) and world-map place names (31 bytes) are fixed fields. A name that fits in bytes can still be too wide on screen: an item list has a fixed quantity column.</p>
+  <h3 id="labels-room">Menu and battle labels</h3>
+  <p>Menu commands, battle messages and system prompts are reached straight from the game code. A translation longer than its slot <strong>moves automatically</strong>: the tools find every place in the code that points at the label and point it at the new copy. The room comes from other labels in the same part of the game that your translation made shorter, and for the pause, shop and save menus from a block of spare bytes kept for translations (no mod uses it). A few labels cannot move; for those the slot is a hard limit, so abbreviate. The translation workbench's <em>Room per category</em> card and <code>legaia-patcher translate space</code> show how much room each category has left.</p>
+  <h3 id="dialog-room">Dialog</h3>
+  <p>For dialog the budget on each line is only a hint. The real limit is the <strong>scene</strong>: each scene's dialog is stored compressed, and on the USA disc each compressed scene fills its space exactly.</p>
+  <p>So one line longer than the English usually still fits - the tools move the rest of the scene along to make room. What cannot grow is the scene as a whole, and translated text compresses a little worse than English, so a scene can overflow even when no line got longer. When it does, the tools put some of its lines back in English, starting with the ones that cost the most room, and report each. Shorten them (or other lines of the same scene) and check again.</p>
+  <h3 id="more-room">Giving dialog more room</h3>
+  <p><em>Give translated dialog more room</em> on the site, <code>--allow-relayout</code> on the command line, removes the scene limit: an overflowing scene gets extra 2048-byte sectors and the rest of the disc shifts along, so every line fits at full length. The official European discs were mastered the same way. It affects only dialog, and it costs three things:</p>
+  <ul class="bullets">
+    <li><strong>The disc image grows</strong>, usually by a few KB.</li>
+    <li><strong>No PPF.</strong> A PPF only describes same-size changes, so you get the patched image only.</li>
+    <li><strong>Save states break.</strong> A save state made on another layout no longer matches; start from a fresh boot or a memory-card save.</li>
+  </ul>
+  <h3 id="screen-room">Room on screen</h3>
+  <p>Fitting in bytes is not the same as fitting on screen. The game <strong>never wraps text for you</strong>: a dialog row breaks only where you put a <code>|</code> (or where a new line starts), and a row wider than the box simply runs past its edge. Names have the same limit sideways - an item name much wider than the English ones runs into the quantity column of the item list.</p>
+  <p>Rough widths, measured in the game's own proportional font: a dialog row holds about 244 pixels (three rows per box), an item name in the pause menu or a shop about 104. Narrow letters (<code>i</code>, <code>l</code>) take far less room than wide ones (<code>M</code>, <code>W</code>), so count pixels, not characters. The full table is in <a href="../formats/dialog-font.html#line-width-and-wrapping">line width and wrapping</a>.</p>
+  <p>The <a href="#workbench">workbench</a> measures each line as you type and draws it in the game's font. From the command line, <code>legaia-patcher translate space --input DISC.bin --pack my_pack.yaml</code> reports a whole pack's room.</p>
+  <p class="hint">Every room rule, per section: <a href="../tooling/translation.html#budgets">budgets</a> in the reference.</p>
+</section>
+
+<section class="doc-section" id="stayed-english">
+  <h2>Why did my line stay English?</h2>
+  <p>A line stays English when its <code>translation:</code> is empty, or when the importer skipped it. Every skip comes with a message; the groups below are the ones the coverage report and the CSV's <code>reason</code> column use. <code>N</code> and <code>M</code> stand for numbers.</p>
+  <table class="layout">
+    <thead><tr><th>Message</th><th>What it means</th><th>What to do</th></tr></thead>
+    <tbody>
+      <tr><th colspan="3">Over budget</th></tr>
+      <tr><td><code>translation needs N bytes but the in-place budget is M (shorten the text)</code></td><td>a label, fixed field or line cannot grow</td><td>shorten to M bytes or fewer</td></tr>
+      <tr><td><code>... and the scene MAN could not be grown to fit it</code></td><td>no room could be made in this scene</td><td>shorten, or give dialog more room</td></tr>
+      <tr><td><code>... and the script walk does not reach this line, so it cannot be relocated</code></td><td>this line can only be replaced in place</td><td>keep it at or under its English length</td></tr>
+      <tr><th colspan="3">Scene dialog does not recompress into its footprint</th></tr>
+      <tr><td><code>scene N: rolled back - the scene's dialog no longer recompresses into its N byte footprint</code></td><td>the scene was full, so this line went back to English</td><td>shorten it or other lines of the scene, or give dialog more room</td></tr>
+      <tr><th colspan="3">Name longer than the name tables have room for</th></tr>
+      <tr><td><code>... the name tables have no free run that long to move it into</code></td><td>every free byte of the table is used</td><td>shorten this name or others in the same section</td></tr>
+      <tr><th colspan="3">Monster name longer than 15 bytes</th></tr>
+      <tr><td><code>monster N: name needs N bytes but a monster name holds at most 15</code></td><td>the game's limit for enemy names</td><td>shorten to 15 bytes</td></tr>
+      <tr><th colspan="3">Not encodable in the retail glyph set</th></tr>
+      <tr><td><code>translation not encodable: '&eacute;' is not in the retail NTSC font - fold it to 'e', or turn on the accent font</code></td><td>the pack is in the default accent mode</td><td>set <code>accents: font</code> (the letter draws) or <code>accents: fold</code> (it becomes <code>e</code>); see <a href="#accents">accents</a></td></tr>
+      <tr><td><code>translation not encodable: '&#x416;' (U+0416) is not in the retail glyph set and has no fold</code></td><td>no font here can draw it</td><td>write it with Latin letters</td></tr>
+      <tr><td><code>translation not encodable: malformed escape</code> / <code>stray '}'</code></td><td>a brace that is not a valid token</td><td>fix the token; write literal braces as <code>{7b}</code> / <code>{7d}</code></td></tr>
+      <tr><td><code>translation not encodable: 0xNN is not a 2-byte opcode</code></td><td>a <code>{xx:yy}</code> token with the wrong first byte</td><td>copy the token exactly from <code>source:</code></td></tr>
+      <tr><td><code>pack source doesn't encode (corrupted pack?)</code></td><td>the <code>source:</code> field was changed</td><td>restore it, or re-export</td></tr>
+      <tr><th colspan="3">Not on this disc (wrong image or conflicting patch)</th></tr>
+      <tr><td><code>disc bytes don't match the pack source</code></td><td>the disc does not hold the expected text</td><td>use a clean, unpatched USA disc</td></tr>
+      <tr><td><code>this disc's text is N bytes but the pack expects M - the pack was not built for this image</code></td><td>the same, for a shareable pack</td><td>use a clean, unpatched USA disc</td></tr>
+      <tr><th colspan="3">Other</th></tr>
+      <tr><td><code>PROT entry N: M other line(s) of this scene no longer sit where the pack expects them</code></td><td>the disc was already patched, so the scene moved</td><td>import onto a fresh copy of the original disc</td></tr>
+      <tr><td><code>segment framing not found at the keyed offset</code></td><td>the line is not where the key says</td><td>import onto a fresh copy; do not edit keys</td></tr>
+      <tr><td><code>the text framing at this offset is a coincidence inside a decoded instruction's operands</code></td><td>the entry was never real dialog</td><td>leave it empty</td></tr>
+      <tr><td><code>PROT entry N is not a dialog carrier on this disc</code></td><td>the entry was never real dialog</td><td>leave it empty, or re-export</td></tr>
+      <tr><td><code>party name must fit 9 bytes</code></td><td>the party-name field is fixed</td><td>shorten to 9 bytes</td></tr>
+      <tr><td><code>a monster name takes printable glyphs only</code></td><td>enemy names take plain characters, apart from their badge</td><td>use plain letters; keep the <code>{5e:xx}</code> badge and <code> $N</code> suffix as in <code>source:</code></td></tr>
+      <tr><td><code>growing the record for a N-byte name would make it larger than any retail record</code></td><td>this enemy's record cannot grow that far</td><td>shorten the name</td></tr>
+      <tr><td><code>unrecognized key shape</code></td><td>the <code>key:</code> was edited</td><td>restore the key</td></tr>
+      <tr><td><code>no NUL-terminated string at this VA</code>, <code>no named monster record at this id</code>, <code>scene MAN not found</code>, ...</td><td>the key does not match this disc</td><td>use the USA disc and unedited keys</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="doc-section" id="markup">
+  <h2>Text markup quick reference</h2>
+  <p>Most text is written as-is. A few special forms keep the game's formatting working:</p>
+  <table class="layout">
+    <thead><tr><th>Write</th><th>Means</th><th>Rule</th></tr></thead>
+    <tbody>
+      <tr><td><code>|</code></td><td>a new line inside the text box</td><td>move it to where your sentence should break</td></tr>
+      <tr><td><code>{c1:00}</code></td><td>a character's name</td><td>keep it; it may move within the sentence</td></tr>
+      <tr><td><code>{c2:..}</code> <code>{c3:..}</code> <code>{c5:..}</code></td><td>an item / magic / art name</td><td>keep it</td></tr>
+      <tr><td><code>{cf:..}</code></td><td>a colour change</td><td>keep it, around the same words</td></tr>
+      <tr><td><code>{ce:..}</code></td><td>a button, icon or number, such as <code>{ce:00}</code> = the X button</td><td>keep it, or add one; see <a href="#buttons-and-icons">buttons and icons</a></td></tr>
+      <tr><td>other <code>{xx:yy}</code></td><td>spacing and control codes</td><td>keep it</td></tr>
+      <tr><td><code>{xx}</code></td><td>one special byte (<code>{01}</code> = item icon)</td><td>keep it</td></tr>
+      <tr><td><code>{7b}</code> / <code>{7d}</code></td><td>a literal <code>{</code> / <code>}</code></td><td>use these instead of typing braces</td></tr>
+    </tbody>
+  </table>
+  <p>The substituted names come from the tables you are also translating, so write sentences that stay grammatical whichever name appears.</p>
+  <h3 id="buttons-and-icons">Buttons and icons</h3>
+  <p><code>{ce:NN}</code> draws a picture inside the text: a controller button (<code>{ce:00}</code> is the X button), a gold or target badge, an equipment-slot icon, an element icon, or a number. Each has a name you can type instead, which reads better and imports as exactly the same bytes: <code>{btn:x}</code>, <code>{btn:circle}</code>, <code>{icon:gold}</code>, <code>{icon:legs}</code>, <code>{icon:fire}</code>, <code>{icon:fire2}</code>, and so on. On the workbench, the <em>Symbols</em> palette shows every one as your disc draws it (hover for its name) and inserts it where your cursor is; the dialog preview draws them in place. The full list, with every name, is in the <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/tooling/translation/pack-format.md#symbols">pack format reference</a>.</p>
+  <h3 id="accents">Accents</h3>
+  <p>The game's own font draws plain English letters only. Type accents as you normally would and pick, once per pack, what happens to them:</p>
+  <ul class="bullets">
+    <li><strong>Draw them</strong> (<code>accents: font</code> in the pack, <em>Draw them</em> on the workbench): the patch adds accented letters to the game's font, built from your disc's own letters, and your text shows as typed. It covers the Western European accents (<code>&eacute; &egrave; &ecirc; &euml; &agrave; &acirc; &auml; &aacute; &atilde; &aring; &ccedil; &ntilde; &iacute; &igrave; &icirc; &iuml; &oacute; &ograve; &ocirc; &ouml; &otilde; &uacute; &ugrave; &ucirc; &uuml; &yuml; &szlig; &aelig; &oelig; &iquest; &iexcl; &deg;</code> and their capitals).</li>
+    <li><strong>Fold to plain letters</strong> (<code>accents: fold</code>): <code>&Eacute;p&eacute;e</code> is written <code>Epee</code>.</li>
+    <li><strong>Report them</strong> (the default): every accent is listed until you fold it or switch modes.</li>
+  </ul>
+  <p>Letters outside that set (Polish <code>&#x142;</code>, Czech <code>&#x10D;</code>) fold to plain letters in both modes. Cyrillic, Greek, Chinese, Japanese and Korean cannot be drawn at all. The command-line import takes <code>--accents font</code> (or <code>fold</code>) to override the pack. Details: <a href="../tooling/translation.html#markup-encoding">markup and encoding</a>.</p>
+  <p><strong>Automatic folding.</strong> A few characters word processors and AI tools like to insert are replaced for you: curly quotes become <code>'</code> and <code>"</code>, en and em dashes and the minus sign become <code>-</code>, the ellipsis becomes <code>...</code>, and a non-breaking space becomes a plain space. Anything else outside the font is reported, character by character.</p>
+</section>
+
+<section class="doc-section" id="testing">
+  <h2>Testing your translation</h2>
+  <ul class="bullets">
+    <li><strong>Start from a fresh boot or a memory-card save.</strong> An emulator save state holds the memory of the disc it was made on, text included. Loaded onto your patched disc it shows the old text, or breaks if the disc was relaid out.</li>
+    <li><strong>Test on a copy.</strong> Keep your original image untouched; the tools never write to it.</li>
+    <li><strong>Read a scene's lines together.</strong> A text box shows up to three lines, and consecutive dialog entries in the pack are consecutive rows of the same box.</li>
+    <li><strong>Watch lists and labels.</strong> Byte room is not screen width; a long item name can run into the quantity column.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="glossary">
+  <h2>Glossary</h2>
+  <dl class="kv">
+    <dt>Language pack</dt><dd>the YAML file holding the text and your translations</dd>
+    <dt>Working pack</dt><dd>a pack with the English <code>source:</code> text; for your own use only</dd>
+    <dt>Shareable pack</dt><dd>only your translations and keys; safe to share (also called a distributable pack)</dd>
+    <dt>Key</dt><dd>where a piece of text lives on the disc, such as <code>man:4:0x210</code></dd>
+    <dt>Budget</dt><dd>how many bytes a translation may take in place</dd>
+    <dt>Byte</dt><dd>one letter, digit or punctuation mark; a <code>{xx:yy}</code> token is two</dd>
+    <dt>Scene / footprint</dt><dd>one area of the game, and the fixed space its compressed dialog occupies on the disc</dd>
+    <dt>Relayout</dt><dd>growing a scene by whole sectors, shifting the rest of the disc</dd>
+    <dt>PPF</dt><dd>a small patch file that turns a clean disc into the patched one</dd>
+    <dt>Token</dt><dd>a <code>{...}</code> code standing for a name, colour, icon or special byte</dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="faq">
+  <h2>FAQ</h2>
+  <dl class="kv">
+    <dt>Is there a flag to let names grow?</dt><dd>No - there is no <code>--relocate-names</code>. A name longer than its slot moves automatically on every import.</dd>
+    <dt>Can I test with a save state?</dt><dd>No. Boot the patched disc fresh, or load a memory-card save.</dd>
+    <dt>What may I share publicly?</dt><dd>The shareable pack and a PPF patch. Never a working pack, a lifted pack, or a patched disc image - they contain the game's own text and data.</dd>
+    <dt>Can I use accents?</dt><dd>Yes. Set the pack to <em>Draw them</em> (<code>accents: font</code>) and the patch adds the accented letters to the game's font; see <a href="#accents">accents</a>.</dd>
+    <dt>Russian, Greek, Japanese, Chinese, Korean?</dt><dd>Not yet. Those scripts need far more letters than the game's font page holds, which these tools do not attempt.</dd>
+    <dt>Can I start from someone else's pack?</dt><dd>Yes: choose it and press <em>Export a working copy of this pack</em>, or pass <code>--resume their-pack.yaml</code> to <code>translate init</code>.</dd>
+    <dt>With the randomizer?</dt><dd>Yes - pick a language and any randomizer options and patch once. Dialog is applied before the randomizer and names after it, so neither disturbs the other.</dd>
+    <dt>My line is fine but still reported?</dt><dd>Dialog is limited per scene, not per line; another line of the same scene may have used the room.</dd>
+    <dt>The European disc?</dt><dd>Packs are keyed to the USA disc. If you own a European or fan-translated disc, <em>Translation from another disc I own</em> turns its text into a pack for the USA disc (<a href="../tooling/translation.html#official-pal">translations from another disc</a>).</dd>
+    <dt>The title-screen logo?</dt><dd>Text drawn as a picture needs replacement artwork (<a href="../tooling/translation.html#baked-text">text baked into textures</a>).</dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>Where to go next</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../tooling/translation.html">Translation / language packs</a>
+    <a href="../tooling/rom-patcher.html">ROM patcher (in browser)</a>
+    <a href="../formats/dialog-font.html">Dialog font</a>
+    <a href="../formats/man-relocation.html">MAN relocation</a>
+  </div>
+  <div class="see-also">
+    <span class="see-also-label">Guides</span>
+    <a href="modding-and-translation.html">Modding + translation</a>
+    <a href="getting-started.html">Getting started</a>
+  </div>
+</section>

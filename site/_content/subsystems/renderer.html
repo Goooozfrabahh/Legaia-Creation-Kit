@@ -1,0 +1,274 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">subsystems</a> &middot; renderer</div>
+  <h1>Renderer</h1>
+  <p class="lede">How Legaia puts 3D on screen. Every town, cave and arena is a set of meshes in a custom variant of Sony's TMD format, pushed through the PlayStation's geometry coprocessor (the GTE) and painted by the GPU into one megabyte of video memory. The thing to know first: almost nothing is lit at run time. Every polygon carries a brightness the artists painted, and the console multiplies the texture by it. This page is the tour; the function-by-function evidence is on <a href="renderer-internals.html">renderer internals</a>, and how one pixel gets its colour is on <a href="shading.html">shading and palettes</a>.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Mesh format</dt><dd><a href="../formats/tmd.html">Legaia TMD</a>: magic <code>0x80000002</code>, primitives in groups behind an 8-byte header, laid out by a six-row descriptor table at <code>DAT_8007326C</code>.</dd>
+    <dt>Leaf that draws</dt><dd>The per-primitive dispatcher <code>FUN_80043390</code> - a 20-slot jump table picked by <code>flags &gt;&gt; 1</code>. The table-driven renderer <code>FUN_8002735C</code> exists, but sits behind an actor field no sampled mode raises.</dd>
+    <dt>Lighting</dt><dd>Baked colour per polygon, through one GTE depth-cue op. The exception is the <strong>light-source rows</strong> (group flags <code>0x10..=0x17</code>), which the GTE shades from a scene light.</dd>
+    <dt>Screen</dt><dd>320&times;224 drawn, 228 lines displayed; projection centre <code>OFX 160, OFY 114</code> - dead centre of the display window.</dd>
+    <dt>Depth</dt><dd>No depth buffer. Primitives go into ordering-table buckets by depth and are painted far to near.</dd>
+    <dt>Port defaults</dt><dd><strong>Shading defaults to retail</strong> (baked colour plus the light-source rows); <strong>rasterisation defaults to clean</strong> (vertex snap and dither are opt-in). Affine UVs are always on.</dd>
+    <dt>In the port</dt><dd><code>legaia-tmd</code> (prim walk, mesh build), <code>engine-render</code> (wgpu, native), <code>site/js/webgl-shaders.js</code> (browser), shared kernels in <code>engine-core</code> / <code>engine-ui</code>.</dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="how-it-works">
+  <h2>How a frame is drawn</h2>
+  <figure class="diagram">
+    <svg viewBox="0 0 860 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Frame pipeline. Top row: placed meshes, mesh-chain walk, per-primitive dispatcher, GTE transform and colour. Bottom row: GP0 packet, ordering-table bucket, GPU paints far to near into VRAM, display window 320 by 228.">
+      <defs><marker id="rn-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="dg-node" x="10" y="30" width="190" height="62" rx="5"/>
+      <text class="dg-label" x="105" y="56">Placed meshes</text>
+      <text class="dg-sub" x="105" y="74">scene objects, actors, party</text>
+      <rect class="dg-node" x="225" y="30" width="190" height="62" rx="5"/>
+      <text class="dg-label" x="320" y="56">Mesh-chain walk</text>
+      <text class="dg-sub" x="320" y="74">one group header at a time</text>
+      <rect class="dg-node-accent" x="440" y="30" width="190" height="62" rx="5"/>
+      <text class="dg-label" x="535" y="56">Per-prim dispatcher</text>
+      <text class="dg-sub" x="535" y="74">kind = flags &gt;&gt; 1</text>
+      <rect class="dg-node-accent" x="655" y="30" width="195" height="62" rx="5"/>
+      <text class="dg-label" x="752" y="56">GTE</text>
+      <text class="dg-sub" x="752" y="74">RTPT, NCLIP, AVSZ, DPCS</text>
+      <rect class="dg-node" x="10" y="170" width="190" height="62" rx="5"/>
+      <text class="dg-label" x="105" y="196">GP0 packet</text>
+      <text class="dg-sub" x="105" y="214">screen XY, UV, colour, CLUT</text>
+      <rect class="dg-node" x="225" y="170" width="190" height="62" rx="5"/>
+      <text class="dg-label" x="320" y="196">Ordering table</text>
+      <text class="dg-sub" x="320" y="214">bucket chosen by depth</text>
+      <rect class="dg-node" x="440" y="170" width="190" height="62" rx="5"/>
+      <text class="dg-label" x="535" y="196">GPU paints</text>
+      <text class="dg-sub" x="535" y="214">far to near, into VRAM</text>
+      <rect class="dg-node-ok" x="655" y="170" width="195" height="62" rx="5"/>
+      <text class="dg-label" x="752" y="196">Display</text>
+      <text class="dg-sub" x="752" y="214">320 x 228 window</text>
+      <path class="dg-edge" d="M200 61 L223 61" marker-end="url(#rn-arrow)"/>
+      <path class="dg-edge" d="M415 61 L438 61" marker-end="url(#rn-arrow)"/>
+      <path class="dg-edge" d="M630 61 L653 61" marker-end="url(#rn-arrow)"/>
+      <path class="dg-edge" d="M752 92 L752 130 L105 130 L105 168" marker-end="url(#rn-arrow)"/>
+      <path class="dg-edge" d="M200 201 L223 201" marker-end="url(#rn-arrow)"/>
+      <path class="dg-edge" d="M415 201 L438 201" marker-end="url(#rn-arrow)"/>
+      <path class="dg-edge" d="M630 201 L653 201" marker-end="url(#rn-arrow)"/>
+      <text class="dg-edge-label" x="430" y="124" text-anchor="middle">light-source rows take NCCS / NCCT instead of the baked colour</text>
+      <text class="dg-edge-label" x="320" y="252" text-anchor="middle">whole frame queued first</text>
+    </svg>
+    <figcaption>One frame, retail side. The CPU never touches a pixel: it fills an ordering table with packets, and the GPU walks the table from the farthest bucket to the nearest once the frame is complete.</figcaption>
+  </figure>
+  <p>A town is a few hundred small meshes - houses, fences, terrain tiles, the party. For each primitive the dispatcher asks the GTE to rotate, translate and project the corners (<code>RTPT</code>), drop it if it faces away (<code>NCLIP</code>), average its depth (<code>AVSZ3</code>/<code>AVSZ4</code>) and run the colour through the depth cue (<code>DPCS</code>). The result is wrapped in a GPU packet and linked into the ordering-table bucket its depth picks. Textures and palettes are rectangles inside video memory, addressed by their top-left corner, and the GPU looks them up per pixel as it paints.</p>
+  <p>The field's ground plane is a separate pass in the field render library (PROT 0900): a per-tile emitter over the camera's visible tile window, which sends most floor cells to the farthest bucket so everything else draws over them.</p>
+  <h3 id="per-mode-table">The descriptor table</h3>
+  <p>A mesh mixes flat and smooth-shaded (gouraud), textured and plain polygons. Each group's 8-byte header <code>[count][flags][olen][ilen][flag][mode]</code> is followed by <code>count &times; ilen &times; 4</code> bytes of primitives. The table row is <code>((flags &gt;&gt; 1) &minus; 8) &gt;&gt; 1</code>; because it shifts twice, each row covers four <code>flags</code> values - a triangle pair and a quad pair - and the legal span is <code>0x10..=0x27</code>.</p>
+  <div class="table-wrap">
+  <table class="data-table">
+    <thead><tr><th><code>flags</code> (tri &middot; quad)</th><th>Row</th><th>Shape</th><th>Vertex offset</th><th>Colour</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x10/11 &middot; 0x12/13</code></td><td>0</td><td>FT (flat textured)</td><td><code>0x07</code></td><td>none - a normal index trails the vertices; <strong>light-source row</strong></td></tr>
+      <tr><td><code>0x14/15 &middot; 0x16/17</code></td><td>1</td><td>GT (gouraud textured)</td><td><code>0x06</code></td><td>none - a normal per corner; <strong>light-source row</strong></td></tr>
+      <tr><td><code>0x18/19 &middot; 0x1A/1B</code></td><td>2</td><td>F (flat)</td><td><code>0x02</code></td><td>baked colour word</td></tr>
+      <tr><td><code>0x1C/1D &middot; 0x1E/1F</code></td><td>3</td><td>G (gouraud)</td><td><code>0x06</code></td><td>baked, one per corner</td></tr>
+      <tr><td><code>0x20/21 &middot; 0x22/23</code></td><td>4</td><td>FT</td><td><code>0x07</code></td><td>leading colour block</td></tr>
+      <tr><td><code>0x24/25 &middot; 0x26/27</code></td><td>5</td><td>GT</td><td><code>0x0B</code></td><td>leading colour block, one per corner</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Bit <code>(flags &gt;&gt; 1) &amp; 1</code> picks quad over triangle. Typed lookup: <code>legaia_tmd::descriptor::Descriptor::for_flags</code>; byte layouts per mode on the <a href="../formats/tmd.html">TMD format</a> page.</p>
+</section>
+
+<section class="doc-section" id="lighting">
+  <h2>Lighting: painted, with one exception</h2>
+  <p>Legaia's towns look lit - shadowed alleys, bright plazas, a glow around lamps - but almost none of it is computed at run time. The artists painted a colour word into every polygon, and the GPU multiplies the texture by it: <code>out = texel &times; colour / 128</code>. <code>0x80</code> is neutral; across the field environment packs about four in five components sit below it, which is where retail's contrast comes from. A renderer that adds its own "helpful" light makes the game look wrong.</p>
+  <ul class="bullets">
+    <li><strong>The depth cue.</strong> Before the multiply, <code>DPCS</code> pulls the colour word toward a far colour by <code>IR0</code>. An unfogged field scene passes <code>IR0 = 0</code>, so the cue is the identity - a retail capture's corner colours leave the op byte-unchanged.</li>
+    <li><strong>The light-source rows.</strong> Rows 0 and 1 carry a normal instead of a colour word. The dispatcher sends them (kinds 8..11) to its <code>NCCS</code> / <code>NCCT</code> handlers, which shade each corner from the scene light against its world normal: back colour plus the first light's intensity, times the object colour. Under the scene-load light a face turned away keeps an eighth of its texel; a face square to it a little over the whole. Most packs hold few or none; <code>cave01</code>'s rock walls are nothing else, and their dark and bright sides are this light.</li>
+    <li><strong>Where the light comes from.</strong> Every scene load resets the light angles to <code>(0x994, 0x9CC, -0x62C)</code> and the back colour to <code>0x202020</code>; field-VM op <code>4C 8A</code> sets other values (<code>town01</code> uses a white back colour, which is why its few lit rows look unlit). The kingdom overworlds carry no light-source rows at all.</li>
+  </ul>
+  <p class="hint">The trap that keeps a synthetic light alive in a port: an unbound colour attribute defaults to white, and white is <code>texel &times; 255/128</code> - a missing colour stream reads as "too bright", not as "unlit". Both site shader paths upload the packet colour for that reason. Formulas and register sources: <a href="renderer-internals.html#light-rows">internals</a>.</p>
+</section>
+
+<section class="doc-section" id="frame-setup">
+  <h2>The screen</h2>
+  <div class="table-wrap">
+  <table class="data-table">
+    <thead><tr><th>Quantity</th><th>Retail value</th><th>Read from</th></tr></thead>
+    <tbody>
+      <tr><td><code>OFX / OFY</code></td><td><code>160 / 114</code></td><td>GTE control file in a save state</td></tr>
+      <tr><td>Drawing area</td><td><code>320 &times; 224</code></td><td>GPU clip registers</td></tr>
+      <tr><td>Draw offset</td><td><code>(0, 4)</code> / <code>(0, 244)</code></td><td>alternating double-buffer halves</td></tr>
+      <tr><td>Display window</td><td><code>320 &times; 228</code> scanlines</td><td><code>DisplayVStart/End = (28, 256)</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>All four hold across field, battle, battle load and the dance minigame - unlike the projection distance <code>H</code>, which is set per phase (256 in battle, 512 in the field). <code>OFY = 114</code> is <code>228 / 2</code>, the centre of the display window; it only looks "six pixels high" against a 240-line frame, which retail never draws.</p>
+  <p>The port keeps a 320&times;240 logical screen, because every 2D rectangle it draws is a retail draw-area coordinate copied verbatim, and moves the GTE origin onto row 114 with a constant bias on clip <code>y</code>. The residual is the frame height: retail's picture fills <code>224/240</code> of the port's, so everything reads about 7% smaller.</p>
+  <p>On the overworld a second table bends the world: a screen-Y curvature table, indexed by depth and added to each vertex's screen Y, gives the continent its rounded horizon (<a href="world-map.html#render-pipeline">world map</a>).</p>
+</section>
+
+<section class="doc-section" id="coplanar">
+  <h2>Depth without a depth buffer</h2>
+  <p>Retail sorts whole polygons by depth and paints far to near. Legaia's artists leaned on that: decals lying exactly on walls, floor tiles overlapping their neighbours, walls modelled once per visible side. A depth-tested renderer turns each of these into flicker, so the port reproduces the painter's outcome without the painter's algorithm.</p>
+  <div class="table-wrap">
+  <table class="data-table">
+    <thead><tr><th>Case</th><th>Retail outcome</th><th>Port policy</th></tr></thead>
+    <tbody>
+      <tr><td>Decal on a base surface</td><td>The decal's mean depth is local, the base's averages deeper - the decal lands in a nearer bucket</td><td>A small depth lift so the retail winner stays the winner</td></tr>
+      <tr><td>Same bucket</td><td>Head insertion: the earliest-emitted primitive draws last, on top</td><td>Equal keys draw later-submitted-first</td></tr>
+      <tr><td>Double-sided pair</td><td><code>NCLIP</code> rasterises only the camera-facing copy</td><td>Pairs are marked at mesh build; only the facing copy draws</td></tr>
+      <tr><td>Far-bucket floor cell</td><td>Painted under everything else in the frame</td><td>Drawn first, under every other primitive</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <h3 id="no-culling">No distance culling</h3>
+  <p>The port adds no frustum cull, draw distance or level of detail of its own; a field scene's draw list is resolved once at load. What it removes is what retail removes. Retail's field render library never draws the whole map: it walks only the map cells inside the camera's visible tile window, clipped to the walk region, and culls placed actors against the same view. Both hosts reproduce that crop while the camera holds retail's own framing; under the port's wider default camera, the zoom and tilt knobs or the debug orbit, the map is drawn whole, because the window was sized for retail's frustum and would open black edges. The per-primitive rejects (back faces, a near-plane test) apply everywhere.</p>
+  <h3 id="gpu-span-limit">The GPU polygon-size limit</h3>
+  <p>One more per-primitive reject is the GPU's, not the game's. The prim leaves hand the GPU the GTE's screen coordinates with no clip of their own, and the GPU skips any polygon whose corners lie more than 1023 pixels apart horizontally or 511 vertically. A corner just in front of the eye, or behind it, projects far off screen, so in battle this removes the primitives of a body whose limbs reach past the camera - a summon close-up that seats a monster between the eye and the caster - where a per-pixel clip would paint them as long shards. Both hosts run the same span test in the vertex stage beside the near reject (<code>prim_near_reject::gpu_span_rejected</code>), armed in battle only; a split quad is dropped only when both halves exceed the limit.</p>
+  <h3 id="facing-cells">Camera-facing decoration cells</h3>
+  <p>About a third of the field maps carry decoration cells whose record flags (<code>+0x12 &amp; 0x380</code>) drop camera pitch, yaw or roll from the cell's matrix: the candle glows in <code>rugi</code> stay square to the lens, the Voz forest trees (<code>vell</code>, <code>vozz</code>) and the billboards of <code>deene</code> and <code>retona</code> turn with the view. The field decoration pass <code>FUN_801F7088</code> builds that matrix per cell; drawn under the full camera instead, the glows lie flat as ellipses. Both play hosts rebuild a flagged cell every frame through one kernel (<code>gte::decoration_cell_basis</code>).</p>
+</section>
+
+<section class="doc-section" id="view-matrix">
+  <h2>Where the camera transform comes from</h2>
+  <p>Once a frame, one routine (<code>FUN_800172C0</code>) turns the field camera's globals into the GTE's rotation and translation registers. The field controller ends on it, and every minigame overlay and the world-map renderer call it too. It builds the light matrix first, then the view:</p>
+  <pre><code>screen = proj(H) * ( S * Rot(pitch, yaw, roll) * (v - focus) + tr_eye )</code></pre>
+  <ul class="bullets">
+    <li><strong><code>S</code> is a per-mode uniform scale</strong> held in a base matrix at <code>0x8007BF10</code>: a live town holds 6&times; (GTE <code>4096</code> is 1.0). The eye offset <code>tr_eye</code> is in <em>unscaled</em> units, so a renderer that draws geometry at 1&times; reproduces the frame by dividing the eye trio by <code>S</code> - the perspective divide is invariant under a uniform scale of the whole eye-space vector.</li>
+    <li><strong>There is no eye-back depth constant</strong> in the chain. The live eye trio is the whole offset.</li>
+    <li><strong>The focus is X and Z only.</strong> The focus globals hold the <em>negated</em> anchor, and in the field only X and Z are ever written; the Y global reads zero on every sampled frame while the player's footing does not. The camera's vertical framing rides the composed eye Y.</li>
+    <li><strong>The d-pad ring goes with the framing.</strong> Retail rings the pad heading at 45 degrees against the camera, so &ldquo;up&rdquo; is always away from the lens (<a href="field-locomotion.html">field locomotion</a>).</li>
+  </ul>
+  <p>A probe that samples the registers every frame confirms the formula across three field states, including frames where the camera's staging values differ from the live ones.</p>
+</section>
+
+<section class="doc-section" id="ground-pass">
+  <h2>The field ground: two emitters and a far bucket</h2>
+  <p>A field scene's floor is not a mesh. The field render library (PROT 0900) walks the map cells inside the camera's visible tile window and emits one textured quad per cell, with its four corner heights read from the collision grid's floor tiers. The library ships that emitter twice - a depth-cued body and a flat one that writes the raw colour word - and ordinary field play takes the flat one.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 860 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="An ordering table drawn as a row of buckets from near on the left to far on the right. The GPU walks it from the far end. A ground cell whose word has bit 0x8000 set is placed in the bucket its farthest vertex picks, among the other scene primitives. A ground cell without the bit goes in the fixed far bucket, the last slot, which the GPU walks first, so every other primitive paints over it.">
+      <defs><marker id="rn-ot-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <text class="dg-edge-label" x="20" y="24">ordering table: one bucket per depth step</text>
+      <rect class="dg-node" x="20" y="34" width="90" height="46" rx="4"/><text class="dg-sub" x="65" y="62">near</text>
+      <rect class="dg-node" x="118" y="34" width="90" height="46" rx="4"/>
+      <rect class="dg-node" x="216" y="34" width="90" height="46" rx="4"/>
+      <rect class="dg-node-accent" x="314" y="34" width="90" height="46" rx="4"/><text class="dg-sub" x="359" y="62">sorted cell</text>
+      <rect class="dg-node" x="412" y="34" width="90" height="46" rx="4"/>
+      <rect class="dg-node" x="510" y="34" width="90" height="46" rx="4"/>
+      <rect class="dg-node" x="608" y="34" width="90" height="46" rx="4"/><text class="dg-sub" x="653" y="62">far</text>
+      <rect class="dg-node-warn" x="730" y="34" width="110" height="46" rx="4"/><text class="dg-label" x="785" y="54">far bucket</text><text class="dg-sub" x="785" y="70">fixed last slot</text>
+
+      <path class="dg-edge" d="M840 104 L24 104" marker-end="url(#rn-ot-arrow)"/>
+      <text class="dg-edge-label" x="545" y="124" text-anchor="middle">the GPU paints from the far end toward the near end</text>
+
+      <rect class="dg-node" x="130" y="160" width="300" height="64" rx="5"/>
+      <text class="dg-label" x="280" y="186">cell word has bit 0x8000</text>
+      <text class="dg-sub" x="280" y="206">bucket from its farthest corner's depth</text>
+      <rect class="dg-node" x="540" y="160" width="300" height="64" rx="5"/>
+      <text class="dg-label" x="690" y="186">cell word lacks bit 0x8000</text>
+      <text class="dg-sub" x="690" y="206">far bucket: under everything</text>
+      <path class="dg-edge" d="M300 160 L354 84" marker-end="url(#rn-ot-arrow)"/>
+      <path class="dg-edge" d="M740 160 L782 84" marker-end="url(#rn-ot-arrow)"/>
+    </svg>
+    <figcaption>A cell is drawn at all only when its object-grid word carries bit <code>0x1000</code>. Bit <code>0x8000</code> then decides whether it competes for depth or simply lies under the whole frame.</figcaption>
+  </figure>
+  <ul class="bullets">
+    <li><strong>The window is the crop.</strong> Four signed bytes in the scratchpad give the tile window as offsets around the camera's tile, so the pass runs a fixed-size double loop - 32 by 48 cells in one measured scene - and nothing outside it exists that frame.</li>
+    <li><strong>A far-bucket cell is painted under everything, nearer or not.</strong> A depth buffer agrees for a flat cell but not for a sloped one: where a cell's corners are a cliff apart it is a near-vertical sheet of ground texture that retail never shows, because the cliff mesh in front paints over it. The port carries the bit per cell and its ground shader pushes such cells to the back of the depth range, flat ones by a hair and sloped ones into a thin far slice.</li>
+    <li><strong>Why the hair matters.</strong> A decal authored on the floor plane - a subtractive shadow strip a tenth of a unit above the ground - ties with the floor at float rounding and loses every pixel without it.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="rejects">
+  <h2>What retail removes before the GPU sees it</h2>
+  <p>Retail has no near-plane clip and no depth buffer, so it drops whole objects and whole primitives instead. The port reproduces each of these cuts through one shared kernel per rule, because a per-pixel clip draws things retail never shows.</p>
+  <div class="table-wrap">
+  <table class="data-table">
+    <thead><tr><th>Cut</th><th>Retail rule</th><th>What goes wrong without it</th></tr></thead>
+    <tbody>
+      <tr><td>Back faces</td><td>Every per-primitive handler runs <code>NCLIP</code> and rejects a non-positive area; a quad survives when either of its triangles faces the eye. A mask lowered by colour-word bit <code>0x08000000</code> makes a body double-sided, and no placed field object carries it</td><td>A sky dome seen from outside paints its outer shell over the scene; a semi-transparent battle body draws about twice as bright because both shells add</td></tr>
+      <tr><td>Placed object near the eye</td><td>The actor draw walk skips a placed object whose origin's view depth is below <code>0xA0</code> (160 units), or behind the eye</td><td>A cutscene camera parked inside a mist shell draws the shell's inside across the frame</td></tr>
+      <tr><td>Primitive near the eye</td><td>After the depth average, a primitive whose ordering-table depth is under a per-scene floor is dropped: a mean depth under 128 on the field, under 64 in battle</td><td>A wall the camera is pressed against stretches across the screen</td></tr>
+      <tr><td>Oversized polygon</td><td>The GPU's own limit (<a href="#gpu-span-limit">above</a>)</td><td>Long shards from a limb that reaches past the camera</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Which passes cull back faces is itself a table: the field, the dance hall and battle <em>bodies</em> do; the world map, the battle stage and the other minigame venues draw both sides. The debug orbit camera is exempt from the near cuts.</p>
+  <h3 id="on-screen-probes">Two &ldquo;is it on screen&rdquo; tests that are not the same test</h3>
+  <p>Retail has two GTE-backed visibility probes, and they are not interchangeable. The field one projects a box around an actor and accepts any corner inside a real rectangle. The battle one tests only the box's <em>horizontal span</em> against the screen band - it reads no Y at all, so a body a full screen above the viewport still counts as visible. The battle probe also has no reference of any kind anywhere on the disc, so nothing consults its verdict; the port's lack of a cull there is parity.</p>
+</section>
+
+<section class="doc-section" id="battle-draw">
+  <h2>Drawing a battle body, and its shadow</h2>
+  <p>Monsters, the party and a summon's parts all go through one draw (<code>FUN_80048A08</code>) once per frame: compose the actor matrix under the camera, decode the pose, apply the render scale, then hand each object of the mesh to a primitive leaf.</p>
+  <ul class="bullets">
+    <li><strong>Rotted limbs draw dark.</strong> The colour word is reloaded for each object, because a party member's status can override it per object. Three Rot bits each map to an object range of that character's battle mesh through a five-byte row per character; a dimmed object draws with red and green quartered and blue halved, pushed three quarters of the way toward a blue-black by the depth cue. It is the only per-object colour rule in the draw.</li>
+    <li><strong>The battle shadow is procedural.</strong> Unless the body is an after-image ghost, the draw ends with a disc under the actor: a 24-column ring of outer radius four tenths of the actor's size, built in the XZ plane at height zero and <em>subtracted</em> from the frame. It is drawn only while the actor is neither pitched nor rolled, and it dims when the actor is airborne.</li>
+    <li><strong>The field shadow is a texture.</strong> A field actor's blob is a different routine (<code>FUN_8001C394</code>): a 3&times;3 grid of points 32 units apart is projected at the actor's feet and its four cells are drawn as textured quads, tiling one 16&times;16 dark blob from the menu-glyph page at half-and-half blend. A depth bias sorts the blob behind the actor standing on it and over the ground. Jumping and scripted vanishes switch it off through one flag bit.</li>
+  </ul>
+  <p>Both shadows are checked against retail captures packet for packet. In the port each sits a few units above the floor so a depth test does the job retail's ordering does.</p>
+</section>
+
+<section class="doc-section" id="shatter">
+  <h2>The shatter renderer: a body that flies apart</h2>
+  <p>A body whose break-up word is non-zero leaves the ordinary primitive dispatcher and is drawn by a sibling pair (<code>FUN_80029888</code> per object, <code>FUN_80029DD8</code> per primitive). It is not a whole-model spin: every triangle spins about its own centroid and is pushed away from a burst centre, so the mesh comes apart in shards. A quad is two triangles, each with its own centroid, and there is no back-face test, so a shattering body draws both sides.</p>
+  <ul class="bullets">
+    <li><strong>Flags shape the burst.</strong> One row of flags turns off the spin, makes each shard shrink as the word rises, or holds the shards in place. Three more sweep a front across the body along a camera axis: only the triangles past the front come apart, which is how a summon creature assembles from the floor up.</li>
+    <li><strong>Who drives it.</strong> On the field, a script op ramps the word from <code>0</code> to <code>0x1000</code> (<a href="script-vm.html">script VM</a>). In battle the cast modules do: six summons break up or assemble their own creature, and two of them do it to the monsters (<a href="cast-module.html">cast modules</a>). Effect parts pass the same gate, so a summoning mound or a crystal bursts the same way.</li>
+    <li><strong>In the port.</strong> <code>render-kernels::shatter</code> is the integer kernel, shared by both play hosts for battle bodies and field NPCs; a body whose word is zero takes the plain path untouched. The field's view-space sweep frame, the per-triangle depth window and the light-source rows' colour are not modelled.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="frame-as-texture">
+  <h2>The frame as a texture, and the grade</h2>
+  <p>On the console the framebuffer <em>is</em> VRAM: the display area is a rectangle inside the same image textures are read from, so a primitive can sample pixels the GPU drew a moment earlier. The field-to-battle transitions depend on it - the curtain slices a captured field frame into row and column strips, each an ordinary textured quad whose texture page is the capture.</p>
+  <ul class="bullets">
+    <li><strong>Where retail parks the capture</strong> follows from the curtain's own texture-page words: a 320&times;240 15-bit image at VRAM <code>(320, 0)</code> with a second copy at <code>(320, 256)</code>, to the right of the two display buffers.</li>
+    <li><strong>The port adds the missing direction.</strong> A modern GPU renders to a target unrelated to the software VRAM page, so a shared kernel reads the frame back and writes it in. The 15-bit quantisation round-trips exactly; the one deviation is a point-sampled downscale when the window is larger than 320&times;240.</li>
+    <li><strong>The colour grade is off everywhere but the prologue.</strong> The opening's gold sepia is applied by retail to the <em>loaded assets</em> - every palette entry and every resident colour word is rewritten - and the port's shaders apply the same laws per decoded texel. Every other scene renders bit-identical to the ungraded pipeline (<a href="cutscene.html">cutscene</a>).</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="psx-mode">
+  <h2>Faithful and default are different axes</h2>
+  <p>Shading - which polygon is which colour - defaults to retail. The PS1's rasterisation artefacts default off and sit one switch away. The enhancements default on in the play hosts and leave the faithful render pixel-identical when switched off.</p>
+  <div class="table-wrap">
+  <table class="data-table">
+    <thead><tr><th>Knob</th><th>Default</th><th>Retail is</th><th>What it gates</th></tr></thead>
+    <tbody>
+      <tr><td><code>set_psx_mode</code> (<code>LEGAIA_PSX_RENDER=1</code>)</td><td>off</td><td>on</td><td>sub-pixel vertex snap and 4&times;4 ordered 15-bit dither, nothing else</td></tr>
+      <tr><td><code>set_semi_blend</code></td><td>on</td><td>on</td><td>semi-transparency; off draws water and glows solid</td></tr>
+      <tr><td>Affine UVs</td><td>always</td><td>always</td><td>a static shader qualifier, not a switch</td></tr>
+      <tr><td>Enhanced lighting (<code>I</code>)</td><td>on in both play hosts</td><td>off</td><td>time-of-day mood, lamp lights at glowing props, emissive primitives, halos</td></tr>
+      <tr><td>Volumetric fog (<code>F9</code>)</td><td>off in both play hosts while the look matures</td><td>off</td><td>ground-hugging fog volumes</td></tr>
+      <tr><td>Occlusion fade (<code>F4</code>)</td><td>on in both play hosts</td><td>off</td><td>see-through walls between the follow camera and the player</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p><strong>Retail dithers.</strong> The draw-environment initialiser stamps the GPU's dither bit to 0, but the frame driver re-stamps it every frame from a global that boots at 1 and a script opcode can change. The port's clean default is a choice about the look, not a reading of the executable.</p>
+  <p><strong>Semi-transparency</strong> is per texel on a textured primitive: palette entries with the STP bit blend, others draw opaque. The four blend equations are on <a href="shading.html#chain">shading</a>.</p>
+</section>
+
+<section class="doc-section" id="vram-emulation">
+  <h2>VRAM in the port</h2>
+  <p>The PS1 keeps every texture and palette in one shared 1&nbsp;MB image, and a polygon does not say "use texture X" - it says "read pixels from this rectangle and look them up in the palette at that row". The port keeps that image as a real 1024&times;512 16-bit texture and decodes 4/8/15-bit texels and palettes per pixel in the fragment shader, so one draw call carries every texture mode exactly as the hardware samples it.</p>
+  <p>Most of the port's VRAM work is deciding which bytes to write: Legaia's palettes are scattered across many PROT entries, and uploading every texture a scene owns lets one image overwrite another mesh's palette row - rainbow noise. The scene builder unions the palette rows and texture pages its meshes actually sample, uploads shared blocks first, then images, then palettes (<a href="renderer-internals.html#vram-upload">upload passes</a>). Every colour stays a PSX framebuffer value end to end; the output is never sRGB-encoded.</p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="renderer-internals.html">Renderer internals</a>
+    <a href="shading.html">Shading and palettes</a>
+    <a href="../formats/tmd.html">Legaia TMD</a>
+    <a href="../formats/tim.html">PSX TIM</a>
+    <a href="../formats/npc-palette.html">NPC palettes</a>
+    <a href="../formats/character-mesh.html">Character meshes</a>
+    <a href="battle.html">Battle</a>
+    <a href="world-map.html">World map</a>
+    <a href="vr-mode.html">VR mode</a>
+    <a href="engine.html">Engine architecture</a>
+    <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/subsystems/renderer.md" target="_blank" rel="noopener">renderer.md</a>
+  </div>
+</section>

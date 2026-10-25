@@ -1,0 +1,1656 @@
+//! Clap command-line interface: the `Cli` root parser and the `Cmd` /
+//! `ConfigCmd` subcommand enums (help text doubles as the user-facing docs).
+
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "legaia-engine",
+    version,
+    about = "From-scratch engine port of Legend of Legaia. Bring your own disc: every \
+             subcommand reads a Legend of Legaia (USA) .bin via --disc, or an \
+             extracted/ tree produced by legaia-extract.",
+    long_about = "From-scratch engine port of Legend of Legaia.\n\n\
+        Bring your own disc: every subcommand reads a Legend of Legaia (USA) \
+        `.bin` disc image via `--disc <PATH>`, or an `extracted/` tree produced \
+        by `legaia-extract` (the `--extracted-root` default `extracted` resolves \
+        against the current directory).\n\n\
+        Start here:\n  \
+        legaia-engine            (no subcommand: the launcher - pick the disc once, \
+        set display options, press Play for the title screen)\n  \
+        legaia-engine play-window --disc \"Legend of Legaia (USA).bin\"\n  \
+        legaia-engine list-scenes --disc \"Legend of Legaia (USA).bin\"\n\n\
+        Config and saves (`legaia-input.toml`, `legaia-options.toml`, `saves/`) \
+        also resolve against the current directory - run from the same directory \
+        each time, or pass explicit paths where supported.",
+    after_help = "COMMAND GROUPS:\n  \
+        Playing:      play-window, play-str, config, save, load\n  \
+        Exploring:    list-scenes, info, record, replay, export-glb\n  \
+        Diagnostics (engine development; not needed to play):\n    \
+        scene / script analysis:  play, clut-trace, man-scripts, xa-cue\n    \
+        parity oracles:           vram-oracle, mode-trace, audio-trace, pcm-trace, gte-replay, scenarios,\n                              \
+        sim-trace, retail-compare, cast-sequence-score\n    \
+        synthetic state drivers:  inventory, equip, title, save-select, encounter,\n                              \
+        target-pick, chain-editor, seru-capture"
+)]
+pub(crate) struct Cli {
+    /// Omit to run the launcher: it asks for the disc image once, remembers
+    /// it, offers the display options, and starts the game on Play.
+    #[command(subcommand)]
+    pub(crate) cmd: Option<Cmd>,
+}
+
+// `PlayWindow` carries the whole engine-runner option surface - render
+// toggles, capture scripting, party composition, debug seeds - so it dwarfs
+// the inspection subcommands beside it. Boxing it would only move the
+// allocation: clap parses exactly one variant per process. Same reasoning as
+// `legaia-patcher`'s `Randomize`.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand, Debug)]
+pub(crate) enum Cmd {
+    /// Load one scene's assets headlessly and print a summary line.
+    /// Use this to verify the asset chain produces the right state without
+    /// firing up the windowed viewer. The optional flags below are VRAM
+    /// diagnostics for engine development.
+    #[command(display_order = 4)]
+    Info {
+        /// CDNAME scene name (e.g. `town01`, `dolk`, `cave01`).
+        #[arg(long)]
+        scene: String,
+        /// Extracted-root directory containing `PROT.DAT` + `CDNAME.TXT`.
+        #[arg(long, default_value = "extracted")]
+        extracted_root: PathBuf,
+        /// Alternative source: read PROT.DAT + CDNAME.TXT directly from a
+        /// `.bin` disc image. When provided, `--extracted-root` is ignored.
+        #[arg(long)]
+        disc: Option<PathBuf>,
+        /// Optional: also write the populated [`SceneResources::vram`] to
+        /// a 1024x512 RGBA8 PNG for offline comparison against a runtime
+        /// VRAM dump (`mednafen-state vram-dump --out-bin`).
+        #[arg(long)]
+        vram_png: Option<PathBuf>,
+        /// Optional: dump the raw 1 MiB BGR555 little-endian VRAM bytes to
+        /// this path for pixel-exact diffs against a runtime capture.
+        #[arg(long)]
+        vram_bin: Option<PathBuf>,
+        /// Optional: read a 1 MiB runtime VRAM blob (from
+        /// `mednafen-state vram-dump --out-bin`) and report per-region
+        /// coverage statistics: how many runtime non-zero rows the engine
+        /// also populates, broken down by VRAM half (texture pages above
+        /// y=256 vs framebuffers / scratch in the top half).
+        #[arg(long)]
+        runtime_vram: Option<PathBuf>,
+        /// Optional: write a colour-coded diff PNG showing where engine
+        /// VRAM matches / differs from the runtime VRAM. Used together
+        /// with `--runtime-vram`.
+        #[arg(long)]
+        vram_diff_png: Option<PathBuf>,
+        /// Optional: for every parsed TMD, walk the prim filter against
+        /// the built VRAM and report kept / dropped counts. Surfaces
+        /// "this mesh references VRAM the pre-pass didn't populate"
+        /// failure modes without firing up the windowed viewer.
+        #[arg(long)]
+        tmd_stats: bool,
+        /// Disable the asset-viewer-style targeted-VRAM upload. By
+        /// default, each TIM's image and CLUT block are decided
+        /// independently, suppressing the side that would clobber
+        /// another mesh's data - this matches what the retail field
+        /// loader does and dramatically reduces CLUT-row collisions on
+        /// town / field scenes. Use `--no-targeted` to force the
+        /// uniform-upload-every-TIM behaviour (legacy diagnostic mode).
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        no_targeted: bool,
+    },
+    /// Trace dropped CLUT references in a scene. Builds the scene's
+    /// [`SceneResources`] with the default shared-block overlay, walks
+    /// every TMD prim that drops as `MissingClut`, and reports which
+    /// PROT entries on the disc carry a TIM whose CLUT block would
+    /// supply each unique row. Use to discover which CDNAME blocks the
+    /// engine needs to keep resident to lift the prim keep ratio.
+    ///
+    /// Optional `--runtime-vram <PATH>` cross-checks each missing row
+    /// against the runtime VRAM ground truth (mednafen-state vram-dump
+    /// --out-bin). Rows that are non-zero in the runtime VRAM but
+    /// missing in the engine are the actionable gap.
+    #[command(display_order = 21)]
+    ClutTrace {
+        /// CDNAME scene name (e.g. `town01`, `dolk`, `cave01`).
+        #[arg(long)]
+        scene: String,
+        /// Extracted-root directory containing `PROT.DAT` + `CDNAME.TXT`.
+        #[arg(long, default_value = "extracted")]
+        extracted_root: PathBuf,
+        /// Alternative source: read PROT.DAT + CDNAME.TXT directly from
+        /// a `.bin` disc image. When provided, `--extracted-root` is
+        /// ignored.
+        #[arg(long)]
+        disc: Option<PathBuf>,
+        /// Optional runtime VRAM blob captured from a save state. When
+        /// provided, the trace marks each missing row as "supplied in
+        /// runtime VRAM" or "absent everywhere" - the former is where
+        /// the engine's loader chain is incomplete.
+        #[arg(long)]
+        runtime_vram: Option<PathBuf>,
+        /// Maximum number of PROT entries to report per missing CLUT row
+        /// (multiple TIMs across the disc can supply the same row).
+        #[arg(long, default_value_t = 4)]
+        max_sources: usize,
+    },
+    /// Walk a scene's MAN partition-1 field-VM scripts (the per-actor
+    /// interaction scripts; record 0 is the scene-entry system script) with
+    /// the opcode-aware disassembler and report every `Yield` site whose
+    /// trailing window decodes as an inline encounter record
+    /// (`[reserved×3][count][monster_ids]`).
+    ///
+    /// This is the scripted-encounter hunt: it distinguishes a real inline
+    /// `[count][ids]` arm at a decoded opcode boundary from the byte-scan
+    /// false positives (every `0x37`/`0x41` byte in dialog text). For
+    /// town01 the survey finds no inline literal - the opening Tetsu fight
+    /// installs via the indexed formation table instead.
+    #[command(display_order = 22)]
+    ManScripts {
+        /// CDNAME scene name (e.g. `town01`, `dolk`, `cave01`).
+        #[arg(long)]
+        scene: String,
+        /// Extracted-root directory containing `PROT.DAT` + `CDNAME.TXT`.
+        #[arg(long, default_value = "extracted")]
+        extracted_root: PathBuf,
+        /// Alternative source: read PROT.DAT + CDNAME.TXT directly from a
+        /// `.bin` disc image. When provided, `--extracted-root` is ignored.
+        #[arg(long)]
+        disc: Option<PathBuf>,
+        /// Print every partition-1 record (including the dialog-heavy
+        /// interaction scripts), not just records carrying a decodable
+        /// inline record.
+        #[arg(long)]
+        all: bool,
+        /// Print the full field-VM opcode disassembly of one record (by
+        /// index; in partition 1 record 0 is the scene-entry system script).
+        /// Useful for tracing scene-entry / cutscene / dialog flow.
+        #[arg(long)]
+        disasm_record: Option<usize>,
+        /// Partition the `--disasm-record` index lives in (default 1, the
+        /// per-actor scripts). Use `2` to disassemble a cutscene-timeline
+        /// record (e.g. opdeene's record 18, the prologue camera/actor/text
+        /// sequence ending in `GFLAG_SET 26`).
+        #[arg(long, default_value_t = 1)]
+        disasm_partition: usize,
+        /// Write the decoded (LZS-decompressed) MAN payload to this path so it
+        /// can be scanned for embedded literals (e.g. a scripted scene-change
+        /// target name). The scene-entry script + every partition's bytecode
+        /// live in this blob.
+        #[arg(long)]
+        dump_man: Option<PathBuf>,
+        /// Operate on the scene's standalone **variant** MAN carried by this
+        /// PROT extraction entry (the type-3 chunk of a DATA_FIELD streaming
+        /// entry in the scene's block, e.g. `157` for rikuroa's post-Caruban
+        /// story-state MAN) instead of the asset-table bundle MAN. Use the
+        /// census output's `PROT[NNNN] VARIANT-MAN` tag to find the index.
+        #[arg(long)]
+        variant: Option<u32>,
+        /// Walk a partition's records as field-VM scripts and report their
+        /// flag write/test sites - both the scratchpad global-flag ops
+        /// (`GFLAG_SET`/`GFLAG_CLEAR`) and the wide SYSTEM-flag ops
+        /// (`0x50..=0x7F`, SET/CLEAR/TEST). Partition 2 holds the
+        /// cutscene-timeline records (e.g. opdeene's `GFLAG_SET 26` town01
+        /// hand-off arm). Reported at real opcode boundaries.
+        #[arg(long)]
+        gflag_partition: Option<usize>,
+        /// Run a disc-wide SYSTEM-flag census across *every* CDNAME scene's
+        /// MAN (all partitions) and print `flag -> [(scene, partition, record,
+        /// op, kind)]` sorted by flag number. Surfaces the setters for the
+        /// overworld progress gates (e.g. `0x193`/`0x482`/`0x2FC`), which
+        /// usually live in a different scene's MAN than the one that gates on
+        /// them. Ignores the per-scene `--scene` argument (it is disc-wide).
+        #[arg(long)]
+        system_flag_census: bool,
+        /// Run a disc-wide **motion-VM** flag census: decode every scene
+        /// MAN's tail-section-1 motion scripts (the `FUN_80038158` bytecode
+        /// `FUN_8003A9D4` installs on actors at scene entry) and print every
+        /// op-`0x07` SET / op-`0x08` CLEAR of the `DAT_80085758` system-flag
+        /// bank, plus the per-stream variant gate flags. This is the second
+        /// bytecode VM writing the same bank - `--system-flag-census` (field
+        /// VM ops `0x50/0x60/0x70`) is structurally blind to it. Disc-wide;
+        /// ignores the per-scene `--scene` argument.
+        #[arg(long)]
+        motion_flag_census: bool,
+        /// Run a disc-wide **op-0x49 flag-WINDOW census**: decode every scene
+        /// MAN's partition records with the field-VM disassembler and print
+        /// every op-`0x49` (`STATE_RESUME`) site with its operand bytes
+        /// interpreted under the `FUN_801EF014` flag-window descriptor
+        /// (`+1` count, `+2` default, `+3` rows, `+4..5` u16 base flag), plus
+        /// containment / near-miss verdicts for the spine flags
+        /// `0x142`/`0x482`/`0x1BE`/`0x225`. This closes the "a window's
+        /// base+offset arithmetic lands on a spine flag with no literal in
+        /// the corpus" hypothesis. Disc-wide; ignores `--scene`.
+        #[arg(long)]
+        op49_window_census: bool,
+        /// Dump the inline cutscene-narration text pages embedded in a
+        /// cutscene-timeline record (the `0x1F`/`0x00`-framed subtitle pages
+        /// after a `0x4C` narration op). Pair with `--disasm-record N
+        /// --disasm-partition 2` to target the right record; defaults to
+        /// scanning every partition-2 record when no record is given.
+        #[arg(long)]
+        narration: bool,
+        /// Print every partition-2 record's C1/C2 header gate lists (the
+        /// `FUN_8003BDE0` spawn conditions: C1 blocks the spawn if ANY listed
+        /// flag is set - the one-shot latch; C2 requires ALL listed flags
+        /// set) plus the record's name bytes. This is the record-HEADER flag
+        /// read surface the inline op censuses are structurally blind to -
+        /// the gate-family mining view (`partition2_record_gates`).
+        #[arg(long)]
+        p2_gates: bool,
+    },
+    /// Compare engine VRAM (built from the scene's targeted asset
+    /// upload) against a runtime VRAM blob captured from a mednafen
+    /// save state. Reports per-64x64-tile overlap and writes a
+    /// colour-coded diff PNG (greyscale = exact match, blue = both
+    /// non-zero but different, red = runtime-only, green = engine-only).
+    ///
+    /// Two modes:
+    ///   - **Explicit**: pass `--scene` + `--runtime-vram` to point at a
+    ///     CDNAME label and a 1 MiB VRAM dump produced by
+    ///     `mednafen-state vram-dump --out-bin`.
+    ///   - **Scenario**: pass `--scenario <label>` to resolve both from
+    ///     `scripts/scenarios.toml`. The scene comes from
+    ///     `expected_active_scene`, the VRAM is read live from the
+    ///     scenario's `.mc{slot}` save via `legaia-mednafen`'s GPU
+    ///     section parser. Optional `--frames N` boots a `NativeSession`
+    ///     and ticks the engine before sampling, so dynamic VRAM
+    ///     uploads land before the diff. `--strict` asserts byte-exact
+    ///     match in the texpage region (y ≥ 256) and fails with the
+    ///     first divergent (row, col).
+    #[command(display_order = 23)]
+    VramOracle {
+        /// CDNAME scene name (e.g. `town01`). Required in explicit mode;
+        /// derived from the scenario's `expected_active_scene` in
+        /// scenario mode.
+        #[arg(long)]
+        scene: Option<String>,
+        /// Extracted-root directory containing `PROT.DAT` + `CDNAME.TXT`.
+        #[arg(long, default_value = "extracted")]
+        extracted_root: PathBuf,
+        /// Alternative source: read PROT.DAT + CDNAME.TXT directly from
+        /// a `.bin` disc image.
+        #[arg(long)]
+        disc: Option<PathBuf>,
+        /// Explicit-mode VRAM blob: 1 MiB BGR555 LE bytes from a save
+        /// state. Required when `--scenario` is not set; ignored when
+        /// `--scenario` is set.
+        #[arg(long)]
+        runtime_vram: Option<PathBuf>,
+        /// Scenario-mode entry: scenario label looked up in the
+        /// manifest. Resolves scene + .mc save path automatically. The
+        /// scenario must have `expected_active_scene` populated.
+        #[arg(long)]
+        scenario: Option<String>,
+        /// Scenario manifest path. Default: `scripts/scenarios.toml`.
+        #[arg(long, default_value = "scripts/scenarios.toml")]
+        manifest: PathBuf,
+        /// Scenario mode only: number of engine frames to tick before
+        /// sampling VRAM. Default 0 = pure pre-pass diff (no engine
+        /// involvement, identical to the legacy explicit-mode build).
+        /// Set > 0 to capture VRAM state after the engine has settled
+        /// dynamic uploads.
+        #[arg(long, default_value_t = 0)]
+        frames: u64,
+        /// Strict mode: assert byte-exact match in the texpage region
+        /// (y ≥ 256). Reports first divergent (row, col) with hex
+        /// values and exits non-zero. The framebuffer half (y < 256)
+        /// is reported but not asserted - the engine port renders
+        /// direct-to-wgpu, not to a simulated PSX framebuffer.
+        #[arg(long, default_value_t = false)]
+        strict: bool,
+        /// Optional: write a 1024x512 RGBA8 colour-coded diff PNG.
+        #[arg(long)]
+        diff_png: Option<PathBuf>,
+        /// Print per-tile (64x64) overlap counts instead of just bands.
+        #[arg(long, default_value_t = false)]
+        tiles: bool,
+        /// Optional: write a per-row (Y=0..511) CSV of pixel-level diff
+        /// stats. Columns: y, runtime_nz, engine_nz, overlap, runtime_only,
+        /// engine_only. Useful for automated regression checks - drift
+        /// in any single row above a threshold (e.g. row 479's NPC CLUT)
+        /// surfaces as a high `runtime_only` count.
+        #[arg(long)]
+        rows_csv: Option<PathBuf>,
+        /// Print a focused report on documented CLUT bands (NPC palette
+        /// row 479, character / texture-page CLUT rows). One line per
+        /// band with overlap percentage; non-zero "runtime_only" on a
+        /// known band is the regression signature this catches.
+        #[arg(long, default_value_t = false)]
+        clut_regions: bool,
+    },
+    /// Mode-trace parity oracle (development diagnostic; Phase E3).
+    /// Boots a `NativeSession` on the
+    /// resolved scene, ticks it `--frames` times sampling
+    /// `(scene_mode, active_scene)` per frame, emits the engine trace
+    /// as JSONL, and (in scenario mode) compares the engine's settled
+    /// state to a snapshot lifted from the matching mednafen
+    /// `.mc{slot}` save.
+    ///
+    /// **Two modes:**
+    ///   - **Explicit**: `--scene <NAME>` runs the engine alone and
+    ///     emits its JSONL trace. No comparison.
+    ///   - **Scenario**: `--scenario <LABEL>` resolves both the scene
+    ///     (from `expected_active_scene` in `scripts/scenarios.toml`)
+    ///     and the retail snapshot (from the `.mc{slot}` save). With
+    ///     `--strict`, exits non-zero if no engine frame matches the
+    ///     retail snapshot's `(scene_mode, active_scene)`.
+    ///
+    /// **Asymmetry.** The engine port doesn't model the 28-mode
+    /// dispatcher yet, so engine-emitted frames have `game_mode = null`
+    /// in the JSONL. Retail snapshots fill it from `_DAT_8007B83C`.
+    /// See `crates/parity/src/mode_trace_oracle.rs` for the
+    /// long-form rationale.
+    #[command(display_order = 24)]
+    ModeTrace {
+        /// CDNAME scene name (e.g. `town01`). Required in explicit
+        /// mode; derived from the scenario's `expected_active_scene`
+        /// in scenario mode.
+        #[arg(long)]
+        scene: Option<String>,
+        /// Extracted-root directory containing `PROT.DAT` +
+        /// `CDNAME.TXT`.
+        #[arg(long, default_value = "extracted")]
+        extracted_root: PathBuf,
+        /// Alternative source: read PROT.DAT + CDNAME.TXT directly
+        /// from a `.bin` disc image.
+        #[arg(long)]
+        disc: Option<PathBuf>,
+        /// Scenario label looked up in the manifest. Resolves scene +
+        /// `.mc` save automatically. The scenario must have
+        /// `expected_active_scene` populated.
+        #[arg(long)]
+        scenario: Option<String>,
+        /// Scenario manifest path.
+        #[arg(long, default_value = "scripts/scenarios.toml")]
+        manifest: PathBuf,
+        /// Engine frames to tick before sampling. Engine trace has
+        /// `frames + 1` entries (one for boot state, one per tick).
+        #[arg(long, default_value_t = 60)]
+        frames: u64,
+        /// Where to write the engine JSONL trace. Default `-` =
+        /// stdout.
+        #[arg(long, default_value = "-")]
+        out: PathBuf,
+        /// Strict mode: assert at least one engine frame matches the
+        /// retail snapshot's `(scene_mode, active_scene)`. Exits
+        /// non-zero with the last engine frame on divergence. Only
+        /// valid in scenario mode.
+        #[arg(long, default_value_t = false)]
+        strict: bool,
+    },
+    /// Recomp-differential sim trace. Boots a `NativeSession` on the scene,
+    /// ticks it `--frames` times, and emits the canonical frame-tagged
+    /// state-trace JSONL (camera pose, player, per-actor positions +
+    /// headings) in RETAIL units (PSX 12-bit angles, retail world units).
+    /// The recomp side of the pair is captured by
+    /// `scripts/recomp/trace_capture.py`; align + compare the two with
+    /// `scripts/recomp/trace_diff.py`. See
+    /// `docs/tooling/recomp-differential.md`.
+    #[command(display_order = 39)]
+    SimTrace {
+        /// CDNAME scene name (e.g. `town01`).
+        #[arg(long)]
+        scene: String,
+        /// Extracted-root directory containing `PROT.DAT` + `CDNAME.TXT`.
+        #[arg(long, default_value = "extracted")]
+        extracted_root: PathBuf,
+        /// Alternative source: read PROT.DAT + CDNAME.TXT directly from
+        /// a `.bin` disc image.
+        #[arg(long)]
+        disc: Option<PathBuf>,
+        /// Sim frames to tick. The trace has `frames + 1` records (one for
+        /// boot state, one per tick).
+        #[arg(long, default_value_t = 100)]
+        frames: u64,
+        /// Skip `enter_field_live`: sample the plain `load_scene` boot
+        /// state instead of dropping into a live field scene (field VM +
+        /// locomotion + camera events armed) first.
+        #[arg(long, default_value_t = false)]
+        no_field_live: bool,
+        /// Where to write the engine JSONL trace. Default `-` = stdout.
+        #[arg(long, default_value = "-")]
+        out: PathBuf,
+    },
+    /// Audio-trace parity oracle. Boots a `NativeSession` on the
+    /// resolved scene, runs a private headless SPU + sequencer in
+    /// parallel, ticks for `--frames` frames sampling
+    /// `(voice_mask, voices[24], master_volume)` per frame, emits the
+    /// engine trace as JSONL, and (in scenario mode) compares against
+    /// the SPU section lifted from the matching mednafen `.mc{slot}`
+    /// save.
+    ///
+    /// **Two modes:**
+    ///   - **Explicit**: `--scene <NAME>` runs the engine alone and
+    ///     emits its JSONL trace. No comparison.
+    ///   - **Scenario**: `--scenario <LABEL>` resolves both the scene
+    ///     (from `expected_active_scene`) and the retail snapshot
+    ///     (from the `.mc{slot}` save's SPU section). With `--strict`,
+    ///     exits non-zero on divergence.
+    ///
+    /// **Asymmetry.** A retail snapshot from a `.mc{slot}` save freezes
+    /// one SPU cycle; the engine trace runs over a window. The
+    /// `--retail-jsonl` mode consumes a multi-frame retail trace
+    /// captured by `scripts/pcsx-redux/autorun_audio_trace.lua` +
+    /// `scripts/pcsx-redux/extract_audio_trace_from_sstates.py`,
+    /// flipping the comparison to multi-frame-vs-multi-frame.
+    /// Convergence rule (per retail frame with active voices): some
+    /// engine frame's mask must be a superset of retail's mask.
+    ///
+    /// **BGM playback.** The trace installs a private
+    /// [`TraceBgmDirector`] and routes field-VM op `0x35` events into
+    /// a headless sequencer, so the engine drives BGM the same way the
+    /// retail engine does. `--bgm-id` is a manual boot-time override
+    /// for scenes whose prescripts don't kick off audio.
+    #[command(display_order = 25)]
+    AudioTrace {
+        /// CDNAME scene name (e.g. `town01`). Required in explicit
+        /// mode; derived from the scenario's `expected_active_scene`
+        /// in scenario mode.
+        #[arg(long)]
+        scene: Option<String>,
+        /// Extracted-root directory containing `PROT.DAT` +
+        /// `CDNAME.TXT`.
+        #[arg(long, default_value = "extracted")]
+        extracted_root: PathBuf,
+        /// Alternative source: read PROT.DAT + CDNAME.TXT directly
+        /// from a `.bin` disc image.
+        #[arg(long)]
+        disc: Option<PathBuf>,
+        /// Scenario label looked up in the manifest. Resolves scene +
+        /// `.mc` save automatically.
+        #[arg(long)]
+        scenario: Option<String>,
+        /// Scenario manifest path.
+        #[arg(long, default_value = "scripts/scenarios.toml")]
+        manifest: PathBuf,
+        /// Engine frames to tick before sampling. Engine trace has
+        /// `frames + 1` entries (one for boot state, one per tick).
+        #[arg(long, default_value_t = 60)]
+        frames: u64,
+        /// Optional: BGM id started through the private sequencer
+        /// before the trace loop begins. Use when a scene's prescript
+        /// doesn't fire op `0x35` within the trace window.
+        #[arg(long)]
+        bgm_id: Option<u16>,
+        /// Where to write the engine JSONL trace. Default `-` = stdout.
+        #[arg(long, default_value = "-")]
+        out: PathBuf,
+        /// Multi-frame retail trace (JSONL) produced by
+        /// `scripts/pcsx-redux/extract_audio_trace_from_sstates.py`.
+        /// Overrides the scenario's `.mc{slot}` single-snapshot path
+        /// for the convergence walk; `--scene` alone is enough in this
+        /// mode (no `--scenario` lookup needed).
+        #[arg(long)]
+        retail_jsonl: Option<PathBuf>,
+        /// Strict mode: exit non-zero on divergence between the
+        /// engine trace and retail. Valid in scenario mode and in
+        /// `--retail-jsonl` mode.
+        #[arg(long, default_value_t = false)]
+        strict: bool,
+        /// Also print the per-voice allocation comparison: mean/max
+        /// sounding voices, distinct notes per frame, the slots-per-note
+        /// doubling factor, and how much of each side's pitch and tone
+        /// vocabulary the other one shares.
+        ///
+        /// Only meaningful when both sides are on the **same track**. An
+        /// engine trace plays whatever the scene's own prescript selects
+        /// with op `0x35`; a retail capture plays whatever the playthrough
+        /// left loaded (`0x8007BAC8`), and the two routinely differ.
+        #[arg(long, default_value_t = false)]
+        per_voice: bool,
+        /// Retail key-on census CSV from
+        /// `scripts/pcsx-redux/autorun_keyon_census.lua`: every `SpuSetKey`
+        /// KON mask the game wrote, per emulated vsync. Aligns it on key-on
+        /// timing against the engine's exact per-voice key-on counters and
+        /// prints both totals - the key-on comparison that reads no SPU
+        /// state, so neither side's envelope clock can bias it.
+        #[arg(long)]
+        retail_keyon_csv: Option<PathBuf>,
+        /// Keep `--bgm-id` playing for the whole trace: the scene's own
+        /// op-`0x35` BGM events are dropped instead of switching the track.
+        /// For a retail state whose story flags select a different track
+        /// than the port's free-roam staging, or whose music is a battle's.
+        #[arg(long, default_value_t = false)]
+        pin_bgm: bool,
+        /// Restrict `--retail-keyon-csv` to one sequence: the libsnd note
+        /// owner key in hex (`1` for the field BGM slot, `3` for a battle or
+        /// minigame track).
+        #[arg(long, value_parser = parse_hex_u16)]
+        retail_keyon_owner: Option<u16>,
+    },
+    /// PCM-window parity oracle - the I2 sibling of `audio-trace`.
+    ///
+    /// Emits stereo PCM windows from both sides at 44.1 kHz:
+    ///
+    ///   - **Engine**: boots a headless `NativeSession`, runs a private
+    ///     SPU + sequencer in parallel, routes field-VM op `0x35`
+    ///     events through a `TraceBgmDirector`, accumulates per-frame
+    ///     PCM over the trace window.
+    ///   - **Retail**: lifts the SPU section from a mednafen
+    ///     `.mc{slot}` save (or a path passed via `--retail-save`),
+    ///     seeds a from-scratch SPU through `engine_spu_from_retail`,
+    ///     and renders one second of PCM. Voice mid-stream state is
+    ///     not preserved by the translator (engine-audio's `Voice`
+    ///     doesn't expose those internals), so this is "what the SPU
+    ///     would play given retail's voice config" rather than a
+    ///     bit-identical resume-from-snapshot.
+    ///
+    /// Two output flavours: WAV files (`--engine-wav`, `--retail-wav`)
+    /// for human listening, plus stderr stats (peak / RMS /
+    /// non-silent-sample count) for both sides.
+    ///
+    /// `--strict` enforces only the conservative bar exercised by the
+    /// disc-gated `pcm_oracle` test: retail audible AND engine silent
+    /// → exit non-zero. Anything finer is informational.
+    #[command(display_order = 26)]
+    PcmTrace {
+        /// CDNAME scene name (e.g. `town01`). Required in explicit
+        /// mode; derived from the scenario's `expected_active_scene`
+        /// in scenario mode.
+        #[arg(long)]
+        scene: Option<String>,
+        /// Extracted-root directory containing `PROT.DAT` +
+        /// `CDNAME.TXT`.
+        #[arg(long, default_value = "extracted")]
+        extracted_root: PathBuf,
+        /// Alternative source: read PROT.DAT + CDNAME.TXT directly
+        /// from a `.bin` disc image.
+        #[arg(long)]
+        disc: Option<PathBuf>,
+        /// Scenario label looked up in the manifest. Resolves scene +
+        /// `.mc` save automatically.
+        #[arg(long)]
+        scenario: Option<String>,
+        /// Scenario manifest path.
+        #[arg(long, default_value = "scripts/scenarios.toml")]
+        manifest: PathBuf,
+        /// Engine frames to tick. PCM window length is `frames *
+        /// 44_100 / 60` stereo samples.
+        #[arg(long, default_value_t = 60)]
+        frames: u64,
+        /// Optional: BGM id started through the private sequencer
+        /// before the trace loop begins. Use when a scene's prescript
+        /// doesn't fire op `0x35` within the trace window.
+        #[arg(long)]
+        bgm_id: Option<u16>,
+        /// Explicit retail save path. Overrides the scenario's `.mc`
+        /// lookup; useful for ad-hoc captures.
+        #[arg(long)]
+        retail_save: Option<PathBuf>,
+        /// Where to write the engine PCM (WAV). Default: skipped.
+        #[arg(long)]
+        engine_wav: Option<PathBuf>,
+        /// Where to write the retail reference PCM (WAV). Default:
+        /// skipped.
+        #[arg(long)]
+        retail_wav: Option<PathBuf>,
+        /// Strict mode: exit non-zero when retail had audible output
+        /// and the engine produced silence over the trace window.
+        #[arg(long, default_value_t = false)]
+        strict: bool,
+    },
+    /// Play back an input session captured with `record`, headless and
+    /// deterministic. Runs the engine for the recorded number of frames,
+    /// samples per-frame `(scene_mode, active_scene)` into JSONL, and
+    /// (with `--strict`) compares against the file's optional
+    /// `[[expected]]` fixture.
+    ///
+    /// No disc required - the replay file (`j-replay-v1` TOML, see
+    /// `legaia_engine_shell::replay`) binds an RNG seed and a scenario
+    /// label, not a CDNAME scene. The same input file run twice produces
+    /// bit-identical traces.
+    #[command(display_order = 9)]
+    Replay {
+        /// Path to the `j-replay-v1` replay file.
+        #[arg(long)]
+        input: PathBuf,
+        /// Where to write the engine JSONL trace. Default `-` = stdout.
+        #[arg(long, default_value = "-")]
+        out: PathBuf,
+        /// Strict mode: exit non-zero on the first divergence between
+        /// the recorded engine trace and the replay's `[[expected]]`
+        /// fixture (if present).
+        #[arg(long, default_value_t = false)]
+        strict: bool,
+    },
+    /// Open a play-window session and capture your pad input into a
+    /// replay file for `replay`. Thin shim over `play-window`: every
+    /// flag carries the same meaning, plus `--out` for the replay file
+    /// path.
+    ///
+    /// The replay file is checkpointed to disk about once a second
+    /// during the session and finalized on window close (Esc), so an
+    /// interrupted session (Ctrl-C, kill) still yields a valid file
+    /// with the input captured up to the last checkpoint; only SIGKILL
+    /// can lose the final second.
+    #[command(display_order = 8)]
+    Record {
+        /// Where to write the captured replay (`j-replay-v1` TOML).
+        #[arg(long)]
+        out: PathBuf,
+        /// Starting scene name (CDNAME label). Default: `town01`.
+        #[arg(long, default_value = "town01")]
+        scene: String,
+        /// Extracted-root directory containing `PROT.DAT` + `CDNAME.TXT`.
+        #[arg(long, default_value = "extracted")]
+        extracted_root: PathBuf,
+        /// Alternative source: read PROT.DAT + CDNAME.TXT directly from
+        /// a `.bin` disc image. When provided, `--extracted-root` is
+        /// ignored.
+        #[arg(long)]
+        disc: Option<PathBuf>,
+        /// Disable audio output. Useful for CI / headless capture where
+        /// cpal can't enumerate a device.
+        #[arg(long, default_value_t = false)]
+        no_audio: bool,
+        /// Open the world map controller instead of a field scene.
+        #[arg(long, default_value_t = false)]
+        world_map: bool,
+        /// Save directory the record's save-select reads / writes
+        /// (default resolves against the current directory).
+        #[arg(long, default_value = "saves")]
+        save_dir: PathBuf,
+        /// Optional scenario label to bind into the recorded file's
+        /// `meta.scenario` field. Replays preserve this so paired
+        /// scenario state can be looked up from `scripts/scenarios.toml`.
+        #[arg(long)]
+        scenario: Option<String>,
+        /// Initial RNG seed to bake into the recorded file's
+        /// `meta.rng_seed` field. Default matches the engine's
+        /// canonical `0xDEADC0DE`.
+        #[arg(long, default_value_t = 0xDEAD_C0DE)]
+        rng_seed: u32,
+    },
+    /// List every distinct scene name the game's file map exposes, with
+    /// the PROT entry range each one covers. Scene names feed the
+    /// `--scene` flag of `play-window` / `info`; a scene's range start is
+    /// also where its files land in `extracted/PROT/` (extraction
+    /// filenames are numbered CDNAME define minus 2).
+    #[command(display_order = 3)]
+    ListScenes {
+        /// Extracted-root directory containing `CDNAME.TXT`.
+        #[arg(long, default_value = "extracted")]
+        extracted_root: PathBuf,
+        /// Alternative source: read CDNAME.TXT directly from a `.bin`
+        /// disc image. When provided, `--extracted-root` is ignored.
+        #[arg(long)]
+        disc: Option<PathBuf>,
+    },
+    /// Export a scene (or every scene) as textured `.glb` files plus a JSON
+    /// manifest for Unity / VRChat world building: the assembled static map
+    /// (ground + terrain + placed objects, frame-0 posed), one animated
+    /// `.glb` per catalogued NPC, and animated-prop `.glb`s (windmills,
+    /// doors) with their placement transforms. The output contains
+    /// Sony-derived asset data - keep it local, never commit or
+    /// redistribute it. Full pipeline + Unity guide:
+    /// docs/tooling/vrchat-world-export.md.
+    #[command(display_order = 7, name = "export-glb")]
+    ExportGlb {
+        /// CDNAME scene name (e.g. `town01`). Repeat for several scenes.
+        #[arg(long)]
+        scene: Vec<String>,
+        /// Export every CDNAME scene that assembles (failures are
+        /// reported and skipped).
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        all_scenes: bool,
+        /// Output directory. Files land as `<out>/<scene>/<scene>.glb`,
+        /// `<out>/<scene>/npcs/*.glb`, `<out>/<scene>/props/*.glb`, and
+        /// `<out>/<scene>/manifest.json`.
+        #[arg(long, default_value = "glb-export")]
+        out: PathBuf,
+        /// Uniform scale: glTF meters per PSX world unit. The default
+        /// (1/128) makes one 128-unit walk tile 1 m - in-headset testing
+        /// found the 1/64 "2 m tile" reads oversized against real player
+        /// scale (retail's field proportions are generous). Use 1.0 for
+        /// raw PSX units.
+        #[arg(long, default_value_t = 1.0 / 128.0)]
+        scale: f32,
+        /// Keep the sky-backdrop shells in the world glb (the site viewers
+        /// hide them; inside a VR world they can serve as horizon dressing).
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        include_sky: bool,
+        /// Skip the per-NPC animated glbs + manifest roster.
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        no_npcs: bool,
+        /// Skip the animated-prop glbs.
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        no_props: bool,
+        /// Also export every equipment item (all four characters' weapons,
+        /// Ra-Seru, armour, headgear, footwear) as animated `.glb`s under
+        /// `<out>/items/`: the item alone (grip repaired) plus the exact
+        /// palette cut with its host limb, each carrying the action bank +
+        /// weapon swings. Works on its own, without `--scene`.
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        items: bool,
+        /// Also export the party's FIELD forms - Vahn, Noa and Gala as they
+        /// walk the towns (PROT 0874: mesh, field textures, idle + walk +
+        /// the rest of each locomotion bank) - as animated `.glb`s under
+        /// `<out>/party/npcs/` with a `party/manifest.json` shaped like a
+        /// scene's, so a world builder places them like villagers. Works
+        /// on its own, without `--scene`.
+        #[arg(long, action = clap::ArgAction::SetTrue)]
+        party: bool,
+        /// Extracted-root directory containing `PROT.DAT` + `CDNAME.TXT`.
+        #[arg(long, default_value = "extracted")]
+        extracted_root: PathBuf,
+        /// Alternative source: read PROT.DAT + CDNAME.TXT directly from a
+        /// `.bin` disc image. When provided, `--extracted-root` is ignored.
+        #[arg(long)]
+        disc: Option<PathBuf>,
+    },
+    /// Save the current world's empty/default party to a slot file.
+    /// Useful as a smoke test for the disk save path; engines drive this
+    /// from menu mode at runtime.
+    #[command(display_order = 6)]
+    Save {
+        #[arg(long, default_value = "extracted")]
+        extracted_root: PathBuf,
+        /// Alternative source: read PROT.DAT + CDNAME.TXT directly from a
+        /// `.bin` disc image. When provided, `--extracted-root` is ignored.
+        #[arg(long)]
+        disc: Option<PathBuf>,
+        /// Save directory (default resolves against the current directory).
+        #[arg(long, default_value = "saves")]
+        save_dir: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        slot: u8,
+        /// Number of party-record entries to materialise in the save.
+        #[arg(long, default_value_t = 3)]
+        party_size: usize,
+    },
+    /// Load a slot file into a fresh world and print the resulting roster
+    /// shape. Mirror of `save` for round-trip testing.
+    ///
+    /// With `--card` the save comes out of a real PSX memory-card image
+    /// instead of the engine's save directory - a raw `.mcr` / `.mcd`, a
+    /// DexDrive `.gme` or a single-save `.mcs`, the same containers the
+    /// browser play page imports. `--save-dir` / `--slot` are then unused.
+    #[command(display_order = 7)]
+    Load {
+        /// Save directory (default resolves against the current directory).
+        #[arg(long, default_value = "saves")]
+        save_dir: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        slot: u8,
+        /// Memory-card image to read the save out of, instead of `--save-dir`.
+        /// The file is only read - nothing is written back.
+        #[arg(long)]
+        card: Option<PathBuf>,
+        /// Card block to load (`1..=15`; block 0 is the card directory).
+        /// Defaults to the lowest block the card files a save in.
+        #[arg(long, requires = "card")]
+        block: Option<u8>,
+    },
+    /// Boot the engine into a scene and tick it for `frames` frames.
+    /// Drives the field VM, camera, BGM director, and per-actor move VMs;
+    /// logs scene transitions and the per-frame BGM events. No window -
+    /// for a windowed, playable session use `play-window` instead.
+    ///
+    /// When `--str-file` is provided the STR video is pre-decoded headlessly
+    /// (frame count logged) before scene ticking begins. The scene label
+    /// patterns that identify in-engine cutscenes (as opposed to FMV) are
+    /// described by `engine_scene::scene::is_cutscene_label`.
+    #[command(display_order = 20)]
+    Play {
+        /// Starting scene name. Default: `town01`.
+        #[arg(long, default_value = "town01")]
+        scene: String,
+        /// Extracted-root directory.
+        #[arg(long, default_value = "extracted")]
+        extracted_root: PathBuf,
+        /// Alternative source: read PROT.DAT + CDNAME.TXT directly from a
+        /// `.bin` disc image. When provided, `--extracted-root` is ignored.
+        #[arg(long)]
+        disc: Option<PathBuf>,
+        /// Number of engine frames to run before exiting. `0` runs
+        /// indefinitely.
+        #[arg(long, default_value_t = 600)]
+        frames: u64,
+        /// Disable audio output. Useful for CI / headless smoke tests
+        /// where cpal can't enumerate a device.
+        #[arg(long, default_value_t = false)]
+        no_audio: bool,
+        /// Per-frame sleep in milliseconds. Default 16 ms ≈ 60 FPS for a
+        /// realtime feel; set to `0` for "as fast as possible" smoke runs.
+        #[arg(long, default_value_t = 16)]
+        frame_ms: u64,
+        /// Optional path to a raw PSX STR file. When provided, the video is
+        /// pre-decoded headlessly and the frame count is printed before scene
+        /// ticking begins. Use for `op*`/`ed*` scenes paired with FMV files.
+        #[arg(long)]
+        str_file: Option<PathBuf>,
+        /// Optional TOML mapping CDNAME labels to MV*.STR paths. When set,
+        /// the engine consults this map first and falls through to the
+        /// hard-coded heuristic for unmapped labels. Format:
+        ///
+        /// ```toml
+        /// [scenes]
+        /// opdeene = "MOV/MV1.STR"
+        /// edteien = "MOV/MV6.STR"
+        /// ```
+        #[arg(long)]
+        cutscene_map: Option<PathBuf>,
+    },
+    /// Open a window, boot a scene, and run the engine with rendering.
+    /// Accepts keyboard input (arrows = D-pad, Z = Cross, Esc = quit).
+    ///
+    /// Camera + movement keys: left-mouse drag orbits the field camera
+    /// around the player (horizontal) and tilts it (vertical), the wheel
+    /// zooms it, and a double-click resets all three to retail framing -
+    /// the same knobs, at the same rates, the browser play page's camera
+    /// takes; under `F3` they steer the debug vantage instead. All three
+    /// are locked while a cutscene owns the camera. The movement
+    /// compass follows the orbited view, so "up" always walks away from the
+    /// camera. `T` cycles the camera
+    /// distance preset (retail / far / farther - default `far`, persisted
+    /// in `legaia-options.toml`); `R` toggles precise free-angle movement
+    /// (non-retail; true key diagonals + continuous analog angles,
+    /// persisted); `F3` toggles the wide debug orbit vantage; `I` toggles
+    /// dynamic lighting; `F4` toggles the camera-occlusion fade; `F2` mutes
+    /// audio; `F6` fills the party's AP gauge and `F7` toggles random
+    /// encounters (cheats). Each toggle shows its new state at the bottom
+    /// left for a moment ("Ground fog: off"); `F12` (or `?`) opens a panel
+    /// listing every toggle key and its state. The shell's own toggles sit on function keys because every
+    /// letter is bindable to a pad button - a toggle on a bound letter
+    /// consumes the event and deletes that button from the keyboard.
+    ///
+    /// When `--str-file` is provided the STR video plays first in a windowed
+    /// player (same as `play-str`). After the video window closes the scene
+    /// window opens and runs normally.
+    ///
+    /// Config + saves resolve against the current directory: key bindings
+    /// come from `legaia-input.toml` (edit via `config set`), options from
+    /// `legaia-options.toml`, and the default `--save-dir` is `saves/`.
+    /// Run from the same directory each time, or pass explicit paths where
+    /// supported.
+    #[command(display_order = 1)]
+    PlayWindow {
+        /// Starting scene name. Default: `town01`.
+        #[arg(long, default_value = "town01")]
+        scene: String,
+        /// Extracted-root directory.
+        #[arg(long, default_value = "extracted")]
+        extracted_root: PathBuf,
+        /// Alternative source: read PROT.DAT + CDNAME.TXT directly from a
+        /// `.bin` disc image. When provided, `--extracted-root` is ignored.
+        #[arg(long)]
+        disc: Option<PathBuf>,
+        /// Disable audio output.
+        #[arg(long, default_value_t = false)]
+        no_audio: bool,
+        /// Force world-map mode: installs a WorldMapController and shows
+        /// the top-view camera globals in the HUD. An overworld `--scene`
+        /// (`map01`..`map03`) enters world-map mode without it, as the
+        /// browser play page does; the flag forces it for any other label.
+        /// Arrow keys scroll the top-view camera; Q/W adjust azimuth; A/S
+        /// adjust zoom.
+        #[arg(long, default_value_t = false)]
+        world_map: bool,
+        /// Optional path to a raw PSX STR file. When provided, the STR video
+        /// plays in a window first (phase 1); the scene window opens after
+        /// the video window closes (phase 2).
+        #[arg(long)]
+        str_file: Option<PathBuf>,
+        /// Open the boot UI flow before entering the scene: title screen
+        /// → save-select on Continue → field/encounter/battle on
+        /// New Game. The default (`false`) behaviour is the legacy
+        /// "jump straight to the scene" path.
+        #[arg(long, default_value_t = false)]
+        boot_ui: bool,
+        /// Save directory used by `--boot-ui` for the save-select pass
+        /// (default resolves against the current directory).
+        #[arg(long, default_value = "saves")]
+        save_dir: PathBuf,
+        /// Optional PSX memory-card image (`.mcr` / `.mcd` / `.gme` /
+        /// `.mcs`) mounted in the save screen's **second** card port, the
+        /// one the save directory does not occupy. Its fifteen blocks fill
+        /// that port's preview grid and a Load reads the block's save; a
+        /// Save writes the block and writes the image file back in place.
+        #[arg(long)]
+        card: Option<PathBuf>,
+        /// Optional TOML CDNAME→STR map; same format as `play --cutscene-map`.
+        #[arg(long)]
+        cutscene_map: Option<PathBuf>,
+        /// Optional GameShark `.gs.txt` or Mednafen `.cht` cheat file.
+        /// Each entry is parsed and applied once at boot through the
+        /// `legaia_engine_cheats::cheat_applier` registry. Per-entry
+        /// status is logged to stderr. Conditional codes (`D0`/`E0`)
+        /// are treated as always-true unless `--cheat-strict` is set.
+        #[arg(long)]
+        cheat_file: Option<PathBuf>,
+        /// When `--cheat-file` is set, honour conditional codes
+        /// strictly: skip every write that follows a `D0`/`E0` gate
+        /// the engine doesn't emulate. Default is to apply
+        /// conditionals as always-true (which is what the player
+        /// expects for "Save Anywhere" / "Status Modifier Menu" /
+        /// etc. style cheats).
+        #[arg(long, default_value_t = false)]
+        cheat_strict: bool,
+        /// Turn OFF the live gameplay loop: the scene then runs the field
+        /// VM + locomotion only and never rolls a random encounter (the
+        /// old "explore but never fight" mode, useful for scene / asset
+        /// inspection). The loop is on by default - walking a field scene
+        /// rolls step-driven encounters, transitions Field -> Battle,
+        /// resolves the battle, and returns to the field with loot on
+        /// victory. NB a battle the engine is *in* is always driven to
+        /// resolution; this flag only gates the encounter roll.
+        #[arg(long, default_value_t = false)]
+        no_live_loop: bool,
+        /// Turn OFF player-driven battles: each party turn then
+        /// auto-attacks the first living monster instead of running the
+        /// retail open flow - the round's `Begin | Run` prompt, then the
+        /// Item / Attack / magic / Spirit ring, then `Auto | Command` under
+        /// Attack (a direction press commits the chip on that side of the
+        /// screen, retail's own one-press dispatch; Circle backs out).
+        /// Player-driven is the default, matching the browser play page.
+        #[arg(long, default_value_t = false)]
+        no_player_battle: bool,
+        /// Present-party composition: comma-separated character names
+        /// (vahn/noa/gala/terra) or 0-based roster indices, in battle
+        /// order - e.g. `--party noa,terra`. Battle ordinal i renders in
+        /// VRAM texture band i with member i's own player-file mesh /
+        /// palette / spells (the live-verified retail banding rule).
+        /// Caps at the 3 on-screen positions. Default: the save's
+        /// composition (identity Vahn/Noa/Gala when none is recorded).
+        #[arg(long)]
+        party: Option<String>,
+        /// Fall back to the simplified typewriter for field NPC dialogue. By
+        /// default dialogue runs through the inline-script field-VM runner so
+        /// branch handlers execute their flag-sets / scene-changes (Up/Down
+        /// navigate a menu, Cross confirms); pass this to disable that and use
+        /// the plain panel with no branch execution.
+        #[arg(long, default_value_t = false)]
+        simple_dialogue: bool,
+        /// Disable terrain-following: keep the player's Y flat instead of
+        /// snapping each field locomotion step to the floor-height sample
+        /// (`FUN_80019278`) at the new tile. Floor-snap is the retail
+        /// behaviour and the default; pass this to get the old flat-Y walk.
+        /// No effect on the world-map walk.
+        #[arg(long, default_value_t = false)]
+        flat_y: bool,
+        /// Disable retail's three-probe leading-edge wall footprint
+        /// (`FUN_801cfe4c`'s `DAT_801f2214` table) and block field walking on
+        /// the single candidate-centre test instead. The footprint is the
+        /// retail behaviour and the default on both hosts - the player rests
+        /// ~47 units off a wall plane; pass this to walk up to the plane (the
+        /// off-flag test the locomotion oracles and BFS nav drivers use).
+        #[arg(long, default_value_t = false)]
+        no_edge_collision: bool,
+        /// Make field NPCs walk-through. By default NPCs are solid with
+        /// retail's actor-collision probes (`FUN_801cfc40`'s `DAT_801f21b4`
+        /// table): walking into an NPC's body box blocks the step. Placed
+        /// PROPS (doors, cupboards) are solid unconditionally - retail keeps
+        /// them in the collision candidate list until their script's `31 00`
+        /// exempts them - so this flag only gates the NPC arm.
+        #[arg(long, default_value_t = false)]
+        no_solid_npcs: bool,
+        /// Hold field NPCs on their seats. By default each villager's
+        /// ambient MAN tail-section-1 stream publishes its wander like
+        /// retail, and a moving NPC's collision box follows its live
+        /// position. Scripted walks run either way.
+        #[arg(long, default_value_t = false)]
+        no_live_npcs: bool,
+        /// Skip the retail damage finisher (`FUN_801ddb30`) on live
+        /// basic-attack damage. Retail always runs it - the party defender's
+        /// equipment elemental-resistance ladder, the `rand()%9+8` floor on
+        /// a hit mitigation zeroed, the 9999 cap - so the finisher is the
+        /// default; this flag keeps the flat pre-finisher path (min-floor 1,
+        /// no resistance ladder) for A/B comparison.
+        #[arg(long, default_value_t = false)]
+        no_damage_finish: bool,
+        /// BGM id to cross-fade to when a live-loop encounter starts; the
+        /// field track resumes when the battle ends. Routed through the same
+        /// BGM director as field op-`0x35` starts: scene-local ids resolve
+        /// through the current scene's asset table, ids `>= 2000` through
+        /// the global `music_01` pool. Omit for the shipped default (retail's
+        /// standard battle theme, 2026); pass `0` to leave the field track
+        /// playing through the fight.
+        #[arg(long)]
+        battle_bgm: Option<u16>,
+        /// Headless-ish screenshot: render offscreen and write a PNG of the
+        /// framebuffer at `--screenshot-tick`, then exit. Deterministic - no
+        /// `scrot` screen-scrape. Combine with `--pad-script` to auto-open a
+        /// menu first. The window still opens (a real wgpu surface is needed)
+        /// but the captured pixels come from an offscreen readback.
+        #[arg(long)]
+        screenshot: Option<PathBuf>,
+        /// World-tick at which `--screenshot` captures (default 120). Ticks
+        /// advance at the fixed 100 Hz sim rate, so the same script + tick
+        /// reproduces the same frame run-to-run.
+        #[arg(long, default_value_t = 120)]
+        screenshot_tick: u64,
+        /// Keep the window's own timed chrome - the start-up key hint and a
+        /// toggle's notice line - in `--screenshot` / `--screenshot-every`
+        /// captures (for documentation shots). Off by default: a parity
+        /// capture shows only what the game draws.
+        #[arg(long)]
+        screenshot_chrome: bool,
+        /// Periodic screenshot sweep: capture a PNG every N ticks into
+        /// `--screenshot-dir` (named `tick_%05d.png`). Composable with
+        /// `--pad-script`; the run exits after the capture at
+        /// `--screenshot-last-tick` (or when the window closes). Independent
+        /// of the single-shot `--screenshot`.
+        #[arg(long)]
+        screenshot_every: Option<u64>,
+        /// Output directory for `--screenshot-every` captures (required with
+        /// it; created if missing).
+        #[arg(long)]
+        screenshot_dir: Option<PathBuf>,
+        /// Last world-tick of a `--screenshot-every` sweep: exit after the
+        /// capture at/past this tick. Omit to run until the window closes.
+        #[arg(long)]
+        screenshot_last_tick: Option<u64>,
+        /// Scripted pad input for a screenshot run: `TICK:BUTTON` pairs,
+        /// comma-separated, e.g. `--pad-script "30:Start,50:Down,50:Down,70:Cross"`.
+        /// Each entry presses BUTTON for exactly the named tick (a one-tick
+        /// edge); a `FIRST-LAST:BUTTON` entry HOLDS the button across the
+        /// inclusive tick range (e.g. `10-200:Up` walks the player). BUTTON
+        /// names match the pad buttons (Start/Cross/Circle/Up/Down/Left/
+        /// Right/...). Replaces `xdotool` for menu navigation.
+        #[arg(long)]
+        pad_script: Option<String>,
+        /// Scripted **keyboard** input: `TICK:KEY` pairs, comma-separated,
+        /// e.g. `--key-script "40:L,120:P,140:Down,160:Enter"`. Each entry
+        /// presses KEY and releases it on that same world tick, in the order
+        /// listed. KEY is a physical key name (letters `A`-`Z`, `Up`/`Down`/
+        /// `Left`/`Right`, `Enter`, `Space`, digits, `F1`-`F10`, `F12`, `/`).
+        ///
+        /// This reaches what `--pad-script` cannot: `--pad-script` writes the
+        /// pad word and the keyboard handler never runs, but every minigame
+        /// entry (`K` dance, `U` dance how-to, `L` fishing, `O` casino slots,
+        /// `M` Muscle Dome, `B` Baka Fighter), the fishing prize exchange
+        /// (`P`) and the inline-dialogue option picker live in that handler.
+        /// Use `--pad-script` for pad buttons and this for everything else -
+        /// a key that also binds to a pad button leaves no bit held here.
+        #[arg(long)]
+        key_script: Option<String>,
+        /// Seed the New Game starting party (Vahn from the SCUS template) at
+        /// boot so the pause menu's Status / party screens show real content -
+        /// name / LV / HP·MP / stat grid / XP - instead of an empty roster.
+        /// This resets story flags / money / inventory to a fresh New Game.
+        /// Matches the retail early-game single-Vahn party.
+        #[arg(long, default_value_t = false)]
+        seed_party: bool,
+        /// Enter a battle deterministically instead of waiting for a step
+        /// roll: `--battle <ROW>` names one of the scene's MAN encounter
+        /// formation rows (the id space the region roll itself produces), and
+        /// `--battle first` takes the scene's lowest row that carries
+        /// monsters. `--battle cell:[s:]ID,...` (hex monster ids, `s:` =
+        /// scripted) registers a formation no row carries, as a boss or duel
+        /// installed from another table. The fight is armed at boot and opens
+        /// through the ordinary transition, so what it shows is what an
+        /// organic encounter shows.
+        /// Forces the live loop on. Omit for normal play - the flag changes
+        /// nothing when absent. Pairs with `--screenshot-tick` (allow ~40
+        /// ticks for the intro transition).
+        #[arg(long, value_name = "ROW|first|cell:IDS")]
+        battle: Option<String>,
+        /// Force the enhanced-lighting ENHANCEMENT (non-retail) on for this
+        /// session: the scene mood's ambient + key light over the baked
+        /// per-prim shading, the derived lamp / window point lights,
+        /// emissive surfaces and their glow. It is on by default anyway
+        /// (the persisted `enhanced_lighting` option); this overrides an
+        /// option saved off. Toggle at runtime with the `I` key, cycle the
+        /// time of day with `F8`.
+        #[arg(long, default_value_t = false, conflicts_with = "no_dynamic_lighting")]
+        dynamic_lighting: bool,
+        /// Force the enhanced lighting off for this session: the faithful
+        /// baked-shading render, pixel-identical to retail's field shading
+        /// (retail has no field light source). Parity captures
+        /// (`retail-compare`) pass this.
+        #[arg(long, default_value_t = false)]
+        no_dynamic_lighting: bool,
+        /// Disable the shadows of `--dynamic-lighting`'s per-scene point
+        /// lights (candle / wall-light sources derived from the scene's
+        /// emissive prims, each with a PCF-filtered shadow map). The lamps
+        /// keep lighting the scene, unshadowed. On
+        /// by default whenever `--dynamic-lighting` is on; irrelevant (and
+        /// costless) without it. Toggle at runtime with the `Y` key.
+        #[arg(long, default_value_t = false)]
+        no_dyn_shadows: bool,
+        /// Disable the scene-entry VDF pulse enhancement (the rolling
+        /// vertex-morph envelope over packs retail never arms at entry -
+        /// jou's flesh ground). Retail draws those scenes static outside
+        /// their cutscene set pieces; this flag restores that. Scenes whose
+        /// morphs retail itself arms (rikuroa) are unaffected either way.
+        #[arg(long, default_value_t = false)]
+        no_entry_pulse: bool,
+        /// Smarter monsters: a monster's single-target attack picks the
+        /// lowest-HP living party member instead of retail's uniform random
+        /// pick (the random stream is unchanged). Not retail; `--retail`
+        /// holds it off. The `LEGAIA_SMART_MONSTERS` environment switch
+        /// raises the same toggle; the play page's twin is its "Smart
+        /// monsters" box, and the launcher stores it as its Smarter monsters
+        /// row.
+        #[arg(long, default_value_t = false)]
+        smart_monsters: bool,
+        /// No Shiny Seru: battle entry never rolls the rare shiny capturable
+        /// enemy (+35% stats, its Seru +35% damage) - the engine twin of the
+        /// patcher's `--shiny-seru`, on by default. Retail has no such roll;
+        /// `--retail` holds it off. The launcher's Shiny Seru row; the play
+        /// page's "Shiny Seru" box.
+        #[arg(long, default_value_t = false)]
+        no_shiny_seru: bool,
+        /// Run-away EXP: a successful escape banks 5% of the fled fight's EXP
+        /// into every party member - the engine twin of the patcher's
+        /// `--flee-exp`. Not retail; `--retail` holds it off. The launcher's
+        /// Run-away EXP row; the play page's "Run-away EXP" box.
+        #[arg(long, default_value_t = false)]
+        flee_exp: bool,
+        /// EXP multiplier for every monster's reward (`1` = retail, `0.1` to
+        /// `5`; e.g. `2`, `1.5x`) - the engine twin of the patcher's
+        /// `--exp-scale`. `--retail` holds it at `1`. The launcher's EXP rate
+        /// row; the play page's "EXP rate" selector.
+        #[arg(long, value_name = "MULT", value_parser = parse_exp_rate)]
+        exp_rate: Option<u16>,
+        /// No Fortress encounter fix: Jette's Absolute Fortress obeys the
+        /// Floating Castle's stale "no battles" flag as retail does - the
+        /// engine twin of the patcher's `--fortress-encounter-fix`, on by
+        /// default (a healthy save plays the same either way). `--retail`
+        /// holds it off.
+        #[arg(long, default_value_t = false)]
+        no_fortress_encounter_fix: bool,
+        /// Jewel fix: the boss cinematic casts (Xain, Cort, the Delilas trio)
+        /// respect elemental jewels, guards and All Guard - the engine twin
+        /// of the patcher's `--jewel-fix`. Not retail; `--retail` holds it
+        /// off.
+        #[arg(long, default_value_t = false)]
+        jewel_fix: bool,
+        /// No battle HP-readout guard: a party HP readout left off live HP
+        /// with nothing pending parks the battle, as retail's can (the
+        /// state-`0x51` softlock). The guard re-seeds it and is on by
+        /// default; `--retail` holds it off.
+        #[arg(long, default_value_t = false)]
+        no_hp_readout_guard: bool,
+        /// Spirit AP: how much AP the Spirit command charges (retail 32;
+        /// `0` = defence only, `100` = one press fills the gauge, negative =
+        /// Spirit drains it) - the engine twin of the patcher's `--spirit-ap`.
+        /// `--retail` holds it at 32.
+        #[arg(long, value_name = "AP", allow_negative_numbers = true,
+              value_parser = clap::value_parser!(i16).range(-100..=100))]
+        spirit_ap: Option<i16>,
+        /// Enemy-damage AP: AP a party member gains per 100% of max HP an
+        /// enemy hit takes (retail 100; negative = being hit drains it) - the
+        /// engine twin of `--damage-ap`. `--retail` holds it at 100.
+        #[arg(long, value_name = "AP", allow_negative_numbers = true,
+              value_parser = clap::value_parser!(i16).range(-200..=200))]
+        damage_ap: Option<i16>,
+        /// Seru catch rate: one flat percent for every capturable Seru
+        /// (retail is each Seru's own chance) - the engine twin of
+        /// `--seru-catch-rate`. `--retail` holds the records' chances.
+        #[arg(long, value_name = "PCT", value_parser = clap::value_parser!(u8).range(0..=100))]
+        seru_catch_rate: Option<u8>,
+        /// Enemy attack count multiplier (`0.1` to `5`): divides each enemy
+        /// attack's AGL price, so the same gauge buys more (or fewer) strikes,
+        /// never fewer than one - the engine twin of `--enemy-attack-count`.
+        #[arg(long, value_name = "MULT", value_parser = parse_exp_rate)]
+        enemy_attack_count: Option<u16>,
+        /// Enemy stat multiplier (`0.1` to `5`) for every monster's HP / MP /
+        /// ATK / UDF / LDF / INT / SPD - the engine twin of a uniform
+        /// `--enemy-stat-scale`. EXP, gold and drops stay as they are.
+        #[arg(long, value_name = "MULT", value_parser = parse_exp_rate)]
+        enemy_stat_scale: Option<u16>,
+        /// Bonus equipment drop: a 5% roll after each won battle for one
+        /// extra random piece of equipment - the engine twin of the patcher's
+        /// `--equipment-drops`. Not retail; `--retail` holds it off.
+        #[arg(long, default_value_t = false)]
+        equipment_drops: bool,
+        /// DEBUG affordance, not a player surface: teach the lead party
+        /// member a spell id (at level 1) before the first world tick, so a
+        /// capture run can open the battle Magic arm without playing to the
+        /// Seru that grants it. Repeatable; decimal or `0x` hex. Retail's
+        /// player Seru-magic block is `0x81..=0x8B`
+        /// (`docs/formats/spell-table.md`). Pair with `--seed-party`: with no
+        /// roster there is no record to write, and the flag warns and does
+        /// nothing. The older `LEGAIA_LEARN_SPELLS=0x81,0x9e` env var still
+        /// works and is applied after these.
+        #[arg(long, value_name = "ID")]
+        learn_spell: Vec<String>,
+        /// DEBUG affordance, not a player surface: raise a system/story flag
+        /// (retail's `DAT_80085758` bank, the one op `0x07` writes and
+        /// `FUN_8003CE64` reads) before the scene is entered, and again after
+        /// `--seed-party` resets the bank. Repeatable; decimal or `0x` hex.
+        /// This is how a capture run reaches state a save would otherwise
+        /// have to carry - e.g. `--set-flag 0x538` unlocks the Muscle Dome's
+        /// Master course, which seeds the arena's special-battle word to
+        /// `0x321` and crosses the Ra-Seru chip out of the command ring.
+        #[arg(long, value_name = "N")]
+        set_flag: Vec<String>,
+        /// Start from an LGSF save file (the `save` / save-screen shape,
+        /// resume trailer included) instead of a door entry into `--scene`:
+        /// the save lands the way a card Load does
+        /// (`NativeSession::resume_save` - the save's own scene entered with the
+        /// save's position as the entry operand and no free-roam picker
+        /// staging, then the world hydrated from the save). `--scene` is the
+        /// fallback when the file carries no resume scene. The retail comparison corpus's
+        /// image channel enters every field state this way, so the window's
+        /// frame is taken from the same seeding the headless channels use.
+        #[arg(long, value_name = "PATH")]
+        resume_save: Option<PathBuf>,
+        /// Cheat: set every present party member to this level (1..=99)
+        /// once the scene is entered, through the level-up tracker so the
+        /// gains are the retail per-character stat growth
+        /// (`legaia_engine_cheats::cheats`, the same mutation the browser play
+        /// page's Cheats panel makes). Raising grants the XP; lowering
+        /// rebuilds each character from the executable's New Game template
+        /// plus the growth for the levels it keeps.
+        #[arg(long, value_name = "LEVEL")]
+        cheat_level: Option<u8>,
+        /// Cheat: set the gold purse (clamped to 9,999,999).
+        #[arg(long, value_name = "GOLD")]
+        cheat_gold: Option<u32>,
+        /// Cheat: set the casino coin bank (clamped to 9,999,999).
+        #[arg(long, value_name = "COINS")]
+        cheat_coins: Option<u32>,
+        /// Cheat: add an item to the bag, `ITEM[:QTY]` (QTY defaults to 1,
+        /// stacks cap at 99). ITEM is a decimal / `0x` id or an item name
+        /// (`healing-leaf:5`, `0x77:5`). Repeatable.
+        #[arg(long, value_name = "ITEM[:QTY]")]
+        cheat_item: Vec<String>,
+        /// Cheat: fill every party member's AP (Spirit) gauge to 100 at scene
+        /// entry. At runtime, `F6` does the same (mid-battle too).
+        #[arg(long)]
+        cheat_max_ap: bool,
+        /// Cheat: refill every party member's HP / MP and revive the fallen
+        /// at scene entry (the play page's Cheats -> Restore HP/MP).
+        #[arg(long)]
+        cheat_restore: bool,
+        /// Cheat: teach every party member all its Seru magic (the 21 Seru
+        /// and its own Ra-Seru; Vahn also the Sim-Seru and Evil Seru
+        /// summons) with every spell at this level (1..=9).
+        #[arg(long, value_name = "LEVEL")]
+        cheat_seru: Option<u8>,
+        /// Cheat: teach every party member every art in its list.
+        #[arg(long)]
+        cheat_arts: bool,
+        /// Cheat: raise every held item and every usable consumable to 99
+        /// (key items and equipment are left alone).
+        #[arg(long)]
+        cheat_max_items: bool,
+        /// Cheat: walk through walls - the field and overworld walk ignores
+        /// walls, bodies and props (doors still trigger when walked into).
+        #[arg(long)]
+        cheat_noclip: bool,
+        /// Disable the camera-occlusion fade ENHANCEMENT (see-through
+        /// walls). By default, field scene geometry between the camera and
+        /// the player dissolves to a screen-door dither in a circle around
+        /// the character, so the character stays visible behind walls /
+        /// roofs / props (retail relies on authored camera framing instead
+        /// and can bury the player). Pure presentation - the simulation and
+        /// the faithful-mode oracles are untouched. Toggle at runtime with
+        /// the `F4` key.
+        #[arg(long, default_value_t = false)]
+        no_occlusion_fade: bool,
+        /// Disable the volumetric ground-fog ENHANCEMENT for this session,
+        /// whatever the options file says. Off by default; with it on,
+        /// scenes that read as misty or night (Rim Elm under the Mist, Drake
+        /// Castle, the Voz forests, the Ravine, and any field scene whose
+        /// retail fog pool is live) carry a low drifting mist bank that the
+        /// characters part as they walk through it, and a battle inherits
+        /// its field scene's bank. Pure presentation - the bank reads the
+        /// actors and never writes back. Toggle (and persist) at runtime
+        /// with the `F9` key.
+        #[arg(long, default_value_t = false)]
+        no_volumetric_fog: bool,
+        /// Start in PSX-faithful rasterisation: sub-pixel vertex jitter and
+        /// 15-bit ordered dithering on the 3D mesh pipelines (the play page's
+        /// "PSX rasterisation" box; the `LEGAIA_PSX_RENDER=1` environment switch does
+        /// the same). Off by default - clean modern output.
+        #[arg(long, default_value_t = false)]
+        psx_render: bool,
+        /// Open borderless fullscreen for this session, whatever the options
+        /// file says. `F11` or `Alt+Enter` toggles fullscreen at runtime (and
+        /// remembers it). Window chrome only: the frame is the same.
+        #[arg(long, default_value_t = false, conflicts_with = "windowed")]
+        fullscreen: bool,
+        /// Open windowed for this session, whatever the options file says.
+        #[arg(long, default_value_t = false)]
+        windowed: bool,
+        /// Windowed size as a multiple of the PlayStation's 320x240 display,
+        /// 2..=6 (3 = 960x720, the default), for this session; the launcher's
+        /// Window size row stores it.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(2..=6))]
+        window_scale: Option<u8>,
+        /// Run retail-faithful: every enhancement off (enhanced lighting and
+        /// its shadows, the volumetric fog, the occlusion fade, the entry
+        /// pulse) and every persisted engine-only option pinned to its retail
+        /// value for this session (retail camera distance, the 8-way movement
+        /// decode, no photosensitivity slew, retail tile windows). The one
+        /// switch a parity capture passes; nothing is written back to the
+        /// options file.
+        #[arg(
+            long,
+            default_value_t = false,
+            conflicts_with_all = ["dynamic_lighting", "no_dynamic_lighting", "no_dyn_shadows",
+                "no_entry_pulse", "no_occlusion_fade", "no_volumetric_fog", "smart_monsters",
+                "no_shiny_seru", "flee_exp", "exp_rate", "no_fortress_encounter_fix", "jewel_fix",
+                "no_hp_readout_guard", "spirit_ap", "damage_ap", "seru_catch_rate",
+                "enemy_attack_count", "enemy_stat_scale", "equipment_drops"]
+        )]
+        retail: bool,
+    },
+    /// Resolve XA voice-cue ids to the `(clip slot, filter channel, duration)`
+    /// triple the retail dispatcher builds - the cutscene-audio census view.
+    ///
+    /// The engine has no streaming CD device, so nothing plays these; this
+    /// reports which `XA*.XA` bank each cue addresses and on which channel.
+    #[command(display_order = 5)]
+    XaCue {
+        /// Cue ids (decimal or 0x-hex). Defaults to one full bank's worth from
+        /// the base id.
+        #[arg()]
+        ids: Vec<String>,
+        /// The per-clip length-table value to convert into `duration_sectors`.
+        #[arg(long, default_value_t = 100)]
+        len: u16,
+        /// Directory of extracted `XA*.XA` files, to confirm each resolved slot
+        /// names a file that is on the disc.
+        #[arg(long)]
+        xa_dir: Option<PathBuf>,
+    },
+    /// Open a window and play back a PSX STR movie using the MDEC decoder,
+    /// paced at the stream's real ~15 fps.
+    ///
+    /// Without `--disc` it plays a raw filesystem STR file (2048-byte Form-1
+    /// sectors, video only - the `legaia-extract` shape). With `--disc <bin>`
+    /// the `<str_file>` argument is an ISO path inside the disc image (e.g.
+    /// `MOV/MV1.STR`); the movie is read as raw 2352-byte sectors so its
+    /// interleaved XA audio track plays, with the video clock driven off the
+    /// audio cursor for A/V sync.
+    #[command(display_order = 2)]
+    PlayStr {
+        /// STR file to play. Without `--disc` this is a raw filesystem path
+        /// (2048-byte Form-1 sectors, video only - the extracted shape).
+        /// With `--disc` it is the ISO path of the movie inside the disc
+        /// image (e.g. `MOV/MV1.STR`), read as raw 2352-byte sectors so the
+        /// interleaved XA audio track plays in sync with the video.
+        #[arg()]
+        str_file: PathBuf,
+        /// Disc image (`.bin`). When set, `str_file` is resolved as an ISO
+        /// path inside it and the cutscene plays with its interleaved audio
+        /// (the video clock is driven off the audio cursor).
+        #[arg(long)]
+        disc: Option<PathBuf>,
+        /// Window width.
+        #[arg(long, default_value_t = 640)]
+        width: u32,
+        /// Window height.
+        #[arg(long, default_value_t = 480)]
+        height: u32,
+    },
+    /// Show or update the keyboard-to-pad-button input mapping used by
+    /// `play-window`. The config file defaults to `legaia-input.toml` in
+    /// the current directory.
+    #[command(display_order = 5)]
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCmd,
+    },
+    /// Drive an inventory-use session against a synthetic World. Prints
+    /// the cursor moves + commit outcome.
+    #[command(display_order = 30)]
+    Inventory {
+        /// Item id used by the synthetic session (default 0x01 = Healing Leaf).
+        #[arg(long, default_value_t = 0x01)]
+        item: u8,
+        /// Number of party members.
+        #[arg(long, default_value_t = 3)]
+        party_size: u8,
+        /// Pre-seeded input sequence (same letters as `Battle`).
+        #[arg(long, default_value = "cc")]
+        script: String,
+    },
+    /// Drive an equip session for a synthetic character. Reports state
+    /// transitions + the final committed equipment row.
+    #[command(display_order = 31)]
+    Equip {
+        /// Slot to edit (0..=7).
+        #[arg(long, default_value_t = 0)]
+        slot: u8,
+        /// Item id to equip into `slot` (must be present in the synthetic
+        /// inventory).
+        #[arg(long, default_value_t = 0x05)]
+        item: u8,
+    },
+    /// Replay a recorded GTE (cop2) trace file against a fresh emulator
+    /// and report per-step register divergences. Useful for validating
+    /// the emulator against captured retail RAM dumps.
+    #[command(display_order = 27)]
+    GteReplay {
+        /// JSON trace path written by `engine-render::gte_trace::Cop2Trace`.
+        #[arg(long)]
+        trace: PathBuf,
+        /// Print mismatch detail even when the trace replays cleanly
+        /// (default off - silence is success).
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
+    },
+    /// Drive a synthetic title screen → main-menu pick session.
+    /// Reports per-tick events as the scripted input drives the SM.
+    #[command(display_order = 32)]
+    Title {
+        /// Pre-seeded input sequence, one character per tick. `s` = start,
+        /// `c` = cross, `o` = circle, `U`/`D` = up/down. All other chars
+        /// advance one tick with no input.
+        #[arg(long, default_value = "ssDc")]
+        script: String,
+        /// Treat the session as having no save data (Continue disabled).
+        #[arg(long, default_value_t = false)]
+        no_save: bool,
+        /// Frames to spend in the fade-in phase before accepting input.
+        #[arg(long, default_value_t = 4)]
+        fade_frames: u16,
+    },
+    /// Drive a synthetic save-select session.
+    #[command(display_order = 33)]
+    SaveSelect {
+        /// Mode: `load` (pick a non-empty slot) or `save` (pick any slot).
+        #[arg(long, default_value = "load")]
+        mode: String,
+        /// Comma-separated slot presence mask (1 = present, 0 = empty).
+        #[arg(long, default_value = "1,0,1")]
+        slots: String,
+        /// Pre-seeded input sequence (same letters as `Title`).
+        #[arg(long, default_value = "cc")]
+        script: String,
+    },
+    /// Roll a synthetic encounter session against a small table for `steps`
+    /// steps. Reports the first triggered encounter (if any).
+    #[command(display_order = 34)]
+    Encounter {
+        /// Trigger rate in 1/256 (default 64 ≈ 25%).
+        #[arg(long, default_value_t = 64)]
+        rate: u8,
+        /// Number of steps to roll.
+        #[arg(long, default_value_t = 100)]
+        steps: u32,
+        /// RNG seed (deterministic).
+        #[arg(long, default_value_t = 0xDEAD_BEEF)]
+        seed: u32,
+    },
+    /// Drive a synthetic battle target picker. Reports cursor moves +
+    /// the resulting outcome.
+    #[command(display_order = 35)]
+    TargetPick {
+        /// Target kind: one of `enemy`, `ally`, `ally-or-self`,
+        /// `dead-ally`, `any-ally`, `all-enemies`, `all-allies`, `self`.
+        #[arg(long, default_value = "enemy")]
+        kind: String,
+        /// Active actor slot (0..=2).
+        #[arg(long, default_value_t = 0)]
+        actor: u8,
+        /// Pre-seeded input sequence.
+        #[arg(long, default_value = "RRc")]
+        script: String,
+    },
+    /// Drive a synthetic Tactical Arts chain editor session.
+    #[command(display_order = 36)]
+    ChainEditor {
+        /// Character slot (0..=2).
+        #[arg(long, default_value_t = 0)]
+        char_slot: u8,
+        /// Pre-seeded input sequence (`L`/`R`/`U`/`D` push directions;
+        /// `c` = cross, `o` = circle, `t` = triangle, `n` = name-next).
+        #[arg(long, default_value = "cLLLcc")]
+        script: String,
+    },
+    /// Run the full Seru capture flow against the vanilla registry: roll
+    /// `count` captures of a given Seru and report the resulting learn
+    /// events.
+    #[command(display_order = 37)]
+    SeruCapture {
+        /// Seru id to capture (default 1 = Spark).
+        #[arg(long, default_value_t = 1)]
+        seru: u16,
+        /// Number of captures to roll.
+        #[arg(long, default_value_t = 4)]
+        count: u32,
+        /// Comma-separated party slots (default `0,1,2`).
+        #[arg(long, default_value = "0,1,2")]
+        party: String,
+    },
+    /// Run the engine integration scenarios manifest. Loads
+    /// `scripts/engine/scenarios.toml` (or the path under `--manifest`),
+    /// boots each scenario headlessly, and asserts the SHA-256 of the
+    /// resulting `SaveFile` byte stream matches the recorded
+    /// `expected_save_sha256`. Use `--bless` to record observed hashes
+    /// into the manifest in place. See
+    /// `crates/engine-shell/src/scenarios.rs`.
+    #[command(display_order = 28)]
+    Scenarios {
+        /// Manifest path. Defaults to `scripts/engine/scenarios.toml`
+        /// relative to the cwd.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        /// Extracted-root directory containing `PROT.DAT` + `CDNAME.TXT`.
+        #[arg(long, default_value = "extracted")]
+        extracted_root: PathBuf,
+        /// Rewrite the manifest in place with observed hashes for any
+        /// scenario whose recorded hash differs (or is empty).
+        #[arg(long, default_value_t = false)]
+        bless: bool,
+    },
+    /// Retail comparison corpus (`docs/tooling/retail-compare.md`).
+    #[command(display_order = 29)]
+    RetailCompare(legaia_parity::retail_compare_cli::RetailCompareArgs),
+    /// Score one cast against retail frame by frame
+    /// (`docs/tooling/cast-sequence-oracle.md`).
+    #[command(display_order = 30)]
+    CastSequenceScore(legaia_parity::cast_sequence::CastSequenceArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ConfigCmd {
+    /// Print the current input mapping to stdout.
+    Show {
+        /// Path to the TOML config file. The default `legaia-input.toml`
+        /// resolves against the current directory - run from the same
+        /// directory as `play-window`, or pass an explicit path.
+        #[arg(long, default_value = "legaia-input.toml")]
+        config_file: PathBuf,
+    },
+    /// Set a single key binding. KEY is the user-friendly key name (e.g.
+    /// `Z`, `Up`, `Enter`, `RShift`); BUTTON is the PSX pad button name
+    /// (e.g. `Cross`, `Circle`, `Start`, `L1`).
+    Set {
+        /// Binding in KEY=BUTTON form, e.g. `--binding Z=Cross`.
+        #[arg(long)]
+        binding: String,
+        /// Path to the TOML config file. The default `legaia-input.toml`
+        /// resolves against the current directory - run from the same
+        /// directory as `play-window`, or pass an explicit path.
+        #[arg(long, default_value = "legaia-input.toml")]
+        config_file: PathBuf,
+    },
+    /// Write the heuristic CDNAME→MV cutscene map to a TOML file.
+    /// Useful as a starting point for engines that want to override one
+    /// or two entries while keeping the rest of the heuristic intact.
+    DumpCutsceneMap {
+        /// Output path (use `-` for stdout).
+        #[arg(long, default_value = "legaia-cutscene-map.toml")]
+        out: PathBuf,
+    },
+}
+
+/// `--retail-keyon-owner` value: hex with or without a `0x` prefix.
+fn parse_hex_u16(v: &str) -> Result<u16, String> {
+    u16::from_str_radix(v.trim_start_matches("0x"), 16).map_err(|e| e.to_string())
+}
+
+/// `--exp-rate` value: a multiplier (`2`, `1.5`, `0.5x`) in `0.1..=5`, as
+/// permille - the patcher's `--exp-scale` grammar.
+fn parse_exp_rate(v: &str) -> Result<u16, String> {
+    let t = v.trim().trim_end_matches(['x', 'X']);
+    let m: f64 = t.parse().map_err(|e| format!("{v:?}: {e}"))?;
+    if !(0.1..=5.0).contains(&m) {
+        return Err(format!("{v:?}: the multiplier is 0.1 to 5"));
+    }
+    Ok((m * 1000.0).round() as u16)
+}
+
+#[cfg(test)]
+mod exp_rate_flag_tests {
+    use super::parse_exp_rate;
+
+    #[test]
+    fn exp_rate_parses_the_multiplier_grammar() {
+        assert_eq!(parse_exp_rate("2"), Ok(2000));
+        assert_eq!(parse_exp_rate("1.5x"), Ok(1500));
+        assert_eq!(parse_exp_rate("0.5"), Ok(500));
+        assert!(parse_exp_rate("9").is_err());
+        assert!(parse_exp_rate("lots").is_err());
+    }
+}
+
+#[cfg(test)]
+mod locomotion_flag_tests {
+    use super::{Cli, Cmd};
+    use clap::Parser;
+
+    fn play_window(extra: &[&str]) -> (bool, bool, bool) {
+        let mut argv = vec!["legaia-engine", "play-window"];
+        argv.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(argv).expect("play-window parses");
+        match cli.cmd.expect("subcommand") {
+            Cmd::PlayWindow {
+                no_edge_collision,
+                no_solid_npcs,
+                no_live_npcs,
+                ..
+            } => (no_edge_collision, no_solid_npcs, no_live_npcs),
+            other => panic!("parsed {other:?}"),
+        }
+    }
+
+    /// The three retail locomotion behaviours - the leading-edge wall
+    /// footprint, solid NPCs, patrolling villagers - are ON by default, the
+    /// same three the browser play page sets unconditionally. The `--no-*`
+    /// spelling is what keeps a bare `play-window` on the browser's side.
+    #[test]
+    fn locomotion_knobs_default_on_and_the_no_flags_clear_them() {
+        assert_eq!(play_window(&[]), (false, false, false));
+        assert_eq!(play_window(&["--no-edge-collision"]), (true, false, false));
+        assert_eq!(play_window(&["--no-solid-npcs"]), (false, true, false));
+        assert_eq!(play_window(&["--no-live-npcs"]), (false, false, true));
+        assert_eq!(
+            play_window(&["--no-edge-collision", "--no-solid-npcs", "--no-live-npcs"]),
+            (true, true, true)
+        );
+    }
+
+    /// The opt-in spellings are gone, not aliased: a script still passing
+    /// them fails to parse rather than silently running the other default.
+    #[test]
+    fn the_old_opt_in_spellings_no_longer_parse() {
+        for old in ["--edge-collision", "--solid-npcs", "--live-npcs"] {
+            assert!(
+                Cli::try_parse_from(["legaia-engine", "play-window", old]).is_err(),
+                "{old} must not parse"
+            );
+        }
+    }
+}

@@ -1,0 +1,784 @@
+//! Battle target picker session.
+//!
+//! Drives the "after the player has picked an art / item / spell, who does
+//! it apply to?" sub-flow. Mirrors the retail target cursor that pops up
+//! during the CommandInput phase of the battle session.
+//!
+//! The picker is parameterised on a [`TargetKind`] that constrains valid
+//! targets:
+//!
+//! - [`TargetKind::SingleEnemy`] - one alive monster slot
+//! - [`TargetKind::SingleAlly`] - one alive party slot (excluding self)
+//! - [`TargetKind::SingleAllyOrSelf`] - any alive party slot
+//! - [`TargetKind::DeadAlly`] - one fallen party slot (Resurrection)
+//! - [`TargetKind::AnyAlly`] - any party slot, alive or dead
+//! - [`TargetKind::AllEnemies`] - sweep target, no cursor; immediate confirm
+//! - [`TargetKind::AllAllies`] - sweep target, no cursor; immediate confirm
+//! - [`TargetKind::Self_` - the actor itself; immediate confirm
+//!
+//! The cursor moves left/right between valid candidates; up/down (where
+//! the kind allows) flips between the party row and the monster row.
+//! Cross confirms; Circle aborts. The session emits typed events the
+//! engine can fold into HUD blips.
+//!
+//! ## Integration
+//!
+//! The picker's [`TargetPickerSession::outcome`] provides the resolved
+//! target slot or "abort" outcome; the battle menu that opened it
+//! ([`crate::battle_magic`], the live loop's command flow) commits or
+//! drops the buffered command on that outcome.
+
+/// The kind of target the action expects. Drives validation + cursor
+/// motion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TargetKind {
+    /// One live enemy slot.
+    SingleEnemy,
+    /// One live party slot, excluding the actor.
+    SingleAlly,
+    /// One live party slot, including the actor.
+    SingleAllyOrSelf,
+    /// One dead party slot (Revive / Resurrection items).
+    DeadAlly,
+    /// One party slot, alive or dead.
+    AnyAlly,
+    /// All enemies - auto-confirm.
+    AllEnemies,
+    /// All allies - auto-confirm.
+    AllAllies,
+    /// The actor itself - auto-confirm.
+    Self_,
+}
+
+impl TargetKind {
+    /// `true` when the picker has no real cursor and resolves immediately.
+    pub fn is_immediate(self) -> bool {
+        matches!(
+            self,
+            TargetKind::AllEnemies | TargetKind::AllAllies | TargetKind::Self_
+        )
+    }
+
+    /// `true` when the picker walks party slots.
+    pub fn picks_ally(self) -> bool {
+        matches!(
+            self,
+            TargetKind::SingleAlly
+                | TargetKind::SingleAllyOrSelf
+                | TargetKind::DeadAlly
+                | TargetKind::AnyAlly
+                | TargetKind::AllAllies
+        )
+    }
+
+    /// `true` when the picker walks monster slots.
+    pub fn picks_enemy(self) -> bool {
+        matches!(self, TargetKind::SingleEnemy | TargetKind::AllEnemies)
+    }
+}
+
+/// Where the cursor currently sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorRow {
+    Ally,
+    Enemy,
+}
+
+/// State of the picker SM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerState {
+    /// Cursor is live. `slot` is the cursor's currently-targeted slot
+    /// (resolved against ally / enemy frame).
+    Cursor { row: CursorRow, slot: u8 },
+    /// Picker resolved.
+    Done(PickerOutcome),
+}
+
+/// Final result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerOutcome {
+    /// One slot was confirmed.
+    Single { slot: u8, row: CursorRow },
+    /// All enemies / allies / self - sweep target.
+    Sweep { row: CursorRow },
+    /// Player cancelled.
+    Cancelled,
+    /// No valid target existed when the picker opened - auto-cancel.
+    NoCandidates,
+}
+
+/// Per-tick input bundle. Mirrors `equip_session::EquipInput` shape.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PickerInput {
+    pub up: bool,
+    pub down: bool,
+    pub left: bool,
+    pub right: bool,
+    pub cross: bool,
+    pub circle: bool,
+}
+
+/// Events emitted per `input()` call. Engines fold these into HUD blips
+/// + BattleHud cursor highlight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerEvent {
+    CursorMoved { row: CursorRow, slot: u8 },
+    RowSwitched { row: CursorRow, slot: u8 },
+    Confirmed { row: CursorRow, slot: u8 },
+    SweepConfirmed { row: CursorRow },
+    Cancelled,
+    InvalidConfirm,
+}
+
+/// One row of slot info the picker queries.
+///
+/// `x` / `z` are the slot's battle-world planar seat (the actor's
+/// `move_state.world_x` / `world_z`, retail's `+0x34` / `+0x38`). They are
+/// only read by the retail attack-target ring - see
+/// [`TargetPickerSession::retail_enemy_step`] - and a host with no positions
+/// to hand leaves them zero, which falls the cursor back to the plain
+/// slot-order scan.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SlotState {
+    pub present: bool,
+    pub alive: bool,
+    /// Battle-world X (`actor[+0x34]`).
+    pub x: i16,
+    /// Battle-world Z (`actor[+0x38]`).
+    pub z: i16,
+}
+
+impl SlotState {
+    pub const fn alive(present: bool, alive: bool) -> Self {
+        Self {
+            present,
+            alive,
+            x: 0,
+            z: 0,
+        }
+    }
+    pub const fn dead(present: bool) -> Self {
+        Self {
+            present,
+            alive: false,
+            x: 0,
+            z: 0,
+        }
+    }
+    /// Same slot with its battle-world seat attached.
+    ///
+    /// Named `with_seat` rather than `at`: `at` already exists in-tree, and a
+    /// second definition of a one-word method name flips the reachability
+    /// analysis's receiver gate on for every call site of the first one.
+    pub const fn with_seat(self, x: i16, z: i16) -> Self {
+        Self { x, z, ..self }
+    }
+}
+
+/// Target picker session.
+#[derive(Debug, Clone)]
+pub struct TargetPickerSession {
+    kind: TargetKind,
+    actor_slot: u8,
+    party: [SlotState; 3],
+    monsters: [SlotState; 5],
+    state: PickerState,
+    events: Vec<PickerEvent>,
+}
+
+impl TargetPickerSession {
+    /// Construct a new picker for `kind`. `actor_slot` is the party-row
+    /// index (0..=2) of the action's owner - used to skip-self for
+    /// [`TargetKind::SingleAlly`]. `party` and `monsters` describe slot
+    /// occupancy + alive state.
+    pub fn new(
+        kind: TargetKind,
+        actor_slot: u8,
+        party: [SlotState; 3],
+        monsters: [SlotState; 5],
+    ) -> Self {
+        let mut s = Self {
+            kind,
+            actor_slot,
+            party,
+            monsters,
+            state: PickerState::Done(PickerOutcome::NoCandidates),
+            events: Vec::new(),
+        };
+        s.init_cursor();
+        s
+    }
+
+    fn init_cursor(&mut self) {
+        if self.kind.is_immediate() {
+            let row = if self.kind == TargetKind::AllEnemies {
+                CursorRow::Enemy
+            } else {
+                // AllAllies / Self_ - both party-row.
+                CursorRow::Ally
+            };
+            // Sanity: ensure at least one valid target exists. For Self_,
+            // the actor is alive (caller guarantees), so always emit.
+            self.state = PickerState::Done(PickerOutcome::Sweep { row });
+            self.events.push(PickerEvent::SweepConfirmed { row });
+            return;
+        }
+
+        // Try ally row first if the kind picks allies; otherwise enemy.
+        let initial_row = if self.kind.picks_ally() && !self.kind.picks_enemy() {
+            CursorRow::Ally
+        } else if self.kind.picks_enemy() {
+            CursorRow::Enemy
+        } else {
+            CursorRow::Ally
+        };
+
+        if let Some(slot) = self.first_valid_in(initial_row) {
+            self.state = PickerState::Cursor {
+                row: initial_row,
+                slot,
+            };
+            return;
+        }
+        // Fall back to the other row.
+        let alt = match initial_row {
+            CursorRow::Ally => CursorRow::Enemy,
+            CursorRow::Enemy => CursorRow::Ally,
+        };
+        if let Some(slot) = self.first_valid_in(alt) {
+            self.state = PickerState::Cursor { row: alt, slot };
+            return;
+        }
+        self.state = PickerState::Done(PickerOutcome::NoCandidates);
+    }
+
+    pub fn state(&self) -> PickerState {
+        self.state
+    }
+
+    /// Move a live cursor onto `slot` of `row` when that slot is a target
+    /// this picker accepts; `false` (and the cursor left where it is)
+    /// otherwise, or once the picker has resolved.
+    ///
+    /// The attack-target cursor opens on the actor's current target byte
+    /// `+0x1DD`, not on the first live slot: the ring's confirm arm keeps a
+    /// monster-slot target (`+0x1DD - 3 < 5`) and re-picks only anything
+    /// else through `FUN_801DB8B4` (`0x801D1574..0x801D15AC`), and the
+    /// round boundary re-picks only a dead or past-slot-6 one
+    /// (`FUN_801D88CC`). So a member who struck a monster last round opens
+    /// on it again while it stands. The host seats that slot through here.
+    ///
+    /// REF: FUN_801D0748 (0x801D1574..0x801D15AC)
+    pub fn seat_cursor(&mut self, row: CursorRow, slot: u8) -> bool {
+        if matches!(self.state, PickerState::Done(_)) || !self.is_valid(row, slot) {
+            return false;
+        }
+        self.state = PickerState::Cursor { row, slot };
+        true
+    }
+
+    pub fn kind(&self) -> TargetKind {
+        self.kind
+    }
+
+    pub fn is_done(&self) -> bool {
+        matches!(self.state, PickerState::Done(_))
+    }
+
+    pub fn outcome(&self) -> Option<PickerOutcome> {
+        match self.state {
+            PickerState::Done(o) => Some(o),
+            _ => None,
+        }
+    }
+
+    pub fn drain_events(&mut self) -> Vec<PickerEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    fn slot_state(&self, row: CursorRow, slot: u8) -> Option<SlotState> {
+        match row {
+            CursorRow::Ally => self.party.get(slot as usize).copied(),
+            CursorRow::Enemy => self.monsters.get(slot as usize).copied(),
+        }
+    }
+
+    fn row_len(&self, row: CursorRow) -> u8 {
+        match row {
+            CursorRow::Ally => self.party.len() as u8,
+            CursorRow::Enemy => self.monsters.len() as u8,
+        }
+    }
+
+    fn is_valid(&self, row: CursorRow, slot: u8) -> bool {
+        let state = match self.slot_state(row, slot) {
+            Some(s) => s,
+            None => return false,
+        };
+        if !state.present {
+            return false;
+        }
+        // Apply per-kind constraints.
+        match self.kind {
+            TargetKind::SingleEnemy => row == CursorRow::Enemy && state.alive,
+            TargetKind::SingleAlly => {
+                row == CursorRow::Ally && state.alive && slot != self.actor_slot
+            }
+            TargetKind::SingleAllyOrSelf => row == CursorRow::Ally && state.alive,
+            TargetKind::DeadAlly => row == CursorRow::Ally && !state.alive,
+            TargetKind::AnyAlly => row == CursorRow::Ally,
+            // Immediate kinds resolve in init_cursor; not used here.
+            TargetKind::AllEnemies | TargetKind::AllAllies | TargetKind::Self_ => true,
+        }
+    }
+
+    fn first_valid_in(&self, row: CursorRow) -> Option<u8> {
+        let len = self.row_len(row);
+        (0..len).find(|&s| self.is_valid(row, s))
+    }
+
+    /// Pool slots the retail attack-target scans cover: `3..=6`, i.e. the
+    /// first four monster rows. `FUN_801D8A88`'s count loop stops at
+    /// `sltiu s0,0x7` and its angle loop runs four entries, so the fifth
+    /// seat (pool slot `7`, a Divide clone's) has no ring entry in retail
+    /// either: it is a target only once the four below it are down, as the
+    /// default (`FUN_801DB8B4` falls through to `7`). The linear scan from
+    /// that seat finds nothing else standing.
+    const RING_MONSTERS: usize = 4;
+
+    /// Step the **enemy** cursor the way retail does: to the angularly nearest
+    /// live alternate, not to the next slot index.
+    ///
+    /// This is `FUN_801D8A88` (the ring builder) feeding `FUN_801D8D00` (the
+    /// cursor step), with the 8-slot battle-actor pool assembled from the
+    /// picker's own rows: pool slot `0` stands in for the acting party actor
+    /// (retail reads its `+0x1DD` current target, here the cursor), and pool
+    /// slots `3..=6` are monster rows `0..=3` with their battle-world seats.
+    ///
+    /// Returns `None` - and the caller falls back to
+    /// [`Self::step_within_row`]'s slot-order walk - whenever the ring cannot
+    /// answer: no seats supplied, a cursor outside the four ring slots, or a
+    /// ring entry that is not a live monster (retail leaves those context
+    /// bytes stale rather than zeroing them, so the port refuses instead of
+    /// following a stale slot).
+    ///
+    /// REF: FUN_801D8A88, FUN_801D8D00, FUN_80019B28
+    fn retail_enemy_step(&self, from: u8, dir: i8) -> Option<u8> {
+        use legaia_engine_battle_vm::battle_action::{
+            PoolActor, TargetCycle, bearing_12bit_approx, build_attack_target_queue,
+            cycle_attack_target,
+        };
+        if (from as usize) >= Self::RING_MONSTERS {
+            return None;
+        }
+        let acting = self.party.get(self.actor_slot as usize).copied()?;
+        // Degenerate seats (a host with no positions) cannot order anything.
+        let seated = self.monsters[..Self::RING_MONSTERS]
+            .iter()
+            .any(|m| m.x != 0 || m.z != 0);
+        if !seated {
+            return None;
+        }
+        let mut pool = [PoolActor::default(); 8];
+        pool[0] = PoolActor {
+            alive: true,
+            x: acting.x,
+            z: acting.z,
+            target_slot: 3 + from,
+            status: 0,
+        };
+        for i in 0..Self::RING_MONSTERS {
+            let m = self.monsters[i];
+            pool[3 + i] = PoolActor {
+                alive: m.present && m.alive,
+                x: m.x,
+                z: m.z,
+                target_slot: 0,
+                status: 0,
+            };
+        }
+        let q = build_attack_target_queue(&pool, 0, bearing_12bit_approx);
+        let ring = [
+            q.count,
+            q.wrap_slot,
+            q.ordered[0],
+            q.ordered[1],
+            q.ordered[2],
+        ];
+        let mode = if dir >= 0 {
+            TargetCycle::Next
+        } else {
+            TargetCycle::Prev
+        };
+        let next = cycle_attack_target(&ring, 3 + from, mode);
+        let slot = next.checked_sub(3)?;
+        if (slot as usize) >= Self::RING_MONSTERS || !self.is_valid(CursorRow::Enemy, slot) {
+            return None;
+        }
+        Some(slot)
+    }
+
+    fn step_within_row(&self, row: CursorRow, from: u8, dir: i8) -> Option<u8> {
+        if row == CursorRow::Enemy
+            && self.kind == TargetKind::SingleEnemy
+            && let Some(s) = self.retail_enemy_step(from, dir)
+        {
+            return Some(s);
+        }
+        let len = self.row_len(row);
+        if len == 0 {
+            return None;
+        }
+        let mut cursor = from as i16;
+        for _ in 0..len {
+            cursor += dir as i16;
+            if cursor < 0 {
+                cursor = (len as i16) - 1;
+            }
+            if cursor >= len as i16 {
+                cursor = 0;
+            }
+            let s = cursor as u8;
+            if self.is_valid(row, s) {
+                return Some(s);
+            }
+        }
+        None
+    }
+
+    fn other_row(row: CursorRow) -> CursorRow {
+        match row {
+            CursorRow::Ally => CursorRow::Enemy,
+            CursorRow::Enemy => CursorRow::Ally,
+        }
+    }
+
+    fn can_switch_row(&self, from: CursorRow) -> bool {
+        // SingleEnemy never lets you switch to ally row.
+        // SingleAlly / DeadAlly / AnyAlly / SingleAllyOrSelf never switch to enemy.
+        match self.kind {
+            TargetKind::SingleEnemy => false,
+            TargetKind::SingleAlly
+            | TargetKind::DeadAlly
+            | TargetKind::AnyAlly
+            | TargetKind::SingleAllyOrSelf => false,
+            _ => false, // sweep kinds resolve in init_cursor; we never reach here with them.
+        }
+        .then_some(())
+        .map(|_| true)
+        .unwrap_or_else(|| {
+            // The dummy match above always returns false - but we want to
+            // future-proof: allow row switching if the kind picks both.
+            // None of the current variants do, so this is effectively false.
+            let _ = from;
+            false
+        })
+    }
+
+    /// Drive the cursor for one frame.
+    pub fn input(&mut self, input: PickerInput) {
+        let (row, slot) = match self.state {
+            PickerState::Cursor { row, slot } => (row, slot),
+            PickerState::Done(_) => return,
+        };
+
+        if input.circle {
+            self.state = PickerState::Done(PickerOutcome::Cancelled);
+            self.events.push(PickerEvent::Cancelled);
+            return;
+        }
+
+        if input.cross {
+            if self.is_valid(row, slot) {
+                self.state = PickerState::Done(PickerOutcome::Single { slot, row });
+                self.events.push(PickerEvent::Confirmed { row, slot });
+            } else {
+                self.events.push(PickerEvent::InvalidConfirm);
+            }
+            return;
+        }
+
+        // Cursor motion. Left/Right step within the row.
+        if input.left {
+            if let Some(s) = self.step_within_row(row, slot, -1)
+                && s != slot
+            {
+                self.state = PickerState::Cursor { row, slot: s };
+                self.events.push(PickerEvent::CursorMoved { row, slot: s });
+            }
+            return;
+        }
+        if input.right {
+            if let Some(s) = self.step_within_row(row, slot, 1)
+                && s != slot
+            {
+                self.state = PickerState::Cursor { row, slot: s };
+                self.events.push(PickerEvent::CursorMoved { row, slot: s });
+            }
+            return;
+        }
+
+        // Up/Down switch row when the kind allows it.
+        if (input.up || input.down) && self.can_switch_row(row) {
+            let new_row = Self::other_row(row);
+            if let Some(s) = self.first_valid_in(new_row) {
+                self.state = PickerState::Cursor {
+                    row: new_row,
+                    slot: s,
+                };
+                self.events.push(PickerEvent::RowSwitched {
+                    row: new_row,
+                    slot: s,
+                });
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Enemy target-menu rows
+// ---------------------------------------------------------------------------
+
+/// The formation table the menu builder walks - four monster-id bytes.
+pub const FORMATION_SLOTS: usize = 4;
+
+/// Menu row stride in the retail context block (`row * 0x20 + 0x29` is the row's
+/// name field).
+pub const MENU_ROW_STRIDE: usize = 0x20;
+
+/// Screen-space centre the row X positions are built around.
+pub const MENU_CENTRE_X: i16 = 0xA0;
+
+/// Left clamp for a row's X (`0x801da144`: `slti v0,v0,0x6`).
+pub const MENU_MIN_X: i16 = 6;
+
+/// Right edge a row's `x + text_width` is clamped against
+/// (`0x801da12c`: `li s1,0x13a`).
+pub const MENU_MAX_RIGHT: i16 = 0x13A;
+
+/// Minimum gap the overlap relaxation opens between two rows, on top of the
+/// left row's own text width (`0x801da050`: `addiu v0,v0,0x14`).
+pub const MENU_ROW_GAP: i16 = 0x14;
+
+/// Y the rows are drawn at (`0x801da1fc`: the fifth argument `0x30`).
+pub const MENU_ROW_Y: i16 = 0x30;
+
+/// The run suffix the composer appends: the rodata string at `0x801CECA8`,
+/// `"* 2"` (`lui a1,0x801d` / `addiu a1,a1,-0x1358` at `0x801D9E4C` /
+/// `0x801D9E5C`, handed to the `strcat` at `FUN_8003CAC4`). Its last byte
+/// is the digit the third and later members of a run increment.
+pub const DEDUP_SUFFIX: &str = "* 2";
+
+/// Row height (`0x801da208`: the seventh argument `0xC`).
+pub const MENU_ROW_HEIGHT: i16 = 0xC;
+
+/// One row of the enemy target-selection menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnemyMenuRow {
+    /// The monster id the row was opened for.
+    pub monster_id: u8,
+    /// Formation slot the row's **first** member occupies - the slot the cursor
+    /// resolves to.
+    pub first_slot: u8,
+    /// Members collapsed into this row (consecutive identical ids).
+    pub members: u8,
+    /// The row's label. The first member contributes the plain name; each
+    /// further member replaces the label's last character with a **dedup
+    /// glyph** and then increments it, so a run of three reads
+    /// `name`, `nam<g>`, `nam<g+1>`.
+    pub label: String,
+    /// Screen X, once [`layout_enemy_menu_rows`] has run. Before that it is the
+    /// running sum of the members' projected positions.
+    pub x: i16,
+}
+
+/// Build the deduplicated row set for the enemy target menu.
+///
+/// PORT: FUN_801D9D3C (`0x801d9d84..0x801d9f0c`).
+///
+/// Provenance: `FUN_801D9D3C` is the flow-`0x0A` battle-**intro** enemy-name
+/// banner composer (sole reference: the `jal` at `0x801D0DFC`), and the
+/// engine runs it for that banner. Retail's target-select strip is built
+/// elsewhere; the engine's picker draws the record-`0x29` plaque instead.
+///
+/// `formation` is the four-byte monster-id table `_DAT_8007BD0C`; a zero id is
+/// an empty slot and is skipped without ending the walk. `name_of` supplies the
+/// per-slot display name (retail copies it from the battle actor's `+0x1BC`),
+/// and `dedup_suffix` is the suffix literal the overlay keeps in its rodata at
+/// `0x801CECA8` ([`DEDUP_SUFFIX`]).
+///
+/// Consecutive identical ids collapse into one row. The **run counter resets on
+/// any id change**, so a formation `A A B A` produces three rows (`A`x2, `B`,
+/// `A`), not two - the dedup is positional, not a set operation.
+///
+/// The suffix arithmetic, read off the disassembly:
+///
+/// * the first member of a run copies its display name (`strcpy` of actor
+///   `+0x1BC`, `0x801D9DF0`);
+/// * the second **drops the name's last character** - `strlen`, then
+///   `sb zero` over byte `len - 1` (`0x801D9E34..0x801D9E54`) - and
+///   **appends** `dedup_suffix` with `strcat` (`0x801D9E60`);
+/// * each further member increments the label's last byte in place
+///   (`0x801D9E7C..0x801D9EA4`), the suffix's digit.
+///
+/// The character dropped is the per-instance letter retail's battle loader
+/// gives duplicate monsters (`Killer Bee A`, `Killer Bee B`), so a run of
+/// three reads `Killer Bee * 3`. An earlier reading here had the second member
+/// overwrite the last character with a one-byte glyph and keep the label's
+/// length; the `strcat` of a three-byte string falsifies it.
+///
+/// `projected_x` is each slot's battle world X (the monster actor's `+0x34`
+/// halfword, `0x801D9E00` / `0x801D9ED4`); the builder accumulates it per row
+/// so [`layout_enemy_menu_rows`] can average it.
+///
+/// Wired: both hosts reach this each battle frame through
+/// [`crate::battle_hud::battle_intro_names`] (native `window/hud.rs`,
+/// browser `play_battle.rs`) via [`crate::battle_hud::battle_enemy_target_rows`],
+/// which stands occupancy in for the retail id table and feeds each slot's
+/// live world X.
+pub fn enemy_menu_rows(
+    formation: [u8; FORMATION_SLOTS],
+    dedup_suffix: &str,
+    mut name_of: impl FnMut(u8) -> String,
+    mut projected_x: impl FnMut(u8) -> i16,
+) -> Vec<EnemyMenuRow> {
+    let mut rows: Vec<EnemyMenuRow> = Vec::new();
+    let mut run = 0u8;
+    for slot in 0..FORMATION_SLOTS {
+        let id = formation[slot];
+        if id == 0 {
+            continue;
+        }
+        let same_as_prev = slot > 0 && formation[slot - 1] == id;
+        run = if same_as_prev { run + 1 } else { 0 };
+        let px = projected_x(slot as u8);
+        if run == 0 {
+            rows.push(EnemyMenuRow {
+                monster_id: id,
+                first_slot: slot as u8,
+                members: 1,
+                label: name_of(slot as u8),
+                x: px,
+            });
+            continue;
+        }
+        let Some(row) = rows.last_mut() else {
+            continue; // retail would index row -1; a leading run cannot happen
+        };
+        if run == 1 {
+            // Drop the final character (the per-instance letter), then
+            // append the suffix.
+            let mut bytes = row.label.clone().into_bytes();
+            bytes.pop();
+            bytes.extend_from_slice(dedup_suffix.as_bytes());
+            row.label = String::from_utf8_lossy(&bytes).into_owned();
+            // Retail bumps the run counter a second time here, which is what
+            // makes the *next* member take the increment arm.
+            run += 1;
+        } else {
+            let mut bytes = row.label.clone().into_bytes();
+            if let Some(last) = bytes.last_mut() {
+                *last = last.wrapping_add(1);
+            }
+            row.label = String::from_utf8_lossy(&bytes).into_owned();
+        }
+        row.members += 1;
+        row.x = row.x.wrapping_add(px);
+    }
+    rows
+}
+
+/// Place the enemy menu rows across the screen.
+///
+/// PORT: FUN_801D9D3C (`0x801d9f1c..0x801da1ac`)
+///
+/// This is the intro banner composer's seat law (labels centred over their
+/// enemies at y = 48, relaxed apart, clamped to the screen).
+///
+/// Three passes, in order:
+///
+/// 1. **Average + centre.** Each row's accumulated projected X is divided by its
+///    member count, scaled down by `>> 3`, then converted to a left edge:
+///    `x = (avg >> 3) - text_width / 2 + 0xA0`.
+/// 2. **Overlap relaxation.** Every unordered pair is compared; when the left
+///    row's `x + text_width + 0x14` reaches into the right row's `x`, the
+///    overlap is **split evenly** - each row moves by half of it, in opposite
+///    directions. Which row counts as "left" is decided per pair by their
+///    current X, so the pass is order-independent.
+/// 3. **Clamp.** Rows are pushed inside `[0x06, 0x13A - text_width]`.
+///
+/// Passes 2 and 3 **repeat as a unit** until pass 3 changes nothing
+/// (`0x801da1ac`), so a clamp that re-introduces an overlap is re-relaxed. With
+/// fewer than two rows retail skips straight past both passes, so a single row
+/// keeps its raw centred position and is never clamped.
+///
+/// `text_width_of` measures a row's label in pixels (retail's `FUN_80035F04`).
+///
+/// Wired: its retail host, the flow-`0x0A` battle-intro enemy-name banner,
+/// is [`crate::battle_hud::battle_intro_names`], which both hosts feed to the
+/// shared battle HUD builder (`legaia_engine_ui::battle_hud`, native
+/// `window/hud.rs`, browser `play_battle.rs`) for the intro timer's span. The
+/// **text measurer** is the `legaia-font` layout advance (the engine's
+/// stand-in for retail's proportional `FUN_80035F04`). The X each row
+/// averages is the monster actor's `+0x34`, its battle **world** X - a
+/// simulation value, not a GTE projection - which the builder reads off the
+/// live battle position, so the labels sit over their groups as retail's
+/// do.
+pub fn layout_enemy_menu_rows(
+    rows: &mut [EnemyMenuRow],
+    mut text_width_of: impl FnMut(&str) -> i16,
+) {
+    for row in rows.iter_mut() {
+        let avg = if row.members == 0 {
+            0
+        } else {
+            row.x / i16::from(row.members)
+        };
+        row.x = (avg >> 3) - text_width_of(&row.label) / 2 + MENU_CENTRE_X;
+    }
+    if rows.len() < 2 {
+        return;
+    }
+    // Retail's outer loop is unbounded; it terminates because each iteration
+    // either clamps (and so is followed by another) or does not (and stops).
+    // The bound here is a safety net, not a behavioural change.
+    for _ in 0..rows.len() * 8 + 8 {
+        for i in 0..rows.len() - 1 {
+            for j in i + 1..rows.len() {
+                let (left, right) = if rows[j].x < rows[i].x {
+                    (j, i)
+                } else {
+                    (i, j)
+                };
+                let reach = rows[left]
+                    .x
+                    .wrapping_add(text_width_of(&rows[left].label.clone()))
+                    .wrapping_add(MENU_ROW_GAP);
+                if reach < rows[right].x {
+                    continue;
+                }
+                let half = (reach - rows[right].x) >> 1;
+                rows[left].x = rows[left].x.wrapping_sub(half);
+                rows[right].x = rows[right].x.wrapping_add(half);
+            }
+        }
+        let mut clamped = false;
+        for row in rows.iter_mut() {
+            if row.x < MENU_MIN_X {
+                row.x = MENU_MIN_X;
+                clamped = true;
+            }
+            let right_limit = MENU_MAX_RIGHT - (text_width_of(&row.label) & 0xFF);
+            if right_limit < row.x {
+                row.x = right_limit;
+                clamped = true;
+            }
+        }
+        if !clamped {
+            return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

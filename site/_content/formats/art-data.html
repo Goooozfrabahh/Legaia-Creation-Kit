@@ -1,0 +1,299 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">formats</a> &middot; art data - tactical arts records</div>
+  <h1>Art Data - Tactical Arts records <span class="tag tag-partial">Inferred</span></h1>
+  <p class="lede">Tap the right d-pad sequence in battle and your character performs a Tactical Art. These records are the data behind that system: for Vahn, Noa and Gala, one record per art holding the input combo, the per-strike damage tiers, the animation and the hit cues. A Miracle Art is a secret input that replaces the whole action queue; a Super Art is a find-and-replace over the queue's tail.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Where</dt><dd><code>record[0]</code> of each <a href="battle-data-pack.html">player battle file</a> (PROT 0863 Vahn / 0864 Noa / 0865 Gala), resident in RAM at <code>0x80160EFC</code> / <code>0x80176998</code> / <code>0x8018BA54</code>. Display names, arrows and AP: the SCUS arts-name table at <code>DAT_80075EC4</code>.</dd>
+    <dt>Stride</dt><dd><code>0xD0</code> bytes per record, indexed by action constant: <code>record = base + (c &minus; 0x10) &times; 0xD0</code>. Name-table rows are 20 bytes.</dd>
+    <dt>Parser</dt><dd><code>crates/art</code> (<code>parse_record</code>, <code>arts_table</code>, <code>tokenize</code>, Miracle / Super matchers); editors <code>legaia_arts_patch::arts_power</code> / <code>super_art_power</code>.</dd>
+    <dt>Confidence</dt><dd>Command prefix, stride, power byte at <code>+0x24</code>, effect class at <code>+0x7A</code> and the name table are <strong>Confirmed</strong>; the variable-field tail offsets are <strong>Inferred</strong> from external RE work.</dd>
+    <dt>Used by</dt><dd><a href="../subsystems/battle-action.html">Battle action SM</a>, <a href="../subsystems/arts-command-gauge.html">Arts gauge</a>, <a href="../arts.html">Arts page</a>, <a href="../tooling/randomizer.html">Randomizer (arts shuffle)</a>.</dd>
+  </dl>
+  <div class="notice">
+    <div class="notice-title">The button combos live in two places</div>
+    <p>The <strong>matcher</strong> - what fires an art - reads the player-file record's command bytes. The <strong>menu</strong> draws its arrows from the SCUS name table. Editing one without the other makes the menu lie: the art still fires on the old combo. The arts randomizer edits both.</p>
+  </div>
+  <figure class="diagram">
+    <svg viewBox="0 0 860 410" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two paths into the arts data. What fires an art: the player file record0 (extraction 0863 to 0865) holds the art block at a 0xD0 stride; its +0 combo feeds the matcher and tokenizer FUN_801EED1C, which writes the action queue at actor+0x1DF; the anim commit FUN_8004AD80 materializes the art record at actor+0x4C; its +0x24 power run feeds the damage kernel FUN_801EC3E4 and its hit run feeds the cue playout FUN_801DEA50. What the menu draws: the SCUS arts-name table DAT_80075EC4 supplies glyphs at +8, AP at +2 and the name at +0xC to the Arts menu display.">
+      <defs><marker id="ad-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <text class="dg-sub dg-start" x="20" y="24">what fires the art - player file</text>
+      <rect class="dg-node" x="20" y="40" width="150" height="50" rx="4"/><text class="dg-label" x="95" y="62">player file record0</text><text class="dg-sub" x="95" y="78">extraction 0863..0865</text>
+      <rect class="dg-node" x="240" y="40" width="150" height="50" rx="4"/><text class="dg-label" x="315" y="62">art block</text><text class="dg-sub" x="315" y="78">0xD0 stride</text>
+      <rect class="dg-node-accent" x="460" y="40" width="150" height="50" rx="4"/><text class="dg-label" x="535" y="62">matcher / tokenizer</text><text class="dg-sub" x="535" y="78">FUN_801EED1C</text>
+      <rect class="dg-node" x="680" y="40" width="150" height="50" rx="4"/><text class="dg-label" x="755" y="62">action queue</text><text class="dg-sub" x="755" y="78">actor+0x1DF</text>
+      <path class="dg-edge" d="M170 65 L238 65" marker-end="url(#ad-arrow)"/>
+      <path class="dg-edge" d="M390 65 L458 65" marker-end="url(#ad-arrow)"/>
+      <text class="dg-edge-label" x="425" y="57" text-anchor="middle">+0 combo</text>
+      <path class="dg-edge" d="M610 65 L678 65" marker-end="url(#ad-arrow)"/>
+      <path class="dg-edge" d="M755 90 L755 138" marker-end="url(#ad-arrow)"/>
+      <rect class="dg-node" x="680" y="140" width="150" height="50" rx="4"/><text class="dg-label" x="755" y="162">anim commit</text><text class="dg-sub" x="755" y="178">FUN_8004AD80</text>
+      <rect class="dg-node-accent" x="460" y="140" width="150" height="50" rx="4"/><text class="dg-label" x="535" y="162">materialized record</text><text class="dg-sub" x="535" y="178">actor+0x4C</text>
+      <rect class="dg-node" x="210" y="140" width="150" height="50" rx="4"/><text class="dg-label" x="285" y="162">damage kernel</text><text class="dg-sub" x="285" y="178">FUN_801EC3E4</text>
+      <rect class="dg-node" x="460" y="240" width="150" height="50" rx="4"/><text class="dg-label" x="535" y="262">cue playout</text><text class="dg-sub" x="535" y="278">FUN_801DEA50</text>
+      <path class="dg-edge" d="M680 165 L612 165" marker-end="url(#ad-arrow)"/>
+      <path class="dg-edge" d="M460 165 L362 165" marker-end="url(#ad-arrow)"/>
+      <text class="dg-edge-label" x="411" y="157" text-anchor="middle">+0x24 power</text>
+      <path class="dg-edge" d="M535 190 L535 238" marker-end="url(#ad-arrow)"/>
+      <text class="dg-edge-label" x="543" y="219">hit run</text>
+      <path class="dg-edge-dim" d="M20 312 L840 312"/>
+      <text class="dg-sub dg-start" x="20" y="336">what the menu draws - SCUS</text>
+      <rect class="dg-node" x="20" y="350" width="150" height="50" rx="4"/><text class="dg-label" x="95" y="372">arts-name table</text><text class="dg-sub" x="95" y="388">SCUS DAT_80075EC4</text>
+      <rect class="dg-node" x="460" y="350" width="150" height="50" rx="4"/><text class="dg-label" x="535" y="372">Arts menu display</text>
+      <path class="dg-edge" d="M170 375 L458 375" marker-end="url(#ad-arrow)"/>
+      <text class="dg-edge-label" x="314" y="367" text-anchor="middle">+8 glyphs, +2 AP, +0xC name</text>
+    </svg>
+    <figcaption>The two places an art lives. The matcher fires off the player-file record and the damage and cues come from the record it materializes; the menu's arrows, AP and name come from the separate SCUS table - which is why editing one without the other makes the menu lie.</figcaption>
+  </figure>
+</section>
+
+<section class="doc-section" id="art-record-layout">
+  <h2>Art record layout</h2>
+  <p>One <code>0xD0</code>-byte record per action constant. Solid cells are byte-pinned; the hatched span is schema-then-walk - its fields are known in order but their exact offsets vary per art.</p>
+  <div class="byte-map" role="img" aria-label="Art record bytes 0x00 to 0x28: command sequence with action constant and anim index, 20-byte name slot at 0x10, power run at 0x24">
+    <div class="bm-cell bm-accent" style="--w:10"><span class="bm-off">+0x00</span><span class="bm-name">commands (1=L 2=R 3=D 4=U, 0 ends)</span><span class="bm-size">u8[]</span></div>
+    <div class="bm-cell" style="--w:2"><span class="bm-off">after</span><span class="bm-name">const</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell" style="--w:4"><span class="bm-off">after</span><span class="bm-name">anim + extras</span><span class="bm-size">u8 + u8[5]</span></div>
+    <div class="bm-cell" style="--w:20"><span class="bm-off">+0x10</span><span class="bm-name">name slot</span><span class="bm-size">20 bytes</span></div>
+    <div class="bm-cell bm-accent" style="--w:6"><span class="bm-off">+0x24</span><span class="bm-name">power run</span><span class="bm-size">u8[1..4]</span></div>
+  </div>
+  <div class="byte-map" role="img" aria-label="Art record bytes 0x28 to 0xD0, not to scale: variable tail of hit timing, cues, status and repeat fields; effect class byte at 0x7A; action-entry tail to 0xD0">
+    <div class="bm-cell bm-pad" style="--w:6"><span class="bm-off">+0x28</span><span class="bm-name">hit timing, cues, status, repeat, background (Inferred)</span><span class="bm-size">variable</span></div>
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+0x7A</span><span class="bm-name">effect class</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell bm-dim" style="--w:5"><span class="bm-off">+0x7B</span><span class="bm-name">action-entry tail</span><span class="bm-size">to +0xD0</span></div>
+  </div>
+  <p>The second row is not to scale. The <code>0x24</code>-byte matcher head is followed by a standard battle action entry (see <a href="battle-data-pack.html#battle-animations">player files &sect; battle animations</a>).</p>
+  <table>
+    <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>command sequence</td><td><code>1</code>=L <code>2</code>=R <code>3</code>=D <code>4</code>=U, <code>0</code>-terminated. A Super Art record's field is a one-byte stub (no combo).</td></tr>
+      <tr><td>action constant</td><td><code>0x1B..=0x32</code> (<a href="#action-constants">below</a>).</td></tr>
+      <tr><td><code>anim_index</code>, <code>anim_extra</code></td><td>Primary animation slot; extras chain multi-stage arts (Noa's Hurricane Kick).</td></tr>
+      <tr><td>name</td><td>Fixed-width name slot; populated for Super, Miracle and some Hyper Arts.</td></tr>
+      <tr><td>power run</td><td>Per-strike damage tier bytes (<a href="#power-encoding">encoding</a>). <strong>Confirmed</strong>; editor <code>legaia_arts_patch::arts_power</code>.</td></tr>
+      <tr><td>impact-effect class</td><td><code>1..=5</code>, <code>0</code> = none. Selects the element spark and afterimage tint - this byte, not the cue script, makes an art read as its element.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure">
+    <summary>Variable-field tail (Inferred positions)</summary>
+    <div class="disclosure-body">
+      <table>
+        <thead><tr><th>Field</th><th>Encoding</th></tr></thead>
+        <tbody>
+          <tr><td>Damage timing (&times;4)</td><td>One byte per power byte: the animation frame at which that hit fires.</td></tr>
+          <tr><td>Special effect cues (&times;2)</td><td>2 words each: half-word effect id, then XYZ half-words. Active iff non-zero.</td></tr>
+          <tr><td>Hit effect cues (&times;4)</td><td>One word each: high half = frame, low half = cue code.</td></tr>
+          <tr><td>Identifier</td><td>Byte; some values trigger special animations (<code>0x67</code> in Heaven's Drop = Thunderbolt).</td></tr>
+          <tr><td>Anim speed</td><td>Byte; lower = slower.</td></tr>
+          <tr><td>Effect on enemy</td><td>Status byte, the entry <code>+0x7A</code> selector: <code>1</code> / <code>2</code> tint only, <code>3</code> sets status bit <code>0x1</code>, <code>4</code> bit <code>0x2</code>, <code>5</code> one of bits <code>0x08</code> / <code>0x10</code> / <code>0x20</code> on a party target, <code>6</code> bit <code>0x1000</code>; <code>7</code> and up write nothing (<code>FUN_801EC3E4</code>). No party art carries a value above <code>2</code>; Tough Love and Love You carry <code>0</code> and get their status from the clip-key arm of <code>FUN_8004CE2C</code> instead.</td></tr>
+          <tr><td>Repeat frames</td><td>3 bytes: count, start, end. Replays a frame range and any hits inside it (Super Tempest: 4 power bytes, 8 hits).</td></tr>
+          <tr><td>Background</td><td><code>0</code> regular, <code>2</code> black (Super Arts, Tornado Flame).</td></tr>
+          <tr><td>Runtime address</td><td>Word written after first use; always zero on disc.</td></tr>
+        </tbody>
+      </table>
+      <p>The runtime hit run the per-frame cue player walks sits at <code>record + 0x14 + cursor &times; 8</code> (8-byte entries: timing, cue code, XYZ). Cue-code high bit = spawn an <a href="effect.html"><code>efect.dat</code></a> billboard; a plain code selects a 3D move-VM prototype. Target-group codes: <code>&lt; 8</code> one actor, <code>8</code> the party, <code>9</code> the enemy row, <code>0xA</code> everyone.</p>
+    </div>
+  </details>
+
+  <h3 id="power-encoding">Power encoding</h3>
+  <p>Each power byte names a defence target and a multiplier. Retail authors the run ascending; weak arts carry one byte, Hyper and Super Arts four.</p>
+  <table>
+    <thead><tr><th>Byte range</th><th>Target</th><th>Multipliers</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x16-0x1A</code></td><td>UDF (upper defence)</td><td><code>12, 18, 20, 22, 28</code></td><td>Standard high hit.</td></tr>
+      <tr><td><code>0x1B-0x1F</code></td><td>LDF (lower defence)</td><td><code>12, 18, 20, 22, 28</code></td><td>Standard low hit.</td></tr>
+      <tr><td><code>0x0C-0x10</code></td><td>UDF</td><td>same</td><td>Misses <strong>short</strong> enemies.</td></tr>
+      <tr><td><code>0x11-0x15</code></td><td>LDF</td><td>same</td><td>Misses <strong>floating</strong> enemies.</td></tr>
+      <tr><td>other</td><td>-</td><td>-</td><td>No damage.</td></tr>
+    </tbody>
+  </table>
+
+  <h3 id="indexed-by-constant">Indexed by action constant, not by combo</h3>
+  <ul class="bullets">
+    <li>Constants <code>0x19</code> / <code>0x1A</code> (the two Art Starters) land on the two "Starter" records, <code>0x1B</code> on the Miracle Art, regular arts at <code>0x1B + display index</code>.</li>
+    <li><strong>Super Art finishers have records too</strong> - <code>0x2B..0x2F</code> (Vahn, Gala), <code>0x2E..0x32</code> (Noa) - with real power tiers, so Super damage is ordinary record data.</li>
+    <li>Some records are reachable by neither route (Vahn's and Gala's <code>0x2A</code>, Noa's <code>0x2C</code>/<code>0x2D</code>): named, powered, but no menu row and no combo.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="action-constants">
+  <h2>Action constants</h2>
+  <p>Every entry in the battle action queue is one of these bytes:</p>
+  <table>
+    <thead><tr><th>Byte</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x00-0x05</code></td><td>Nothing, Item, Magic, Attack, Spirit, Escape</td></tr>
+      <tr><td><code>0x07 / 0x08</code></td><td>Faint animations 1 / 2</td></tr>
+      <tr><td><code>0x0A / 0x0B</code></td><td>Item-or-magic animation / block animation</td></tr>
+      <tr><td><code>0x0C-0x0F</code></td><td>Left, Right, Down, Up</td></tr>
+      <tr><td><code>0x10</code></td><td>Spirit animation</td></tr>
+      <tr><td><code>0x11-0x18</code></td><td>Empty slots (never in static data)</td></tr>
+      <tr><td><code>0x19 / 0x1A</code></td><td>Regular / Special Art Starter</td></tr>
+      <tr><td><code>0x1B-0x32</code></td><td>Per-character arts - the same constant is a different art per character (<code>crates/art/src/tables.rs</code>)</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure">
+    <summary>Learned-art slots and animation slots per character</summary>
+    <div class="disclosure-body">
+      <p>A per-character byte (<code>0x8008488D</code> Vahn, <code>0x80084CA1</code> Noa, <code>0x8008506C</code> Gala) tracks the highest learned slot; slots resolve to constants through a table with holes (Noa skips <code>0x02</code>/<code>0x03</code> because one learned slot covers all three Hurricane Kick levels). API: <code>legaia_art::learned_art_action(character, slot)</code>.</p>
+      <table>
+        <thead><tr><th>Slot</th><th>Vahn</th><th>Noa</th><th>Gala</th></tr></thead>
+        <tbody>
+          <tr><td><code>0x00</code></td><td>Vahn's Craze</td><td>Noa's Ark</td><td>Biron Rage</td></tr>
+          <tr><td><code>0x01</code></td><td>Burning Flare</td><td>Hurricane Kick</td><td>Explosive Fist</td></tr>
+          <tr><td><code>0x02</code></td><td>Fire Blow</td><td>-</td><td>Lightning Storm</td></tr>
+          <tr><td><code>0x03</code></td><td>Tornado Flame</td><td>-</td><td>Thunder Punch</td></tr>
+          <tr><td><code>0x04</code></td><td>Cyclone</td><td>Vulture Blade</td><td>Bull Horns</td></tr>
+          <tr><td><code>0x05</code></td><td>Hurricane</td><td>Frost Breath</td><td>Electro Thrash</td></tr>
+          <tr><td><code>0x06</code></td><td>PK Combo</td><td>Tempest Break</td><td>Neo Raising</td></tr>
+          <tr><td><code>0x07</code></td><td>Spin Combo</td><td>Rushing Gale</td><td>Black Rain</td></tr>
+          <tr><td><code>0x08</code></td><td>Pyro Pummel</td><td>Tough Love</td><td>Side Kick</td></tr>
+          <tr><td><code>0x09</code></td><td>Cross-Kick</td><td>Swan Driver</td><td>Head-Splitter</td></tr>
+          <tr><td><code>0x0A</code></td><td>Power Punch</td><td>Bird Step</td><td>Guillotine</td></tr>
+          <tr><td><code>0x0B</code></td><td>Slash Kick</td><td>Dolphin Attack</td><td>Back Punch</td></tr>
+          <tr><td><code>0x0C</code></td><td>Somersault</td><td>Mirage Lancer</td><td>Ironhead</td></tr>
+          <tr><td><code>0x0D</code></td><td>Charging Scorch</td><td>Blizzard Bash</td><td>Battering Ram</td></tr>
+          <tr><td><code>0x0E</code></td><td>Hyper Elbow</td><td>Sonic Javelin</td><td>Flying Knee Attack</td></tr>
+          <tr><td><code>0x0F</code></td><td>-</td><td>Acrobatic Blitz</td><td>-</td></tr>
+          <tr><td><code>0x10</code></td><td>-</td><td>Lizard Tail</td><td>-</td></tr>
+        </tbody>
+      </table>
+      <p>Slot constants run <code>0x1B + slot</code>. The record's <code>anim_index</code> indexes a separate per-character animation table (slot <code>0</code> = Spirit, <code>3</code> = Art Starter, with holes); API <code>legaia_art::art_anim_name(character, anim_index)</code>.</p>
+      <table>
+        <thead><tr><th>Anim</th><th>Vahn</th><th>Noa</th><th>Gala</th></tr></thead>
+        <tbody>
+          <tr><td><code>0x01</code></td><td>Power Punch</td><td>Tempest Break</td><td>Bull Horns</td></tr>
+          <tr><td><code>0x02</code></td><td>Slash Kick</td><td>Tough Love</td><td>Head-Splitter</td></tr>
+          <tr><td><code>0x04</code></td><td>Tornado Flame</td><td>Hurricane Kick 1</td><td>Lightning Storm</td></tr>
+          <tr><td><code>0x05</code></td><td>Hurricane</td><td>Hurricane Kick 2</td><td>Back Punch</td></tr>
+          <tr><td><code>0x06</code></td><td>Charging Scorch</td><td>Rushing Gale</td><td>Ironhead</td></tr>
+          <tr><td><code>0x07</code></td><td>PK Combo</td><td>Swan Driver</td><td>Battering Ram</td></tr>
+          <tr><td><code>0x08</code></td><td>Fire Blow</td><td>Frost Breath</td><td>Flying Knee Attack</td></tr>
+          <tr><td><code>0x09</code></td><td>Somersault</td><td>Lizard Tail</td><td>-</td></tr>
+          <tr><td><code>0x0A</code></td><td>Cyclone</td><td>Jurassic Blow 2</td><td>Thunder Punch</td></tr>
+          <tr><td><code>0x0B</code></td><td>Hyper Elbow</td><td>Bird Step</td><td>Guillotine</td></tr>
+          <tr><td><code>0x0C</code></td><td>-</td><td>Dolphin Attack</td><td>Explosive Fist</td></tr>
+          <tr><td><code>0x0D</code></td><td>Burning Flare</td><td>Vulture Blade</td><td>Black Rain</td></tr>
+          <tr><td><code>0x0E</code></td><td>Spin Combo</td><td>Mirage Lancer</td><td>-</td></tr>
+          <tr><td><code>0x0F</code></td><td>Pyro Pummel</td><td>Blizzard Bash</td><td>-</td></tr>
+          <tr><td><code>0x10</code></td><td>Cross-Kick</td><td>Sonic Javelin</td><td>Side Kick</td></tr>
+          <tr><td><code>0x11</code></td><td>Acrobatic Blitz</td><td>Electro Thrash</td><td>-</td></tr>
+          <tr><td><code>0x12</code></td><td>-</td><td>-</td><td>Neo Raising</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="miracle-arts">
+  <h2>Miracle Arts</h2>
+  <p>Each character has one. When the exact sequence is entered, the runtime clears the whole action queue and writes the art's replacement string: four directionals, the Special Starter, then the finisher constants. On disc the four directionals carry the high bit (<code>0x8C..0x8F</code>); the copy masks them to <code>0x0C..0x0F</code>.</p>
+  <table>
+    <thead><tr><th>Character</th><th>Art</th><th>Input</th></tr></thead>
+    <tbody>
+      <tr><td>Vahn</td><td>Vahn's Craze</td><td>R D L U L U R D L</td></tr>
+      <tr><td>Noa</td><td>Noa's Ark</td><td>L U R D U L U D R</td></tr>
+      <tr><td>Gala</td><td>Biron Rage</td><td>R R D U D U D L L</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="doc-section" id="super-arts">
+  <h2>Super Arts</h2>
+  <p>A Super Art is never matched against the raw input. The game first <em>tokenizes</em> the arrows into arts, then looks for a registered Find pattern at the tail of the queue and replaces it with the Super's finisher.</p>
+  <ol class="steps">
+    <li><b>Input arrows</b><span>The player types 7-9 directions, e.g. <code>&uarr;&darr;&uarr;&uarr;&uarr;&darr;&uarr;</code>.</span></li>
+    <li><b>Tokenize</b><span>Tail-first: each matched art overwrites its <strong>last</strong> arrow with a Starter (<code>0x19</code>) and inserts its constant; leading arrows stay, so one arrow can belong to two arts. Restarts after every match.</span></li>
+    <li><b>Queue</b><span><code>19 27 0F 19 1F 0E 19 27</code> in <code>actor[+0x1DF]</code> - Somersault, Cyclone, Somersault overlapping.</span></li>
+    <li><b>Find at tail</b><span>Table <code>0x801F6524</code>: the pattern must end the queue and every chain art must have paid its AP.</span></li>
+    <li><b>Replace</b><span>Table <code>0x801F65E8</code>: <code>&hellip; 1A 2B 2B 2B</code> - Special Starter + Tri-Somersault &times; 3 hits. AP is the chain's sum; the Super charges none of its own.</span></li>
+  </ol>
+  <p>Because the Find pattern is what the <em>physical input</em> tokenizes to, laying the chain arts end to end does not trigger it. Every retail Super derives to a unique shortest input; fourteen of fifteen agree with the public walkthrough table (Dragon Fangs' printed six-arrow input drops one arrow and never performs Swan Driver).</p>
+  <table>
+    <thead><tr><th>Character</th><th>Super Art</th><th>Chain</th><th>Input</th><th>AP</th></tr></thead>
+    <tbody>
+      <tr><td>Vahn</td><td>Tri-Somersault</td><td>Somersault, Cyclone, Somersault</td><td><code>&uarr;&darr;&uarr;&uarr;&uarr;&darr;&uarr;</code></td><td>60</td></tr>
+      <tr><td>Vahn</td><td>Maximum Blow</td><td>Charging Scorch, Slash Kick, Power Punch</td><td><code>&darr;&rarr;&uarr;&darr;&larr;&larr;&darr;</code></td><td>54</td></tr>
+      <tr><td>Vahn</td><td>Fire Tackle</td><td>Hyper Elbow, Power Punch, Charging Scorch</td><td><code>&larr;&rarr;&larr;&larr;&darr;&rarr;&uarr;</code></td><td>54</td></tr>
+      <tr><td>Vahn</td><td>Power Slash</td><td>Charging Scorch, Somersault, Slash Kick</td><td><code>&darr;&rarr;&uarr;&darr;&uarr;&darr;&larr;</code></td><td>54</td></tr>
+      <tr><td>Vahn</td><td>Rolling Combo</td><td>Spin Combo, Power Punch, PK Combo</td><td><code>&uarr;&darr;&rarr;&larr;&larr;&darr;&uarr;&uarr;&larr;</code></td><td>66</td></tr>
+      <tr><td>Noa</td><td>Triple Lizard</td><td>Bird Step, Swan Driver, Lizard Tail</td><td><code>&darr;&darr;&darr;&uarr;&uarr;&uarr;&darr;&uarr;</code></td><td>66</td></tr>
+      <tr><td>Noa</td><td>Super Javelin</td><td>Rushing Gale, Sonic Javelin</td><td><code>&uarr;&uarr;&larr;&darr;&rarr;&darr;&rarr;</code></td><td>48</td></tr>
+      <tr><td>Noa</td><td>Super Tempest</td><td>Dolphin Attack, Tempest Break</td><td><code>&rarr;&rarr;&larr;&rarr;&rarr;&larr;&uarr;&uarr;&uarr;</code></td><td>60</td></tr>
+      <tr><td>Noa</td><td>Love You</td><td>Mirage Lancer, Lizard Tail, Tough Love</td><td><code>&rarr;&rarr;&uarr;&uarr;&darr;&uarr;&darr;&larr;&rarr;</code></td><td>72</td></tr>
+      <tr><td>Noa</td><td>Dragon Fangs</td><td>Lizard Tail, Swan Driver, Acrobatic Blitz</td><td><code>&uarr;&darr;&uarr;&uarr;&uarr;&darr;&darr;</code></td><td>60</td></tr>
+      <tr><td>Gala</td><td>Back Punch x3</td><td>Ironhead, Flying Knee Attack, Back Punch</td><td><code>&uarr;&darr;&darr;&uarr;&larr;&rarr;&larr;</code></td><td>54</td></tr>
+      <tr><td>Gala</td><td>Super Ironhead</td><td>Flying Knee Attack, Head-Splitter, Ironhead</td><td><code>&darr;&uarr;&larr;&uarr;&uarr;&darr;&darr;</code></td><td>54</td></tr>
+      <tr><td>Gala</td><td>Rushing Crush</td><td>Battering Ram, Flying Knee Attack, Head-Splitter</td><td><code>&larr;&rarr;&darr;&uarr;&larr;&uarr;&uarr;</code></td><td>54</td></tr>
+      <tr><td>Gala</td><td>Heaven's Drop</td><td>Flying Knee Attack, Head-Splitter, Black Rain</td><td><code>&darr;&uarr;&larr;&uarr;&uarr;&larr;&darr;&darr;</code></td><td>60</td></tr>
+      <tr><td>Gala</td><td>Neo Static Raising</td><td>Back Punch, Guillotine, Neo Raising</td><td><code>&larr;&rarr;&larr;&uarr;&larr;&larr;&rarr;&uarr;&larr;</code></td><td>66</td></tr>
+    </tbody>
+  </table>
+  <p>Tables: <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/crates/art/src/super_art.rs"><code>crates/art/src/super_art.rs</code></a>, <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/crates/art/src/miracle.rs"><code>miracle.rs</code></a>.</p>
+</section>
+
+<section class="doc-section" id="arts-name-table">
+  <h2>Arts-name table (SCUS)</h2>
+  <p>Display names, arrows and AP costs live in a static 20-byte-stride table in <code>SCUS_942.54</code>, sorted by character and terminated by a <code>(99, 99)</code> "End" row. Each character's index <code>0</code> is the Miracle Art (AP byte <code>99</code>). This is also the table the <a href="mes.html#bytecode-encoding">MES <code>0xC5</code></a> substitution reads.</p>
+  <table class="layout">
+    <thead><tr><th>Offset</th><th>Type</th><th>Field</th></tr></thead>
+    <tbody>
+      <tr><td><code>+0</code></td><td>u8</td><td>character: <code>0</code> Vahn, <code>1</code> Noa, <code>2</code> Gala</td></tr>
+      <tr><td><code>+1</code></td><td>u8</td><td>art display index</td></tr>
+      <tr><td><code>+2</code></td><td>u8</td><td>AP cost - a <strong>display mirror</strong>; the battle path computes <code>multiplier &times; command count</code> from code immediates and retail keeps the two consistent by authoring (<a href="../subsystems/arts-command-gauge.html">arts gauge</a>)</td></tr>
+      <tr><td><code>+4</code></td><td>u16</td><td>per-art tier constant with <strong>no reader anywhere on the disc</strong> - see below</td></tr>
+      <tr><td><code>+8</code></td><td>u32</td><td>pointer to the arrow-glyph string: <code>[count]</code> then two-byte glyphs <code>0x81A9</code> L, <code>0x81A8</code> R, <code>0x81AB</code> D, <code>0x81AA</code> U; a <code>0xFF06</code> / <code>0xFF09</code> marker is not a direction</td></tr>
+      <tr><td><code>+0xC</code></td><td>u32</td><td>pointer to the name string</td></tr>
+      <tr><td><code>+0x10</code></td><td>u32</td><td>aux string pointer</td></tr>
+    </tbody>
+  </table>
+  <p>The <code>+4</code> halfword is authored data the runtime never consults. Eight sites materialise the table base (<code>addiu rX, rY, 0x5EC4</code>); walking every load whose base descends from one of them, with the displacement tracked through the <code>addiu</code>/<code>addu</code>/<code>sll</code> chain, reaches the record only at <code>+0</code>, <code>+1</code>, <code>+2</code>, <code>+8</code>, <code>+0xC</code> and <code>+0x10</code> - never <code>+4</code> or <code>+6</code> - and a five-form sweep for <code>0x80075EC8</code> finds no reference in any image. The values are a per-art tier ladder keyed to the art&rsquo;s position in its character&rsquo;s list: <code>60000</code> for the Miracle Art, <code>50000</code>/<code>40000</code>/<code>30000</code> for the three elemental arts, <code>20000</code> for Noa&rsquo;s Tempest Break, then <code>15000</code>/<code>10000</code>/<code>5000</code> for the six-, five- and four-input arts, and <code>1</code> on the terminator. It is not an AP mirror (Noa&rsquo;s 70-AP and Vahn&rsquo;s 50-AP index-1 arts share <code>50000</code>) and not the input count (five-input arts appear at both <code>40000</code> and <code>10000</code>).</p>
+  <p>The glyph string stores the <strong>physical</strong> direction (Noa's Arms / Ra-Seru are swapped) and is the oracle for both the record parser and the curated <a href="../reference/gamedata.html">gamedata</a> arts table - every AP agrees, and one walkthrough error surfaces (Vahn's Hyper Elbow is <code>L R L</code> on disc). Decoder <code>legaia_art::arts_table::parse_from_scus</code>; dump with <code>art arts-table</code>.</p>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <p>The fixed fields are read off the overlay damage kernel, queue builder and cue player's disassembly; the Super tables are validated against a captured resident queue, and every record's command bytes agree with the SCUS name table's glyph strings.</p>
+  <details class="disclosure">
+    <summary>Provenance: functions and tables</summary>
+    <div class="disclosure-body">
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Function</th><th>Address</th><th>What it proves</th><th>Dump</th></tr></thead>
+    <tbody>
+      <tr><td>Damage kernel</td><td><code>FUN_801EC3E4</code> (overlay 0898)</td><td>Reads the strike's power byte at <code>art_record[+0x24 + cursor]</code>, cursor at <code>actor+0x1F4</code>; bounds <code>+0x7A</code> to <code>&lt; 6</code>.</td><td>-</td></tr>
+      <tr><td>Art materialiser</td><td><code>FUN_8004AD80</code></td><td><code>actor[+0x4C] = DAT_801C9360[char][slot]</code> - the runtime copy of <code>record[0]</code>; fires the CD-XA shout and Hyper fanfare.</td><td>-</td></tr>
+      <tr><td>Queue builder / tokenizer</td><td><code>FUN_801EED1C</code> (<code>0x801EF2EC..0x801EF858</code>)</td><td>Emits a matched art's constant as row <code>+0x18</code>; Starter over the last arrow, leading arrows kept, tail-first restart.</td><td>-</td></tr>
+      <tr><td>Super tables</td><td>find <code>0x801F6524</code>, replace <code>0x801F65E8</code></td><td>15 entries, capture-validated against a resident queue.</td><td>-</td></tr>
+      <tr><td>Cue playout</td><td><code>FUN_801DEA50</code>, <code>FUN_801E22C8</code>, <code>FUN_801E09F8</code></td><td>Per-frame hit-cue walk at <code>+0x14 + cursor&times;8</code>; per-art cue list at <code>0x801F6470</code>; special-attack sibling.</td><td><code>ghidra/scripts/funcs/overlay_battle_action_801dea50.txt</code></td></tr>
+      <tr><td>Element renderers</td><td><code>FUN_8004998C</code>, <code>FUN_80049348</code></td><td>Spark along the swing path and afterimage tint keyed on <code>actor[+0x21F]</code> (the <code>+0x7A</code> class); neither reads the cue records.</td><td>-</td></tr>
+      <tr><td>Name-table expander</td><td><code>FUN_80036514</code></td><td>Scans <code>DAT_80075EC4</code> rows by <code>(character, index)</code>; returns the <code>+0xC</code> name pointer.</td><td>-</td></tr>
+      <tr><td>AP display read</td><td><code>0x801D4524</code> in <code>FUN_801D33D8</code> (overlay 0899)</td><td>The only reader of the name table's <code>+2</code> byte is the status-panel renderer.</td><td>-</td></tr>
+    </tbody>
+  </table>
+  </div>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../subsystems/battle-action.html">Battle action SM</a>
+    <a href="../subsystems/battle-formulas.html">Battle formulas</a>
+    <a href="../subsystems/arts-command-gauge.html">Arts command gauge</a>
+    <a href="battle-data-pack.html">Player battle files</a>
+    <a href="move-power.html">Move-power table</a>
+    <a href="mdt.html">MDT move tables</a>
+    <a href="effect.html">Effect bundles</a>
+    <a href="mes.html">MES (0xC5 art-name substitution)</a>
+    <a href="../arts.html">Arts page</a>
+    <a href="../tooling/randomizer.html">Randomizer (arts)</a>
+    <a href="../reference/gamedata.html">Curated gamedata</a>
+    <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/formats/art-data.md">Full doc: art-data.md</a>
+  </div>
+</section>

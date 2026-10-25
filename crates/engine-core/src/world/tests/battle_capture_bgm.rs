@@ -1,0 +1,719 @@
+use super::*;
+use legaia_engine_mode::mode::SceneMode;
+
+#[test]
+fn capture_banks_points_and_learns_on_finish_battle() {
+    let mut world = capture_world(2);
+    // Two monsters captured this battle: Killer Bee (Seru 1, learns) and
+    // Wolf (no Seru, banks nothing).
+    world.seru.battle_captures = vec![7, 9];
+
+    world.finish_battle();
+
+    // battle_captures always drained.
+    assert!(world.seru.battle_captures.is_empty());
+    // Both party slots learned Spark (id 0x20).
+    assert!(world.seru.log.has_learned(0, 1));
+    assert!(world.seru.log.has_learned(1, 1));
+    assert_eq!(world.seru.log.learned_spells(0), &[0x20]);
+    // One accepted outcome (the Wolf had no Seru), with two learn events.
+    let outcomes = world.drain_last_capture_outcomes();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].learns.len(), 2);
+    // Outcomes drained.
+    assert!(world.drain_last_capture_outcomes().is_empty());
+}
+
+#[test]
+fn capture_below_threshold_banks_points_without_learning() {
+    let mut world = capture_world(1);
+    world.seru.battle_captures = vec![8]; // Slime -> Seru 2, 40 < 100
+
+    world.finish_battle();
+
+    assert!(!world.seru.log.has_learned(0, 2), "not learned yet");
+    assert_eq!(world.seru.log.row(0, 2).points, 40, "points banked");
+    let outcomes = world.drain_last_capture_outcomes();
+    assert_eq!(outcomes.len(), 1);
+    assert!(outcomes[0].learns.is_empty());
+}
+
+#[test]
+fn capture_sets_the_banner_and_it_clears_on_tick() {
+    use legaia_engine_battle::seru_learning::CaptureState;
+
+    let mut world = capture_world(1);
+    world.set_spell_catalog(legaia_engine_battle::spells::SpellCatalog::vanilla());
+    world.seru.battle_captures = vec![7]; // Killer Bee -> Seru 1 (Spark), learns
+    world.finish_battle();
+
+    // The banner opens on the capture phase naming the captured Seru.
+    let banner = world
+        .party
+        .current_capture_banner
+        .as_ref()
+        .expect("capture banner set");
+    assert_eq!(banner.seru_name(), "Spark");
+    assert!(matches!(banner.state(), CaptureState::Capturing { .. }));
+    assert_eq!(banner.current_banner().as_deref(), Some("Captured: Spark!"));
+    // A learn event was recorded (party slot 0 crossed the threshold).
+    assert_eq!(banner.learns().len(), 1);
+
+    // Drive the banner to completion via World::tick (Field mode after the
+    // battle). The default durations are 60 capture + 90 announce frames.
+    for _ in 0..(60 + 90 + 4) {
+        world.tick();
+    }
+    assert!(
+        world.party.current_capture_banner.is_none(),
+        "banner clears after its phases elapse"
+    );
+}
+
+#[test]
+fn sub_threshold_capture_banner_shows_no_learn_line() {
+    let mut world = capture_world(1);
+    world.seru.battle_captures = vec![8]; // Slime -> Seru 2, 40 < 100, no learn
+    world.finish_battle();
+
+    let banner = world
+        .party
+        .current_capture_banner
+        .as_ref()
+        .expect("capture banner set even without a learn");
+    assert_eq!(banner.seru_name(), "Slow");
+    assert!(banner.learns().is_empty());
+}
+
+#[test]
+fn battle_bgm_swaps_on_encounter_and_restores_on_finish() {
+    use legaia_engine_battle::monster_catalog::{FormationDef, FormationSlot};
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.actors[0].battle.hp = 100;
+    world.audio.current_bgm = Some(0x0A); // field track playing
+    world.set_battle_bgm(Some(0x40)); // configured battle track
+    let formation = FormationDef::new(7, vec![FormationSlot::new(1)]);
+
+    world.enter_battle_from_formation(&formation);
+
+    // Swapped to the battle track, with a start event queued for the host.
+    assert_eq!(world.audio.current_bgm, Some(0x40));
+    assert!(world.audio.battle_bgm_active);
+    let evs = world.drain_field_events();
+    assert!(
+        evs.iter().any(|e| matches!(
+            e,
+            FieldEvent::Bgm {
+                text_id: 0x40,
+                sub_op: 1
+            }
+        )),
+        "battle BGM start queued: {evs:?}"
+    );
+
+    // Finish (no formation/loot) restores the field track + queues its start.
+    world.finish_battle();
+    assert_eq!(world.audio.current_bgm, Some(0x0A));
+    assert!(!world.audio.battle_bgm_active);
+    let evs = world.drain_field_events();
+    assert!(
+        evs.iter().any(|e| matches!(
+            e,
+            FieldEvent::Bgm {
+                text_id: 0x0A,
+                sub_op: 1
+            }
+        )),
+        "field BGM restore queued: {evs:?}"
+    );
+}
+
+/// The shipped default carries retail's standard battle theme, so a host
+/// that arms the loop with `LiveLoopOpts::playable()` gets the Battle↔Field
+/// swap without configuring anything. The swap used to default to `None` on
+/// both hosts, which kept the field track playing through every fight.
+#[test]
+fn playable_default_swaps_to_the_standard_battle_theme() {
+    use legaia_engine_battle::monster_catalog::{FormationDef, FormationSlot};
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.actors[0].battle.hp = 100;
+    world.audio.current_bgm = Some(2007); // a field track from the global pool
+    world.arm_live_loop("town01", &crate::live_loop::LiveLoopOpts::playable());
+    assert_eq!(
+        world.audio.battle_bgm,
+        Some(legaia_engine_system::music_labels::BATTLE_THEME_1_BGM_ID),
+        "playable() installs the retail battle theme by default"
+    );
+
+    let formation = FormationDef::new(7, vec![FormationSlot::new(1)]);
+    world.enter_battle_from_formation(&formation);
+    assert_eq!(
+        world.audio.current_bgm,
+        Some(legaia_engine_system::music_labels::BATTLE_THEME_1_BGM_ID)
+    );
+    assert!(world.audio.battle_bgm_active);
+
+    world.finish_battle();
+    assert_eq!(world.audio.current_bgm, Some(2007), "field track restored");
+    assert!(!world.audio.battle_bgm_active);
+}
+
+#[test]
+fn battle_bgm_unset_leaves_music_untouched() {
+    use legaia_engine_battle::monster_catalog::{FormationDef, FormationSlot};
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.actors[0].battle.hp = 100;
+    world.audio.current_bgm = Some(0x0A);
+    // No battle_bgm configured (default None) -> no swap, no events.
+    let formation = FormationDef::new(7, vec![FormationSlot::new(1)]);
+    world.enter_battle_from_formation(&formation);
+    assert_eq!(world.audio.current_bgm, Some(0x0A));
+    assert!(!world.audio.battle_bgm_active);
+    assert!(
+        !world
+            .drain_field_events()
+            .iter()
+            .any(|e| matches!(e, FieldEvent::Bgm { .. })),
+        "no BGM events when battle_bgm is unset"
+    );
+    world.finish_battle();
+    assert_eq!(world.audio.current_bgm, Some(0x0A));
+}
+
+#[test]
+fn battle_bgm_with_silent_field_stops_on_finish() {
+    use legaia_engine_battle::monster_catalog::{FormationDef, FormationSlot};
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.actors[0].battle.hp = 100;
+    world.audio.current_bgm = None; // no field music playing
+    world.set_battle_bgm(Some(0x40));
+    let formation = FormationDef::new(7, vec![FormationSlot::new(1)]);
+
+    world.enter_battle_from_formation(&formation);
+    assert_eq!(world.audio.current_bgm, Some(0x40));
+    let _ = world.drain_field_events();
+
+    world.finish_battle();
+    // Nothing to resume -> battle music stops (the engine's own stop word,
+    // not retail's sub-op 4, which re-attaches) and id clears.
+    assert_eq!(world.audio.current_bgm, None);
+    let evs = world.drain_field_events();
+    assert!(
+        evs.iter().any(|e| matches!(
+            e,
+            FieldEvent::Bgm {
+                sub_op: crate::world::BGM_SUB_OP_ENGINE_STOP,
+                ..
+            }
+        )),
+        "BGM stop queued when no field track to resume: {evs:?}"
+    );
+}
+
+#[test]
+fn learned_spell_is_offered_in_the_battle_spell_session() {
+    let mut world = capture_world(1);
+    world.set_spell_catalog(legaia_engine_battle::spells::SpellCatalog::vanilla());
+    // Caster has an empty roster spell list; learning Spark via capture
+    // should still surface it in the battle spell menu.
+    world.seru.battle_captures = vec![7];
+    world.finish_battle();
+    world.actors[0].battle.mp = 99;
+
+    let session = world
+        .build_battle_spell_session(0)
+        .expect("session builds for slot 0");
+    assert!(
+        session.spells.iter().any(|s| s.id == 0x20),
+        "captured Spark is castable: {:?}",
+        session.spells.iter().map(|s| s.id).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn battle_arts_synthetic_chain_runs_through_art_power_path_and_cycles_turn() {
+    use legaia_engine_battle_vm::battle_action::ActionState;
+    use legaia_engine_system::input::PadButton;
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.battle.player_driven = true;
+    world.mode = SceneMode::Battle;
+    world.actors[0].battle.max_hp = 200;
+    world.actors[0].battle.hp = 200;
+    world.actors[0].battle.liveness = 1;
+    world.set_battle_attack(0, 40);
+    world.actors[1].battle.max_hp = 500;
+    world.actors[1].battle.hp = 500;
+    world.actors[1].battle.liveness = 1;
+    world.set_battle_defense(1, 10);
+    // One saved chain, 3 directional commands (Left, Right, Down) -> 3 hits.
+    // No art record staged, so the row uses the synthetic ×12 profile.
+    world
+        .party
+        .saved_chains
+        .push(legaia_save::SavedChainRecord {
+            char_slot: 0,
+            name: "Combo".into(),
+            sequence: vec![1, 2, 3],
+        });
+
+    world.battle_ctx.active_actor = 0;
+    world.battle.arts_menu = Some(legaia_engine_battle::battle_arts::BattleArtsSession::new(
+        0,
+        0,
+        world.build_battle_arts_rows(0),
+    ));
+    assert_eq!(world.battle.arts_menu.as_ref().unwrap().arts[0].hits(), 3);
+
+    // Frame 1: Cross opens the target cursor.
+    world.set_pad(0);
+    world.set_pad(PadButton::Cross.mask());
+    world.tick_battle_arts_menu();
+    take_commit_begin(&mut world);
+    assert!(world.battle.arts_menu.is_some(), "still picking a target");
+
+    // Frame 2: Cross confirms the monster; the art runs.
+    world.set_pad(0);
+    world.set_pad(PadButton::Cross.mask());
+    world.tick_battle_arts_menu();
+    take_commit_begin(&mut world);
+
+    assert!(world.battle.arts_menu.is_none(), "arts menu closed");
+    // The confirm arms the SM's attack band with the queue the builder made
+    // of the three arrows - three swings and the terminator, retail's own
+    // answer to a string that matches no art (`0x0B + dir`).
+    assert_eq!(&world.actors[0].battle.params[..4], &[0x0C, 0x0D, 0x0E, 0]);
+    assert_eq!(
+        world.actors[1].battle.hp, 500,
+        "nothing lands before the band runs"
+    );
+    // Walk the band exactly as the play window's live loop does. A
+    // clip-less world resolves each staged byte as a zero-length clip: one
+    // hit per swing with the swing's own byte as its power byte, accumulated
+    // on the target, and the total landing on the last byte (retail's
+    // `ctx[+0x15] == 0xFF` + last-beat apply in `FUN_801EC3E4`).
+    let mut ended = false;
+    for _ in 0..400 {
+        if world.battle_ctx.action_state == ActionState::EndOfAction.as_byte()
+            || world.battle.command.is_some()
+        {
+            ended = true;
+            break;
+        }
+        world.set_pad(0);
+        live_tick(&mut world);
+        let _ = world.drain_battle_events();
+    }
+    assert!(ended, "the armed action ran to its end");
+    let hits = world.drain_battle_hit_events();
+    assert_eq!(hits.len(), 3, "one hit event per swing: {hits:?}");
+    assert_eq!(
+        hits.iter().map(|h| h.power_byte).collect::<Vec<_>>(),
+        vec![0x0C, 0x0D, 0x0E],
+        "each swing resolves with its own byte"
+    );
+    assert!(
+        hits.iter().all(|h| h.hit_index == 0),
+        "each swing is its own clip"
+    );
+    assert!(
+        hits.iter()
+            .all(|h| h.attacker_slot == 0 && h.target_slot == 1 && !h.is_art)
+    );
+    assert_eq!(
+        hits.iter().map(|h| h.applied).collect::<Vec<_>>(),
+        vec![false, false, true],
+        "the total lands on the last swing only"
+    );
+    let total: u32 = hits.iter().map(|h| u32::from(h.damage)).sum();
+    assert!(total > 0, "ATK 40 vs DEF 10 lands");
+    assert_eq!(
+        u32::from(hits[1].running_total),
+        u32::from(hits[0].damage) + u32::from(hits[1].damage),
+        "the running total accumulates hit by hit"
+    );
+    assert_eq!(hits[2].running_total, 0, "zeroed once applied");
+    assert_eq!(u32::from(world.actors[1].battle.hp), 500 - total);
+    // Through the SM the popups are per hit, like retail's rising numerals.
+    let fx: Vec<_> = world
+        .drain_battle_hit_fx()
+        .into_iter()
+        .filter(|f| f.target_slot == 1)
+        .collect();
+    assert_eq!(fx.len(), 3, "one popup per hit");
+    assert!(fx.iter().all(|f| !f.is_heal));
+    assert_eq!(fx.iter().map(|f| u32::from(f.amount)).sum::<u32>(), total);
+}
+
+#[test]
+fn battle_arts_uses_staged_art_record_power_tiers_and_status() {
+    use legaia_art::power::PowerByte;
+    use legaia_art::queue::{ActionConstant, Command};
+    use legaia_art::record::EnemyEffect;
+    use legaia_engine_battle_vm::battle_action::ActionState;
+    use legaia_engine_system::input::PadButton;
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.battle.player_driven = true;
+    world.mode = SceneMode::Battle;
+    world.actors[0].battle.liveness = 1;
+    world.set_battle_attack(0, 64);
+    world.actors[1].battle.max_hp = 4000;
+    world.actors[1].battle.hp = 4000;
+    world.actors[1].battle.liveness = 1;
+    // UDF / LDF split so the record's per-strike target picks the right half.
+    world.set_battle_defense_split(1, Some((10, 40)));
+
+    // Stage a Vahn art: two damage strikes (UDF ×28, LDF ×28) that burns. A
+    // normal-art constant (`0x1F+`): the queue-builder tokenizes only those
+    // (the Miracle / Hyper ordinals take retail's other arm).
+    let rec = legaia_art::ArtRecord {
+        action: ActionConstant::Art1F,
+        commands: vec![Command::Up, Command::Up],
+        anim_index: 0,
+        anim_extra: vec![],
+        name: None,
+        power: vec![PowerByte::from_byte(0x1A), PowerByte::from_byte(0x1F)],
+        dmg_timing: vec![],
+        effect_cues: Default::default(),
+        hit_cues: vec![],
+        identifier: 0,
+        anim_speed: 0,
+        enemy_effect: EnemyEffect::Toxic,
+        repeat_frames: Default::default(),
+        background: 0,
+        runtime_address: None,
+    };
+    world.set_art_record(legaia_art::Character::Vahn, ActionConstant::Art1F, rec);
+
+    // Saved chain ending in the art's command string (Up, Up).
+    world
+        .party
+        .saved_chains
+        .push(legaia_save::SavedChainRecord {
+            char_slot: 0,
+            name: "Burning Combo".into(),
+            sequence: vec![1, 4, 4], // Left, Up, Up
+        });
+
+    let rows = world.build_battle_arts_rows(0);
+    assert_eq!(rows[0].hits(), 2, "two damage strikes from the record");
+    assert_eq!(rows[0].enemy_effect, EnemyEffect::Toxic);
+
+    world.battle_ctx.active_actor = 0;
+    world.battle.arts_menu = Some(legaia_engine_battle::battle_arts::BattleArtsSession::new(
+        0, 0, rows,
+    ));
+
+    // Open the target cursor, then confirm.
+    world.set_pad(0);
+    world.set_pad(PadButton::Cross.mask());
+    world.tick_battle_arts_menu();
+    take_commit_begin(&mut world);
+    world.set_pad(0);
+    world.set_pad(PadButton::Cross.mask());
+    world.tick_battle_arts_menu();
+    take_commit_begin(&mut world);
+
+    // The confirm resolves no damage: it builds retail's action queue from
+    // the row's arrows and arms the SM's attack band with it verbatim. The
+    // leading Left stays a swing (`0x0C`), Up-Up matches the art - its last
+    // arrow becomes the starter and the constant is inserted after it - and
+    // the starter is `0x1A`, not `0x19`, because this performance is the one
+    // that learns the art (`FUN_801EFBFC` verdict 2, `+ 0x18`).
+    assert_eq!(
+        &world.actors[0].battle.params[..5],
+        &[
+            0x0C,
+            0x0F,
+            ActionConstant::SpecialStarter.as_byte(),
+            ActionConstant::Art1F.as_byte(),
+            0
+        ],
+        "swing, swing-turned-starter, the constant, the terminator"
+    );
+    assert_eq!(world.actors[0].battle.action_category, 3);
+    assert!(
+        world.actors[0].battle.chosen_art.is_none(),
+        "the art is identified from the staged byte, not a side field"
+    );
+    assert_eq!(
+        world.actors[1].battle.hp, 4000,
+        "nothing lands before the band runs"
+    );
+
+    // Let the band walk the stream, exactly as the play window's live loop
+    // does - and stop the moment the art's own turn is over. The round runs
+    // on from there (the monster's turn, then the round end and the next
+    // round start's per-round Toxic DoT tick on this very target), so the
+    // HP read has to land before the turn moves on.
+    for _ in 0..400 {
+        if world.battle_ctx.action_state == ActionState::EndOfAction.as_byte()
+            || world.battle.command.is_some()
+            || world.battle_ctx.active_actor != 0
+        {
+            break;
+        }
+        world.set_pad(0);
+        live_tick(&mut world);
+        // Both play hosts drain once per simulation tick; the loop folds and
+        // then re-publishes, so a driver that never drains re-folds the same
+        // strikes on the next tick.
+        let _ = world.drain_battle_events();
+    }
+
+    // Four hits: the two leading swings with their own bytes, then the
+    // art's two power bytes (UDF x28, LDF x28) walked by hit index - the
+    // starter carries no event and hits nothing. The total lands once, on
+    // the art's last hit.
+    let hits = world.drain_battle_hit_events();
+    assert_eq!(
+        hits.iter()
+            .map(|h| (h.power_byte, h.hit_index, h.is_art))
+            .collect::<Vec<_>>(),
+        vec![
+            (0x0C, 0, false),
+            (0x0F, 0, false),
+            (0x1A, 0, true),
+            (0x1F, 1, true)
+        ],
+        "{hits:?}"
+    );
+    assert_eq!(
+        hits.iter().map(|h| h.applied).collect::<Vec<_>>(),
+        vec![false, false, false, true]
+    );
+    let total: u32 = hits.iter().map(|h| u32::from(h.damage)).sum();
+    assert!(hits.iter().all(|h| h.damage > 0), "ATK 64 lands every hit");
+    assert_eq!(u32::from(world.actors[1].battle.hp), 4000 - total);
+    assert!(
+        world.battle.status_effects.is_afflicted(1),
+        "the art's Toxic effect was applied to the target"
+    );
+    // Through the SM the popups are per hit, like the melee seam's, rather
+    // than one summed number for the whole turn. (The turn cycles to the
+    // monster once the band parks, so filter to the art's own target.)
+    let fx: Vec<_> = world
+        .drain_battle_hit_fx()
+        .into_iter()
+        .filter(|f| f.target_slot == 1)
+        .collect();
+    assert_eq!(fx.len(), 4, "one popup per landed hit");
+    assert!(fx.iter().all(|f| !f.is_heal));
+    assert_eq!(fx.iter().map(|f| u32::from(f.amount)).sum::<u32>(), total);
+}
+
+#[test]
+fn build_battle_arts_rows_resolves_miracle_finisher_profile() {
+    use legaia_art::power::PowerByte;
+    use legaia_art::queue::{ActionConstant, Command};
+    use legaia_art::record::EnemyEffect;
+
+    // Vahn's Craze directional string: Right, Down, Left, Up, Left, Up,
+    // Right, Down, Left (Left=1 Right=2 Down=3 Up=4).
+    let craze_seq = vec![2u8, 3, 1, 4, 1, 4, 2, 3, 1];
+
+    // No art records staged: each of Vahn's Craze's six component arts
+    // (Art22/28/23/27/20/2A) degrades to one synthetic ×12 strike.
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world
+        .party
+        .saved_chains
+        .push(legaia_save::SavedChainRecord {
+            char_slot: 0,
+            name: "MyCraze".into(),
+            sequence: craze_seq.clone(),
+        });
+    let rows = world.build_battle_arts_rows(0);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].miracle,
+        Some("Vahn's Craze"),
+        "chain flagged Miracle"
+    );
+    assert_eq!(
+        rows[0].hits(),
+        6,
+        "six component arts -> six synthetic strikes with no records"
+    );
+    assert_eq!(rows[0].enemy_effect, EnemyEffect::None);
+
+    // Stage the first component art (Art22) with two damage strikes that
+    // burn: it contributes its real bytes; the other five stay synthetic.
+    let rec = legaia_art::ArtRecord {
+        action: ActionConstant::Art22,
+        commands: vec![Command::Up],
+        anim_index: 0,
+        anim_extra: vec![],
+        name: None,
+        power: vec![PowerByte::from_byte(0x1A), PowerByte::from_byte(0x1A)],
+        dmg_timing: vec![],
+        effect_cues: Default::default(),
+        hit_cues: vec![],
+        identifier: 0,
+        anim_speed: 0,
+        enemy_effect: EnemyEffect::Toxic,
+        repeat_frames: Default::default(),
+        background: 0,
+        runtime_address: None,
+    };
+    world.set_art_record(legaia_art::Character::Vahn, ActionConstant::Art22, rec);
+    let rows = world.build_battle_arts_rows(0);
+    assert_eq!(
+        rows[0].hits(),
+        7,
+        "Art22 record (2 strikes) + 5 synthetic component arts"
+    );
+    assert_eq!(
+        rows[0].enemy_effect,
+        EnemyEffect::Toxic,
+        "first staged component art's status effect is adopted"
+    );
+}
+
+#[test]
+fn build_battle_arts_rows_fires_super_from_recognized_art_sequence() {
+    use legaia_art::power::PowerByte;
+    use legaia_art::queue::{ActionConstant, Command};
+    use legaia_art::record::EnemyEffect;
+
+    // Vahn's Tri-Somersault chains Somersault (Art27) -> Cyclone (Art1F) ->
+    // Somersault (Art27); art_sequence = [0x27, 0x1F, 0x27]. Give each
+    // component art a one-direction command so a flat chain recognizes them.
+    fn stage_art(world: &mut World, action: ActionConstant, cmd: Command, strikes: usize) {
+        let rec = legaia_art::ArtRecord {
+            action,
+            commands: vec![cmd],
+            anim_index: 0,
+            anim_extra: vec![],
+            name: None,
+            power: vec![PowerByte::from_byte(0x16); strikes],
+            dmg_timing: vec![],
+            effect_cues: Default::default(),
+            hit_cues: vec![],
+            identifier: 0,
+            anim_speed: 0,
+            enemy_effect: EnemyEffect::None,
+            repeat_frames: Default::default(),
+            background: 0,
+            runtime_address: None,
+        };
+        world.set_art_record(legaia_art::Character::Vahn, action, rec);
+    }
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    stage_art(&mut world, ActionConstant::Art27, Command::Up, 2);
+    stage_art(&mut world, ActionConstant::Art1F, Command::Down, 1);
+
+    // Chain Up Down Up -> Somersault Cyclone Somersault.
+    // (Left=1 Right=2 Down=3 Up=4.)
+    world
+        .party
+        .saved_chains
+        .push(legaia_save::SavedChainRecord {
+            char_slot: 0,
+            name: "TriSom".into(),
+            sequence: vec![4, 3, 4],
+        });
+    let rows = world.build_battle_arts_rows(0);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].super_art,
+        Some("Tri-Somersault"),
+        "recognized art sequence [27 1F 27] fires Vahn's Tri-Somersault"
+    );
+    assert_eq!(rows[0].miracle, None, "Super is not a Miracle");
+    // Super replace art constants = [27, 1F, 2B, 2B, 2B]: Art27 (2 strikes) +
+    // Art1F (1 strike) + three synthetic finisher (0x2B) strikes = 6.
+    assert_eq!(rows[0].hits(), 6, "component-art strikes + 3 finisher hits");
+
+    // Connector abstraction: a stray Left/Right between the arts (matching no
+    // staged art) is skipped, so the same Super still fires.
+    world.party.saved_chains.clear();
+    world
+        .party
+        .saved_chains
+        .push(legaia_save::SavedChainRecord {
+            char_slot: 0,
+            name: "TriSomLoose".into(),
+            sequence: vec![4, 1, 3, 2, 4], // Up [Left] Down [Right] Up
+        });
+    let rows = world.build_battle_arts_rows(0);
+    assert_eq!(
+        rows[0].super_art,
+        Some("Tri-Somersault"),
+        "connector directions between arts are abstracted (skipped)"
+    );
+
+    // With no art catalog staged the recognizer can't run, so no Super is
+    // detected and the chain falls back to a plain/synthetic row.
+    let mut bare = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    bare.party.saved_chains.push(legaia_save::SavedChainRecord {
+        char_slot: 0,
+        name: "TriSom".into(),
+        sequence: vec![4, 3, 4],
+    });
+    assert_eq!(
+        bare.build_battle_arts_rows(0)[0].super_art,
+        None,
+        "no art catalog -> no Super detection (graceful degradation)"
+    );
+}

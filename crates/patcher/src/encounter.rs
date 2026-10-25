@@ -1,0 +1,1310 @@
+//! Random-encounter randomization: reassign the monster ids in each scene's
+//! formation table.
+//!
+//! The formations live in the per-scene MAN asset (type `0x03`, descriptor
+//! index 2 of a scene bundle), inside an LZS stream. Each formation record is
+//! `[3 reserved][u8 count 0..4][u8 ids...]` (see
+//! [`legaia_scene_formats::man_section`] and `docs/formats/encounter.md`). An edit is
+//! therefore: locate the MAN inside the scene's PROT entry, decompress, rewrite
+//! the id bytes (same length - count is preserved), recompress, and write the
+//! stream back over the original (the LZS decoder stops at the descriptor's
+//! decompressed size, so a shorter or equal re-pack is safe).
+//!
+//! **Sane pool.** Reassignment draws only from the ids the scene *already*
+//! uses, so every swapped-in monster is one the scene loads - no missing model
+//! / crash. `Shuffle` redistributes the existing ids (same monsters, new
+//! formations - difficulty preserved); `Random` draws each id uniformly from
+//! the scene's distinct-id set.
+//!
+//! **Bosses are protected.** A scene's formation array holds both random
+//! encounters *and* scripted/boss fights (Tetsu, Cort, Songi, …) that the field
+//! VM engages by explicit index. Only the random ones - the formations reached
+//! by a region whose `rate_increment > 0` (a region that can actually trigger an
+//! encounter) - are randomized; scripted formations are left exactly as
+//! authored, so a randomized run never replaces a boss (see
+//! `random_formation_mask` / [`SceneEncounters::is_random_formation`]).
+//!
+//! **An explicit id guard backs the heuristic.** The region-rate test classifies
+//! every story boss's formation as scripted except the early **Gimard** fight,
+//! whose formation sits at an index a rate>0 region's range happens to span - so
+//! the heuristic alone would treat it as random and could replace that tutorial
+//! boss (stranding a fresh save) or donate Gimard, a boss-tier enemy, into an
+//! ordinary early encounter. [`PROTECTED_FORMATION_IDS`] lists the ids that must
+//! never participate in a random encounter; any formation holding one is forced
+//! back to scripted in [`SceneEncounters::locate`], and such ids never enter a
+//! donor pool, so the fight ships exactly as authored regardless of the region
+//! layout.
+
+use legaia_scene_formats::man_section::{self, EncounterSection};
+use legaia_scene_formats::scene_asset_table;
+
+use crate::drops::DropMode;
+use legaia_disc_patch::rng::SplitMix64;
+
+/// MAN asset type byte in a scene bundle's descriptor table.
+const MAN_TYPE: u8 = 0x03;
+
+/// 1-based `battle_data` monster ids that must never take part in a **random**
+/// encounter - neither donated into one nor replaced out of an existing fight -
+/// *on top of* the formations [`random_formation_mask`] already marks scripted.
+///
+/// The region-rate heuristic correctly classifies every story boss's formation
+/// as scripted, with one exception: the early **Gimard** Seru-boss fight sits at
+/// a formation index a rate>0 region's range spans, so the heuristic alone would
+/// treat it as a random encounter. Left unguarded a randomized run could replace
+/// that mandatory tutorial fight (soft-locking a fresh save) or donate Gimard - a
+/// boss-tier enemy - into an ordinary early encounter the party can't yet beat.
+/// Listing its id forces every formation that holds it back to scripted (see
+/// [`SceneEncounters::locate`]) and keeps it out of every donor pool, so the
+/// fight is preserved no matter how the scene's regions are laid out - the same
+/// intent as the matching stat-side guard (`crate::monster_stats`).
+///
+/// The first wild Piura are deliberately **not** listed: they are genuine random
+/// encounters, and the heuristic already leaves their scripted appearances fixed.
+pub const PROTECTED_FORMATION_IDS: &[u8] = &[
+    10, // Gimard - the early scripted Seru-boss fight.
+];
+
+/// Whether `id` is a [`PROTECTED_FORMATION_IDS`] enemy (one that must never be a
+/// random encounter).
+pub fn is_protected_formation_id(id: u8) -> bool {
+    PROTECTED_FORMATION_IDS.contains(&id)
+}
+
+/// Per-monster **combat-power** lookup, keyed by the formation byte (a 1-based
+/// `battle_data` archive id - the same id space [`SceneEncounters`] writes into a
+/// formation slot). The metric the "limit strong fights to a solo enemy" option
+/// compares formations against: a single scalar per monster (its stat budget; see
+/// [`crate::monster_stats::combat_power`]), so a swapped-in monster can be judged
+/// against an area's native average without reading the archive twice.
+///
+/// An id with no record (slot `0`, the empty-slot sentinel, or any id the archive
+/// doesn't populate) reads as power `0`, so it never counts as a "strong" monster
+/// and never inflates a baseline.
+#[derive(Debug, Clone)]
+pub struct MonsterPowerTable {
+    /// `power[id]` for every byte id `0..=255`. Indexed directly by the formation
+    /// byte (1-based archive id), so no per-lookup offset math.
+    power: [u32; 256],
+}
+
+impl MonsterPowerTable {
+    /// Build from `(monster_id, power)` pairs, where `monster_id` is the 1-based
+    /// `battle_data` archive id (exactly the value a formation slot stores). Ids
+    /// outside `0..=255` are ignored (no retail monster id exceeds a byte).
+    pub fn from_powers(pairs: impl IntoIterator<Item = (u16, u32)>) -> Self {
+        let mut power = [0u32; 256];
+        for (id, p) in pairs {
+            if let Some(slot) = power.get_mut(id as usize) {
+                *slot = p;
+            }
+        }
+        Self { power }
+    }
+
+    /// The combat power of formation-slot id `id` (`0` for the empty slot or any
+    /// id with no record).
+    pub fn power_of(&self, id: u8) -> u32 {
+        self.power[id as usize]
+    }
+}
+
+/// The most **distinct** monster species a random formation may hold: **2**,
+/// retail's own authoring ceiling - and a hard engine invariant, not a style
+/// choice. The battle setup `FUN_80055B6C` (at `0x80055C80..0x80055D2C`)
+/// classifies the formation cells into "the first species" (`cells[0]`, with a
+/// copy count) and "the other species" - held in a **single register** - then,
+/// behind a 50% RNG coin flip (`FUN_80056798() & 1`), rebuilds the cell array
+/// as `[other x other_count, first x first_count]` (the species-order variety
+/// shuffle). With three distinct species the single "other" register is
+/// overwritten by each later species, so `[a, b, c]` rebuilds as `[c, c, a]`:
+/// the middle species silently vanishes and the last is duplicated. The other
+/// half of the flip loads the formation verbatim - all three distinct blocks
+/// stream, which is what makes an over-budget trio a *probabilistic* freeze.
+/// Capping distinct species at 2 keeps every formation inside the invariant
+/// the rebuild was written for (where it is an exact multiset-preserving
+/// species swap). Pinned live: forced installs of `[133,151,94]` /
+/// `[94,133,151]` / `[151,133,94]` / `[32,34,14]` (map03 + rikuroa contexts)
+/// each read back `[c2, c2, c0]` at battle main, with the write PC at
+/// `0x80055D14/18` and the per-seat record pointers showing seat 1 sharing
+/// seat 0's block.
+pub const MAX_DISTINCT_SPECIES: usize = 2;
+
+/// Per-monster **battle-heap cost** lookup, keyed by the formation byte. The
+/// cost is the decoded `battle_data` block's `+0x08` word (the texture-pool
+/// offset): exactly the bytes the battle loader `FUN_800542C8` mallocs for one
+/// distinct species (stats + name + TMD + action/animation streams - the
+/// texture pool itself decodes into the GPU staging area, never the heap; see
+/// `docs/subsystems/battle.md`, heap-budget section). Duplicate seats share
+/// one block, so a formation's heap exposure is the sum over its **distinct**
+/// ids. An id with no archive record costs `0`.
+#[derive(Debug, Clone)]
+pub struct MonsterCostTable {
+    /// `cost[id]` for every byte id `0..=255`, indexed directly by the
+    /// formation byte (1-based archive id).
+    cost: [u32; 256],
+}
+
+impl MonsterCostTable {
+    /// Build from `(monster_id, cost)` pairs (1-based archive ids). Ids outside
+    /// `0..=255` are ignored.
+    pub fn from_costs(pairs: impl IntoIterator<Item = (u16, u32)>) -> Self {
+        let mut cost = [0u32; 256];
+        for (id, c) in pairs {
+            if let Some(slot) = cost.get_mut(id as usize) {
+                *slot = c;
+            }
+        }
+        Self { cost }
+    }
+
+    /// The heap cost of one distinct species `id` (`0` for the empty slot or an
+    /// id with no record).
+    pub fn cost_of(&self, id: u8) -> u32 {
+        self.cost[id as usize]
+    }
+
+    /// A formation's battle-heap exposure: the summed cost of its **distinct**
+    /// non-zero ids (the loader dedupes seats by id, so duplicates are free).
+    pub fn formation_cost(&self, ids: &[u8]) -> u32 {
+        let mut seen = [false; 256];
+        let mut sum = 0u32;
+        for &id in ids {
+            if id != 0 && !seen[id as usize] {
+                seen[id as usize] = true;
+                sum = sum.saturating_add(self.cost_of(id));
+            }
+        }
+        sum
+    }
+}
+
+/// Which formation indices a scene's **random-encounter** roll can produce.
+///
+/// The encounter section holds a single formation array, but only some of those
+/// formations are random encounters. Each region record (a per-area AABB) names
+/// a contiguous `[formation_range_base, +formation_range_count)` slice it rolls
+/// into **and** a `rate_increment`: the per-step amount it adds to the encounter
+/// counter while the player stands in the AABB. A region with
+/// `rate_increment == 0` never advances the counter, so it never triggers a
+/// random encounter - it can reference formations without ever rolling them
+/// (the retail position-aware roll `FUN_801D9E1C`; mirrored in
+/// `legaia_engine_battle::region_encounter`).
+///
+/// So a formation is a random encounter iff some region with **`rate_increment >
+/// 0`** reaches it. Formations reached only by rate-0 regions (or by no region)
+/// are *scripted* fights the field VM engages by explicit index - boss battles
+/// (Tetsu, Cort, Songi, …) and story encounters. Randomizing those would replace
+/// a boss, so the randomizer must leave them alone.
+///
+/// Returns a `bool` per formation index. Verified against the corpus: town01
+/// (Rim Elm) has rate-0 regions covering formations 2..=4 but its only rate>0
+/// regions reach 0..=2, so the Tetsu fight at index 4 is correctly scripted;
+/// cave01's rate>0 regions reach 0..=9, leaving the scripted ids 19/20 at
+/// indices 10/11 untouched.
+fn random_formation_mask(body: &[u8], sec: &EncounterSection) -> Vec<bool> {
+    let mut mask = vec![false; sec.formation_count as usize];
+    for r in man_section::region_records(body, sec).flatten() {
+        // A zero-rate region never triggers an encounter, so the formations it
+        // references are not (by themselves) random - only rate>0 regions do.
+        if r.rate_increment == 0 {
+            continue;
+        }
+        let base = r.formation_range_base as usize;
+        let count = r.formation_range_count as usize;
+        for i in base..base.saturating_add(count) {
+            if let Some(slot) = mask.get_mut(i) {
+                *slot = true;
+            }
+        }
+    }
+    mask
+}
+
+/// Force any formation that holds a [`PROTECTED_FORMATION_IDS`] enemy back to
+/// non-random in `mask`. The explicit-id complement to the region-rate
+/// [`random_formation_mask`]: the heuristic misclassifies the early Gimard fight
+/// as random (a rate>0 region's range spans its formation index), so this pass
+/// re-marks every formation containing a protected id as scripted, keeping it out
+/// of every randomize / collapse / donor path (see the module docs). `decoded`
+/// is the parsed MAN, `formation_array_off` the absolute offset of the formation
+/// array within it, and `stride` the per-record stride.
+fn mask_out_protected_formations(
+    decoded: &[u8],
+    formation_array_off: usize,
+    stride: usize,
+    mask: &mut [bool],
+) {
+    for (i, m) in mask.iter_mut().enumerate() {
+        if !*m {
+            continue;
+        }
+        let rec = formation_array_off + i * stride;
+        // Bounds-guard the record read: a MAN truncated near the buffer end can
+        // leave a formation record short. Skip such a record rather than panic;
+        // for well-formed records (the count byte + all `cnt` ids present) the
+        // behaviour is unchanged.
+        let Some(&cnt_byte) = decoded.get(rec + 3) else {
+            continue;
+        };
+        let cnt = (cnt_byte as usize).min(4);
+        let Some(ids) = decoded.get(rec + 4..rec + 4 + cnt) else {
+            continue;
+        };
+        if ids.iter().any(|&id| is_protected_formation_id(id)) {
+            *m = false;
+        }
+    }
+}
+
+/// A scene's encounter data, located inside one PROT scene-bundle entry and
+/// decompressed so its formation ids can be rewritten.
+pub struct SceneEncounters {
+    /// PROT entry index this scene bundle lives in.
+    pub entry_idx: usize,
+    /// Byte offset of the compressed MAN stream within the entry.
+    pub man_offset: usize,
+    /// Bytes the recompressed MAN must fit within (the original compressed
+    /// length; the data after it belongs to the next asset).
+    pub compressed_budget: usize,
+    /// `true` when the MAN is stored **uncompressed**, as the payload of a
+    /// type-3 DATA_FIELD streaming chunk rather than as an LZS stream in a
+    /// `scene_asset_table` bundle. The v12-family dungeon scenes carry their
+    /// MAN that way (see [`Self::locate_streaming_mans`]), and a rewrite of one
+    /// is same-size by construction - there is nothing to recompress and no
+    /// budget to overflow.
+    pub raw_in_place: bool,
+    /// Decompressed MAN buffer (mutated in place by [`Self::randomize`]).
+    pub decoded: Vec<u8>,
+    /// Absolute offset of the formation array within `decoded`.
+    formation_array_off: usize,
+    formation_stride: usize,
+    formation_count: usize,
+    /// Per-formation flag: `true` when the formation is reachable by some region
+    /// (a **random** encounter), `false` when it's a scripted/boss fight the
+    /// field VM engages by index. Only random formations are randomized - see
+    /// [`random_formation_mask`].
+    random_mask: Vec<bool>,
+}
+
+impl SceneEncounters {
+    /// Try to locate a scene bundle's encounter data in a PROT entry's bytes.
+    /// Returns `None` when the entry isn't a scene asset table, carries no MAN,
+    /// or the MAN doesn't decode / parse - i.e. "nothing to randomize here".
+    pub fn locate(entry: &[u8], entry_idx: usize) -> Option<Self> {
+        let table = scene_asset_table::detect(entry)?;
+        let man = table
+            .used()
+            .iter()
+            .find(|d| d.type_byte == MAN_TYPE)
+            .copied()?;
+        if man.size == 0 || man.data_offset == 0 {
+            return None;
+        }
+        // Plain scene bundles place the descriptor table at offset 0, so a
+        // descriptor offset is entry-relative.
+        let man_offset = man.data_offset as usize;
+        let body = entry.get(man_offset..)?;
+        let (decoded, _consumed) = legaia_lzs::decompress_tracked(body, man.size as usize).ok()?;
+        if decoded.len() != man.size as usize {
+            return None;
+        }
+        let compressed_budget =
+            legaia_disc_patch::man_compressed_budget(&table, man_offset, entry.len());
+        Self::from_man_bytes(decoded, entry_idx, man_offset, compressed_budget, false)
+    }
+
+    /// Locate every **variant** MAN carried as a type-3 `DATA_FIELD` streaming
+    /// chunk in this entry, one [`SceneEncounters`] per chunk that parses.
+    ///
+    /// [`Self::locate`] only sees the `scene_asset_table` family, and thirteen
+    /// retail blocks - the v12-family dungeons `rikuroa` / `rikuroa2` / `dolk2`
+    /// / `rayman` / `station` / `balden2` / `ropeway2` / `taiku` / `taiku2` /
+    /// `doman` / `nilboa2` / `edbalden` / `eddoman` - ship their MAN, or a
+    /// story-state variant of it, in a streaming chunk instead. Mt. Rikuroa has
+    /// no bundle MAN at all, so a bundle-only sweep leaves its encounters
+    /// vanilla however wide the pool. The engine already reads both carriers
+    /// (`engine-core`'s `scene_man_carriers`); this is the patcher's half.
+    ///
+    /// The chunk payload is stored raw, so the rewrite is same-size and needs
+    /// no repack. A chunk whose declared size runs past the entry end - the
+    /// `DataFieldTruncated` tail, which the runtime extends by streaming DMA
+    /// continuation - is skipped rather than clamped: a partial MAN would
+    /// re-pack over bytes that are not ours.
+    pub fn locate_streaming_mans(entry: &[u8], entry_idx: usize) -> Vec<Self> {
+        let Ok(report) = legaia_container_formats::parse_streaming(entry, 4096) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for chunk in &report.chunks {
+            if chunk.type_byte != MAN_TYPE {
+                continue;
+            }
+            let start = chunk.header_offset + 4;
+            let Some(payload) = entry.get(start..start.saturating_add(chunk.size as usize)) else {
+                continue;
+            };
+            let len = payload.len();
+            if let Some(scene) = Self::from_man_bytes(payload.to_vec(), entry_idx, start, len, true)
+            {
+                out.push(scene);
+            }
+        }
+        out
+    }
+
+    /// Shared tail of both locators: parse the MAN, find its encounter section,
+    /// and build the random-formation mask.
+    fn from_man_bytes(
+        decoded: Vec<u8>,
+        entry_idx: usize,
+        man_offset: usize,
+        compressed_budget: usize,
+        raw_in_place: bool,
+    ) -> Option<Self> {
+        let manfile = man_section::parse(&decoded).ok()?;
+        let sec_body = manfile.encounter_section_body(&decoded)?;
+        let sec: EncounterSection = man_section::parse_encounter_section(sec_body).ok()?;
+        let formation_array_off = manfile.encounter_section().body_offset() + sec.formation_range.0;
+        // Bounds sanity: the whole formation array must sit inside `decoded`.
+        let arr_end =
+            formation_array_off + sec.formation_count as usize * sec.formation_stride as usize;
+        if arr_end > decoded.len() {
+            return None;
+        }
+        let mut random_mask = random_formation_mask(sec_body, &sec);
+        // Explicit id guard on top of the region-rate heuristic: a formation that
+        // holds a protected enemy (an early scripted fight the heuristic can
+        // misclassify as random) is forced non-random so it is never replaced,
+        // collapsed, or donated, whatever the scene's region layout.
+        mask_out_protected_formations(
+            &decoded,
+            formation_array_off,
+            sec.formation_stride as usize,
+            &mut random_mask,
+        );
+        Some(Self {
+            entry_idx,
+            man_offset,
+            compressed_budget,
+            raw_in_place,
+            decoded,
+            formation_array_off,
+            formation_stride: sec.formation_stride as usize,
+            formation_count: sec.formation_count as usize,
+            random_mask,
+        })
+    }
+
+    /// Whether formation `i` is a **random** encounter (reachable by a region),
+    /// as opposed to a scripted/boss fight the field VM engages by index. Only
+    /// random formations are touched by [`Self::randomize`] /
+    /// [`Self::randomize_with_extra`], so a boss is never replaced. Out-of-range
+    /// `i` (and any formation no region references) is `false`.
+    pub fn is_random_formation(&self, i: usize) -> bool {
+        self.random_mask.get(i).copied().unwrap_or(false)
+    }
+
+    /// Count of formations that are random encounters (the population the
+    /// randomizer actually touches).
+    pub fn random_formation_count(&self) -> usize {
+        self.random_mask.iter().filter(|&&b| b).count()
+    }
+
+    /// Monster count of formation `i` (`0..4`), clamped defensively.
+    fn count(&self, i: usize) -> usize {
+        let rec = self.formation_array_off + i * self.formation_stride;
+        (self.decoded[rec + 3] as usize).min(4)
+    }
+
+    /// `(absolute offset, length)` of formation `i`'s id bytes within `decoded`.
+    fn id_span(&self, i: usize) -> (usize, usize) {
+        let rec = self.formation_array_off + i * self.formation_stride;
+        (rec + 4, self.count(i))
+    }
+
+    /// Number of formation rows this scene declares. Each row index is also the
+    /// `formation_id` the engine registers it under (the MAN row index is the
+    /// encounter table's formation index, per `docs/formats/encounter.md`), so a
+    /// caller can patch row `i` here and force the same row at runtime.
+    pub fn formation_count(&self) -> usize {
+        self.formation_count
+    }
+
+    /// The monster ids of formation row `i` (its `count` ids, `0..4`), read live
+    /// from [`Self::decoded`]. Empty when `i` is out of range. Useful for a
+    /// surgical inspection of one row without re-parsing the MAN.
+    pub fn formation_ids(&self, i: usize) -> Vec<u8> {
+        if i >= self.formation_count {
+            return Vec::new();
+        }
+        let (off, len) = self.id_span(i);
+        self.decoded[off..off + len].to_vec()
+    }
+
+    /// Absolute offset within [`Self::decoded`] of formation row `i`'s monster-id
+    /// slot `slot`, so a caller can rewrite a single id in place (the counterpart
+    /// to [`Self::randomize`]'s whole-array rewrite). `None` when `i` or `slot`
+    /// is out of range.
+    pub fn formation_id_offset(&self, i: usize, slot: usize) -> Option<usize> {
+        if i >= self.formation_count {
+            return None;
+        }
+        let (off, len) = self.id_span(i);
+        (slot < len).then_some(off + slot)
+    }
+
+    /// The distinct monster ids this scene uses across its **random** formations
+    /// - the safe pool to draw from (every id is already scene-loaded, and
+    ///   scripted/boss ids are excluded so a `Random` roll never drops a boss into
+    ///   an ordinary encounter). Scripted formations are skipped (see
+    ///   [`Self::is_random_formation`]).
+    pub fn monster_pool(&self) -> Vec<u8> {
+        let mut pool = Vec::new();
+        for i in 0..self.formation_count {
+            if !self.is_random_formation(i) {
+                continue;
+            }
+            let (off, len) = self.id_span(i);
+            for &id in &self.decoded[off..off + len] {
+                if !pool.contains(&id) {
+                    pool.push(id);
+                }
+            }
+        }
+        pool.sort_unstable();
+        pool
+    }
+
+    /// Total monster-id slots across all formations (the count of bytes a
+    /// shuffle permutes / a random pass rewrites).
+    pub fn id_slot_count(&self) -> usize {
+        (0..self.formation_count).map(|i| self.count(i)).sum()
+    }
+
+    /// Count formation id slots whose current id is in `set` (live from
+    /// [`Self::decoded`]). Used to report how many unused enemies a run actually
+    /// placed.
+    pub fn count_ids_in(&self, set: &[u8]) -> usize {
+        let mut n = 0;
+        for i in 0..self.formation_count {
+            let (off, len) = self.id_span(i);
+            for &id in &self.decoded[off..off + len] {
+                if set.contains(&id) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// Rewrite the formation ids in place from `seed`. Returns the number of id
+    /// bytes that actually changed. The per-scene RNG is derived from
+    /// `(seed, entry_idx)` so the result is independent of iteration order and
+    /// reproducible.
+    pub fn randomize(&mut self, seed: u64, mode: DropMode) -> usize {
+        self.randomize_with_extra(seed, mode, &[])
+    }
+
+    /// Like [`Self::randomize`], but for [`DropMode::Random`] the candidate pool
+    /// is the scene's own monster ids **plus** `extra` (deduped). This is how the
+    /// `--unused-enemies` toggle re-introduces monsters no formation references:
+    /// the battle loader streams a monster's archive slot on demand by id, so an
+    /// id outside the scene's own set still loads and renders. `extra` has no
+    /// effect under [`DropMode::Shuffle`] - a multiset-preserving permutation
+    /// can't introduce a new id, by construction - so passing it there is a
+    /// no-op (a `Shuffle` run never spawns an unused enemy; document that at the
+    /// CLI). The base RNG sequence is unchanged when `extra` is empty, so the
+    /// existing (no-unused) results stay byte-identical.
+    pub fn randomize_with_extra(&mut self, seed: u64, mode: DropMode, extra: &[u8]) -> usize {
+        let mut pool = self.monster_pool();
+        if mode == DropMode::Random {
+            for &id in extra {
+                // A protected enemy (e.g. Gimard) is never a draw target, even if
+                // it is somehow passed as an extra/unused id.
+                if !pool.contains(&id) && !is_protected_formation_id(id) {
+                    pool.push(id);
+                }
+            }
+        }
+        if pool.is_empty() {
+            return 0;
+        }
+        let mut rng =
+            SplitMix64::new(seed ^ (self.entry_idx as u64).wrapping_mul(0x9E3779B97F4A7C15));
+
+        // Every **random** formation id slot, in a stable order. Scripted/boss
+        // formations (no region references them) are excluded, so a randomized
+        // run never replaces a Tetsu / Cort / Songi fight - only the ordinary
+        // random encounters are shuffled/redrawn.
+        let slots = self.random_slot_offsets();
+        let originals: Vec<u8> = slots.iter().map(|&o| self.decoded[o]).collect();
+
+        let new_vals: Vec<u8> = match mode {
+            DropMode::Shuffle => {
+                let mut vals = originals.clone();
+                rng.shuffle(&mut vals);
+                vals
+            }
+            DropMode::Random => slots.iter().map(|_| pool[rng.below(pool.len())]).collect(),
+        };
+
+        let mut changed = 0;
+        for (&off, &v) in slots.iter().zip(&new_vals) {
+            if self.decoded[off] != v {
+                self.decoded[off] = v;
+                changed += 1;
+            }
+        }
+        changed
+    }
+
+    /// Absolute `decoded` offsets of every **random**-formation monster-id slot,
+    /// in a stable order (ascending formation index, then slot). Scripted/boss
+    /// formations are excluded - this is exactly the population every randomize
+    /// path rewrites. Shared by the per-scene [`Self::randomize_with_extra`] and
+    /// the cross-scene scoped passes ([`Self::random_slot_ids`] /
+    /// [`Self::fill_random_slots_from_pool`] / [`Self::apply_random_slots`]).
+    fn random_slot_offsets(&self) -> Vec<usize> {
+        let mut slots = Vec::new();
+        for i in 0..self.formation_count {
+            if !self.is_random_formation(i) {
+                continue;
+            }
+            let (off, len) = self.id_span(i);
+            for s in 0..len {
+                slots.push(off + s);
+            }
+        }
+        slots
+    }
+
+    /// How many random-encounter monster-id slots this scene exposes to a
+    /// scoped (kingdom / world) pass - the count of ids it contributes to a
+    /// cross-scene shuffle and consumes back from it.
+    pub fn random_slot_count(&self) -> usize {
+        self.random_slot_offsets().len()
+    }
+
+    /// The current monster ids in this scene's random-formation slots, in the
+    /// stable [`Self::random_slot_offsets`] order. This is the scene's
+    /// contribution to a cross-scene **shuffle** multiset (and the read side of
+    /// [`Self::apply_random_slots`]).
+    pub fn random_slot_ids(&self) -> Vec<u8> {
+        self.random_slot_offsets()
+            .iter()
+            .map(|&o| self.decoded[o])
+            .collect()
+    }
+
+    /// Overwrite this scene's random-formation slots with `ids` (taken in the
+    /// stable [`Self::random_slot_offsets`] order), the write side of a
+    /// cross-scene shuffle. Only the first `min(ids.len(), slot_count)` slots
+    /// are written, so a short slice is a partial-but-safe write rather than a
+    /// panic. Returns the number of id bytes that actually changed.
+    pub fn apply_random_slots(&mut self, ids: &[u8]) -> usize {
+        let mut changed = 0;
+        for (&off, &v) in self.random_slot_offsets().iter().zip(ids) {
+            if self.decoded[off] != v {
+                self.decoded[off] = v;
+                changed += 1;
+            }
+        }
+        changed
+    }
+
+    /// Fill this scene's random-formation slots by drawing each id uniformly
+    /// from an **externally supplied** `pool` (the kingdom-wide or world-wide
+    /// monster set), as opposed to [`Self::randomize`]'s scene-local pool. The
+    /// per-scene RNG is derived from `(seed, entry_idx)` so the result is
+    /// reproducible and independent of iteration order. Returns the number of id
+    /// bytes that changed; a no-op (0) when `pool` is empty.
+    pub fn fill_random_slots_from_pool(&mut self, seed: u64, pool: &[u8]) -> usize {
+        if pool.is_empty() {
+            return 0;
+        }
+        let mut rng =
+            SplitMix64::new(seed ^ (self.entry_idx as u64).wrapping_mul(0x9E3779B97F4A7C15));
+        let slots = self.random_slot_offsets();
+        let new_vals: Vec<u8> = (0..slots.len())
+            .map(|_| pool[rng.below(pool.len())])
+            .collect();
+        let mut changed = 0;
+        for (&off, &v) in slots.iter().zip(&new_vals) {
+            if self.decoded[off] != v {
+                self.decoded[off] = v;
+                changed += 1;
+            }
+        }
+        changed
+    }
+
+    /// The scene's native **combat-power baseline**: the mean
+    /// [`MonsterPowerTable::power_of`] across every monster currently in its
+    /// **random** formation slots. This is the area's intended enemy strength -
+    /// the stand-in for "what the party can handle here" the solo-strong option
+    /// compares a swapped-in monster against.
+    ///
+    /// Call this **before** randomizing, so the baseline reflects the area's
+    /// authored difficulty rather than the post-shuffle monsters (a uniformly
+    /// stronger scene would otherwise hide every outlier). `None` when the scene
+    /// has no random monster slots (nothing to compare against). Scripted/boss
+    /// formations are excluded, exactly as the rest of the randomizer treats them.
+    pub fn baseline_power(&self, table: &MonsterPowerTable) -> Option<u32> {
+        let ids = self.random_slot_ids();
+        if ids.is_empty() {
+            return None;
+        }
+        let sum: u64 = ids.iter().map(|&id| table.power_of(id) as u64).sum();
+        Some((sum / ids.len() as u64) as u32)
+    }
+
+    /// Force every **random** formation whose strongest monster is at least
+    /// `threshold_pct`% of `baseline` combat power down to a **solo** fight: keep
+    /// the single strongest monster (in slot 0) and drop the rest (`count := 1`,
+    /// trailing id bytes zeroed). This is what keeps a randomized run from ganging
+    /// up 2+ over-strong monsters on the party - an out-of-area heavy hitter is
+    /// faced alone, never in a pack.
+    ///
+    /// Only multi-monster (`count >= 2`) random formations are eligible; solo
+    /// formations are already solo and scripted/boss formations are never touched
+    /// (see [`Self::is_random_formation`]). A no-op when `baseline` or
+    /// `threshold_pct` is `0`, or no formation clears the bar.
+    ///
+    /// Same-size edit: the `count` byte and the dropped id bytes all live inside
+    /// the formation record's fixed stride, so the MAN's decompressed length is
+    /// unchanged and [`Self::repack`] applies. Returns `(formations_collapsed,
+    /// id_bytes_zeroed)`.
+    pub fn enforce_solo_strong(
+        &mut self,
+        table: &MonsterPowerTable,
+        baseline: u32,
+        threshold_pct: u16,
+    ) -> (usize, usize) {
+        if baseline == 0 || threshold_pct == 0 {
+            return (0, 0);
+        }
+        let threshold = (baseline as u64 * threshold_pct as u64) / 100;
+        let mut collapsed = 0;
+        let mut zeroed = 0;
+        for i in 0..self.formation_count {
+            if !self.is_random_formation(i) {
+                continue;
+            }
+            let (off, len) = self.id_span(i);
+            if len < 2 {
+                continue;
+            }
+            // Strongest member + whether any member clears the "strong" bar.
+            let mut best_slot = 0;
+            let mut best_power = 0u32;
+            let mut any_strong = false;
+            for s in 0..len {
+                let p = table.power_of(self.decoded[off + s]);
+                if p as u64 >= threshold {
+                    any_strong = true;
+                }
+                if p >= best_power {
+                    best_power = p;
+                    best_slot = s;
+                }
+            }
+            if !any_strong {
+                continue;
+            }
+            // Keep the strongest in slot 0, zero the rest, set count := 1.
+            let keep = self.decoded[off + best_slot];
+            self.decoded[off] = keep;
+            for s in 1..len {
+                if self.decoded[off + s] != 0 {
+                    zeroed += 1;
+                }
+                self.decoded[off + s] = 0;
+            }
+            let rec = self.formation_array_off + i * self.formation_stride;
+            self.decoded[rec + 3] = 1;
+            collapsed += 1;
+        }
+        (collapsed, zeroed)
+    }
+
+    /// Enforce the two **battle-load safety limits** on every random formation,
+    /// as a post-pass over already-randomized ids (composes with every scope +
+    /// mode, exactly like [`Self::enforce_solo_strong`]):
+    ///
+    /// 1. at most [`MAX_DISTINCT_SPECIES`] distinct species - the retail battle
+    ///    setup's species-order rebuild (`FUN_80055B6C`) holds "the other
+    ///    species" in one register, so a third distinct species is silently
+    ///    dropped-and-duplicated on half of all rolls and streams a third
+    ///    decoded block on the other half;
+    /// 2. a summed distinct-species heap cost of at most `budget` bytes - the
+    ///    battle heap's malloc is unchecked (`FUN_800542C8` stores through a
+    ///    NULL return), so an over-budget formation is a hang at battle load,
+    ///    not an error.
+    ///
+    /// A violating formation is reduced in place: every copy of its costliest
+    /// species is replaced by its cheapest species (both already present in the
+    /// formation, so no new id enters the scene - pool and residency invariants
+    /// hold), repeating until both limits pass. Monster count is preserved; the
+    /// reduction only ever merges species, and a single-species formation
+    /// always passes (no retail block exceeds ~93 KB). Same-size edit, so
+    /// [`Self::repack`] applies. Returns `(formations_fixed, id_bytes_changed)`.
+    pub fn enforce_species_limits(
+        &mut self,
+        table: &MonsterCostTable,
+        budget: u32,
+        max_distinct: usize,
+    ) -> (usize, usize) {
+        let mut fixed = 0;
+        let mut changed = 0;
+        for i in 0..self.formation_count {
+            if !self.is_random_formation(i) {
+                continue;
+            }
+            let (off, len) = self.id_span(i);
+            let mut touched = false;
+            loop {
+                let ids = &self.decoded[off..off + len];
+                let mut distinct: Vec<u8> = ids.iter().copied().filter(|&d| d != 0).collect();
+                distinct.sort_unstable();
+                distinct.dedup();
+                let cost = table.formation_cost(ids);
+                if distinct.len() <= max_distinct.max(1) && cost <= budget {
+                    break;
+                }
+                if distinct.len() < 2 {
+                    // A lone species over budget cannot be reduced further;
+                    // leave it (does not occur with retail archives).
+                    break;
+                }
+                // Merge the costliest species into the cheapest one present.
+                let costliest = *distinct
+                    .iter()
+                    .max_by_key(|&&d| (table.cost_of(d), d))
+                    .unwrap();
+                let cheapest = *distinct
+                    .iter()
+                    .min_by_key(|&&d| (table.cost_of(d), d))
+                    .unwrap();
+                for s in 0..len {
+                    if self.decoded[off + s] == costliest {
+                        self.decoded[off + s] = cheapest;
+                        changed += 1;
+                        touched = true;
+                    }
+                }
+            }
+            if touched {
+                fixed += 1;
+            }
+        }
+        (fixed, changed)
+    }
+
+    /// Recompress the (mutated) MAN. Returns the stream if it fits the original
+    /// compressed footprint, or `None` if it would overflow (the rare case our
+    /// re-packer is a byte or two looser than the retail packer).
+    pub fn repack(&self) -> Option<Vec<u8>> {
+        // A streaming-chunk MAN is stored raw, so the mutated buffer *is* the
+        // stream and it cannot change length - the randomizer only overwrites
+        // formation id bytes in place.
+        if self.raw_in_place {
+            return Some(self.decoded.clone());
+        }
+        legaia_disc_patch::compress_within(&self.decoded, self.compressed_budget)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn species_limits_cap_distinct_count_and_heap_cost() {
+        // Costs: id 10 -> 100, id 20 -> 60, id 30 -> 50, id 40 -> 10.
+        let table = MonsterCostTable::from_costs([(10u16, 100u32), (20, 60), (30, 50), (40, 10)]);
+        // decoded layout: formation array at offset 0, stride 8, 4 formations.
+        let mut decoded = vec![0u8; 32];
+        // formation 0: 3 DISTINCT species [10, 20, 30] (over the species cap;
+        // cost 210 also over budget).
+        decoded[3] = 3;
+        decoded[4] = 10;
+        decoded[5] = 20;
+        decoded[6] = 30;
+        // formation 1: 2 distinct, over budget: [10, 20] = 160.
+        decoded[8 + 3] = 2;
+        decoded[8 + 4] = 10;
+        decoded[8 + 5] = 20;
+        // formation 2: compliant [40, 40, 30] (2 distinct, cost 60).
+        decoded[16 + 3] = 3;
+        decoded[16 + 4] = 40;
+        decoded[16 + 5] = 40;
+        decoded[16 + 6] = 30;
+        // formation 3: scripted [10, 20, 30] - must never be touched.
+        decoded[24 + 3] = 3;
+        decoded[24 + 4] = 10;
+        decoded[24 + 5] = 20;
+        decoded[24 + 6] = 30;
+        let mut se = SceneEncounters {
+            entry_idx: 7,
+            man_offset: 0,
+            compressed_budget: 9999,
+            raw_in_place: false,
+            decoded,
+            formation_array_off: 0,
+            formation_stride: 8,
+            formation_count: 4,
+            random_mask: vec![true, true, true, false],
+        };
+        let budget = 120;
+        let (fixed, changed) = se.enforce_species_limits(&table, budget, MAX_DISTINCT_SPECIES);
+        assert_eq!(fixed, 2, "formations 0 and 1 violate, 2 is compliant");
+        assert!(changed > 0);
+        // Every random formation now satisfies both limits; counts preserved.
+        for i in 0..3 {
+            let ids = se.formation_ids(i);
+            let mut d: Vec<u8> = ids.iter().copied().filter(|&x| x != 0).collect();
+            d.sort_unstable();
+            d.dedup();
+            assert!(d.len() <= MAX_DISTINCT_SPECIES, "formation {i}: {ids:?}");
+            assert!(
+                table.formation_cost(&ids) <= budget,
+                "formation {i}: {ids:?}"
+            );
+        }
+        assert_eq!(se.count(0), 3, "monster count preserved");
+        // Formation 0: costliest (10) merged into cheapest (30) -> [30,20,30];
+        // still over? cost 110 <= 120, distinct 2 - done in one step.
+        assert_eq!(se.formation_ids(0), vec![30, 20, 30]);
+        // Formation 1: [10,20] -> merge 10 into 20 -> [20,20] cost 60.
+        assert_eq!(se.formation_ids(1), vec![20, 20]);
+        // Compliant formation untouched.
+        assert_eq!(se.formation_ids(2), vec![40, 40, 30]);
+        // Scripted formation untouched.
+        assert_eq!(se.formation_ids(3), vec![10, 20, 30]);
+        // Idempotent.
+        let (fixed2, changed2) = se.enforce_species_limits(&table, budget, MAX_DISTINCT_SPECIES);
+        assert_eq!((fixed2, changed2), (0, 0));
+    }
+
+    #[test]
+    fn shuffle_preserves_id_multiset_and_counts() {
+        // Build a minimal MAN-less SceneEncounters by hand to exercise the
+        // id-rewrite logic directly (locate() is covered by the disc-gated test).
+        // decoded layout: formation array at offset 0, stride 8, 3 formations.
+        let mut decoded = vec![0u8; 24];
+        // formation 0: count 2, ids [10, 20]
+        decoded[3] = 2;
+        decoded[4] = 10;
+        decoded[5] = 20;
+        // formation 1: count 1, id [30]
+        decoded[8 + 3] = 1;
+        decoded[8 + 4] = 30;
+        // formation 2: count 0
+        let mut se = SceneEncounters {
+            entry_idx: 7,
+            man_offset: 0,
+            compressed_budget: 9999,
+            raw_in_place: false,
+            decoded,
+            formation_array_off: 0,
+            formation_stride: 8,
+            formation_count: 3,
+            random_mask: vec![true; 3],
+        };
+        let before: Vec<u8> = (0..3)
+            .flat_map(|i| {
+                let (o, l) = se.id_span(i);
+                se.decoded[o..o + l].to_vec()
+            })
+            .collect();
+        se.randomize(0x1234, DropMode::Shuffle);
+        // Counts unchanged.
+        assert_eq!(se.count(0), 2);
+        assert_eq!(se.count(1), 1);
+        assert_eq!(se.count(2), 0);
+        // Multiset of ids preserved.
+        let mut after: Vec<u8> = (0..3)
+            .flat_map(|i| {
+                let (o, l) = se.id_span(i);
+                se.decoded[o..o + l].to_vec()
+            })
+            .collect();
+        let mut b = before.clone();
+        b.sort_unstable();
+        after.sort_unstable();
+        assert_eq!(b, after, "shuffle keeps the same multiset of monster ids");
+    }
+
+    #[test]
+    fn formation_accessors_read_and_locate_single_ids() {
+        let mut decoded = vec![0u8; 24];
+        // formation 0: count 2, ids [10, 20]
+        decoded[3] = 2;
+        decoded[4] = 10;
+        decoded[5] = 20;
+        // formation 1: count 1, id [30]
+        decoded[8 + 3] = 1;
+        decoded[8 + 4] = 30;
+        // formation 2: count 0
+        let se = SceneEncounters {
+            entry_idx: 7,
+            man_offset: 0,
+            compressed_budget: 9999,
+            raw_in_place: false,
+            decoded,
+            formation_array_off: 0,
+            formation_stride: 8,
+            formation_count: 3,
+            random_mask: vec![true; 3],
+        };
+        assert_eq!(se.formation_count(), 3);
+        assert_eq!(se.formation_ids(0), vec![10, 20]);
+        assert_eq!(se.formation_ids(1), vec![30]);
+        assert!(se.formation_ids(2).is_empty(), "zero-count row has no ids");
+        assert!(se.formation_ids(3).is_empty(), "out-of-range row is empty");
+        // The slot offset points at exactly the id byte.
+        let off = se.formation_id_offset(0, 1).expect("row 0 slot 1");
+        assert_eq!(se.decoded[off], 20);
+        assert_eq!(se.formation_id_offset(1, 0), Some(8 + 4));
+        assert!(se.formation_id_offset(1, 1).is_none(), "row 1 has one slot");
+        assert!(se.formation_id_offset(2, 0).is_none(), "row 2 is empty");
+    }
+
+    #[test]
+    fn protected_ids_cover_gimard_only() {
+        assert!(is_protected_formation_id(10), "Gimard (id 10) is protected");
+        assert!(
+            !is_protected_formation_id(19),
+            "the first wild Piura are genuine random encounters, not protected"
+        );
+        assert!(
+            !is_protected_formation_id(0),
+            "the empty slot is not protected"
+        );
+        assert!(
+            !is_protected_formation_id(0x4F),
+            "an ordinary id is not protected"
+        );
+    }
+
+    #[test]
+    fn protected_formation_is_forced_scripted_and_never_randomized() {
+        // A scene whose region heuristic marks all three formations random:
+        // [5,10] (holds Gimard), [5], [9]. The id guard must demote the Gimard
+        // row to scripted so it is never replaced and never donates id 10.
+        let rows: &[(&[u8], bool)] = &[(&[5, 10], true), (&[5], true), (&[9], true)];
+        let mut se = make_scene(3, rows);
+        mask_out_protected_formations(
+            &se.decoded,
+            se.formation_array_off,
+            se.formation_stride,
+            &mut se.random_mask,
+        );
+        assert!(
+            !se.is_random_formation(0),
+            "the Gimard formation is demoted to scripted"
+        );
+        assert!(se.is_random_formation(1));
+        assert!(se.is_random_formation(2));
+        // Gimard never enters the donor pool.
+        assert_eq!(
+            se.monster_pool(),
+            vec![5, 9],
+            "Gimard (10) excluded from pool"
+        );
+
+        // Neither mode rewrites the Gimard formation, and 10 never leaks elsewhere.
+        for mode in [DropMode::Shuffle, DropMode::Random] {
+            let mut s = make_scene(3, rows);
+            mask_out_protected_formations(
+                &s.decoded,
+                s.formation_array_off,
+                s.formation_stride,
+                &mut s.random_mask,
+            );
+            s.randomize(7, mode);
+            assert_eq!(
+                s.formation_ids(0),
+                vec![5, 10],
+                "the Gimard formation must be byte-identical ({mode:?})"
+            );
+            for i in [1usize, 2] {
+                for &id in &s.formation_ids(i) {
+                    assert_ne!(
+                        id, 10,
+                        "Gimard must not leak into a random formation ({mode:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn random_draws_only_from_scene_pool_and_is_deterministic() {
+        let mut decoded = vec![0u8; 16];
+        decoded[3] = 2;
+        decoded[4] = 5;
+        decoded[5] = 9;
+        decoded[8 + 3] = 2;
+        decoded[8 + 4] = 9;
+        decoded[8 + 5] = 5;
+        let make = || SceneEncounters {
+            entry_idx: 3,
+            man_offset: 0,
+            compressed_budget: 9999,
+            raw_in_place: false,
+            decoded: decoded.clone(),
+            formation_array_off: 0,
+            formation_stride: 8,
+            formation_count: 2,
+            random_mask: vec![true; 2],
+        };
+        let pool = make().monster_pool();
+        assert_eq!(pool, vec![5, 9]);
+        let mut a = make();
+        a.randomize(42, DropMode::Random);
+        let mut b = make();
+        b.randomize(42, DropMode::Random);
+        assert_eq!(a.decoded, b.decoded, "same seed reproduces the rewrite");
+        for i in 0..2 {
+            let (o, l) = a.id_span(i);
+            for &id in &a.decoded[o..o + l] {
+                assert!(pool.contains(&id), "id {id} not in scene pool");
+            }
+        }
+    }
+
+    #[test]
+    fn scripted_formations_are_never_randomized() {
+        // 3 formations; the middle one (index 1) is a scripted boss no region
+        // references, so it must be left untouched while 0 and 2 are randomized.
+        let mut decoded = vec![0u8; 24];
+        decoded[3] = 1;
+        decoded[4] = 10; // formation 0: id 10 (random)
+        decoded[8 + 3] = 1;
+        decoded[8 + 4] = 0x4F; // formation 1: id 0x4F "Tetsu" (scripted boss)
+        decoded[16 + 3] = 1;
+        decoded[16 + 4] = 20; // formation 2: id 20 (random)
+        let make = || SceneEncounters {
+            entry_idx: 1,
+            man_offset: 0,
+            compressed_budget: 9999,
+            raw_in_place: false,
+            decoded: decoded.clone(),
+            formation_array_off: 0,
+            formation_stride: 8,
+            formation_count: 3,
+            random_mask: vec![true, false, true],
+        };
+        // The boss id is excluded from the candidate pool entirely.
+        assert_eq!(
+            make().monster_pool(),
+            vec![10, 20],
+            "boss id 0x4F not in pool"
+        );
+        assert_eq!(make().random_formation_count(), 2);
+
+        for mode in [DropMode::Shuffle, DropMode::Random] {
+            let mut se = make();
+            se.randomize(7, mode);
+            let (off, _) = se.id_span(1);
+            assert_eq!(
+                se.decoded[off], 0x4F,
+                "scripted boss formation (index 1) must be untouched ({mode:?})"
+            );
+            // The boss id never leaked into a random formation either.
+            for i in [0usize, 2] {
+                let (o, l) = se.id_span(i);
+                for &id in &se.decoded[o..o + l] {
+                    assert_ne!(id, 0x4F, "boss id must not appear in a random formation");
+                }
+            }
+        }
+    }
+
+    /// Hand-build a scene whose formation array is a list of `(ids, is_random)`
+    /// rows at stride 8 (count byte at +3, ids from +4). Mirrors the layout the
+    /// other unit tests assemble by hand, factored so the cross-scene tests can
+    /// build several scenes cheaply.
+    fn make_scene(entry_idx: usize, rows: &[(&[u8], bool)]) -> SceneEncounters {
+        let stride = 8;
+        let mut decoded = vec![0u8; rows.len() * stride];
+        let mut mask = Vec::with_capacity(rows.len());
+        for (i, (ids, is_random)) in rows.iter().enumerate() {
+            let rec = i * stride;
+            decoded[rec + 3] = ids.len() as u8;
+            decoded[rec + 4..rec + 4 + ids.len()].copy_from_slice(ids);
+            mask.push(*is_random);
+        }
+        SceneEncounters {
+            entry_idx,
+            man_offset: 0,
+            compressed_budget: 9999,
+            raw_in_place: false,
+            decoded,
+            formation_array_off: 0,
+            formation_stride: stride,
+            formation_count: rows.len(),
+            random_mask: mask,
+        }
+    }
+
+    #[test]
+    fn random_slot_ids_and_apply_roundtrip_skip_scripted() {
+        // Rows: random [10,20], scripted [0x4F], random [30].
+        let mut se = make_scene(2, &[(&[10, 20], true), (&[0x4F], false), (&[30], true)]);
+        // Only the random rows' ids are exposed, in order.
+        assert_eq!(se.random_slot_count(), 3);
+        assert_eq!(se.random_slot_ids(), vec![10, 20, 30]);
+        // Apply a permutation; the scripted boss row stays put.
+        let changed = se.apply_random_slots(&[30, 10, 20]);
+        assert_eq!(changed, 3);
+        assert_eq!(se.random_slot_ids(), vec![30, 10, 20]);
+        assert_eq!(se.formation_ids(1), vec![0x4F], "scripted row untouched");
+        // A short slice is a partial, panic-free write.
+        let mut se2 = make_scene(2, &[(&[1, 2, 3], true)]);
+        se2.apply_random_slots(&[9]);
+        assert_eq!(se2.random_slot_ids(), vec![9, 2, 3]);
+    }
+
+    #[test]
+    fn fill_from_pool_only_uses_pool_and_skips_scripted() {
+        let pool = [40u8, 41, 42, 43];
+        let mut se = make_scene(5, &[(&[10, 20], true), (&[0x4F], false)]);
+        let changed = se.fill_random_slots_from_pool(99, &pool);
+        assert!(changed > 0);
+        for &id in &se.random_slot_ids() {
+            assert!(
+                pool.contains(&id),
+                "filled id {id} came from outside the pool"
+            );
+        }
+        assert_eq!(se.formation_ids(1), vec![0x4F], "scripted row untouched");
+        // Same seed reproduces the fill; empty pool is a no-op.
+        let mut a = make_scene(5, &[(&[10, 20], true)]);
+        let mut b = make_scene(5, &[(&[10, 20], true)]);
+        a.fill_random_slots_from_pool(99, &pool);
+        b.fill_random_slots_from_pool(99, &pool);
+        assert_eq!(a.decoded, b.decoded);
+        let mut c = make_scene(5, &[(&[10, 20], true)]);
+        assert_eq!(c.fill_random_slots_from_pool(99, &[]), 0);
+    }
+
+    #[test]
+    fn cross_scene_shuffle_preserves_group_multiset() {
+        // Two scenes in one group; simulate the orchestration's gather -> shuffle
+        // -> redistribute over their random slots and assert the group-wide
+        // multiset is conserved while scripted ids never move.
+        let mut scenes = vec![
+            make_scene(0, &[(&[1, 2], true), (&[0x90], false)]),
+            make_scene(1, &[(&[3], true), (&[4, 5], true)]),
+        ];
+        let before: Vec<u8> = {
+            let mut v: Vec<u8> = scenes.iter().flat_map(|s| s.random_slot_ids()).collect();
+            v.sort_unstable();
+            v
+        };
+        let mut all_ids: Vec<u8> = scenes.iter().flat_map(|s| s.random_slot_ids()).collect();
+        let mut rng = SplitMix64::new(0xABCD);
+        rng.shuffle(&mut all_ids);
+        let mut cursor = 0;
+        for s in &mut scenes {
+            let n = s.random_slot_count();
+            s.apply_random_slots(&all_ids[cursor..cursor + n]);
+            cursor += n;
+        }
+        let after: Vec<u8> = {
+            let mut v: Vec<u8> = scenes.iter().flat_map(|s| s.random_slot_ids()).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(before, after, "cross-scene shuffle conserves the multiset");
+        assert_eq!(scenes[0].formation_ids(1), vec![0x90], "scripted id stays");
+    }
+
+    /// A power table built from id->power pairs reads back, with absent ids 0.
+    #[test]
+    fn power_table_reads_back_and_zeros_absent() {
+        let t = MonsterPowerTable::from_powers([(10u16, 100u32), (20, 4000), (300, 9)]);
+        assert_eq!(t.power_of(10), 100);
+        assert_eq!(t.power_of(20), 4000);
+        assert_eq!(t.power_of(0), 0, "empty slot is power 0");
+        assert_eq!(t.power_of(99), 0, "unpopulated id is power 0");
+        // An id past a byte was dropped, not wrapped onto id 300&0xFF.
+        assert_eq!(t.power_of((300u16 & 0xFF) as u8), 0);
+    }
+
+    /// Baseline is the mean power across the scene's random slots (scripted slots
+    /// excluded), and `None` when there are no random slots.
+    #[test]
+    fn baseline_power_is_random_slot_mean() {
+        let t = MonsterPowerTable::from_powers([(1u16, 100u32), (2, 200), (9, 100_000)]);
+        // random [1,2], scripted [9 = a heavyweight]. Baseline ignores 9.
+        let se = make_scene(0, &[(&[1, 2], true), (&[9], false)]);
+        assert_eq!(se.baseline_power(&t), Some(150));
+        // No random slots -> None.
+        let only_scripted = make_scene(0, &[(&[9], false)]);
+        assert_eq!(only_scripted.baseline_power(&t), None);
+    }
+
+    /// A formation holding an over-strong monster collapses to that lone monster;
+    /// a balanced pack and a solo formation are left alone, and the scripted boss
+    /// pack is never touched.
+    #[test]
+    fn enforce_solo_strong_collapses_only_strong_packs() {
+        let t = MonsterPowerTable::from_powers([
+            (1u16, 100u32),
+            (2, 120),
+            (3, 110),
+            (7, 1000), // the heavy hitter (>= 2x the ~110 baseline)
+            (9, 5000), // a scripted boss
+        ]);
+        // formation 0: balanced pair [1,2]; 1: strong pair [3,7]; 2: solo strong
+        // [7]; 3: scripted boss pair [9,9].
+        let mut se = make_scene(
+            0,
+            &[
+                (&[1, 2], true),
+                (&[3, 7], true),
+                (&[7], true),
+                (&[9, 9], false),
+            ],
+        );
+        let baseline = se.baseline_power(&t).unwrap();
+        let (collapsed, zeroed) = se.enforce_solo_strong(&t, baseline, 200);
+        assert_eq!(collapsed, 1, "only the strong pair collapses");
+        assert_eq!(zeroed, 1, "one id byte dropped");
+        // Balanced pair untouched.
+        assert_eq!(se.formation_ids(0), vec![1, 2]);
+        // Strong pair is now the lone heavy hitter (the strongest member kept).
+        assert_eq!(se.formation_ids(1), vec![7]);
+        // Solo strong formation untouched (already a single enemy).
+        assert_eq!(se.formation_ids(2), vec![7]);
+        // Scripted boss pack is never collapsed.
+        assert_eq!(se.formation_ids(3), vec![9, 9]);
+    }
+
+    /// The strongest member is the survivor regardless of its slot, and a
+    /// zero/absent baseline or threshold is a no-op.
+    #[test]
+    fn enforce_solo_strong_keeps_strongest_and_guards() {
+        let t = MonsterPowerTable::from_powers([(1u16, 90u32), (2, 5000), (3, 80)]);
+        // The heavy hitter is in the middle slot.
+        let mut se = make_scene(0, &[(&[1, 2, 3], true)]);
+        let baseline = se.baseline_power(&t).unwrap();
+        let (collapsed, _) = se.enforce_solo_strong(&t, baseline, 200);
+        assert_eq!(collapsed, 1);
+        assert_eq!(
+            se.formation_ids(0),
+            vec![2],
+            "the strongest member survives"
+        );
+
+        // Guards: zero threshold / zero baseline never collapse.
+        let mut s2 = make_scene(0, &[(&[1, 2, 3], true)]);
+        assert_eq!(s2.enforce_solo_strong(&t, 100, 0), (0, 0));
+        assert_eq!(s2.enforce_solo_strong(&t, 0, 200), (0, 0));
+        assert_eq!(s2.formation_ids(0), vec![1, 2, 3], "no-op guards leave it");
+    }
+}

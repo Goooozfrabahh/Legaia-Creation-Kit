@@ -1,0 +1,162 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">formats</a> &middot; mdt - the MOVE buffer (animation clip bank)</div>
+  <h1>MDT - the MOVE buffer (animation clip bank) <span class="tag tag-done">Confirmed</span></h1>
+  <p class="lede">When a scene tells an actor to "do move 12" - a villager's wave, a door swinging, a scripted
+  stumble - the frames come from the scene's <strong>move table</strong>: the buffer the engine keeps in RAM at the
+  <code>MOVE</code> base, one record per move id. Despite the name, that buffer is the scene's
+  <a href="anm.html">ANM clip bank</a>: byte-equality against the live bank in a field save state shows the
+  type-<code>0x05</code> payload is an ANM container, and its records are per-bone keyframes, not
+  <a href="../subsystems/move-vm.html">move-VM</a> bytecode. Every scene ships its own bank inside its asset
+  bundle; there is no single global one. And a naming trap for anyone browsing an extracted disc: the files
+  literally named <code>move_program_no.BIN</code> are <strong>not</strong> move tables at all (<a
+  href="#cdname-mismatch">below</a>).</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>In the game</dt><dd>Scripted actor motion in the field - the script VM's <code>0x22 EXEC_MOVE</code> binds one of these clips to an actor</dd>
+    <dt>Magic / marker</dt><dd>None - an ANM container: <code>u32 count</code>, then <code>count</code> byte offsets, then the records (each header carries <code>marker_1 = 0x080C</code>)</dd>
+    <dt>Lives in</dt><dd>Each scene's <code>scene_asset_table</code> entry (the second PROT entry of the scene's CDNAME block), descriptor 4, type byte <code>0x05</code>; loaded to the <code>MOVE</code> base <code>_DAT_8007B888</code> on area transition</dd>
+    <dt>Retail reader</dt><dd><code>FUN_800204F8</code>, the ANM clip driver (binding and playhead advance); the entries are decoded by <code>FUN_8001BE80</code></dd>
+    <dt>Parser</dt><dd><code>crates/mdt</code> (<code>MoveBuffer</code>), <code>legaia_scene_formats::scene_asset_table::move_descriptor</code>, <code>engine-scene::scene_bundle::extract_move_payload</code></dd>
+    <dt>Confidence</dt><dd>Confirmed - consumer disassembly for the layout; per-scene source verified by mednafen save-state diff against <code>_DAT_8007B888</code></dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="overview">
+  <h2>How a move is found</h2>
+  <ol class="steps">
+    <li><b>Script asks for a move</b><span>The field VM's <code>0x22 EXEC_MOVE</code> stores a <code>move_id</code> in the actor's <code>+0x5C</code> and calls the clip driver (<a href="../subsystems/script-vm.html">script VM</a>).</span></li>
+    <li><b>Pick a buffer</b><span>Actor flag <code>0x01000000</code> set &rarr; alternate base <code>_DAT_8007B75C</code>; else <code>MOVE</code> for ids <code>&lt; 0x400</code>, <code>MOVE2</code> for <code>&gt;= 0x400</code>.</span></li>
+    <li><b>Offset table</b><span>The driver reads word <code>move_id &amp; 0x3FF</code> of the container head: word 0 is the record count, word <code>d</code> is <code>offsets[d-1]</code>.</span></li>
+    <li><b>Record header</b><span>Clamp the playhead, pick the frame divisor, find the per-frame data (<a href="#layout-the-consumer-reads">layout</a>).</span></li>
+    <li><b>Pose the frame</b><span>The per-frame data is one 8-byte (bone, frame) entry per bone, decoded to a rigid transform per TMD object (<a href="anm.html">ANM</a>).</span></li>
+  </ol>
+</section>
+
+<section class="doc-section" id="layout-the-consumer-reads">
+  <h2>Layout the consumer reads</h2>
+  <p>The driver masks the move id to 10 bits, so a table is <em>addressable</em> up to 1024 words; a real bank is an ANM container holding far fewer records (69-72 in the field scenes), with the record bodies packed right after its offset table:</p>
+  <div class="byte-map" role="img" aria-label="Move buffer: a record count, the record offsets, then the records">
+    <div class="bm-cell bm-accent" style="--w:1"><span class="bm-off">+0x000</span><span class="bm-name">count</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell bm-accent" style="--w:3"><span class="bm-off">+0x004</span><span class="bm-name">byte_offsets[count] - word <code>move_id</code> of the head is read</span><span class="bm-size">u32 &times; count</span></div>
+    <div class="bm-cell bm-dim" style="--w:2"><span class="bm-off">offsets[0]</span><span class="bm-name">records, back to back</span><span class="bm-size">varies</span></div>
+  </div>
+  <p>Each record is an ANM clip (the field names this page used before the ANM reading in brackets):</p>
+  <div class="byte-map" role="img" aria-label="Clip record header: bone count, scale bit, frame count, marker, divisor, then the per-frame entries">
+    <div class="bm-cell bm-pad" style="--w:2"><span class="bm-off">+0x00</span><span class="bm-name">bones</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+0x01</span><span class="bm-name">scale [flags]</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell bm-accent" style="--w:3"><span class="bm-off">+0x02</span><span class="bm-name">frames [max_position_x16]</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell bm-pad" style="--w:3"><span class="bm-off">+0x04</span><span class="bm-name">marker_1 = 0x080C</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+0x06</span><span class="bm-name">flag; low byte = divisor</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell bm-dim" style="--w:6"><span class="bm-off">+0x08</span><span class="bm-name">per-frame data: one 8-byte entry per (bone, frame)</span><span class="bm-size">8 &times; bones &times; frames</span></div>
+  </div>
+  <ul class="bullets">
+    <li>Scale bit 0 = "use frame divisor" (and blend adjacent frames); the divisor is consulted only when it is set.</li>
+    <li><code>frames</code> clamps the playhead at <code>(frames * 16) - 1</code>: the cursor is in 1/16-frame units.</li>
+  </ul>
+  <p><code>FUN_800204F8</code> clamps <code>actor[0x68]</code> (the playhead) to <code>[0, frames * 16)</code>,
+  advances it by <code>actor[0x6A]</code> (frame delta) optionally scaled by the divisor at <code>record[6]</code>, and binds the
+  clip for the renderer to pose. This is <a href="anm.html#playback">ANM clip playback</a> itself, not a sibling format sharing
+  its frame cursor.</p>
+</section>
+
+<section class="doc-section" id="on-disc-source-per-scene-scene-asset-table-slot-4">
+  <h2>On-disc source - per-scene <code>scene_asset_table</code> slot 4</h2>
+  <p>(PROT.DAT is the disc's single big archive; CDNAME is the name map that groups consecutive entries into
+  per-scene blocks.) The <code>MOVE</code> base is <strong>populated per scene</strong> during area transitions, not from a
+  boot-time entry. Every scene block's second PROT entry - the one classified <code>scene_asset_table</code> - carries
+  an <code>Asset(0x05) = Move</code> descriptor whose payload is that scene's runtime table.</p>
+  <div class="byte-map" role="img" aria-label="Scene asset table header: count, total size, seven descriptors, payloads">
+    <div class="bm-cell" style="--w:2"><span class="bm-off">+0x00</span><span class="bm-name">count = 7</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell bm-dim" style="--w:2"><span class="bm-off">+0x04</span><span class="bm-name">total decompressed size (never read)</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell bm-accent" style="--w:5"><span class="bm-off">+0x08</span><span class="bm-name">7 &times; (u32 type_size, u32 data_offset); <code>descriptor[4]</code> type <code>0x05</code> = Move</span><span class="bm-size">7 &times; 8</span></div>
+    <div class="bm-cell bm-dim" style="--w:4"><span class="bm-off">data_offset</span><span class="bm-name">payloads, each its own <a href="lzs.html">LZS</a> stream decoding to exactly <code>size</code> bytes</span><span class="bm-size">varies</span></div>
+  </div>
+  <p>Examples verified by mednafen save-state diff against <code>_DAT_8007B888</code>:</p>
+  <table>
+    <thead><tr><th>Scene block</th><th>Slot-1 PROT entry</th><th>Move size</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>dolk</code> (60)</td><td><code>0061_dolk.BIN</code></td><td><code>0xE370</code> (58224)</td><td>Loaded as <code>MOVE</code> at <code>0x800E412C</code> (Drake Castle save)</td></tr>
+      <tr><td><code>suimon</code> (77)</td><td><code>0078_suimon.BIN</code></td><td><code>0x09A0</code> (2464)</td><td>Loaded at <code>0x801355D0</code> (Suimon-block saves)</td></tr>
+      <tr><td><code>map01</code> (85)</td><td><code>0086_map01.BIN</code></td><td><code>0x7E30</code> (32304)</td><td>Loaded at <code>0x8011A624</code> (every <code>map01</code>-resident save, incl. menu and battle states layered on it)</td></tr>
+    </tbody>
+  </table>
+  <p>The descriptor's <code>data_offset</code> is measured from the start of the bundle entry, and the payload lies
+  inside that entry's own sectors (an entry's size is the <a href="prot.html">sector gap to the next TOC entry</a>).
+  In the port, <code>engine-scene::scene_bundle::extract_move_payload</code> slices and decodes it, and
+  <code>scene_asset_table::move_descriptor</code> is the typed slot accessor:</p>
+<pre><code>let s = legaia_scene_formats::scene_asset_table::detect(&amp;prot_bytes)?;
+let move_descriptor = s.move_descriptor()?; // type_byte = 0x05</code></pre>
+  <p>The <code>MOVE2</code> base (<code>_DAT_8007B840</code>) is zero across every observed save state, and no Move2 payload has been observed in a retail
+  <a href="scene-bundles.html">scene bundle</a> - the alternate table is rare or unused. (The <code>scene_scripted_asset_table</code>
+  that once looked like its carrier was an entry-size over-read; see <a href="prot.html">PROT.DAT</a>.)</p>
+</section>
+
+<section class="doc-section" id="cdname-mismatch">
+  <h2>The <code>move_program_no</code> name</h2>
+  <p>The extraction files <em>named</em> <code>0972</code> / <code>0973 move_program_no.BIN</code> are not move tables. Under the
+  <a href="cdname.html#numbering-space">+2 CDNAME numbering shift</a> they sit in the <code>other_game</code> block: 0972 is
+  the <strong>fishing minigame overlay</strong> (dev <code>other1</code>) and 0973 the 1-sector <code>OTHER2</code> dev module. The
+  <code>move_program_no</code> define actually covers extraction <strong>0970..0971</strong> - a <code>\DATA\MOV*.STR</code> FMV
+  program / path table (the block names <strong>MOV</strong>ie program numbers; see the <a href="str-fmv-table.html">STR
+  FMV table</a>), not Tactical-Arts moves. <code>mdt classify</code> correctly reports that neither file matches the
+  runtime layout above.</p>
+  <details class="disclosure" id="parse-caveat">
+    <summary>Caveat: <code>MoveBuffer::parse</code> over-reads the offset table</summary>
+    <div class="disclosure-body">
+      <p>Real per-scene buffers have offset tables far shorter than the 1024-word mask and pack record data densely right after the
+      real table end, so <code>MoveBuffer::parse</code> keeps reading record bytes as offsets. Most of those point past the
+      buffer and are counted as <code>bogus_offsets</code>, which makes the strict <code>fitness()</code> score
+      (<code>used - 2*bogus</code>) strongly negative for valid retail data. Use <code>MoveBuffer::looks_like_move_buffer()</code>
+      instead - it requires <code>records.len() &gt; 0 &amp;&amp; used &gt; bogus</code>, which real per-scene buffers pass while
+      random data fails - and <code>classify()</code>'s <code>OffsetTableLayout</code> verdict routes through it, so the CLI reports
+      the same shape the engine accepts.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <details class="disclosure">
+    <summary>Consumer disassembly and save-state evidence</summary>
+    <div class="disclosure-body">
+  <table>
+    <thead><tr><th>Function</th><th>Address</th><th>What it proves</th><th>Dump</th></tr></thead>
+    <tbody>
+      <tr><td>Clip driver</td><td><code>FUN_800204F8</code></td><td>Offset-table indexing, record header fields, playhead clamp / advance, the MOVE / MOVE2 / alternate-base routing</td><td><code>funcs/800204f8.txt</code></td></tr>
+      <tr><td>Entry decoder</td><td><code>FUN_8001BE80</code></td><td>The per-frame data is ANM 8-byte (bone, frame) entries, decoded to a rigid transform per object - not move-VM bytecode</td><td><code>funcs/8001be80.txt</code></td></tr>
+      <tr><td>Clip-bank byte match</td><td>field save state (<code>v0_1_pre_battle_tetsu</code>)</td><td>The live bank at <code>_DAT_8007B888</code> byte-matches the scene bundle's type-<code>0x05</code> payload decoded as an ANM container (<a href="anm.html">ANM</a>)</td><td>scenario manifest</td></tr>
+      <tr><td>Per-scene source</td><td><code>_DAT_8007B888</code> diffs (dolk / suimon / map01 saves)</td><td>The MOVE base is refilled per scene from slot-4 of the scene's asset table</td><td><a href="../tooling/mednafen-automation.html">mednafen automation</a></td></tr>
+      <tr><td>MOVE2 base</td><td><code>_DAT_8007B840</code></td><td>Zero across every observed save state - the alternate table is rare or unused</td><td>save-state corpus</td></tr>
+    </tbody>
+  </table>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="cli">
+  <h2>CLI</h2>
+<pre><code>mdt classify &lt;PATH&gt;                        # which layout?
+mdt records  &lt;PATH&gt; --limit 8              # decode as flat record table
+mdt slots    &lt;PATH&gt; --limit 8              # decode as offset-table layout</code></pre>
+  <p>Source of record: <a
+  href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/formats/mdt.md"><code>docs/formats/mdt.md</code></a>.</p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="art-data.html">Art records</a>
+    <a href="move-power.html">Move-power table</a>
+    <a href="anm.html">ANM animation container</a>
+    <a href="scene-bundles.html">Scene bundles</a>
+    <a href="cdname.html">CDNAME numbering</a>
+    <a href="../subsystems/move-vm.html">Move VM</a>
+    <a href="../subsystems/script-vm.html">Field script VM</a>
+    <a href="../subsystems/battle-action.html">Battle action SM</a>
+    <a href="../arts.html">Arts</a>
+  </div>
+</section>

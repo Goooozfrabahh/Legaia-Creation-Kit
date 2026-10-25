@@ -1,0 +1,118 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">formats</a> &middot; window widget scripts</div>
+  <h1>Window widget scripts <span class="tag tag-done">Confirmed</span></h1>
+  <p class="lede">When a shop opens, five UI windows slide onto the screen in one coordinated motion - the vendor's
+  name plate, the Buy/Sell picker, the gold box and two panels. That entrance is data: a tiny bytecode program
+  of fixed 4-byte instructions, run by the menu overlay's window-script interpreter. The programs are not in a
+  scene file or an asset bundle; they sit in a small table inside the menu overlay's own data segment - the code
+  module that hosts the pause menu, shop and save UI. This page is the byte-level spec; the interpreter is on the
+  <a href="../subsystems/actor-vm.html">actor VM</a> page.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>In the game</dt><dd>The choreography of pause-menu, shop and save-UI windows opening, closing and sliding</dd>
+    <dt>Magic / marker</dt><dd>None - a zero opcode byte terminates a program</dd>
+    <dt>Lives in</dt><dd>Menu overlay, PROT extraction entry <strong>0899</strong> (slot-A base <code>0x801CE818</code>): programs cluster at file <code>0x16260..0x16740</code>, VA <code>0x801E4A78..0x801E4F58</code></dd>
+    <dt>Stride</dt><dd>4 bytes per instruction; programs are 2 to 7 instructions long on disc</dd>
+    <dt>Retail reader</dt><dd><code>FUN_801D6628(&amp;program)</code>, 13-entry jump table at <code>0x801CED70</code></dd>
+    <dt>Parser</dt><dd><code>legaia_game_tables::widget_script</code> (parser + <code>jal</code>-site scanner)</dd>
+    <dt>Confidence</dt><dd>Confirmed - interpreter and caller disassembly, program bytes verified on the disc image</dd>
+    <dt>Used by</dt><dd><a href="../subsystems/shop.html">Shop flow</a>, <a href="../subsystems/level-up.html">Level-up notice</a>, <a href="../subsystems/field-menu.html">Field menu</a></dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="layout">
+  <h2>Instruction encoding</h2>
+  <p>Each instruction is exactly 4 bytes. After every instruction the interpreter reads the opcode byte of the next
+  slot and stops when it is zero.</p>
+
+  <div class="byte-map">
+    <div class="bm-cell bm-accent" style="--w:1"><span class="bm-off">+0</span><span class="bm-name">opcode</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell" style="--w:1"><span class="bm-off">+1</span><span class="bm-name">window id</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell" style="--w:2"><span class="bm-off">+2</span><span class="bm-name">operand</span><span class="bm-size">u16 LE</span></div>
+    <div class="bm-cell bm-pad" style="--w:2"><span class="bm-off">+4</span><span class="bm-name">next opcode, 00 = end</span><span class="bm-size">u8</span></div>
+  </div>
+  <div class="table-wrap"><table class="layout">
+    <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>opcode</td><td><code>0x01..=0x0D</code> selects one of 13 handlers; <code>0x00</code> terminates the program</td></tr>
+      <tr><td>window id</td><td>Index into the 52-record <a href="../subsystems/field-menu.html">window descriptor table</a> (16 bytes per record); the record's <code>x</code> / <code>y</code> are the instruction's default coordinates</td></tr>
+      <tr><td>operand</td><td>Packed position for opcodes <code>0x02</code> / <code>0x09</code>: <code>x = (w &gt;&gt; 7) &amp; 0x1FE</code>, <code>y = w &amp; 0xFF</code>. Style byte for <code>0x03</code>. Zero elsewhere on disc</td></tr>
+    </tbody>
+  </table></div>
+  <p>Opcode semantics (create / snap / slide / close / global tick) belong to the interpreter and are documented on the <a href="../subsystems/actor-vm.html">actor VM</a> page.</p>
+  <table>
+    <thead><tr><th>Opcode</th><th>Seen on disc as</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x01</code></td><td>Open a window at its home position</td></tr>
+      <tr><td><code>0x02</code></td><td>Open at a packed position (operand)</td></tr>
+      <tr><td><code>0x04</code></td><td>Close</td></tr>
+      <tr><td><code>0x05</code></td><td>Global tick</td></tr>
+      <tr><td><code>0x06</code></td><td>Motion-flag clear</td></tr>
+      <tr><td><code>0x0A</code></td><td>Close / re-open / slide-back composite</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="doc-section" id="where">
+  <h2>Where the programs live</h2>
+  <p>Each caller builds a pointer to a program and calls the interpreter with it. Because the table is overlay data
+  at fixed addresses, the lookup is <strong>per boot, not per scene</strong>: the same programs are resident whenever
+  the menu overlay is - pause menu, shop, save UI, every scene.</p>
+  <ul class="bullets">
+    <li><code>legaia_game_tables::widget_script::scan</code> recovers the programs structurally: find every call into the interpreter, resolve the argument each site materialises, keep the targets that parse as terminated programs with in-range opcodes and window ids.</li>
+    <li>Call sites that forward the pointer through a saved register (the shop pair among them) are not resolvable by that pass; those programs are pinned by reading the caller's disassembly.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="pinned">
+  <h2>Pinned programs</h2>
+  <p>Byte-verified on the disc image. The shop pair is additionally pinned by the randomizer's Seru-trading vendor,
+  which reuses exactly these scripts (<code>legaia_code_hooks::seru_overlay::consts</code>, <a
+  href="../subsystems/shop.html">shop flow</a>).</p>
+  <table>
+    <thead><tr><th>VA</th><th>File offset</th><th>Program</th><th>Caller</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x801E4E38</code></td><td><code>0x16620</code></td><td><code>[05][01 21][01 2A][01 20][01 28][01 22][00]</code> - tick, then open vendor plate, picker, gold box and two panels</td><td>shop picker open, <code>FUN_801DAFD4</code></td></tr>
+      <tr><td><code>0x801E4E54</code></td><td><code>0x1663C</code></td><td><code>[04 28][04 2A][04 22][00]</code> - close the picker windows, keep gold + vendor plate</td><td>shop Sell transition, <code>FUN_801DAFD4</code></td></tr>
+      <tr><td><code>0x801E4A78</code></td><td><code>0x16260</code></td><td><code>[05][00]</code> - global tick only</td><td>menu-open staging (multiple callers)</td></tr>
+      <tr><td><code>0x801E4D50</code> / <code>0x801E4D78</code></td><td><code>0x16538</code> / <code>0x16560</code></td><td><code>[01 07][00]</code> - open window 7</td><td>spell level-up notice, <code>FUN_801D9280</code> / <code>FUN_801D9594</code></td></tr>
+      <tr><td><code>0x801E4EA8</code> / <code>0x801E4EDC</code></td><td><code>0x16690</code> / <code>0x166C4</code></td><td><code>[01 1F][00]</code> - open window 31</td><td>Point Card toast, <code>FUN_801DB7F4</code> / <code>FUN_801DB380</code></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <details class="disclosure"><summary>Disassembly anchors</summary>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Function / site</th><th>Address</th><th>What it proves</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td>Interpreter entry</td><td><code>FUN_801D6628</code></td><td>Takes a program pointer; 4-byte stride</td><td>Disassembly of PROT 0899 at slot-A base <code>0x801CE818</code></td></tr>
+      <tr><td>Opcode range check</td><td><code>0x801D6680</code></td><td><code>sltiu v0, opcode-1, 0xd</code> - 13 handlers, <code>0x00</code> falls out</td><td>Disassembly</td></tr>
+      <tr><td>Jump table</td><td><code>0x801CED70</code></td><td>The 13 handler addresses</td><td>Disassembly</td></tr>
+      <tr><td>Terminator re-read</td><td><code>0x801D6854</code></td><td><code>lbu v0,0x0(s4)</code> after each dispatch - a zero byte ends the program</td><td>Disassembly</td></tr>
+      <tr><td>Window-table index</td><td><code>0x801E4738 + id*0x10</code></td><td>Byte 1 is a window id, not an actor or animation id</td><td>Disassembly of the base materialisation</td></tr>
+      <tr><td>Program bytes</td><td>file <code>0x16260..0x16740</code></td><td>The pinned programs above exist on the disc as listed</td><td>Read off the disc image</td></tr>
+    </tbody>
+  </table></div>
+  </details>
+  <p>In the port, <code>legaia_engine_menus::menu_widget</code> resolves the same programs from the user's disc at boot and runs them through the interpreter in <code>legaia_engine_vm</code>.</p>
+  <p>Source of record: <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/formats/window-script.md"><code>docs/formats/window-script.md</code></a>.</p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../subsystems/actor-vm.html">Actor VM (the interpreter)</a>
+    <a href="../subsystems/field-menu.html">Field menu (window table)</a>
+    <a href="../subsystems/shop.html">Shop flow</a>
+    <a href="../subsystems/level-up.html">Level-up</a>
+    <a href="../shops.html">Shops</a>
+    <a href="../tooling/randomizer.html">Randomizer (seru vendor)</a>
+    <a href="../reference/re-do-not-re-walk.html">Do not re-walk</a>
+  </div>
+</section>

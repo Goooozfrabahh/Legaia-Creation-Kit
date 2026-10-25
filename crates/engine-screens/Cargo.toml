@@ -1,0 +1,48 @@
+[package]
+name = "legaia-engine-screens"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# tests/integration.rs gathers every tests/*.rs into one binary.
+autotests = false
+
+[lib]
+name = "legaia_engine_screens"
+path = "src/lib.rs"
+
+[dependencies]
+legaia-engine-dev-menu.workspace = true
+legaia-engine-core.workspace = true
+legaia-engine-world-views.workspace = true
+legaia-engine-battle-hud.workspace = true
+legaia-engine-scene-host.workspace = true
+legaia-engine-menu-runtime.workspace = true
+legaia-engine-dialog.workspace = true
+legaia-engine-scene.workspace = true
+legaia-engine-ui.workspace = true
+legaia-font.workspace = true
+legaia-engine-battle.workspace = true
+legaia-engine-battle-vm.workspace = true
+legaia-ui-formats.workspace = true
+legaia-engine-camera.workspace = true
+legaia-engine-effects.workspace = true
+legaia-engine-field.workspace = true
+legaia-engine-fishing.workspace = true
+legaia-engine-battle-menus.workspace = true
+legaia-engine-menus.workspace = true
+legaia-engine-title.workspace = true
+legaia-engine-minigame-scenes.workspace = true
+legaia-engine-minigames.workspace = true
+legaia-engine-mode.workspace = true
+legaia-engine-system.workspace = true
+legaia-game-tables.workspace = true
+legaia-minigame-formats.workspace = true
+legaia-render-kernels.workspace = true
+glam.workspace = true
+
+[dev-dependencies]
+legaia-save.workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

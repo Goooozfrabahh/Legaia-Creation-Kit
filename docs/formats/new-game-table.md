@@ -1,0 +1,267 @@
+# New-game starting-party table
+
+When the title screen's NEW GAME row is confirmed, the boot chain
+(`FUN_80025B64` → `FUN_801D6704`, see [`boot.md`](../subsystems/boot.md)) launches
+the field/town overlay with a fresh game state. Part of that fresh state is the
+**starting party**: a small static table in `SCUS_942.54` holds each roster
+member's opening stats and display name, which the seed routine expands into the
+live per-character records at `0x80084708 + n*0x414`.
+
+The interactive scene a New Game enters is `town01` (Rim Elm) - the executable's
+default map-name buffer at `0x8007050C` holds the literal `"town01"`, and the
+global reset/init `FUN_8001D424` reads an optional dev `initmap.txt` override
+when the debug flag `_DAT_8007B8C2` is clear. Retail boots with that flag set to
+`1`, so the override never fires and a retail New Game always enters `town01`.
+
+## Table base + record layout
+
+| | |
+|---|---|
+| Base address | `0x80078C4C` (Vahn's record) |
+| Stride | `26` bytes (`8×u16` stats + 10-byte name) |
+| Records | `4` - `Vahn`, `Noa`, `Gala`, `Terra`, in roster order |
+
+| Offset | Type | Field |
+|---|---|---|
+| `+0`  | u16 | `hp_max` (also the starting HP) |
+| `+2`  | u16 | `mp_max` (also the starting MP) |
+| `+4`  | u16 | `agl` - the live agility cells only, not the cap cells |
+| `+6`  | u16 | `atk` |
+| `+8`  | u16 | `udf` (upper / physical defence) |
+| `+10` | u16 | `ldf` (lower / magical defence) |
+| `+12` | u16 | `spd` (turn-order initiative seed) |
+| `+14` | u16 | `intel` |
+| `+16` | u8[10] | display name, NUL-padded |
+
+At a true New Game only Vahn has joined; the other rows are the templates the
+game uses as each character is introduced. Tetsu's tutorial-fight dialogue
+string (`"I will show you how to fight…"`) sits immediately after the table.
+
+The seed loop fills all four live records, so a member who joins later (field
+op `0x3C`, party add) already has a level-1 record. The engine's New Game
+roster is Vahn alone and keeps the template (`DiscTables::starting_party`);
+`World::set_active_party` seeds every slot up to the highest one a party list
+names from it when the roster lacks that record. Without it a joined member
+fought at 0 / 0 HP while counted alive, so the battle never saw the party
+wiped.
+
+### Decoded values
+
+| Slot | Name | HP | MP | AGL | ATK | uDEF | lDEF | SPD | INT |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | Vahn  | 180 | 20  | 100 | 24 | 16 | 12 | 19 | 9 |
+| 1 | Noa   | 150 | 10  | 120 | 21 | 13 | 11 | 30 | 3 |
+| 2 | Gala  | 210 | 40  | 80  | 30 | 43 | 30 | 15 | 20 |
+| 3 | Terra | 400 | 200 | 200 | 45 | 20 | 17 | 45 | 25 |
+
+The `+4` stat lands in the live agility cells of both stat blocks (`+0x110`
+current, `+0x122` max). The per-character archetypes (`Vahn = 100`,
+`Noa = 120`, `Gala = 80`) are what make it read as agility.
+
+The neighbouring cap cells (`+0x10C` current, `+0x120` max) are **not** fed
+from `+4`. The seed routine writes the literal `100` into both, for every
+roster slot: `800561b8 li v0,0x64` / `800561bc sh v0,0x6d4(s0)` /
+`800561c0 sh v0,0x6e8(s0)`, inside the four-iteration loop. Vahn's `+4` is
+also `100`, so a Vahn-only save-state cross-validation cannot separate the
+literal from the template field - Noa and Gala can, and they seed `100` while
+their agility differs.
+
+## Starting inventory (code-built, not a table)
+
+The opening inventory is **not** a static table like the party stats - the
+new-game data-init `FUN_80034A6C` (`docs/subsystems/boot.md`) builds it in code,
+writing a single slot into the live owned-item array at `0x80085958`
+(= `SC` base `0x80084140` + `0x1818`; 2 bytes/slot `[id: u8][count: u8]`,
+id-`0` terminator):
+
+```
+0x80034b0c  addiu $v0, $zero, 0x77    ; item id  = Healing Leaf
+0x80034b10  sb    $v0, 0x1818($s0)    ; inventory[0].id   ($s0 = SC base)
+0x80034b14  addiu $v0, $zero, 5       ; count    = 5
+0x80034b18  sb    $v0, 0x1819($s0)    ; inventory[0].count
+```
+
+So a vanilla New Game starts with **Healing Leaf ×5** and nothing else. A
+6-instruction loop right after (`0x80034b04..`, `0x80034b1c..0x80034b2b`) zeroes
+the 512 bytes *below* the inventory - but **both** callers of `FUN_80034A6C`
+(`FUN_8001DCF8`'s new-game branch, guarded by the new-game flag at
+`0x8007b7ac`, and `FUN_8001FFA4`) `memset` the whole `SC[0..0x1a18)` region -
+which contains the entire 72-slot inventory - immediately before the call, so
+that inline zero-loop is redundant. The reclaimable seed region is therefore
+the **10 instructions at [`STARTING_INV_SEED_VA`] (`0x80034b04`, 40 bytes)**.
+
+The array at `0x1818` is a **single ordered `(id, count)` owned-item list shared
+by every item category** - the inventory menu only *filters* it into Items /
+Goods / Key tabs by item id. (Verified against a real end-game save: consumables,
+equipment, and accessories all sit in this one list as plain `(id, count)` pairs,
+running past the first 72 slots to a `(0, 0)` terminator.) So a seeded slot can
+hold any item id regardless of category - the randomizer's starting-bag toggles
+seed the Door of Wind / Incense consumables and the Speed Chain / Chicken Heart /
+Good Luck Bell accessories through this same array (see
+[`randomizer.md`](../tooling/randomizer.md#starting-bag-convenience-toggles)).
+
+`legaia_game_tables::new_game::StartingInventory` decodes this region by replaying its
+`$v0`-source byte/halfword stores into an `SC`-offset → byte map and reading
+`(id, count)` slots from `0x1818`, so it reads back either the vanilla `sb` pair
+or the randomizer's packed `sh` halfword store (slot = `id | (count << 8)` in one
+instruction). The relevant LE-instruction-word top-16 signatures are:
+
+| Op | Top 16 bits | Meaning |
+|---|---|---|
+| `addiu $v0, $zero, imm` | `0x2402` | load constant into the source reg |
+| `sb $v0, off($s0)` | `0xA202` | byte store at `SC + off` |
+| `sh $v0, off($s0)` | `0xA602` | halfword store at `SC + off` |
+
+## Starting level / XP seed
+
+The same routine (`FUN_800560B4`) also seeds each live record's progression
+fields. The relevant live-record cells (boot-confirmed via the starting-level
+randomizer):
+
+| Record offset | Field | Vanilla seed |
+|---|---|---|
+| `+0x0` (u32) | cumulative experience (the "Max Exp" cheat target / "Experience" readout; the level-up applier compares it against the threshold) | `0` |
+| `+0x4` (u32) | next-level XP threshold (the status screen's "next" readout) | `reach(L2)`: Vahn/Terra `121`, Noa `102`, Gala `140` |
+| `+0x130` (u8) | **displayed character level** - what "LV" shows and the `Level 99` cheat targets; the applier maintains it `+1` per level-up event | `1` |
+| `+0x131` (u8) | a second per-character byte the seed also inits to `1` - **write-only, no reader on the disc** (see below) | `1` |
+
+`+0x100` is unrelated to the level - it is word 3 of the ability bitfield
+`+0xF4..+0x103` ([`save-record.md`](save-record.md)). The shown level is read from `+0x130` directly, **not**
+re-derived from experience at a New Game - confirmed live: a record with level-10
+experience + stats but `+0x130 == 1` still shows LV 1.
+
+### `+0x131` is seeded and never read
+
+The seed's `li $v0, 0x1` at `0x800561C4` feeds two byte stores in the same
+four-record loop - `sb $v0, 0x6f9($s0)` (`+0x131`) at `0x800561C8` and
+`sb $v0, 0x6f8($s0)` (`+0x130`) at `0x800561CC` - so the two bytes are written
+from one register, in that order. `0x800561C8` is the **only** instruction on the
+disc that touches `+0x131`: an opcode-decoding sweep for a `lb`/`lbu`/`sb` whose
+displacement is `0x131` (record-relative) or `0x6f9`/`0xb0d`/`0xf21`/`0x1335`
+(the four slots' displacements off the `0x80084140` game-state block the menu
+overlay addresses records through) finds that one store and nothing else across
+`SCUS_942.54` plus all 80 based overlay images, and no wider access covers the
+byte either - every level read in the corpus is a `lbu` at the `+0x130` /
+`0x6f8` form, never a halfword or word spanning `+0x130..+0x131`. Widening the
+sweep to the whole `+0x131..+0x13B` span leaves only false positives inside
+asset entries. So the record's displayed level is `+0x130` alone and `+0x131`
+carries no runtime meaning.
+
+That also retires the "magic-rank candidate" reading. The magic-rank counter is
+a *different* byte and is already capture-pinned at record `+0x9C`
+(`0x09 → 0x0A` across a magic-rank-up save pair; see
+[battle.md](../subsystems/battle.md)).
+
+The starting-level randomizer seeds the whole growth-capable party
+(Vahn / Noa / Gala) at level `N` with same-size in-place edits to the seed routine.
+The seed routine seeds `+0x4` for each slot by storing one `$v0` literal, reloading
+it twice for the per-character values - so the edits work by controlling that one
+register and reclaiming the two reload sites (plus a redundant `lui`) as the
+experience stores:
+
+1. **Level** - the loop's level literal + stores set `+0x130 = N` for *every* record
+   (packed `addiu $v0, (1<<8)|N; sh $v0, 0x6f8($s0); nop` at `0x800561C4`/`C8`/`CC`,
+   keeping `+0x131` at 1).
+2. **Experience** - each growth slot's `+0x0` gets an in-band level-`N` value (the
+   midpoint of `reach(N)..reach(N+1)`). A single `addiu $t0` preload (at
+   `0x800560FC`, the old slot-3 / Terra threshold store) feeds three
+   `sw $t0, <+0x0>($s0)` stores - Vahn `0x5c8`, Noa `0x9dc`, Gala `0xdf0` - written at
+   `0x80056100` (old Noa `0x66` literal), `0x80056108` (old Gala `0x8c` literal), and
+   `0x80056118` (a redundant second `lui $at, 0x8008`; the first `lui` at `0x80056110`
+   still serves both `sb $zero` global clears).
+3. **Next threshold** - each growth slot's `+0x4` gets `reach(N+1)`. The literal at
+   `0x800560F0` loads it into `$v0`; dropping the two per-character reloads (now
+   experience stores) leaves `$v0` intact through the existing
+   `sw $v0, 0x5cc/0x9e0/0xdf4($s0)` stores, so all three take the same threshold. The
+   small per-slot `FUN_801E9504` correction (Noa −, Gala +; ≤2 % near these levels) is
+   re-applied by the level-up applier on each character's first post-seed level-up.
+   (Vanilla `+0x4`: Vahn `121`, Noa `102`, Gala `140` - these differ *because* of that
+   correction, not because the XP curve is per-character.)
+4. **Stats** - each growth slot's template stats are recomputed to level `N`.
+
+Seeding only slot 0 would leave Noa with an experience readout of `0` and Gala with a
+stale level-1 `+0x4` of `140` (which triggers a spurious early level-up); seeding all
+three keeps the visible roster coherent.
+
+See [`subsystems/level-up.md`](../subsystems/level-up.md) for the XP thresholds +
+growth curves and [`tooling/randomizer.md`](../tooling/randomizer.md) for the
+feature.
+
+## World-state seed (code literals, not a table)
+
+Before `FUN_80034A6C` calls the template expander it writes a fixed set of `SC`
+cells from immediates in its own instruction stream. It holds the save-context
+base in `$s0` for the whole routine (`lui $s0, 0x8008` / `addiu $s0, $s0, 0x4140`
+= `0x80084140`), so every seed write is an `sb` or `sw` at `$s0 + off`:
+
+| `SC` offset | Width | Value |
+|---|---|---|
+| `+0x454` | `sb` | `3` |
+| `+0x457` / `+0x458` | `sb` | `0` |
+| `+0x459` / `+0x45A` / `+0x45B` | `sb` | `1` / `2` / `3` |
+| `+0x45C` | `sw` | `0x1F4` = **500**, the party's starting gold |
+| `+0x460` / `+0x464` / `+0x470` / `+0x478` | `sw` | `0` |
+| `+0x590` / `+0x594` / `+0x598` / `+0x59C` | `sw` | `0x44` / `0x21` / `0x10` / `0x48` |
+
+Three further `sw`s are absolute rather than `SC`-relative and so are not part of
+this set: `0x80073EF4 = 0xE40`, `0x80073EF8 = 0x2DC0`, `0x80073EFC = 0`, each
+off a `lui $at, 0x8007`.
+
+### The entry seat
+
+Those three words are the field initialiser's **destination-entry operand**,
+the pair a door's `0x3F` or the world-map arrival kernel writes before a scene
+change. The first scene a New Game enters is the prologue `opdeene`, so the
+seed seats the player there, at world `(0xE40, 0x2DC0)` - tile `(28, 91)`.
+`opdeene`'s entry script reads the seat once: the per-frame body's region
+selector (system flags `0x19B..0x1AA`, op `0x42` mode 0 over the region-type
+mask) runs in the pass before the one that spawns the opening record (`44 23`),
+so it lands on region type 7 and sets `0x1A2` - the bit the cold-boot
+`s1_newgame_field` capture holds - and re-applies that region's view window
+(op `0x46`). The opening record then moves the player on.
+
+The port arms the seat in `World::begin_new_game`
+(`legaia_game_tables::new_game::NEW_GAME_ENTRY_SEAT`); the next field entry takes it
+and seats the player on it when that entry is `opdeene`. A host-armed operand
+(a resume or a capture seed) is the later write and wins. The disc-gated
+`new_game_seed_disc::new_game_entry_seat_matches_the_routines_absolute_stores`
+re-decodes the three stores.
+
+After the expander returns, the routine writes the starting-item pair at
+`SC + 0x1818` (above) and then clears `SC + 0x1618..0x1817` - `0x200` bytes of
+story flags, walked downward by `sb $zero, 0x1618($v1)` with `$v1` starting at
+`$s0 + 0x1FF`. The Door-of-Wind warp bitmask at `SC + 0x161C` is inside that
+range, which is why any warp preset has to be applied *after* the clear.
+
+**Widths come from the opcodes, not from Ghidra's naming.** The decompiled body
+renders these as `DAT_` / `_DAT_` globals, and that prefix is a Ghidra heuristic
+with no width meaning - it also hides that the two starting-item stores are
+`$s0`-relative rather than absolute. `legaia_game_tables::new_game::new_game_seed_words`
+mirrors the table above, and the disc-gated
+`new_game_seed_disc::world_state_seed_matches_the_routines_stores` re-decodes the
+routine out of the user's own `SCUS_942.54` and fails on any offset, value or
+width the port gets wrong.
+
+## Provenance + parser
+
+The table base + stride are pinned by byte-search of `SCUS_942.54` for Vahn's
+stat run (`18 00 10 00 0c 00 13 00 09 00` = ATK..INT) followed by the `"Vahn"`
+name, with every field cross-validated against the live per-character record at
+`0x80084708` lifted from an early `town01` save state. `legaia_game_tables::new_game::StartingParty`
+parses the table from a `SCUS_942.54` image at runtime (PSX-EXE `t_addr` →
+file-offset map, identical to the [item-name table](item-table.md) resolver), so
+the engine can seed a faithful New Game from the user's own disc without
+committing any Sony bytes. The disc-gated `new_game_real` test pins the four
+rows against the real executable. CLI: `asset new-game <SCUS> [--json]` (dumps
+the party template + the code-built starting inventory).
+
+`legaia_game_tables::new_game::seed_live_records` ports the seed routine's halfword
+stores, and the engine's record builder
+(`legaia_engine_menus::new_game::starting_record`) applies them rather than
+restating the template-field → live-cell mapping, so the two cannot drift.
+
+## See also
+
+- [Per-character save record](save-record.md) - the live `0x414`-byte record this template seeds.
+- [Item-name table](item-table.md) - the sibling static table using the same offset-map resolver.
+- [`subsystems/boot.md`](../subsystems/boot.md) - the New Game boot chain into `town01`.

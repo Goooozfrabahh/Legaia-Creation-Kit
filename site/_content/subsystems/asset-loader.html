@@ -1,0 +1,254 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">subsystems</a> &middot; asset loader</div>
+  <h1>Asset loader</h1>
+  <p class="lede">What happens between "walk through a door" and "the next room is on screen". The game gathers everything a scene needs - meshes, textures, palettes, sound banks, scripts - out of PROT.DAT, the disc's single big archive of numbered entries. Battle, field, sound and music each have their own loader, but they all funnel into one dispatcher and one descriptor walk.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Source archive</dt><dd><a href="../formats/prot.html">PROT.DAT</a>, 1233 entries; names resolve through <a href="../formats/cdname.html">CDNAME.TXT</a></dd>
+    <dt>Loaders</dt><dd>One per scene type - battle, field / town, sound, streams (<a href="#how-we-know">table below</a>)</dd>
+    <dt>Common router</dt><dd>The asset-type dispatcher: an 8-bit type byte picks a handler (TIM, TMD, MES, ANM, &hellip;)</dd>
+    <dt>Scene change</dt><dd>Field-VM op <code>0x3F</code> carries a scene <em>name</em>; op <code>0x3E</code> door-warps reach only the seven minigames</dd>
+    <dt>In the port</dt><dd><code>engine-scene::SceneResources::build_targeted</code> + the format parsers (<code>legaia_scene_formats::{scene_asset_table, scene_tmd_stream}</code>, <code>legaia_actor_formats::battle_data_pack</code>)</dd>
+    <dt>Confidence</dt><dd>Confirmed - disassembly + corpus round-trips (<a href="#how-we-know">how we know</a>)</dd>
+  </dl>
+  <div class="notice">
+    <p class="notice-title">Two traps</p>
+    <p>Slot &rarr; asset mapping is <strong>positional</strong>: slot <code>i</code> is the <code>i</code>-th descriptor, and the descriptor's own <code>data_offset</code> is the whole indirection - there is no lookup table to find. And descriptor offsets are relative to the entry's <em>whole on-disc footprint</em>, so an offset that looks out-of-bounds usually is not.</p>
+  </div>
+</section>
+
+<section class="doc-section" id="how-it-works">
+  <h2>How it works</h2>
+  <p>"Load this scene" never means "load one file". A battle needs character meshes, monster meshes, palettes (CLUTs - colour tables stored as rows of framebuffer pixels), a sound bank, effect scripts and dialog text, scattered across dozens of PROT entries. Each scene type has a loader that fetches all of it, and every loader shares one shape:</p>
+  <ul class="bullets">
+    <li>A small state machine with one numbered case per asset slot.</li>
+    <li>Each case hands one entry's bytes to the asset-type dispatcher.</li>
+    <li>Some cases kick off async CD reads so data streams in while the scene initialises.</li>
+  </ul>
+  <figure class="diagram">
+    <svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Loading a field scene. The scene name resolves through CDNAME.TXT to a block of consecutive PROT entries: .MAP at +0, .PCH at +1, the prescript at +2, the .LZS bundle at +3. The bundle streams into the shared asset buffer during the door fade; the descriptor walker hands each slot's payload to LZS and then to the type-byte dispatcher, whose handlers upload TIMs to VRAM, register TMD meshes in the mesh pool and copy MES, ANM and MAN data into RAM tables.">
+      <defs><marker id="al-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="dg-node-accent" x="20" y="20" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="95" y="44">scene name</text><text class="dg-sub" x="95" y="62">"town01"</text>
+      <rect class="dg-group" x="200" y="10" width="640" height="78" rx="6"/>
+      <text class="dg-edge-label" x="212" y="26">CDNAME block: consecutive PROT entries</text>
+      <rect class="dg-node" x="212" y="34" width="140" height="44" rx="4"/><text class="dg-label" x="282" y="54">+0 .MAP</text><text class="dg-sub" x="282" y="70">walk + trigger grid</text>
+      <rect class="dg-node" x="362" y="34" width="140" height="44" rx="4"/><text class="dg-label" x="432" y="54">+1 .PCH</text><text class="dg-sub" x="432" y="70">walk-on triggers</text>
+      <rect class="dg-node" x="512" y="34" width="140" height="44" rx="4"/><text class="dg-label" x="582" y="54">+2 prescript</text><text class="dg-sub" x="582" y="70">event scripts</text>
+      <rect class="dg-node-accent" x="662" y="34" width="166" height="44" rx="4"/><text class="dg-label" x="745" y="54">+3 .LZS bundle</text><text class="dg-sub" x="745" y="70">the scene's assets</text>
+      <rect class="dg-node" x="662" y="120" width="166" height="56" rx="5"/>
+      <text class="dg-label" x="745" y="144">asset buffer</text><text class="dg-sub" x="745" y="162">streamed during the fade</text>
+      <rect class="dg-node" x="440" y="120" width="190" height="56" rx="5"/>
+      <text class="dg-label" x="535" y="144">descriptor walk</text><text class="dg-sub" x="535" y="162">slot i = i-th descriptor</text>
+      <rect class="dg-node" x="230" y="120" width="180" height="56" rx="5"/>
+      <text class="dg-label" x="320" y="144">LZS decode</text><text class="dg-sub" x="320" y="162">one stream per slot</text>
+      <rect class="dg-node-accent" x="20" y="120" width="180" height="56" rx="5"/>
+      <text class="dg-label" x="110" y="144">type dispatcher</text><text class="dg-sub" x="110" y="162">type = word &gt;&gt; 24</text>
+      <rect class="dg-node-ok" x="20" y="226" width="180" height="56" rx="5"/>
+      <text class="dg-label" x="110" y="250">TIM</text><text class="dg-sub" x="110" y="268">upload to VRAM</text>
+      <rect class="dg-node-ok" x="230" y="226" width="180" height="56" rx="5"/>
+      <text class="dg-label" x="320" y="250">TMD</text><text class="dg-sub" x="320" y="268">register in mesh pool</text>
+      <rect class="dg-node-ok" x="440" y="226" width="190" height="56" rx="5"/>
+      <text class="dg-label" x="535" y="250">MES / ANM / MAN</text><text class="dg-sub" x="535" y="268">RAM tables, scripts</text>
+      <path class="dg-edge" d="M170 48 L198 48" marker-end="url(#al-arrow)"/>
+      <path class="dg-edge" d="M745 78 L745 118" marker-end="url(#al-arrow)"/>
+      <path class="dg-edge" d="M662 148 L632 148" marker-end="url(#al-arrow)"/>
+      <path class="dg-edge" d="M440 148 L412 148" marker-end="url(#al-arrow)"/>
+      <path class="dg-edge" d="M230 148 L202 148" marker-end="url(#al-arrow)"/>
+      <path class="dg-edge" d="M110 176 L110 224" marker-end="url(#al-arrow)"/>
+      <path class="dg-edge" d="M150 176 L150 200 L320 200 L320 224" marker-end="url(#al-arrow)"/>
+      <path class="dg-edge" d="M180 176 L180 192 L535 192 L535 224" marker-end="url(#al-arrow)"/>
+    </svg>
+    <figcaption>A field scene load. The sidecars (+0..+2) are staged into a per-scene buffer; the bundle at +3 is what the walk turns into live assets. A battle stacks its own loader on top of what is already resident, through the same dispatcher.</figcaption>
+  </figure>
+  <p class="hint">Each format on the way down has its own page: <a href="../formats/prot.html">PROT.DAT</a> (the archive), <a href="../formats/cdname.html">CDNAME</a> (the name map), <a href="../formats/lzs.html">LZS</a> (the compression), <a href="../formats/asset-type.html">asset-type</a> + <a href="../formats/asset-descriptor.html">asset-descriptor</a> (the router and its 8-byte records). Function names like <code>FUN_8001F05C</code> are RAM addresses from the disassembly - the game shipped without symbols.</p>
+</section>
+
+<section class="doc-section" id="field-loader">
+  <h2>Field / town scene loader</h2>
+  <p>The "walk into a room" path: every town, dungeon and field map goes through it. The scene's name becomes a family of consecutive PROT entries, addressed from the block base:</p>
+  <table class="layout">
+    <thead><tr><th>Raw offset</th><th>File</th><th>What it is</th></tr></thead>
+    <tbody>
+      <tr><td><code>+0</code></td><td><code>.MAP</code></td><td>Fixed <code>0x12000</code>-byte collision / trigger map (<a href="field-locomotion.html">walkability grid</a>)</td></tr>
+      <tr><td><code>+1</code></td><td><code>.PCH</code></td><td>Walk-on trigger patch, exactly one sector (<a href="../formats/scene-v12-table.html">v12 table</a>)</td></tr>
+      <tr><td><code>+2</code></td><td>prescript</td><td>The event-script prescript sister entry</td></tr>
+      <tr><td><code>+3</code></td><td><code>.LZS</code></td><td>The scene asset bundle: count word, then typed assets (<a href="../formats/scene-bundles.html">scene bundles</a>)</td></tr>
+      <tr><td><code>+6</code></td><td>BGM base</td><td>Where scene-local music ids count from (<a href="#bgm-lookup">below</a>)</td></tr>
+    </tbody>
+  </table>
+  <p>The loader stages the first three sidecars into a per-scene buffer, sizing the read by summing three consecutive entries' sector counts with the standard <a href="../formats/prot.html">PROT TOC math</a>.</p>
+
+  <h3>Name-based scene change</h3>
+  <p>Doors, stairs, town entry from the overworld and the prologue hand-off all carry a destination <em>name</em>: field-VM opcode <code>0x3F</code> embeds it inline in the bytecode, so nearly every in-game transition has a recoverable destination. The scene-change routine copies the name into the pending-scene buffer, then spawns a <strong>transition streaming actor</strong> that streams the destination block's <code>.LZS</code> bundle into the shared asset buffer <em>during the fade</em>, and finally flips the game mode to MAIN INIT. Dev and retail branches converge on the same content: raw <code>scene_base + 3</code> <em>is</em> the bundle entry, verified across the corpus.</p>
+  <details class="disclosure">
+    <summary>Deep dive: the transition streamer state machine</summary>
+    <div class="disclosure-body">
+      <p><code>FUN_8001FD44(name_ptr)</code> copies the target CDNAME string into <code>0x8007050C</code>, syncs it to the active buffer <code>0x80084548</code> (<code>FUN_8001D7F8</code>), and stages the destination index from the resolved halfword at <code>0x80084540</code> (retail arm: into <code>DAT_8007B768</code>; dev arm: <code>_DAT_8007B9A0</code>); <code>s_ERR_CHANGE_PACKET</code> guards re-entry while a packet is pending. It then spawns the streaming actor via <code>FUN_80020DE0(&amp;DAT_80070734, _DAT_8007C34C)</code> - descriptor <code>0x80070734</code> of the 24-byte spawn-descriptor family at <code>0x800705FC..0x80070763</code> (layout <code>[+4 0xFFFF0000][+8 handler][+0xC flags]</code>). The handler is <code>FUN_80021934</code> (real entry 3 instructions before the <code>0x80021940</code> prologue), a 5-state machine over <code>actor+0x1A</code>:</p>
+      <table class="data-table">
+        <thead><tr><th>State</th><th>Does</th></tr></thead>
+        <tbody>
+          <tr><td>0</td><td><code>DAT_8007B648 = 0x80</code>; seed the 70-frame fade countdown <code>gp+0x710 = 0x46</code>.</td></tr>
+          <tr><td>1 / 3</td><td>Poll stream progress via <code>FUN_8003DE7C(1)</code>.</td></tr>
+          <tr><td>2 (dev)</td><td>Stream raw TOC entry <code>DAT_8007B768 + 3</code> into <code>_DAT_8007B85C</code> by index.</td></tr>
+          <tr><td>4 (retail)</td><td>After the countdown: rotate the name buffers (<code>0x80084558</code> &larr; <code>0x80084548</code> &larr; <code>0x800915C8</code>), build the literal path <code>DATA_FIELD\&lt;scene&gt;.LZS</code>, stream it by name, then set <code>_DAT_8007B83C = 2</code> (mode 2, MAIN INIT).</td></tr>
+        </tbody>
+      </table>
+      <p>Sidecar staging: <code>.MAP</code> at buffer <code>+0</code>, <code>.PCH</code> at <code>+0x12000</code> (zero-filled sector when absent), <code>efect.dat</code> at <code>+0x12800</code>. Sibling spawn descriptors in the same family: <code>0x800705FC</code> (intro-skip actor) and <code>0x8007065C</code> (name-entry setup) - both on the <a href="boot.html#new-game-chain">boot page</a>.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="descriptor-walker">
+  <h2>Asset descriptor walker</h2>
+  <p>Once the bundle is in RAM, one loop turns it into live assets - and its one surprise is that there is nothing clever in it. The walker reads a count word, then for each slot hands <code>base + data_offset</code> to the dispatcher, which splits the descriptor word into <code>type = word &gt;&gt; 24</code> and <code>size = word &amp; 0xFF_FFFF</code> and jumps through the handler table.</p>
+  <p>The walk is also <strong>what fills the mesh pool</strong>: two dispatcher cases (type <code>0x02</code> TMD pack, type <code>0x09</code> bare mesh) register meshes into the runtime pointer table in walk order, past the resident 5-mesh head (the party). A magic-byte sweep of a scene block is <em>not</em> equivalent - see <a href="../formats/scene-bundles.html">scene bundles</a>.</p>
+  <p>The walker has zero static callers in the main executable; its sole caller lives in the field <em>overlay</em> (code streamed into RAM on demand), at the start of every field session. The port&rsquo;s reader is <code>legaia_scene_formats::scene_asset_table</code>, checked against every classified entry on the disc.</p>
+</section>
+
+<section class="doc-section" id="warp-flow">
+  <h2>Door warps into minigames (opcode 0x3E)</h2>
+  <p>The fishing pond, the casino machines, the Baka Fighter booth, the dance floor: stepping onto those is a different kind of transition. The script hands over a small number instead of a name, the game swaps in that minigame's whole code overlay, and remembers where you came from.</p>
+  <ul class="bullets">
+    <li>Op <code>0x3E</code> with <code>op0 &ge; 100</code> stores <code>sub_id = op0 - 100</code> and flips the game mode to OTHER INIT.</li>
+    <li>The handler backs up the active scene name and id, loads the per-sub-id minigame overlay, and calls its init entry.</li>
+    <li>Only <strong>7 destinations</strong> exist (<code>sub_id</code> 0..6): fishing, slot machine, Baka Fighter, dance, plus two dev modules and the monster-roster arena.</li>
+    <li>The op carries <strong>no destination name</strong>: on exit the return handler restores the backed-up name, commits casino winnings, and hands off to MAIN INIT, which reloads the restored scene.</li>
+  </ul>
+  <details class="disclosure">
+    <summary>Globals, overlay indices and the phantom-warp filter</summary>
+    <div class="disclosure-body">
+      <table class="data-table">
+        <thead><tr><th>Global</th><th>Role</th></tr></thead>
+        <tbody>
+          <tr><td><code>DAT_80084548</code></td><td>Active scene name string (max 8 chars)</td></tr>
+          <tr><td><code>DAT_80084540</code></td><td>Current scene PROT base index (short)</td></tr>
+          <tr><td><code>DAT_8007BAE8</code></td><td>Warp handler's backup of the scene name (8 bytes)</td></tr>
+          <tr><td><code>DAT_8007B768</code></td><td>Pending destination PROT index; <code>0xFFFF</code> = none</td></tr>
+          <tr><td><code>DAT_8007BA34</code></td><td>Pending warp sub_id (0..6); read by <code>FUN_80025980</code></td></tr>
+        </tbody>
+      </table>
+      <p>The overlay loader values <code>0x4D..0x55</code> (<code>FUN_8003EBE4(sub_id + 0x4D)</code>; <code>sub_id &ge; 6</code> adds 2 first) are raw loader parameters, not extraction indices - they resolve to extraction entries 0972..0980 (<code>prot_index = param + 0x37F</code>; fishing = 0972, slot machine = 0975, Baka Fighter = 0976, dance = 0980). A genuine warp's <code>op0</code> is always <code>100..=106</code>; the placement classifier uses that range (plus the absence of the <code>0x80</code> cross-context prefix) to reject text-desync phantom warps.</p>
+    </div>
+  </details>
+  <p class="hint">Full chain and provenance: <a href="script-vm.html">field VM</a> &sect; 0x3E WARP; the mode-word trap ("<code>0x19</code> alone cannot tell fishing from dance") is on the <a href="boot.html#game-mode">boot page</a>. Play them on the <a href="../minigames.html">minigames page</a>.</p>
+</section>
+
+<section class="doc-section" id="battle-loader">
+  <h2>Battle bundle</h2>
+  <p>A battle starts from inside a field scene, so its loader (an 11-case state machine) stacks on top of what's already resident: monsters, their sound banks, effect scripts, and the side-band streams that summons and special attacks pull from mid-fight.</p>
+  <table class="data-table">
+    <thead><tr><th>Case</th><th>Loads</th></tr></thead>
+    <tbody>
+      <tr><td>6</td><td>The <code>befect_data</code> bundle (<a href="../formats/effect.html">effect</a>; extraction 0870..0873)</td></tr>
+      <tr><td>7, 8</td><td>The active monsters' sound banks from <code>monster.snd</code> via a per-monster LBA pair (<a href="audio.html">audio</a>)</td></tr>
+      <tr><td>0xE</td><td>Initialises the runtime <a href="effect-vm.html">effect 2-pack wrapper</a></td></tr>
+      <tr><td>0xFF</td><td>The side-band streaming handler for <code>summon.dat</code> / <code>readef.DAT</code> (<a href="../formats/summon-readef.html">summon-readef</a>)</td></tr>
+    </tbody>
+  </table>
+  <p>The party's own battle meshes are <em>not</em> loaded here: they are assembled per character from the player battle files' equipment sections - see <a href="../formats/battle-data-pack.html">battle-data-pack</a> and <a href="../formats/character-mesh.html">character-mesh</a>.</p>
+  <details class="disclosure">
+    <summary>Deep dive: the per-PROT chunk walker (FUN_8001FE70)</summary>
+    <div class="disclosure-body">
+      <p>One battle-scene state calls <code>FUN_8001FA88(scene_base + slot, 0, dst_buf)</code> then <code>FUN_8001FE70(dst_buf)</code> to walk a <a href="../formats/scene-bundles.html">scene_tmd_stream</a> entry - a leading TMD body followed by streaming chunks. It differs from the standard streaming walker:</p>
+      <ul class="bullets">
+        <li>Chunk 0 header: low 24 bits = TMD body size; round to 32-byte alignment, allocate at <code>_DAT_8007B864</code>, copy the TMD in.</li>
+        <li>Loop: advance by <code>(prev_size &amp; ~3) + 4</code>. Header low-24 zero = terminator. Type <code>0x01</code> &rarr; LoadImage (VRAM upload); type <code>0x02</code> &rarr; explicit terminator; others skipped.</li>
+        <li>The register call that follows hooks the parsed TMD into the mesh pointer table.</li>
+      </ul>
+      <p>Each entry holds <strong>exactly one</strong> <code>[TMD][TIM chunks][terminator]</code> sub-stream, then padding to its sector-aligned end. This is the path that uploads the field NPC palettes to VRAM row 479 - plain TIMs in type-<code>0x01</code> chunks, dispatched only during battle init (<a href="../formats/npc-palette.html">npc-palette</a>). <code>scene_tmd_stream::sub_streams</code> mirrors the walk and keeps a post-terminator scan as a regression detector.</p>
+    </div>
+  </details>
+  <details class="disclosure">
+    <summary>History: the "two sub-streams per entry" reading</summary>
+    <div class="disclosure-body">
+      <p>Some entries were once described as holding a second concatenated sub-stream. That reading is falsified: it was an artifact of a superseded PROT entry-size expression that over-read every entry into its successor - the "second sub-stream" is simply the next PROT entry. See <a href="../reference/re-do-not-re-walk.html">do-not-re-walk</a>.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="clut-scattering">
+  <h2>Filling VRAM: the targeted upload</h2>
+  <p>A PS1 texture is useless without its palette, and Legaia keeps the two in different places: a character's mesh sits in one PROT entry while the palette rows it samples come from another. Retail uploads only the texture bytes the current scene's meshes need, in a fixed order, and the port reproduces that policy rather than blasting every TIM into VRAM: it collects the palette rows and texture-page boxes the scene's meshes sample, then uploads each TIM only where it will not collide with a referenced palette row (<code>SceneResources::build_targeted</code>). Field and battle differ in scope:</p>
+  <ul class="bullets">
+    <li><strong>Battle</strong> uploads everything, including the meshes and TIM chunks inside <code>scene_tmd_stream</code> entries and the player battle files.</li>
+    <li><strong>Field</strong> skips both - those are battle-init residents. Retail field saves carry VRAM row 479 as zeros, which is the boundary the engine matches.</li>
+    <li>Two CDNAME blocks (<code>init_data</code>, <code>player_data</code>) stay resident across field transitions - they carry the field-form party meshes and atlas from PROT 0874.</li>
+    <li>Two entry classes are <strong>never</strong> uploaded: v12 trigger sidecars (they are trigger data, not textures) and pochi filler slots (reserved one-sector fills; see <a href="../formats/pochi.html">pochi</a>).</li>
+  </ul>
+  <details class="disclosure">
+    <summary>Deep dive: shared blocks, battle boot pre-load, diagnostics</summary>
+    <div class="disclosure-body">
+      <p><strong>Field-shared blocks.</strong> The field-form character meshes and textures both originate from PROT 0874 (<code>player.lzs</code>, loaded by disc index <code>0x36C</code>): &sect;0 = the 5-TMD party mesh pack, &sect;1 = effect models, &sect;2 = the field texture pack (Vahn / Noa / Gala atlas pages at texpage <code>(832, 256)</code>, CLUTs on row 478). The extraction file <em>named</em> <code>player_data</code> is 0876 - the <a href="../formats/cdname.html#numbering-space">+2 filename shift</a> - and holds a VAB + SEQ trailer, no meshes.</p>
+      <p><strong>Battle boot pre-load.</strong> <code>build_battle_boot_vram</code> walks the player battle files (extraction 863..866), uploads their standard TIMs and runs the descriptor-driven CLUT pass (<code>battle_data_pack::clut_uploads</code>); retail does the equivalent at boot or first battle so character meshes are resident before the scene-specific chunk walk fires. The result is merged into battle VRAM only, never field VRAM.</p>
+      <p><strong>Row-479 NPC CLUTs.</strong> Town NPC meshes sample CLUT row <code>y=479</code>; the source is the scene's own <code>scene_tmd_stream</code> entries, not the player battle files (byte-match corpus on <a href="../formats/battle-data-pack.html">battle-data-pack</a>).</p>
+      <p><strong>Diagnostics.</strong> <code>asset clut-finder &lt;x&gt; &lt;y&gt;</code> reports every extracted TIM whose CLUT covers a VRAM cell. <code>legaia-engine clut-trace --scene &lt;name&gt; --disc &lt;bin&gt;</code> groups a scene's missing-CLUT prims and finds suppliers across the whole PROT corpus; <code>legaia-engine vram-oracle</code> diffs the rebuilt VRAM against a runtime dump (<code>--diff-png</code> writes a colour-coded 1024&times;512 image). Parity policy on the <a href="engine.html#vram-diff">engine page</a>.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="bgm-lookup">
+  <h2>Music selection (BGM lookup)</h2>
+  <p>When a scene asks for "music track 2016", there is no music table to consult. A global id is an <em>offset</em> into the shared music bank. A scene-local id (below 2000) looks like an offset into the scene's own CDNAME block, but that index only drives the "did the track change" test - the load itself is overwritten with global slot 2.</p>
+  <ul class="bullets">
+    <li><strong>Global id (&ge; 2000):</strong> the change test and the load both use <code>music_01_base + (id &minus; 2000)</code>.</li>
+    <li><strong>Scene-local id (&lt; 2000):</strong> the change test compares <code>scene_block + 6 + id</code>, but the load index is overwritten with global slot 2 (<code>0x800245A4..0x800245BC</code> in <code>FUN_800243F0</code>), so no scene bank is ever staged as music.</li>
+  </ul>
+  <p>Global id <code>2000+i</code> is sound-test track <code>i</code>, but the <code>music_01</code> bank is <strong>piecewise</strong> in extraction space (<code>988+i</code> for <code>i &le; 67</code>, <code>990+i</code> for <code>i &ge; 68</code>, gap at 1056/1057) - not a flat base. Resolver: <code>engine-system::music_labels</code>; the full cue list is on <a href="../reference/music-tracks.html">music tracks</a>.</p>
+</section>
+
+<section class="doc-section" id="sound-loaders">
+  <h2>Sound and stream loaders</h2>
+  <table class="data-table">
+    <thead><tr><th>Loader</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td>Sound bank</td><td>Loads <code>bse.dat</code> (the battle SFX descriptor bank) at battle-scene setup, then per-scene <code>.dpk</code> files by path (dev builds load by PROT index directly).</td></tr>
+      <tr><td>Streaming assets</td><td>Builds paths under the <code>sound\</code> prefix; the XA / <code>.pac</code> / STR consumer. Same dev / retail split as the field loader.</td></tr>
+    </tbody>
+  </table>
+  <p>Full breakdown in <a href="audio.html">Audio</a>. The offline twin of the whole ladder is <code>legaia-extract</code>: <code>verify &rarr; disc &rarr; PROT &rarr; categorize &rarr; extract &rarr; TIM &rarr; PNG</code> - per-stage invocations on the <a href="../tooling/extraction.html">extraction page</a>, results browsable in the <a href="../viewer.html">asset viewer</a>.</p>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <table class="data-table">
+    <thead><tr><th>Function</th><th>Address</th><th>What it proves</th><th>Dump</th></tr></thead>
+    <tbody>
+      <tr><td>Asset-type dispatcher</td><td><code>FUN_8001F05C</code></td><td>Type byte split (<code>&gt;&gt; 24</code>), 21-entry handler table at <code>0x80010638</code>.</td><td><code>ghidra/scripts/funcs/8001f05c.txt</code></td></tr>
+      <tr><td>Descriptor walker</td><td><code>FUN_80020224</code></td><td>Count word + 8-byte descriptors; positional slots; OR-ed status word. Sole runtime caller in the field overlay's MAIN_INIT.</td><td><code>80020224.txt</code></td></tr>
+      <tr><td>Field loader</td><td><code>FUN_8001F7C0</code> + <code>FUN_800255B8</code></td><td>Sidecar staging layout; path roots <code>DATA\FIELD\</code> and <code>h:\PROT\FIELD\</code>.</td><td><code>8001f7c0.txt</code></td></tr>
+      <tr><td>Footprint helper</td><td><code>FUN_80020310</code></td><td>Sums three entries' sector sizes with the TOC gap math (<code>toc[i+3] - toc[i+2]</code>).</td><td><code>80020310.txt</code></td></tr>
+      <tr><td>Scene change</td><td><code>FUN_8001FD44</code></td><td>Name copy, pending-index staging, re-entry guard.</td><td><code>8001fd44.txt</code></td></tr>
+      <tr><td>Transition streamer</td><td><code>FUN_80021934</code></td><td>5-state fade + stream machine; hands off to mode 2.</td><td><code>80021934.txt</code></td></tr>
+      <tr><td>Battle bundle</td><td><code>FUN_800520F0</code></td><td>11-case slot machine; monster sound-bank LBA pairs.</td><td><code>800520f0.txt</code></td></tr>
+      <tr><td>Chunk walker</td><td><code>FUN_8001FE70</code></td><td>TMD-then-TIM-chunks layout; type-<code>0x01</code> LoadImage; terminator rule.</td><td><code>8001fe70.txt</code></td></tr>
+      <tr><td>Minigame warp</td><td><code>FUN_80025980</code> / <code>FUN_80026018</code></td><td>Scene-name backup / restore; overlay parameter <code>+0x4D</code>; coin-bank commit.</td><td><code>80025980.txt</code></td></tr>
+      <tr><td>Mesh register</td><td><code>FUN_80026B4C</code></td><td>Pool stores in walk order with a post-incremented index.</td><td><code>80026b4c.txt</code></td></tr>
+      <tr><td>BGM resolver</td><td><code>FUN_800243F0</code></td><td>The <code>&lt; 2000</code> scene-local / global split.</td><td><code>800243f0.txt</code></td></tr>
+      <tr><td>Disc corpus</td><td>-</td><td>The walk verified against every classified entry; the pochi / v12 skips verified across every scene.</td><td>-</td></tr>
+    </tbody>
+  </table>
+  <p class="hint">Full write-up: <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/subsystems/asset-loader.md" target="_blank" rel="noopener"><code>docs/subsystems/asset-loader.md</code></a>.</p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../formats/prot.html">PROT.DAT</a>
+    <a href="../formats/cdname.html">CDNAME</a>
+    <a href="../formats/lzs.html">LZS</a>
+    <a href="../formats/asset-descriptor.html">Asset descriptor</a>
+    <a href="../formats/asset-type.html">Asset-type dispatch</a>
+    <a href="../formats/scene-bundles.html">Scene bundles</a>
+    <a href="../formats/data-field.html">DATA_FIELD streaming</a>
+    <a href="boot.html">Boot sequence</a>
+    <a href="script-vm.html">Field VM</a>
+    <a href="renderer.html">Renderer</a>
+    <a href="../tooling/extraction.html">Extraction</a>
+    <a href="../viewer.html">Asset viewer</a>
+  </div>
+</section>

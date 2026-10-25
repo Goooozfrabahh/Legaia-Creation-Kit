@@ -1,0 +1,100 @@
+# Sound-driver path-string cluster
+
+The SCUS string cluster at RAM `0x8007B380` (file offset `0x6BB80`) holds the file extensions the sound subsystem appends to scene-asset paths. The dispatch chain *into* these formats is traced; the one retail file format among them, the per-scene `.dpk` pack, is a VAB + SEQ pair in a streaming-chunk container ([below](#the-dpk--sound_data2-payload-is-a-vab--seq-bundle)). The `.MAP` / `.PCH` intermediates are not on the retail disc.
+
+## Cluster layout
+
+| Offset | Bytes | Meaning |
+|---|---|---|
+| `0x8007B380` | 12 bytes | Per-extension flag/mode metadata table: `00 01 FF FF FF FF 00 00 00 02 00 00`. |
+| `0x8007B38C` | `"sound\"` | Path prefix for streaming-asset loads. |
+| `0x8007B394` | `".spk"` | SPU sample bank. |
+| `0x8007B39C` | `".LZS"` | Compressed wrapper (per-file). |
+| `0x8007B3A4` | 8 bytes | **Not sound data.** This window holds the per-character equipment-swap selector bytes (3 equip-condition offsets at `0x8007B3A4` + 3 group indices at `0x8007B3A8`) consumed by the graphics-side `FUN_8001EBEC` - see [character-mesh.md § equipment-conditional group-transform swap](character-mesh.md#10-group-cap--equipment-conditional-swap). Adjacent to the path cluster in BSS but unrelated to it. |
+| `0x8007B3AC` | `"bse.dat"` | Battle SFX descriptor-bank file name (loaded at battle init, see [`bse-dat.md`](bse-dat.md)). |
+| `0x8007B3B4` | `".dpk"` | Per-scene sound pack - the format `FUN_8001FA88` loads. |
+| `0x8007B3BC` | `".MAP"` | Sound bank map (PsyQ SoundArtist output). |
+| `0x8007B3C4` | `".PCH"` | Patch / instrument data (PsyQ output). |
+| `0x8007B3CC` | `".LZS"` | Duplicate, fallback. |
+| `0x8007B3D4` | `".pac"` | Per-scene generic pack. |
+| `0x8007B3DC` | `"STR"` | Streaming audio (raw PSX `.STR` containers). |
+
+## Consumers
+
+Two SCUS functions touch the cluster (located via [`ghidra/scripts/find/find_sound_path_builders.py`](../../ghidra/scripts/find/find_sound_path_builders.py)). A third function the locator flags, `FUN_8001EBEC`, is not a sound consumer - see the note below the table:
+
+| Function | Role | Touch points |
+|---|---|---|
+| `FUN_8001FA88` | **Battle sound loader** (`bse.dat` + the per-set `.dpk`), called once per battle from battle init. Allocates a 0x1800-byte buffer at `_DAT_8007B8D0` and loads `bse.dat` into it. The dev branch then assembles `h:\main\bg\domepack\<name>.dpk` (template at `0x800105C8` + extension at `0x8007B3B4`) and opens it. | `0x8007B3AC` (`bse.dat`), `0x8007B3B4` (`.dpk`) |
+| `FUN_8001FC00` | **Streaming-asset loader.** Builds paths under the `sound\` prefix; the XA / `.pac` / `STR` consumer. | `0x8007B38C` (`sound\`) |
+
+> **Not sound:** `FUN_8001EBEC`, which reads `_DAT_8007B824` + tables at `0x8007B3A4`/`0x8007B3A8`, is not an extension dispatcher and not part of the sound subsystem. It is the character-TMD equipment-conditional group-transform swap (it reads the loaded battle-character TMD pointers from `DAT_8007C018[_DAT_8007B824 + 0..2]`, where `_DAT_8007B824` is the party base index, and copies group transforms). The `0x8007B3A4`/`0x8007B3A8` bytes are its per-character selector tables, not sound-extension descriptors. See [character-mesh.md](character-mesh.md#10-group-cap--equipment-conditional-swap).
+
+## Dev-build vs retail-build paths
+
+Both `FUN_8001FA88` and `FUN_8001FC00` carry a `_DAT_8007B8C2` (debug-flag) carve-out:
+
+- **Retail branch** (`_DAT_8007B8C2 != 0`, the value retail boots with) loads sound data via PROT indices. `FUN_8001FA88`'s retail branch loads raw TOC index `0x37A` (= extraction 888, `bse.dat`) plus `param_1 + 5` for the per-scene `.dpk`, via the index-based loader (`FUN_8003EB98`).
+- **Dev branch** (`_DAT_8007B8C2 == 0`) opens an `h:\` path through `FUN_8003E6BC`. That helper does no name resolution - it is `strcpy`, then `FUN_800608F0` (`break 0x103`, a dev-station host trap), then fseek/fread/fclose. Retail hardware cannot service it.
+
+Only the retail branch runs on a real disc; the dev branch is a build-time artefact whose paths are not present in the filesystem. The same dev/retail split appears in [`FUN_800255B8`](../subsystems/asset-loader.md), so it's a pattern that repeats across asset-loading subsystems.
+
+## `bse.dat` bank header (from `FUN_8001FA88`)
+
+`FUN_8001FA88`'s body (`ghidra/scripts/funcs/8001fa88.txt`) loads the battle SFX descriptor bank `bse.dat` ([`bse-dat.md`](bse-dat.md); called from battle init, not at boot) into the 0x1800-byte buffer `_DAT_8007B8D0`, then derives a second pointer from a single `u16` at offset `+2`:
+
+```text
+count     = *(u16 *)(bse_base + 2)
+gp[0x678] = bse_base + (count & ~1)        ; (count/2)*2 -- an even byte offset
+```
+
+So `bse.dat` leads with `[u16 tag @0][u16 @2 = even byte-offset of the record table][records …]`, and the `>>1 … *2` is a round-to-even of that offset, not a division of the data. `+2` is not a record-count divisor, and the file is not **two sections**: `@2` is `4` in both retail carriers, so the "second section" is simply the record table and there is nothing before it but the header. What follows the table in entry 888 belongs to a different file - see [`bse-dat.md`](bse-dat.md#the-bytes-past-the-table-are-not-this-banks). The pointer indexes the battle-loaded bank, **not** the per-scene `.dpk`.
+
+## `.dpk` is a streaming-chunk container
+
+`FUN_8001FA88` loads the per-scene `.dpk` into the caller's buffer (`param_3`) and does **not** read it; the **consumer** is `FUN_8001FE70`, which `FUN_800513F0` calls on that same buffer right after the load (`ghidra/scripts/funcs/800513f0.txt:405-413` passes `gp[0xA8C]` to both). `FUN_8001FE70` (`ghidra/scripts/funcs/8001fe70.txt`) is the generic **streaming-chunk walker** the asset dispatcher already models (`legaia_container_formats` lib docs; `[u32 (type << 24) | (size & 0xFFFFFF)][size bytes, 4-padded]` chunks, advance by `(size & ~3) + 4`, type `1` → `FUN_800198E0`, type `2` = terminator). So the `.dpk` / `sound_data2` per-scene sound pack **is that container**, not a novel layout.
+
+Empirically confirmed against the disc: PROT `0877` (`sound_data2`) walks cleanly as `[type 0: 0x2820][type 1: 0x1BA90][type 2: terminator]` and the type-`2` marker lands inside the file - the same shape `FUN_8001FE70` expects.
+
+`FUN_8001FA88`'s hardcoded `0x37A` load is **not** the `.dpk` and does not tie the filename to this block, though it does sit in it: raw TOC `0x37A` is extraction 888, which is `bse.dat`, and the load is on the **retail** branch. The `.dpk` is the routine's other load, `param_1 + 5`. See [`bse-dat.md`](bse-dat.md#which-entry-it-is-and-when-it-loads).
+
+The difference from the DATA_FIELD walker is **only the terminator**: `FUN_8001FE70` ends on a type-`0x02` chunk (whose `size` is non-zero), whereas `FUN_8002541C` ends on a zero-`size` header - so the DATA_FIELD parser mis-reads a `.dpk`. The walker is `legaia_container_formats::parse_streaming_with(buf, max, StreamTerminator::TypeTwo)`; the disc-gated `sound_pack_stream_real` test pins the clean type-2 walk of PROT `0877`.
+
+## The `.dpk` / `sound_data2` payload is a VAB + SEQ bundle
+
+The pack is a **VAB followed by a SEQ**, not a novel `.MAP`/`.PCH`/`.spk`
+layout. The chunk payloads, pinned from the disc:
+
+| Chunk type | Payload | Magic |
+|---|---|---|
+| `0` | VAB **header** section | `pBAV` (`0x5641_4270` LE) |
+| `1` | VAB **sample** section (SPU-ADPCM / VAG waveform pool) | - (raw samples) |
+| `2` | **SEQ** (the stream terminator) | `pQES` |
+
+The decisive invariant: **type-0 + type-1 reconstitute one contiguous VAB**
+whose header `total_size` (`+0x0C`) equals `chunk[0].size + chunk[1].size`.
+Byte-verified across `0877`..=`0885` (e.g. `0877`: `0x2820 + 0x1BA90 ==
+0x1E2B0`); the reconstituted VAB parses with `legaia_vab` and the terminator
+SEQ with `legaia_seq`.
+
+The **type-1 chunk payload** is the VAB's sample pool. On the *graphics*
+battle-init walk, `FUN_8001FE70`'s type-1 handler is the TIM/CLUT upload
+(`FUN_800198E0`), but a sound pack's type-1 chunk is not a TIM. The content shape is identical
+to the [`scene_vab_stream`](scene-bundles.md) BGM wrapper (VAB + SEQ), only the
+container differs (type-2-terminated streaming chunks vs the chunk0-prefixed
+form). Decoder: [`legaia_container_formats::sound_pack`](../../crates/container-formats/src/sound_pack.rs)
+(`extract` returns the reconstituted VAB + the SEQ); disc-gated
+`sound_pack_vab_seq_real` test. The `.dpk` is not a *bare* VAG-record
+container: the VAG samples are the type-1 section *of a VAB*, indexed by the
+type-0 header, not a header-less stream.
+
+The `.MAP` (sample-address map) and `.PCH` (patch / program data) PsyQ
+SoundArtist intermediates are the dev-side inputs that *produce* this VAB.
+The retail disc does not carry them as separate chunks, so there is nothing
+further to parse.
+
+## See also
+
+- [VAB sound bank](vab.md) - the instrument-bank format these drivers emit.
+- [SEQ sequence](seq.md) - the sequenced-music format played against the banks.
+- [`subsystems/audio.md`](../subsystems/audio.md) - the PsyQ audio stack.

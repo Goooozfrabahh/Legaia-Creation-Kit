@@ -1,0 +1,648 @@
+# summon.dat / readef.DAT - battle side-band streaming slots
+
+`\data\battle\summon.dat` and `\data\battle\readef.DAT` are the two files the battle streams from disc *while a fight is running* (CDNAME block `bat_back_dat`). Each is a flat array of fixed `0x10800`-byte (33-sector) slots. A slot holds one of four things: a texture page with its palette rows, a summon creature's actor record, a big summon's raw palette + page + part pool, or a party member's art-animation `"ME"` archive. The action id of the cast or turn picks a group of three or four consecutive slots.
+
+Parser: `legaia_actor_formats::summon_readef` (`crates/actor-formats/src/summon_readef.rs`). Confidence: **Confirmed** (byte-verified RAM↔disc and VRAM↔disc in a mid-cast battle save state).
+
+## At a glance
+
+| File | Retail TOC index | Extraction entry | Slots | Holds |
+|---|---|---|---|---|
+| `summon.dat` | `0x37F` | 893 | 103 | player Seru and Ra-Seru casts: texture pages + actor records |
+| `readef.DAT` | `0x380` | 894 | 78 | 26 three-slot groups: party `"ME"` archives (groups 0..3) and monster-family texture pages |
+
+| Slot kind | Head | Consumer | Section |
+|---|---|---|---|
+| Texture | `u32 mode` in `{0, 1, 2}` | `FUN_801F12D0` cases 2 / 4 → VRAM | [Texture slot](#texture-slot-u32-mode--0-1-2) |
+| Actor record | three `u32` offsets (name, TMD, texture pool) | `FUN_801F19EC` → battle slot 7 | [Actor-record slot](#actor-record-slot-last-streamed-slot-of-a-group) |
+| Big-summon raw | headerless | `FUN_801F12D0` case 6 | [Big-summon raw slot](#big-summon-raw-slot-3rd-slot-base--0xcb-only) |
+| `"ME"` archive | `'M' 'E'`, count, sizes | `FUN_8002B28C` from `FUN_8004AD80` | [Art "ME" slot](#art-me-stream-archive-slot-readef-groups-03) |
+
+```mermaid
+flowchart TD
+    id["action id (actor +0x1DF) or turn group"] --> base["base byte ctx+0x277"]
+    base -- "bit 7 set" --> summon["summon.dat (extraction 893)"]
+    base -- "bit 7 clear" --> readef["readef.DAT (extraction 894)"]
+    summon --> slot["slot = base & 0x7F, 0x10800 bytes each"]
+    readef --> slot
+    slot --> buf["stream buffer *0x8007BD74"]
+    buf --> tex["texture slot -> VRAM CLUT row + page"]
+    buf --> rec["actor record -> FUN_801F19EC -> slot-7 actor"]
+    buf --> raw["big-summon raw slot -> VRAM + part pool"]
+    buf --> me["ME archive -> art entry +0x88 stream"]
+```
+
+## PROT entries and how the dev paths resolve
+
+The battle overlay's streaming handler `FUN_801F17F8` opens both files via the
+file-open shim `FUN_800558FC(path, 0, 0, prot_index)`:
+
+```c
+uVar5 = func_0x800558fc(s_data_battle_readef_DAT_801f64cc, 0, 0, 0x380);
+uVar5 = func_0x800558fc(s_data_battle_summon_DAT_801f64b4, 0, 0, 0x37f);
+```
+
+In the retail build the ISO9660 open `FUN_800608F0` is a trap stub and
+`_DAT_8007B8C2 != 0` (verified live: the halfword is `1` in battle save
+states), so `FUN_800558FC` ignores the path string entirely and passes its
+**fourth argument straight to `FUN_8003E8A8` as a PROT TOC index**. The dev
+path is a debug-build referent only.
+
+`FUN_8003E8A8` resolves `start_lba = word[(idx + 2) * 4 + 0x801C70F0]` against
+the in-RAM TOC copy. The boot TOC loader (`FUN_8003E4E8`) fills `0x801C70F0`
+with PROT.DAT's first 3 sectors **verbatim, 8-byte header included**, while
+`legaia_prot::archive::Archive` strips the header and indexes entry `p` at
+`toc[p + 2]` - so a retail TOC index maps to the extraction-space entry index
+**minus 2**:
+
+| File | Retail TOC index | Extraction entry | Footprint | Slots |
+|---|---|---|---|---|
+| `summon.dat` | `0x37F` | **893** | 6 961 152 B | exactly 103 × `0x10800` |
+| `readef.DAT` | `0x380` | **894** | 5 271 552 B | exactly 78 × `0x10800` |
+
+Verification (executed comparisons, not inference):
+
+- The raw TOC words at `(0x37F + 2)` / `(0x380 + 2)` equal the extraction
+  entries' start LBAs and footprints (asserted by the disc-gated
+  `summon_readef_real` test).
+- In the `battle_gimard_tail_fire_a` save state the entire 67 584-byte stream
+  buffer at `*0x8007BD74` is byte-identical to extraction entry 894 at offset
+  `1 * 0x10800` (slot 1).
+- Slot 0 of entry 894 (mode 2) matches the same state's VRAM byte-for-byte:
+  512-byte CLUT row at `(0, 488)` and 65 536-byte texture page at `(512, 0)`
+  (128 halfwords × 256 rows).
+
+The same `idx + 2` arithmetic applies to every `FUN_8003E8A8` consumer
+(including the overlay loaders' `param + 0x381`), so CDNAME `#define` numbers
+live in the retail index space, not the extraction space - see
+[`cdname.md`](cdname.md#numbering-space).
+
+## Streaming state machine
+
+The battle scene loader (`FUN_800520F0`) case `0xFF` dispatches `FUN_801F17F8`
+each frame. Two coupled state machines live in the battle context at
+`*0x8007BD24`:
+
+- **Transfer SM** (`+0x26B` request byte, `+0x26C` stage): stage 1 opens the
+  file selected by bit 7 of `(request - 1)` (set → `summon.dat`, clear →
+  `readef.DAT`), seeks `((request - 1) & 0x7F) * 0x10800` bytes past the entry
+  start (`FUN_80055A5C` → `FUN_8003E964`, sector-granular relative to the
+  `FUN_8003E8A8`-saved base MSF) and reads `0x10800` bytes into `*0x8007BD74`
+  (`FUN_800559EC` → `FUN_8003E800`); stage 2 closes. `FUN_80055B4C(slot)`
+  arms a request (`+0x26B = slot + 1`).
+- **Applier SM** (`FUN_801F12D0`, `+0x276` stage, `+0x277` base slot byte):
+  odd stages request slots `base`, `base+1`, `base+2`, `base+3`; even stages
+  consume the arrived slot.
+
+Three sites feed the SMs (decomps `overlay_battle_action_801daba4.txt`,
+`overlay_battle_action_801e295c.txt`):
+
+- **Per turn** the initiative scheduler `FUN_801DABA4` seeds `+0x277` with
+  the acting entity's group base - party actor: `3*(char−1)` from
+  `DAT_8007BD10`; enemy actor: `3 * monster_record[+0x1C]` (each monster
+  record carries its readef group byte at `+0x1C`); an AI-delegated party
+  attacker substitutes the delegate's group - and sets `+0x276 = 1`. For
+  readef groups the applier stops after `base+1`, leaving the character's
+  **main "ME" archive** resident for the turn.
+- **At battle end** the win-pose staging requests slot `3*char + 2` (the
+  **base "ME" archive**) directly through `FUN_80055B4C`, bypassing the
+  applier: `FUN_801DABA4`'s no-living-enemy branch and `FUN_801E295C`'s
+  victory arm, which re-rolls `ctx+0x13` onto a living party member **only when
+  the acting actor is dead** - a living acting actor skips the re-pick at
+  `0x801E6690` (the hole behind the enemy-ally charm softlock; see
+  [`battle.md`](../subsystems/battle.md#enemy-ally-charm-at-the-end-of-action-gate-the-charm-battle-softlock)).
+  See
+  [`battle-data-pack.md` § "ME" stream archives](battle-data-pack.md#me-stream-archives-readefdat)
+  for the archive-side consequence (win-pose records read the base archive,
+  everything else the main).
+- **At cast time** the base slot byte is computed by the battle-action SM
+  `FUN_801E295C` (case `0x32` of the cast sequence) from the actor's action
+  id (`actor + 0x1DF`):
+
+```text
+id <  0x9A:  base = 3 * (id - 1)    (mod 256)
+id >= 0x9A:  base = 4 * id + 0x63   (mod 256)
+```
+
+Bit 7 of `base` selects the file; `base & 0x7F` is the starting slot. Both
+forms above are the *byte-truncated* result - the instructions compute
+something that looks different but is congruent mod 256, see
+[the slot map in instructions](#the-slot-map-in-instructions).
+
+The id bands tile both files exactly:
+
+| Action ids | File | Group shape | Slots |
+|---|---|---|---|
+| `0x01..=0x1A` | `readef.DAT` | 3 slots (`[texture, aux, aux]`; the all-texture band `base 0x0C..=0x36` ships two texture pages) | 26 × 3 = 78 |
+| `0x81..=0x99` | `summon.dat` | 3 slots (`[texture, texture, actor record]`) | 25 × 3 = 75 |
+| `0x9A..=0xA0` | `summon.dat` | 4 slots (`[texture, texture, raw CLUT+texture+part pool, actor record]`) | 7 × 4 = 28 |
+
+`readef.DAT` sequences stop after the second slot (the applier resets unless
+bit 7 is set or `base == 0x36`, the one readef id with a four-slot group);
+the second texture upload is also skipped for `base < 0x0C` and
+`base 0x37..=0x41`. Summon group 0 (spell id `0x81`, Gimard) carries the
+"Burning Attack" actor record - consistent with the
+[spell table](spell-table.md)'s player Seru-magic block.
+
+### The slot map in instructions
+
+`FUN_801E295C` splits on `sltiu v0,v0,0x9a` and stores the result with `sb`,
+so both arms are only ever meaningful modulo 256:
+
+```text
+801e499c  lbu   v0,0x1df(s3)      ; the action id
+801e49a4  sltiu v0,v0,0x9a
+801e49a8  beq   v0,zero,0x801e49d0
+
+; low arm (id < 0x9A)
+801e49b8  addiu v1,v1,-0x81
+801e49bc  sll   v0,v1,0x1
+801e49c0  addu  v0,v0,v1          ; 3 * (id - 0x81)
+801e49cc  addiu v0,v0,-0x80       ; ... minus 0x80
+
+; high arm (id >= 0x9A)
+801e49dc  sll   v0,v0,0x2
+801e49e0  addiu v0,v0,-0x29d      ; 4 * id - 0x29D
+
+801e49e4  sb    v0,0x277(v1)      ; stored as a BYTE
+```
+
+The two documented forms follow by congruence, and the check matters because
+the instruction constants share no digits with them:
+
+- Low arm: `3*(id - 0x81) - 0x80 ≡ 3*(id - 1)  (mod 256)`, since the two differ
+  by `3*0x80 - (-0x80) = 0x200`. Spot-check `id = 0x81 → 0x80` and
+  `id = 0x99 → 0xC8` from either form.
+- High arm: `4*id - 0x29D ≡ 4*id + 0x63  (mod 256)`, since `0x29D + 0x63 = 0x300`.
+
+The `-0x80` on the low arm is also **where bit 7 comes from**. The file-select
+bit is not a separate flag the code sets; it falls out of the same expression,
+which is why the whole `0x81..=0x99` band lands in `summon.dat` automatically.
+The applier reads the byte back signed (`lb`) precisely to test that bit:
+
+```text
+801f1644  lb   v0,0x277(a0)
+801f164c  bltz v0,0x801f17e4      ; bit 7 set -> summon.dat, keep streaming
+801f1650  li   v0,0x36
+801f1654  beq  v1,v0,0x801f17e4   ; the one readef four-slot group
+801f1660  sb   zero,0x276(a0)     ; otherwise stop after base+1
+```
+
+(`FUN_801F12D0`, from `overlay_muscle_dome_801f12d0.txt` - see the dump warning
+in [Tooling](#tooling).) The `base+2` and `base+3` arms start at `801f1664` and
+`801f1788`; `801f1678` / `801f179c` are their `addiu a0,a0,2` / `addiu a0,a0,3`
+index adjusts. All four arms funnel into **one** `jal 0x80055b4c`, at
+`0x801F17A0`, which is why an address sweep for the staging call returns a
+single hit inside this routine rather than one per arm.
+
+## The low-band aux-slot consumer
+
+The slot the `base+1` arm streams is an **indexed keyframe-stream archive**,
+and it is bound to the art record's `+0x88`, not uploaded as a texture.
+
+### The loader
+
+`FUN_801F17F8` (PROT 0898 file `+0x22FE0`) opens the file through the raw CD
+API rather than the `FUN_8001FC00` / `FUN_8001E54C` streaming pair, and seeks
+by slot index:
+
+```text
+801F1928  addiu a0,a0,0x64cc      ; "\data\battle\readef.DAT"
+801F1928  jal   0x800558fc
+801F192C  _addiu a3,zero,0x380    ; raw TOC index (= extraction 894)
+801F1948  sll   a1,v0,5           ; slot = ctx[+0x26B] - 1
+801F194C  addu  a1,a1,v0          ; a1 = slot * 33
+801F1950  jal   0x80055a5c        ; seek
+801F1954  _sll  a1,a1,0xb         ; a1 = slot * 33 * 0x800 = slot * 0x10800
+801F1964  lw    a1,-0x428c(v0)    ; destination = *0x8007BD74
+801F196C  jal   0x800559ec        ; read 0x10800 bytes
+```
+
+`addiu/ori rt,zero,0x37F|0x380` adjacent to a `jal` occurs in exactly one
+image disc-wide - PROT 0898, file `+0x230DC` and `+0x23114`, the two arms
+above. `FUN_801F17F8` has two call sites, both SCUS (`0x8004E62C` inside
+`FUN_8004E568`, and `0x80052750` inside the battle scene loader
+`FUN_800520F0`).
+
+### The consumer, and why the set is closed
+
+`*0x8007BD74` has **twelve** references disc-wide (`find-gp-relative-refs.py
+--va 0x8007bd74 --prot`, 1234 images): the writer + its sibling derivation in
+`FUN_800513F0`, three `FUN_80017B94` free calls, five applier-side texture /
+raw uploads in `FUN_801F12D0` + the DMA destination in `FUN_801F17F8`, the
+actor-record install at `0x801F19F8` - and exactly **one** content read outside
+the applier, at `0x8004BCA8` inside `FUN_8004AD80`:
+
+```text
+8004BC8C  lw   a1,0xa24(gp)        ; decode scratch = 0x8007BD3C
+8004BC9C  sw   a1,0x88(v0)         ; art entry's +0x88 stream pointer
+8004BCA0  lbu  v1,0x1da(s1)        ; staged anim id
+8004BCA8  lw   a0,-0x428c(a0)      ; the streamed slot
+8004BCC4  lbu  a2,-0xcf6(v0)       ; the art record's stream-source byte
+8004BCC8  jal  0x8002b28c
+```
+
+`FUN_8002B28C` has one `jal` disc-wide, that one, and its own body gives the
+format: `'M'`, `'E'`, a count byte, then `count` `u16` sizes whose low 15 bits
+sum to the body offsets, with bit 15 selecting channel-delta decompression
+(`jal 0x8002A9CC`) over a verbatim copy. So the aux slot is an **ME archive**
+whose selected entry is expanded into the scratch at `gp[0xA24]`
+(`0x8007BD3C`), and that scratch pointer becomes the art entry's `+0x88`
+keyframe-stream pointer - the same field a monster archive fills from its own
+inline `+0x8C` stream.
+
+The applier confirms the negative half: stage 4 refuses to upload the low band
+as a texture, because bases `0x00/0x03/0x06/0x09` (groups 0..3) fail both of
+its range tests (`sltiu v0,v1,0x42` at `0x801F1500`, `addiu v0,v1,-0xc` /
+`sltiu v0,v0,0x2b` at `0x801F1508`).
+
+### The cast band requests no slot
+
+The slot-B modules `0903..0966` originate no request: zero `jal 0x80055b4c`,
+zero references to `*0x8007BD74`, and zero stores with immediate `0x26B`,
+`0x26C`, `0x276` or `0x277` anywhere in the band. Their only contact with the
+streaming machine is one `lbu v0,0x276(<ctx>)` **read** per image in
+`0903..0934` - a poll for completion before `jal 0x801F19EC` installs the
+actor record. (Positive control for that negative: the same sweep finds 34
+`jal 0x801F19EC` from those images, so it does reach the band.) The base slot
+byte is written only by `FUN_801E295C` case `0x32` (`0x801E49E4`) and by
+`FUN_801DABA4`.
+
+### Group 3 is decoded, and the seat gate is what decides it
+
+The ME read is gated to party seats `0..2`: `sltiu v0,s3,0x3` /
+`beq v0,zero` at `0x8004B6F0`/`0x8004B6F4` skips the whole block for seat
+`>= 3`, and the block containing `0x8004BCC8` has a single predecessor chain
+from there. So `FUN_801DABA4` can seed `ctx+0x277 = 3*(char - 1)` for char 4
+and stream slots 10/11 that nothing decodes - unless char 4 occupies a seat
+below 3. It does: sweeping `DAT_8007BD10[seat]` over the save-state corpus
+finds char 4 at seat 1 in one state (a Terra-in-party battle), so readef group
+3's archives are decoded there and the group is not a dead lane.
+
+## Slot formats
+
+### Every slot is transferred whole, and most end in fill
+
+The stream SM reads a slot as a fixed `0x10800`-byte span, never as "the content
+length". `FUN_801F17F8` stage 1 turns the slot index into a byte seek with
+`sll a1,v0,0x5; addu a1,a1,v0; sll a1,a1,0xb` (`0x801F1948` - `index * 33 *
+0x800`), then passes `0x10800` as a byte count to `FUN_800559EC` (`lui a2,0x1`
+at `0x801F1958`, `ori a2,a2,0x800` in the `jal`'s delay slot at `0x801F1970`),
+which divides it by `0x800` for the sector count (`srl a1,a2,0xb`). Both files'
+extents are exact multiples of the stride.
+
+So a slot's content ends where its own format says - a texture page's declared
+width times 256 rows, an actor record's part pool, an "ME" archive's last entry -
+and the rest of the slot is fill that arrives in the stream buffer and is never
+read. Every slot in both files ends in such a run.
+[Byte accounting](../tooling/byte-accounting.md) claims those runs as `pad`
+bounded by the stride, which is what takes both entries to whole: the residue
+that is left over is inter-record alignment measured in tens of bytes, and no
+format is hiding in the fill. See `ghidra/scripts/funcs/overlay_battle_action_801f17f8.txt`
+and `ghidra/scripts/funcs/800559ec.txt`.
+
+### Texture slot (`u32 mode` ∈ {0, 1, 2})
+
+```text
++0x000  u32  mode
++0x004  CLUT rows - 256 BGR555 entries each (mode 1: 2 rows, else 1 row)
++0x204 / +0x404  4bpp texture page, 256 rows tall:
+        mode 0: 64 halfwords wide (0x8000 bytes)
+        mode 1: 128 halfwords wide (0x10000 bytes), CLUTs at +4..+0x404
+        mode 2: 128 halfwords wide (0x10000 bytes)
+```
+
+VRAM targets are positional (`FUN_801F12D0` cases 2 / 4): the group's first
+texture slot → CLUT at `(0, 488)` + page at `(512, 0)`; the second → CLUT at
+`(0, 490)` + page at `(640, 0)`.
+
+A summon module's parts sample those pages. PROT 0903's fire tunnel draws one
+of its two additive layers from a single texel of the `(512, 0)` page through
+row 488 (`gimard_burning_attack`'s packets: tpage `0xA8`, CLUT `0x7A00`, every
+UV `(0, 255)`), so the tunnel's orange cast is the cast's own `summon.dat`
+page; with the last monster turn's `readef.DAT` page left there instead, the
+tunnel draws grey. The port streams a player cast's two texture slots when its
+stager arms (`battle_sideband_textures::record_cast_sideband_textures`), and
+the formation's monster groups at battle entry.
+
+### Big-summon raw slot (3rd slot, `base >= 0xCB` only)
+
+Consumed headerless by case 6 - the three regions tile the slot exactly
+(`0x1E0 + 0x8000 + 0x8620 = 0x10800`):
+
+```text
++0x0000  240 BGR555 entries - STP bit forced on non-zero entries,
+         uploaded to VRAM (0, 486) as a 240×1 rect
++0x01E0  64×256-halfword texture page → VRAM (448, 256)
++0x81E0  0x8620-byte part pool → RAM *0x8007B85C + 0x44000
+         (the summon creature's part data for the off-band fixup arm)
+```
+
+The first two regions are a **monster texture pool byte-for-byte**: `0x1E0` is
+exactly [`monster_archive::CLUT_REGION_BYTES`](monster-animation.md) (15
+sixteen-colour palettes) and the page is the usual 256-row 4bpp block. Their
+VRAM targets pin the slot too - CLUT row `486` and page origin `(448, 256)` are
+`484 + slot` and `((5 + slot) * 64, 256)` for **slot 2**, so a big summon
+installs over monster battle slot 2 and the ordinary `FUN_80055468` relocation
+reproduces its placement exactly. The part pool holds the group's per-part
+animation entries; see [Per-part animation entries](#per-part-animation-entries).
+
+### Actor-record slot (last streamed slot of a group)
+
+Consumed in place by `FUN_801F19EC` (offsets are slot-relative; the installer
+adds the buffer base to each):
+
+```text
++0x00  u32  name offset    - NUL-terminated attack-name string
++0x04  u32  TMD offset     - Legaia TMD, magic 0x80000002 (every record
+                             in the corpus passes the magic check)
++0x08  u32  texture-pool offset
++0x0C  ..   monster-record-shaped stat head (same offsets as the
+            [monster archive record](../subsystems/battle-formulas.md)):
+            the summon body's stats, copied into battle actor slot 7
+            (+0x0C HP, +0x18 INT, ...; the damage roll reads that slot -
+            see "The stat head is the summon body" below)
++0x1D  u8   ELEMENT of the cast (0=earth 1=water 2=fire 3=wind
+            4=thunder 5=light 6=dark 7=none)
++0x4A  u8   part count
++0x4B  u8   link count (equals the largest link below on every record;
+            the installer never reads it)
++0x4C  u32[part_count]  per-part offsets (each part gets *(p+0x88) = p+0x8C
+       and indirection fixups at p+4 / p+8 through the table that follows
+       the part offsets)
+       u32[links]  link targets: a non-zero p+4 / p+8 is a 1-based index
+       into this tail, rebased to record + table[part_count + link - 1]
+```
+
+The link tail has no count the installer reads: `FUN_801F19EC` resolves each
+non-zero link word through `table[part_count + link - 1]`
+(`0x801F1B08..0x801F1B80`, repeated on the big-summon arm at
+`0x801F1C28..0x801F1CA0`) and stops at `part_count` entries of its own loop.
+So the tail is as long as the largest link any part entry names, and the
+`+0x4B` byte carries that number without being read. The bytes between the
+NUL of the ASCII attack name and the TMD are slack, but not zero: on many
+records they are the tail of a Shift-JIS katakana string the English name was
+written over. `ActorRecordSlot::linked_offset_count` sizes the tail and the
+byte accounting claims it.
+
+The `+0x1D` byte is the **element the damage pipeline attributes to the
+cast**: `FUN_801F19EC` installs the record pointer at `0x801C9358`
+(= record-pointer table `0x801C9348[4]`, i.e. battle slot 7), the per-spell
+summon overlay modules (PROT 0903..0934) call the damage roll
+`FUN_801DD0AC` with a **hardcoded attacker slot 7** (`li a1, 7` before the
+`jal` in every module), and the scale / finisher kernels
+(`FUN_801DD864` / `FUN_801DDB30`) resolve any slot `>= 3` element as
+`0x801C9348[slot - 3] + 0x1D` - so a cast's element is this record byte,
+never the caster's element and never a spell-table field. Across the
+corpus the byte matches the spells' known elements (Burning Attack = 2
+fire, Sonicsizer = 3 wind, Hell's Music = 6 dark, ...), and the
+Evil-Seru-Magic body (`^H Juggernaut`) carries **7 = non-elemental**,
+which is why player ESM damage matches no elemental guard. Confirmed
+live: a Gimard cast rolls `FUN_801DD0AC(_, 7, target)` with the element
+read from the installed Burning Attack record while the acting seat
+(`ctx+0x13`) stays on the caster
+(`scripts/pcsx-redux/autorun_element_attribution_trace.lua`).
+
+`FUN_801F19EC` then routes the TMD + texture pool through `FUN_80055468` - the
+same mesh/texture installer the [monster archive](../formats/monster-animation.md)
+uses - and stages the summon creature as a battle actor (`FUN_80024C88`
+allocation, scale `(part_pool_byte_0x1F) << 5`, etc.).
+
+#### The stat head is the summon body
+
+Between the two it calls `FUN_80054CB0(record, 4)` (`0x801F1D1C`): the monster
+record -> actor copy, with seat `4`, which is actor slot `3 + 4` = 7. The
+record head is a monster-record head, and the copy reads it the same way:
+`+0x0C` HP, `+0x10` MP and the six stats `+0x0E` AGL, `+0x12` ATK, `+0x14` /
+`+0x16` the defence pair, `+0x18` INT, `+0x1A` SPD (`0x8005516C..0x8005520C`),
+then boosts four of them by the fight's `ctx[+0x287]` exactly as for a monster
+seat. Slot 7 is the attacker every summon module names in its damage roll
+(`FUN_801DD0AC(_, 7, seat)`), so the HP and INT that roll reads are this
+record's.
+
+That makes the record the summon body for **every** player cast, and the
+`battle_data` twin a mesh source only. The twin's stats are the enemy's, which
+are a different record: Gimard the enemy is HP 99 / INT 16, the Burning Attack
+body HP 192 / INT 48. The flutes and the big summons have no twin, so their
+record is the only source of a body; Terra's Queen Twister record is HP 2176 /
+INT 272. Captured live (`scripts/pcsx-redux/autorun_summon_body_stats.lua` on a
+random-encounter Gimard cast): at the slot-7 roll the actor holds HP 192 and
+INT 60 - the record's 48 under the random-encounter profile (`+ INT >> 2`) -
+with UDF / LDF 21 / 25 off the record's 12 / 15 (`x7/4`), against an installed
+record reading 192 / 48. Parser `summon_readef::cast_record_stats`; the disc-gated
+`cast_record_stat_heads_are_their_own_bodies` pins that each base head shares
+its twin's element but not its stats. The engine seats these stats on `DiscTables::summon_creatures` at scene entry
+(`monster_catalog::apply_cast_record`).
+
+For the **base + evolved-Seru summons (`0x81..=0x95`)** this actor-record TMD is
+**byte-identical** to a record in the `battle_data` monster archive (PROT 867):
+the summon reuses an ordinary enemy creature's mesh. Matching each group's
+actor-record TMD against the archive by longest-common-prefix recovers the full
+spell → creature map (e.g. Gimard `0x81`→ archive id 10; the otherwise
+capture-less evolved legs `0x90`→ Kemaro 144, `0x91`→ Spoon 147). The texture
+pool is byte-identical too, so an evolved cast seats its own evolved body
+(Gola Gola, not Gimard), colours included. The map lives
+in `legaia_actor_formats::summon_creatures` and is byte-validated by the disc-gated
+`summon_creature_tmd_map_real`. Both play hosts seat the body through
+`engine-effects::summon::summon_spawn_asset`: the archive twin where one exists,
+the cast's own record (`parse_cast`) otherwise, which covers the high block
+`0x99..=0xA0`. The **big-summon block `0x9A..=0xA0`** instead
+carries a **bespoke mesh** - its actor-record TMD byte-matches no archive
+record - so those seven summons are not reused enemy bodies, and the
+creature-id route resolves nothing for them. Their mesh is still the actor
+record's own TMD; what moves out of the record is the *texture pool* and the
+*per-part entries*, both of which live in the group's third (raw) slot. See
+[`open-rev-eng-threads.md`](../reference/open-rev-eng-threads.md) (Seru-magic
+summon visual).
+
+#### The seven big summons
+
+Each row's id is pinned by two independent reads of its own actor record: the
+inline ASCII attack name at `rec[0]`, and the element byte at `+0x1D`. Both
+agree with the curated summon table in
+[`gamedata.md`](../reference/gamedata.md), which is what makes the labelling a
+measurement rather than an ordering assumption. Mirrored at
+`engine-effects::summon::BIG_SUMMONS`; asserted by `summon_view_real`.
+
+| Spell id | Summon | Attack name (`rec[0]`) | Element (`+0x1D`) |
+|---|---|---|---|
+| `0x9A` | Palma | Meteor Cluster | 0 earth |
+| `0x9B` | Mule | Deep Avalanche | 1 water |
+| `0x9C` | Horn | Resurrector | 5 light |
+| `0x9D` | Jedo | Deadly Promise | 6 dark |
+| `0x9E` | Meta | Inferno | 2 fire |
+| `0x9F` | Terra | Queen Twister | 3 wind |
+| `0xA0` | Ozma | Voltagor | 4 thunder |
+
+### Per-part animation entries
+
+The actor record's `+0x4A` count and `+0x4C` offset table are the **same shape
+as the monster archive's `magic_count` / spell-offset array**, and each entry
+they point at is a per-action record whose packed keyframe stream sits at entry
+`+0x8C` - `[u8 parts][u8 frames]` then `frames × parts` nine-byte TRS records,
+decoded by the same `FUN_8004998C` bit layout, with the playback-rate byte at
+`+0x78`. That is why a cast's animation plays through the ordinary battle
+rigid-TRS draw and needs no separate decoder.
+
+What the offsets are **relative to** differs by band, and this is the part that
+hides the seven big summons from a reader who assumes one rule:
+
+- `0x81..=0x99` (three-slot groups): relative to the **actor-record slot**
+  itself. The streams tile the slot contiguously - each entry's stream ends
+  exactly where the next entry begins, and the last one ends exactly at the
+  record's `rec[2]` texture-pool offset.
+- `0x9A..=0xA0` (four-slot groups): relative to the group's **raw slot part
+  pool** (`+0x81E0`), the "off-band fixup arm". Every offset in the corpus lands
+  inside the pool's `0x8620` bytes and the streams tile it the same way.
+
+Parser: `legaia_actor_formats::summon_readef::parse_cast`, which returns the cast's
+mesh (as a `MonsterMesh`, so `battle_render_mesh` applies), its clips, its
+element, its attack name and the group's FX texture slots. The site's
+`magic.html` summon viewer is built on it.
+
+### Art `"ME"` stream-archive slot (readef groups 0..3)
+
+The aux slots of `readef.DAT` groups 0..3 - slots `3*char + 1` and
+`3*char + 2` for char = Vahn / Noa / Gala / Terra - carry the player
+**art-animation keyframe-stream archives** at the slot head: magic
+`'M' 'E'`, `u8 count`, `u16 entry_sizes[count]` (bit 15 = compressed),
+concatenated bodies. The consumer is `FUN_8002B28C` (called by the anim
+commit `FUN_8004AD80` with the `*0x8007BD74` streaming buffer as the
+archive), and every retail entry decompresses through the channel-delta
+codec `FUN_8002A9CC` into a packed
+`[u8 parts][u8 frames][9-byte TRS]` stream - the art-bank side is decoded
+in [`battle-data-pack.md` § "ME" stream
+archives](battle-data-pack.md#me-stream-archives-readefdat). Parser
+`legaia_actor_formats::me_archive`; the side-band classifier reports these as
+`SlotKind::MeArchive`. Slot `3*char` is the group's non-ME (texture) slot.
+On every retail art slot the bytes between the archive's last body and the
+`0x10800` slot boundary are zero padding - the reader walks only the size
+chain, so an archive re-authored in place may grow into that tail freely.
+
+### The higher readef groups' `base+1` slot
+
+The aux slots of the **higher** readef groups (the enemy-special bands) carry
+no new kind. Every one is a [texture slot](#texture-slot-u32-mode--0-1-2) or an
+[actor record](#actor-record-slot-last-streamed-slot-of-a-group), and which of
+the two it is falls out of the applier's own gate.
+
+`FUN_801F12D0` stage 4 - the consumer of `base+1` - tests the base byte before
+uploading anything:
+
+```text
+801f14f8  lbu   v1,0x277(v0)     ; base
+801f1500  sltiu v0,v1,0x42
+801f1504  beq   v0,zero,0x801f1518   ; base >= 0x42 -> upload
+801f1508  _addiu v0,v1,-0xc
+801f150c  sltiu v0,v0,0x2b
+801f1510  beq   v0,zero,0x801f163c   ; base outside 0x0C..0x36 -> skip
+```
+
+so the second texture upload runs for `0x0C <= base <= 0x36` and for
+`base >= 0x42`, and is skipped otherwise
+(`legaia_actor_formats::summon_readef::aux_slot_is_texture_upload`). The file's own content agrees slot
+for slot: every readef group inside the gate holds a texture in `base+1`;
+groups 0..3 (`base < 0x0C`) hold the character ME archives; and the three
+groups the gate excludes from above - `base = 0x39`, `0x3C`, `0x3F`, i.e.
+action ids `0x14`, `0x15`, `0x16` - hold an **actor record** there instead.
+Those three records are byte-identical to the same group's `base+2` slot
+(slot pairs 58/59, 61/62 and 64/65 hash equal), which the applier never
+stages for a readef group because it stops at stage 4.
+
+Streaming a slot is not the same as installing it. The only routine that
+installs an actor record is `FUN_801F19EC`, which rebases the record's three
+header offsets in place and stores the buffer pointer at `0x801C9358`. That is
+`0x801C9348 + (seat - 3)*4` for **seat 7** - the same enemy-record table
+`FUN_801DABA4` reads `+0x1C` from at `0x801DB098` / `0x801DB0C8`, which is how
+a streamed record becomes the group byte the next turn resolves against. Every
+one of `FUN_801F19EC`'s **34** callers disc-wide is a slot-B module in
+the `0903..0966` band (`find-address-word-refs.py 801f19ec --prot`: 34 `jal`,
+no word / `j` / branch / materialisation), and slot B is loaded for the
+`summon.dat` bands. So on a readef-band cast the `base+1` actor record
+arrives in `*0x8007BD74` and nothing reads it.
+
+**No monster names those three groups.** The census below sweeps every
+LZS-decoded record in the PROT 0867 archive: `+0x1C` never takes the values
+19, 20 or 21, so the per-turn seed cannot reach bases `0x39` / `0x3C` /
+`0x3F` at all, and the duplicated actor records in slots 58 / 61 / 64 are
+unreachable through the enemy path.
+
+### Which monsters name which readef group
+
+`readef.DAT`'s 78 slots are 26 three-slot groups, and a monster record's
+`+0x1C` is the group index (`legaia_actor_formats::monster_archive::MonsterRecord::readef_group`;
+disc-gated census in `crates/actor-formats/tests/monster_readef_group_real.rs`).
+Across the 186 populated records the byte never leaves `0..=25`, which is
+itself the check that the group reading is the right one - a base outside
+`0..=75` would seek past the end of the file.
+
+| Group (base) | Records | Who |
+|---|---|---|
+| `0` (`0x00`) | 119 | the roster default - no dedicated bank; `base < 0x0C` also skips the second upload, so nothing but slot 0 streams |
+| `3` (`0x09`) | 5 | the flying-insect family (Evil Fly / Death Wings / Demon Fly / Poisonous Worm / Moldy Worm) |
+| `4` (`0x0C`) | 1 | Dohati |
+| `6` (`0x12`) | 13 | the lizard / face family (Stone Lizard … Terror Face) |
+| `7` (`0x15`) | 7 | the undead family (Skeleton / Skull Knight / Dead Bone / Ghost Knight / Evil Shadow / Shade …) |
+| `8` (`0x18`) | 1 | Gizam |
+| `9` (`0x1B`) | 3 | Freed and its two variants |
+| `10` (`0x1E`) | 3 | Nova and its two variants |
+| `11` (`0x21`) | 2 | Xain, Cort (one of the multi-record boss set) |
+| `13` (`0x27`) | 3 | the Lippian family |
+| `14` (`0x2A`) | 1 | Gi Delilas |
+| `15` (`0x2D`) | 4 | Gilium (three variants) + Gaza |
+| `16` (`0x30`) | 6 | Iota + Puera (three variants each) |
+| `17` (`0x33`) | 1 | Zora |
+| `18` (`0x36`) | 5 | the Cort boss set |
+| `22` (`0x42`) | 1 | Songi |
+| `24` (`0x48`) | 5 | Mushrin / Mush Mush / Berserker (three variants) |
+| `25` (`0x4B`) | 6 | Gizam variants, Zeto, Slippery (three variants) |
+
+Groups `1`, `2`, `5`, `12`, `19`, `20`, `21` and `23` are named by no record.
+Groups `1` and `2` are two of the four **party** ME-archive groups
+(`3*(char-1)`), so an enemy naming them would be a bug; the other six are
+unreferenced through `+0x1C`.
+
+Two of the unreferenced ones still have a consumer elsewhere. The AI spell
+picker `FUN_801E9FD4` reads the *first enemy seat*'s record byte directly -
+`lw v0,-0x6cb8(s1)` (`0x801C9348[0]`) then `lbu v0,0x1c(v0)` at
+`0x801EBB90` - and compares it against `0x17` (group 23), selecting a
+hardcoded action id for that arm. No retail record carries `0x17`, so that
+arm never fires from the shipped table. And the three groups' actor records
+are not unique to them: slots 58 / 59 / 71 are byte-identical, as are
+64 / 65 / 68, so group 19's creature also sits in group 23's `base+2` slot
+and group 21's in group 22's (Songi's) - the copies the applier's stage-4
+stop never reaches either.
+
+## Tooling
+
+`asset summon-readef <entry.BIN>` lists every slot's class (texture / actor
+record / ME stream archive / payload), texture layout, and attack-name string; `--texture-png-dir`
+decodes each texture slot's 4bpp page through a CLUT-row window (`--clut-sub`)
+to PNG; `--action-id` resolves an action id to its `(file, slot)` stream
+target. The attack-name sequence across the `summon.dat` actor records follows
+the spell-id order exactly (slot group 0 = the `0x81` cast, group 1 = `0x82`,
+…), independently corroborating the case-`0x32` banding; `readef.DAT` slot 0's
+page decodes to a legible dev "back read test" texture.
+
+> **Which `FUN_801F12D0` dump to read.** Use
+> `ghidra/scripts/funcs/overlay_muscle_dome_801f12d0.txt` (330 instructions,
+> proper prologue). The sibling `overlay_0897_801f12d0.txt` is a **VA-aliased
+> mid-function fragment**: it opens with `lw v1,-0x6c84(v0)` and no
+> `addiu sp,sp,-N`, yet closes restoring `s0`-`s3` and `ra` it never saved. Its
+> body contains none of the slot-streaming logic described above, so anyone
+> re-walking this thread from it will conclude the applier does something else
+> entirely.
+
+## See also
+
+- [`effect.md`](effect.md) - the resident efect.dat 2-pack this side-band
+  channel complements.
+- [`prot.md`](prot.md) - TOC math and the in-RAM index space.
+- [`subsystems/effect-vm.md`](../subsystems/effect-vm.md) - the effect pool
+  and the streaming handler's place in it.
+
+Provenance: `ghidra/scripts/funcs/overlay_battle_801f17f8.txt`,
+`overlay_muscle_dome_801f12d0.txt`, `overlay_muscle_dome_801f19ec.txt`,
+`800558fc.txt`, `80055a5c.txt`, `800559ec.txt`, `80055b4c.txt`,
+`8003e8a8.txt`, `8003e964.txt`, `8003e4e8.txt`,
+`overlay_magic_capture_801e295c.txt`, `overlay_battle_action_801daba4.txt`.

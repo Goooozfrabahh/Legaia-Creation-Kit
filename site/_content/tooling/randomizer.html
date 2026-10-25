@@ -1,0 +1,878 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">tooling</a> &middot; randomizer</div>
+  <h1>Randomizer / disc patcher</h1>
+  <p class="lede">Give it your own Legend of Legaia disc and a seed, and it hands back a re-rolled game: different loot in the chests, different monsters on the road, doors that lead somewhere new, harder or easier fights - plus features retail never had, from experience for running away to a new Muscle Dome course. This page is the option reference: one block per feature, with the knobs it takes and, folded away, how the patch reaches the disc.</p>
+</header>
+
+<section class="doc-section" id="glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Two front ends</dt><dd>The <a href="rom-patcher.html">browser patcher</a> (nothing uploaded; presets or fine-tuning) and the <code>legaia-patcher</code> <a href="#cli">CLI</a> (scriptable; emits a shareable PPF). Same code, same bytes for the same seed.</dd>
+    <dt>Modes</dt><dd><em>Shuffle</em> permutes what the disc already has (totals preserved); <em>Random</em> draws each slot from the valid pool; <em>none</em> leaves it alone. Sliders and manual edits are seedless.</dd>
+    <dt>Editing rule</dt><dd>Same-size in place - the disc layout never moves. Only door retargets and place renames resize a record, through the <a href="../formats/man-relocation.html">MAN relocation engine</a>. Anything that cannot re-pack into its footprint is skipped and reported.</dd>
+    <dt>Disc</dt><dd>USA only (<code>SCUS-94254</code>); a PAL disc is refused rather than hybridised.</dd>
+    <dt>Crate</dt><dd><code>crates/patcher</code> (<code>legaia_patcher</code>), built on <code>legaia_lzs::compress</code>, <code>legaia_iso::write</code> and <code>DiscPatcher</code>. Internals: <a href="randomizer-internals.html">randomizer internals</a>.</dd>
+    <dt>Sony bytes</dt><dd>None ship. A PPF carries only the deltas between your disc and the patched one.</dd>
+    <dt>Engine</dt><dd>Never involved - the disc is edited and retail (or the port) plays it. Exception: <a href="#seru-trade">Seru trading</a>, whose vendor UI the port draws.</dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="how">
+  <h2>How a patch reaches the disc</h2>
+  <p>A PlayStation disc is not a folder of files. Almost every value the randomizer changes sits inside a compressed block, on a sector whose checksums must be recomputed, at an address nothing else may move. Every feature on this page uses one of six techniques, from &ldquo;overwrite a byte in a table&rdquo; up to &ldquo;host new machine code in space the game never uses&rdquo;.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 780 360" role="img" aria-label="The six patch tiers, top to bottom: A static tables, B inside LZS slots, C script operands (all same-size in place), D MAN relocation (resizes one record), E rodata-gap code and F overlay dead space (new machine code), each with the features that use it">
+      <defs><marker id="tl-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <path class="dg-edge" d="M24 20 L24 340" marker-end="url(#tl-arrow)"/>
+      <rect class="dg-node" x="44" y="14" width="230" height="42" rx="5"/>
+      <text class="dg-label" x="159" y="40">A &middot; static tables</text>
+      <path class="dg-edge-dim" d="M274 35 L300 35"/>
+      <text class="dg-edge-label" x="308" y="39" style="font-size:12px">steals, spell costs, equip bonuses</text>
+      <rect class="dg-node" x="44" y="68" width="230" height="42" rx="5"/>
+      <text class="dg-label" x="159" y="94">B &middot; inside LZS slots</text>
+      <path class="dg-edge-dim" d="M274 89 L300 89"/>
+      <text class="dg-edge-label" x="308" y="93" style="font-size:12px">drops, monster stats, arts</text>
+      <rect class="dg-node" x="44" y="122" width="230" height="42" rx="5"/>
+      <text class="dg-label" x="159" y="148">C &middot; script operands</text>
+      <path class="dg-edge-dim" d="M274 143 L300 143"/>
+      <text class="dg-edge-label" x="308" y="147" style="font-size:12px">chests, shops, encounters</text>
+      <rect class="dg-node-warn" x="44" y="176" width="230" height="42" rx="5"/>
+      <text class="dg-label" x="159" y="202">D &middot; MAN relocation</text>
+      <path class="dg-edge-dim" d="M274 197 L300 197"/>
+      <text class="dg-edge-label" x="308" y="201" style="font-size:12px">doors, place names, bag overflow</text>
+      <rect class="dg-node-accent" x="44" y="230" width="230" height="42" rx="5"/>
+      <text class="dg-label" x="159" y="256">E &middot; rodata-gap code</text>
+      <path class="dg-edge-dim" d="M274 251 L300 251"/>
+      <text class="dg-edge-label" x="308" y="255" style="font-size:12px">flee EXP, enemy ally, shiny Seru</text>
+      <rect class="dg-node-accent" x="44" y="284" width="230" height="42" rx="5"/>
+      <text class="dg-label" x="159" y="310">F &middot; overlay dead space</text>
+      <path class="dg-edge-dim" d="M274 305 L300 305"/>
+      <text class="dg-edge-label" x="308" y="309" style="font-size:12px">Seru trading, Super Arts list</text>
+      <path class="dg-edge-dim" d="M600 18 L612 18 L612 160 L600 160"/>
+      <text class="dg-edge-label" x="622" y="93">same-size in place</text>
+      <path class="dg-edge-dim" d="M600 180 L612 180 L612 214 L600 214"/>
+      <text class="dg-edge-label" x="622" y="201">resizes one record</text>
+      <path class="dg-edge-dim" d="M600 234 L612 234 L612 322 L600 322"/>
+      <text class="dg-edge-label" x="622" y="282">new machine code</text>
+    </svg>
+    <figcaption>Tier A: <a href="../writeups/disc-patching/a-static-tables.html">static tables</a> &middot; B: <a href="../writeups/disc-patching/b-lzs-slots.html">LZS slots</a> &middot; C: <a href="../writeups/disc-patching/c-field-vm-operands.html">field-VM operands</a> &middot; D: <a href="../writeups/disc-patching/d-man-relocation.html">MAN relocation</a> &middot; E: <a href="../writeups/disc-patching/e-rodata-gap-code.html">rodata-gap code</a> &middot; F: <a href="../writeups/disc-patching/f-overlay-dead-region.html">overlay dead region</a>.</figcaption>
+  </figure>
+  <p>Three terms recur in the feature blocks below:</p>
+  <ul class="bullets">
+    <li><strong>MAN</strong> - a scene's script-and-data bundle: its encounters, chests, shops, doors and dialogue, LZS-compressed with no slack. Re-packing it must land inside its original span.</li>
+    <li><strong>Monster slot</strong> - each monster's record in the battle archive (PROT entry 867) has a fixed <code>0x14000</code>-byte slot, so a re-packed record is zero-padded back to size.</li>
+    <li><strong>Code hook</strong> - a two-word jump from a retail routine into hand-assembled MIPS hosted in space the game never reads, which replays the displaced instructions and returns. Several hooks share one small arena and are mutually exclusive.</li>
+  </ul>
+  <p>The patch chain, the checksum math and the two injection traps are on the <a href="randomizer-internals.html">internals page</a>.</p>
+</section>
+
+<section class="doc-section" id="cli">
+  <h2>CLI: <code>legaia-patcher</code></h2>
+  <p>The scriptable path: disc + seed in, a portable PPF out (default <code>&lt;input&gt;.ppf</code>), optionally a patched <code>.bin</code> + <code>.cue</code> (<code>--output</code>) and a spoiler-safe TOML run record (<code>--manifest</code>). Disc arguments take a raw Mode 2/2352 <code>.bin</code> or a <code>.cue</code>. The seed resolves from a number or a hashed string and is always printed, so a run reproduces byte-for-byte.</p>
+  <div class="cli"><code>legaia-patcher randomize --input DISC.bin --seed myrun --drops shuffle --encounters shuffle --chests shuffle --shops shuffle --steals shuffle --doors shuffle --door-coupling coupled --starting-items 3 --patch run.ppf --manifest run.toml</code></div>
+  <div class="cli"><code>legaia-patcher verify --input DISC.bin --patch run.ppf</code></div>
+  <div class="cli"><code>legaia-patcher chests --input DISC.bin</code></div>
+  <p><code>verify</code> applies the patch to a copy and sanity-checks it; <code>chests</code> is one of the read-only listings below.</p>
+  <table class="layout">
+    <thead><tr><th>Subcommand</th><th>Does</th></tr></thead>
+    <tbody>
+      <tr><td>randomize</td><td>Applies every flag in the feature blocks below. <code>--dry-run</code> plans without writing; <code>--allow-region-mismatch</code> overrides the USA-disc check.</td></tr>
+      <tr><td>verify</td><td>Applies a PPF to a copy of your disc and confirms it still parses end to end - a recipient's check.</td></tr>
+      <tr><td>drops, chests, steals, shops, casino, doors, house-doors, map-doors, starting-items, monster-stats, move-powers, affinity, spell-costs, arts, equip-bonuses, weapon-specialty, equipment, fishing, locations, earth-egg</td><td>Read-only listings of the population each feature edits, with item and scene names read off your disc.</td></tr>
+      <tr><td>monster-block</td><td><code>--dump</code> one monster's decoded record for hex editing; <code>--write</code> re-packs it into its slot. Walkthrough: <a href="../guides/modding-and-translation.html">modding guide</a>.</td></tr>
+      <tr><td>tim-list, tim-export, tim-replace</td><td><a href="#texture-replacement">Texture replacement</a>.</td></tr>
+      <tr><td>monster-model</td><td><a href="#custom-models">Custom monster models</a> (export / import).</td></tr>
+      <tr><td>translate</td><td><a href="translation.html">Language packs</a>.</td></tr>
+    </tbody>
+  </table>
+  <p>Mode flags (<code>--drops</code>, <code>--encounters</code>, &hellip;) take <code>shuffle</code> / <code>random</code> / <code>none</code>; the rest are toggles or values. Each flag is documented in its feature block.</p>
+</section>
+
+<section class="doc-section" id="group-loot">
+  <h2>Loot &amp; economy</h2>
+  <p>What falls out of a monster, what is in the chest, what the shop and the casino sell, what the Evil God Icon steals. Quest and story items always stay put, so a re-rolled game is finishable.</p>
+</section>
+
+<section class="doc-section" id="drops">
+  <h3>Monster drops</h3>
+  <p>Every monster has one drop slot (item + chance); the pass deals those slots out again across the roster.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--drops</td><td>shuffle / random / none</td><td>Shuffle preserves the drop economy; random draws from real, named items.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier B. The drop is the byte pair at <code>+0x48</code> (item) / <code>+0x49</code> (chance) of the decoded monster record; each edit is decompress &rarr; mutate &rarr; recompress &rarr; zero-pad of that monster's slot. A slot too tight to re-pack is skipped and reported. See <a href="../formats/battle-data-pack.html">battle data pack</a> and the <a href="../writeups/disc-patching/b-lzs-slots.html">tier B write-up</a>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="equipment">
+  <h3>Equipment drops</h3>
+  <p>Retail never drops gear; with this on, any battle has a small chance of paying out one extra weapon, armor piece or accessory on top of the normal drop - rarer the better the gear and the weaker the enemy.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>--equipment-drops</td><td>toggle</td><td>On in every browser preset except Vanilla.</td></tr>
+      <tr><td>--equipment-drop-chance</td><td>percent, default 5</td><td>Per-battle roll for the bonus piece.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier E code hook. A record has one drop slot, so no data edit can make a monster drop two things; instead the battle-end reward routine is detoured after it grants the normal drop. The injected routine rolls <code>rand() % 100 &lt; chance</code> with the battle RNG, picks an id from an embedded equipment table, adds it, replays the two displaced instructions and returns. It runs once per battle.</p>
+    <p>Equipment ids are recovered by <strong>name</strong>: the curated <a href="../reference/gamedata.html">gamedata</a> weapon / armor / accessory names are matched case-insensitively against the disc's own item-name table, so no Sony bytes ship. The rate is tiered by gear price (early &le; 3700 G, mid &le; 17000 G, late above) and by monster EXP (early &le; 600, mid &le; 3000, late above), taking the <em>lower</em> tier: 3% / 2% / 1%. Sub-percent rates are unrepresentable because the retail roll is integer.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="chests">
+  <h3>Treasure chests</h3>
+  <p>A chest's item and the message announcing it are reassigned together, so the text always names what you got; keys, quest tools, letters and every other progression item stay where they are.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>--chests</td><td>shuffle / random / none</td><td>Global across every chest on the disc.</td></tr>
+      <tr><td>--keep-static-items</td><td>id list, or <code>""</code></td><td>Overrides the protected set; empty string randomizes everything.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier C. A chest grants its item through the field VM's <code>GIVE_ITEM</code> opcode <code>0x39</code>, a single inline operand byte in the scene's script. The sites are found by an opcode-aware walk that skips inline dialogue segments (a byte scan would false-hit a <code>0x39</code> inside text) and is bounded to each record. The chest's announcement names the item again through a separate dialogue token <code>0xC2 &lt;id&gt;</code>; both bytes are rewritten together (<em>display vs grant</em>) so the flavour text matches the grant. Scenes arrive as either a bundle MAN or a raw streaming chunk; both carriers are walked, so the streamed dungeons (Mt. Rikuroa, Mt. Balden) join the pool. A scene too tight to re-pack keeps its items and its ids leave the shuffle pool.</p>
+    <p><strong>Keep-static items.</strong> The protected set is derived from the disc, not a hand list: every named item the item table prices at <code>0</code> (the game's own &ldquo;never sold&rdquo; marker) minus the chest-found gear that is merely unsold (the Ra-Seru set and the Astral Sword). A protected chest keeps its item and its id never enters another chest.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="shops">
+  <h3>Town shops (what stores sell)</h3>
+  <p>Each store's stock list is rewritten across every shop on the disc; quest items never appear, and gear that is normally chest-only is given a price so it can.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--shops</td><td>shuffle / random / none</td><td>Random draws from the sellable (priced &gt; 0) pool.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier C. A gold merchant's stock is inline in the scene MAN, in the payload of field-VM op <code>0x49</code> sub-op <code>0</code>: <code>[u8 count][count &times; u8 item_id][ASCII name\0]</code>. Sites are found by a <strong>signature scan</strong> rather than an opcode walk, because a confirm-picker ahead of the op desyncs a linear walk; strict validation (sub-op byte, small count, non-zero ids, printable name, id names a real item) rules out false hits. Item ids are rewritten same-size and the MAN recompressed. The chest-only Ra-Seru gear and Astral Sword ship at price 0, so the pass first prices them (approximated from the nearest priced gear of the same type) with a same-size SCUS edit.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="casino">
+  <h3>Casino prize exchange</h3>
+  <p>The casino counter's prizes move around; each keeps its coin price and the progression gate that unlocks it, so the counter still fills in as you play.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--casino</td><td>shuffle / random / none</td><td>Whole records move, so price + gate stay with the prize.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier A. The prize list is a static table in the menu overlay's data segment (PROT entry 899, stored raw): four <code>0x60</code>-byte blocks of 8-byte <code>[u16 item][u16 story-gate][u32 coin-price]</code> records. It debits the casino <strong>coin</strong> bank, not gold, which is how it is told apart from a merchant. Same-size raw edit, no LZS.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="steals">
+  <h3>Steal items (Evil God Icon)</h3>
+  <p>What each monster carries for the Evil God Icon changes; the odds of stealing it never do.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--steals</td><td>shuffle / random / none</td><td>Chance byte preserved per monster.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier A. The <a href="../formats/steal-table.html">steal table</a> is a static <code>SCUS_942.54</code> table of <code>[chance, item]</code> per 1-based monster id - not part of the monster record. The item byte is overwritten straight into the executable; nothing can overflow, so nothing is ever skipped.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="fishing-prices">
+  <h3>Fishing prize prices</h3>
+  <p>Reprice any prize at the Buma and Vidna fishing exchanges; a prize only appears once you can afford it, so the price also moves when it shows up.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--fishing-price</td><td>ITEM=POINTS, repeatable</td><td>e.g. <code>0x6F=500</code>. A prize sold at both venues is one row.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier A. Each prize is a raw 12-byte row <code>[u32 limit][u32 price][u32 item]</code> in the fishing-exchange table (parser <code>legaia_minigame_formats::fishing_exchange</code>); rows can be repriced, not added, removed or swapped. See the <a href="../minigames.html">fishing minigame</a> and the <a href="../writeups/spirit-fish.html">spirit fish write-up</a>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="earth-egg">
+  <h3>Earth Egg coin threshold</h3>
+  <p>Set how many casino coins the Sol Tower Prize Counter demands for the Earth Ra-Seru Egg (retail 100,000); the game debits exactly that many.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--earth-egg-price</td><td>1 &ndash; 8,388,608</td><td>A hidden scripted exchange, not a casino-table row.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier C. The threshold is a script literal in the Sol Tower scene MAN, rewritten same-size and recompressed.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="group-fights">
+  <h2>Fights</h2>
+  <p>What jumps you on the road, how tough it is, how hard its specials hit and which element beats which. The shuffles move values between monsters; the sliders scale every monster together, ignore the seed, and compose with the shuffles.</p>
+</section>
+
+<section class="doc-section" id="encounters">
+  <h3>Random encounters</h3>
+  <p>Each area's random formations are refilled from its own roster, from anywhere in its kingdom, or from the whole disc; bosses and story fights are never touched, and an over-strong monster dropped into an early area arrives alone.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>--encounters</td><td>shuffle / random / none</td><td>Shuffle conserves the scope-wide monster census.</td></tr>
+      <tr><td>--encounter-scope</td><td>scene (default) / kingdom / world</td><td>Kingdoms are read off <code>CDNAME.TXT</code>, anchored on the three overworld maps.</td></tr>
+      <tr><td>--no-solo-strong-encounters</td><td>toggle</td><td>Opts out of the solo pass (on by default).</td></tr>
+      <tr><td>--solo-strong-threshold</td><td>percent, default 200</td><td>A pack whose strongest member exceeds this share of the area's norm collapses to one enemy.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier C. Formations are <a href="../formats/encounter.html">encounter records</a> <code>[3 reserved][u8 count][u8 ids]</code> inside the scene MAN; monster id bytes are rewritten and the stream recompressed. Both MAN carriers are walked (bundle MAN and raw streaming chunk), so the v12-family dungeons are covered.</p>
+    <p><strong>Boss protection.</strong> A formation is random only if some region with a non-zero encounter rate reaches it; formations the script starts by index (bosses, story fights) stay byte-identical and never enter a donor pool. An explicit id guard pins Gimard, whose tutorial formation a rate&gt;0 region happens to span.</p>
+    <p><strong>Solo-strong pass.</strong> Each monster is scored by its combat-stat budget; each scene's baseline is the mean of its <em>original</em> random monsters. Any multi-monster random formation whose strongest member clears the threshold is cut to that monster alone (same-size: count set to 1, rest zeroed). Wider scopes work because the battle loader streams any monster's slot by id on demand.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="monster-stats">
+  <h3>Monster combat stats</h3>
+  <p>Each stat column is dealt out again across the roster, so the total difficulty budget is unchanged but nobody is where you remember; tutorial enemies and story bosses keep their numbers.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--monster-stats</td><td>shuffle / random / none</td><td>HP / MP / ATK / DEF&uarr; / DEF&darr; / INT / SPD; AGL untouched.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier B. Stats are <code>u16</code> halfwords at fixed offsets of the decoded monster record (HP <code>+0x0C</code>, MP <code>+0x10</code>, then ATK / DEF&uarr; / DEF&darr; / INT / SPD). The pass is column-wise: shuffle permutes one stat across the roster (multiset preserved), random draws each cell from that column. The AGL action gauge (<code>+0x0E</code>) is excluded because it gates the AI's action economy. Protected ids (the Rim Elm sparring partner, the first wild Piura, every story-boss form) are neither source nor target. Each slot re-packs to <code>0x14000</code>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="enemy-stat-scale">
+  <h3>Enemy difficulty scale</h3>
+  <p>One dial that makes every enemy - bosses included - tougher or gentler without moving anything between monsters; random encounters and bosses can get their own dial, and so can each stat.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>--enemy-stat-scale</td><td>0.1 &ndash; 5 (retail 1)</td><td>Whole roster. Seedless; applied after <code>--monster-stats</code>.</td></tr>
+      <tr><td>&nbsp;&nbsp;stat=mult list</td><td><code>hp=3</code>, <code>attack=2,defense=0.5</code></td><td>Scales only the named stats.</td></tr>
+      <tr><td>&nbsp;&nbsp;regular: / boss: split</td><td><code>'regular:0.75|boss:2'</code></td><td>Each half may itself be a stat list.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier B, same seven halfwords as the stat shuffle. Integer permille arithmetic (<code>(v * permille + 500) / 1000</code>), zero stays zero, non-zero floors at 1, saturates at <code>u16</code>. Bosses <em>are</em> scaled - a difficulty knob that skipped the set-pieces would miss the hardest fights - except the unwinnable Rim Elm sparring partner, pinned in both directions. AGL is left alone so a 5x run is harder, not a slideshow of enemy turns; EXP, gold and drops never move.</p>
+    <p>Which enemies are bosses is read off the disc through the encounter randomizer's mask (a monster seen only in script-started formations), unioned with the curated story-boss list for the mid-battle forms no formation names, and with the tutorial enemies forced back to regular. The loader's own fixed ATK / DEF / INT boost applies on top when a record becomes a live actor.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="exp-scale">
+  <h3>Experience multiplier</h3>
+  <p>Every monster pays a multiple of its usual experience, on wins and on escapes alike; gold and drops are untouched.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--exp-scale</td><td>0.1 &ndash; 5 (retail 1)</td><td>Seedless. Browser: Experience multiplier slider.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier B. One field is the whole feature: the base EXP halfword at decoded-record <code>+0x46</code>, which the victory-spoils routine (&times;3/4, split among living members) and the <a href="#flee-exp">run-away EXP</a> hook both read. Same permille arithmetic and clamps as the difficulty scale.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="seru-catch-rate">
+  <h3>Seru catch rate</h3>
+  <p>Replace the per-monster absorb odds with one flat chance - from &ldquo;every kill absorbs&rdquo; to &ldquo;never&rdquo;, for a run without Seru magic.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--seru-catch-rate</td><td>0 &ndash; 100 percent</td><td>Only the 63 capturable records change; the Ivory Book's +30 still applies.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier B. A killing physical blow rolls a d100 against the record's catch byte (<code>+0x3F</code>) when its Seru id (<code>+0x3E</code>) is non-zero; retail rates run from 80% (Gimard) to 1%. The byte is overwritten and the slot re-packed. Seedless.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="enemy-attack-count">
+  <h3>Enemy attack count</h3>
+  <p>Enemies swing more (or fewer) times per attack turn without changing how hard each hit lands; nothing drops below one hit.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--enemy-attack-count</td><td>0.1 &ndash; 5 (retail 1)</td><td>Seedless. Movesets never change, only counts.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier B. The hit count is not stored: the AI queues strikes while a per-round AGL budget (the record's AGL stat) affords each attack move's AGL-cost byte, bounded at 15. The dial divides each retail-affordable cost byte by the multiplier (round half up) and clamps it to the budget, so an attacker always keeps at least one hit. Sentinel, overpriced and zero-cost entries and spell casts are byte-identical; AGL itself never moves, so this composes with the difficulty scale.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="move-power">
+  <h3>Special-attack power</h3>
+  <p>How hard enemy specials and Seru magic hit is redistributed across the moves; animations, effects and sounds stay with their move, and party Tactical Arts are a separate table.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--move-power</td><td>shuffle / random / none</td><td>Populated records only.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier A. Only the <code>+0x00</code> power halfword of each 26-byte <a href="../formats/move-power.html">move-power</a> record moves (the roll modulus the damage kernel reads); the other 24 bytes - geometry, timing, effect and sound cues - are untouched. PROT entry 898 is stored raw, so the write is same-size in place.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="element-affinity">
+  <h3>Element-affinity matrix</h3>
+  <p>The 8&times;8 grid of which element hurts which is scrambled; shuffle keeps the same number of weaknesses and resistances, between different pairs.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--element-affinity</td><td>shuffle / random / none</td><td>Per-character elements and summon rows untouched.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier A. Cells are damage-scale percentages (100 neutral, &gt;100 weak, &lt;100 resist, 0 immune) in <code>matrix[attacker][defender]</code> inside PROT entry 898 (raw). Shuffle permutes the 64 cells; random draws from them. See <a href="../subsystems/battle-formulas.html">battle formulas</a>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="spell-cost">
+  <h3>Spell MP costs</h3>
+  <p>Every named spell's MP cost is dealt out again; free enemy-only entries never gain a cost.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--spell-cost</td><td>shuffle / random / none</td><td>Named, non-zero-cost spells only.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier A. The cost byte at record <code>+3</code> of the static <a href="../formats/spell-table.html">spell table</a> in <code>SCUS_942.54</code>; names and target shapes untouched.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="group-party">
+  <h2>Your party</h2>
+  <p>Tactical Arts, the AP gauge that pays for them, gear, and how a new game starts. Most of these are targeted edits aimed at one art or one item rather than seeded shuffles.</p>
+</section>
+
+<section class="doc-section" id="arts-combos">
+  <h3>Arts button combos</h3>
+  <p>The arrow combo that fires each Tactical Art is reassigned; every art keeps its input count, the menu's arrows always match the real trigger, and Miracle Arts are left alone.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--arts</td><td>shuffle / random / none</td><td>Combos permute within each length class.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tiers A + B. A combo lives in two files that must change together: the matcher records in each character's player battle file (LZS, rewritten in place) and the SCUS arts-name table's menu-arrow glyph string. Display strings are deduplicated across characters, so the assignment permutes distinct combo strings per length class. See <a href="../formats/art-data.html">art records</a>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="arts-damage-power">
+  <h3>Arts damage power</h3>
+  <p>Tune how hard any single Tactical Art hits - power a favourite down for a challenge run, or turn its damage off.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--arts-power</td><td>COMBO=VALUE; tier <code>0x0C..=0x1F</code> or 0</td><td>e.g. <code>RDLDL=0x16</code>. Lower = weaker; 0 disables the hits. Browser: Tactical-Art overrides picker.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier B. An art's 1&ndash;4 per-strike power bytes sit at <code>+0x24</code> of its <code>0xD0</code>-stride record in the character's player battle file; a byte is a tier, <code>mult = [12,18,20,22,28][(v-0xC)%5]</code>. Every active byte of the matched record is set (hit count preserved; a spirit-only art with no damage byte is skipped) and the record recompressed. There is no menu copy to sync. A combo shared by two characters edits both files.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="super-art-damage-power">
+  <h3>Super Art damage power</h3>
+  <p>Super Arts - the finishers a chain of ordinary arts triggers - have no button combo and no AP of their own, so their damage is edited by name; their AP is the AP of the arts that trigger them.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--super-art-power</td><td>NAME=VALUE; tier <code>0x0C..=0x1F</code> or 0</td><td>e.g. <code>"Tri-Somersault"=0x1A</code>. Names match ignoring case and punctuation.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier B. A Super Art has its own <code>0xD0</code>-stride record (name at <code>+0x10</code>, power bytes at <code>+0x24</code>) indexed by action constant: <code>base + (c - 0x10) * 0xD0</code>. The finisher constants are known, so the address is derived and self-checked against the record's name; an unrecognised build yields nothing. To make a Super cheaper to set up, retune its chain arts with <a href="#arts-ap-override">the AP override</a> - the browser's Super Art row names them and offers an <em>Add rows</em> button. No per-Super AP field is injected.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="show-super-arts">
+  <h3>Show Super Arts on the move list</h3>
+  <p>Retail never lists a Super Art anywhere; with this on, a Super Art you have performed appears on the in-battle Triangle arts list and on the pause menu's Moves page, sorted by AP, with its name, the AP its chain costs and the arrows you type.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--show-super-arts</td><td>toggle</td><td>Arena feature: exclusive with <code>--shiny-seru</code>, <code>--super-arts-pack</code>, <code>--arts-ap-grant</code> / <code>--arts-ap-cost</code>, <code>--delilas-challenge</code>. Terra has no Super Arts.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tiers E + F. <strong>Performed</strong> is a per-character bitfield in the one free, save-persistent byte of the character record (<code>+0x75D</code>, the sixteenth learned-id slot no fifteen-art character reaches), set by a two-word detour at the Super applier's match arm. It rides in the save block, so rows survive a save/load.</p>
+    <p>A row's AP is the chain's sum, read off the arts-name table at patch time; its name is chased from the live art record; its arrows are the Super's <strong>physical input</strong> derived by the byte-exact retail tokenizer (arts overlap, so Tri-Somersault is seven arrows). The battle list synthesises a 20-byte arts-table record in dead space and jumps the list renderer past its scan into its own hit arm, so retail draws every field; the pager is replaced in place so pages step. The pause-menu half detours the menu overlay's panel renderer with routines hosted in that overlay's dead runs. Both halves are verified live under PCSX-Redux. Known cosmetic gap: the Triangle prompt's page caption can still read &ldquo;View Hyper Arts list&rdquo; on a later page.</p>
+    <p>The battle-list half needs 613 bytes of the 652-byte verified-dead SCUS arena - hence the exclusivity; the <a href="randomizer-internals.html#arena">arena budget</a> explains why it cannot move into the battle overlay.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="super-arts-pack">
+  <h3>Super Arts Pack (by ZetaPhoenix)</h3>
+  <p>A community mod by ZetaPhoenix that gives each character five more Super Arts - each with its own banner, hit count, animation and trigger chain - installed as a disc patch so it works from a cold boot instead of a cheat device.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--super-arts-pack</td><td>toggle</td><td>Off by default, in no preset. Arena feature (exclusive with <code>--show-super-arts</code> and its siblings). The retail five per character are untouched.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>ZetaPhoenix authored the payload as a GameShark-style RAM patch: a 3764-byte block at <code>0x801FD000</code> holding trigger tables, fifteen names, four MIPS routines and seventeen animation edit-lists. It is installed <strong>unmodified</strong>: parked in the <code>DMY.DAT</code> annex and streamed in by a twelve-instruction stub entered from battle init, one instruction after the battle overlay's own CD read finishes. That address is free RAM in every state of the project's save library, with no overlay covering it.</p>
+    <p>Fourteen same-size word edits across ten sites point the game at it - ZetaPhoenix's own hook set, supplied by him and installed verbatim: seven retarget the retail Super-Art applier onto the pack's wider tables (doubling one register turns the 5-row strides into the pack's 10-row strides, and the match arm's exit seed widens with the loop bound so a match still ends the scan), the rest jump into his routines. The one addition is the battle-load stub and its hook, this project's by construction - his RAM patch had nothing to load. New arts: Vahn - Ultra Elbow, Somersault Duo, Searing Rush, Criss-Cross, Blazing Typhoon; Noa - Double Lizard, Falcon Talons, Chilling Smash, Zephyr Swipes, Grand Maelstrom; Gala - Ground Pound, Storm Kick, System Shock, Skyvolt Knee, Raging Bull. The pack also ships the author's fix for retail's mis-centred art name banner (the banner is measured against a placeholder name and only re-measured for regular/Hyper arts), its routine parked behind the battle-load stub - his instruction stream verbatim, relocated out of the SsAPI zero-padding window to read-watch-verified arena space. His licence is to be confirmed before a tagged release ships it.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="arts-ap-override">
+  <h3>Arts AP override</h3>
+  <p>Make any Tactical Art cheaper, dearer, or turn it into one that <em>pays you</em> AP each time it lands in a combo.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>--arts-ap-grant</td><td>[CHAR:]COMBO=1..100</td><td>Grants AP (capped at 100), castable at any AP level. Menu AP shows <code>0</code>.</td></tr>
+      <tr><td>--arts-ap-cost</td><td>[CHAR:]COMBO=1..100</td><td>Flat cost in place of retail's computed one. Without a prefix, every character holding the combo.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier E. Retail has no per-art AP number - it computes the cost from the art's position in the character's list - so one code hook into the party arts queue-builder (PROT 0898; party slots only) reads a <code>4 &times; 32</code> <code>i8</code> config table keyed by (character, arts row) hosted in the verified-dead SCUS arena, which is why it is exclusive with the other arena features. Each targeted art's menu AP byte (<code>+2</code> of the arts-name record) is rewritten to match. Sites and AP math: <a href="../subsystems/arts-command-gauge.html">arts command gauge</a>. Disc-verified; a live battle playtest is what would make it runtime-verified.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="oscillating-ap-costs">
+  <h3>Oscillating AP costs</h3>
+  <p>Every battle deals each Tactical Art onto one of two sides at random: the <strong>cost</strong> side is exactly retail, the <strong>grant</strong> side is castable at any AP level, <em>gives back</em> the AP it would have cost, and deals a fraction of its damage. Fresh deal every fight, per art, so a battle is a mix of both.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>--oscillating-ap</td><td>[0..100] (default 20)</td><td>Grant-side damage as a percent of retail. Enemies untouched. The in-battle arts list (Triangle) shows a grant-side art as <code>0</code> AP for that battle.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier E. The AP half is the <a href="#arts-ap-override">arts AP override</a>'s hook with its config byte replaced by a per-battle side bit: sixteen bytes in the SCUS gap, filled at the battle loader's setup site by sixteen calls to retail's own <code>rand</code>. A grant-side art adds the charge the builder had just computed instead of subtracting it. The damage half is a detour in the arms execution resolver at the word after the 9999 cap, where <code>s0 - s1</code> is the strike's final damage; the kernel does not know which art it is running, but the action entry it was called with is a pointer into the character's <code>0xD0</code>-stride art bank (the one the queue builder walks), so the routine recovers the row as <code>(entry - bank - 0x28) / 0xD0 - 0x0B</code> when that division is exact. The playing anim id at <code>actor[+0x1D9]</code> is a staging slot handed out in queue order, not the art, and is not used. A third detour in the SCUS arts-list widget draws a grant-side row's AP as <code>0</code> while the game mode is battle. Occupies all four arena regions, so it excludes every other arena feature. The roll and the damage fraction are emulator-verified (a Tri-Somersault chain with the table forced to grant lands Cyclone's 218 and 239 as 43 and 47), and the AP side and the list read-out have been played.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="ap-gauge-tuning">
+  <h3>AP gauge tuning</h3>
+  <p>The AP gauge that pays for Super and Miracle Arts fills two ways - pressing Spirit and getting hit - and each gets a slider, including negative values that turn the fill into a drain.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>--spirit-ap</td><td>-100 &ndash; 100 (retail 32)</td><td>0 = pure defensive stance; 100 fills the gauge in one press; negative drains.</td></tr>
+      <tr><td>--damage-ap</td><td>-200 &ndash; 200 (retail 100)</td><td>AP per 100% of max HP lost; 0 also drops the min-1 floor; negative drains.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Same-size immediates inside the battle overlay (PROT 0898), no arena. <strong>Spirit</strong> is the per-action accrual the battle-action state machine adds in its state-<code>0x50</code> cleanup (<code>8</code> per action, <code>0x20</code> for Spirit) plus the three gauge-widget ramp targets that mirror it, so the animation stays honest. <strong>Damage</strong> is <code>pct = max(1, damage * 100 / max_hp)</code>; the 100 is a shift/add chain, restated as an explicit multiply for any other factor, and it is inlined <strong>twice</strong> (the closed-form finisher for magic / specials, the arms resolver for physical hits) - the patch writes both and refuses an image whose copies disagree.</p>
+    <h4 id="the-signed-accrual-tail">The signed accrual tail</h4>
+    <p>The gauge is a <code>u16</code> and every retail site clamps only against the 100 ceiling, so a negative value needs a floor the consumer honours. On the damage site the dead ceiling words host a <code>bgez</code> floor. The Spirit tail is shared with the <code>+8</code> every action grants, so the floor and the surviving ceiling do not both fit; they fit because a negative setting makes the AP-Boost-1 arm dead, and its head hosts the relocated over-100 clamp. Consequence: <strong>while a slider is negative, the AP-Boost accessory arm is inert</strong>. Negative modes are statically verified only. The assembled tail is listed on the <a href="randomizer-internals.html#signed-tail">internals page</a>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="equip-bonus">
+  <h3>Equipment stat bonuses</h3>
+  <p>Gear stat bonuses are dealt out again within each slot type - a weapon's numbers only land on another weapon - so the best sword might be an early one.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--equip-bonus</td><td>shuffle / random / none</td><td>Masks, passives and slot types stay with their row.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier A. The <code>[INT, ATK, UDF, LDF, SPD]</code> tuples of the static <a href="../formats/equipment-table.html">equipment table</a> in <code>SCUS_942.54</code>, permuted within slot category. Rows are edited, not item ids (several items can share a row), and unreferenced rows are left alone. Composes with <a href="#equip-mask">the mask pass</a>, which edits the disjoint <code>+6</code> byte.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="equip-mask">
+  <h3>Equip mask (who can equip what)</h3>
+  <p>Who can wear what is reshuffled within each slot type; each character keeps exactly as many equippable weapons, body, head and footwear pieces as in retail, just different ones.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--equip-mask</td><td>shuffle / random / none</td><td>Nobody is ever left with zero gear in a slot under shuffle.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier A. The <code>+6</code> equip-character mask (<code>1</code> Vahn, <code>2</code> Noa, <code>4</code> Gala, <code>7</code> any) of the same table, permuted within slot category (<code>+7 &amp; 0x60</code>). The engine's equip picker reads the same byte, so a patched disc re-gates it there too.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="weapon-specialty">
+  <h3>Weapon specialty</h3>
+  <p>Vahn favours blades, Noa claws, Gala clubs - and an off-class weapon makes that character's Arms command wider on the arts bar, so fewer commands fit; this permutes who favours what.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--weapon-specialty</td><td>toggle</td><td>Seeded bijection: each class keeps one specialist. The Astral Sword stays always-wide.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier B. The arm cost is not a runtime class check but a per-(character, weapon) byte baked into the player battle files; each weapon section is decompressed, the byte rewritten for the new relationship, and recompressed in place. See <a href="../subsystems/arts-command-gauge.html">arts command gauge</a>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="equipment-editor">
+  <h3>Equipment editor (command costs and equip owners)</h3>
+  <p>Two manual edits: set exactly what any weapon costs on the arts bar for any character, and set who can equip any item - give someone a weapon their battle file never had and the patcher carries the model over.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>--swing-cost</td><td>CHAR:ITEM[:up]=COST</td><td>Retail tiers 30 favored / 42 off / 54 far; minimum 7. <code>default</code>, <code>raseru</code>, <code>feet</code>[:up] address a section's default record.</td></tr>
+      <tr><td>--equip-owner</td><td>ITEM=V|N|G|any|none</td><td>Rows shared by several items move together (reported).</td></tr>
+      <tr><td>--no-model-transplant</td><td>toggle</td><td>New owner keeps the default look.</td></tr>
+      <tr><td>--allow-relayout</td><td>toggle, <code>--output</code> only</td><td>Whole-disc relayout when the <code>DMY.DAT</code> annex is unavailable; no PPF.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p><strong>Command cost</strong> (tier B): each of the four commands is priced by the equipment section that fills it in the character's player battle file - Left and Right by the weapon and the Ra-Seru arm, Down and Up by the footwear's two records (<code>:up</code>). The cost byte is the AP a press charges and the pennant width plus 6. An item the file has no section for falls to the section's default record. Applied after <code>--weapon-specialty</code>, so a named cost wins.</p>
+    <p><strong>Equip owner</strong> (tier A + B): rewrites the item's mask in the SCUS table, then for a weapon cuts the model out of the donor file's record, re-seats it into the new owner's grip (calibrated per weapon class from the weapons both files carry) with the donor's texture tile, palettes and arm cost. Room comes first from re-packing the three player files (PROT 863..865) with the optimal LZS parse, then from parking the rebuilt records in the <strong><code>DMY.DAT</code> annex</strong> the loader reaches by descriptor offsets alone - same-size image, still a PPF. Ra-Seru forms, body, head and footwear are never carried over. Details: <a href="../formats/battle-data-pack.html#weapon-transplant">battle data pack</a>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="starting-items">
+  <h3>Starting bag and starting level</h3>
+  <p>A vanilla New Game begins with five Healing Leaves and a level-1 party; these flags seed a different bag, named extras, warps everywhere, and a higher starting level with real level-N stats.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>--starting-items</td><td>N (0 = vanilla)</td><td>N distinct random consumables replace the leaves.</td></tr>
+      <tr><td>--start-with</td><td>id[:count],&hellip;</td><td>Explicit picks of any kind, additive.</td></tr>
+      <tr><td>--door-of-wind / --incense</td><td>[N], default 10</td><td>Convenience consumables.</td></tr>
+      <tr><td>--speed-chain / --chicken-heart / --good-luck-bell</td><td>[N], default 1</td><td>Convenience accessories.</td></tr>
+      <tr><td>--all-warps</td><td>toggle</td><td>Door of Wind reaches every town from the start.</td></tr>
+      <tr><td>--starting-level</td><td>2 &ndash; 14</td><td>Whole starting party.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tiers A + D. There is no starting-inventory table: the new-game init routine builds the bag in code, so the seed code is rewritten in a reclaimable 40-byte region, one packed halfword store per slot (cap 7, or 5 with all-warps). Overflow is granted by splicing a guarded run of silent <code>GIVE_ITEM</code> ops into the opening scene's entry script through the MAN relocation engine.</p>
+    <p>The starting level is three coordinated SCUS edits: the level literal on every roster slot (magic rank kept at 1); each growth character's cumulative XP seeded to the midpoint of level N's band and the next threshold to <code>reach(N+1)</code> from the disc's own thresholds; and each stat template recomputed from the disc's growth curves (Terra has none). See <a href="../formats/new-game-table.html">new-game table</a>, <a href="../formats/save-record.html">save record</a>, <a href="../subsystems/level-up.html">level-up</a>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="location-names">
+  <h3>Location names</h3>
+  <p>Rename a town or dungeon everywhere the game shows it: the quick-travel list, the world-map label and the on-entry banner each read their own copy off the disc.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--rename-location</td><td>TARGET=NAME, repeatable</td><td>TARGET = quick-travel index or exact current name; ASCII, up to 23 characters.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <table class="layout">
+      <thead><tr><th>Display</th><th>Carrier</th><th>Edit</th></tr></thead>
+      <tbody>
+        <tr><td>quick-travel list</td><td>16 fixed <code>0x20</code>-byte SCUS cells</td><td>same-size</td></tr>
+        <tr><td>world-map label</td><td>29-record table trailing every kingdom MAN</td><td>same-size</td></tr>
+        <tr><td>entry banner (+ save-screen row)</td><td>scene MAN section-2 name, unpadded</td><td>tier D relocation</td></tr>
+      </tbody>
+    </table>
+    <p>Places with a label but no quick-travel cell (Hunter's Spring, Sol Tower, &hellip;) are addressed by name; matching is exact, so <code>Conkram</code> leaves <code>Conkram (Past)</code> alone. The rename runs in the door randomizer's slot, after a language pack. See <a href="../formats/place-names.html">place names</a>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="group-hooks">
+  <h2>New mechanics and fixes</h2>
+  <p>Things retail has no table for. Each is hand-assembled MIPS hosted in space the executable never uses; several share one small arena of dead bytes, so only one arena feature can be on at a time.</p>
+</section>
+
+<section class="doc-section" id="flee-exp">
+  <h3>Run-away EXP</h3>
+  <p>A successful escape banks a slice of the fight's experience; it shows on the status screen at once and counts toward the next level-up.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>--flee-exp</td><td>toggle</td><td>On in the Balanced / Full Chaos presets.</td></tr>
+      <tr><td>--flee-exp-pct</td><td>percent, default 5</td><td>Share of the fled formation's EXP.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier E. The battle-action state machine's successful-escape teardown state runs once per escape, after party HP has been floored to 1; its first two instructions are detoured to a routine in the SCUS rodata gap that sums each live enemy's EXP halfword, scales it, adds it to every member's cumulative-experience cell (capped at 9,999,999) and returns. The grant is banked, never a level-up mid-fade. The routine shares the gap with the equipment-drop hook, clear of it, so both battle hooks coexist.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="enemy-ally">
+  <h3>Enemy ally (charm)</h3>
+  <p>Some battles open with one enemy already on your side, attacking its former friends - a charmed enemy for that fight, not a fourth party member; never in one-enemy fights.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>--enemy-ally</td><td>toggle</td><td>Multi-enemy fights only.</td></tr>
+      <tr><td>--enemy-ally-pct</td><td>percent, default 20</td><td>Per-battle chance.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier E. A battle-setup hook sets the game's own AI-delegated confuse/charm flag (<code>+0x16E |= 0x380</code>) on the frontmost enemy, and a one-word widen of the victory check stops the ally counting as an enemy left. A bundled <code>charm_fix</code> guard closes the hard-freeze the widen otherwise arms: a living ally can be the acting actor at victory, and the win-pose staging would index the 3-byte party roster with a monster slot; a single-word detour keeps the acting slot only when it is a living party slot. See the <a href="../subsystems/battle-action.html">battle action SM</a>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="enemy-hp-bars">
+  <h3>Enemy HP bars</h3>
+  <p>Every living enemy carries a red HP gauge - an <strong>HP</strong> label, a red meter and the remaining percentage, no frame - on its own row along the top of the screen, following the enemy left and right as the battle camera moves and stepping down hit by hit inside a combo. The game never shows a monster's HP on its own.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>--enemy-hp-bar</td><td>toggle</td><td>Cosmetic. Combines with every other option, including the arena features.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier F, with no arena byte claimed. The plate is the roster panel's HP label and the AP meter's gauge primitive, drawn by the game's own icon and gauge routines; the routine calls the primitive with the percentage of the displayed-HP mirror (the value each hit moves) and recolours the gold end of the two strips it just emitted. Each plate's X comes from the billboard projector the damage numbers use, so it tracks the monster under any camera; the rows are fixed so plates never pile up when a zoomed camera brings monsters together. A two-word detour at the head of the damage-popup renderer runs it once per fighting-phase frame, and the code is laid over four routines nothing on the disc references - three in the battle overlay, one in the executable - each fingerprinted before it is overwritten. The full placement story is in the <a href="../reference/functions.html">function reference</a> and the repo's <code>docs/tooling/randomizer.md</code>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="shiny-seru">
+  <h3>Shiny Seru</h3>
+  <p>Now and then a capturable enemy spawns translucent and 35% stronger; absorb it and the Seru keeps a permanent +35% damage boost, shown in a caption every cast.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>--shiny-seru</td><td>toggle</td><td>Arena feature (exclusive with the Super Arts list / pack, AP override, Delilas Challenge). Applies to Seru captured after patching.</td></tr>
+      <tr><td>--shiny-pct</td><td>percent, default 2</td><td>Per-battle chance on the frontmost capturable enemy.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier E: nine same-size detours into SCUS regions verified dead and outside every live indexed table (618 of the arena's 652 bytes). &ldquo;Capturable&rdquo; is an allowlist built at patch time from the disc's monster names matching the player Seru-magic names; the permanent flag is a parallel per-spell byte inside the saved character record, so it survives a memory-card save. See <a href="../formats/spell-table.html">spell table</a>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="seru-trade">
+  <h3>Seru trading</h3>
+  <p>Every shop gains a Trade row: swap one of a party member's learned Seru-magic for a different one at a set level; offers rotate with play time and differ per vendor.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>--seru-trade</td><td>toggle</td><td>Composes with every gap-based hook.</td></tr>
+      <tr><td>--seru-trade-offers</td><td>count, default 4</td><td>Offers listed per vendor at once.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier F. Hand-assembled MIPS hosted entirely in the menu overlay's (PROT 0899) reference-free dead region: a fourth Buy / Sell / Trade / Quit row, a Wants / Offers screen, and a &ldquo;No &lt;want&gt; available&rdquo; message when nobody holds the wanted Seru. Levels are curved low (1-3 common, 7-9 very rare); offers rotate on a play-time bucket, phased per vendor by an offset summed from its shop record, all deterministic from the seed (kernel <code>legaia_game_tables::seru_trade</code>).</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="jewel-fix">
+  <h3>Jewel fix</h3>
+  <p>A few boss cinematic casts - Xain's Bloody Horns and Terio Punch, Cort's Guilty Cross, the Delilas signature moves - bypass the elemental resist ladder in retail, so a Jewel or All Guard does nothing against them; this makes elemental guards apply. The casts then use the damage roll every other boss cast uses, which reads the caster's INT rather than its ATK, so the hits change size too.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--jewel-fix</td><td>toggle, seedless</td><td>In every browser preset above Vanilla.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Same-size retargets of those casts' damage path onto the ordinary elemental route. See <a href="../subsystems/battle-formulas.html">battle formulas</a> and <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/subsystems/cast-module.md" target="_blank" rel="noopener">cast modules</a>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="approach-softlock-fix">
+  <h3>Approach-softlock fix</h3>
+  <p>Retail can freeze a boss fight forever - the boss walks toward you, its walking animation dies, and the camera circles the party for eternity; this makes the boss start walking again.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--approach-softlock-fix</td><td>toggle, seedless</td><td>On in the Balanced / Full Chaos presets. Healthy fights are byte-identical.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>A monster approaching an out-of-reach target waits in a range poll with no movement code and no timeout while its staged Move clip carries it; when Kemaro's put-back leaves the target's exit-to-idle flag set and its melee follows inside one idle loop, that clip dies and nothing re-stages it. The fix is a nine-word rewrite of the poll's redundant per-frame facing recompute: when the clip reads dead while the poll still fails, the state bounces back to staging and retail's own code resumes the walk. Runtime-verified on both live-caught park states. Full story: <a href="../writeups/gaza-orbit-softlock.html">the endless camera orbit</a>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="fortress-encounter-fix">
+  <h3>Fortress encounter fix</h3>
+  <p>In some retail saves Jette's Absolute Fortress has no random battles at all and the Door of Light is greyed out inside it; this brings both back, including on a save that is already affected.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--fortress-encounter-fix</td><td>toggle, seedless</td><td>On in the Balanced / Full Chaos presets. A healthy save, and Zora's Floating Castle itself, play as retail.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Zora's Floating Castle switches battles off for the last minute of its escape clock by raising system flag <code>0x15</code>, and the record that ends a successful escape never lowers it. Both Fortress scenes (<code>deroa</code>, <code>chitei2</code>) open their encounter condition list with a copy of the castle's flag-gated silent group. The fix rewrites that group - 14 decoded bytes of each scene MAN, same size - into a duplicate of the scene's own post-Jette group (flag <code>0x521</code>), so the Fortress never tests flag <code>0x15</code>. The duplicate is checked to read the same as the group retail reaches one record later, so no other story state changes. Full story: <a href="../writeups/glitches/field-oddities.html#fortress-no-encounters">no encounters in Jette's Absolute Fortress</a>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="conkram-freeze-fix">
+  <h3>Conkram freeze fix</h3>
+  <p>On emulators that run the CPU faster than a console, the Room of Mirrors scene in present-day Conkram can lock the game up; this stops it.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--conkram-freeze-fix</td><td>toggle, seedless</td><td>On in the Balanced / Full Chaos presets. Console-speed play is unchanged.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>The scene runs with almost no free heap, and a faster emulated CPU keeps more mirror-effect particles alive until their requests for memory fail. The move VM's keyframe-pose seat (op <code>0x3C</code>) never tests its request and copies the particle's animation through the NULL pointer onto the CPU's exception vector; the render-node request is tested, but leaves its NULL pointer for later code to write through. The fix makes four same-size edits of <code>SCUS_942.54</code>: op <code>0x3C</code> is rearranged so a NULL block ends the particle through the move VM's own halt, a failed render node gets a shared stand-in node in free RAM, and both requests go through a quiet copy of the allocation routine, placed over an unreferenced thunk, so an absorbed failure never reaches the <code>PRG ERR</code> readout. Every allocation that succeeds runs the retail instructions. Full story: <a href="../writeups/glitches/field-oddities.html#conkram-mirror-freeze">Conkram mirror freeze</a>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="delilas-challenge">
+  <h3>Delilas Challenge</h3>
+  <p>The Muscle Dome clerk gains a fourth course: Che and Lu Delilas together, then Gi with two borrowed tricks; a full clear pays 5,000 coins and, with custom items on, three items retail never shipped.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--delilas-challenge</td><td>toggle, seedless</td><td>Unlocks after the Koru event in Nivora Ravine. Arena feature. On in Balanced / Full Chaos.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>A <code>koin1</code> script edit grows the enrollment picker to its four-option ceiling, plus a small arena/SCUS code injection. The 1v2 fits the battle heap by streaming <strong>slim clones</strong> of Che and Lu from two unreferenced archive slots; the real records, the ravine duels and the Master course are untouched. The pair fire their specials once every four turns, staggered two apart. Gi borrows two streamed capture-class casts - Divide below half HP (after which Blazing Slash is locked out and the clone only melees) and Spore Gas from turn 3. Losing returns you to the Sol venue; the course repeats.</p>
+    <p id="custom-items-reward">With <a href="#custom-items">custom items</a> on, a clear also hands out Nature's Elixir, the Ra-Seru Tear and the Fury Bloom in place of the Honey reward.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="custom-items">
+  <h3>Custom items</h3>
+  <p>Three items the game never had, built into the item table's only free slots: <strong>Nature's Elixir</strong> (full HP and MP, field or battle), the <strong>Ra-Seru Tear</strong> (a free cast of the user's own Ra-Seru summon, castable by anyone) and the <strong>Fury Bloom</strong> (a party-wide Fury Boost).</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--custom-items</td><td>toggle, seedless</td><td>Obtained through <code>random</code> drop / chest / steal fills or the Delilas Challenge reward; with neither, they exist but nothing hands them out.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier A + E: name, description and effect-descriptor rows written into the three free slots of the <a href="../formats/item-table.html">item table</a> and <a href="../formats/item-effect-table.html">item effect table</a>, with the effects hosted as code hooks.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="delilas-party-swap">
+  <h3>Delilas party swap</h3>
+  <p>Play as Gi, Lu and Che: the siblings take the heroes' place in battle, in the field, on the save screen and in dialogue, while Vahn, Noa and Gala step into the siblings' story duels; each sibling brings their signature special in place of a Hyper Art.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>--delilas-party</td><td>any permutation of gi,lu,che</td><td>Maps onto Vahn, Noa, Gala in order. Seedless; in no preset. Cannot be combined with <code>--delilas-challenge</code>.</td></tr>
+      <tr><td>--delilas-moves</td><td>hybrid (default) / delilas</td><td><a href="#delilas-move-set">Move set</a>.</td></tr>
+      <tr><td>--delilas-arts-voice</td><td>original (default) / adjusted / removed</td><td><a href="#delilas-arts-voice">Arts voices</a>.</td></tr>
+      <tr><td>--delilas-che-hammer</td><td>toggle</td><td>Che keeps his welded hammer instead of the mirrored fist; <code>--allow-kept-hammer</code> waives the audit's radius check.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Each character keeps their animations, arts, magic, stats and story but wears the mapped sibling's battle model; each sibling's monster block is rebuilt around the mapped hero's model, and because the animation streams pose parts by index, a same-part-count model inherits every move. The swap is an anatomy permutation plus a per-part rest-pose bake between the rigs and a bit-exact 4bpp texel re-layout between the monster page and the party texture band, applied to every equipment variant of the player files. Field models rebuild from the siblings' Nivora Ravine NPC meshes; battle grunts resample from their voice banks; save-select faces, memory-card icons and load-screen portraits follow the mapping; every dialog line naming a sibling is rewritten. Pause-menu portraits and battle HUD faces stay retail.</p>
+    <h4 id="delilas-signature-timing">The signature special lands when it connects</h4>
+    <p>The reskinned Hyper Art plays the sibling's multi-stage signature chain, and its damage frames and visual burst are re-derived onto the frames the chain actually connects on: a stage with authored contact beats (Lu's strikes) uses them; one without (Gi's and Che's, damaged by cast modules as enemies) takes the frame the whole body arrests hardest. Anchoring on the final stage's start instead lands the first hit 1&ndash;3 seconds late, because that stage opens with its own approach.</p>
+    <h4 id="delilas-element">Each slot fights in its sibling's element</h4>
+    <p>Retail keeps one element byte per character in the battle overlay (Vahn fire, Noa wind, Gala thunder), read by both affinity readers. The swap copies each sibling's element from their monster record - Gi fire, Che earth, Lu thunder - into the slot, so Lu's Plasma Strike deals thunder out of Vahn's slot. It is per character, not per art.</p>
+    <h4 id="delilas-move-set">Move set</h4>
+    <p><strong>Hybrid</strong> changes nothing but the one reskinned Hyper Art. <strong>Delilas</strong> rebuilds the character's whole battle-animation archive from the sibling's monster clips (the signature, the locomotion clip and one entry per distinct swing), repoints and re-times every art, renames each surviving art after the clip it plays, and blanks the combos of arts neither a Super Art nor the Miracle Art needs - a blanked combo is never performed, so never learned. The archive is rebuilt rather than extended because retail leaves too little free space (Noa's slot has room for no extra clip); repeated names are also what keeps the art bank inside its compressed footprint. Result: 12 / 16 / 12 performable arts, 3 / 1 / 3 hidden; Super and Miracle Arts remain reachable.</p>
+    <h4 id="delilas-arts-voice">Arts voices</h4>
+    <p><strong>Original</strong> leaves the retail XA arts shouts untouched. <strong>Adjusted</strong> re-voices them toward the mapped sibling through a tuned pitch/formant map. <strong>Removed</strong> silences the XA2/4/6 arts banks and the party's three swing-grunt channels, routing intact, leaving the resampled battle grunts. The grunt resample is SPU-side and rides with the swap in every mode.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="injection-traps">
+  <h3>Two traps in the MIPS injection features</h3>
+  <ul class="bullets">
+    <li><strong>The R3000 load-delay slot.</strong> A just-loaded register is not ready for the very next instruction; every injected routine keeps a filler between a load and its first use.</li>
+    <li><strong>&ldquo;Zero is not dead.&rdquo;</strong> A run of zero bytes is safe to host code only if no code reads it. A region qualifies when it is zero in the clean image, constant across states, outside every known table, <em>and</em> read-watch-verified unreferenced on a live session.</li>
+  </ul>
+  <p>The three times the second trap bit, and the arena arithmetic behind the mutual exclusions, are on the <a href="randomizer-internals.html#traps">internals page</a>.</p>
+</section>
+
+<section class="doc-section" id="group-world">
+  <h2>Getting around</h2>
+  <p>Three kinds of door live on the disc, each a different edit: a scene-transition door names its destination scene inline; a house door inside a town is a scripted teleport of the player; and most house <em>exits</em> are a bare trigger tile in the map data with no script at all.</p>
+</section>
+
+<section class="doc-section" id="doors">
+  <h3>Doors (scene transitions)</h3>
+  <p>Walk through the Rim Elm gate and come out somewhere else; doors are re-paired two-way by default so turning around still takes you back, and the big overworld hubs keep theirs because their data cannot grow in place.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>--doors</td><td>shuffle / random / none</td><td>160 doors across 48 scenes on the retail disc.</td></tr>
+      <tr><td>--door-coupling</td><td>coupled (default) / decoupled</td><td>Two-way pairs via a random involution, or fully independent one-way destinations.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier D - the only randomizer that resizes an asset. The field VM's <code>0x3F</code> named-scene-change op carries <code>[i16 index][u8 name_len][name][entry_x][entry_z][dir]</code> inline in partition-2 MAN records; the destination name is variable length, so the op is rewritten through the <a href="../formats/man-relocation.html">relocation engine</a>, the MAN recompressed and the descriptor's size word updated. The whole destination (scene + entry tile + facing) moves as one unit, so a re-pointed door always lands somewhere valid. Doors with no reverse partner fall back to one-way and are reported; a scene whose MAN cannot grow in its footprint keeps its doors.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="house-doors">
+  <h3>House doors (intra-town)</h3>
+  <p>Inside a town the front doors lead to different houses; entries stay entries and exits stay exits, so you can never be trapped indoors.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--house-doors</td><td>shuffle / none</td><td>Per-scene, class-preserving. Also drives <a href="#map-doors">map doors</a>.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Tier C. Entering a house is an intra-scene reposition: the cross-context player move <code>0xA3 0xF8 xb zb</code> (opcode <code>0x23 | 0x80</code> into the player channel), in partition-0 records paired by a fullwidth naming convention (ＩＮ/ＯＵＴ, 入口/出口, Ａ/Ｂ elevator endpoints). 56 warps across 12 scenes; a same-size 2-byte operand edit, recompressed in place. A record carrying several player warps is choreography (the tower's multi-stop elevator), not a door, and stays vanilla.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="map-doors">
+  <h3>Map doors (<code>.MAP</code> intra-scene teleports)</h3>
+  <p>Most house exits are not a script at all: crossing the tile just inside the doorway repositions the player outright - by far the largest door population on the disc, rewired only when the scene's walk geometry proves nothing becomes unreachable.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody><tr><td>--house-doors</td><td>shuffle</td><td>2319 records across 72 scenes. <code>legaia-patcher map-doors</code> lists them with walk-component classes.</td></tr></tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>Same-size 2-byte writes into the raw <code>.MAP</code> sectors - the per-scene <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/formats/field-map.md" target="_blank" rel="noopener">field map</a>'s trigger block carries a kind-0 sub-table of <code>[tile_x][tile_z][dest_x][dest_z]</code> records with no object, record or name; landing is <code>(dest_x*64 + 64, (dest_z+1)*64)</code>. Records have no entry/exit class, so the softlock policy is <strong>reachability verification</strong>: the walkable surface (walk-visible floor minus collision wall bits) partitions into 4-connected components, each record is a directed edge, and a permutation is accepted only if the component graph keeps every retail reachability pair and adds no one-way trap - retried deterministically, vanilla when nothing verifies. Endpoints that cannot be attributed on the base grid stay vanilla. See <a href="../subsystems/field-locomotion.html">field locomotion</a>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="group-extras">
+  <h2>Cut content and custom art</h2>
+</section>
+
+<section class="doc-section" id="unused-content">
+  <h3>Unused content</h3>
+  <p>The disc ships two monsters and two items the finished game never uses; these toggles put them back into play.</p>
+  <table class="layout">
+    <thead><tr><th>Flag</th><th>Values</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>--unused-enemies</td><td>toggle</td><td>&ldquo;Comm&rdquo; (id 78) and the Evil Bat clones (176-178) join the encounter pool. Needs <code>--encounters random</code>.</td></tr>
+      <tr><td>--unused-items</td><td>toggle</td><td>Something Good (<code>0x6B</code>) and the unnamed accessory (<code>0xFD</code>, named &ldquo;Seru Bell&rdquo;) join the random-fill pool.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>The battle loader streams a monster's slot by id on demand with no per-scene preload list, so a formation byte alone makes a cut monster spawn. The unnamed accessory's name string is written into preserved rodata padding of <code>SCUS_942.54</code> and only <code>0xFD</code>'s name pointer is repointed; the region is chosen by its flanking rodata surviving file&rarr;RAM byte-for-byte, since the data segment's trailing zero-fill is scratch the game overwrites every frame. The accessory's documented effect (only Seru-class random encounters) is never exercised in retail, so treat it as experimental.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="texture-replacement">
+  <h3>Texture replacement</h3>
+  <p>Swap any texture on the disc - a town's ground, a monster's skin, the party's in-battle art, the save-slot portraits - for your own PNG, in the <a href="rom-patcher.html">browser</a> or with three CLI subcommands.</p>
+  <table class="layout">
+    <thead><tr><th>Subcommand</th><th>Args</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>tim-list</td><td></td><td>Both catalogs: <strong>raw</strong> (standalone entries, timpack members, the system-UI gap) and <strong>lzs</strong> (inside compressed sections).</td></tr>
+      <tr><td>tim-export</td><td>--entry N --offset K [--format image|composite|strip|indexed] [--clut K | --in-game] -o out.png</td><td>Decode one texture; a multi-palette one can also come with every palette, or as its palettes alone.</td></tr>
+      <tr><td>tim-palette-map</td><td>--entry N --offset K</td><td>Which palette the game draws each region through (the menu / battle UI sheet).</td></tr>
+      <tr><td>tim-replace</td><td>--entry N --offset K --png in.png [--quantize]</td><td>Same pixel size required; colours must fit the palette (or be quantized). Recognises every <code>tim-export</code> shape.</td></tr>
+      <tr><td>&nbsp;&nbsp;--tier battle --battle-slot</td><td>record / header0 / header1</td><td>The battle-equipment upload block, which is not a TIM.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p>The encoder copies the original's pixel mode, CLUT layout and VRAM placement fields (<a href="../formats/tim.html">TIM</a>); alpha maps to the semi-transparency bit. A raw-tier texture always applies; an lzs-tier one only when its section re-compresses into the original footprint - the battle-equipment art is the tightest, with as little as two spare bytes in one record. A monster sheet is shown through the palettes its model uses and its palettes are never rewritten. Browser change packs carry your images plus a fingerprint of each retail texture, never the game's pixels. See also <a href="../formats/npc-palette.html">NPC palettes</a> and <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/formats/save-icon.md" target="_blank" rel="noopener">save icons</a>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="multi-palette-textures">
+  <h3>Textures with several palettes</h3>
+  <p>A 4bpp texture stores color <em>numbers</em>, not colors, and many carry several 16-color palettes. The game picks the palette per sprite, so one texture is several colorings of the same pixels - the menu / battle UI sheet holds sixteen, and through any single one most of its badges, plates and labels show the wrong colors. Three downloads cover the edit loop, and the upload box (or <code>tim-replace</code>) recognises each one by its shape:</p>
+  <table class="layout">
+    <thead><tr><th>Download</th><th>What it is</th><th>What an edit changes</th></tr></thead>
+    <tbody>
+      <tr><td>The texture</td><td>Its own size, through the palette chosen in <em>Show colors through</em> (or each region's in-game palette).</td><td>Pixels, and a new color lands in a free slot of the palette that region is drawn with.</td></tr>
+      <tr><td>With every palette</td><td>That image, plus one row of color cells per palette below it.</td><td>Pixels and palette colors together; a recolored cell carries to every pixel using it.</td></tr>
+      <tr><td>Palettes only</td><td>One row of 16 cells per palette.</td><td>Colors only - no pixel moves.</td></tr>
+      <tr><td>Indexed PNG</td><td>The stored color numbers, one palette attached for display.</td><td>Color numbers only - no palette moves.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How the palette of a region is known</summary><div class="disclosure-body">
+    <p>The texture file does not say which palette a region is drawn with; the draw call does. For the UI sheet it is disc data: the executable's widget table lists every sprite's rectangle and the palette it is drawn through (<code>tim-palette-map</code> prints it). Three of its status badges use palettes stored in a small sibling texture, which stay read-only here, and one rectangle (the button glyphs) is covered at runtime by another texture - edit that one instead. For every other texture, every palette is an equally valid view. Only the palettes an edit actually changes are rewritten; every other palette stays byte-identical, and a no-change round trip writes nothing.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="custom-models">
+  <h3>Custom monster models</h3>
+  <p>Replace a monster's whole 3D model - mesh, texture page and baked vertex shading - with one authored in Blender, and it performs every retail move with zero animation work. CLI only.</p>
+  <table class="layout">
+    <thead><tr><th>Subcommand</th><th>Args</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>monster-model --export</td><td>--id N --export name</td><td>Writes <code>.obj</code> / <code>.mtl</code> / <code>.png</code>; one <code>o part_NN</code> per TMD object, baked colours as <code>v x y z r g b</code>.</td></tr>
+      <tr><td>monster-model --obj</td><td>--id N --obj m.obj --texture m.png [--allow-grow]</td><td>Part count must match retail; may not grow past the retail decoded size without the flag.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure"><summary>How it is patched</summary><div class="disclosure-body">
+    <p><strong>The part-count law:</strong> battle animations pose TMD objects rigidly by index with no skeleton (<a href="../formats/monster-animation.html">monster animation</a>), so a replacement with the retail object count inherits every move; the importer rejects any other count. Material names carry render state (<code>skin_pNN</code>, <code>skin_semi_abrN_pNN</code>, <code>flat</code>) so a round trip reproduces the palette partition; faces without a hint are re-palettized greedily into at most 15 sixteen-colour CLUTs. The block is re-packed into its <code>0x14000</code> slot and the patched image re-decoded before success is reported. Two worked examples ship in the repo. See <a href="../formats/tmd.html">TMD</a> and the <a href="../monsters.html">bestiary</a>.</p>
+  </div></details>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <p>The retail routines each family of edits is pinned against. Per-function dumps live in <code>ghidra/scripts/funcs/&lt;addr&gt;.txt</code>.</p>
+  <table class="layout">
+    <thead><tr><th>Function</th><th>Address</th><th>What it proves</th></tr></thead>
+    <tbody>
+      <tr><td>LZS decoder</td><td><code>FUN_8001A55C</code></td><td>The stream shape <code>legaia_lzs::compress</code> must produce.</td></tr>
+      <tr><td>PROT entry size</td><td><code>FUN_8003E68C</code></td><td>Entry span = gap to the next TOC entry; the re-pack budget.</td></tr>
+      <tr><td>Battle-end reward</td><td><code>FUN_8004E568</code>, join <code>0x8004F610</code></td><td>Where the normal drop is granted; the equipment-drop hook site; the integer <code>rand() % 100</code> roll.</td></tr>
+      <tr><td>Battle RNG</td><td><code>FUN_80056798</code></td><td>The roll every hook reuses.</td></tr>
+      <tr><td>Field-VM dispatcher</td><td><code>FUN_801DE840</code> cases <code>0x23</code>, <code>0x39</code>, <code>0x3F</code>, <code>0x49</code></td><td>House-door warp, <code>GIVE_ITEM</code>, scene change, shop payload - all inline operands.</td></tr>
+      <tr><td>Encounter roll</td><td><code>FUN_801D9E1C</code></td><td>Only <code>rate_increment &gt; 0</code> regions trigger; the boss-protection mask.</td></tr>
+      <tr><td>Kind-0 teleport arm</td><td><code>FUN_801D1EC4</code> &rarr; <code>FUN_801D5630</code></td><td>Map-door records and their half-tile landing formula.</td></tr>
+      <tr><td>Battle-action SM</td><td><code>FUN_801E295C</code></td><td>Escape teardown state (flee EXP hook), Spirit accrual, state-<code>0x19</code> approach poll.</td></tr>
+      <tr><td>Damage finisher / arms resolver</td><td><code>FUN_801DDB30</code> / <code>FUN_801EC3E4</code></td><td>The twice-inlined damage-AP fill; arts power tiers; the Seru catch roll.</td></tr>
+      <tr><td>Party arts queue-builder</td><td><code>FUN_801EED1C</code></td><td>AP override hook site.</td></tr>
+      <tr><td>Super-Art applier</td><td><code>FUN_801EF9E4</code>, arm <code>0x801EFBCC</code></td><td>Find/replace over the action queue; the performed-flag writer and the pack's retarget words.</td></tr>
+      <tr><td>Arts list renderer / pager</td><td><code>FUN_80034358</code> / <code>FUN_801D3748</code></td><td>Where the Super-Art rows are merged into the battle list.</td></tr>
+      <tr><td>Menu panel renderer</td><td><code>FUN_801D33D8</code></td><td>The pause-menu Moves page half.</td></tr>
+      <tr><td>New-game init</td><td><code>FUN_80034A6C</code>, seed <code>0x80034B04</code></td><td>The bag is built in code; the starting-item rewrite site.</td></tr>
+      <tr><td>Actor loader boost</td><td><code>FUN_80054CB0</code></td><td>The fixed ATK / DEF / INT boost applied on top of scaled records.</td></tr>
+      <tr><td>Static tables</td><td><code>DAT_80077828</code> steals, <code>DAT_800754C8</code> spells, <code>DAT_80074F68</code> equipment, <code>DAT_801E4518</code> casino, <code>0x801F4F5C</code> move power</td><td>Tier A targets, each verified against the curated gamedata tables.</td></tr>
+      <tr><td>Rodata gap</td><td><code>0x8007AB38</code> (1028 bytes)</td><td>Tier E host; flanking rodata survives file&rarr;RAM, proving it is not boot-cleared scratch.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="doc-section" id="modules">
+  <h2>Under the hood</h2>
+  <p>The crate's module map, how a patch is verified, and the no-Sony-bytes rules are on <a href="randomizer-internals.html">randomizer internals</a>: <a href="randomizer-internals.html#modules" id="tests">modules</a> &middot; <a href="randomizer-internals.html#tests">tests</a> &middot; <a href="randomizer-internals.html#hygiene" id="hygiene">hygiene</a>.</p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="rom-patcher.html">ROM patcher (in browser)</a>
+    <a href="randomizer-internals.html">Randomizer internals</a>
+    <a href="translation.html">Translation packs</a>
+    <a href="../writeups/disc-patching/index.html">Write-up: patching a sealed disc</a>
+    <a href="../formats/lzs.html">LZS compression</a>
+    <a href="../formats/disc.html">PSX disc geometry</a>
+    <a href="../formats/prot.html">PROT.DAT TOC</a>
+    <a href="../formats/man-relocation.html">MAN relocation</a>
+    <a href="../guides/modding-and-translation.html">Guide: modding + translation</a>
+  </div>
+</section>

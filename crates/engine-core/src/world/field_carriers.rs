@@ -1,0 +1,813 @@
+//! Field carrier install/engage/tick, field interaction probing, carrier menus, and carrier/world-map encounter entry.
+
+use super::*;
+use legaia_engine_field::man_field_scripts::FieldCarrierConfig;
+use legaia_engine_mode::mode::SceneMode;
+
+impl World {
+    /// First synthetic [`crate::world::FieldPropState::walk_touch`] slot for gate-0
+    /// tile-trigger binds ([`Self::install_trigger_walk_touch`]). Partition-1
+    /// placement indices (the natural walk-touch keys) stay well below this
+    /// in the retail corpus, so the two key spaces never collide.
+    pub const TRIGGER_WALK_TOUCH_SLOT_BASE: u8 = 0xC0;
+
+    /// Place the scene's field entity SMs (all Idle). One
+    /// [`legaia_engine_field::world_map_entity::WorldMapEntityCtx`] per [`FieldCarrierConfig`], so a
+    /// scripted-encounter carrier can be advanced via
+    /// [`Self::engage_field_carrier`] and ticked by
+    /// `Self::tick_field_carriers`. Replaces any previously installed set.
+    ///
+    /// This is the field-mode counterpart to
+    /// [`Self::install_world_map_entities_with_configs`]; retail builds the
+    /// same per-entity records from the scene's MAN actor-placement partition.
+    pub fn install_field_carriers(&mut self, configs: Vec<FieldCarrierConfig>) {
+        self.carriers.entities = (0..configs.len())
+            .map(|_| legaia_engine_field::world_map_entity::WorldMapEntityCtx::default())
+            .collect();
+        self.carriers.configs = configs;
+        self.carriers.pending_battle = None;
+        // The slot map is only meaningful for a MAN-derived install; a
+        // hand-built set has no placement slots. Clear it (and any armed engage)
+        // so a re-install never leaves a stale slot pointing at the old set.
+        self.carriers.slots.clear();
+        self.carriers.pending_engage = None;
+        self.carriers.menu = None;
+        // NPC motion + walk-touch state is placement-keyed too: never let a
+        // previous scene's in-flight legs / door events leak.
+        self.npcs.glide_speeds.clear();
+        self.npcs.default_moves.clear();
+        self.npcs.motions.clear();
+        self.npcs.face_legs.clear();
+        self.npcs.rotate_legs.clear();
+        self.npcs.glide_legs.clear();
+        self.npcs.landed_ticks.clear();
+        self.npcs.talk_player_landed = None;
+        self.props.walk_touch.clear();
+        self.props.boss_stagers.clear();
+        self.props.active_walk_touch = None;
+        self.props.arrival_exempt.clear();
+        self.dialog.stepping_inline_npc = None;
+        self.dialog.active_inline_slot = None;
+    }
+
+    /// Install the scene's field carriers **derived from its MAN actor-placement
+    /// partition** ([`legaia_engine_field::man_field_scripts::derive_field_carriers`]) rather
+    /// than from a hand-built list, replacing any previously installed set.
+    ///
+    /// Returns the carrier-Vec index of the Rim Elm sparring partner (the
+    /// [`FieldCarrierConfig::ScriptedEncounter`] carrier) when the scene MAN
+    /// contains it (town01), so the caller can [`Self::engage_field_carrier`] it
+    /// on the dialogue-accept; `None` for scenes without that placement.
+    ///
+    /// This is the faithful counterpart to the hand-built
+    /// [`Self::install_field_carriers`]: the carrier set, and the sparring
+    /// carrier's identity within it, come from the real scene data.
+    pub fn install_field_carriers_from_man(
+        &mut self,
+        man_file: &legaia_scene_formats::man_section::ManFile,
+        man: &[u8],
+    ) -> Option<usize> {
+        // The MAN loader `FUN_8003AEB0` zeroes the battle sound set on every
+        // scene entry (`sw zero,-0x4780(v0)` at `0x8003B4F8`), before the
+        // scene's scripts can select one with op-`0x35` sub-op `7`.
+        self.audio.battle_sound_set = 0;
+        // ... and clears the sound flags' script-owned start bit 0, so a
+        // start a cutscene left uncommitted does not outlive its scene.
+        self.audio.start_pending_commit = false;
+        // ... and the pause bit 1 with it.
+        self.audio.bgm_script_paused = false;
+        let derived = legaia_engine_field::man_field_scripts::derive_field_carriers(man_file, man);
+        let sparring_idx = derived
+            .iter()
+            .position(|d| matches!(d.config, FieldCarrierConfig::ScriptedEncounter { .. }));
+
+        // Map each scripted-encounter carrier's placement slot -> its carrier-Vec
+        // index, so a field-interact on that placement auto-arms the fight. The
+        // carrier index is the position in `derived` (install_field_carriers
+        // preserves order). Plain talk NPCs are intentionally excluded: talking
+        // to them must never launch a battle.
+        let carrier_slots: std::collections::HashMap<u8, usize> = derived
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| matches!(d.config, FieldCarrierConfig::ScriptedEncounter { .. }))
+            .filter_map(|(idx, d)| u8::try_from(d.placement_index).ok().map(|slot| (slot, idx)))
+            .collect();
+
+        self.install_field_carriers(derived.into_iter().map(|d| d.config).collect());
+        // install_field_carriers cleared the slot map; repopulate for this set.
+        self.carriers.slots = carrier_slots;
+
+        // The system flags this scene's own records SET on their way into a
+        // `3E FF <row>` scripted battle entry - the disc-side half of a
+        // direct entry into that row replaying the record's arm
+        // (`World::replay_scripted_battle_arm`). Keyed on the SET -> entry-op
+        // pairing rather than the census's `clean` bit: town01's `50 19` sits
+        // just past the record's dialogue bytes, where the linear walk is
+        // still resynchronising and the clean bit is structurally false.
+        self.scene_battle_entry_arms =
+            legaia_engine_field::man_field_scripts::walk_battle_entry_arms(man_file, man);
+        self.scene_battle_entry_scores =
+            legaia_engine_field::man_field_scripts::walk_battle_entry_scores(man_file, man);
+        if !self.scene_battle_entry_arms.is_empty() {
+            let arms: Vec<String> = self
+                .scene_battle_entry_arms
+                .iter()
+                .map(|a| {
+                    format!(
+                        "P{}[{}] flag 0x{:03X} -> row {}",
+                        a.partition, a.record, a.flag, a.row
+                    )
+                })
+                .collect();
+            log::info!(
+                "field: scripted battle-entry arm(s) in this scene's script: {}",
+                arms.join(", ")
+            );
+        }
+
+        // Capture each actor's inline interaction-script dialogue, keyed by its
+        // partition-1 record index (= the `slot` the talk probe addresses),
+        // so `trigger_field_interact` can open the interacted actor's real
+        // dialogue.
+        // This is the actor's own inline MES text (retail `actor[+0x90]`), the
+        // mechanism `0x3F` was wrongly standing in for.
+        self.npcs.dialog.clear();
+        self.npcs.dialog_prologue.clear();
+        self.npcs.talk_proxies.clear();
+        self.npcs.positions.clear();
+        self.npcs.glide_y.clear();
+        self.npcs.entry_positions.clear();
+        self.npcs.headings.clear();
+        self.npcs.heading_ramps = legaia_engine_motion_vm::ambient_motion::RampScheduler::new();
+        // Motion state is per-scene: a snapshot carried across a scene change
+        // would diff the warp itself as one enormous step and start every
+        // actor - the player included - walking on the landing frame.
+        self.locomotion.motion_prev.clear();
+        self.locomotion.actor_moving.clear();
+        for (placement, kind) in
+            legaia_engine_field::man_field_scripts::classify_placements(man_file, man)
+        {
+            let Ok(slot) = u8::try_from(placement.index) else {
+                continue;
+            };
+            // Party-member special-model placements (model >= 0xF0 - Noa,
+            // Gala, the savepoint) classify as script-only actors with no
+            // inline dialogue, so the NPC arm below never seeds a live
+            // position for them. Without an anchor the motion VM refuses a
+            // walk leg (`start_field_npc_motion` requires an installed slot)
+            // and a cutscene's walk-to-tile poke has nothing to glide - one
+            // half of "the party never appears in a cutscene". Seed the spawn
+            // anchor (usually the off-map hide box until a story beat seats
+            // them); a parked anchor draws nothing and collides with nothing,
+            // so free-roam behaviour is unchanged.
+            if placement.special_model {
+                self.npcs
+                    .positions
+                    .insert(slot, (placement.world_x, placement.world_z));
+            }
+            // A **minigame door** placement (`PlacementKind::Portal`, i.e. a
+            // genuine `0x3E` `op0 >= 100` record - the casino cabinets, the
+            // dance-hall desk, the fishing signboards). Retail dispatches an
+            // interaction on it through the same dialog SM as a talk NPC
+            // (`FUN_80039B7C` on the placement's own record), so it needs the
+            // same interaction record installed; what it must NOT get is a
+            // `field_npc_dialog` entry, because the simplified path would then
+            // type the record's refusal line as if it were an NPC's greeting.
+            // Without this the door had no interaction dispatch at all: the
+            // record was only ever reached by the walk-touch arm's decoded
+            // effect, never executed.
+            // REF: FUN_80039B7C, FUN_801d5b5c
+            if matches!(
+                kind,
+                legaia_engine_field::man_field_scripts::PlacementKind::Portal { .. }
+            ) && let Some(record) =
+                legaia_engine_field::man_field_scripts::placement_interaction_record(
+                    man_file, man, &placement,
+                )
+            {
+                self.npcs.dialog_prologue.insert(slot, record);
+            }
+            // A **save point** (and any other text-free record whose
+            // interaction is a scripted menu press): the same dialog SM runs
+            // its interaction section, which parks on `49 01` and opens the
+            // pause menu on the save screen. With no text it is invisible to
+            // the text-keyed arms here, so pressing the action button at one
+            // ran nothing.
+            // REF: FUN_80039B7C
+            if let Some(record) =
+                legaia_engine_field::man_field_scripts::placement_scripted_menu_record(
+                    man_file, man, &placement,
+                )
+            {
+                self.npcs.dialog_prologue.insert(slot, record);
+                self.npcs
+                    .positions
+                    .entry(slot)
+                    .or_insert((placement.world_x, placement.world_z));
+            }
+            // A **talk proxy**: an undrawn text-free placement whose
+            // interaction raises another actor's touched mark (`B1 <id> 08`),
+            // so the action button at it runs that actor's conversation
+            // (`concnow` P1[26] for the gate guard P1[13]).
+            // REF: FUN_801D5B5C, FUN_80039B7C
+            if let Some(target) =
+                legaia_engine_field::man_field_scripts::placement_talk_proxy_target(
+                    man_file, man, &placement,
+                )
+                && let Ok(target) = u8::try_from(target)
+            {
+                self.npcs
+                    .talk_proxies
+                    .insert(slot, (target, (placement.world_x, placement.world_z)));
+            }
+            if let legaia_engine_field::man_field_scripts::PlacementKind::Npc {
+                dialog_inline: Some(inline),
+                ..
+            } = kind
+            {
+                self.npcs.dialog.insert(slot, inline);
+                // Stash the untruncated record so the field-VM runner can
+                // execute the interaction prologue (segment selection),
+                // entered at the interaction cursor - one past the spawn
+                // section's `0x21`, where retail's dialog SM resumes
+                // `actor[+0x9E]` - never at `script_pc0`, which would re-run
+                // the spawn section on every talk. The simplified path keeps
+                // using `field_npc_dialog`.
+                if let Some(prologue) =
+                    legaia_engine_field::man_field_scripts::placement_interaction_record(
+                        man_file, man, &placement,
+                    )
+                {
+                    self.npcs.dialog_prologue.insert(slot, prologue);
+                }
+                // The interaction probe box-tests the player against this spawn
+                // position (= runtime actor frame; see `field_npc_positions`).
+                self.npcs
+                    .positions
+                    .insert(slot, (placement.world_x, placement.world_z));
+                // No autonomous route is installed from the placement's own
+                // `4C 51` ops: retail's `4C 51` is an instant seat, one per
+                // story-flag branch, and the entry pre-run already applied
+                // the branch the flags select. Looping those seats as a
+                // patrol walked town01's gate guard between his story
+                // stations; retail holds him still (every catalogued town01
+                // field state has him on his seat).
+                // Faithful per-leg glide speed from the placement's real
+                // walk-kernel operands: the bound tail-section-1
+                // wander/step ops (`FUN_80038158` `0x80 >> (2+bits)`)
+                // first, then the record's own field-VM yield ops
+                // (`FUN_8003774C` `numerator / (4 << bits)`), then the
+                // facing-nibble heuristic as a last resort; absent = the
+                // leg falls back to `FIELD_NPC_MOTION_SPEED`. Scripted legs
+                // (cutscene walk pokes) look the pace up.
+                if let Some(speed) = legaia_engine_field::man_field_scripts::placement_glide_speed(
+                    man_file, man, &placement,
+                ) {
+                    self.npcs.glide_speeds.insert(slot, speed);
+                }
+            }
+            // Walk-touch events ride any non-parked placement (door warps are
+            // Portal-classified, throw-back teleports are usually on guard
+            // NPCs) - the locomotion's touch dispatch posts them on contact.
+            if let Some(event) = legaia_engine_field::man_field_scripts::placement_walk_touch_event(
+                man_file, man, &placement,
+            ) {
+                self.props
+                    .walk_touch
+                    .insert(slot, ((placement.world_x, placement.world_z), event));
+            }
+        }
+
+        // Per-NPC default-move pairs: the motion op-`0x17` writes into the
+        // retail per-actor table at `0x801C6470`, statically harvested from
+        // the MAN's tail-section-1 streams. Feeds the interaction
+        // motion-pause kick (`legaia_engine_field::motion_pause`) a real table.
+        // REF: FUN_80038158 (case 0x17), FUN_8003C9AC
+        for (slot, pair) in
+            legaia_engine_field::man_field_scripts::motion_default_move_writes(man_file, man)
+        {
+            self.npcs.default_moves.insert(slot, pair);
+        }
+
+        // Seed the per-actor field-VM channels from the same placement partition
+        // (retail spawns one script context per placement at scene load, cutscene
+        // or not - the free-roam half of `FUN_8003AEB0`). Each channel's own init
+        // spawn section then runs in the load-frame pre-run
+        // (`pre_run_field_channel_prologues`). A cutscene scene re-seeds
+        // this set through `install_cutscene_timeline_record` afterwards.
+        self.seed_field_channels(man_file, man);
+
+        // Ambient facing channels: each placement's bound tail-section-1
+        // motion stream (`FUN_80038158` ops 0x04 / 0x0D). Seeded last so the
+        // VMs start from whatever heading the spawn prologue / channel init
+        // above left in `field_npc_headings`.
+        self.seed_field_npc_ambient(man_file, man);
+
+        sparring_idx
+    }
+
+    /// Install walk-touch entries for the scene's **`.MAP` object binds**
+    /// (house doors): each bind sits at the object's contact-box centre
+    /// (`FUN_801CFC40`) and fires the MAN record the object's key tile
+    /// resolves (`FUN_8003A55C`) on player contact, through the same
+    /// [`Self::check_field_walk_touch`] dispatch as placement contacts.
+    ///
+    /// Keyed from [`Self::TRIGGER_WALK_TOUCH_SLOT_BASE`] so the synthetic
+    /// slots never collide with partition-1 placement indices. Call after
+    /// [`Self::install_field_carriers_from_man`] (whose inner install clears
+    /// `field_walk_touch`); idempotent per scene - re-installing replaces the
+    /// previous bind set.
+    // REF: FUN_8003A55C, FUN_801CFC40, FUN_801d5b5c
+    pub fn install_trigger_walk_touch(
+        &mut self,
+        binds: &[(
+            (i16, i16),
+            legaia_engine_field::man_field_scripts::WalkTouchEvent,
+        )],
+    ) {
+        self.install_trigger_walk_touch_with_records(
+            &binds.iter().map(|&(p, e)| (p, e, None)).collect::<Vec<_>>(),
+        );
+    }
+
+    /// [`Self::install_trigger_walk_touch`] plus each bind's **flat MAN record
+    /// index**, so the touch dispatch can re-resolve the record's story-flag
+    /// branch at contact time (see [`crate::world::FieldPropState::walk_touch_records`]).
+    pub fn install_trigger_walk_touch_with_records(
+        &mut self,
+        binds: &[(
+            (i16, i16),
+            legaia_engine_field::man_field_scripts::WalkTouchEvent,
+            Option<usize>,
+        )],
+    ) {
+        self.props
+            .walk_touch
+            .retain(|slot, _| *slot < Self::TRIGGER_WALK_TOUCH_SLOT_BASE);
+        self.props
+            .walk_touch_records
+            .retain(|slot, _| *slot < Self::TRIGGER_WALK_TOUCH_SLOT_BASE);
+        for (i, (pos, event, record)) in binds.iter().enumerate() {
+            let Some(slot) = Self::TRIGGER_WALK_TOUCH_SLOT_BASE.checked_add(i as u8) else {
+                break;
+            };
+            self.props.walk_touch.insert(slot, (*pos, *event));
+            if let Some(record) = record {
+                self.props.walk_touch_records.insert(slot, *record);
+            }
+        }
+    }
+
+    /// Trigger a field interaction on placement `slot` (the interaction-probe
+    /// dispatch - retail's entity SM resuming the touched actor's script, not
+    /// a field-VM opcode). Opens the actor's inline dialogue if it has any,
+    /// arms / engages a scripted-encounter carrier on that slot (the
+    /// dialogue-accept auto-arm), and surfaces a [`FieldEvent::FieldInteract`].
+    /// Called by `Self::tick_field_interaction_probe` and the walk-touch path.
+    /// Op `0x3E` with `op0 < 100` is **not** an interaction: it is the
+    /// scripted-battle install ([`Self::trigger_scripted_battle`]).
+    pub fn trigger_field_interact(&mut self, interact_id: u8, slot: u8) {
+        self.dialog.last_field_interact = Some((interact_id, slot));
+        // The touch post's tail call (`FUN_801D5B5C` -> `jal 0x8003C9AC` at
+        // `0x801D5BF0`): every moving-class walker is asked for its standing
+        // move as the interaction engages, whatever the interaction is.
+        // REF: FUN_8003C9AC
+        self.kick_field_npc_motion_pause();
+        // Turn the addressed NPC to face the player, saving the heading it
+        // stood with (retail's touch post + dialog SM; see
+        // [`Self::face_field_npc_at_player`]). Ahead of the dialogue open so
+        // the very first drawn frame of the box already shows the NPC turned,
+        // and ahead of the boss-stager arm: that record is the same dialog-SM
+        // context resumed by the same touch, so it takes the same state-1
+        // snap (`town0c` `P1[21]`, Nene's "Bees!" beat, turns to the player
+        // before the Queen Bee ambush).
+        self.face_field_npc_at_player(slot);
+        // A boss-stager placement (rikuroa's Caruban stager P1[3]): the
+        // approach / interact runs the placement's own partition-1 record
+        // through the field VM - the engine mirror of retail's touch
+        // dispatch resuming the parked stager script. The record's own bytes
+        // stage the fight (`52 89` marker SET -> `3E FF <row>` battle entry),
+        // so no dialog panel opens here.
+        if self.props.boss_stagers.contains_key(&slot) && self.run_boss_stager_record(slot) {
+            self.pending_field_events.push(
+                legaia_engine_field::field_events::FieldEvent::FieldInteract { interact_id, slot },
+            );
+            return;
+        }
+        // Stash this slot's untruncated record (if any) so the opt-in VM-dialogue
+        // runner can execute its interaction prologue. Always reassigned (to
+        // `None` when absent) so a prior interaction's prologue can't leak.
+        self.dialog.active_inline_prologue = self.npcs.dialog_prologue.get(&slot).cloned();
+        // Remember which NPC this interaction belongs to: the inline runner
+        // routes the prologue's `0x4C 0x51` NPC-run ops to this slot.
+        self.dialog.active_inline_slot = Some(slot);
+        let inline = self.npcs.dialog.get(&slot).cloned();
+        let opened_dialog = if let Some(ref text) = inline {
+            self.open_field_dialog(text.clone());
+            true
+        } else {
+            false
+        };
+        // A scripted-encounter carrier on this slot (the sparring partner):
+        // - no inline text -> engages immediately on interaction;
+        // - dialogue with the 4-option spar picker -> a `CarrierMenu` gates the
+        //   engage on the fight option (faithful);
+        // - dialogue without a picker -> the any-accept `pending_carrier_engage`.
+        if let Some(&carrier_idx) = self.carriers.slots.get(&slot) {
+            if !opened_dialog {
+                self.engage_field_carrier(carrier_idx);
+            } else if let Some((n, fight_option)) = inline.as_deref().and_then(spar_menu_of) {
+                self.carriers.menu = Some(CarrierMenu {
+                    carrier_idx,
+                    n,
+                    fight_option,
+                    cursor: 0,
+                });
+            } else {
+                self.carriers.pending_engage = Some(carrier_idx);
+            }
+        }
+        self.pending_field_events.push(
+            legaia_engine_field::field_events::FieldEvent::FieldInteract { interact_id, slot },
+        );
+    }
+
+    /// Open a field dialogue box from an inline interaction-script buffer (the
+    /// text is the buffer itself; the retail box geometry isn't pinned, so the
+    /// box coords are zero). Sets [`legaia_engine_field::dialog_state::DialogState::current`] and surfaces a
+    /// [`FieldEvent::OpenDialog`].
+    fn open_field_dialog(&mut self, inline: Vec<u8>) {
+        self.dialog.current = Some(DialogRequest {
+            text_id: 0,
+            inline: inline.clone(),
+            world_x: 0,
+            world_z: 0,
+            depth_id: 0,
+        });
+        self.pending_field_events
+            .push(legaia_engine_field::field_events::FieldEvent::OpenDialog {
+                text_id: 0,
+                inline,
+                world_x: 0,
+                world_z: 0,
+                depth_id: 0,
+            });
+    }
+
+    /// While a carrier's spar [`CarrierMenu`] is up, handle Up/Down navigation
+    /// and the confirm. Returns `true` when a menu is active (so the generic
+    /// dialog-dismiss must skip - the menu owns the input). On **confirm**:
+    /// engages the carrier iff the cursor is on the fight option, else just
+    /// closes the box (the other options' talk branches, which the engine does
+    /// not run); **Circle** cancels (closes, no engage); Up/Down move the cursor
+    /// without closing. Mirrors the retail inline-picker cursor.
+    pub(crate) fn handle_carrier_menu(&mut self) -> bool {
+        use legaia_engine_system::input::PadButton;
+        if self.dialog.current.is_none() {
+            // Box closed elsewhere; drop a stale menu.
+            self.carriers.menu = None;
+            return false;
+        }
+        let Some(menu) = self.carriers.menu else {
+            return false;
+        };
+        if self.dialog.input_consumed {
+            return true; // already handled this tick
+        }
+        let confirm = self.input.just_pressed(PadButton::Cross);
+        let cancel = self.input.just_pressed(PadButton::Circle);
+        if confirm || cancel {
+            self.dialog.input_consumed = true;
+            self.carriers.menu = None;
+            self.dialog.current = None;
+            self.pending_field_events
+                .push(legaia_engine_field::field_events::FieldEvent::DialogDismissed);
+            if confirm && menu.cursor == menu.fight_option {
+                self.engage_field_carrier(menu.carrier_idx);
+            }
+            return true;
+        }
+        let up = self.input.just_pressed(PadButton::Up);
+        let down = self.input.just_pressed(PadButton::Down);
+        if up || down {
+            let mut m = menu;
+            if up {
+                m.cursor = m.cursor.saturating_sub(1);
+            }
+            if down && m.cursor + 1 < m.n {
+                m.cursor += 1;
+            }
+            self.carriers.menu = Some(m);
+            self.dialog.input_consumed = true;
+        }
+        true
+    }
+
+    /// Port-side interaction input tick: the action-button handling that
+    /// opens / dismisses a field NPC's dialogue around the retail probe.
+    /// The probe itself is `FUN_801cf9f4` - a pure geometry leaf (no pad
+    /// read, no `jal`) that box-tests the actor list against a probe point
+    /// at `0x1F800020`, links both nodes' `+0x98`, and returns bit 1 for a
+    /// `0x40020000`-class hit, bit 4 for any other hit and bit 2 for a
+    /// walk-grid wall - ported as [`Self::field_interact_probe_slot`]. Its
+    /// bit-2 grid-wall result is not modelled there.
+    ///
+    /// Mirrors [`Self::tick_world_map_npc_dialog`] for field mode: a single
+    /// handler for both opening and dismissing a field dialogue on player input,
+    /// so a probe-opened box (talking to an NPC by walking up to it, with no
+    /// script `0x4C` poll) still dismisses.
+    ///
+    /// - **Box up:** a just-pressed Cross / Circle dismisses it (and engages a
+    ///   pending scripted-encounter carrier - the dialogue-accept).
+    /// - **No box:** a just-pressed Cross runs the retail facing probe
+    ///   ([`Self::field_interact_probe_slot`]: the `DAT_801f2254` compass
+    ///   point 64 units ahead, ±72 box); a hit opens that NPC's dialogue via
+    ///   [`Self::trigger_field_interact`] and turns the player toward it
+    ///   ([`Self::face_field_npc`]).
+    ///
+    /// The [`legaia_engine_field::dialog_state::DialogState::input_consumed`] per-tick guard keeps this and the
+    /// field VM's `0x4C` dialog poll from both acting on the same button edge.
+    /// No-op without a player actor or installed NPC positions.
+    ///
+    /// REF: FUN_801cf9f4, FUN_8003A1E4, FUN_80024C88
+    pub(crate) fn tick_field_interaction_probe(&mut self) {
+        use legaia_engine_system::input::PadButton;
+        let confirm = self.input.just_pressed(PadButton::Cross);
+        let cancel = self.input.just_pressed(PadButton::Circle);
+
+        // A prop record run (door swing / cupboard search) owns the frame's
+        // input: its own stepper routes the confirm edges
+        // ([`Self::step_prop_interaction`]).
+        if self
+            .dialog
+            .inline
+            .as_ref()
+            .is_some_and(|id| id.prop_anchor.is_some())
+        {
+            return;
+        }
+
+        // Nothing opens between a battle's commit and the battle: retail's
+        // probe `FUN_801CF9F4` runs from the field frame pump, which the
+        // intro overlay pages out (see `World::step_field_locomotion`). A
+        // talk opened in the transition's last frames was dropped by battle
+        // entry half-run.
+        if !self.dialogue_owns_input() && self.field_scripts_held_for_battle() {
+            return;
+        }
+
+        // A dialogue engagement owns the frame: **either** channel. Testing
+        // only `current_dialog` here let the ordinary NPC talk - which the
+        // inline field-VM runner drives, often with no `current_dialog` at all
+        // - fall through to the "open an interaction" arm below on every
+        // page-advance press, re-arming `active_inline_prologue` each time.
+        // The runner then restarted that prologue the frame after it finished,
+        // with no button press: the conversation looped and could not be left.
+        // Retail cannot reach this shape - the engaged bit `+0x10 & 0x80000`
+        // that the touch post raises suppresses the whole probe until the
+        // dialog SM's teardown clears it.
+        if self.dialogue_owns_input() {
+            // A carrier's spar menu owns the input while it is up (navigate +
+            // confirm the fight option); only then does the generic dismiss run.
+            if self.handle_carrier_menu() {
+                return;
+            }
+            // The inline-script runner, when active, owns box dismissal.
+            if self.dialog.inline.is_none() && (confirm || cancel) && !self.dialog.input_consumed {
+                self.dialog.input_consumed = true;
+                self.dialog.current = None;
+                self.pending_field_events
+                    .push(legaia_engine_field::field_events::FieldEvent::DialogDismissed);
+                if let Some(idx) = self.carriers.pending_engage.take() {
+                    self.engage_field_carrier(idx);
+                }
+            }
+            return;
+        }
+
+        if self.dialog.input_consumed || !confirm {
+            return;
+        }
+        // A script context that engages the player refuses the talk as well
+        // as the walk. The probe lives inside the pad controller
+        // `FUN_801D01B0` (`jal 0x801CF9F4` at `0x801D0854`), and the field
+        // tick skips that whole controller while the player's `+0x10 &
+        // 0x80000` is up (`lw v0,0x10(s2)` / `and` / `bne` at
+        // `0x801D1694..0x801D16A0`, around the `jal 0x801D01B0` at
+        // `0x801D16F4`) - the same bit the script runner raises for every
+        // context it steps. Locomotion already honours it
+        // ([`Self::script_context_engages_player`]); without it here a Cross
+        // press under a spawned beat re-opened the talk that spawned it
+        // (`station`'s ticket seller, over its own P2[19] departure).
+        //
+        // REF: FUN_801D1344 (`0x801D1694`), FUN_801D01B0 (`0x801D0854`)
+        if self.script_context_engages_player() {
+            return;
+        }
+        // Retail geometry: a single facing-indexed compass probe 64 units
+        // ahead, box-tested at ±72 against each NPC
+        // ([`Self::field_interact_probe_slot`]). A hit posts the touch event
+        // on the matched actor and turns the player toward it - the
+        // face-the-NPC step retail applies to moving-class partners
+        // (`flags & 0x20010 == 0x20000`), which every talk NPC is
+        // (capture-pinned by `rimelm_npc_press_tetsu`).
+        if !self.npcs.positions.is_empty()
+            && let Some(npc_slot) = self.field_interact_probe_slot()
+        {
+            self.dialog.input_consumed = true;
+            self.trigger_field_interact(0, npc_slot);
+            self.face_field_npc(npc_slot);
+            return;
+        }
+        // The same button probe fires the **interact-gated props** (retail's
+        // `FUN_801CF9F4` walks one actor list; the `+0x10 & 0x40020000` class
+        // - Rim Elm's cupboards, `31 1E` in the spawn prologue - is only ever
+        // posted from here, never from body contact). The prop's bind record
+        // then runs through the field VM: swing open, grant + message, swing
+        // shut on dismiss.
+        if let Some(anchor) = self.field_interact_prop_anchor()
+            && self.start_prop_interaction(anchor)
+        {
+            self.dialog.input_consumed = true;
+        }
+    }
+
+    /// Host signal that the player engaged field carrier `idx` (accepted the
+    /// Tetsu "Come at me!" dialogue / pressed confirm on the NPC). Advances the
+    /// carrier's `FUN_801DA51C` SM from Idle to **Activating** and drains its
+    /// countdown to zero, so the next `Self::tick_field_carriers` runs the
+    /// state-1 body in full: `on_activating` (formation copy) immediately
+    /// followed by the `case 2/3` fall-through scene-transition (battle
+    /// handoff). No-op for an out-of-range index or a non-Idle carrier.
+    ///
+    /// Mirrors retail's scripted state-0 -> state-1 advance (towns are 0%
+    /// random, so the Tetsu carrier never self-advances via the encounter
+    /// roll; the dialogue script drives it).
+    ///
+    /// REF: FUN_801DA51C
+    pub fn engage_field_carrier(&mut self, idx: usize) {
+        if let Some(ctx) = self.carriers.entities.get_mut(idx)
+            && ctx.state == legaia_engine_field::world_map_entity::EntityState::Idle as u16
+        {
+            ctx.state = legaia_engine_field::world_map_entity::EntityState::Activating as u16;
+        }
+    }
+
+    /// Step every installed field carrier SM one frame (the field-mode use of
+    /// the ported `FUN_801DA51C`), then resolve a latched scripted-encounter
+    /// transition into a battle. No-op when no carriers are installed.
+    ///
+    /// The entity list is taken out of the world so the SM's host bridge can
+    /// borrow `&mut World` (same pattern as [`Self::tick_world_map`]).
+    ///
+    /// REF: FUN_801DA51C
+    pub(crate) fn tick_field_carriers(&mut self) {
+        if !self.carriers.entities.is_empty() {
+            let mut carriers = std::mem::take(&mut self.carriers.entities);
+            for (idx, ctx) in carriers.iter_mut().enumerate() {
+                let mut host = FieldCarrierHostImpl { world: self };
+                legaia_engine_field::world_map_entity::step(idx, ctx, &mut host);
+            }
+            self.carriers.entities = carriers;
+        }
+
+        // The latched battle entry is shared with the field-VM op-`3E FF`
+        // scripted-battle arm ([`Self::trigger_scripted_battle`]), which can
+        // fire in a scene with no installed carriers - drain it regardless.
+        if let Some(formation_id) = self.carriers.pending_battle.take() {
+            self.begin_field_carrier_battle(formation_id);
+        }
+    }
+
+    /// Arm the field-to-battle transition for a field carrier's latched
+    /// `formation_id`. A carrier battle is a forced encounter against a
+    /// registered MAN formation, and retail runs the intro overlay (the
+    /// screen-shatter transition) for it exactly as for a step roll - so it
+    /// enters through the same [`legaia_engine_battle::encounter::EncounterPhase::Transition`]
+    /// bracket instead of flipping `Field -> Battle` on the spot. The
+    /// per-frame field tick drains `Triggered` into
+    /// [`Self::begin_encounter_battle`] once the transition elapses.
+    fn begin_field_carrier_battle(&mut self, formation_id: u16) {
+        let roll = legaia_engine_battle::encounter::EncounterRoll {
+            formation_id,
+            row_index: 0,
+            roll_q8: 0,
+        };
+        // Towns roll nothing of their own and may have no session installed:
+        // a bare bracket carries the transition + grace state machine only.
+        if self.encounters.session.is_none() {
+            self.install_encounter_bracket();
+        }
+        // A post-battle grace window suppresses step rolls, never a story
+        // fight - reset it and arm.
+        if let Some(s) = self.encounters.session.as_mut()
+            && matches!(
+                s.phase(),
+                legaia_engine_battle::encounter::EncounterPhase::Grace { .. }
+            )
+        {
+            s.reset();
+        }
+        let armed = self
+            .encounters
+            .session
+            .as_mut()
+            .is_some_and(|s| s.trigger_with(roll));
+        if !armed {
+            // Non-Idle session (a roll already mid-transition): enter
+            // directly rather than drop a scripted fight.
+            self.begin_encounter_battle(roll);
+        }
+    }
+
+    /// Arm the field-to-battle transition for a world-map encounter against
+    /// `formation_id`. Retail runs the same intro overlay (the screen-shatter
+    /// transition) for an overworld contact as for a field step roll, so the
+    /// entry defers through [`legaia_engine_battle::encounter::EncounterPhase::Transition`];
+    /// the world-map tick drains `Triggered` into
+    /// [`Self::enter_world_map_battle`] when it elapses.
+    ///
+    /// An unregistered id drops the encounter, and says so: the world-map roll
+    /// that produced it is destructive, so a silent return spends a fight
+    /// nothing ever sees - the same shape of defect that made nine consecutive
+    /// field rolls vanish.
+    pub(crate) fn begin_world_map_encounter(&mut self, formation_id: u16) {
+        if self
+            .tables
+            .formation_table
+            .formation(formation_id)
+            .is_none()
+        {
+            log::error!(
+                "world-map encounter: formation {formation_id} is not registered \
+                 ({} rows in the table) - the roll is dropped",
+                self.tables.formation_table.len()
+            );
+            return;
+        }
+        let roll = legaia_engine_battle::encounter::EncounterRoll {
+            formation_id,
+            row_index: 0,
+            roll_q8: 0,
+        };
+        // The overworld may have no step-roll session installed: a bare
+        // bracket carries the transition + grace state machine only.
+        if self.encounters.session.is_none() {
+            self.install_encounter_bracket();
+        }
+        // A post-battle grace window suppresses step rolls, not a contact
+        // the entity SM already committed to - reset it and arm.
+        if let Some(s) = self.encounters.session.as_mut()
+            && matches!(
+                s.phase(),
+                legaia_engine_battle::encounter::EncounterPhase::Grace { .. }
+            )
+        {
+            s.reset();
+        }
+        let armed = self
+            .encounters
+            .session
+            .as_mut()
+            .is_some_and(|s| s.trigger_with(roll));
+        if !armed {
+            // A transition is already pending: the earlier fight wins.
+            log::warn!(
+                "world-map encounter: formation {formation_id} arrived while a transition \
+                 is already pending - dropped"
+            );
+        }
+    }
+
+    /// Resolve a drained world-map [`legaia_engine_battle::encounter::EncounterRoll`] and
+    /// flip into the battle, snapshotting the world-map context so
+    /// [`Self::finish_battle`] returns to [`SceneMode::WorldMap`].
+    pub(crate) fn enter_world_map_battle(
+        &mut self,
+        roll: legaia_engine_battle::encounter::EncounterRoll,
+    ) {
+        let Some(formation) = self
+            .tables
+            .formation_table
+            .formation(roll.formation_id)
+            .cloned()
+        else {
+            log::error!(
+                "world-map encounter: drained formation {} vanished from the table - the \
+                 battle is dropped",
+                roll.formation_id
+            );
+            self.end_encounter_battle();
+            return;
+        };
+        self.field_return = Some(FieldReturnState {
+            actors: self.actors.clone(),
+            player_actor_slot: self.player_actor_slot,
+            party_count: self.party.party_count,
+        });
+        self.battle.return_mode = SceneMode::WorldMap;
+        // `enter_battle_from_formation` swaps to the battle BGM itself.
+        self.enter_battle_from_formation(&formation);
+        self.battle.active_formation = Some(formation);
+    }
+}

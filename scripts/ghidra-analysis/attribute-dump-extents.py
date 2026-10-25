@@ -1,0 +1,996 @@
+#!/usr/bin/env python3
+"""Attribute VA-ambiguous dump extents to the extracted image that holds them.
+
+`scripts/ci/disc-coverage.py` measures each image's code coverage by asking
+which dump extents fall inside that image's mapped span. Several overlays load
+at one base, so an extent can fall inside more than one span and be counted by
+each - which the coverage report reports as `VA-ambiguous` and, past a
+threshold, as `not meaningful`. Address arithmetic cannot separate those cases:
+the two spans are nested and every extent in the overlap belongs to both.
+
+The bytes can. This sweep canonicalises each dump's opening instruction window
+and asks, of every extracted image's OWN CONTENT at that VA, which one
+reproduces it. Output is a CSV of `entry,bytes,image,class,reason` - addresses,
+image labels and one-line mechanical reasons, no dump text, so it is safe to
+commit next to `worklist-classification.csv`.
+
+The instrument that consumes it must not be edited by this sweep: the CSV is the
+interface. `docs/tooling/dump-corpus-integrity.md` documents the classes and the
+residue that stays unattributable.
+
+Usage:
+  scripts/ghidra-analysis/attribute-dump-extents.py
+  scripts/ghidra-analysis/attribute-dump-extents.py --out /tmp/attr.csv
+  scripts/ghidra-analysis/attribute-dump-extents.py --explain 801d84c0
+  scripts/ghidra-analysis/attribute-dump-extents.py --all-extents
+"""
+
+import argparse
+import collections
+import csv
+import glob
+import importlib.util
+import os
+import re
+import sys
+
+try:
+    import tomllib
+except ImportError:  # py<3.11
+    import tomli as tomllib
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(os.path.dirname(HERE))
+DEFAULT_FUNCS = os.path.join(REPO, "ghidra", "scripts", "funcs")
+DEFAULT_EXTRACTED = os.path.join(REPO, "extracted")
+OVERLAY_MAP = os.path.join(REPO, "crates", "asset", "data", "static-overlays.toml")
+DEFAULT_OUT = os.path.join(HERE, "dump-extent-attribution.csv")
+
+# One header parser for the whole corpus, shared with `scripts/ci/disc-coverage.py`.
+sys.path.insert(0, HERE)
+import dump_header  # noqa: E402
+import inherited_tail  # noqa: E402
+import slot_b_band  # noqa: E402
+
+SCUS_BASE = 0x80010000
+SCUS_HEADER = 0x800
+
+# Signature length, and the floor below which a window carries too little signal
+# to name an image. Both match `classify-worklist.py`'s static arbiter, so the
+# two artifacts agree about what "these bytes are that image's" means.
+WINDOW = 24
+MIN_SIGNABLE = 8
+
+# Floor for the AT-VA test only (see `attribute_dump`), and it is set from its
+# own control (`--validate-short-floor`) rather than from judgement. Truncating
+# every extent the full window resolves and re-running the at-VA test gives, over
+# ~3000 trials: no wrong answer at ANY length down to one instruction, and a
+# precision that falls off only through the honest direction - the short window
+# names several images instead of one, which returns `identical` and credits all
+# of them. Agreement is 99.9% at three instructions and 98.9% at one. Three is
+# where the curve flattens, so it buys the reach without the extra imprecision.
+# The floor bounds the imprecise outcome only: below it a window with exactly
+# ONE holder is still named (`unique`), because the control's failure mode -
+# several holders - cannot occur there.
+SHORT_VA_FLOOR = 3
+
+# A PROT entry's head, long enough that finding it inside another entry is the
+# over-read and not a coincidence. Same probe `classify-worklist.py` uses.
+OVER_READ_PROBE = 256
+
+INSN_RE = re.compile(r"^([0-9a-fA-F]{8})\s+(\S+)\s*(.*)$")
+
+MEM_MNEMONICS = {
+    "lb", "lbu", "lh", "lhu", "lw", "lwl", "lwr",
+    "sb", "sh", "sw", "swl", "swr",
+}
+ZERO_ABS_RE = re.compile(r",\s*-?(?:0x)?[0-9a-fA-F]+\(\$?zero\)")
+
+
+def _cdbi():
+    """The shared canonicaliser from `check-dump-base-integrity.py`."""
+    path = os.path.join(HERE, "check-dump-base-integrity.py")
+    spec = importlib.util.spec_from_file_location("_cdbi", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+CDBI = None  # set in main(), after arg parsing, so --help needs no capstone
+
+
+# --- images ----------------------------------------------------------------
+
+class Image:
+    """One extracted image, cut down to the bytes its PROT entry owns.
+
+    An extraction taken through the superseded entry-size expression is the
+    entry's over-read footprint and runs into its neighbours' sectors, so the
+    raw file answers for VAs its overlay never loads - with a neighbour's code.
+    Three cuts are available and they are not equally good:
+
+    * `content_bytes` from `static-overlays.toml`: the entry's own sector
+      extent, `(toc[p+3] - toc[p+2]) * 2048` (docs/formats/prot.md), which is
+      exactly the slice the runtime loader streams. Every row carries one, and
+      it is the cut used.
+    * the offset at which another image's head appears, sector-aligned. That is
+      the neighbour's start, so it bounds an over-read. Kept as the fallback for
+      a row with no cited length.
+    * the whole file.
+
+    `clean_copy_bytes` is deliberately NOT one of them. It answers a different
+    question - how much of a row a RAM capture has byte-verified - and on PROT
+    0899 it is 0x_f174 bytes shorter than the image, which would make this sweep
+    answer "menu does not hold these bytes" for 178 extents that are in menu's
+    own content. `own_source` records which cut a row used, because a `trim` cut
+    is an inference and a `content_bytes` cut is a citation.
+    """
+
+    def __init__(self, label, prot, base, data, own_end, own_source):
+        self.label = label
+        self.prot = prot
+        self.base = base
+        self.data = data
+        self.own_end = own_end
+        self.own_source = own_source
+
+    @property
+    def name(self):
+        return "%s(%d)" % (self.label, self.prot) if self.prot else self.label
+
+    def offset_of(self, va):
+        """File offset for a VA, or None when the VA is outside own content."""
+        off = va - self.base
+        if off < 0 or off >= self.own_end:
+            return None
+        return off
+
+    def window_at(self, va, n):
+        off = self.offset_of(va)
+        if off is None or off + 4 * n > self.own_end:
+            return None
+        toks = CDBI.canon_bytes(self.data[off:off + 4 * n], n)
+        return norm_tokens(toks) if len(toks) >= n else None
+
+
+def load_images(extracted):
+    rows = []
+    if os.path.exists(OVERLAY_MAP):
+        with open(OVERLAY_MAP, "rb") as fh:
+            rows = tomllib.load(fh).get("overlays", [])
+
+    raw = []
+    for row in rows:
+        label, base = row.get("label"), row.get("base_va")
+        if not label or not base:
+            continue
+        cands = sorted(glob.glob(
+            os.path.join(extracted, "overlays", "overlay_%s_*.bin" % label)))
+        if not cands:
+            continue
+        with open(cands[0], "rb") as fh:
+            raw.append((row, fh.read()))
+
+    heads = [(r.get("label"), d[:OVER_READ_PROBE])
+             for r, d in raw if len(d) >= OVER_READ_PROBE]
+
+    images = []
+    for row, data in raw:
+        label = row["label"]
+        cut = len(data)
+        for other, head in heads:
+            if other == label:
+                continue
+            at = data.find(head)
+            if 0 < at < cut and at % 0x800 == 0:
+                cut = at
+        content = row.get("content_bytes")
+        if content and content <= len(data):
+            own, src = content, "content_bytes"
+        elif cut < len(data):
+            own, src = cut, "trim"
+        else:
+            own, src = len(data), "whole_file"
+        images.append(Image(label, row.get("prot_index"), row["base_va"],
+                            data, own, src))
+
+    # Cut the inherited tail. The packer wrote each overlay into a buffer it did
+    # not clear, so a module shorter than the buffer flushes its own bytes and
+    # then the previous, longer module's residue - inside `content_bytes`, at
+    # the same file offsets that module occupies. Those bytes are not this
+    # image's own content, and leaving them in makes a dump that lies wholly
+    # inside one read `identical` (two images hold them) when exactly one owns
+    # them. See `inherited_tail.py` for the rule and its asymmetry.
+    tail_inputs = [(im.prot, im.base, im.data[:im.own_end]) for im in images
+                   if im.prot is not None]
+    labels_by_index = {im.prot: im.label for im in images if im.prot is not None}
+    # Equal-EXTENT siblings are donor candidates too - `content_bytes` is the
+    # PROT entry's sector extent, not the module's content - but only where the
+    # bytes say which of the two owns the shared suffix. That is what
+    # `own_ends` carries: each image's structural own-content end.
+    # Iterated, not taken once: `content_end` is measured over the image and
+    # the cut is what makes that measurement right, so the first estimate
+    # overshoots wherever a record chain walks into the residue. See
+    # `inherited_tail.tail_starts_fixpoint`.
+    # The packer-buffer leg (`inherited_tail.tail_cuts`) adds the cuts no
+    # sibling makes (PROT 0898 / 0895, donor the non-overlay 0894) and moves
+    # PROT 0901's down to where 0900's routine resumes mid-body.
+    by_index = inherited_tail.tail_cuts(
+        tail_inputs,
+        lambda _key, base, data: slot_b_band.content_end(data, base),
+        prot_dir=os.path.join(extracted, "PROT"))
+    tails = {labels_by_index[k]: (off, labels_by_index.get(d, "prot_%04d" % d))
+             for k, (off, d) in by_index.items()}
+    for im in images:
+        cut = tails.get(im.label)
+        if cut and cut[0] < im.own_end:
+            im.own_end = cut[0]
+            im.own_source = "inherited_tail(%s)" % cut[1]
+
+    scus = os.path.join(extracted, "SCUS_942.54")
+    if os.path.exists(scus):
+        with open(scus, "rb") as fh:
+            blob = fh.read()
+        if blob[:8] == b"PS-X EXE":
+            import struct
+            t_addr, t_size = struct.unpack_from("<II", blob, 0x18)
+            body = blob[SCUS_HEADER:SCUS_HEADER + t_size]
+            images.append(Image("SCUS", None, t_addr, body, len(body), "exe_header"))
+    return images
+
+
+def measured_spans(extracted):
+    """The spans `disc-coverage.py` measures - the ones an extent is ambiguous over.
+
+    Its filter is exactly `base_va` and `content_bytes` both present and an
+    extracted image on disk; a row without a cited own-content length has no
+    honest denominator and is skipped there rather than guessed.
+    """
+    spans = []
+    if not os.path.exists(OVERLAY_MAP):
+        return spans
+    with open(OVERLAY_MAP, "rb") as fh:
+        for row in tomllib.load(fh).get("overlays", []):
+            base, span, label = (row.get("base_va"), row.get("content_bytes"),
+                                 row.get("label"))
+            if not base or not span or not label:
+                continue
+            cands = sorted(glob.glob(
+                os.path.join(extracted, "overlays", "overlay_%s_*.bin" % label)))
+            if not cands:
+                continue
+            span = min(span, os.path.getsize(cands[0]))
+            spans.append((base, base + span, label, row.get("prot_index")))
+    return spans
+
+
+# --- dumps -----------------------------------------------------------------
+
+def read_dumps(funcs_dir):
+    """[(entry, nbytes, stem, [(va, mnem, ops)])] over the whole corpus.
+
+    The extent is `(entry, nbytes)` from the header, which is the same key
+    `disc-coverage.py` builds its intervals from - not the filename address, and
+    not the printed address of the first instruction.
+    """
+    out = []
+    for path in sorted(glob.glob(os.path.join(funcs_dir, "*.txt"))):
+        try:
+            with open(path, errors="replace") as fh:
+                lines = fh.readlines()
+        except OSError:
+            continue
+        if not lines:
+            continue
+        # One header parser, shared with `disc-coverage.py`, so the two
+        # instruments agree about which files are dumps and where each one
+        # starts. A private regex here silently dropped real dumps whose header
+        # uses one of the corpus's other spellings, and the resulting extents
+        # then had no attribution row at all - which reads in the coverage
+        # report as unresolvable ambiguity rather than as a parser gap.
+        dump, _reject = dump_header.parse_text("".join(lines), path)
+        if dump is None:
+            continue
+        entry, nbytes = dump.entry, dump.nbytes
+        insns, in_dis = [], False
+        for line in lines[2:]:
+            if "--- DISASSEMBLY ---" in line:
+                in_dis = True
+                continue
+            if not in_dis:
+                continue
+            t = line.rstrip("\n").strip()
+            if t.startswith("---"):
+                break
+            if not t:
+                if insns:
+                    break
+                continue
+            im = INSN_RE.match(t)
+            if im:
+                insns.append((int(im.group(1), 16), im.group(2), im.group(3) or ""))
+            if len(insns) >= WINDOW:
+                break
+        stem = os.path.splitext(os.path.basename(path))[0]
+        out.append((entry, nbytes, stem, insns))
+    return out
+
+
+def looks_like_data(insns):
+    """The `$zero`-absolute signature: a table decoded as opcodes.
+
+    Real MIPS reaches statics through `gp` or a `lui`/`addiu` pair, so a run of
+    `lb rN,0xNNNN(zero)` is a table of `0x80`-high bytes read as instructions. A
+    window that matches an image here matches that image's DATA, and two images
+    agreeing on nothing but a table must not read as a shared routine.
+    """
+    if not insns:
+        return False
+    hits = sum(1 for _, mn, ops in insns
+               if mn.lower().lstrip("_") in MEM_MNEMONICS
+               and ZERO_ABS_RE.search("," + ops))
+    return hits * 2 >= len(insns)
+
+
+# Mnemonics whose first operand is the general register they write. A compiler
+# writes `$zero` only with the canonical `nop`, so any of these naming `zero` as
+# its destination is a table decoded as opcodes (the R3000 has no pipeline hazard
+# a `$zero` write would be emitted to cover). Ghidra's pseudo-ops are included.
+ZERO_DEST_MNEMONICS = {
+    "sll", "srl", "sra", "sllv", "srlv", "srav", "mfhi", "mflo",
+    "add", "addu", "sub", "subu", "and", "or", "xor", "nor", "slt", "sltu",
+    "addi", "addiu", "slti", "sltiu", "andi", "ori", "xori", "lui",
+    "lb", "lbu", "lh", "lhu", "lw", "lwl", "lwr",
+    "mfc0", "cfc0", "mfc2", "cfc2",
+    "li", "move", "negu", "neg", "not", "clear",
+}
+
+# Mnemonics Ghidra prints for words no PSX compiler emits: MIPS II+ and COP1
+# forms the R3000A lacks, and the disassembler's own undecodable markers. A
+# denylist rather than an allowlist, so a Ghidra pseudo-op this list does not
+# know errs toward "code".
+NON_R3000_MNEMONICS = {
+    "movf", "movt", "movz", "movn", "beql", "bnel", "blezl", "bgtzl",
+    "bltzl", "bgezl", "bltzall", "bgezall", "cache", "ll", "sc", "pref",
+    "sync", "lwc1", "swc1", "ldc1", "sdc1", "lwc3", "swc3", "teq", "tne",
+    "tge", "tgeu", "tlt", "tltu", "teqi", "tnei", "tgei", "tgeiu", "tlti",
+    "tltiu", "eret", "deret", "sdbbp", "madd", "maddu", "msub", "msubu",
+    "mul", "clz", "clo", "ssnop", "ehb", ".byte", "??",
+}
+
+
+def no_instruction_signature(insns):
+    """The window's non-`nop` words do what no compiled routine does.
+
+    The mnemonic-level twin of `byte_account::no_instruction_signature`: at
+    least half of the non-`nop` instructions either write `$zero` or are not
+    R3000 instructions at all. It catches the fill-headed windows too short
+    for `zero_padded`'s floor to fire on and too varied for `looks_like_data`
+    - the Baka Fighter image's `0x801DAA50` label (seven `nop`s, `mfhi zero`,
+    `syscall`, `movf zero,zero`) and the fishing image's `0x801D8DE8` label
+    (three shifts into `zero`). Without it the attribution sweep credited both
+    windows as `unique` code while the byte account refused them, so the two
+    instruments disagreed about the same bytes.
+    """
+    signal = odd = 0
+    for _, mn, ops in insns:
+        m = mn.lower().lstrip("_")
+        if m == "nop":
+            continue
+        signal += 1
+        first = ops.split(",", 1)[0].strip().lstrip("$").lower()
+        if m in NON_R3000_MNEMONICS or (m in ZERO_DEST_MNEMONICS
+                                        and first == "zero"):
+            odd += 1
+    return odd >= 1 and odd * 2 >= signal
+
+
+def zero_padded(insns):
+    """The window is zero fill with too little in it to name an image.
+
+    `nop` encodes `0x00000000`, so a `nop` reproduces inside **any** image's
+    zero fill, at any base, at any VA: it carries no signal, and a window made
+    of them makes the at-VA test return true while saying nothing. A window's
+    effective length is therefore its **non-`nop`** instruction count, and the
+    floor that applies to it is the same [`SHORT_VA_FLOOR`] the tool already
+    calibrated for naming an image at a VA.
+
+    Both failure shapes this catches are real. An all-`nop` window was read as
+    byte-identical across two images that agreed about nothing but being empty.
+    A 24-instruction window with **one** non-`nop` word in it - a lone
+    `0x00000004` inside a run of zeros - was read as a `unique` attribution,
+    crediting one image with a 20 KB extent that is over nine-tenths zero fill.
+
+    `signal < len(insns)` keeps the guard to zero-padded windows: a genuinely
+    short window of real instructions is the existing `short` verdict's case,
+    and this predicate must not take it over.
+    """
+    if not insns:
+        return False
+    signal = sum(1 for _, mn, _ in insns if mn.lower().lstrip("_") != "nop")
+    # A `nop` in a branch delay slot is not fill. Ghidra prints a delay-slot
+    # instruction with a leading `_`, and the zero word there is the one the
+    # preceding jump dictates, so a window like `lhu v0,0(a0); jr ra; _nop` -
+    # a whole three-word leaf - is a genuinely short window of real
+    # instructions (the `short` / at-VA path below), not zero fill. Only a
+    # plain `nop` is a word that reproduces inside any image's padding.
+    fill = sum(1 for _, mn, _ in insns if mn.lower() == "nop")
+    return signal < SHORT_VA_FLOOR and fill > 0
+
+
+def gapped(insns):
+    """Non-contiguous printed addresses: Ghidra left holes in the body.
+
+    Instructions are four bytes and a dumped body is contiguous, so a jump in
+    the address column means every later instruction is offset against the
+    image. Such a window can match no image as a contiguous run, and that
+    failure says nothing about the corpus.
+    """
+    return any(b[0] - a[0] != 4 for a, b in zip(insns, insns[1:]))
+
+
+# `break`'s operand is a 20-bit code the two disassemblers split differently:
+# Ghidra prints the whole field (`break 0x1c00`), capstone a sub-field
+# (`break 7`). The instruction is the same instruction, so the immediate is
+# dropped on BOTH sides rather than compared. This is not a loosening chosen for
+# convenience - it is the only systematic divergence a survey of near-miss
+# windows turned up, and it matters out of proportion to its size because
+# `div; bne; break 0x1c00` is the signed-division overflow check the compiler
+# emits at every integer divide.
+#
+# The divergence lives in the shared canonicaliser, so it also inflates
+# `check-dump-base-integrity.py`'s NOT_FOUND count; fixing it there is that
+# tool's owner's call, and this normalisation is local until then.
+def norm_tokens(toks):
+    return ["BREAK||" if t.startswith("BREAK|") else t for t in toks]
+
+
+def dump_tokens(insns):
+    return norm_tokens([CDBI.canon(mn, ops) for _, mn, ops in insns[:WINDOW]])
+
+
+# --- attribution -----------------------------------------------------------
+
+def holders(images, va, toks):
+    """Images whose own content reproduces this token window at this VA."""
+    hits = []
+    for img in images:
+        w = img.window_at(va, len(toks))
+        if w is not None and w == toks:
+            hits.append(img)
+    return hits
+
+
+class Relocator:
+    """Lazy index from a token signature to every (image, file offset).
+
+    Answers "if the bytes are not at this VA, are they anywhere?" - the question
+    that separates a mis-based print from a dump whose source was a live RAM
+    capture no extraction covers. Only the first `SIG` tokens are indexed; a
+    candidate is then re-checked over the full window.
+    """
+
+    SIG = 10
+
+    def __init__(self, images):
+        self.images = images
+        self._idx = None
+
+    def _build(self):
+        idx = collections.defaultdict(list)
+        for img in self.images:
+            n = img.own_end // 4
+            for w in range(max(0, n - self.SIG)):
+                off = w * 4
+                toks = CDBI.canon_bytes(img.data[off:off + 4 * self.SIG], self.SIG)
+                if len(toks) == self.SIG:
+                    idx["\n".join(norm_tokens(toks))].append((img, off))
+        self._idx = idx
+
+    def find(self, toks):
+        if self._idx is None:
+            self._build()
+        out = []
+        for img, off in self._idx.get("\n".join(toks[:self.SIG]), ()):
+            w = norm_tokens(
+                CDBI.canon_bytes(img.data[off:off + 4 * len(toks)], len(toks)))
+            if w == toks:
+                out.append((img, img.base + off))
+        return out
+
+
+# --- the link-time entry tables -------------------------------------------
+
+# Three tables in PROT 0898 name an entry point in every slot-B module
+# (docs/subsystems/cast-module.md#the-entry-tables-and-where-the-addresses-live).
+# `0x801F6734` holds 64 module entry VAs directly, row `i` = PROT `903 + i`;
+# `0x801CF4EC` (row `i` = PROT `903 + i`) and `0x801CF56C` (row `i` = PROT
+# `935 + i`) hold the address of a short arm in 0898 whose first `jal` is the
+# module entry. They are a SECOND, link-time signal about which module owns a
+# VA, independent of any window comparison.
+#
+# What that signal is worth here is small and worth stating rather than
+# assuming, because it is not the direction it looks like from the outside:
+#
+# * it does NOT discriminate. Every extent the rule resolves is one the short
+#   at-VA byte test already names a single image for; the table agrees and adds
+#   provenance, not separation.
+# * it CANNOT be used alone. A table VA frequently names several modules (many
+#   modules put their entry at the same offset), and where a residue extent came
+#   from a RAM capture the table names the module whose entry sits at that VA
+#   while the bytes are some other module's - `0x801F69EC` is the entry of
+#   PROT 0910 and the five capture dumps printed there hold neither 0910's bytes
+#   nor any other extracted image's.
+# * it does NOT override `identical`. Byte-identical content in several modules
+#   really is present in each of them, and a coverage figure has to credit each;
+#   the table names only the one whose ENTRY the VA is.
+#
+# So the rule is corroboration on the weakest class only: a residue extent whose
+# printed VA is a table entry for exactly one module, and whose window that
+# module's own content reproduces at that VA.
+SLOTB_TABLES = (
+    (0x801F6734, 64, 903, False),
+    (0x801CF4EC, 32, 903, True),
+    (0x801CF56C, 32, 935, True),
+)
+TABLE_IMAGE_PROT = 898
+ARM_JAL_SPAN = 0x40
+
+
+def load_entry_tables(images):
+    """`{entry_va: {prot, ...}}` decoded from the three PROT 0898 tables."""
+    host = next((i for i in images if i.prot == TABLE_IMAGE_PROT), None)
+    if host is None:
+        return {}
+
+    def word(va):
+        off = host.offset_of(va)
+        if off is None or off + 4 > host.own_end:
+            return None
+        import struct as _s
+        return _s.unpack_from("<I", host.data, off)[0]
+
+    def first_jal(va):
+        for k in range(0, ARM_JAL_SPAN, 4):
+            w = word(va + k)
+            if w is None:
+                return None
+            if (w >> 26) == 3:  # jal
+                return 0x80000000 | ((w & 0x03FFFFFF) << 2)
+        return None
+
+    out = collections.defaultdict(set)
+    for base, count, first_prot, via_arm in SLOTB_TABLES:
+        for i in range(count):
+            w = word(base + 4 * i)
+            if not w:
+                continue
+            target = first_jal(w) if via_arm else w
+            if target:
+                out[target].add(first_prot + i)
+    return out
+
+
+def attribute_dump(images, reloc, entry, insns, tables=None):
+    """(class, [image names], reason) for one dump at one VA."""
+    if not insns:
+        return ("no_disassembly", [], "dump carries no instruction stream")
+    if looks_like_data(insns):
+        return ("data", [], "opening window is the `$zero`-absolute data "
+                            "signature - a table decoded as opcodes")
+    if no_instruction_signature(insns):
+        return ("data", [], "at least half the window's non-`nop` "
+                            "instructions write `$zero` or are no R3000 "
+                            "instruction - a table decoded as opcodes")
+    if gapped(insns):
+        return ("gapped", [], "printed addresses are non-contiguous, so the "
+                              "window matches no image as a contiguous run")
+    toks = dump_tokens(insns)
+    # The link-time tables sign a VA below the window floor, and only there:
+    # above it the window is its own evidence, and where several images hold the
+    # bytes each of them holds them (see `SLOTB_TABLES`).
+    if toks and len(toks) < SHORT_VA_FLOOR and tables:
+        named = tables.get(entry) or ()
+        if len(named) == 1:
+            prot = next(iter(named))
+            img = next((i for i in images if i.prot == prot), None)
+            if img is not None and img.window_at(entry, len(toks)) == toks:
+                return ("resolved_by_table", [img.name],
+                        "PROT 0898's link-time entry table names this VA as the "
+                        "entry of %s alone, and that image's own content "
+                        "reproduces the %d-instruction window here"
+                        % (img.name, len(toks)))
+    # Below the table check on purpose. The link-time table is evidence from
+    # OUTSIDE the window - PROT 0898 naming this VA as one image's entry - so it
+    # survives a window that carries no signal of its own. Everything after this
+    # point rests on the window, and a zero-padded window has nothing to rest on.
+    if zero_padded(insns):
+        return ("zero_window", [], "window is zero fill with fewer than %d "
+                                   "non-`nop` instructions in it - it "
+                                   "reproduces inside any image's zero fill "
+                                   "and names none" % SHORT_VA_FLOOR)
+    if len(toks) < MIN_SIGNABLE:
+        # A short window can still answer the AT-VA question, and that is a
+        # different question from the one the floor guards. `MIN_SIGNABLE` is
+        # calibrated for the relocation SEARCH - "do these bytes appear anywhere
+        # in any image" - where a short signature has millions of chances to
+        # match by accident. `holders()` asks only "does THIS image's own
+        # content reproduce this window at THIS VA", a two-way test at a fixed
+        # offset with no multiple-comparison problem. A short window that
+        # matches several images returns `identical`, which credits all of them
+        # and is honest; the only outcome it cannot support is a `misbased`
+        # verdict, so a short window that matches nothing stays `short` rather
+        # than falling through to the search.
+        if len(toks) >= SHORT_VA_FLOOR:
+            hits = holders(images, entry, toks)
+            if hits:
+                names = [h.name for h in hits]
+                kind = "unique" if len(hits) == 1 else "identical"
+                return (kind, names,
+                        "own content of %s reproduces the %d-instruction window "
+                        "at this VA (short window, at-VA test only)"
+                        % (", ".join(names), len(toks)))
+            # The at-VA test RAN and no image's own content reproduces the
+            # window. That is a finding about every measured image at once, and
+            # a negative one: each was compared at this VA and each disagrees.
+            # A mismatch at a fixed offset needs no length to be believed - the
+            # floor guards a POSITIVE match against coincidence, and there is no
+            # coincidence to guard against in "these words are not those
+            # words". So the extent is `no_holder`: credited to no measured
+            # image. Where the bytes really live is a different question, and a
+            # short window is exactly what the relocation search cannot be
+            # trusted with, so the verdict does not claim `misbased`.
+            return ("no_holder", [], "%d instructions: no image's own content "
+                                     "reproduces this window at this VA, and "
+                                     "the window is too short to search for "
+                                     "it elsewhere" % len(toks))
+        # Below the floor a mismatch is as strong as ever, and a match is
+        # weaker only in one direction. The control (`--validate-short-floor`,
+        # which reports every length down to one instruction) finds no WRONG
+        # answer at one or two instructions either - the short test never
+        # names a different single image than the full window does; what it
+        # loses is precision, returning several images where the full window
+        # names one. So a SOLE holder below the floor is the answer the control
+        # always gave, and it is named `unique`; several holders are exactly
+        # the imprecise case, so they stay `short` with the holders in the
+        # image column as the only candidates left, and a consumer keeps the
+        # extent residue for those images and drops it for every other.
+        cands = [h.name for h in holders(images, entry, toks)] if toks else []
+        if toks and not cands:
+            return ("no_holder", [], "%d instructions: no image's own content "
+                                     "reproduces this window at this VA"
+                                     % len(toks))
+        if len(cands) == 1:
+            return ("unique", cands,
+                    "own content of %s, and of no other image, reproduces the "
+                    "%d-instruction window at this VA (below the at-VA floor; "
+                    "sole holder)" % (cands[0], len(toks)))
+        return ("short", cands, "%d instructions, below the %d-instruction at-VA "
+                                "floor for naming an image%s"
+                                % (len(toks), SHORT_VA_FLOOR,
+                                   "; own content of %s reproduces it here"
+                                   % ", ".join(cands) if cands else ""))
+
+    hits = holders(images, entry, toks)
+    if len(hits) == 1:
+        img = hits[0]
+        return ("unique", [img.name],
+                "own content of %s reproduces the %d-instruction window at this "
+                "VA (%s cut)" % (img.name, len(toks), img.own_source))
+    if len(hits) > 1:
+        names = [h.name for h in hits]
+        return ("identical", names,
+                "%d images hold byte-identical code here (%s) - the window "
+                "cannot separate them" % (len(hits), ", ".join(names)))
+
+    found = reloc.find(toks)
+    if found:
+        where = ", ".join("%s 0x%08x (delta +0x%x)"
+                          % (img.name, va, (va - entry) & 0xFFFFFFFF)
+                          for img, va in found[:3])
+        return ("misbased", [], "no image holds these bytes at this VA; they "
+                               "live at %s" % where)
+    return ("unresolved", [], "no extracted image holds these bytes at this VA "
+                              "or anywhere - RAM-capture-derived or an "
+                              "un-extracted overlay")
+
+
+# Ordered worst-to-best: when several dumps share an extent, the weakest verdict
+# is the one the extent can support.
+CLASS_RANK = {
+    "unique": 0, "resolved_by_table": 1, "identical": 2, "misbased": 3,
+    "unresolved": 4, "short": 5, "no_holder": 6, "gapped": 7, "data": 8,
+    "zero_window": 9, "no_disassembly": 10,
+}
+
+
+def combine(per_dump):
+    """One verdict for an extent several dumps produce.
+
+    A `unique` verdict outranks everything: one dump resolving to one image's own
+    content at this VA is positive evidence, and the others failing to sign is
+    the absence of it. Two dumps resolving to DIFFERENT images is the one case
+    that has to stay ambiguous, because both are positive.
+    """
+    uniques = {}
+    for cls, names, reason in per_dump:
+        if cls == "unique":
+            uniques[names[0]] = reason
+    if len(uniques) == 1:
+        name, reason = next(iter(uniques.items()))
+        return ("unique", [name], reason)
+    if len(uniques) > 1:
+        names = sorted(uniques)
+        return ("divergent", names,
+                "dumps at this extent resolve to different images (%s), so it is "
+                "genuinely more than one routine" % ", ".join(names))
+    best = min(per_dump, key=lambda t: CLASS_RANK.get(t[0], 99))
+    return best
+
+
+def validate_short_floor(images, reloc, by_extent):
+    """Does the short at-VA test agree with the full-window verdict?
+
+    A relaxation of a confidence floor is a measurement change, and a
+    measurement change has no oracle - so it needs a control built from data the
+    relaxation did not choose. This one is available for free: every extent the
+    FULL window already resolves has a known answer, so truncating it to each
+    short length and re-running the same at-VA test measures the short test's
+    error rate directly.
+
+    Three outcomes per trial, and they are not equally bad. `agree` is the
+    short test reaching the same verdict. `weaker` is it returning several
+    images where the full window named one - honest, since `identical` credits
+    all of them, and the only cost is precision. `WRONG` is it naming a
+    different single image, which is the failure that would put a false
+    attribution in the CSV. Only the third invalidates the floor.
+    """
+    trials = collections.Counter()
+    wrong = []
+    for (entry, _nbytes), members in sorted(by_extent.items()):
+        for _stem, insns in members:
+            toks = dump_tokens(insns)
+            if len(toks) < MIN_SIGNABLE:
+                continue
+            full = holders(images, entry, toks)
+            if len(full) != 1:
+                continue
+            for n in range(1, MIN_SIGNABLE):
+                if len(toks) < n:
+                    break
+                short = holders(images, entry, toks[:n])
+                key = "n=%d" % n
+                if not short:
+                    trials[key + " none"] += 1
+                elif len(short) == 1 and short[0].name == full[0].name:
+                    trials[key + " agree"] += 1
+                elif full[0].name in [s.name for s in short]:
+                    trials[key + " weaker"] += 1
+                else:
+                    trials[key + " WRONG"] += 1
+                    wrong.append((entry, n, full[0].name,
+                                  [s.name for s in short]))
+    print("control: short at-VA test vs the full-window verdict it should match")
+    print("  agree = same single image · weaker = several, including the right "
+          "one · WRONG = a different single image")
+    for n in range(1, MIN_SIGNABLE):
+        row = {k.split()[-1]: v for k, v in trials.items()
+               if k.startswith("n=%d " % n)}
+        total = sum(row.values())
+        if not total:
+            continue
+        print("  %d insns: %5d trials  agree %5d (%.1f%%)  weaker %4d  "
+              "none %4d  WRONG %d"
+              % (n, total, row.get("agree", 0),
+                 100.0 * row.get("agree", 0) / total, row.get("weaker", 0),
+                 row.get("none", 0), row.get("WRONG", 0)))
+    for entry, n, right, got in wrong[:20]:
+        print("  WRONG 0x%08x at n=%d: full says %s, short says %s"
+              % (entry, n, right, "|".join(got)))
+    return 1 if wrong else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--funcs", default=DEFAULT_FUNCS)
+    ap.add_argument("--extracted", default=DEFAULT_EXTRACTED)
+    ap.add_argument("--out", default=DEFAULT_OUT)
+    ap.add_argument("--explain", default=None,
+                    help="print per-dump evidence for one entry VA")
+    ap.add_argument("--all-extents", action="store_true",
+                    help="attribute every extent, not only the VA-ambiguous ones")
+    ap.add_argument("--per-dump", action="store_true",
+                    help="print one row per DUMP FILE rather than per extent - "
+                         "the form a re-dump needs, since it must be told which "
+                         "program to run against. Printed, never committed: it "
+                         "is keyed to filenames over a gitignored corpus and "
+                         "rots as soon as a dump is added.")
+    ap.add_argument("--validate-short-floor", action="store_true",
+                    help="control run for the SHORT_VA_FLOOR relaxation: take "
+                         "every extent the full window resolves, truncate it to "
+                         "each short length, and report how often the short "
+                         "at-VA test gives the same answer. A relaxation that "
+                         "cannot pass its own control is guesswork.")
+    ap.add_argument("--min-insns", type=int, default=None,
+                    help="signature floor; lower values trade confidence for "
+                         "reach and are a sensitivity check, not a default "
+                         "(default %d)" % MIN_SIGNABLE)
+    args = ap.parse_args()
+
+    globals()["CDBI"] = _cdbi()
+    if args.min_insns:
+        globals()["MIN_SIGNABLE"] = args.min_insns
+
+    images = load_images(args.extracted)
+    if not images:
+        print("[attribute-dump-extents] no extracted images - nothing to do")
+        return 0
+    spans = measured_spans(args.extracted)
+    dumps = read_dumps(args.funcs)
+    if not dumps:
+        print("[attribute-dump-extents] no dump corpus - nothing to do")
+        return 0
+
+    def ambiguous(va):
+        return sum(1 for lo, hi, _, _ in spans if lo <= va < hi) > 1
+
+    by_extent = collections.defaultdict(list)
+    for entry, nbytes, stem, insns in dumps:
+        if not args.all_extents and not ambiguous(entry):
+            continue
+        by_extent[(entry, nbytes)].append((stem, insns))
+
+    reloc = Relocator(images)
+    tables = load_entry_tables(images)
+
+    if args.explain:
+        va = int(args.explain, 16)
+        print("images covering 0x%08x by own content:" % va)
+        for img in images:
+            if img.offset_of(va) is not None:
+                print("  %-24s base=0x%08x own_end=0x%-6x (%s)"
+                      % (img.name, img.base, img.own_end, img.own_source))
+        print("measured spans containing it: %s"
+              % ", ".join(l for lo, hi, l, _ in spans if lo <= va < hi))
+        for (entry, nbytes), members in sorted(by_extent.items()):
+            if entry != va:
+                continue
+            print("extent 0x%08x +0x%x:" % (entry, nbytes))
+            for stem, insns in members:
+                cls, names, reason = attribute_dump(images, reloc, entry,
+                                                   insns, tables)
+                print("  %-52s %-12s %s" % (stem, cls, reason))
+            print("  => %s" % (combine([attribute_dump(images, reloc, entry, i,
+                                                        tables)
+                                        for _, i in members]),))
+        return 0
+
+    if args.validate_short_floor:
+        return validate_short_floor(images, reloc, by_extent)
+
+    if args.per_dump:
+        print("# dump\tentry\tbytes\timage\tclass")
+        for (entry, nbytes), members in sorted(by_extent.items()):
+            for stem, insns in sorted(members):
+                cls, names, _ = attribute_dump(images, reloc, entry, insns,
+                                               tables)
+                print("%s\t%08x\t%d\t%s\t%s"
+                      % (stem, entry, nbytes, "|".join(names) or "-", cls))
+        return 0
+
+    rows = []
+    for (entry, nbytes), members in sorted(by_extent.items()):
+        per = [attribute_dump(images, reloc, entry, insns, tables)
+               for _, insns in members]
+        cls, names, reason = combine(per)
+        rows.append(("%08x" % entry, nbytes, "|".join(names) or "-", cls, reason))
+
+    outp = os.path.abspath(args.out)
+    os.makedirs(os.path.dirname(outp) or ".", exist_ok=True)
+    with open(outp, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["entry", "bytes", "image", "class", "reason"])
+        for row in rows:
+            w.writerow(row)
+
+    # Independent cross-check on the dumper defect: a dump is named after the
+    # REQUESTED address but `getFunctionContaining` resolves the ENCLOSING
+    # function, so the header's `entry=` is the truth and the filename is a
+    # claim about an entry point that may not exist. The signature of that rule
+    # is that the resolved entry is always BELOW the requested address; a
+    # mismatch in the other direction would mean something else is wrong.
+    named = mismatched = below = 0
+    for entry, _nbytes, stem, _insns in dumps:
+        m = re.search(r"([0-9a-f]{8})$", stem)
+        if not m:
+            continue
+        named += 1
+        req = int(m.group(1), 16)
+        if req != entry:
+            mismatched += 1
+            below += 1 if entry < req else 0
+    print("dumps whose filename address is not their `entry=`: %d of %d "
+          "(%d resolve BELOW the requested address%s)"
+          % (mismatched, named, below,
+             ", i.e. all of them" if below == mismatched else ""))
+
+    hist = collections.Counter(c for _, _, _, c, _ in rows)
+    total = len(rows)
+    print("\nambiguous extents: %d" % total)
+    for cls, n in hist.most_common():
+        print("  %-15s %5d  (%4.1f%%)" % (cls, n, 100.0 * n / total if total else 0))
+
+    resolved = hist["unique"]
+    print("\nattributed to exactly one image : %d (%.1f%%)"
+          % (resolved, 100.0 * resolved / total if total else 0))
+    print("excluded from every image       : %d (misbased + data + gapped + "
+          "zero_window + unresolved + no_holder + no_disassembly)"
+          % (hist["misbased"] + hist["data"] + hist["gapped"]
+             + hist["zero_window"] + hist["unresolved"] + hist["no_holder"]
+             + hist["no_disassembly"]))
+    print("stays ambiguous                 : %d (identical + divergent + "
+          "short)"
+          % (hist["identical"] + hist["divergent"] + hist["short"]))
+
+    credited = collections.Counter()
+    for _, _, image, cls, _ in rows:
+        if cls == "unique":
+            credited[image] += 1
+    print("\nunique attributions by image:")
+    for name, n in credited.most_common():
+        measured = any(name.startswith(l + "(") for _, _, l, _ in spans)
+        print("  %-24s %5d%s" % (name, n, "" if measured else "   [not measured]"))
+
+    # What the attribution does to the two rows the coverage report calls "not
+    # meaningful". An extent stops being ambiguous FOR an image once the bytes
+    # say it belongs to some other image, or to no image at all - both of those
+    # remove it from this image's set without a judgement call about which of
+    # the overlapping spans deserves it.
+    verdict = {(int(e, 16), b): (img, cls) for e, b, img, cls, _ in rows}
+    all_extents = {(e, n) for e, n, _, _ in dumps}
+    print("\nprojected effect on the measured rows (distinct extents):")
+    print("  %-18s %7s %7s %7s %7s %7s %8s %8s" % (
+        "image", "extents", "keep", "other", "exclude", "residue",
+        "amb% now", "after"))
+    for lo, hi, label, prot in spans:
+        name = "%s(%d)" % (label, prot)
+        mine = [(e, n) for e, n in all_extents if lo <= e < hi]
+        keep = other = excl = residue = 0
+        for key in mine:
+            got = verdict.get(key)
+            if got is None:
+                # Unambiguous already: only one measured span contains it.
+                continue
+            img, cls = got
+            if cls == "unique":
+                keep += 1 if img == name else 0
+                other += 0 if img == name else 1
+            elif cls in ("misbased", "data", "gapped", "zero_window",
+                         "unresolved", "no_holder", "no_disassembly"):
+                excl += 1
+            elif cls == "identical" and name in img.split("|"):
+                keep += 1
+            elif cls == "short" and img != "-" and name not in img.split("|"):
+                excl += 1
+            else:
+                residue += 1
+        amb_now = keep + other + excl + residue
+        after_total = len(mine) - other - excl
+        print("  %-18s %7d %7d %7d %7d %7d %7.1f%% %7.1f%%" % (
+            name, len(mine), keep, other, excl, residue,
+            100.0 * amb_now / len(mine) if mine else 0.0,
+            100.0 * residue / after_total if after_total else 0.0))
+    print("  keep = bytes say this image · other = bytes say a different image")
+    print("  exclude = no measured image holds it at this VA · residue = "
+          "unattributable")
+    print("  `after` divides residue by the extents that remain in the image's "
+          "set, since `other` and `exclude` leave it entirely")
+
+    print("\nwrote %s" % outp)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

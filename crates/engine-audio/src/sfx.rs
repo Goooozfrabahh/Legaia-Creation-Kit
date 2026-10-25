@@ -1,0 +1,1542 @@
+//! Sound-effect catalog + scheduler.
+//!
+//! Maps battle / field cue IDs (the `kind` byte the art-record `HitCue`
+//! / overlay scripts emit) to per-cue [`SfxEntry`] descriptors that
+//! describe how to fire a one-shot through the SPU. Engines populate the
+//! catalog at startup, then forward `ScheduledCue`-like requests through
+//! [`SfxScheduler`] which queues each request with its retail timing
+//! offset and dispatches when the per-frame tick reaches the firing
+//! frame.
+//!
+//! [`SfxScheduler::tick_frame`] additionally drives the byte-faithful retail
+//! cue ring in [`crate::sfx_ring`], whose two halves live in the frame-begin
+//! and frame-end drivers.
+//! REF: FUN_8001698C, FUN_80016B6C
+//!
+//! ## Cue ID conventions
+//!
+//! - `0x1A` - generic SFX trigger (the canonical `HitCue` "play sound"
+//!   kind). The catalog typically maps this to per-strike weapon impact
+//!   tones.
+//! - `0x4C` - hit-effect visual (no sound on its own; engines that fold
+//!   the visual into a synced sound use this slot).
+//! - `0x80..=0xFE` - reserved per-character or per-art SFX IDs (the
+//!   retail engine indexes from the per-actor `+0x9C0` table).
+//!
+//! Beyond these documented bytes the catalog is open - the scheduler
+//! itself is agnostic to ID ranges.
+//!
+//! ## Frame timing
+//!
+//! Strikes carry a `timing_frames` value (the `HitCue::timing_frames`
+//! field). The scheduler wraps that as a per-cue countdown. `tick_frame`
+//! advances every queued cue by one frame; cues whose countdown hits zero
+//! are returned in the [`SfxFireBatch`] for the host to dispatch through
+//! [`SfxBank::play_one_shot`] (or its own SPU bridge).
+//!
+//! Pure data - no SPU access here. The scheduler is a queue + clock; the
+//! catalog is a lookup table; firing the actual note-on is the engine's
+//! call.
+
+use crate::spu::Spu;
+use crate::vab_bind::VabBank;
+
+/// Per-cue descriptor. Engines populate one entry per cue id, then look
+/// the entry up to drive the actual SPU note-on parameters.
+///
+/// The fields mirror the retail static SFX descriptor
+/// (`legaia_game_tables::sfx_table::SfxDescriptor`): `program_index` is the
+/// descriptor `+0` program, `tone` is the descriptor `+1` **region index**
+/// (NOT a key-range window), `key` is the `+2` note-level attribute, and
+/// `voices` is the `+3 & 0x1F` voice count. The retail SFX path
+/// (`FUN_80016B6C` → `FUN_80065034`) names a cue's tone by explicit region
+/// index and fans a multi-voice cue across consecutive regions `tone + i`,
+/// so [`SfxBank::play_one_shot`] resolves through [`VabBank::play_tone`],
+/// not the sequencer's key-range [`VabBank::play_note`]. `voice_pref` pins
+/// the first voice slot - `None` means the drainer's own voice choice
+/// ([`SfxBank`]'s one-shot cursor, or the sustained run from voice 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SfxEntry {
+    /// Cue id this entry handles. The art-record `HitCue::kind` byte for
+    /// strike-fired cues; engines extend the namespace for menu blips,
+    /// footstep cues, etc.
+    pub id: u8,
+    /// Index into [`VabBank::programs`] (descriptor `+0` `p`).
+    pub program_index: u8,
+    /// Explicit tone / ADSR-region base index (descriptor `+1` `t`). Voice
+    /// `i` of a multi-voice cue plays region `tone + i`. This is an index,
+    /// not a key-range window - see [`VabBank::play_tone`].
+    pub tone: u8,
+    /// Note-level attribute (descriptor `+2` `l`, MIDI-ish 0..=127). Feeds
+    /// the tone's pitch math; does NOT select the tone.
+    pub key: u8,
+    /// Voice count (descriptor `+3 & 0x1F`): how many consecutive regions
+    /// `tone..tone+voices` the cue keys on. Clamped to at least 1 at fire
+    /// time.
+    pub voices: u8,
+    /// MIDI-style velocity (0..=127). Engines map this to the SPU's
+    /// voice volume.
+    pub vel: u8,
+    /// Optional preferred first voice slot (0..=23). `None` = the retail
+    /// drainer's choice (see [`SfxBank`]); a multi-voice cue keys on
+    /// `voice_pref + i` when pinned.
+    pub voice_pref: Option<u8>,
+    /// Descriptor `+3` bit `0x20`: a **sustained** cue. Retail keys it on
+    /// voices `7..7 + voices` and releases the previous sustained run first,
+    /// instead of rolling it through the one-shot voices at the top.
+    pub sustained: bool,
+}
+
+impl SfxEntry {
+    /// Construct a single-voice entry (tone 0) with the canonical "use first
+    /// available voice" preference and unity velocity. Prefer
+    /// [`SfxEntry::from_descriptor`] when the disc descriptor's tone /
+    /// voice-count are known.
+    pub fn new(id: u8, program_index: u8, key: u8) -> Self {
+        Self {
+            id,
+            program_index,
+            tone: 0,
+            key,
+            voices: 1,
+            vel: 100,
+            voice_pref: None,
+            sustained: false,
+        }
+    }
+
+    /// Construct from the full retail descriptor fields (program, tone,
+    /// note, `+3` byte) - the shape [`SfxBank::from_descriptors`] carries.
+    /// `flags` may be the raw `+3` byte: its low five bits are the voice
+    /// count and bit `0x20` the sustained mode. A plain voice count
+    /// (`0..=31`) never sets `0x20`, so a masked count reads as a one-shot.
+    pub fn from_descriptor(id: u8, program_index: u8, tone: u8, key: u8, flags: u8) -> Self {
+        Self {
+            id,
+            program_index,
+            tone,
+            key,
+            voices: (flags & 0x1F).max(1),
+            vel: 100,
+            voice_pref: None,
+            sustained: flags & 0x20 != 0,
+        }
+    }
+
+    /// With explicit tone / region index.
+    pub fn with_tone(self, tone: u8) -> Self {
+        Self { tone, ..self }
+    }
+
+    /// With explicit voice count.
+    pub fn with_voices(self, voices: u8) -> Self {
+        Self {
+            voices: voices.max(1),
+            ..self
+        }
+    }
+
+    /// With explicit velocity.
+    pub fn with_vel(self, vel: u8) -> Self {
+        Self { vel, ..self }
+    }
+
+    /// With pinned first voice.
+    pub fn with_voice(self, voice: u8) -> Self {
+        Self {
+            voice_pref: Some(voice),
+            ..self
+        }
+    }
+}
+
+/// Highest SPU voice; the drainer's one-shots count down from it.
+pub const ONE_SHOT_TOP_VOICE: u8 = 23;
+
+/// First voice of a sustained cue's run (`lui s0,0x7` at `0x80016E20`).
+pub const SUSTAINED_BASE_VOICE: u8 = 7;
+
+/// The drainer's one-shot cursor limit outside the field: voices `23..=20`.
+pub const ONE_SHOT_LIMIT: u8 = 3;
+
+/// The limit in game modes `3` (field) and `0x17` (menu): voices `23..=22`.
+pub const ONE_SHOT_LIMIT_FIELD: u8 = 1;
+
+/// The cue drainer's voice bookkeeping (`FUN_80016B6C`): the rolling one-shot
+/// cursor `gp+0x4BC`, its per-mode limit, and the held sustained count
+/// `gp+0x5D0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DrainerVoices {
+    one_shot: u8,
+    limit: u8,
+    held: u8,
+}
+
+impl Default for DrainerVoices {
+    fn default() -> Self {
+        Self {
+            one_shot: 0,
+            limit: ONE_SHOT_LIMIT,
+            held: 0,
+        }
+    }
+}
+
+/// Catalog of cue-id → [`SfxEntry`] mappings, plus the retail drainer's
+/// voice choice.
+///
+/// Stores entries in a `Vec` keyed by id. Lookup is O(N) but the table is
+/// small (≤256 cues) and rebuilt at scene transitions.
+///
+/// **Which voice a cue keys** is retail's, not "first idle":
+/// `FUN_80016B6C` keys a one-shot on voice `23 - cursor`, the cursor rolling
+/// `0..=limit` (`limit` = 3 in battle, 1 in the field and menus; the check
+/// at `0x80016D10` wraps it only once it *exceeds* the limit) and the voice
+/// re-keyed whether or not it is still sounding. A sustained cue (`+3 &
+/// 0x20`) releases the previous sustained run and keys `7..7 + n`. So a
+/// burst of hits reuses four voices at the top of the voice file - the
+/// newest cuts the oldest - instead of spreading across every idle voice
+/// the BGM sequencer would otherwise take, and a cue is never dropped for
+/// want of an idle voice. The bookkeeping sits in a `Cell` so the hosts'
+/// shared borrows of the bank keep working.
+#[derive(Debug, Default, Clone)]
+pub struct SfxBank {
+    entries: Vec<SfxEntry>,
+    voices: std::cell::Cell<DrainerVoices>,
+}
+
+impl SfxBank {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a minimal default bank used by the asset viewer's preview
+    /// path: a single generic hit-cue tied to program 0, key 60.
+    pub fn vanilla() -> Self {
+        let mut s = Self::new();
+        s.insert(SfxEntry::new(0x1A, 0, 60));
+        s.insert(SfxEntry::new(0x4C, 0, 67));
+        s
+    }
+
+    /// Build a bank from decoded SFX descriptors - the
+    /// `(id, program, tone, note, voice_count)` tuples the disc
+    /// `legaia_game_tables::sfx_table::SfxTable::active` iterator yields (program =
+    /// `SfxDescriptor::program`, tone = `SfxDescriptor::tone`, note =
+    /// `SfxDescriptor::note`, voice_count = `SfxDescriptor::voice_count()`).
+    /// Keeping the argument a plain tuple iterator avoids a dependency on the
+    /// asset crate from the audio layer; the host (engine-shell) wires the
+    /// disc-decoded table in. Carrying the tone + voice count is required:
+    /// the SFX path names its tone by explicit region index, and several
+    /// retail cues (e.g. the strike cue `0x1A`) place `note` outside the
+    /// tone's key window, so a key-range resolve would render silence. Later
+    /// tuples overwrite earlier ones with the same id.
+    pub fn from_descriptors<I: IntoIterator<Item = (u8, u8, u8, u8, u8)>>(descriptors: I) -> Self {
+        let mut bank = Self::new();
+        for (id, program_index, tone, note, voices) in descriptors {
+            bank.insert(SfxEntry::from_descriptor(
+                id,
+                program_index,
+                tone,
+                note,
+                voices,
+            ));
+        }
+        bank
+    }
+
+    /// Select the drainer's one-shot limit for the world's mode: retail uses
+    /// [`ONE_SHOT_LIMIT_FIELD`] in game modes `3` (field) and `0x17` (menu
+    /// screens over the field) and [`ONE_SHOT_LIMIT`] everywhere else
+    /// (`0x80016B70..0x80016BBC`). Hosts call this with "the world is in a
+    /// field-family mode".
+    // REF: FUN_80016B6C
+    pub fn set_field_family(&self, field_family: bool) {
+        let mut v = self.voices.get();
+        v.limit = if field_family {
+            ONE_SHOT_LIMIT_FIELD
+        } else {
+            ONE_SHOT_LIMIT
+        };
+        self.voices.set(v);
+    }
+
+    /// The current one-shot cursor limit.
+    pub fn one_shot_limit(&self) -> u8 {
+        self.voices.get().limit
+    }
+
+    /// Insert (or overwrite) the entry for `entry.id`.
+    pub fn insert(&mut self, entry: SfxEntry) {
+        if let Some(slot) = self.entries.iter_mut().find(|e| e.id == entry.id) {
+            *slot = entry;
+        } else {
+            self.entries.push(entry);
+        }
+    }
+
+    /// Look up an entry by cue id.
+    pub fn get(&self, id: u8) -> Option<&SfxEntry> {
+        self.entries.iter().find(|e| e.id == id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &SfxEntry> {
+        self.entries.iter()
+    }
+
+    /// Fire one shot. Resolves the cue id and keys the descriptor's
+    /// `voices` consecutive tone regions (`tone + i`), delegating to
+    /// [`VabBank::play_tone`] - the retail SFX shape (`FUN_80016B6C` →
+    /// `FUN_80065034`): a cue names its tone by an explicit region **index**,
+    /// not by a key-range window. This differs from the sequencer's
+    /// [`VabBank::play_note`]; several retail cues place `note` outside the
+    /// tone's authored `min..=max` window (the generic strike cue `0x1A` =
+    /// program 3 / tone 8 / note 67 is one), so a key-range resolve renders
+    /// silence for them. The voices are the drainer's (see [`SfxBank`]).
+    ///
+    /// Returns the FIRST voice keyed on, or `None` if the cue isn't in the
+    /// bank or nothing sounded (the bank's program / tone / sample is
+    /// missing - e.g. the cue's program isn't resident in this bank).
+    /// Mirrors `crates/web-viewer/src/sfx_view.rs::render_cue`.
+    pub fn play_one_shot(&self, id: u8, spu: &mut Spu, vab: &VabBank) -> Option<u8> {
+        self.play_entry(self.get(id)?, spu, vab)
+    }
+
+    /// Fire one raw 8-byte descriptor row - the shape both halves of the
+    /// drainer's id split resolve to (`FUN_80016B6C` `0x80016C24`): the static
+    /// `DAT_8006F198` table below cue `0x200`, and the **runtime** bank above
+    /// it, whose rows a field scene carries in its own prescript record 0
+    /// (`docs/formats/sfx-table.md`). A runtime row has no id in this bank's
+    /// `u8` space, so a host that resolved one hands the row here directly.
+    /// Returns the first voice keyed, as [`Self::play_one_shot`] does; a row
+    /// with a zero voice count keys nothing, matching the drainer's skip.
+    // REF: FUN_80016B6C
+    pub fn play_descriptor(&self, row: &[u8; 8], spu: &mut Spu, vab: &VabBank) -> Option<u8> {
+        if row[3] & 0x1F == 0 {
+            return None;
+        }
+        let entry = SfxEntry::from_descriptor(0, row[0], row[1], row[2], row[3]);
+        self.play_entry(&entry, spu, vab)
+    }
+
+    /// The sustained-cue teardown `FUN_80017910`: when a sustained run is
+    /// held (`gp+0x5D0 != 0`), key off voices `7 .. 7 + held` in ascending
+    /// order (`FUN_800653C8`, the libsnd voice key-off) and clear the held
+    /// count. With nothing held it does nothing. Returns how many voices it
+    /// released.
+    ///
+    /// A sustained cue's sample loops (VAG repeat flag) and holds its ADSR
+    /// sustain, so nothing but this teardown - or the drainer's own release
+    /// when the next sustained cue keys - ever stops it. Retail runs it from
+    /// the mode initialiser `FUN_8001DCF8` (`0x8001DDA8`), from the battle
+    /// anim commit `FUN_8004AD80` whenever an actor's staged clip differs
+    /// from its latched one (`0x8004AE68`), and from the battle tint pass
+    /// `FUN_80050120` over a fading monster (`0x8005040C`).
+    // PORT: FUN_80017910
+    pub fn release_sustained(&self, spu: &mut Spu) -> u8 {
+        let mut st = self.voices.get();
+        let held = st.held;
+        for i in 0..held {
+            let v = (SUSTAINED_BASE_VOICE + i) as usize;
+            if let Some(voice) = spu.voices.get_mut(v) {
+                voice.key_off();
+                spu.record_key_off(v);
+            }
+        }
+        st.held = 0;
+        self.voices.set(st);
+        held
+    }
+
+    /// How many sustained voices the drainer holds (`gp+0x5D0`).
+    pub fn held_sustained(&self) -> u8 {
+        self.voices.get().held
+    }
+
+    // PORT: FUN_80016B6C (the two key-on loops' voice choice,
+    // 0x80016D0C..0x80016DBC one-shot, 0x80016DC4..0x80016E90 sustained)
+    fn play_entry(&self, entry: &SfxEntry, spu: &mut Spu, vab: &VabBank) -> Option<u8> {
+        let voices = entry.voices.max(1);
+        let mut first_voice: Option<u8> = None;
+        let mut key = |voice: usize, i: u8, spu: &mut Spu| {
+            if voice < crate::spu::NUM_VOICES
+                && vab.play_tone(
+                    spu,
+                    voice,
+                    entry.program_index as usize,
+                    entry.tone as usize + i as usize,
+                    entry.key,
+                    entry.vel,
+                )
+            {
+                first_voice.get_or_insert(voice as u8);
+            }
+        };
+        if let Some(v) = entry.voice_pref {
+            for i in 0..voices {
+                key((v as usize + i as usize).min(23), i, spu);
+            }
+            return first_voice;
+        }
+        let mut st = self.voices.get();
+        if entry.sustained {
+            // Release the previous sustained run, then key `7..7 + n`. The
+            // held count is written inside the key-on loop, as retail does.
+            for i in 0..st.held {
+                let v = (SUSTAINED_BASE_VOICE + i) as usize;
+                if let Some(voice) = spu.voices.get_mut(v) {
+                    voice.key_off();
+                    spu.record_key_off(v);
+                }
+            }
+            for i in 0..voices {
+                st.held = voices;
+                key((SUSTAINED_BASE_VOICE + i) as usize, i, spu);
+            }
+        } else {
+            for i in 0..voices {
+                if st.one_shot > st.limit {
+                    st.one_shot = 0;
+                }
+                // Retail stops the voice and re-keys it in the same flush:
+                // the key-on restarts it, whatever it was playing.
+                key((ONE_SHOT_TOP_VOICE - st.one_shot) as usize, i, spu);
+                st.one_shot += 1;
+            }
+        }
+        self.voices.set(st);
+        first_voice
+    }
+}
+
+/// How the cue dispatcher `FUN_8004fcc8` routes a raw cue id.
+///
+/// `FUN_8004fcc8` is the front-end in front of the [`SfxScheduler`]'s cue ring
+/// (`FUN_80035B50`): it classifies the raw id, de-dups UI/SFX cues against the
+/// currently-selected cue, and routes voice ids (`>= 0x100`) to the streamed
+/// voice trigger `FUN_8003D53C` instead. This enum is the pure classification;
+/// the actual ring write, the runtime voice gates (`gp[0xA0C]+0x276 == 0`,
+/// `FUN_8003DE7C(1) == 0`), and the SPU note-on stay with the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CueDispatch {
+    /// A UI / SFX one-shot to enqueue into the cue ring. `ring_value` is the
+    /// value stored (`id - 1` for `id < 0x40`, else `id`); `dedup_key` is what
+    /// the dispatcher compares against the currently-selected cue
+    /// (`DAT_8007B724`) to suppress an immediate repeat - see
+    /// [`CueDispatch::ring_suppressed_by`].
+    Ring { ring_value: u16, dedup_key: i32 },
+    /// A streamed voice trigger (`FUN_8003D53C`). `channel` is the **clip
+    /// slot** after the `1 → 0x1A`, `3 → 0x1B`, `5 → 0x1C` remap;
+    /// `submode = id & 7` is the channel inside that file.
+    ///
+    /// `span_index = id - 0x100` indexes the read-span table `DAT_800788B8`;
+    /// what comes back is the clip starter's **read span** in vsyncs
+    /// ([`voice_clip_span`]), not a playback pitch - the field used to be
+    /// called `pitch_index`, which nothing in either routine supports.
+    Voice {
+        channel: u8,
+        submode: u8,
+        span_index: u16,
+    },
+}
+
+impl CueDispatch {
+    /// For a [`CueDispatch::Ring`] cue, whether the dispatcher suppresses it
+    /// because `current_selection` (`DAT_8007B724`) already equals its
+    /// `dedup_key` (so a held/repeated selection cue doesn't re-fire). Always
+    /// `false` for [`CueDispatch::Voice`].
+    pub fn ring_suppressed_by(&self, current_selection: i32) -> bool {
+        matches!(self, CueDispatch::Ring { dedup_key, .. } if *dedup_key == current_selection)
+    }
+}
+
+/// Classify a raw cue id the way `FUN_8004fcc8` does (the pure decode; no ring
+/// write, no voice gate, no SPU access).
+///
+/// - `id < 0x40` → [`CueDispatch::Ring`] storing `id - 1`, de-dup key `id - 1`.
+/// - `0x40 <= id < 0x100` → [`CueDispatch::Ring`] storing `id`, de-dup key
+///   `id + 0x19C` (the retail `param_1 + 0x19c` compare).
+/// - `id >= 0x100` → [`CueDispatch::Voice`]: `channel = remap((id - 0x100) >> 3)`
+///   (`1 → 0x1A`, `3 → 0x1B`, `5 → 0x1C`), `submode = (id - 0x100) & 7`,
+///   `span_index = id - 0x100`.
+///
+/// PORT: FUN_8004FCC8 (cue dispatch decode; the ring write / voice gate / SPU
+/// note-on stay with the caller - the ring is [`SfxScheduler`] / `FUN_80035B50`).
+pub fn classify_cue(id: u32) -> CueDispatch {
+    if id < 0x100 {
+        if id < 0x40 {
+            let v = id.wrapping_sub(1);
+            CueDispatch::Ring {
+                ring_value: v as u16,
+                dedup_key: v as i32,
+            }
+        } else {
+            CueDispatch::Ring {
+                ring_value: id as u16,
+                dedup_key: (id + 0x19C) as i32,
+            }
+        }
+    } else {
+        let v = id - 0x100;
+        let channel = match v >> 3 {
+            1 => 0x1A,
+            3 => 0x1B,
+            5 => 0x1C,
+            other => other as u8,
+        };
+        CueDispatch::Voice {
+            channel,
+            submode: (v & 7) as u8,
+            span_index: v as u16,
+        }
+    }
+}
+
+/// The clip starter's **read span** for a voice cue: `(raw * 0x3C + 99) / 100`,
+/// the integer round-up of `raw * 0.6`, where `raw` is the `u16` at
+/// `DAT_800788B8[span_index]`.
+///
+/// It is not a pitch, and it used to be named `voice_pitch`. `FUN_8004FCC8`
+/// passes it as the third argument of the CD-XA clip starter (`jal
+/// 0x8003d53c` at `0x8004fd74`, value in `a2`), and `FUN_8003D53C` copies
+/// that argument to `s0`, range-checks it against `0x2A31` (`slti
+/// v0,s0,0x2a31` at `0x8003d5c8`) and stops the drive `(span * 150 + 149) /
+/// 60` sectors past the clip's start. Neither routine touches a pitch
+/// register. The span is denominated in vsyncs (`legaia_game_tables::xa_cue_table`);
+/// `legaia_engine_shell::xa_clip::voice_clip_duration_sectors` and
+/// `legaia_engine_battle_vm::battle_cast_cue::admit_voice_cue` carry the same
+/// arithmetic.
+pub fn voice_clip_span(raw_span: u16) -> u16 {
+    // Retail: `(value * 0x3C + 99) / 100`; the `+ 99` over `/ 100` is the
+    // round-up of `value * 0.6`, i.e. `(value * 0x3C).div_ceil(100)`.
+    (raw_span as u32 * 0x3C).div_ceil(100) as u16
+}
+
+/// One queued cue waiting for its firing frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingCue {
+    /// Cue id (resolved through [`SfxBank`] at fire time).
+    pub id: u16,
+    /// Frames remaining until the cue fires. Zero = fire on next tick.
+    pub frames_remaining: u16,
+    /// Optional source actor slot. Engines surface this through HUD logs.
+    pub actor_slot: Option<u8>,
+    /// Optional target slot.
+    pub target_slot: Option<u8>,
+}
+
+impl PendingCue {
+    pub fn new(id: u16, frames: u16) -> Self {
+        Self {
+            id,
+            frames_remaining: frames,
+            actor_slot: None,
+            target_slot: None,
+        }
+    }
+
+    pub fn with_actors(self, actor: u8, target: u8) -> Self {
+        Self {
+            actor_slot: Some(actor),
+            target_slot: Some(target),
+            ..self
+        }
+    }
+}
+
+/// Result of one [`SfxScheduler::tick_frame`]. Engines drain `fired` to
+/// emit the actual SPU note-ons (or HUD popups for hit-effect cues).
+#[derive(Debug, Default, Clone)]
+pub struct SfxFireBatch {
+    pub fired: Vec<PendingCue>,
+    /// Retail-ring slots that came due this frame, as the **resolved** cue
+    /// ids the ring holds (`DAT_8007B6D8`), in ascending slot order.
+    ///
+    /// Kept apart from [`Self::fired`] because the two id spaces differ: a
+    /// queued [`PendingCue`] still has to go through the router
+    /// (`classify_cue` = `FUN_8004FCC8`), while a ring id is already the
+    /// drainer's input - below `0x200` a `DAT_8006F198` row, at or above it a
+    /// row of the runtime bank. Routing a ring id through `classify_cue`
+    /// would send every runtime-bank cue (`>= 0x200`) to the CD-XA voice leg.
+    pub ring: Vec<i16>,
+}
+
+impl SfxFireBatch {
+    pub fn is_empty(&self) -> bool {
+        self.fired.is_empty() && self.ring.is_empty()
+    }
+
+    /// A batch holding one cue that fires **now**, built without touching any
+    /// [`SfxScheduler`]. A host that has to sound a UI blip on the frame of
+    /// the press (the browser page's menu cues, which it fires outside its
+    /// sim tick) fires this instead of enqueueing and ticking the scheduler:
+    /// ticking there advances every *other* queued cue a frame per blip, which
+    /// the native window - whose menu cues wait for the one per-frame tick -
+    /// never does.
+    pub fn immediate(id: u16) -> Self {
+        Self {
+            fired: vec![PendingCue::new(id, 0)],
+            ring: Vec::new(),
+        }
+    }
+}
+
+/// Frame-driven scheduler.
+///
+/// `enqueue` adds a [`PendingCue`] with a delay; `tick_frame` advances
+/// the clock by one frame and returns any cues whose countdown reached
+/// zero. Cues with `frames_remaining = 0` fire on the *next* tick (so a
+/// cue queued mid-frame doesn't fire immediately and gives the host a
+/// chance to clear render state first).
+#[derive(Debug, Default, Clone)]
+pub struct SfxScheduler {
+    queue: Vec<PendingCue>,
+    ring: crate::sfx_ring::SfxCueRing,
+    frame_step: u8,
+}
+
+impl SfxScheduler {
+    pub fn new() -> Self {
+        Self {
+            queue: Vec::new(),
+            ring: crate::sfx_ring::SfxCueRing::new(),
+            frame_step: 1,
+        }
+    }
+
+    /// Install the adaptive frame step (`DAT_1F800393`) the **retail ring**
+    /// ages by. Defaults to `1`; field play runs at `2`
+    /// (`legaia_engine_vm::actor_tick::FrameCadence::FIELD`). Only the ring
+    /// half reads it - the approximate [`Self::enqueue`] queue is still
+    /// per-tick, which is the difference the ring exists to remove.
+    pub fn set_frame_step(&mut self, step: u8) {
+        self.frame_step = step.max(1);
+    }
+
+    /// Write a cue into a slot of the byte-faithful retail ring
+    /// ([`crate::sfx_ring::SfxCueRing`]), with its delay in **vsyncs**.
+    ///
+    /// This is the retail producer contract: four slots, the producer picks
+    /// the slot, a fifth cue replaces one. [`Self::tick_frame`] ages the ring
+    /// and folds any due cue into the same [`SfxFireBatch`].
+    pub fn arm_ring_cue(&mut self, slot: usize, id: i16, delay_vsyncs: i32) {
+        self.ring.arm(slot, id, delay_vsyncs);
+    }
+
+    /// The retail enqueue: write `id` into the ring slot the round-robin
+    /// cursor names, zero its delay, advance the cursor
+    /// ([`crate::sfx_ring::SfxCueRing::push_cue`]). Returns the slot written.
+    pub fn push_ring_cue(&mut self, id: i16) -> usize {
+        self.ring.push_cue(id)
+    }
+
+    /// Store `id` straight into ring slot `slot`
+    /// ([`crate::sfx_ring::SfxCueRing::write_id`]).
+    pub fn write_ring_slot(&mut self, slot: usize, id: i16) {
+        self.ring.write_id(slot, id);
+    }
+
+    /// Write both cells of ring slot `slot` - the id and its countdown in
+    /// vsyncs ([`crate::sfx_ring::SfxCueRing::arm`]).
+    pub fn arm_ring_slot(&mut self, slot: usize, id: i16, delay_vsyncs: i32) {
+        self.ring.arm(slot, id, delay_vsyncs);
+    }
+
+    /// Set the delay (vsyncs) of the slot the last [`Self::push_ring_cue`]
+    /// wrote ([`crate::sfx_ring::SfxCueRing::set_last_delay`]).
+    pub fn set_ring_cue_delay(&mut self, delay: i16) {
+        self.ring.set_last_delay(delay);
+    }
+
+    /// Overwrite the last pushed ring cue in place
+    /// ([`crate::sfx_ring::SfxCueRing::replace_last`]).
+    pub fn replace_ring_cue(&mut self, id: i16) {
+        self.ring.replace_last(id);
+    }
+
+    /// Borrow the retail ring (inspection / tests).
+    pub fn ring(&self) -> &crate::sfx_ring::SfxCueRing {
+        &self.ring
+    }
+
+    /// Queue a cue. The cue fires when `frames_remaining` reaches zero
+    /// during a [`Self::tick_frame`] call.
+    ///
+    /// This is a port-side scheduler, not a retail routine: an unbounded
+    /// queue with a per-cue countdown in ticks, which the battle cue timing
+    /// (`HitCue::timing_frames`) and the host SFX fronts ride. The retail
+    /// four-slot enqueue `FUN_80035B50` - one fixed cursor, the delay zeroed,
+    /// a fifth cue overwriting the first - is [`Self::push_ring_cue`].
+    pub fn enqueue(&mut self, cue: PendingCue) {
+        self.queue.push(cue);
+    }
+
+    /// Bulk-queue several cues from a slice of `(id, frames)` pairs.
+    pub fn enqueue_all<I: IntoIterator<Item = PendingCue>>(&mut self, cues: I) {
+        self.queue.extend(cues);
+    }
+
+    /// Number of cues still waiting to fire.
+    pub fn pending_count(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Advance the clock by one frame. Returns the cues whose
+    /// `frames_remaining` reached zero this tick (in queue order), followed
+    /// by any retail-ring slot that came due this frame.
+    ///
+    /// The ring half runs the exact retail order - age
+    /// (`FUN_8001698C`), then drain (`FUN_80016B6C`) - so a ring cue fires on
+    /// the frame its countdown first reads zero and is cleared before the next
+    /// drain can see it. See [`crate::sfx_ring`].
+    pub fn tick_frame(&mut self) -> SfxFireBatch {
+        let mut batch = SfxFireBatch::default();
+        // Decrement, partition into fired vs. still-pending.
+        let mut still = Vec::with_capacity(self.queue.len());
+        for mut cue in self.queue.drain(..) {
+            if cue.frames_remaining == 0 {
+                batch.fired.push(cue);
+            } else {
+                cue.frames_remaining -= 1;
+                if cue.frames_remaining == 0 {
+                    // Just hit zero - fire on the *next* tick (matches
+                    // retail timing where a `timing_frames = 1` cue plays
+                    // one frame after the strike begins).
+                    still.push(cue);
+                } else {
+                    still.push(cue);
+                }
+            }
+        }
+        self.queue = still;
+
+        // The retail ring pair, phase-rotated for a host that arms *before*
+        // the tick instead of in the middle of one.
+        //
+        // Retail's frame is age (FUN_8001698C) -> game logic, which is where
+        // FUN_80035B50 arms a slot with timer 0 -> drain (FUN_80016B6C). So a
+        // cue armed on frame N is drained on frame N, and cleared by frame
+        // N+1's aging pass. Here the host arms and *then* calls this, so
+        // draining first and ageing after reproduces exactly that schedule:
+        // delay 0 fires on this tick, delay d fires d ticks later, and the
+        // slot is cleared before it can fire twice. Ageing first would
+        // clear a just-armed delay-0 cue before it ever played.
+        batch.ring.extend(self.ring.drain().map(|(_slot, id)| id));
+        self.ring.age(self.frame_step);
+        batch
+    }
+
+    /// Drop every queued cue. Engines call this on scene transitions /
+    /// battle abort.
+    pub fn clear(&mut self) {
+        self.queue.clear();
+        self.ring.clear();
+    }
+}
+
+/// The eight arguments of retail's explicit voice key-on, `SsUtKeyOnV`
+/// (`FUN_80065034`), in the order it takes them.
+///
+/// The catalog path above ([`SfxBank::play_one_shot`]) covers a cue that
+/// names itself by **id** and looks its parameters up. This is the other
+/// shape: a caller that already knows the program, tone, note and volume and
+/// wants a specific voice slot keyed - the Muscle Dome tally roll's per-lane
+/// cue (`FUN_801D1288`, whose resolved call
+/// `legaia_engine_minigames::other_game_overlay::VoiceAttrCue` carries) is one, and
+/// the SCUS cue drainer `FUN_80016B6C` fills the same eight slots from a cue
+/// descriptor.
+///
+/// Argument order read off `0x80065034..0x80065120`: `a0` = voice (bounded
+/// `sltiu v0,v0,0x18`, so slots `0..=23`), `a1` = **VAB id** (sign-extended
+/// into the program-attr lookup `jal 0x80068B98`, *not* a mixer level),
+/// `a2` = program, `a3` = tone, then four stack words - `sp+0x50` note,
+/// `sp+0x54` fine, `sp+0x58` `vol_l`, `sp+0x5C` `vol_r`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoiceAttr {
+    /// `a0` - SPU voice slot. Retail rejects `>= 24`.
+    pub voice: u8,
+    /// `a1` - VAB id the program/tone pair is resolved against. The port
+    /// resolves against the [`VabBank`] the caller hands in, so this is
+    /// carried for provenance and compared against nothing.
+    pub vab_id: i16,
+    /// `a2` - program within the bank.
+    pub program: u8,
+    /// `a3` - tone / ADSR region index within the program (an index, like
+    /// every other SFX-path tone; see [`VabBank::play_tone`]).
+    pub tone: u8,
+    /// `sp+0x50` - note the voice is keyed at.
+    pub note: u8,
+    /// `sp+0x54` - the pitch fine-tune byte (`0x40` at every retail call
+    /// site). Carried; the port's pitch math is [`VabBank::play_tone`]'s.
+    pub fine: i16,
+    /// `sp+0x58` / `sp+0x5C` - left / right volume, `0..=127`.
+    pub vol_l: i16,
+    pub vol_r: i16,
+}
+
+impl VoiceAttr {
+    /// The velocity the key-on chain reads: the **larger** half of the
+    /// volume pair (`0x80065100..0x80065118` stores `vol_l`, or `vol_r` when
+    /// it is the bigger one), clamped into `0..=127`. The ratio of the two is
+    /// a staged pan, not folded in here ([`crate::vab_bind::cue_volume_pair`]).
+    pub fn velocity(&self) -> u8 {
+        crate::vab_bind::cue_volume_pair(self.vol_l, self.vol_r).0
+    }
+
+    /// Narrow one resolved voice-attr call - the eight arguments retail's
+    /// `FUN_80065034` takes, in the widths its callers compute them at - into
+    /// this struct.
+    ///
+    /// The arena tally cue (`legaia_engine_minigames::other_game_overlay`) resolves
+    /// its arguments as `u32` / `i32` because that is how the overlay computes
+    /// them; every host then has to narrow the same eight slots the same way
+    /// before it can key a voice. Three hosts each spelled that narrowing out
+    /// by hand, which is three places for the voice-slot clamp to drift - and
+    /// the clamp is not cosmetic: retail rejects a voice slot at or above
+    /// [`NUM_VOICES`](crate::spu::NUM_VOICES), so a host that let one through
+    /// would key nothing and report success.
+    ///
+    /// The tuples are grouped as the cue carries them: `(vab_id, program,
+    /// tone)`, `(note, fine)`, `(vol_l, vol_r)`.
+    pub fn from_cue_words(
+        voice: u32,
+        vab_program_tone: (i32, i32, i32),
+        note_and_fine: (i32, i32),
+        volume: (i32, i32),
+    ) -> Self {
+        Self {
+            voice: voice.min(crate::spu::NUM_VOICES as u32 - 1) as u8,
+            vab_id: vab_program_tone.0 as i16,
+            program: vab_program_tone.1 as u8,
+            tone: vab_program_tone.2 as u8,
+            note: note_and_fine.0 as u8,
+            fine: note_and_fine.1 as i16,
+            vol_l: volume.0 as i16,
+            vol_r: volume.1 as i16,
+        }
+    }
+}
+
+/// Key one voice from an explicit [`VoiceAttr`] set.
+///
+/// Returns `false` for retail's own rejection (voice slot `>= 24`) and for the
+/// port's (the bank holds no such program / tone / sample).
+///
+/// PORT: FUN_80065034 (voice reject, volume-pair split and key-on only)
+///
+/// Partial. Not carried: the `vag == 0xFF` arm (`0x80065358`), the `fine`
+/// argument the pitch call takes (`0x80065370`, here the fixed cue fine),
+/// the per-voice record stores (owner, vab, program, tone, note, reserved
+/// flag, age; `0x800652c0..0x80065334`), the re-entry lock at `0x801CD2B4`
+/// and the bank select through `0x80068B98` - the caller passes the bank.
+///
+/// The record stores are what would matter audibly: they hand the voice to
+/// owner `0x21` with the tone's priority and the reserved flag, so the BGM
+/// allocator `FUN_80066B00` treats it as taken. Only the minigames' direct
+/// voice cues reach this routine, and the key-on census on the casino floor,
+/// Baka Fighter and dance states matches retail key-on for key-on without
+/// them, so they stay out until a capture shows a cue and a BGM note
+/// contending for one voice.
+pub fn key_on_voice_attr(attr: &VoiceAttr, spu: &mut Spu, vab: &VabBank) -> bool {
+    if usize::from(attr.voice) >= 24 {
+        return false;
+    }
+    vab.play_tone_pair(
+        spu,
+        usize::from(attr.voice),
+        usize::from(attr.program),
+        usize::from(attr.tone),
+        attr.note,
+        attr.vol_l,
+        attr.vol_r,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The eight cue arguments narrow in ONE place, and the voice-slot clamp
+    /// is the reason: retail rejects a slot at or above `NUM_VOICES`, so a
+    /// host that let one through would key nothing and report success. Three
+    /// hosts each spelled this out by hand before.
+    #[test]
+    fn cue_words_narrow_and_clamp_the_voice_slot() {
+        let a = VoiceAttr::from_cue_words(7, (1, 2, 3), (60, 0x40), (100, 100));
+        assert_eq!(a.voice, 7);
+        assert_eq!((a.vab_id, a.program, a.tone), (1, 2, 3));
+        assert_eq!((a.note, a.fine), (60, 0x40));
+        assert_eq!((a.vol_l, a.vol_r), (100, 100));
+        // An out-of-range slot lands on the last real voice rather than
+        // wrapping through `as u8` into a slot the SPU does have.
+        let b = VoiceAttr::from_cue_words(999, (0, 0, 0), (0, 0), (0, 0));
+        assert_eq!(b.voice, crate::spu::NUM_VOICES as u8 - 1);
+        assert!(usize::from(b.voice) < crate::spu::NUM_VOICES);
+    }
+
+    #[test]
+    fn bank_insert_and_get_round_trip() {
+        let mut bank = SfxBank::new();
+        bank.insert(SfxEntry::new(0x1A, 3, 72));
+        let e = bank.get(0x1A).unwrap();
+        assert_eq!(e.program_index, 3);
+        assert_eq!(e.key, 72);
+        assert_eq!(e.vel, 100);
+        assert!(e.voice_pref.is_none());
+    }
+
+    #[test]
+    fn bank_insert_overwrites_existing() {
+        let mut bank = SfxBank::new();
+        bank.insert(SfxEntry::new(0x1A, 0, 60));
+        bank.insert(SfxEntry::new(0x1A, 5, 70).with_vel(80));
+        let e = bank.get(0x1A).unwrap();
+        assert_eq!(e.program_index, 5);
+        assert_eq!(e.vel, 80);
+        assert_eq!(bank.len(), 1);
+    }
+
+    #[test]
+    fn bank_vanilla_has_two_default_entries() {
+        let bank = SfxBank::vanilla();
+        assert!(bank.get(0x1A).is_some());
+        assert!(bank.get(0x4C).is_some());
+        assert!(bank.get(0xFF).is_none());
+    }
+
+    #[test]
+    fn bank_from_descriptors_maps_program_tone_and_key() {
+        // Mirrors the retail descriptors for ids 0x1A (p3 tone8 note67 v1) and
+        // 0x4C (p3 tone8 note64 v2) decoded from DAT_8006F198.
+        let bank = SfxBank::from_descriptors([(0x1A, 3, 8, 67, 1), (0x4C, 3, 8, 64, 2)]);
+        assert_eq!(bank.len(), 2);
+        let a = bank.get(0x1A).unwrap();
+        assert_eq!((a.program_index, a.tone, a.key, a.voices), (3, 8, 67, 1));
+        let b = bank.get(0x4C).unwrap();
+        assert_eq!((b.program_index, b.tone, b.key, b.voices), (3, 8, 64, 2));
+        // A zero voice-count clamps to 1 (still fires one voice).
+        let clamped = SfxBank::from_descriptors([(0x10, 0, 0, 60, 0)]);
+        assert_eq!(clamped.get(0x10).unwrap().voices, 1);
+        // Later tuple overwrites an earlier same-id one.
+        let over = SfxBank::from_descriptors([(0x1A, 1, 0, 10, 1), (0x1A, 9, 2, 90, 1)]);
+        assert_eq!(over.len(), 1);
+        assert_eq!(over.get(0x1A).unwrap().program_index, 9);
+        assert_eq!(over.get(0x1A).unwrap().tone, 2);
+    }
+
+    #[test]
+    fn bank_with_vel_and_with_voice_chain() {
+        let e = SfxEntry::new(0x1A, 0, 60).with_vel(127).with_voice(7);
+        assert_eq!(e.vel, 127);
+        assert_eq!(e.voice_pref, Some(7));
+    }
+
+    #[test]
+    fn scheduler_empty_tick_returns_no_fires() {
+        let mut s = SfxScheduler::new();
+        let batch = s.tick_frame();
+        assert!(batch.is_empty());
+        assert_eq!(s.pending_count(), 0);
+    }
+
+    #[test]
+    fn scheduler_immediate_cue_fires_on_first_tick() {
+        let mut s = SfxScheduler::new();
+        s.enqueue(PendingCue::new(0x1A, 0));
+        let batch = s.tick_frame();
+        assert_eq!(batch.fired.len(), 1);
+        assert_eq!(batch.fired[0].id, 0x1A);
+    }
+
+    /// An immediate batch fires its one cue and leaves the queue's clock
+    /// alone: a delayed cue already waiting still needs its full count of
+    /// ticks afterwards.
+    #[test]
+    fn immediate_batch_does_not_age_the_queue() {
+        let mut s = SfxScheduler::new();
+        s.enqueue(PendingCue::new(0x2E, 2));
+        let blip = SfxFireBatch::immediate(0x21);
+        assert_eq!(blip.fired.len(), 1);
+        assert_eq!(blip.fired[0].id, 0x21);
+        assert!(blip.ring.is_empty());
+        // The waiting cue still takes 2 -> 1 -> 0 -> fire: three ticks.
+        assert!(s.tick_frame().fired.is_empty());
+        assert!(s.tick_frame().fired.is_empty());
+        assert_eq!(s.tick_frame().fired.len(), 1);
+    }
+
+    #[test]
+    fn scheduler_delayed_cue_waits_n_frames() {
+        let mut s = SfxScheduler::new();
+        s.enqueue(PendingCue::new(0x1A, 3));
+        // Tick 1: 3 -> 2, no fire.
+        // Tick 2: 2 -> 1, no fire.
+        // Tick 3: 1 -> 0, no fire.
+        // Tick 4: 0 fires.
+        for _ in 0..3 {
+            assert!(s.tick_frame().fired.is_empty());
+        }
+        let batch = s.tick_frame();
+        assert_eq!(batch.fired.len(), 1);
+    }
+
+    #[test]
+    fn scheduler_preserves_queue_order_on_simultaneous_fire() {
+        let mut s = SfxScheduler::new();
+        s.enqueue(PendingCue::new(0x10, 0));
+        s.enqueue(PendingCue::new(0x20, 0));
+        s.enqueue(PendingCue::new(0x30, 0));
+        let batch = s.tick_frame();
+        let ids: Vec<u16> = batch.fired.iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![0x10, 0x20, 0x30]);
+    }
+
+    #[test]
+    fn scheduler_clear_drops_pending() {
+        let mut s = SfxScheduler::new();
+        s.enqueue(PendingCue::new(0x1A, 5));
+        s.enqueue(PendingCue::new(0x4C, 10));
+        assert_eq!(s.pending_count(), 2);
+        s.clear();
+        assert_eq!(s.pending_count(), 0);
+        assert!(s.tick_frame().is_empty());
+    }
+
+    #[test]
+    fn scheduler_actor_slots_propagate_through_fire() {
+        let mut s = SfxScheduler::new();
+        s.enqueue(PendingCue::new(0x1A, 0).with_actors(2, 5));
+        let batch = s.tick_frame();
+        assert_eq!(batch.fired[0].actor_slot, Some(2));
+        assert_eq!(batch.fired[0].target_slot, Some(5));
+    }
+
+    #[test]
+    fn scheduler_long_delay_does_not_fire_early() {
+        let mut s = SfxScheduler::new();
+        s.enqueue(PendingCue::new(0x1A, 60));
+        for _ in 0..60 {
+            assert!(s.tick_frame().fired.is_empty());
+        }
+        assert_eq!(s.tick_frame().fired.len(), 1);
+    }
+
+    #[test]
+    fn ring_cue_fires_once_through_the_scheduler_and_is_then_cleared() {
+        let mut s = SfxScheduler::new();
+        s.arm_ring_cue(0, 0x1A, 0);
+        let b = s.tick_frame();
+        assert_eq!(b.ring, vec![0x1A], "delay 0 fires on the arming frame");
+        assert!(b.fired.is_empty(), "ring ids never enter the router queue");
+        assert!(
+            s.tick_frame().is_empty(),
+            "the aging pass cleared the slot - a ring cue never repeats"
+        );
+    }
+
+    #[test]
+    fn ring_delay_is_denominated_in_vsyncs_not_ticks() {
+        let mut s = SfxScheduler::new();
+        // Field cadence: one tick spans two vsyncs.
+        s.set_frame_step(2);
+        s.arm_ring_cue(1, 0x33, 4);
+        assert!(s.tick_frame().is_empty());
+        assert!(s.tick_frame().is_empty());
+        assert_eq!(
+            s.tick_frame().ring,
+            vec![0x33],
+            "4 vsyncs at cadence 2 = 2 ticks"
+        );
+    }
+
+    #[test]
+    fn scheduler_clear_empties_the_ring_too() {
+        let mut s = SfxScheduler::new();
+        s.arm_ring_cue(2, 0x40, 0);
+        s.clear();
+        assert!(s.tick_frame().is_empty());
+    }
+
+    /// The field VM's scripted pair `36 00 80 <id>` / `36 04 80 <delay>` is
+    /// `FUN_80035B50(id)` then `FUN_80035BAC(delay)`: the second call lands on
+    /// the slot the first one wrote, so the cue plays `delay` vsyncs later -
+    /// and a runtime-bank id (`>= 0x200`) comes out of the ring untouched.
+    #[test]
+    fn a_pushed_cue_with_a_delay_fires_on_its_frame_with_its_raw_id() {
+        let mut s = SfxScheduler::new();
+        s.set_frame_step(2);
+        s.push_ring_cue(0x1C);
+        s.push_ring_cue(0x1C);
+        s.set_ring_cue_delay(0x0C);
+        assert_eq!(s.tick_frame().ring, vec![0x1C], "the undelayed first push");
+        for _ in 0..5 {
+            assert!(s.tick_frame().is_empty());
+        }
+        assert_eq!(s.tick_frame().ring, vec![0x1C], "12 vsyncs at cadence 2");
+        s.push_ring_cue(0x20B);
+        assert_eq!(s.tick_frame().ring, vec![0x20B]);
+    }
+
+    #[test]
+    fn scheduler_mixed_delays_fire_in_correct_frames() {
+        let mut s = SfxScheduler::new();
+        s.enqueue(PendingCue::new(0xA, 1));
+        s.enqueue(PendingCue::new(0xB, 3));
+        s.enqueue(PendingCue::new(0xC, 0));
+        // Frame 1: C fires.
+        let f1 = s.tick_frame();
+        assert_eq!(f1.fired.len(), 1);
+        assert_eq!(f1.fired[0].id, 0xC);
+        // Frame 2: A fires.
+        let f2 = s.tick_frame();
+        assert_eq!(f2.fired.len(), 1);
+        assert_eq!(f2.fired[0].id, 0xA);
+        // Frame 3: nothing.
+        assert!(s.tick_frame().fired.is_empty());
+        // Frame 4: B fires.
+        let f4 = s.tick_frame();
+        assert_eq!(f4.fired.len(), 1);
+        assert_eq!(f4.fired[0].id, 0xB);
+    }
+
+    #[test]
+    fn classify_cue_low_range_stores_id_minus_one() {
+        // id < 0x40: ring_value = id - 1, dedup_key = id - 1.
+        match classify_cue(0x05) {
+            CueDispatch::Ring {
+                ring_value,
+                dedup_key,
+            } => {
+                assert_eq!(ring_value, 4);
+                assert_eq!(dedup_key, 4);
+            }
+            _ => panic!("expected Ring"),
+        }
+        // id 0 underflows to 0xFFFF / -1 (mirrors the retail uint - 1).
+        match classify_cue(0) {
+            CueDispatch::Ring {
+                ring_value,
+                dedup_key,
+            } => {
+                assert_eq!(ring_value, 0xFFFF);
+                assert_eq!(dedup_key, -1);
+            }
+            _ => panic!("expected Ring"),
+        }
+    }
+
+    #[test]
+    fn classify_cue_high_range_stores_id_with_offset_dedup() {
+        // 0x40..0x100: ring_value = id, dedup_key = id + 0x19C.
+        match classify_cue(0x50) {
+            CueDispatch::Ring {
+                ring_value,
+                dedup_key,
+            } => {
+                assert_eq!(ring_value, 0x50);
+                assert_eq!(dedup_key, 0x50 + 0x19C);
+            }
+            _ => panic!("expected Ring"),
+        }
+    }
+
+    #[test]
+    fn classify_cue_voice_range_remaps_channel() {
+        // id >= 0x100: voice. v = id - 0x100; channel = remap(v >> 3),
+        // submode = v & 7, span_index = v.
+        // v = 8 -> v>>3 = 1 -> channel 0x1A; submode 0; span_index 8.
+        match classify_cue(0x108) {
+            CueDispatch::Voice {
+                channel,
+                submode,
+                span_index,
+            } => {
+                assert_eq!(channel, 0x1A);
+                assert_eq!(submode, 0);
+                assert_eq!(span_index, 8);
+            }
+            _ => panic!("expected Voice"),
+        }
+        // v = 0x1B -> v>>3 = 3 -> channel 0x1B; submode 3.
+        match classify_cue(0x100 + 0x1B) {
+            CueDispatch::Voice {
+                channel, submode, ..
+            } => {
+                assert_eq!(channel, 0x1B);
+                assert_eq!(submode, 3);
+            }
+            _ => panic!("expected Voice"),
+        }
+        // v = 0x28 -> v>>3 = 5 -> channel 0x1C.
+        match classify_cue(0x128) {
+            CueDispatch::Voice { channel, .. } => assert_eq!(channel, 0x1C),
+            _ => panic!("expected Voice"),
+        }
+        // v = 0x10 -> v>>3 = 2 (no remap) -> channel 2.
+        match classify_cue(0x110) {
+            CueDispatch::Voice { channel, .. } => assert_eq!(channel, 2),
+            _ => panic!("expected Voice"),
+        }
+    }
+
+    #[test]
+    fn cue_ring_suppression_matches_current_selection() {
+        let cue = classify_cue(0x05); // dedup_key = 4
+        assert!(cue.ring_suppressed_by(4));
+        assert!(!cue.ring_suppressed_by(3));
+        // Voice cues are never ring-suppressed.
+        assert!(!classify_cue(0x108).ring_suppressed_by(0));
+    }
+
+    #[test]
+    fn voice_clip_span_rounds_up_times_point_six() {
+        // (100 * 0x3C + 99) / 100 = (6000 + 99)/100 = 60.
+        assert_eq!(voice_clip_span(100), 60);
+        // (1 * 60 + 99)/100 = 159/100 = 1 (round-up of 0.6).
+        assert_eq!(voice_clip_span(1), 1);
+        assert_eq!(voice_clip_span(0), 0);
+        // (200*60+99)/100 = 12099/100 = 120.
+        assert_eq!(voice_clip_span(200), 120);
+        // The two captured casts: raw 1143 -> 686 vsyncs, raw 946 -> 568.
+        assert_eq!(voice_clip_span(1143), 686);
+        assert_eq!(voice_clip_span(946), 568);
+    }
+
+    #[test]
+    fn play_one_shot_keys_on_a_voice_through_an_uploaded_bank() {
+        use crate::spu::Spu;
+        use crate::vab_bind::{UploadedVag, VabBank, VabProgram};
+        use legaia_vab::VagAtr;
+
+        // Minimal one-program bank: a single tone covering every note, bound
+        // to VAG #1 (1-based, so samples[0]).
+        let tone = VagAtr {
+            prior: 0,
+            mode: 0,
+            vol: 127,
+            pan: 64,
+            center: 60,
+            shift: 0,
+            min: 0,
+            max: 127,
+            vibw: 0,
+            vibt: 0,
+            porw: 0,
+            port: 0,
+            pbmin: 0,
+            pbmax: 0,
+            reserved1: 0,
+            reserved2: 0,
+            adsr1: 0,
+            adsr2: 0,
+            prog: 0,
+            vag: 1,
+            reserved3: [0; 4],
+        };
+        let vab = VabBank {
+            master_vol: 127,
+            samples: vec![Some(UploadedVag {
+                addr: 0x1010,
+                size: 0x20,
+            })],
+            programs: vec![VabProgram {
+                mvol: 0x7F,
+                mpan: 0x40,
+                tones: vec![tone],
+                key_tones: legaia_vab::TONES_PER_PROGRAM as u8,
+            }],
+        };
+        let mut spu = Spu::new();
+
+        // Bank maps cue 0x1A -> program 0, tone 0, note 60, 1 voice. Firing
+        // it keys the drainer's first one-shot voice, 23.
+        let bank = SfxBank::from_descriptors([(0x1A, 0, 0, 60, 1)]);
+        let voice = bank.play_one_shot(0x1A, &mut spu, &vab);
+        assert_eq!(voice, Some(23), "the drainer's first one-shot voice");
+        assert!(!spu.voices[23].is_off(), "voice 23 is now playing");
+
+        // A cue id not in the bank is a no-op and never touches the SPU.
+        assert_eq!(bank.play_one_shot(0x4C, &mut spu, &vab), None);
+    }
+
+    /// The core regression this fix targets: a cue whose descriptor `note`
+    /// falls OUTSIDE the target tone's authored `min..=max` key window still
+    /// sounds, because the SFX path resolves the tone by explicit **index**
+    /// (`play_tone`), not by the sequencer's key-range window (`play_note`).
+    /// This mirrors the retail strike cue `0x1A` (program 3 / tone 8 / note
+    /// 67), whose tone's window excludes 67.
+    #[test]
+    fn play_one_shot_resolves_tone_by_index_not_key_range() {
+        use crate::spu::Spu;
+        use crate::vab_bind::{UploadedVag, VabBank, VabProgram};
+        use legaia_vab::VagAtr;
+
+        let mk = |center: u8, min: u8, max: u8| VagAtr {
+            prior: 0,
+            mode: 0,
+            vol: 127,
+            pan: 64,
+            center,
+            shift: 0,
+            min,
+            max,
+            vibw: 0,
+            vibt: 0,
+            porw: 0,
+            port: 0,
+            pbmin: 0,
+            pbmax: 0,
+            reserved1: 0,
+            reserved2: 0,
+            adsr1: 0,
+            adsr2: 0,
+            prog: 0,
+            vag: 1,
+            reserved3: [0; 4],
+        };
+        // Program 0 has two tones. The cue targets tone index 1, whose key
+        // window is 0..=40 - which does NOT contain the descriptor note 67.
+        let vab = VabBank {
+            master_vol: 127,
+            samples: vec![Some(UploadedVag {
+                addr: 0x1010,
+                size: 0x20,
+            })],
+            programs: vec![VabProgram {
+                mvol: 0x7F,
+                mpan: 0x40,
+                tones: vec![mk(60, 50, 60), mk(30, 0, 40)],
+                key_tones: legaia_vab::TONES_PER_PROGRAM as u8,
+            }],
+        };
+        let bank = SfxBank::from_descriptors([(0x1A, 0, 1, 67, 1)]);
+
+        // Key-range lookup would miss tone 1 (67 outside 0..=40) -> silence.
+        let mut spu_kr = Spu::new();
+        assert!(
+            !vab.play_note(&mut spu_kr, 0, 0, 67, 100),
+            "key-range resolve finds no tone for note 67 (the silence bug)"
+        );
+
+        // The one-shot path resolves tone index 1 directly and sounds.
+        let mut spu = Spu::new();
+        let voice = bank.play_one_shot(0x1A, &mut spu, &vab);
+        assert_eq!(voice, Some(23), "tone-index resolve keys on a voice");
+        assert!(!spu.voices[23].is_off(), "voice 23 plays");
+    }
+
+    /// A multi-voice cue keys `voices` consecutive regions on the
+    /// drainer's descending one-shot voices (`FUN_80016B6C`'s `tone + i`
+    /// fan-out over `23 - cursor`).
+    #[test]
+    fn play_one_shot_multi_voice_keys_consecutive_regions() {
+        use crate::spu::Spu;
+        use crate::vab_bind::{UploadedVag, VabBank, VabProgram};
+        use legaia_vab::VagAtr;
+
+        let tone = |center: u8| VagAtr {
+            prior: 0,
+            mode: 0,
+            vol: 127,
+            pan: 64,
+            center,
+            shift: 0,
+            min: 0,
+            max: 127,
+            vibw: 0,
+            vibt: 0,
+            porw: 0,
+            port: 0,
+            pbmin: 0,
+            pbmax: 0,
+            reserved1: 0,
+            reserved2: 0,
+            adsr1: 0,
+            adsr2: 0,
+            prog: 0,
+            vag: 1,
+            reserved3: [0; 4],
+        };
+        let vab = VabBank {
+            master_vol: 127,
+            samples: vec![Some(UploadedVag {
+                addr: 0x1010,
+                size: 0x20,
+            })],
+            programs: vec![VabProgram {
+                mvol: 0x7F,
+                mpan: 0x40,
+                tones: vec![tone(60), tone(48), tone(72)],
+                key_tones: legaia_vab::TONES_PER_PROGRAM as u8,
+            }],
+        };
+        let mut spu = Spu::new();
+        // Cue 0x4C: program 0, tone base 0, note 64, 2 voices -> regions 0 & 1
+        // key on voices 23 & 22.
+        let bank = SfxBank::from_descriptors([(0x4C, 0, 0, 64, 2)]);
+        let voice = bank.play_one_shot(0x4C, &mut spu, &vab);
+        assert_eq!(voice, Some(23), "first voice returned");
+        assert!(!spu.voices[23].is_off(), "voice 23 playing");
+        assert!(
+            !spu.voices[22].is_off(),
+            "voice 22 playing (2nd of the cue)"
+        );
+        assert!(spu.voices[21].is_off(), "only two voices keyed");
+
+        // A runtime-bank row (`>= 0x200`, the scene's prescript record 0)
+        // keys the same way off its raw bytes; category and trailer ride
+        // along unread.
+        let mut spu = Spu::new();
+        let fresh = SfxBank::new();
+        let row = [0u8, 1, 64, 2, 3, 0, 0, 0];
+        assert_eq!(fresh.play_descriptor(&row, &mut spu, &vab), Some(23));
+        assert!(!spu.voices[22].is_off() && spu.voices[21].is_off());
+        // `n & 0x1F == 0` keys nothing (the drainer's skip at 0x80016D04).
+        let mut spu = Spu::new();
+        let silent = [0u8, 1, 64, 0x00, 3, 0, 0, 0];
+        assert_eq!(
+            SfxBank::new().play_descriptor(&silent, &mut spu, &vab),
+            None
+        );
+        assert!(spu.voices.iter().all(|v| v.is_off()));
+    }
+
+    fn one_tone_bank() -> crate::vab_bind::VabBank {
+        use crate::vab_bind::{UploadedVag, VabBank, VabProgram};
+        let tone = legaia_vab::VagAtr {
+            prior: 0,
+            mode: 0,
+            vol: 127,
+            pan: 64,
+            center: 60,
+            shift: 0,
+            min: 0,
+            max: 127,
+            vibw: 0,
+            vibt: 0,
+            porw: 0,
+            port: 0,
+            pbmin: 0,
+            pbmax: 0,
+            reserved1: 0,
+            reserved2: 0,
+            adsr1: 0,
+            adsr2: 0,
+            prog: 0,
+            vag: 1,
+            reserved3: [0; 4],
+        };
+        VabBank {
+            master_vol: 127,
+            samples: vec![Some(UploadedVag {
+                addr: 0x1010,
+                size: 0x20,
+            })],
+            programs: vec![VabProgram {
+                mvol: 0x7F,
+                mpan: 0x40,
+                tones: vec![tone; 4],
+                key_tones: legaia_vab::TONES_PER_PROGRAM as u8,
+            }],
+        }
+    }
+
+    /// The drainer's one-shot cursor (`gp+0x4BC`) rolls `23, 22, 21, 20`
+    /// and wraps once it exceeds the limit - so a burst of hits re-keys the
+    /// same four voices, newest cutting oldest, and never needs an idle one.
+    /// In the field (game modes 3 / 0x17) the limit is 1: voices 23, 22.
+    #[test]
+    fn one_shots_roll_down_from_voice_23_and_wrap_past_the_limit() {
+        let vab = one_tone_bank();
+        let mut spu = crate::spu::Spu::new();
+        let bank = SfxBank::from_descriptors([(0x1A, 0, 0, 60, 1)]);
+        let seq: Vec<_> = (0..6)
+            .map(|_| bank.play_one_shot(0x1A, &mut spu, &vab).unwrap())
+            .collect();
+        assert_eq!(seq, [23, 22, 21, 20, 23, 22]);
+        assert!(spu.voices[..20].iter().all(|v| v.is_off()));
+
+        let bank = SfxBank::from_descriptors([(0x1A, 0, 0, 60, 1)]);
+        bank.set_field_family(true);
+        let seq: Vec<_> = (0..4)
+            .map(|_| bank.play_one_shot(0x1A, &mut spu, &vab).unwrap())
+            .collect();
+        assert_eq!(seq, [23, 22, 23, 22]);
+    }
+
+    /// A sustained cue (`+3 & 0x20`) keys `7..7 + n` and releases the
+    /// previous sustained run first; it does not move the one-shot cursor.
+    #[test]
+    fn sustained_cues_key_from_voice_7_and_release_the_previous_run() {
+        use crate::spu::adsr::Phase;
+        let vab = one_tone_bank();
+        let mut spu = crate::spu::Spu::new();
+        let bank = SfxBank::from_descriptors([
+            (0x1D, 0, 0, 60, 0x23),
+            (0x1E, 0, 0, 60, 0x21),
+            (0x1A, 0, 0, 60, 1),
+        ]);
+        assert!(bank.get(0x1D).unwrap().sustained);
+        assert_eq!(bank.get(0x1D).unwrap().voices, 3);
+        assert_eq!(bank.play_one_shot(0x1D, &mut spu, &vab), Some(7));
+        assert!((7..10).all(|v| spu.voices[v].adsr.phase == Phase::Attack));
+        assert_eq!(bank.play_one_shot(0x1A, &mut spu, &vab), Some(23));
+        // The next sustained cue releases the held run 7..10, then keys its
+        // own single voice 7.
+        assert_eq!(bank.play_one_shot(0x1E, &mut spu, &vab), Some(7));
+        assert_eq!(spu.voices[7].adsr.phase, Phase::Attack);
+        assert!((8..10).all(|v| spu.voices[v].adsr.phase == Phase::Release));
+        assert_eq!(
+            spu.voices[23].adsr.phase,
+            Phase::Attack,
+            "one-shot untouched"
+        );
+    }
+
+    /// `FUN_80017910`: the teardown keys off the held sustained run and
+    /// clears the count, leaves one-shots alone, and is a no-op with nothing
+    /// held.
+    #[test]
+    fn release_sustained_keys_off_the_held_run_only() {
+        use crate::spu::adsr::Phase;
+        let vab = one_tone_bank();
+        let mut spu = crate::spu::Spu::new();
+        let bank = SfxBank::from_descriptors([(0x1D, 0, 0, 60, 0x23), (0x1A, 0, 0, 60, 1)]);
+        assert_eq!(bank.release_sustained(&mut spu), 0, "nothing held");
+        assert_eq!(bank.play_one_shot(0x1D, &mut spu, &vab), Some(7));
+        assert_eq!(bank.play_one_shot(0x1A, &mut spu, &vab), Some(23));
+        assert_eq!(bank.held_sustained(), 3);
+        assert_eq!(bank.release_sustained(&mut spu), 3);
+        assert!((7..10).all(|v| spu.voices[v].adsr.phase == Phase::Release));
+        assert_eq!(spu.voices[23].adsr.phase, Phase::Attack);
+        assert_eq!(bank.held_sustained(), 0);
+        assert_eq!(
+            bank.release_sustained(&mut spu),
+            0,
+            "a second call is a no-op"
+        );
+    }
+
+    #[test]
+    fn scheduler_enqueue_all_appends_in_order() {
+        let mut s = SfxScheduler::new();
+        s.enqueue_all([
+            PendingCue::new(0x1, 0),
+            PendingCue::new(0x2, 1),
+            PendingCue::new(0x3, 0),
+        ]);
+        assert_eq!(s.pending_count(), 3);
+        // Frame 1: 0x1 and 0x3 fire (both delay=0).
+        let batch = s.tick_frame();
+        let ids: Vec<u16> = batch.fired.iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![0x1, 0x3]);
+    }
+}

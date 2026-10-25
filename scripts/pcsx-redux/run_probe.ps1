@@ -1,0 +1,207 @@
+<#
+.SYNOPSIS
+  Windows-native PCSX-Redux probe runner -- the counterpart of run_probe.sh.
+
+.DESCRIPTION
+  Launches PCSX-Redux with the Legaia disc + BIOS and -dofile's an autorun Lua
+  probe (default: the battle->MIDI relay). Sets the LEGAIA_* env vars the autorun
+  reads, including LEGAIA_MIDI_WINPORT so the winmm sink (midi_sink.lua) pushes
+  Control-Change to your Windows MIDI port.
+
+  Interpreter mode is the default (the recompiler diverges on interpreter-authored
+  save states, and Lua breakpoints only fire under -interpreter -debugger).
+
+.EXAMPLE
+  # Drive the battle relay into LegaiaDiorama (B); VRChat listens on (A).
+  ./scripts/pcsx-redux/run_probe.ps1 -Sstate D:\Unreal\Repos\legend-of-legaia-re\saves\slot_00.bin
+
+.EXAMPLE
+  # Dry run (null sink, no MIDI) -- just writes the CC text log for inspection.
+  ./scripts/pcsx-redux/run_probe.ps1 -Sstate <state> -NoMidi
+
+.NOTES
+  Loopback pairs CROSS OVER: relay -> "LegaiaDiorama (B)", VRChat -> --midi="LegaiaDiorama (A)".
+#>
+[CmdletBinding()]
+param(
+    [string]$Lua      = "scripts/pcsx-redux/autorun_battle_midi_stream.lua",
+    [string]$Sstate   = $env:LEGAIA_SSTATE,
+    [string]$Scenario = "",
+    [string]$MidiPort = "LegaiaDiorama (B)",
+    [string]$Iso      = $(if ($env:LEGAIA_ISO) { $env:LEGAIA_ISO } else { "$env:USERPROFILE\Documents\ROMS\Legend of Legaia (USA)\Legend of Legaia (USA).bin" }),
+    [string]$Bios     = $(if ($env:LEGAIA_BIOS) { $env:LEGAIA_BIOS } else { "$env:USERPROFILE\Documents\DuckStation\bios\SCPH1001.BIN" }),
+    [string]$Pcsx     = $(if ($env:PCSX_REDUX) { $env:PCSX_REDUX } else { "$env:USERPROFILE\Tools\pcsx-redux\pcsx-redux.exe" }),
+    [int]$Frames      = 1800,
+    [int]$Sweep       = 120,
+    [string]$OutDir   = "",
+    [switch]$Fast,
+    [switch]$NoMidi,
+    # Config isolation: run against a throwaway persistent dir with a curated
+    # fast profile instead of the user's real %APPDATA%\pcsx-redux, so a
+    # volunteer's persisted PCSX-Redux settings can't degrade the capture.
+    # ON BY DEFAULT under -Fast (mirrors run_probe.sh). -NoIsolateConfig or
+    # $env:LEGAIA_NO_ISOLATE=1 forces the real dir.
+    [switch]$IsolateConfig,
+    [switch]$NoIsolateConfig,
+    # PCSX-Redux applies <image stem>.ppf from beside the image it loads
+    # (cdrom/ppf.cc, logged only as "[+ppf]"), and the randomizer writes its
+    # .ppf beside its INPUT disc. This runner refuses such an image unless
+    # -AllowSiblingPpf says the patch is wanted (run_probe.sh stages instead).
+    [switch]$AllowSiblingPpf,
+    [string]$ProfileDir  = $(if ($env:LEGAIA_PCSX_PROFILE_DIR) { $env:LEGAIA_PCSX_PROFILE_DIR } else { "" }),
+    [string]$RealConfig  = $(if ($env:LEGAIA_PCSX_REAL_CONFIG) { $env:LEGAIA_PCSX_REAL_CONFIG } else { "$env:APPDATA\pcsx-redux" })
+)
+$ErrorActionPreference = "Stop"
+
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+if (-not $ProfileDir) { $ProfileDir = Join-Path $RepoRoot "captures\.pcsx-profile" }
+
+# ---- scenario -> save-state resolution (optional; mirrors run_probe.sh) ----
+# Uses python + scripts/scenarios.toml when -Scenario is given. Otherwise -Sstate
+# (or $env:LEGAIA_SSTATE) is used directly.
+if ($Scenario) {
+    $py = (Get-Command python, python3, py -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+    if (-not $py) { throw "-Scenario needs python (for tomllib); pass -Sstate instead." }
+    $manifest = Join-Path $RepoRoot "scripts\scenarios.toml"
+    if (-not (Test-Path $manifest)) { throw "scenarios.toml not found: $manifest" }
+    $pyResolve = @'
+import os, sys, glob, tomllib
+manifest_path, label, repo_root = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(manifest_path, "rb") as f:
+    data = tomllib.load(f)
+for s in data.get("scenarios", []):
+    if s.get("label") == label:
+        fp = s.get("backup_fingerprint")
+        if fp:
+            hits = sorted(glob.glob(os.path.join(repo_root, "saves", "library", "pcsx-redux", fp + "*")))
+            if hits:
+                print(hits[0]); sys.exit(0)
+        v = s.get("pcsx_redux_sstate")
+        if v:
+            print(os.path.expanduser(os.path.expandvars(v)))
+        sys.exit(0)
+sys.exit(2)
+'@
+    # python '-' reads the program from stdin; argv[1..3] = manifest, label, repo.
+    $resolved = $pyResolve | & $py - $manifest $Scenario $RepoRoot
+    if ($LASTEXITCODE -ne 0 -or -not $resolved) { throw "scenario '$Scenario' not resolved from scenarios.toml" }
+    $Sstate = $resolved.Trim()
+}
+
+# ---- preflight ----
+if (-not $Sstate) { throw "No save state. Pass -Sstate <path>, -Scenario <name>, or set `$env:LEGAIA_SSTATE." }
+$required = @{ "pcsx-redux" = $Pcsx; "iso" = $Iso; "bios" = $Bios; "sstate" = $Sstate; "lua" = (Join-Path $RepoRoot $Lua) }
+foreach ($kv in $required.GetEnumerator()) {
+    if (-not (Test-Path -LiteralPath $kv.Value)) { throw ("required {0} not found: {1}" -f $kv.Key, $kv.Value) }
+}
+
+# ---- output + log locations (per-run subtree, like the bash runner) ----
+$stem = [IO.Path]::GetFileNameWithoutExtension($Lua) -replace '^autorun_', ''
+if (-not $OutDir) { $OutDir = Join-Path $RepoRoot "captures\$stem\win-run" }
+New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+$log = Join-Path $OutDir "pcsx.log"
+
+# Most repo autoruns build a default save-state path as
+# `os.getenv("HOME") .. "/Tools/pcsx-redux/..."`. Lua evaluates that default
+# expression EAGERLY even when LEGAIA_SSTATE is set, and HOME is unset on Windows
+# -> "attempt to concatenate a nil value" aborts the autorun. Provide HOME so the
+# (discarded) default is harmless. Does not affect which state actually loads.
+if (-not $env:HOME) { $env:HOME = $env:USERPROFILE }
+
+# ---- env the autorun reads ----
+$env:LEGAIA_SSTATE        = $Sstate
+$env:LEGAIA_STREAM_FRAMES = "$Frames"
+$env:LEGAIA_STREAM_SWEEP  = "$Sweep"
+$env:LEGAIA_OUT_DIR       = $OutDir
+# Empty string reads as "unset" to the sink's from_env (null sink / dry run).
+$env:LEGAIA_MIDI_WINPORT  = $(if ($NoMidi) { "" } else { $MidiPort })
+
+# ---- config isolation resolution + fast-profile write ----
+# Effective isolation: explicit switch wins, else auto (on under -Fast).
+$isolate = $false
+if ($NoIsolateConfig -or $env:LEGAIA_NO_ISOLATE -eq "1") { $isolate = $false }
+elseif ($IsolateConfig) { $isolate = $true }
+elseif ($Fast) { $isolate = $true }
+$rendererDesc = "ship-default (software)"
+if ($isolate) {
+    $hwGpu = ($env:LEGAIA_PCSX_HARDWARE_GPU -eq "1")
+    if ($hwGpu) { $rendererDesc = "hardware (OpenGL)" }
+    New-Item -ItemType Directory -Force -Path $ProfileDir, $RealConfig | Out-Null
+    # CPU/Debug mirror the run mode (fast -> recompiler+debug off, slow ->
+    # interpreter+debug on); only pinned keys are set, the rest fall back to the
+    # emulator ship defaults. Mcd paths are ABSOLUTE into the real config dir so
+    # card saves survive isolation (memorycard.cc only prepends the persistent
+    # dir to relative names). Rewritten fresh each run.
+    $mcd1 = (Join-Path $RealConfig "memcard1.mcd")
+    $mcd2 = (Join-Path $RealConfig "memcard2.mcd")
+    $profile = [ordered]@{
+        emulator = [ordered]@{
+            Dynarec          = [bool]$Fast
+            HardwareRenderer = $hwGpu
+            Xa               = $true
+            SpuIrq           = $false
+            FastBoot         = $true
+            Scaler           = 100
+            AutoUpdate       = $false
+            Mcd1             = $mcd1
+            Mcd2             = $mcd2
+            Mcd1Inserted     = $true
+            Mcd2Inserted     = $true
+            Debug            = [ordered]@{ Debug = (-not $Fast); GdbServer = $false; WebServer = $false }
+        }
+    }
+    ($profile | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath (Join-Path $ProfileDir "pcsx.json") -Encoding utf8
+}
+
+# ---- sibling .ppf guard (see -AllowSiblingPpf) ----
+$siblingPpf = [System.IO.Path]::ChangeExtension($Iso, ".ppf")
+if ((Test-Path -LiteralPath $siblingPpf) -and -not $AllowSiblingPpf) {
+    throw "A .ppf sits beside the image ($siblingPpf); PCSX-Redux would apply it silently. Copy the .bin into a directory without one, or pass -AllowSiblingPpf to measure the patched disc on purpose."
+}
+
+# ---- emulator flags (interpreter+debugger unless -Fast) ----
+$emuArgs = @('-bios', $Bios, '-iso', $Iso, '-run', '-stdout', '-dofile', $Lua)
+if (-not $Fast) {
+    $emuArgs = @('-interpreter', '-debugger') + $emuArgs
+} else {
+    # Force the recompiler explicitly: omitting -interpreter lets a persisted
+    # "Dynarec": false win (same trap the bash runner documents).
+    $emuArgs = @('-dynarec') + $emuArgs
+}
+# -portable PATH must be immediately followed by its value (the flags parser
+# takes the next token as the value).
+if ($isolate) { $emuArgs = @('-portable', $ProfileDir) + $emuArgs }
+
+Write-Host "=== run_probe.ps1 ==="
+Write-Host "  pcsx-redux : $Pcsx"
+Write-Host "  bios       : $Bios"
+Write-Host "  iso        : $Iso"
+Write-Host "  sstate     : $Sstate"
+Write-Host "  lua        : $Lua"
+Write-Host "  midi       : $(if ($NoMidi) { '(null sink -- -NoMidi)' } else { $MidiPort })"
+Write-Host "  frames     : $Frames  sweep: $Sweep"
+Write-Host "  mode       : $(if ($Fast) { 'fast (-dynarec forced -- no Lua BPs)' } else { 'interpreter+debugger' })"
+Write-Host "  config     : $(if ($isolate) { "ISOLATED profile ($ProfileDir; renderer=$rendererDesc; cards=$RealConfig)" } else { "real persistent dir ($RealConfig)" })"
+Write-Host "  out_dir    : $OutDir"
+Write-Host "  log        : $log"
+Write-Host "====================="
+
+# Launch from the repo root so the autorun's relative package.path entries resolve.
+# Use Start-Process with redirected output rather than `& ... | Tee-Object`: PCSX-Redux
+# is a GUI-subsystem app, so piping its output through a pipeline both fails to capture
+# its -stdout and makes it exit with a spurious STATUS_CONTROL_C_EXIT (0xC000013A) code
+# even on a clean PCSX.quit(0). Quote args containing spaces (BIOS/ISO paths) so the
+# arg list survives on both Windows PowerShell 5.1 and PowerShell 7.
+$argline = ($emuArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
+$errlog  = "$log.err"
+$proc = Start-Process -FilePath $Pcsx -ArgumentList $argline -WorkingDirectory $RepoRoot `
+    -RedirectStandardOutput $log -RedirectStandardError $errlog -PassThru
+$proc.WaitForExit()
+$code = $proc.ExitCode
+if ((Test-Path $errlog) -and ((Get-Item $errlog).Length -gt 0)) {
+    Add-Content -Path $log -Value "`n----- stderr -----"
+    Get-Content $errlog | Add-Content -Path $log
+}
+Write-Host ""
+Write-Host "pcsx-redux exited with status $code  (log: $log)"
+exit $code

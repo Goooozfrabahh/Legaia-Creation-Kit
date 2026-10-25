@@ -1,0 +1,354 @@
+# Builds + region data
+
+The known builds of *Legend of Legaia* and what differs between them, plus the
+build-level facts that are handy when testing against a running game: the debug
+flags and their pad chords, the developer menus, and the RAM cells that
+published cheat codes poke. The project's anchor build is the North American
+retail disc, `SCUS-94254`; every address on this page is that build's unless a
+column says otherwise.
+
+Sources are public cheat-code databases and save-state guides, cross-checked
+against the disassembly where a row cites a function or an instruction address.
+`PROT` is the disc's main archive (`PROT.DAT`); an *overlay* is a code image the
+game loads from it into RAM at runtime.
+
+| If you want | Go to |
+|---|---|
+| Which discs exist, and how their executables differ | [Known builds](#known-builds) |
+| How to switch on the debug menu and what it offers | [Debug flags](#debug-flags), [Debug input bindings](#debug-input-bindings), [Developer menus](#developer-menus) |
+| What a `CDNAME.TXT` block label covers | [CDNAME subsystem semantics](#cdname-subsystem-semantics) |
+| Cheat-pinned RAM cells | [Dispatch RAM addresses](#dispatch-ram-addresses-gamehackingorg), [Mini-game state regions](#mini-game-state-regions), [Character struct](#character-struct) |
+
+## Region enum
+
+`legaia_prot::Region` captures the three retail regions. `ProtIndex` carries this as metadata - the TOC formula and CDNAME layout are region-agnostic.
+
+| `Region` variant | Product codes | Notes |
+|---|---|---|
+| `Region::Na` | `SCUS-94254` | NA retail; anchor build for this project. Default. |
+| `Region::Jp` | `SCPS-10059`, `SCPS-91246` | JP retail + "PlayStation The Best" reissue. A separate compile; the `+0x1B90` shift relative to NA holds only for the cells it was derived from. |
+| `Region::Eu` | `SCES-01752`, `SCES-01944–47` | EU EN + FR/DE/IT/ES localisations. Same `PROT.DAT` layout as NA with the text swapped; the executables differ in battle spoils and stat boost (see [Known builds](#known-builds)). No address shift is applied. |
+
+`Region::from_product_code(code)` maps a disc ID prefix to the right variant.  
+`Region::translate_addr(na_addr)` applies the per-region shift to an NA-anchor address.
+
+## Developer attribution
+
+- **Prokion** (also styled "Procyon" - appears in Japanese as ぷろきおん) is the primary studio.
+- **Contrail** is co-credited.
+- Publisher: SCEI (JP), SCEA (US), SCEE (EU).
+
+This explains the dev paths visible in `SCUS_942.54` strings (`H:\PROT\FIELD\<stage>\tim.dat` etc.) - Sony PsyQ on a Windows host with `H:` mapped to the project tree.
+
+## Known builds
+
+| ID | Date | Notes |
+|---|---|---|
+| PAPX-90040 | 1996-06-02 | Trial on PrePre Vol. 14 demo disc |
+| PAPX-90055 | 1998-08-19 | Demo 2 (JP) |
+| PCPX-96130 | 1998-08-18 | Demo 1 / store kiosk video (JP) |
+| SCPS-10059 | 1998-09-09 | JP retail (Regaia Densetsu) |
+| SCPS-10059 | 1998-11-16 | NA prototype (uses JP serial) |
+| SCUS-94366 | 1998-12-21 | NA demo |
+| **SCUS-94254** | 1999-01-29 | **NA retail (anchor build for this project)** |
+| SCES-01752 | 1999-09-27 | EU English retail |
+| SCES-01944 | 2000-04-05 | French |
+| SCES-01945 | 2000-05-10 | German |
+| SCES-01946 | 2000-04-26 | Italian |
+| SCES-01947 | 2000-??-?? | Spanish |
+| SCPS-91246 | ? | "PlayStation The Best" reissue |
+| SCPS-45340 | ? | Unknown JP variant |
+
+The FR / DE / IT discs are container-identical to USA (same PROT layout, same monster records) but their executables are **not** the NTSC-U engine with swapped text: they carry no battle-load stat boost and pay half the record gold + the whole record EXP where NTSC-U pays a quarter + three quarters. Details in [pal-localizations.md](../tooling/pal-localizations.md#what-the-executables-do-not-share). The JP original (SCPS-10059) matches the PAL behaviour on both counts, so both are NTSC-U additions. ES and the EU English disc are unmeasured. Cross-region testing priority: SCPS-10059 (original JP) → SCUS-94254 (anchor) → SCES-01752 (EU English).
+
+## Debug flags
+
+Two distinct flags in the same RAM page:
+
+| Flag | NA address | JP address | Effect |
+|---|---|---|---|
+| `_DAT_8007B8C2` | `0x8007B8C2` | (build-shifted by 0x1B90) | Dev/retail loader-path flag; read by `lh` throughout SCUS, three of those reads `$gp`-relative (`0x80015FD4` / `0x80016038` / `0x8001631C`). Retail boots it to `1` (`0x80015F08`), selecting the PROT-index arm; the `== 0` arm is the `h:\PROT\FIELD\<stage>\…` dev-path branch in `FUN_800255B8` and its sisters. |
+| `_DAT_8007B9B0` | `0x8007B9B0` | - | Overlay **print flag**. Separate from the menu enable: the slot-A minigame overlays gate their `printf`-style readouts on it, several of them additionally on held pad bit `0x2`. In the fishing overlay that pair also swaps the bite cadence for a debug value. |
+| `_DAT_8007B98F` | `0x8007B98F` | `0x8007D51F` | In-game debug menu enable. Accessed as the high byte of the word at `0x8007B98C` - the GameShark byte-write `8007B98F 0001` makes the LE word non-zero (`0x01000000`), enabling every debug branch with one check. |
+
+All three do have static writers in `SCUS_942.54`, reached `$gp`-relative
+(`$gp = 0x8007B318`, from the `lui`/`addiu` pair at `0x80026CA8`) - which is why a
+`lui`-pair-only cross-reference sweep reports none:
+
+| Cell | Writer(s) |
+|---|---|
+| `0x8007B8C2` | `sh` at `0x80015F08` (`gp+0x5AA`) - the retail boot-to-`1` store |
+| `0x8007B98C` | `sw` at `0x8001D444` (clear), `0x8001D490`, `0x8001D4B0` (`gp+0x674`) |
+| `0x8007B9B0` | `sw zero` at `0x8001D448` (`gp+0x698`) |
+
+Only the *byte* `0x8007B98F` has no accessor of its own - it is reached as the high
+byte of the word at `0x8007B98C`. Published GameShark codes additionally prove all
+three are runtime-writable by external POKE.
+
+The `0x1B90`-byte shift between the JP and NA addresses of the debug-menu byte is what `Region::translate_addr` applies. It holds for the cells it was derived from (the published cheat pair), not for the build as a whole: `SCPS_100.59` is a separate compile, not the NA layout relocated, and no single shift maps NA addresses onto it.
+
+- **Save-window cells.** The inventory bag sits at `0x801CBFC8`, gold at `0x801CAC0C` and coins at `0x801CAC14` (NA `0x80085958` / `0x8008459C` / `0x800845A4`).
+- **Overlay load bases.** Slot A (PROT 0897 / 0898 / 0899) loads at `0x801D05C8` (NA `0x801CE818`) and the slot-B cast modules (PROT 0903..0966) at `0x801F9DB0` (NA `0x801F69D8`) - shifts of `0x1DB0` and `0x33D8`.
+- **Battle-context fields** sit `0xA0` lower: scripted-fight flag `ctx[+0x1E7]` against NA `ctx[+0x287]`, cast phase `ctx[+0x1D9]` against `ctx[+0x279]`, round counter `ctx[+0x1EA]` against `ctx[+0x28A]`.
+
+The French `SCES_019.44` is the NA code relocated, with slot A at `0x801CF0A8` and slot B at `0x801F7400`.
+
+## Debug input bindings
+
+Once `_DAT_8007B98F` is set, these button combos are live. Dispatcher: `FUN_8001822C`.
+
+| Combo | Effect |
+|---|---|
+| SELECT + △ | Open Debug Menu (item-give, map-change, stats, event flags, …) |
+| SELECT + START | Start game in Debug Mode - the full-screen configuration tester in PROT 0971, reached as game mode 0 / `CONFIG INIT` (see [`boot.md`](../subsystems/boot.md#game-mode-state-machine)) |
+| R1 + R2 + X | Coordinates debug overlay + free camera |
+| (in coords mode) ○ | Dim lighting |
+| (in coords mode) ▢ | Toggle verbose overlay |
+
+`FUN_8001822C` per-frame:
+- Reads BIOS pad data at `0x800840F8`, builds 32-bit button mask `_DAT_8007B850`.
+- `if (_DAT_8007B98C == 0) _DAT_8007B850 &= 0xFFFF` - the upper 16 bits (controller 2 / debug bindings) are stripped when debug is OFF. **This is the master gate.**
+- Then a large block guarded by `if (_DAT_8007B98C != 0)` handles the button combos above.
+
+Two consequences of that mask, both load-bearing when driving the menu externally:
+
+- **The combos are pad-port-2 bindings.** The debug block reads the upper 16 bits, so
+  the chord must arrive on the second controller port; the same chord on port 1 lands
+  in the low half and is ignored.
+- **The gate does not latch for the session.** The word's sole `sw` writer is the
+  shared menu/title/save-init routine, which scene transitions run - so entering a
+  scene can clear `_DAT_8007B98C` mid-session and the gate has to be re-asserted
+  rather than set once.
+
+GameShark D-code globals:
+- `DAT_8007B7C0` - previous-frame button mask (so `D007B7C0 XXXX` D-codes mean "wait for the user to press XXXX").
+- `_DAT_8007B874 = mask & ~prev` - newly pressed this frame (edge detection).
+- `DAT_8007B7C4 = mask ^ prev` - buttons that changed.
+
+## Developer menus
+
+`SELECT + Triangle` above opens the in-game debug menu. It is not one screen -
+it is four separate tools, each resident in a different overlay, that the
+retail debug branches reach:
+
+| Tool | Retail entry | Lives in |
+|---|---|---|
+| Row list (`MAP CHANGE`, `CAMERA`, `ENCOUNT`, ... 24 rows) | `FUN_801EAD98` draws it, `FUN_801E9F64` feeds each row's pad edits | field overlay (PROT 0897) - the world map is a 0897-hosted mode, not an overlay of its own |
+| EVENT FLAG editor | `FUN_801DBD04` value step, `FUN_801DB8B4` / `FUN_801DB8F4` list cursor | field overlay (0897) |
+| Character-parameter editor | `FUN_801D6E18` | menu overlay (0899) |
+| Equip commit | `FUN_801E5A08` | field overlay (0897) |
+
+The row list's cursor lives at `ctx + 0x9E` and `FUN_801E9F64` dispatches on
+`cursor - 3`; each arm edits one row's backing value from the frame's
+newly-pressed pad word, Right (`0x2000`) stepping up and Left (`0x8000`) down.
+The two editors take the whole pad instead: both read the **packed** words
+`_DAT_8007BB84` (newly pressed) and `_DAT_8007B850` (held), Up/Down walking
+their own cursor and Left/Right editing the hovered value.
+
+The character editor is worth reading even outside a debug build, because it
+runs a two-stage clamp over all four party records at the end of **every**
+tick, whichever row is hovered. That clamp is the game's own statement of its
+stat caps - see [`docs/subsystems/save-screen.md`](../subsystems/save-screen.md)
+for where the records live, and the port in `legaia_engine_core`.
+
+### Reaching the menus in the engine
+
+The Rust port carries all four kernel families, and both play hosts mount
+them behind an explicit opt-in. `legaia-engine`'s `play-window` keys on
+`LEGAIA_DEV_MENU=1`; the browser play page keys on its Dev-menu checkbox
+(`crates/web-play/src/play_dev_menu.rs`), which starts unchecked on every
+load and is deliberately neither persisted nor URL-readable, so it is the
+same shape of opt-in - a deliberate act by the person running the program
+that a shared link cannot carry. With the opt-in taken, a row list is drawn
+and driven once a frame off the same packed pad words retail's dev code
+reads; without it nothing runs and no draw is produced, so a default
+build/page is unchanged. Square swaps the list for the battle-records page
+on both hosts.
+
+The engine's list carries the subset of retail's rows whose backing state the
+engine owns - `MAP_CHANGE`, `ENCOUNT`, `EVENT_FLAG`, `PLAYER_PARAM`, `EQUIP` -
+rather than all 24, so that no row steps a value nothing reads. The rows that
+are missing need overlay-resident state the engine never loads: the flag-list
+table (`DAT_801F2E94`, stride `0xA` with an `'X'` sentinel) is the clearest
+case, and without it the EVENT FLAG page edits a raw index only.
+
+## Camera control axes
+
+The debug coordinate overlay uses cinematography axis names - useful as a string-search anchor for finding the camera-debug renderer:
+
+```
+VX (truck), VY (pedestal), VZ (zoom)
+WX (track), WY, WZ (dolly)
+AX (crane), AY (tongue/pan), AZ (roll)
+SC (FOV)
+```
+
+They live in the **field overlay** (PROT 0897), not in `SCUS_942.54` - the block
+starts at `0x801CF1E4` and runs `VX VY VZ AX AY AZ WX WZ SC WY`, then `DCX` /
+`DCY` / `DCZ`, `MX0` / `MY0` / `MX1` / `MY1`, and `PLAYER_STAT` / `HEIGHT_STAT` /
+`FREEZE_STAT` / `ANM_FREEZE_FLAG`. Search the extracted PROT entry, not the
+executable.
+
+## CDNAME subsystem semantics
+
+The block labels of `CDNAME.TXT` past the per-scene blocks. The numbers are the
+file's own `#define` values, which are raw in-RAM TOC indices: the extraction
+entry (the `NNNN` in a `PROT entry NNNN` citation) is the define **minus 2**
+([`cdname.md`](../formats/cdname.md#numbering-space)). A label is a hint, not a
+verdict - several blocks hold something other than what their name suggests.
+
+| `#define` range | Label | Extraction entries | What the entries hold |
+|---|---|---|---|
+| 0..864 | per-scene names | - | Stage / field blocks (towns, dungeons, world maps, cutscenes), one block per scene name |
+| 865..868 | `battle_data` | 863..866 | The four player battle files `PLAYER1..4` ([`battle-data-pack.md`](../formats/battle-data-pack.md)) |
+| 869 | `monster_data` | 867 | Monster archive: stat records, meshes, animations |
+| 870..871 | `sound_data` | 868..869 | Sound-driver data |
+| 872..875 | `befect_data` | 870..873 | Battle effects `etim` / `etmd` / `vdf` / `efect` ([`effect.md`](../formats/effect.md)) |
+| 876 | `player_data` | 874 | Player character pack ([`character-mesh.md`](../formats/character-mesh.md)) |
+| 877..890 | `sound_data2` | 875..888 | Sound-driver data |
+| 891..892 | `level_up` | 889..890 | Level-up block; entry 890 is the title TIM |
+| 893 | `monster_se` | 891 | Monster sound effects |
+| 894 | `card_data` | 892 | Memory-card screen kanji font |
+| 895..896 | `bat_back_dat` | 893..894 | `summon.dat` / `readef.DAT` battle side-band ([`summon-readef.md`](../formats/summon-readef.md)) |
+| 897..971 | `xxx_dat` | 895..969 | Code overlays: boot `init.pak` (895), the field / battle / menu images (897..899), the slot-B band (900..966) and the battle stage modules (967..969) |
+| 972..973 | `move_program_no` | 970..971 | STR / MDEC movie player (970) and the debug-menu overlay (971) |
+| 974..979 | `other_game` | 972..977 | Mini-game overlays: fishing (972), dev modules (973 / 974), slot machine (975), Baka Fighter (976), Muscle Dome hub (977) |
+| 980..989 | `monster_test` | 978..987 | More overlays, among them FIELD BACK READ (978), dance (980) and the world-map top view (981) |
+| 990..1071 | `music_test` / `music_01` | 988..1069 | BGM sequences + banks ([`music-tracks.md`](music-tracks.md)) |
+| 1072..1194 | `vab_01` | 1070..1192 | VAB instrument banks |
+| 1195..1232 | `other1` / `4` / `5` / `6` / `7` | 1193..1230 | Mini-game and contest assets (e.g. the ringside stills at 1221 / 1222) |
+
+## Dispatch RAM addresses (GameHacking.org)
+
+PSX RAM (KSEG0, `0x80000000` base). Useful as runtime-tracing anchors.
+
+| Address | Purpose |
+|---|---|
+| `0x80084540` | Current map ID (writable; "Map Modifier" / "View Credits" use this) |
+| `0x8007B6F4` | "Small maps" debug mode flag |
+| `0x8007B7C0` | **Previous-frame button mask** - what the `D0` / `E0` conditional codes compare against. `FUN_8001822C` loads it, XORs it against the fresh mask into the edge words `0x8007B7C4` / `0x8007B874`, then stores the fresh mask back (`0x80018510..0x80018548`). Not a dispatch selector. |
+| `0x8007B450` | Debug-dispatch parameter slot - sub-action within the trigger's mode |
+| `0x800422F4` | **Not a RAM cell** - a `bne r2, r0, +2` inside SCUS's inventory-add clamp (`slti r2,r2,100` / `addiu r3,99` / `sb`). The "99 quantity" cheat writes `0001`, shortening the displacement so the clamp always runs. See [`cheats.md`](cheats.md). |
+
+`0x8007B450` is the menu-request register the menu overlay polls each frame; the cheats below drive it directly. Sample values:
+
+| Parameter | Effect |
+|---|---|
+| `0x0001` | Open Status Modifier Menu |
+| `0x000D` | Open name modifier for Gala |
+| `0x0011` | Open name modifier for Vahn |
+| `0x0085` | Show End-of-Game stat page |
+| `0x4097` | "Save Anywhere" prompt |
+
+When trigger == `0x0003`, writing to `0x80084540` warps to that map ID.
+
+## Mini-game state regions
+
+Each mini-game is a slot-A overlay image: the mode-24 warp streams its PROT entry (fishing 0972, slot machine 0975, Baka Fighter 0976, Muscle Dome 0977, dance 0980) to `0x801CE818`, over whatever image was resident, so the addresses below name mini-game state only while that mini-game's image is loaded. Extents per image are in [`memory-map.md`](memory-map.md#overlay-slot-a-0x801ce818).
+
+| Address | Mini-game | Purpose |
+|---|---|---|
+| `0x801D9168` | Fishing | Tension |
+| `0x801D9274` | Fishing | Casting power |
+| `0x801D9298` | Fishing | Life |
+| `0x801D91CC` | Fishing | Fish ID modifier |
+| `0x801D53CC` | Dancing | Dance points |
+| `0x801DBFC4` | Baka Fighter | Player life |
+| `0x801DC06C` | Baka Fighter | Computer life |
+
+## Character struct
+
+Stride: **0x414 bytes (1044)**. Confirmed by file-offset deltas in ePSXe save states (Vahn / Noa / Gala). 4 slots (Vahn / Noa / Gala / Terra-the-wolf) gives a party-data block of ~4096 bytes - exactly one PSX RAM page.
+
+Layout (relative to Level offset, all `u16` LE unless noted):
+
+| Offset | Field |
+|---|---|
+| `-0x2C` | HP max |
+| `-0x2A` | HP current |
+| `-0x28` | MP max |
+| `-0x26` | MP current |
+| `-0x20` | AGL current |
+| `-0x1E` | ATK current |
+| `-0x1C` | UDF current |
+| `-0x1A` | LDF current |
+| `-0x18` | SPD current |
+| `-0x16` | INT current |
+| `-0x14` | HP unequipped (base) |
+| `-0x12` | MP unequipped (base) |
+| `-0x0E..-0x04` | AGL/ATK/UDF/LDF/SPD/INT unequipped (base) |
+| `+0x00` | Level |
+| `+0x55` | Moves-learned count (u8) |
+| `+0x56...` | Moves array (u8 IDs, contiguous) |
+| `+0x177` | Name (string) |
+
+The "current" stats are post-equipment; "unequipped" are the base values. Stat order (AGL/ATK/UDF/LDF/SPD/INT) is fixed across both blocks and across all 4 slots.
+
+## Money and inventory
+
+- **Money**: 24-bit (3 consecutive u8 bytes, LE). Cap = 0x00FFFFFF = 16,777,215 G.
+- **Inventory**: single shared list, 2 bytes per entry `[item_id, quantity]`. Weapons, armor, items, and Ra-Seru levels are all in the same list.
+
+## Item ID table
+
+256 max. Canonical NA assignments:
+
+```
+Items (consumables, books, flutes):    0x65-0x9A, 0xA3
+Ra-Seru weapons (per char × levels):   0x01-0x19  (Meta=Vahn 1-9, Terra=Noa 1-8, Ozma=Gala 1-7, plus 0x12=empty Noa slot)
+Normal weapons:                        0x1A-0x33, 0x52 (empty), 0xBA (Astral Sword)
+Helmets:                               0x34-0x42
+Armors:                                0x43-0x57
+Boots:                                 0x58+
+```
+
+ID `0x12` is "empty wp. for Noa" and `0x52` is "empty wp. for Vahn" - the inventory has reserved-but-empty slots.
+
+## Move tables (Tactical Arts)
+
+Slot `0x00` is the Miracle Art starter on every character (action constant `0x1B` =
+Vahn's Craze / Noa's Ark / Biron Rage, gated by a story flag). Vahn and Gala carry
+their 14 regular arts at slots `0x01..0x0E`. Noa's table runs to slot `0x10` with
+holes at `0x02` / `0x03` (her Hurricane Kick covers three on-disc levels through one
+slot), so her slot `0x0F` is the ordinary art Acrobatic Blitz, not a Miracle Art.
+Mirror: `legaia_art::tables`.
+
+**Vahn:**
+```
+0x01 Burning Flare    0x02 Fire Blow      0x03 Tornado Flame  0x04 Cyclone
+0x05 Hurricane        0x06 PK Combo       0x07 Spin Combo     0x08 Pyro Pummel
+0x09 Cross-Kick       0x0A Power Punch    0x0B Slash Kick     0x0C Somersault
+0x0D Charging Scorch  0x0E Hyper Elbow
+```
+
+**Noa** (in display order): Lizard Tail, Acrobatic Blitz, Sonic Javelin, Blizzard Bash, Mirage Lancer, Dolphin Attack, Bird Step, Swan Driver, Tough Love, Rushing Gale, Tempest Break, Frost Breath, Vulture Blade, Hurricane Kick.
+
+**Gala**: Flying Knee Attack, Battering Ram, Ironhead, Back Punch, Guillotine, Head-Splitter, Side Kick, Black Rain, Neo Raising, Electro Thrash, Bull Horns, Thunder Punch, Lightning Storm, Explosive Fist.
+
+The script VM's [`EXEC_MOVE` (op 0x22)](../subsystems/script-vm.md) feeds these IDs into the move-table consumer at `FUN_800204F8`; the move-table file format itself is documented at [`formats/mdt.md`](../formats/mdt.md).
+
+## Translation notes
+
+Character-name discrepancies between JP and NA scripts:
+
+- Gala (NA) = Gaara (JP)
+- Vahn (NA) = Vann (JP)
+- Noa (NA) = Noah (JP)
+- Tetsu (NA) = Todd (JP)
+
+They matter when comparing MES text across regions.
+
+## Unused content
+
+Useful as fixtures for validating extractors:
+
+- **Unused enemies**: index 78 ("Comm") and 140 ("Evil Bat") in the monster table.
+- **Unused items**: "Something Good" (sells for 50,000G) and an unnamed accessory (forces Seru-only encounters).
+- **Placeholder battle background**: a graphic containing `ぷろきおん` in hiragana - loaded when a real battle background is missing.
+- **Placeholder music**: tracks copied from Alundra (Zazan battle theme) and Wild ARMs (battle theme) sit in the SEQ/VAB data.
+
+## See also
+
+- [`docs/reference/gamedata.md`](gamedata.md) - the curated enemy / item tables the unused-content indices reference.
+- [`docs/reference/memory-map.md`](memory-map.md) - the region map, including the slot-A window the mini-game images share, and region-shifted globals.
+- [`docs/reference/cheats.md`](cheats.md) - region-specific RAM offsets validated against these builds.

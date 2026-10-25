@@ -1,0 +1,525 @@
+//! Per-actor animation slot pool: keyframe playback via `AnimPlayer` plus opaque-record frame stepping.
+
+use super::*;
+use legaia_anm::{AnimPlayer, PoseFrame};
+
+/// Per-actor animation state.
+///
+/// `Idle` slots hold no record. `Playing` slots own the record bytes,
+/// the bone count, and either an `AnimPlayer` (for `RecordKind::Keyframe`)
+/// or a frame counter for the opaque kinds. The runtime advances the
+/// counter every `tick`; the host fills in the per-kind side-effects.
+#[derive(Debug, Clone, Default)]
+pub enum AnimSlot {
+    /// No animation is registered on this actor.
+    #[default]
+    Idle,
+    /// A keyframe-style animation is playing - handled natively.
+    Keyframe {
+        player: AnimPlayer,
+        kind: RecordKind,
+    },
+    /// An opaque-kind record is registered; the runtime advances a
+    /// frame counter and surfaces it to the host on each tick. The host
+    /// owns interpretation.
+    Opaque {
+        record: Vec<u8>,
+        bone_count: usize,
+        kind: RecordKind,
+        /// Per-frame counter (mirrors retail `actor[+0x68]`, which
+        /// `FUN_80024CFC` initialises to 100).
+        frame_counter: u32,
+    },
+}
+
+impl AnimSlot {
+    /// Helper: explicit constructor for the idle variant.
+    pub fn idle() -> Self {
+        AnimSlot::Idle
+    }
+
+    pub fn is_idle(&self) -> bool {
+        matches!(self, AnimSlot::Idle)
+    }
+
+    /// Header `a` byte for the active record, or `None` if idle. Useful
+    /// when routing by record kind without re-parsing.
+    pub fn header_a(&self) -> Option<u16> {
+        match self {
+            AnimSlot::Idle => None,
+            AnimSlot::Keyframe { .. } => Some(0x06),
+            AnimSlot::Opaque { kind, .. } => match kind {
+                RecordKind::Kind2 => Some(0x02),
+                RecordKind::Kind3 => Some(0x03),
+                RecordKind::KindA => Some(0x0A),
+                RecordKind::Keyframe => Some(0x06),
+                RecordKind::Other(v) => Some(*v),
+            },
+        }
+    }
+}
+
+/// Frame events surfaced by the runtime. Engines drain these to
+/// drive renderer / SFX side-effects without inspecting actor state.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnimEvent {
+    /// A keyframe pose was produced for this actor on this frame.
+    /// `pose.finished` mirrors `PoseFrame::finished` (true after the
+    /// non-looping cycle has clamped at 0xFF).
+    PoseUpdated { actor: u8, pose: PoseFrame },
+    /// An opaque-kind record advanced one frame; the host's
+    /// `on_opaque_record` hook saw it. The runtime only reports that
+    /// the tick happened - the host is responsible for any side
+    /// effect (sprite frame swap, voice cue, etc.).
+    OpaqueTick {
+        actor: u8,
+        kind: RecordKind,
+        frame: u32,
+    },
+    /// A non-looping animation has finished. Engines typically clear
+    /// the slot or transition to an idle pose.
+    Finished { actor: u8, kind: RecordKind },
+    /// `play` was called on a slot that was already busy. Host can
+    /// treat this as either a forced replace or a no-op.
+    Replaced { actor: u8 },
+}
+
+/// Engine-side callbacks the runtime makes for opaque-kind records.
+///
+/// The retail per-frame consumer at `FUN_8004AD80` dispatches on the
+/// consumer-struct kind byte at `+0x00` (an [`OpaqueRecordKind`]
+/// classification - not the same byte as the [`RecordKind`] header
+/// `a` field, though they happen to live at the same offset in the
+/// runtime record) into five explicit branches plus a default "raw
+/// playback" path. The runtime here invokes one trait method per
+/// branch so the engine can supply per-kind behaviour without having
+/// to re-classify in user code.
+///
+/// The five helper hooks below name routines that sit **around**
+/// `FUN_8004AD80`, not inside it. The retail call graph (every `jal` read
+/// off the SCUS disassembly): the battle-actor anim tick `FUN_80047430`
+/// calls the commit `FUN_8004AD80` (`0x80047A3C`, `0x80047B54`); the
+/// afterimage draw `FUN_80049348` calls the battle-actor draw
+/// `FUN_80048A08`, which calls the pose decoder `FUN_8004998C`; and the
+/// commit's only call among them is the solo-action freeze `FUN_8004E13C`.
+/// (This doc used to say `FUN_8004AD80` calls all five.) The hooks are
+/// default no-ops; engines that model any of them call them from wherever
+/// their own pipeline reaches the equivalent point.
+///
+/// `on_opaque_record` remains the catch-all fallback - every per-kind
+/// method defaults to routing through it, so existing host
+/// implementations that only override `on_opaque_record` continue to
+/// work.
+pub trait Host {
+    /// Catch-all fallback: called by the default body of every
+    /// per-kind dispatcher below. Engines that want a single
+    /// handler for every kind can override just this method; engines
+    /// that want per-kind specialisation override the per-kind
+    /// methods directly.
+    ///
+    /// `frame_counter` mirrors `actor[+0x68]` and increments each
+    /// tick while the slot is alive. Returning `true` keeps the slot
+    /// alive; `false` ends it (transitions to `Idle` on the next
+    /// tick boundary).
+    fn on_opaque_record(
+        &mut self,
+        actor: u8,
+        kind: RecordKind,
+        record: &[u8],
+        frame_counter: u32,
+    ) -> bool {
+        let _ = (actor, kind, record, frame_counter);
+        true
+    }
+
+    /// `OpaqueRecordKind::Kind2` (`+0x00 == 0x02`) handshake. When
+    /// the global character-action byte is `-0x4D` / `-0x4B` and the
+    /// actor's anim flag at `+0x14C` is zero, the consumer flips the
+    /// kind byte to `Kind4` and ticks `+0x56`. Per-kind port of the
+    /// `Kind2` branch in `FUN_8004AD80`.
+    fn on_kind2_handshake(&mut self, actor: u8, record: &[u8], frame_counter: u32) -> bool {
+        self.on_opaque_record(actor, RecordKind::Kind2, record, frame_counter)
+    }
+
+    /// `OpaqueRecordKind::Kind4` (`+0x00 == 0x04`) action engaged. If
+    /// the actor's anim-flag at `+0x14C` is zero, set
+    /// `actor[+0x1DA] = 7`; otherwise copy `actor[+0x1F2]` into
+    /// `+0x1DA`. Per-kind port of the `Kind4` branch in
+    /// `FUN_8004AD80`.
+    fn on_kind4_action_engaged(&mut self, actor: u8, record: &[u8], frame_counter: u32) -> bool {
+        self.on_opaque_record(actor, RecordKind::Other(0x04), record, frame_counter)
+    }
+
+    /// `OpaqueRecordKind::Kind5` (`+0x00 == 0x05`): `actor[+0x1DC] |=
+    /// 4`. Per-kind port of the `Kind5` branch in `FUN_8004AD80`.
+    fn on_kind5_or_bit2(&mut self, actor: u8, record: &[u8], frame_counter: u32) -> bool {
+        self.on_opaque_record(actor, RecordKind::Other(0x05), record, frame_counter)
+    }
+
+    /// `OpaqueRecordKind::Kind7` (`+0x00 == 0x07`): set
+    /// `actor[+0x1DA] = 8`. Per-kind port of the `Kind7` branch in
+    /// `FUN_8004AD80`.
+    fn on_kind7_set_da_8(&mut self, actor: u8, record: &[u8], frame_counter: u32) -> bool {
+        self.on_opaque_record(actor, RecordKind::Other(0x07), record, frame_counter)
+    }
+
+    /// `OpaqueRecordKind::Kind8` (`+0x00 == 0x08`): `actor[+0x1DC] |=
+    /// 8`. Per-kind port of the `Kind8` branch in `FUN_8004AD80`.
+    fn on_kind8_or_bit3(&mut self, actor: u8, record: &[u8], frame_counter: u32) -> bool {
+        self.on_opaque_record(actor, RecordKind::Other(0x08), record, frame_counter)
+    }
+
+    /// Catch-all branch for `OpaqueRecordKind::Other(byte)`: raw
+    /// playback. The default `FUN_8004AD80` path runs the per-field
+    /// reads but no kind-specific sub-state mutates.
+    fn on_other_kind(&mut self, actor: u8, byte: u8, record: &[u8], frame_counter: u32) -> bool {
+        self.on_opaque_record(actor, RecordKind::Other(byte.into()), record, frame_counter)
+    }
+
+    /// Battle-actor animation tick - host-trait abstraction of
+    /// `FUN_80047430`: advances the clip cursor `+0x68` by the rate
+    /// `+0x78` scaled by the anim-rate byte `+0x21D`
+    /// (`0x80047704..0x80047764`), loops on `+0x85` / `+0x86` against
+    /// `+0x176`, and calls the commit `FUN_8004AD80`. (Formerly described
+    /// as a world-position "movement step".)
+    ///
+    /// Default no-op so engines without a movement pipeline still
+    /// build.
+    fn on_movement_step(&mut self, actor: u8, record: &[u8], frame_index: u16) {
+        let _ = (actor, record, frame_index);
+    }
+
+    /// Battle-actor draw - host-trait abstraction of `FUN_80048A08`:
+    /// decodes the pose through `FUN_8004998C` (`jal` at `0x80048A84`) and
+    /// submits the meshes through the TMD renderer `FUN_8002735C`
+    /// (`0x80048FE4`). It reads neither `+0x84` nor `+0x86`, which an
+    /// earlier version of this doc said it looped on.
+    fn on_render_loop(&mut self, actor: u8, record: &[u8]) {
+        let _ = (actor, record);
+    }
+
+    /// Afterimage (ghost) draw - host-trait abstraction of
+    /// `FUN_80049348`: with step `8 / +0x21D`
+    /// ([`ACTOR_LOD_STEP_OFFSET`]; `lod_step` is that folded value, see
+    /// [`ActorAnimState::lod_step_factor`]) it walks the pose-history
+    /// slots, skipping any whose `+0x1FB[i]` byte is below `0x11`, and
+    /// draws each as a tinted copy of the actor - it loads the history
+    /// frame `+0x17A[i]` into `+0x68` and record `+0x234[i]` into `+0x4C`,
+    /// then calls `FUN_80048A08` (`0x8004950C`). It is not a child-actor chain walk.
+    /// Ported for the engine as `legaia_engine_battle::battle_afterimage`.
+    fn on_child_step_iter(&mut self, actor: u8, lod_step: u8) {
+        let _ = (actor, lod_step);
+    }
+
+    /// Per-bone keyframe interpolator - host-trait abstraction of
+    /// `FUN_8004998C`. Unpacks the two `[i16; 3]` vectors per bone
+    /// from the nested per-frame data, lerps by
+    /// `sub_frame_factor / 16`, writes the result into the GPU OT
+    /// scratch buffer.
+    fn on_per_bone_interp(&mut self, actor: u8, record: &[u8], sub_frame_factor: u8) {
+        let _ = (actor, record, sub_frame_factor);
+    }
+
+    /// Solo-action freeze - host-trait abstraction of `FUN_8004E13C`:
+    /// sets `+0x21C = 1` on every living slot of the seven at
+    /// `DAT_801C9370` that is neither the active slot (`ctx+0x13`) nor its
+    /// `+0x1DD` target, and stores its argument at `ctx+0x243`
+    /// (`0x8004E2C0`); its RNG draws land in the battle context
+    /// (`ctx+0x6DA`, `ctx+0x26D`), not in an actor. Not an effect spawn,
+    /// as this hook's name still says.
+    fn on_special_effect_spawn(&mut self, actor: u8, effect_id: u8) {
+        let _ = (actor, effect_id);
+    }
+}
+
+/// Default host that does nothing on opaque records (slots stay alive
+/// indefinitely until `stop` is called). Useful for tests and engines
+/// that don't yet wire the overlay dispatcher.
+#[derive(Debug, Default)]
+pub struct NullHost;
+
+impl Host for NullHost {}
+
+/// Per-actor animation runtime - fixed-size pool of `AnimSlot`s.
+#[derive(Debug)]
+pub struct AnimRuntime {
+    pub(crate) slots: Vec<AnimSlot>,
+    /// Latest pose per actor (mirrors `World::Actor::pose_frame`).
+    /// Engines that don't want the event stream can read this directly.
+    poses: Vec<Option<PoseFrame>>,
+    /// Pending events surfaced from the most recent `tick`. Engines
+    /// drain via `take_events`.
+    events: Vec<AnimEvent>,
+    /// Frame counter - useful for trace logs / fingerprinting.
+    pub frame: u64,
+}
+
+impl Default for AnimRuntime {
+    fn default() -> Self {
+        Self::with_slots(MAX_ACTOR_SLOTS)
+    }
+}
+
+impl AnimRuntime {
+    /// Build a runtime with `n` actor slots. The retail per-scene actor
+    /// table tops out at `MAX_ACTOR_SLOTS`; engines can pick a smaller
+    /// pool to bound memory.
+    pub fn with_slots(n: usize) -> Self {
+        Self {
+            slots: vec![AnimSlot::Idle; n],
+            poses: vec![None; n],
+            events: Vec::new(),
+            frame: 0,
+        }
+    }
+
+    /// Register `record` on actor `id`. Errors if `id` is out of range.
+    /// If the slot was busy, emits `AnimEvent::Replaced` and overwrites
+    /// it (matching the retail convention - `FUN_80024CFC` always
+    /// overwrites).
+    pub fn play(
+        &mut self,
+        id: u8,
+        record: Vec<u8>,
+        bone_count: usize,
+    ) -> Result<RecordKind, AnimError> {
+        let i = id as usize;
+        if i >= self.slots.len() {
+            return Err(AnimError::ActorOutOfRange { actor: id });
+        }
+        let kind = RecordKind::from_record(&record).ok_or(AnimError::HeaderTooSmall)?;
+        let was_busy = !self.slots[i].is_idle();
+        let new_slot = match kind {
+            RecordKind::Keyframe => {
+                let player = AnimPlayer::new(record, bone_count.max(1))
+                    .map_err(|e| AnimError::PlayerInit(e.to_string()))?;
+                AnimSlot::Keyframe { player, kind }
+            }
+            _ => AnimSlot::Opaque {
+                record,
+                bone_count,
+                kind,
+                frame_counter: 100, // mirrors actor[+0x68] init
+            },
+        };
+        self.slots[i] = new_slot;
+        if was_busy {
+            self.events.push(AnimEvent::Replaced { actor: id });
+        }
+        Ok(kind)
+    }
+
+    /// Stop animation on actor `id`. Out-of-range actor is a no-op.
+    pub fn stop(&mut self, id: u8) {
+        if let Some(s) = self.slots.get_mut(id as usize) {
+            *s = AnimSlot::Idle;
+        }
+        if let Some(p) = self.poses.get_mut(id as usize) {
+            *p = None;
+        }
+    }
+
+    /// Snapshot the current pose for actor `id`, if any.
+    pub fn pose(&self, id: u8) -> Option<&PoseFrame> {
+        self.poses.get(id as usize).and_then(|p| p.as_ref())
+    }
+
+    /// Read the current slot for actor `id`.
+    pub fn slot(&self, id: u8) -> Option<&AnimSlot> {
+        self.slots.get(id as usize)
+    }
+
+    /// `true` if any slot is non-idle.
+    pub fn any_active(&self) -> bool {
+        self.slots.iter().any(|s| !s.is_idle())
+    }
+
+    /// Number of actor slots in this runtime.
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Drain any pending events from the most recent `tick`.
+    pub fn take_events(&mut self) -> Vec<AnimEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// Advance one frame. Walks every slot and dispatches per-kind:
+    ///
+    /// - `Keyframe` slots: tick the embedded `AnimPlayer`, write the
+    ///   resulting pose into `poses[i]`, emit `PoseUpdated`. If the
+    ///   player reports `finished`, also emit `Finished` and clear
+    ///   the slot.
+    /// - `Opaque` slots: bump the frame counter, ask the host whether
+    ///   to keep going via `on_opaque_record`, emit `OpaqueTick`.
+    ///   If the host returns `false`, emit `Finished` and clear.
+    /// - `Idle` slots: skipped.
+    pub fn tick<H: Host>(&mut self, host: &mut H) {
+        self.frame = self.frame.saturating_add(1);
+        for i in 0..self.slots.len() {
+            let actor = i as u8;
+            // Take ownership briefly so we can mutate the slot while
+            // also borrowing the host.
+            let mut slot = std::mem::replace(&mut self.slots[i], AnimSlot::Idle);
+            match &mut slot {
+                AnimSlot::Idle => {
+                    // Already idle - restore (still idle).
+                    self.slots[i] = AnimSlot::Idle;
+                    continue;
+                }
+                AnimSlot::Keyframe { player, kind } => {
+                    let pose = player.tick();
+                    let finished = pose.finished;
+                    self.poses[i] = Some(pose.clone());
+                    self.events.push(AnimEvent::PoseUpdated {
+                        actor,
+                        pose: pose.clone(),
+                    });
+                    if finished {
+                        self.events.push(AnimEvent::Finished { actor, kind: *kind });
+                        self.slots[i] = AnimSlot::Idle;
+                    } else {
+                        self.slots[i] = slot;
+                    }
+                }
+                AnimSlot::Opaque {
+                    record,
+                    bone_count: _,
+                    kind,
+                    frame_counter,
+                } => {
+                    *frame_counter = frame_counter.saturating_add(1);
+                    // Per-kind dispatch on the consumer-struct kind
+                    // byte at `+0x00` of the runtime record. Matches
+                    // the outer dispatch in FUN_8004AD80.
+                    let consumer_kind =
+                        OpaqueRecordKind::from_byte(record.first().copied().unwrap_or(0));
+                    let alive = match consumer_kind {
+                        OpaqueRecordKind::Kind2 => {
+                            host.on_kind2_handshake(actor, record, *frame_counter)
+                        }
+                        OpaqueRecordKind::Kind4 => {
+                            host.on_kind4_action_engaged(actor, record, *frame_counter)
+                        }
+                        OpaqueRecordKind::Kind5 => {
+                            host.on_kind5_or_bit2(actor, record, *frame_counter)
+                        }
+                        OpaqueRecordKind::Kind7 => {
+                            host.on_kind7_set_da_8(actor, record, *frame_counter)
+                        }
+                        OpaqueRecordKind::Kind8 => {
+                            host.on_kind8_or_bit3(actor, record, *frame_counter)
+                        }
+                        OpaqueRecordKind::Other(b) => {
+                            host.on_other_kind(actor, b, record, *frame_counter)
+                        }
+                    };
+                    self.events.push(AnimEvent::OpaqueTick {
+                        actor,
+                        kind: *kind,
+                        frame: *frame_counter,
+                    });
+                    if !alive {
+                        self.events.push(AnimEvent::Finished { actor, kind: *kind });
+                        self.slots[i] = AnimSlot::Idle;
+                    } else {
+                        self.slots[i] = slot;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Staged battle-anim commit (the FUN_8004AD80 id -> slot/record ladder)
+// ---------------------------------------------------------------------------
+
+/// First staged anim id that resolves through the per-character
+/// **art-animation bank** instead of the runtime action table
+/// (`docs/formats/battle-data-pack.md` § Art-animation bank).
+pub const ART_ANIM_ID_BASE: u8 = 0x10;
+
+/// The two **dynamic** action-table slots the anim commit materializes an
+/// art-bank record into (`0x801C9360 + slot*4`, slots `0x10` / `0x11`).
+pub const DYNAMIC_ART_SLOT_A: u8 = 0x10;
+pub const DYNAMIC_ART_SLOT_B: u8 = 0x11;
+
+/// Where a staged battle anim id (`actor[+0x1DA]`, written by the battle
+/// action SM) resolves when the anim system commits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedAnimTarget {
+    /// `q < 0x10`: play action-table entry `q` directly. For a party
+    /// member the table is the player file's record[0] slots widened with
+    /// the equipment-spliced swings (`0` idle, `1` walk/approach, `2..5`
+    /// hit reactions, `7..9` ready/recover/defeat, `0xC..0xF` the four
+    /// direction-command weapon swings); for a monster, its archive entry
+    /// index.
+    Direct { slot: u8 },
+    /// `q >= 0x10`: materialize **art-bank record** `q - 0x10` into
+    /// dynamic action-table slot `slot` (`0x10` or `0x11`) and rewrite the
+    /// staged id to `slot`. Only meaningful for actors that carry an art
+    /// bank (party members); a monster's ids stay plain entry indices.
+    ArtBank { record: u8, slot: u8 },
+}
+
+/// Resolve a staged anim id through the retail commit ladder: ids below
+/// [`ART_ANIM_ID_BASE`] play their action-table entry directly; ids
+/// `q >= 0x10` select art-bank record `q - 0x10` and install at a dynamic
+/// slot - `0x10` for the plain base ids `0x11..=0x19` (the `0x19` regular
+/// starter among them), `0x11` for `0x10`, for the `0x1A` SpecialStarter
+/// and for **every art constant** `>= 0x1B`. The staged id is then
+/// rewritten to the slot number, so the SM's `+0x1D9 == +0x1DA` equality
+/// checks compare slot numbers.
+///
+/// Read off the register, not the C: the slot register `s2` defaults to
+/// `0x10` in the delay slot of the `0x1A` test (`bne a0,v0 ; _li s2,0x10` at
+/// `0x8004B720`), the `0x1A` arm sets `0x11` at `0x8004B76C`, the `0x10`
+/// test sets `0x11` at `0x8004BB58`, and the art-constant arm (`staged >=
+/// 0x1B`, entered at `0x8004BB5C`) sets `0x11` in the delay slot of its
+/// name-width call (`jal 0x80035f04 ; _li s2,0x11` at `0x8004BBBC..
+/// 0x8004BBC0`) before the install at `0x8004BC4C`. A live Tri-Somersault
+/// capture reads the same: `0x27`, `0x1F` and `0x2B` all commit with
+/// `+0x1D9 = 0x11`, the `0x19` starter with `0x10`. The earlier "`0x10` and
+/// `0x1A` only" reading was the decompiler dropping that delay-slot store.
+// PORT: FUN_8004AD80 (dynamic-art commit arm) - staged id q >= 0x10 reads
+// bank record q - 0x10 (`q*0xD0 + bank + 4 - 0xCDC` install arithmetic),
+// installs at action-table slot 0x11 when q == 0x10 || q >= 0x1A else
+// 0x10, and rewrites the staged byte to the slot number. See
+// docs/formats/battle-data-pack.md § Art-animation bank.
+pub fn resolve_staged_anim(q: u8) -> StagedAnimTarget {
+    if q < ART_ANIM_ID_BASE {
+        return StagedAnimTarget::Direct { slot: q };
+    }
+    let slot = if q == 0x10 || q >= 0x1A {
+        DYNAMIC_ART_SLOT_B
+    } else {
+        DYNAMIC_ART_SLOT_A
+    };
+    StagedAnimTarget::ArtBank {
+        record: q - ART_ANIM_ID_BASE,
+        slot,
+    }
+}
+
+/// Errors the runtime can return from `play`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnimError {
+    ActorOutOfRange { actor: u8 },
+    HeaderTooSmall,
+    PlayerInit(String),
+}
+
+impl std::fmt::Display for AnimError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AnimError::ActorOutOfRange { actor } => {
+                write!(f, "actor {actor} is out of range for this AnimRuntime")
+            }
+            AnimError::HeaderTooSmall => write!(f, "record buffer too small for an 8-byte header"),
+            AnimError::PlayerInit(msg) => write!(f, "AnimPlayer init failed: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for AnimError {}

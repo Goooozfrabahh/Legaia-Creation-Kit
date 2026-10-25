@@ -1,0 +1,80 @@
+# legaia-iso
+
+PSX disc image reader and ISO9660 walker.
+
+The Legend of Legaia disc is shipped as Mode2/2352 (`.bin` + `.cue`). Each
+2352-byte sector wraps 2048 bytes of user data behind a 24-byte header
+(sync + Mode2/Form1 subheader) and an 8-byte EDC/ECC trailer. This crate
+strips that wrapper and exposes a clean ISO9660 view.
+
+## What it provides
+
+- `raw::RawDisc` - sector-addressed reader. `read_sector(lba)` returns the
+  2048-byte user payload only; the caller never sees raw 2352-byte sectors.
+- `iso9660` - primary volume descriptor + directory walker. Yields
+  `(name, lba, size)` tuples for every file on the disc.
+- `image` - the borrowed-slice reader the browser hosts load a visitor's
+  image through: `walk_iso_files` lists every file (subdirectories
+  included), `extract_prot_dat` / `extract_cdname_txt` / `extract_scus`
+  return a root file's logical bytes, and `read_raw_sector` hands the XA
+  demuxer a whole 2352-byte sector. No `std::fs`, so it builds for `wasm32`.
+  It walks directories through `iso9660`'s in-memory reader
+  (`root_in_image`, `list_directory_in_image`), the same one behind
+  `find_file_in_image` / `find_path_in_image` / `read_file_in_image`, so
+  the browser and the patcher resolve a name identically: case-insensitive,
+  `;1` version suffix stripped.
+- `region` - product-code heuristics for identifying which retail build
+  (USA / JP / EU / debug) you're holding.
+- `write` - the write side: `encode_mode2_form1_sector` recomputes a sector's
+  EDC + P/Q ECC (the generic ECMA-130 / Yellow Book math; not game-specific),
+  `encode_mode2_form2_sector` the Form 2 variant (EDC only, and a blank
+  retail EDC field stays blank - the XA-audio write path),
+  `patch_file_logical` overwrites bytes in an ISO file's logical payload and
+  re-encodes every touched sector, `iso9660::find_file_in_image` locates a
+  top-level file in an in-memory image, and `iso9660::find_path_in_image`
+  walks subdirectories (`"XA/XA2.XA"`). Used by the
+  [randomizer / disc patcher](../../docs/tooling/randomizer.md) to write edited
+  assets back into a `.bin`.
+
+The single binary, `disc-extract`, drives the read path above.
+
+## CLI
+
+```bash
+disc-extract list   <disc.bin>             # ISO9660 listing
+disc-extract extract <disc.bin> <out_dir>  # walk + dump every file
+disc-extract verify  <disc.bin>            # SHA-256 of the .bin
+```
+
+Verification table for the canonical NA build is in the root [`README.md`](../../README.md);
+cross-reference [Redump](http://redump.org/disc/425/) for per-track hashes.
+
+## Tests
+
+`relayout` grows a file (specifically `PROT.DAT`) by **whole sectors** and
+cascades every downstream disc LBA reference - the disc-integrity operation the
+official PAL discs used at mastering to fit longer localized dialog. It rebuilds
+`PROT.DAT` (fresh EDC/ECC + correct MSF headers), relocates every sector after it
+(MSF header only - Form 1 EDC/ECC do not cover the header), and renumbers the PVD
+volume space / path tables / directory records / `PROT.DAT` record size. Generic
+ISO9660 + ECMA-130 (no game bytes). See
+[`docs/formats/disc.md` § Full-ISO relayout](../../docs/formats/disc.md#full-iso-relayout).
+
+`tests/disc_pipeline.rs` is a disc-gated integration test: it asserts file
+count, key file SHA-256s, and that the ISO9660 walk reaches every entry.
+`tests/ecc_real.rs` is the write-side disc-gated test: it confirms the EDC/ECC
+encoder reproduces real PROT.DAT sectors' parity bit-for-bit and that a one-byte
+patch + restore round-trips a real sector exactly. Both read `LEGAIA_DISC_BIN`;
+with the env var unset they skip (and pass) so CI runs without redistributing
+Sony data.
+
+```bash
+LEGAIA_DISC_BIN="/path/to/Legend of Legaia (USA).bin" cargo test -p legaia-iso
+```
+
+## See also
+
+- [`docs/formats/disc.md`](../../docs/formats/disc.md) - Mode2/2352 layout
+  and the iso9660 primary volume descriptor.
+- [`docs/reference/builds.md`](../../docs/reference/builds.md) - the
+  region table.

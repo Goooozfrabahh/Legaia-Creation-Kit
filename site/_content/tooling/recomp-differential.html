@@ -1,0 +1,227 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">tooling</a> &middot; recomp differential</div>
+  <h1>Recomp differential oracle</h1>
+  <p class="lede">When the engine's camera swings a beat late or an NPC turns the wrong way, "it looks off" is not a bug report. This harness turns it into one: the retail game (run natively as a <strong>static recomp</strong>) and the from-scratch engine both write the same per-frame state trace in retail units, and a diff names the <em>first frame</em> on which any channel - camera pose, player position, an NPC's heading - departs from retail. A note-level variant does the same for music.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Retail side</dt><dd>psxrecomp static recomp of <code>SCUS_942.54</code>, driven over its JSON-over-TCP debug server by <code>scripts/recomp/probe.py</code></dd>
+    <dt>Engine side</dt><dd><code>legaia-engine sim-trace</code> (<code>crates/parity/src/sim_trace.rs</code>) ticking a <code>BootSession</code></dd>
+    <dt>Trace shape</dt><dd>One JSON object per frame; angles 12-bit (4096 = full turn), positions in retail world units, mode = the retail game-mode word</dd>
+    <dt>Diff</dt><dd><code>trace_diff.py</code> (state), <code>note_diff.py</code> (BGM key-ons); non-zero exit on any divergence</dd>
+    <dt>Environment</dt><dd><code>LEGAIA_RECOMP_DIR</code>, <code>LEGAIA_RECOMP_BIOS</code>, <code>LEGAIA_RECOMP_PORT</code> - each overridable per call</dd>
+    <dt>Never committed</dt><dd>Captured traces carry retail RAM values; only the synthetic fixtures in <code>scripts/recomp/test_*.py</code> are tracked</dd>
+    <dt>Used by</dt><dd><a href="../subsystems/cutscene.html">cutscene</a> camera parity, <a href="../subsystems/audio.html">audio</a> sequencer parity, the arts-voice pins in <a href="../subsystems/battle-action.html">battle action</a></dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="when">
+  <h2>What this solves</h2>
+  <p>The emulator harnesses (<a href="pcsx-redux-automation.html">PCSX-Redux</a>, <a href="mednafen-automation.html">mednafen</a>) observe retail through breakpoints and save-state diffs: precise, but slow and one address at a time. The recomp path reads a dozen retail globals every frame at full speed, so hundreds of aligned frames from both sides cost seconds. Reach for it when a scene <em>plays</em> differently in the engine and you need the first diverging quantity and frame.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 760 230" role="img" aria-label="Two lanes: the retail recomp read by trace_capture.py and the from-scratch engine run by legaia-engine sim-trace each emit a JSONL trace in retail units; trace_diff.py aligns the two on the first camera cut and reports the first divergent frame per channel">
+      <defs><marker id="rd-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <text class="dg-sub" x="100" y="16">retail</text>
+      <rect class="dg-node" x="10" y="26" width="180" height="56" rx="5"/>
+      <text class="dg-label" x="100" y="50">static recomp</text><text class="dg-sub" x="100" y="68">TCP debug server</text>
+      <rect class="dg-node" x="240" y="26" width="200" height="56" rx="5"/>
+      <text class="dg-label" x="340" y="50">trace_capture.py</text><text class="dg-sub" x="340" y="68">reads pinned globals</text>
+      <text class="dg-sub" x="100" y="216">port</text>
+      <rect class="dg-node" x="10" y="146" width="180" height="56" rx="5"/>
+      <text class="dg-label" x="100" y="170">engine BootSession</text><text class="dg-sub" x="100" y="188">cold-booted scene</text>
+      <rect class="dg-node" x="240" y="146" width="200" height="56" rx="5"/>
+      <text class="dg-label" x="340" y="170">sim-trace</text><text class="dg-sub" x="340" y="188">reads Camera::globals</text>
+      <rect class="dg-group" x="470" y="20" width="110" height="190" rx="6"/>
+      <text class="dg-label" x="525" y="58">JSONL</text><text class="dg-sub" x="525" y="76">retail units</text>
+      <text class="dg-label" x="525" y="178">JSONL</text><text class="dg-sub" x="525" y="196">retail units</text>
+      <rect class="dg-node-accent" x="610" y="86" width="140" height="56" rx="5"/>
+      <text class="dg-label" x="680" y="110">trace_diff.py</text><text class="dg-sub" x="680" y="128">first divergence</text>
+      <path class="dg-edge" d="M190 54 L238 54" marker-end="url(#rd-arrow)"/>
+      <path class="dg-edge" d="M190 174 L238 174" marker-end="url(#rd-arrow)"/>
+      <path class="dg-edge" d="M440 54 L478 54" marker-end="url(#rd-arrow)"/>
+      <path class="dg-edge" d="M440 174 L478 174" marker-end="url(#rd-arrow)"/>
+      <path class="dg-edge" d="M572 64 L608 104" marker-end="url(#rd-arrow)"/>
+      <path class="dg-edge" d="M572 170 L608 126" marker-end="url(#rd-arrow)"/>
+    </svg>
+    <figcaption>Both sides emit the same trace shape in retail units; the diff aligns them on the first camera cut and reports, per channel, the first frame they disagree.</figcaption>
+  </figure>
+</section>
+
+<section class="doc-section" id="quick-start">
+  <h2>Quick start</h2>
+  <div class="cli"><code>python3 scripts/recomp/probe.py --port 4494 launch --cache-dir /tmp/mycache --wait-tcp</code></div>
+  <div class="cli"><code>python3 scripts/recomp/probe.py --port 4494 load-state 4 --expect-scene 'jou ene' --expect-mode 0x15</code></div>
+  <div class="cli"><code>python3 scripts/recomp/trace_capture.py --port 4494 --frames 100 --map camera --out /tmp/scratch/recomp_cam.jsonl</code></div>
+  <div class="cli"><code>legaia-engine sim-trace --scene town01 --disc "$LEGAIA_DISC_BIN" --frames 100 --out /tmp/scratch/engine_town01.jsonl</code></div>
+  <div class="cli"><code>python3 scripts/recomp/trace_diff.py /tmp/scratch/recomp_cam.jsonl /tmp/scratch/engine_town01.jsonl --tol-angle 2 --tol-pos 2</code></div>
+  <p>Each divergent channel prints its first divergent frame with a &plusmn;5-frame window of both sides' values. Always pass <code>--expect-scene</code> / <code>--expect-mode</code> to a load: a stale slot loads "successfully" into the wrong state.</p>
+</section>
+
+<section class="doc-section" id="moving-parts">
+  <h2>Moving parts</h2>
+  <table>
+  <thead><tr><th>Tool</th><th>Lives in</th><th>Role</th></tr></thead>
+  <tbody>
+  <tr><td><code>probe.py</code></td><td><code>scripts/recomp/</code></td><td><code>RecompClient</code> library + CLI for the debug server: ping / read / press / load-state / screenshot / launch / kill</td></tr>
+  <tr><td><code>trace_capture.py</code></td><td><code>scripts/recomp/</code></td><td>Per-frame capture of a named address map (<code>camera</code>, <code>player</code>, <code>scene</code>, <code>--actors</code>) into JSONL</td></tr>
+  <tr><td><code>legaia-engine sim-trace</code></td><td><code>crates/parity</code> (subcommand of <code>legaia-engine</code>)</td><td>Engine side: boots the scene live, ticks N frames, emits N+1 records</td></tr>
+  <tr><td><code>trace_diff.py</code></td><td><code>scripts/recomp/</code></td><td>Aligns two traces, first divergence per channel</td></tr>
+  <tr><td><code>preflight.py</code>, <code>apply_boot_state_fix.py</code></td><td><code>scripts/recomp/</code></td><td>Diagnose and repair the recomp's savestate-resume defect</td></tr>
+  <tr><td><code>minigame_warp.py</code></td><td><code>scripts/recomp/</code></td><td>Replays the field VM's door-warp writes to drop any field state into a minigame</td></tr>
+  <tr><td><code>audio_note_capture.py</code>, <code>note-trace</code>, <code>note_diff.py</code></td><td><code>scripts/recomp/</code>, <code>crates/engine-audio</code></td><td>The note-level BGM differential</td></tr>
+  <tr><td><code>xa_cue_capture.py</code></td><td><code>scripts/recomp/</code></td><td>Per-frame capture of CD-XA voice-cue fires (arts shouts, grunts)</td></tr>
+  </tbody>
+  </table>
+</section>
+
+<section class="doc-section" id="trace-shape">
+  <h2>Trace shape and channels</h2>
+  <p>One JSON object per line; every field except <code>frame</code> is optional (absent = not captured that frame):</p>
+<pre><code>{"frame": 32915, "scene": "jou ene", "mode": 21,
+ "cam": {"pitch": 32, "yaw": 2408, "roll": 0, "h": 256,
+         "eye": [0, 1280, 7920], "focus": [0, 0, 0]},
+ "player": {"x": 100, "z": 200, "heading": 0},
+ "actors": [{"i": 1, "x": -40, "z": 80, "heading": 1024}]}</code></pre>
+  <aside class="notice warn">
+    <span class="notice-title"><code>cam.eye</code> / <code>cam.focus</code> are not a world-space eye and look-at</span>
+    They are the retail camera globals verbatim. <code>eye</code> is the <em>eye-space translation trio</em> - the post-rotation <code>(dx, dy, depth)</code> of the projection, in a space carrying retail's 6&times; world scale. <code>focus</code> is stored <em>negated in X and Z</em>. An engine side that emits a world-space pair here diverges totally on both channels in every scene, looks exactly like a camera bug, and cannot be fixed by any change to the camera. Check the convention before reading a camera divergence.
+  </aside>
+  <table>
+    <thead><tr><th>Channel</th><th>Retail global (recomp side)</th><th>Engine source</th><th>Compared as</th></tr></thead>
+    <tbody>
+      <tr><td><code>cam.pitch/yaw/roll</code></td><td>u16 trio <code>0x8007B790/92/94</code>, masked to 12 bits</td><td><code>Camera::globals</code></td><td>wraparound distance mod 4096</td></tr>
+      <tr><td><code>cam.h</code></td><td>GTE projection distance <code>0x8007B6F4</code></td><td><code>Camera::globals</code></td><td>absolute</td></tr>
+      <tr><td><code>cam.eye[3]</code></td><td>i32 trio <code>0x800840B8</code></td><td><code>Camera::globals</code></td><td>absolute distance</td></tr>
+      <tr><td><code>cam.focus[3]</code></td><td>i32 trio <code>0x80089118</code> (X, Z negated)</td><td><code>Camera::globals</code></td><td>absolute distance</td></tr>
+      <tr><td><code>player.x/z/heading</code></td><td>pointer <code>0x8007C364</code> &rarr; <code>+0x14</code>, <code>+0x18</code>, <code>+0x26</code></td><td><code>move_state.world_x/z</code>, <code>render_26</code></td><td>absolute / wraparound</td></tr>
+      <tr><td><code>scene</code></td><td>8-byte name at <code>0x8007050C</code></td><td><code>SceneMode</code> name</td><td>exact</td></tr>
+      <tr><td><code>mode</code></td><td>u16 at <code>0x8007B83C</code></td><td>Field 3, WorldMap 13, Battle <code>0x15</code>, Menu <code>0x17</code>, Cutscene 27; omitted otherwise</td><td>exact</td></tr>
+    </tbody>
+  </table>
+  <p>Channels present on only one side are reported and skipped, never counted as divergence.</p>
+</section>
+
+<section class="doc-section" id="capture">
+  <h2>Capturing and diffing</h2>
+  <h3>Two capture engines</h3>
+  <table>
+    <thead><tr><th><code>--engine</code></th><th>Property</th><th>Use when</th></tr></thead>
+    <tbody>
+      <tr><td><strong>ring</strong></td><td>Frame-exact: the server's per-frame snapshot ring (4 regions &times; 128 bytes, 36000-frame history). The <code>camera</code> map alone uses all four regions.</td><td>Any map that fits the budget.</td></tr>
+      <tr><td><strong>poll</strong></td><td>Best-effort live loop tagged with the frame counter; skipped frames are absent lines, a sample can straddle a frame.</td><td>Actor sweeps (pointer chases) and maps past the budget - <code>camera</code>+<code>player</code> together fall back here.</td></tr>
+    </tbody>
+  </table>
+  <h3>Alignment</h3>
+  <ul class="bullets">
+    <li>Default: the <strong>first camera change</strong> on each side - the two sides boot from unrelated frame counters, but the first scripted cut is the same event. <code>--offset N</code> overrides; first frames are the fallback when neither side has a cut.</li>
+    <li><code>sim-trace</code>'s first record is a pre-tick boot sample, so the engine camera always "changes" between its first two lines; <code>--skip-lead-b</code> (default 1) drops it.</li>
+    <li>A first divergence with no context rows above it is the first frame of the <em>overlap</em>, not the end of a matching run.</li>
+    <li>Right after a savestate load the camera can sit static for a settle window; capture longer and let alignment find the first change.</li>
+  </ul>
+  <h3>Reading a camera divergence</h3>
+  <p>Before reading a position gap as a pose error, rule out a <strong>timeline-phase difference</strong>: <code>sim-trace</code> boots a scene cold at frame 0, while a retail capture usually arrives through the prologue chain several beats in, so the engine's beat 0 can be compared against retail's beat 5. A scene where the cold-booted engine runs no camera script at all reads the same way - a beat gated on arrival story flags. Telling either from a pose error needs the engine driven <em>through</em> the chain.</p>
+  <details class="disclosure">
+    <summary>Getting into a scene the opening chain does not reach</summary>
+    <div class="disclosure-body">
+      <table>
+        <thead><tr><th>Route</th><th>Cost</th><th>How</th></tr></thead>
+        <tbody>
+          <tr><td>1. Parked savestate</td><td>seconds</td><td><code>probe.py load-state N --expect-scene ... --expect-mode ...</code>. Verify liveness by sampling <code>frame</code> twice. Slots drift (F1-F12 in a windowed run overwrites one): the fingerprint is the evidence, not the slot number. The name-entry screen shares the field mode word - screenshot when in doubt.</td></tr>
+          <tr><td>2. Cold boot + memory-card load</td><td>minutes</td><td>Reaches anywhere a save reaches. The runtime resolves the card next to the <strong>executable</strong>, never the cwd; seed <code>build-dbg/card1.mcd</code> from a real card (back it up), confirm with <code>save-tool saves</code>, then drive <code>START &rarr; DOWN &rarr; CROSS &rarr; CROSS &rarr; CROSS &rarr; UP &rarr; CROSS</code>, screenshotting each screen.</td></tr>
+          <tr><td>3. Warp into a minigame</td><td>seconds</td><td><code>minigame_warp.py --from-slot N --sub-id K</code> replays the field VM's op-<code>0x3E</code> door-warp writes from any field state. The scene name is <strong>not</strong> a fingerprint here (it holds the host scene); identify a dome state by <code>mode == 0x15</code> + sub-id global <code>0x8007BA34</code> + the match phase byte.</td></tr>
+        </tbody>
+      </table>
+      <p>Route 2's traps: the title cursor starts on <code>NEW GAME</code>; the load confirm defaults to <code>No</code>; the title times out back to the attract demo (poll for mode <code>0x17</code> and press immediately); <code>START</code> does not always skip the demo.</p>
+      <p>Capturing a slot (<code>save_savestate</code>) is staged like a load and is believed only after three checks: the <code>.pst</code> carries a non-zero resume PC (<code>preflight.py --slot N</code>), a <strong>fresh</strong> process's load lands on the expected fingerprint, and a scripted input advances the state.</p>
+    </div>
+  </details>
+  <details class="disclosure">
+    <summary>The savestate-resume fix and its preflight</summary>
+    <div class="disclosure-body">
+      <p>Stock, the recomp runtime cannot resume a savestate: its loader forces the PC back to the game entry (the BSS-clear routine), so every load restores RAM and immediately wipes the game-mode word - and acks <code>{"ok":true}</code> either way. <code>apply_boot_state_fix.py</code> rewrites the one line (honour the recorded resume PC); it is a script rather than a <code>.patch</code> so no PolyForm-licensed source is vendored. Then build the <code>psx-runtime</code> target - <strong>not</strong> the executable-named target, which make treats as already satisfied and silently skips.</p>
+      <table>
+        <thead><tr><th>Fault</th><th>Signal</th><th>Fix</th></tr></thead>
+        <tbody>
+          <tr><td>Self-wiping runtime</td><td><code>boot_state.c</code> carries <code>cpu-&gt;pc = entry_pc</code></td><td><code>apply_boot_state_fix.py</code></td></tr>
+          <tr><td>Stale build</td><td>binary older than <code>boot_state.c</code></td><td><code>make psx-runtime</code></td></tr>
+          <tr><td>Stale snapshot</td><td>the <code>.pst</code> records <code>pc == 0</code></td><td>recapture that slot</td></tr>
+        </tbody>
+      </table>
+      <p><code>preflight.py</code> separates the three and is wired into <code>probe.py launch</code>, <code>trace_capture.py --savestate</code> and failed <code>--expect-*</code> checks (<code>--skip-preflight</code> bypasses).</p>
+    </div>
+  </details>
+  <details class="disclosure">
+    <summary>Debug-server protocol traps <code>probe.py</code> bakes in</summary>
+    <div class="disclosure-body">
+      <ul class="bullets">
+        <li><strong>One request per connection</strong> - the server closes the socket after every response.</li>
+        <li><strong><code>press</code> takes a raw active-low SIO pad word</strong> in a field named <code>buttons</code> (Cross <code>0xBFFF</code>, Circle <code>0xDFFF</code>, Start <code>0xFFF7</code>; <code>probe.BUTTON_WORDS</code>). It returns before the hold elapses; use &ge; 30-frame holds for confirms.</li>
+        <li><strong>Savestate loads are staged</strong> - executed at the next block boundary, dropping every connection; the client retries verification reads through the reconnect.</li>
+        <li><strong>No synchronous stepping</strong> (<code>pause</code>/<code>step</code>/<code>run_to_frame</code> are removed); the frame-exact primitive is <code>set_snapshot</code> + <code>read_frame_ram</code>.</li>
+        <li><code>vram_peek</code> clamps to 128 px per call (the client chunks); <code>dirty_exec_hot</code> PCs are physical - OR <code>0x80000000</code> before resolving against overlay VAs.</li>
+        <li>Kill by PID, never by pattern; one port, one instance (<code>launch</code> refuses a port that already answers).</li>
+        <li>A <code>display disabled</code> error means the <em>guest</em> GPU's display-enable bit is off (early boot, between attract segments), not that the host lacks a display. Headless instances can screenshot without X.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="note-differential">
+  <h2>Note-level audio differential</h2>
+  <p>The same shape applied to music: instead of camera channels per frame it compares the stream of <em>key-ons</em> a sequencer asked the SPU for. Both sides snapshot the same instant (sample start address, pitch, per-voice volumes, ADSR words), so a divergence localises directly - a missing key-on means the sequencer never asked, a wrong start address means tone selection diverged, a wrong pitch means the note or its bend resolved differently.</p>
+  <div class="cli"><code>python3 scripts/recomp/audio_note_capture.py --port 4472 --seconds 30 --out /tmp/scratch/recomp_notes.jsonl --summary</code></div>
+  <div class="cli"><code>./target/release/note-trace --extracted extracted --track 0 --frames 1800 --out /tmp/scratch/engine_notes.jsonl</code></div>
+  <div class="cli"><code>python3 scripts/recomp/note_diff.py /tmp/scratch/recomp_notes.jsonl /tmp/scratch/engine_notes.jsonl</code></div>
+  <table>
+    <thead><tr><th>Rule</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Capture from a <strong>clocked</strong> instance: <code>SDL_AUDIODRIVER=dummy xvfb-run -a &lt;runtime&gt; --debug-port N --no-launcher ...</code></td><td>A <code>--headless</code> recomp never clocks the SPU; every voice stays at envelope 0, the driver thinks all 24 are free, and nearly everything keys onto voice 0. The script refuses unless SPU frames advance - verify the rate is exactly 735.0 per guest frame yourself.</td></tr>
+      <tr><td>Read <code>vag</code> before <code>pitch</code></td><td>Raw SPU addresses never match (each side lays out the bank); ids are renumbered per trace by ascending address. When distinct-VAG counts differ, <code>pitch</code> is the reliable channel.</td></tr>
+      <tr><td>Pick the track from the running game: BGM id at <code>0x8007BAC8</code>, PROT index at <code>0x8007BAB8</code></td><td>Both read 0 until a scene starts music. <code>--track</code> is not the sound-test slot - cross-check <code>note-trace --list</code>'s <code>prot_entry</code> column (see <a href="../reference/music-tracks.html">music tracks</a>).</td></tr>
+      <tr><td>Alignment is on note <em>ordinal</em></td><td>Captures start mid-track and the frame counters have unrelated origins.</td></tr>
+    </tbody>
+  </table>
+  <p class="hint">The <code>v</code> (voice index) channel differs whenever any other channel does - voice allocation order is an effect, not a finding. The volume domain the key-on carries is retail's 14-bit SPU range (<code>FUN_80067550</code>'s chain), and a program resolves to its tone page by rank among the used programs (<code>FUN_80068d94</code> / <code>FUN_80068b98</code>).</p>
+</section>
+
+<section class="doc-section" id="xa-cue">
+  <h2>CD-XA cue capture</h2>
+  <p><code>xa_cue_capture.py</code> applies the snapshot ring to the streamed-voice layer (arts shouts, grunts, fanfares): every cue fire stages its parameters in a cluster of SCUS globals before arming the CD filter, and the tool records those globals per frame, detects an edge on the play-state write, and resolves the staged disc location against the clip table to name the <code>XA&lt;n&gt;.XA</code> file. It is the instrument behind the arts-voice channel pins in <code>legaia_art::arts_voice</code>.</p>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <table>
+    <thead><tr><th>Item</th><th>Address / function</th><th>What it proves</th><th>Source</th></tr></thead>
+    <tbody>
+      <tr><td>Camera trio + focus + eye globals</td><td><code>0x8007B790</code>, <code>0x80089118</code>, <code>0x800840B8</code>; writer <code>FUN_801DE084</code> (op-<code>0x45</code> apply)</td><td>The channels are the retail camera state, not a derived pose</td><td><a href="../subsystems/cutscene.html">cutscene</a>, <a href="../reference/memory-map.html">memory map</a></td></tr>
+      <tr><td>Player record fields</td><td><code>0x8007C364</code> &rarr; <code>+0x14/+0x18/+0x26</code></td><td>Position + heading source</td><td><a href="../subsystems/field-locomotion.html">field locomotion</a></td></tr>
+      <tr><td>Key-on volume chain</td><td><code>FUN_80067550</code></td><td>14-bit volume domain and truncation points</td><td><code>ghidra/scripts/funcs/80067550.txt</code></td></tr>
+      <tr><td>Program-to-page rank table</td><td><code>FUN_80068d94</code> (write), <code>FUN_80068b98</code> (read)</td><td>Tone pages are indexed by rank among used programs</td><td><code>ghidra/scripts/funcs/</code></td></tr>
+      <tr><td>XA cue fire</td><td><code>FUN_8003D53C</code>; clip table <code>0x801C6ED8</code></td><td>Which globals stage a cue and how a location maps to a file</td><td><a href="../subsystems/battle-action.html">battle action</a></td></tr>
+      <tr><td>Diff semantics</td><td>synthetic fixtures beside the scripts in <code>scripts/recomp/</code></td><td>Alignment, wraparound, tolerance and edge rules, checked without retail data</td><td><code>python3 -m unittest</code></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Tooling</span>
+    <a href="determinism-replay.html">Determinism + replay</a>
+    <a href="pcsx-redux-automation.html">PCSX-Redux automation</a>
+    <a href="mednafen-automation.html">Mednafen automation</a>
+    <a href="port-catalog.html">Port catalog</a>
+  </div>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../reference/memory-map.html">Memory map</a>
+    <a href="../subsystems/engine.html">Engine architecture</a>
+    <a href="../subsystems/cutscene.html">Cutscene</a>
+    <a href="../subsystems/audio.html">Audio</a>
+    <a href="../formats/seq.html">SEQ format</a>
+    <a href="../reference/re-settled-threads.html">Settled RE threads</a>
+  </div>
+</section>

@@ -1,0 +1,318 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">formats</a> &middot; dialog font (proportional latin)</div>
+  <h1>Dialog font (proportional Latin) <span class="tag tag-done">Confirmed</span></h1>
+  <p class="lede">Every line an NPC speaks, every menu label and every "learned a new Art" banner is drawn one letter at a time from a single 256-cell glyph sheet. It is a proportional sans-serif - an "i" is 3 pixels wide, a "W" is 9 - and its pixel widths - not byte counts - decide whether a translated line fits its box. The sheet lives in video memory at runtime; the widths and escape codes live in the executable.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance" data-doc="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>In the game</dt><dd>The dialog box, pause menu, shop and battle text - every proportional line of Latin text</dd>
+    <dt>Where</dt><dd>Glyph sheet: a plain <a href="tim.html">TIM</a> at <code>PROT.DAT</code> file offset <code>0x7F40</code> (the unindexed head gap before entry 0), uploaded to VRAM <code>(896, 0)</code>. Width table at SCUS <code>0x80073F1C</code>; escape table at SCUS <code>0x80074050</code></dd>
+    <dt>Size</dt><dd>256&times;256 4bpp pixels = 16 &times; 14 cells of 16&times;16 (224 glyphs); 256-byte width table; 38 &times; 4-byte escape entries</dd>
+    <dt>Parser</dt><dd><code>crates/font</code> - <code>Font::from_disc_tim_and_scus</code>, layout API, CLI <code>font-extract</code></dd>
+    <dt>Confidence</dt><dd>Confirmed - tables and packet shape traced in the single-line renderer; the disc TIM byte-matches the save-state VRAM extraction (<a href="#how-we-know">how we know</a>)</dd>
+    <dt>Used by</dt><dd><a href="mes.html">MES dialog</a>, <a href="../subsystems/field-menu.html">field menu</a>, <a href="../subsystems/save-screen.html">save screen</a>, <a href="../tooling/translation.html">translation packs</a></dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="overview" data-doc="-">
+  <h2>Three pieces of data</h2>
+  <ul class="bullets">
+    <li><strong>The glyph sheet</strong> - 4bpp tiles in VRAM at <code>(896, 0)..(960, 256)</code>, one 16&times;16 cell per character byte.</li>
+    <li><strong>The width table</strong> - 256 bytes in the executable, one advance per character byte.</li>
+    <li><strong>The escape table</strong> - 38 four-byte entries in the executable, selected by the byte after a <code>0xCE</code> escape; they draw controller-button and UI icons, or print a script counter.</li>
+  </ul>
+  <figure class="overlay-strip">
+    <svg viewBox="0 0 900 200" width="100%" style="max-width:900px" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="How one character byte becomes a glyph on screen: the byte picks a 16 by 16 cell in the VRAM sheet, the width table gives the advance, and the CLUT index picks the colour">
+      <style>
+        .df-box { fill: var(--bg-raised); stroke: var(--accent); stroke-width: 1.2; }
+        .df-dim { fill: none; stroke: var(--border); stroke-width: 1.1; stroke-dasharray: 3 3; }
+        .df-seg { font: 12px 'Inter', sans-serif; fill: currentColor; text-anchor: middle; dominant-baseline: middle; }
+        .df-sub { font: 11px 'JetBrains Mono', monospace; fill: var(--accent); text-anchor: middle; }
+        .df-lab { font: 12px 'Inter', sans-serif; fill: var(--text-muted); text-anchor: middle; }
+        .df-arr { stroke: var(--accent); stroke-width: 1.2; fill: none; }
+      </style>
+      <rect x="20" y="40" width="130" height="44" class="df-box"/><text x="85" y="62" class="df-seg">character byte c</text>
+      <text x="85" y="106" class="df-sub">0x20..0xFF</text>
+      <path class="df-arr" d="M150 62 L208 62 M202 57 L208 62 L202 67"/>
+      <rect x="210" y="40" width="170" height="44" class="df-box"/><text x="295" y="55" class="df-seg">cell in VRAM sheet</text><text x="295" y="71" class="df-seg">U = (c &amp; 0xF) &times; 16</text>
+      <text x="295" y="106" class="df-sub">V = (c &amp; 0xF0) - 0x20</text>
+      <path class="df-arr" d="M380 62 L438 62 M432 57 L438 62 L432 67"/>
+      <rect x="440" y="40" width="160" height="44" class="df-box"/><text x="520" y="55" class="df-seg">sprite 14 &times; 15 px</text><text x="520" y="71" class="df-seg">GP0 0x64 packet</text>
+      <text x="520" y="106" class="df-sub">CLUT (96 + 16i, 510)</text>
+      <path class="df-arr" d="M600 62 L658 62 M652 57 L658 62 L652 67"/>
+      <rect x="660" y="40" width="220" height="44" class="df-box"/><text x="770" y="55" class="df-seg">advance X by</text><text x="770" y="71" class="df-seg">widths[c] + pad + 1</text>
+      <text x="770" y="106" class="df-sub">widths at 0x80073F1C</text>
+      <rect x="20" y="140" width="860" height="40" class="df-dim"/>
+      <text x="450" y="160" class="df-lab">escapes: 0x7C newline (+14 px), 0xCE + index = escape table, 0xCF + n = palette n, 0x00 = end</text>
+    </svg>
+    <figcaption>One sprite per glyph; the texture page is set once per string by a separate draw-mode primitive, not per glyph.</figcaption>
+  </figure>
+</section>
+
+<section class="doc-section" id="glyph-layout-in-vram" data-doc="glyph-layout-in-vram,clut">
+  <h2>Glyph sheet</h2>
+  <p>The sheet is a 4bpp TIM (4 bits per pixel, 16 colours), 64 halfwords wide &times; 256 tall = 256&times;256 pixels, framebuffer destination <code>(896, 0)</code>. Cell <code>c</code> for character byte <code>c</code> in <code>0x20..=0xFF</code>:</p>
+<pre><code>U = (c &amp; 0x0F) * 16
+V = (c &amp; 0xF0) - 0x20</code></pre>
+  <p>The drawn region in each cell is 14 &times; 15 pixels; the remaining 2 &times; 1 pixels are guard space. Bytes <code>0x00..=0x1F</code> are control codes and have no glyph. The TIM uses three palette indices: <code>0</code> transparent, <code>14</code> the <code>(32,32,32)</code> drop shadow, <code>15</code> the glyph fill.</p>
+  <p id="on-disc-carrier">The TIM sits in the unindexed head gap of <code>PROT.DAT</code> - after the table of contents, before the first numbered entry - which is why a per-entry walk never sees it. The font is therefore decodable straight from the disc, no save state required.</p>
+  <h3 id="clut">Palettes</h3>
+  <p>Sixteen 16-colour palettes (CLUTs) sit end-to-end on VRAM row 510 from x = 96, one every 16 pixels. The colour-change escape <code>0xCF n</code> sets the palette index; the CLUT word in each glyph packet is <code>index + 0x7F86</code>, and <code>0x7F86</code> decodes as <code>(96, 510)</code>. A text <strong>ink</strong> is therefore a CLUT pick (<code>DAT_8007B454</code>), and each ink&rsquo;s CLUT carries its own shadow in entry 14 beside the fill in entry 15, so the drop shadow changes with the ink. Read off a retail frame&rsquo;s VRAM:</p>
+  <div class="table-wrap">
+  <table class="compact">
+    <thead><tr><th>Ink</th><th>Fill (entry 15, 5-bit RGB)</th><th>Shadow (entry 14)</th><th>Where it is used</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td><code>(16, 16, 16)</code></td><td><code>(4, 4, 4)</code></td><td>a list&rsquo;s unfocused rows</td></tr>
+      <tr><td>1</td><td><code>(13, 13, 28)</code></td><td><code>(3, 3, 5)</code></td><td></td></tr>
+      <tr><td>2</td><td><code>(28, 4, 0)</code></td><td><code>(8, 4, 4)</code></td><td>the downed / 0-HP tier</td></tr>
+      <tr><td>3</td><td><code>(28, 13, 28)</code></td><td><code>(8, 2, 8)</code></td><td>the status-lock tier</td></tr>
+      <tr><td>4</td><td><code>(13, 27, 13)</code></td><td><code>(3, 8, 3)</code></td><td>skill passives, MP Used</td></tr>
+      <tr><td>5</td><td><code>(8, 27, 27)</code></td><td><code>(4, 8, 8)</code></td><td>teal labels</td></tr>
+      <tr><td>6</td><td><code>(28, 21, 0)</code></td><td><code>(8, 8, 4)</code></td><td>gold values, the caution tier</td></tr>
+      <tr><td>7</td><td><code>(25, 25, 25)</code></td><td><code>(4, 4, 4)</code></td><td>dialogue, menu text, every battle caption</td></tr>
+      <tr><td>8</td><td><code>(25, 25, 25)</code></td><td><code>(14, 14, 14)</code></td><td></td></tr>
+      <tr><td>9</td><td><code>(27, 11, 0)</code></td><td><code>(8, 6, 3)</code></td><td>the danger tier</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The engine&rsquo;s stencil atlas whitewashes the fill and marks each shadow texel; the overlay tint (<code>legaia_render_kernels::ui_tint</code>) draws a marked texel under a known ink as that ink&rsquo;s own entry 14, and under any other tint as an opaque grey.</p>
+</section>
+
+<section class="doc-section" id="width-table-advance-lookup" data-doc="width-table-advance-lookup">
+  <h2>Width table</h2>
+  <p>256 bytes indexed by character byte. The advance for <code>c</code> is <code>widths[c] + pad + 1</code>: <code>+1</code> is the fixed inter-character gap, and <code>pad</code> is a per-call override that resets to zero after each render call. Menus and battle draw with <code>pad = 0</code>; the field dialog pager sets it to <code>1</code> before every row, so <strong>dialogue runs one pixel wider per glyph</strong> than the same text in a menu.</p>
+  <p>Every byte reaches the advance except the four control bytes; a space takes its advance without emitting a sprite. A line's pixel width is exactly the sum of its per-byte advances, with no per-line term - the save screen's memory-card warning line measures 164 px.</p>
+  <p>A string whose <strong>first</strong> byte is below <code>0x20</code> draws nothing: the renderer tests it before the expander runs and returns <code>0</code>. That is what a <code>0x1F</code> dialogue lead hits, and why the segment drawer steps past the lead before drawing.</p>
+  <table>
+    <thead><tr><th>Byte</th><th>Char</th><th>Width</th><th>Byte</th><th>Char</th><th>Width</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x20</code></td><td>space</td><td>4</td><td><code>0x4D</code></td><td>M</td><td>8</td></tr>
+      <tr><td><code>0x21</code></td><td>!</td><td>4</td><td><code>0x57</code></td><td>W</td><td>9</td></tr>
+      <tr><td><code>0x41</code></td><td>A</td><td>7</td><td><code>0x69</code></td><td>i</td><td>3</td></tr>
+      <tr><td><code>0x49</code></td><td>I</td><td>3</td><td><code>0x6D</code></td><td>m</td><td>8</td></tr>
+    </tbody>
+  </table>
+  <p>Entries <code>0x00..=0x1F</code> overlap three short actor-name strings and are not advances. The full table is exported as <code>extracted/font/dialog_font_widths.csv</code>.</p>
+</section>
+
+<section class="doc-section" id="inline-control-bytes" data-doc="inline-control-bytes,escape-table-0x80074050">
+  <h2>Control bytes and escapes</h2>
+  <table>
+    <thead><tr><th>Byte</th><th>Operand</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x00</code></td><td>-</td><td>String terminator</td></tr>
+      <tr><td><code>0x20</code></td><td>-</td><td>Space: no glyph, advance like any glyph</td></tr>
+      <tr><td><code>0x7C</code></td><td>-</td><td>Newline: Y += 14 px, X back to line start</td></tr>
+      <tr><td><code>0xCE</code></td><td>u8 index</td><td>Escape: index into the 38-entry table below</td></tr>
+      <tr><td><code>0xCF</code></td><td>u8 palette</td><td>Colour change: palette index 0..15</td></tr>
+      <tr><td><code>0x21..=0xFF</code></td><td>-</td><td>Glyph: one sprite</td></tr>
+    </tbody>
+  </table>
+  <p>Before drawing, a preprocessor expands the string into a line buffer: authoring-time <code>^X</code> becomes <code>0xCE (X - 0x2D)</code>, and the substitution tokens <code>0xC1..=0xC5</code> / <code>0xC7</code> are replaced by the text they name (a party member's name, an item, spell or arts name). The renderer only ever sees the expanded string.</p>
+
+  <h3 id="escape-table-0x80074050">Escape table</h3>
+  <p>38 four-byte entries at SCUS <code>0x80074050</code>, indices <code>0x00..=0x25</code>; an index past <code>0x25</code> reads whatever follows the table.</p>
+  <div class="byte-map" role="img" aria-label="Escape entry: i16 sprite id at +0, u8 advance at +2, i8 y offset at +3">
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+0x00</span><span class="bm-name">sprite_id (0 = number)</span><span class="bm-size">i16</span></div>
+    <div class="bm-cell" style="--w:1"><span class="bm-off">+0x02</span><span class="bm-name">advance px</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell" style="--w:1"><span class="bm-off">+0x03</span><span class="bm-name">y_offset / counter</span><span class="bm-size">i8</span></div>
+  </div>
+  <p>A non-zero first field is <strong>not a string</strong>: it is a UI-icon sprite id into the 12-byte sprite records at <code>0x800732A4</code>, drawn untinted from the system-UI sheet at VRAM <code>(896, 256)</code> at <code>y + y_offset</code>. A zero first field prints a number instead: the signed halfword at script-counter slot <code>y_offset</code> (the field VM's counter table, written by <code>4C CA/CB/CC</code>), at 8 px per digit - but only for <code>y_offset &lt; 4</code>; a larger operand draws nothing and advances nothing. Leading zeros are suppressed and the units digit always draws, so any value <code>&lt;= 0</code> prints a single <code>0</code>.</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Index</th><th>Sprite id</th><th>Size</th><th>Advance</th><th><code>y_offset</code></th><th>Draws</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x00..=0x07</code></td><td>55..62</td><td>16&times;16</td><td>16</td><td>-2</td><td>Controller buttons: X, Circle, Square, Triangle, R1, R2, L1, L2</td></tr>
+      <tr><td><code>0x08</code></td><td>98</td><td>12&times;12</td><td>12</td><td>+2</td><td>Gold badge</td></tr>
+      <tr><td><code>0x09</code> / <code>0x0A</code></td><td>132 / 133</td><td>12&times;12</td><td>12</td><td>0</td><td>One-target / all-targets badges</td></tr>
+      <tr><td><code>0x0B..=0x0E</code></td><td>0</td><td>-</td><td>8 per digit</td><td>0..3</td><td><strong>Script counter</strong> 0..3 as a number</td></tr>
+      <tr><td><code>0x0F</code></td><td>137</td><td>38&times;12</td><td>38</td><td>0</td><td>"Ra-Seru" in kana, a text sprite</td></tr>
+      <tr><td><code>0x10..=0x13</code></td><td>36, 34, 35, 37</td><td>12&times;12</td><td>12</td><td>0</td><td>Equip-slot icons: arms, head, body, legs</td></tr>
+      <tr><td><code>0x14..=0x1A</code></td><td>139..145</td><td>20&times;12</td><td>20</td><td>0</td><td>Element plates: fire, thunder, wind, water, earth, light, dark</td></tr>
+      <tr><td><code>0x1B</code></td><td>146</td><td>20&times;12</td><td>20</td><td>0</td><td>Monster plate</td></tr>
+      <tr><td><code>0x1C</code></td><td>147</td><td>12&times;12</td><td>20</td><td>0</td><td>The fire plate's left edge (a 12 px window at U 0)</td></tr>
+      <tr><td><code>0x1D..=0x23</code></td><td>148..154</td><td>28&times;12</td><td>28</td><td>0</td><td>Winged element icons, same order as <code>0x14..=0x1A</code></td></tr>
+      <tr><td><code>0x24</code> / <code>0x25</code></td><td>155 / 156</td><td>28&times;12</td><td>28</td><td>0</td><td>Wider reads of the monster and fire plates</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>On the disc only <code>0x0B</code> and <code>0x0E</code> of the number escapes occur, in the <code>koin1</code> and <code>koin3</code> scene dialogue. The first list of these symbols was contributed by Henrique Stanke Scandelari (Stann0x) for a Brazilian Portuguese translation; translation packs can write them as aliases such as <code>{btn:x}</code> or <code>{icon:fire}</code>.</p>
+</section>
+
+<section class="doc-section" id="line-width-and-wrapping" data-doc="line-width-and-wrapping">
+  <h2>Line width: nothing wraps</h2>
+  <p><strong>No retail text surface wraps.</strong> Every line break is an authored <code>0x7C</code> or a new dialog line; an over-long line is drawn in full, over the box frame and off it. The renderer has no clip and no width test, and none of its callers measure a line first. Its only bound is an optional cap on the number of units drawn (glyphs, numeric escapes and line breaks), which is the typewriter: the pager passes its reveal counter for the row being typed and no cap anywhere else. That is why a translation has to fit the box <em>by pixels</em>, not only its byte slot.</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Surface</th><th>Pad</th><th>Room</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Field dialog box row</td><td>1</td><td>244 px</td><td>Three rows per page; the page-advance hand covers the last two rows from 228 px in</td></tr>
+      <tr><td>Picker option label</td><td>1</td><td>228 px</td><td>Drawn 16 px in from the box edge</td></tr>
+      <tr><td>Player-chosen name</td><td>0</td><td>56 px</td><td>Bounded by the name-entry screen</td></tr>
+      <tr><td>Item list / shop buy list / status magic</td><td>0</td><td>104 px</td><td>Stops at the next column (count, price, level)</td></tr>
+      <tr><td>Item info window</td><td>0</td><td>124 px</td><td></td></tr>
+      <tr><td>Item / spell description line</td><td>0</td><td>144 px</td><td>Drawn in full from the info window's left edge; <code>FUN_8003CD00</code> keeps the widest line but never wraps, and no retail description starts below <code>0x20</code>, so every description is one draw. A spell description has two rows above &quot;MP Used&quot;</td></tr>
+      <tr><td>Status moves page</td><td>0</td><td>114 px</td><td>Stops at the AP field</td></tr>
+      <tr><td>Battle message banner</td><td>0</td><td>288 px</td><td></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <h3 id="typewriter-pacing">Typewriter pacing</h3>
+  <p>Dialogue types in. The pager keeps a reveal counter per row, and the draw shows only that many units. A unit is a glyph, a <code>0x7C</code> or a whole <code>0xCE</code> escape; a colour change costs nothing, and a substitution costs the length of what it splices in. The counter gains one unit per vsync. A row shorter than <code>0x22</code> units then holds for a moment before the next starts, so short lines do not flash past; the last row of a page never holds. Confirm while a row types completes the page. Rows scroll inside the box rather than clearing per page - see <a href="mes.html">MES dialog</a>.</p>
+</section>
+
+<section class="doc-section" id="rendering-pipeline" data-doc="rendering-pipeline">
+  <h2>Rendering pipeline</h2>
+  <ol class="steps">
+    <li><b>Expand</b><span>Preprocessor: <code>^X</code> &rarr; <code>0xCE</code> escapes, substitution tokens &rarr; their text.</span></li>
+    <li><b>Count</b><span>Glyph count for the typewriter reveal - a unit count, not a pixel width.</span></li>
+    <li><b>Draw line</b><span>Walk bytes, dispatch escapes, emit one GP0 <code>0x64</code> sprite per glyph, apply the advance.</span></li>
+    <li><b>Pager</b><span>The field dialog pager draws each row at the box's x with pad 1, capped at the reveal counter.</span></li>
+  </ol>
+  <figure class="diagram">
+    <svg viewBox="0 0 880 270" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The single-line renderer's per-byte loop over an expanded string. A first byte below 0x20 draws nothing. Each byte then dispatches: 0x00 ends the line; 0x7C moves down 14 pixels and back to the line start; 0xCF sets the ink and counts no unit; 0xCE draws an escape, either an icon sprite or a script-counter number, and advances by the entry's own width; 0x20 takes the advance without a sprite; any other byte emits one 14 by 15 sprite from the glyph sheet. Every byte except the four control bytes reaches the common advance tail: width table entry plus pad plus one.">
+      <defs><marker id="df-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="dg-node" x="10" y="20" width="170" height="56" rx="4"/>
+      <text class="dg-label" x="95" y="44">Expanded string</text><text class="dg-sub" x="95" y="62">^X and names spliced</text>
+      <rect class="dg-node-warn" x="10" y="120" width="170" height="56" rx="4"/>
+      <text class="dg-label" x="95" y="144">first byte &lt; 0x20</text><text class="dg-sub" x="95" y="162">draws nothing</text>
+      <rect class="dg-node-accent" x="230" y="20" width="160" height="56" rx="4"/>
+      <text class="dg-label" x="310" y="44">Next byte</text><text class="dg-sub" x="310" y="62">per-byte loop</text>
+      <path class="dg-edge" d="M180 48 L228 48" marker-end="url(#df-arrow)"/>
+      <path class="dg-edge-dim" d="M95 76 L95 118" marker-end="url(#df-arrow)"/>
+      <rect class="dg-node" x="440" y="10" width="190" height="40" rx="4"/>
+      <text class="dg-label" x="535" y="35">0x00: end of line</text>
+      <rect class="dg-node" x="440" y="60" width="190" height="40" rx="4"/>
+      <text class="dg-label" x="535" y="85">0x7C: y += 14</text>
+      <rect class="dg-node" x="440" y="110" width="190" height="40" rx="4"/>
+      <text class="dg-label" x="535" y="135">0xCF n: set ink</text>
+      <rect class="dg-node" x="440" y="160" width="190" height="40" rx="4"/>
+      <text class="dg-label" x="535" y="185">0xCE n: icon / number</text>
+      <rect class="dg-node" x="440" y="210" width="190" height="40" rx="4"/>
+      <text class="dg-label" x="535" y="235">glyph: one sprite</text>
+      <path class="dg-edge" d="M390 48 L415 48 L415 30 L438 30" marker-end="url(#df-arrow)"/>
+      <path class="dg-edge" d="M415 48 L415 80 L438 80" marker-end="url(#df-arrow)"/>
+      <path class="dg-edge" d="M415 80 L415 130 L438 130" marker-end="url(#df-arrow)"/>
+      <path class="dg-edge" d="M415 130 L415 180 L438 180" marker-end="url(#df-arrow)"/>
+      <path class="dg-edge" d="M415 180 L415 230 L438 230" marker-end="url(#df-arrow)"/>
+      <rect class="dg-node-ok" x="680" y="200" width="190" height="56" rx="4"/>
+      <text class="dg-label" x="775" y="224">Advance tail</text><text class="dg-sub" x="775" y="242">width[c] + pad + 1</text>
+      <path class="dg-edge" d="M630 230 L678 230" marker-end="url(#df-arrow)"/>
+      <rect class="dg-node" x="680" y="120" width="190" height="56" rx="4"/>
+      <text class="dg-label" x="775" y="144">Escape advance</text><text class="dg-sub" x="775" y="162">entry +2 (8 px / digit)</text>
+      <path class="dg-edge" d="M630 180 L655 180 L655 148 L678 148" marker-end="url(#df-arrow)"/>
+      <path class="dg-edge-dim" d="M680 236 L660 260 L310 260 L310 78" marker-end="url(#df-arrow)"/>
+      <text class="dg-edge-label" x="300" y="200" text-anchor="end">loop until 0x00</text>
+    </svg>
+    <figcaption>Every byte but the four control bytes reaches the common advance tail; a space (<code>0x20</code>) takes the advance without emitting a sprite. The optional unit cap - the typewriter&rsquo;s reveal counter - counts glyphs, line breaks and whole escapes; an ink change costs nothing.</figcaption>
+  </figure>
+  <p>A separate pixel measurer (the same expansion, then the widest <code>0x7C</code>-separated line) exists for the few surfaces that size themselves to their text, such as the battle name plaque.</p>
+  <details class="disclosure">
+    <summary>Per-glyph GPU packet</summary>
+    <div class="disclosure-body">
+      <div class="byte-map" role="img" aria-label="Per-glyph GP0 0x64 packet: command word, X and Y, U V and CLUT, width 14 and height 15">
+        <div class="bm-cell bm-dim" style="--w:4"><span class="bm-off">+0x00</span><span class="bm-name">OT link</span><span class="bm-size">u32</span></div>
+        <div class="bm-cell bm-accent" style="--w:4"><span class="bm-off">+0x04</span><span class="bm-name">0x64 + RGB 80 80 80</span><span class="bm-size">u32</span></div>
+        <div class="bm-cell" style="--w:4"><span class="bm-off">+0x08</span><span class="bm-name">X, Y</span><span class="bm-size">i16 &times; 2</span></div>
+        <div class="bm-cell" style="--w:4"><span class="bm-off">+0x0C</span><span class="bm-name">U, V, CLUT</span><span class="bm-size">u8 u8 u16</span></div>
+        <div class="bm-cell" style="--w:4"><span class="bm-off">+0x10</span><span class="bm-name">W = 14, H = 15</span><span class="bm-size">u16 &times; 2</span></div>
+      </div>
+      <p>The texture page is set earlier by a separate GP0 <code>0xE1</code> draw-mode primitive. A second, HUD-only text path (the text-actor tick) uses a width-bucketed layout for status numbers (column stride 8 px, height 12 px) and recognises its own <code>0xCC..=0xCF</code> ops; it is outside this page's scope.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="font-patch-feasibility" data-doc="accented-latin-cells,the-accent-font">
+  <h2>Accented Latin cells</h2>
+  <p>The sheet indexes every byte <code>0x20..=0xFF</code>, so the cells above <code>0x7E</code> are ordinary glyph cells. Whether one <em>draws</em> needs two things at once: ink in the cell and a non-zero width.</p>
+  <ul class="bullets">
+    <li><strong>USA page.</strong> 32 of the 128 high cells carry accented Latin letters, mostly at their IBM CP437 positions (<code>0x80..=0x90</code>, <code>0x95..=0x9A</code>, <code>&oelig;</code> at <code>0x9C</code>, a run one cell below CP437 at <code>0xA0..=0xAC</code>). The width table gives 26 of them a <strong>zero advance</strong>, so they draw and the next letter overprints them. Retail English text barely touches them.</li>
+    <li><strong>PAL pages</strong> (French / German / Italian). A different, smaller drawing of every glyph, with CP437 accents plus accented capitals and <code>&szlig;</code> mostly at CP850 positions. The French preprocessor alone folds <code>oe</code> / <code>OE</code> to the ligature cells at draw time. The three PAL pages differ from each other only in cell <code>0x24</code>, the level mark a monster variant&rsquo;s <code>$N</code> suffix draws: &ldquo;Lv&rdquo; on the USA, German and Italian pages, &ldquo;Nv&rdquo; on the French one.</li>
+    <li><strong>Byte range limits.</strong> <code>0xC0..=0xCF</code> are two-byte dialog opcodes, never glyphs, so those cells are unreachable from text.</li>
+  </ul>
+  <p>The <a href="../tooling/translation.html">translation tools</a> share one byte-to-character layout, <code>legaia_font::latin::LATIN_CELLS</code> (CP437 for the lowercase block, CP850 for the rest, so text lifted from a <a href="../tooling/pal-localizations.html">PAL disc</a> and text typed by hand land on the same cells). Three cells are the tools&rsquo; own choice, because CP850&rsquo;s cell for <code>&atilde;</code> / <code>&Atilde;</code> sits in the opcode window and CP850 has no <code>&OElig;</code>:
+  <code>&atilde;</code> is <code>0x9B</code>, <code>&Atilde;</code> is <code>0xD0</code>, <code>&OElig;</code> is <code>0x9E</code>. Their <strong>accent font</strong> rebuilds every layout cell on the user's own disc at patch time: it copies the base letter from the same page, paints a small diacritic mask in the page's two ink indices, and sets the width to the base letter's advance. It is two same-size in-place edits (the font TIM rows in <code>PROT.DAT</code> and the SCUS width table), and no glyph pixels are committed - the recipes run against the disc being patched.</p>
+  <p>A capital shifts down as far as its mark needs, the way the retail accented capitals do; ligatures join two base letters with a one-column overlap; <code>&iquest;</code> and <code>&iexcl;</code> are <code>?</code> and <code>!</code> turned half a turn onto the descender line. Every mark pixel uses the page&rsquo;s fill index with its shadow as the fill dilated one pixel right, down and diagonally - the rule almost every retail glyph follows. Because the result is a function of the input page alone, an import can tell a disc already carries the font by rebuilding it and comparing (<code>legaia_font::accent_font::accent_font_state</code>).</p>
+  <p>What does not fit: Latin letters with no cell in the layout (Polish <code>&#322;</code>, Czech <code>&#269;</code>) fold to ASCII, and Cyrillic, Greek and CJK need more cells than the 224-cell sheet has - a second glyph bank plus a multi-byte encoding in the renderer.</p>
+</section>
+
+<section class="doc-section" id="how-we-know" data-doc="provenance">
+  <h2>How we know</h2>
+  <p>The tables, packet shape and escape handling are read off the single-line renderer's disassembly; the disc TIM byte-matches the font page in live save-state VRAM, and line widths decoded from it match the drawn display lists.</p>
+  <details class="disclosure">
+    <summary>Provenance: functions and dumps</summary>
+    <div class="disclosure-body">
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Function</th><th>Address</th><th>What it proves</th><th>Dump</th></tr></thead>
+    <tbody>
+      <tr><td>Single-line renderer</td><td><code>FUN_80036888</code></td><td>Width table at <code>DAT_80073F1C + c</code>; U/V formula; escape-table layout at <code>0x80074050</code>; sprite call and counter read; CLUT base <code>0x7F86</code>; <code>0xCF</code> palette case; advance tail at <code>0x80036B9C</code></td><td><code>funcs/80036888.txt</code></td></tr>
+      <tr><td>Text-actor renderer</td><td><code>FUN_8003C11C</code></td><td>Same GP0 <code>0x64</code> packet shape</td><td><code>funcs/8003c11c.txt</code></td></tr>
+      <tr><td>Preprocessor</td><td><code>FUN_80036514</code></td><td><code>^X</code> &rarr; <code>0xCE (X - 0x2D)</code>; substitution expansion</td><td><code>funcs/80036514.txt</code></td></tr>
+      <tr><td>Glyph count / draw-and-count</td><td><code>FUN_80036044</code>, <code>FUN_8003CC98</code></td><td>Typewriter unit count (not a wrap); one string drawn and counted</td><td><code>funcs/8003cc98.txt</code></td></tr>
+      <tr><td>Pixel measurer</td><td><code>FUN_80035F04</code></td><td>Widest <code>0x7C</code>-separated line of the expanded string</td><td>per-function dump</td></tr>
+      <tr><td>Field dialog pager</td><td><code>FUN_801D84D0</code></td><td>Pad 1 per row, 244 px box, three rows, reveal counter and short-row hold</td><td>field overlay dump</td></tr>
+      <tr><td>Icon sprites / numbers</td><td><code>FUN_8002C488</code>, <code>FUN_80034B78</code></td><td>Sprite records at <code>0x800732A4</code>; integer formatting</td><td>per-function dumps</td></tr>
+      <tr><td>Disc carrier</td><td><code>PROT.DAT + 0x7F40</code></td><td>PROT.DAT-wide TIM scan for framebuffer <code>(896, 0)</code>; byte-verified against the save-state VRAM page</td><td>-</td></tr>
+    </tbody>
+  </table>
+  </div>
+    </div>
+  </details>
+  <p>Field dialogue has no dedicated opcode: an NPC's text is its inline interaction-script MES, shown by the per-frame actor-dialog state machine and the dialog pager, triggered by the touch / button-press interaction rather than an opcode - see <a href="../subsystems/script-vm.html">field script VM</a>.</p>
+</section>
+
+<section class="doc-section" id="deep-dive" data-doc="extraction-tools">
+  <h2>Deep dive</h2>
+  <details class="disclosure" id="extraction-tools">
+    <summary>Extraction tools and outputs</summary>
+    <div class="disclosure-body">
+      <p><code>extracted/font/</code> (gitignored - Sony pixel data) is produced by <code>font-extract</code>, which reads the executable for the tables and a mednafen save state's <code>&amp;GPURAM[0][0]</code> section for the live VRAM bytes:</p>
+      <table>
+        <thead><tr><th>File</th><th>What it is</th></tr></thead>
+        <tbody>
+          <tr><td><code>dialog_font_sheet.png</code></td><td>The full 256&times;256 sheet, expanded with palette 0</td></tr>
+          <tr><td><code>dialog_font_atlas.png</code></td><td>Per-glyph atlas, 14&times;15 cells in 16 columns &times; 14 rows</td></tr>
+          <tr><td><code>dialog_font_metadata.json</code></td><td>Width table + escape table + VRAM source rect</td></tr>
+          <tr><td><code>dialog_font_widths.csv</code></td><td>The width table as CSV</td></tr>
+          <tr><td><code>dialog_font_vram_4bpp.bin</code></td><td>Raw 32 KB 4bpp VRAM bytes</td></tr>
+        </tbody>
+      </table>
+<pre><code>cargo run -p legaia-font --bin font-extract -- \
+    --scus extracted/SCUS_942.54 \
+    --save "$HOME/.mednafen/mcs/Legend of Legaia (USA).&lt;hash&gt;.mcN" \
+    --out extracted/font</code></pre>
+    </div>
+  </details>
+  <details class="disclosure" id="what-s-still-open">
+    <summary>Open questions</summary>
+    <div class="disclosure-body">
+      <ul class="bullets">
+        <li><strong>The upload routine.</strong> The font TIM sits in the unindexed gap of <code>PROT.DAT</code> ahead of the first entry, with the other boot-resident UI pages; the routine that uploads that gap to VRAM is not named.</li>
+        <li><strong>The expansion buffer's end.</strong> The expander <code>FUN_80036514</code> writes to <code>0x800740EC</code> with no length test, so the buffer is as long as the longest expansion a drawn string produces; it can run at most <code>0x206</code> bytes to the next initialised data, an upper bound by inference.</li>
+      </ul>
+      <p>Both are tracked on <a href="../reference/open-rev-eng-threads.html">open RE threads</a>. The text-actor walker <code>FUN_80031D00</code> has no escape ops of its own - it walks the drawable list and reads no glyph stream.</p>
+    </div>
+  </details>
+  <p>Source of record: <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/formats/dialog-font.md" target="_blank" rel="noopener"><code>docs/formats/dialog-font.md</code></a>.</p>
+</section>
+
+<section class="doc-section" id="see-also" data-doc="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="mes.html">MES dialog</a>
+    <a href="tim.html">PSX TIM</a>
+    <a href="../subsystems/renderer.html">Renderer</a>
+    <a href="../subsystems/script-vm.html">Field script VM (dialogue)</a>
+    <a href="../subsystems/save-screen.html">Save screen</a>
+  </div>
+  <div class="see-also">
+    <span class="see-also-label">Tooling</span>
+    <a href="../tooling/translation.html">Translation / language packs</a>
+    <a href="../tooling/rom-patcher.html">ROM patcher</a>
+    <a href="../tooling/extraction.html">Extraction pipeline</a>
+  </div>
+</section>

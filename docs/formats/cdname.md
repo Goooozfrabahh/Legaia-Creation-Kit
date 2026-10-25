@@ -1,0 +1,221 @@
+# CDNAME.TXT - entry name map
+
+`CDNAME.TXT` is a plain-text file at the disc root that gives developer names to runs of [`PROT.DAT`](prot.md) entries: scene blocks (`town01`, `retock`), sound banks, battle data, code overlays. `PROT.DAT` itself has no names, so this file is where every `NNNN_<name>.BIN` extraction label comes from. Two things about it catch people out. Its numbers are **raw table-of-contents indices, two higher than extraction indices**, so a filename label is a hint rather than a verdict. And the game's own loader stores the names in 16-byte records that corrupt any name longer than 11 bytes.
+
+Implementation: [`crates/prot/src/cdname.rs`](../../crates/prot/src/cdname.rs). Retail loader: `FUN_8001D8FC` (see `ghidra/scripts/funcs/8001d8fc.txt`).
+
+## File format
+
+One C-style `#define` per line, ASCII:
+
+```
+#define init_data 0
+#define gameover_data 1
+#define town01 3
+#define town0b 12
+#define town0c 21
+...
+#define vab_01 1072
+```
+
+| Token | Meaning | Confidence |
+|---|---|---|
+| `#define` | Line marker. Retail stops at the first line that does not start with `#` | Confirmed |
+| name | Block name, ended by a space | Confirmed |
+| `N` | Decimal **raw-TOC index** at which the block starts | Confirmed |
+
+## Block-start semantics
+
+Each `#define name N` marks **the start of a block at raw-TOC index `N`**. Every later index inherits the most recent name until the next define:
+
+```
+raw-TOC index:    3    4    5   ...   11  |  12   13  ...  20  |  21 ...
+                 [--------- town01 -------] [----- town0b -----] [town0c
+extraction idx:   1    2    3   ...    9  |  10   11  ...  18  |  19 ...
+```
+
+- raw index 3 → block `town01`
+- raw index 11 → block `town01` (since `town0b` starts at 12)
+- raw index 12 → block `town0b`
+
+`prot-extract` writes filenames like `0148_retock.BIN` by applying the define numbers to **extraction** indices directly, which is the +2 label shift described next.
+
+## Numbering space
+
+The `#define` numbers are **raw in-RAM PROT-TOC indices** - the index space `FUN_8003E8A8` consumes - **not** extraction-entry indices. The boot TOC loader copies `PROT.DAT` verbatim (8-byte header included) into `0x801C70F0`, so `raw index = extraction index + 2` (see [`prot.md` § In-RAM TOC](prot.md#in-ram-toc)). The content `#define name N` actually names lives at **extraction entry `N − 2`**, and the extractor's filename labels (which apply define numbers as extraction indices directly) are systematically shifted +2.
+
+The default `NNNN_<name>.BIN` naming is kept for stability; `legaia_prot::cdname::block_for_extraction_index` resolves the retail-space name for an extraction index, and `scripts/asset-investigation/cdname_shift_analysis.py` reproduces the full quantitative analysis against a local extraction.
+
+### Evidence
+
+**Loader-constant identities** (strongest - retail hard-codes raw-TOC indices for dev-named files, and each constant *equals* the same-named define):
+
+| Block (defines) | Retail raw-TOC constant | Provenance |
+|---|---|---|
+| `battle_data 865..868` | `0x361..0x364` = 865..868, `data\battle\PLAYER1..4` | `FUN_800558FC(char+0x360)` live trace; extraction 863..866 start at the traced PROT.DAT offsets |
+| `monster_se 893` | `0x37D` = 893, `h:\mpack\monster.snd` | `FUN_8003E104` (`li v0,0x37d`); extraction 891 is a 206-bank multi-VAB SE archive |
+| `bat_back_dat 895..896` | `0x37F`/`0x380` = 895/896, `summon.dat`/`readef.DAT` | `FUN_801F17F8`; byte-verified RAM↔disc at extraction 893/894 ([`summon-readef.md`](summon-readef.md)) |
+| `xxx_dat 897..` | `0x381+`, overlay slots | `FUN_8003EBE4`/`FUN_8003EC70` call `FUN_8003E8A8(param + 0x381)`; param 2 = field overlay = extraction 0897 |
+
+**Structural (scene region, defines 3..864):** the per-scene [v12 fixup table](scene-v12-table.md) recurs once per scene block, and scene block *lengths vary* (7..11 slots), so its slot position is shift-sensitive. At shift 0 the 96 scene-region v12 tables scatter across slots 4..10 (modal slot holds only 41); at −2 **all 96 sit at slot 1**. Slot constancy alone admits any shift ≤ −1; the identity anchors pin −2 exactly (the same resolver serves every block). The universal field-`.MAP`-at-`define − 2` rule is this same fact: each scene's `.MAP` is retail **slot 0** of its block, the v12 table slot 1, the event prescript slot 2, the 7-asset table slot 3.
+
+**Semantic scoring:** over the name blocks with checkable expectations (`sound_data`/`sound_data2`/`level_up`/`monster_se`/`music_01`/`vab_01` → VAB/SEQ shapes; `move_program_no` → `\DATA\MOV*.STR` program table; `other_game` → `OTHER<n>` overlay banners), shift −2 matches 217/225 decidable entries vs 209/225 at shift 0 - e.g. `vab_01` → extraction 1070..1192 is 121/121 VAB-headed.
+
+### Consequential relabelings
+
+Per-entry content claims in this repo stay in extraction space (unambiguous); the retail-space names below are what the dev defines actually cover. The relabelings that matter most (extraction entry → retail-space block):
+
+| Extraction | Filename label says | Retail-space block (content) |
+|---|---|---|
+| raw 0..1 (LBA 3..120, unindexed by extraction) | - | `init_data` + `gameover_data` slot 0 - the boot-UI gap with the menu-glyph atlas |
+| 0000 | `init_data` | `gameover_data` (second slot) |
+| 0863..0866 | `edstati3`/`battle_data` | `battle_data` = the four per-character battle files `PLAYER1..4` ([battle palettes](../reference/open-rev-eng-threads.md)) |
+| 0867 | `battle_data` | `monster_data` - the 16 MB monster stat archive (so `battle_data` 0865 and the monster archive 0867 are different blocks) |
+| 0868..0869 | `monster_data`/`sound_data` | `sound_data` (VAB-prefixed streams) |
+| 0870..0873 | `sound_data`/`befect_data` | `befect_data` - `etim` (0870, the pixel-verified effect-texture source), `etmd`+`vdf`, billboard pack, `efect.dat` (0873) |
+| 0874 | `befect_data` | `player_data` - the field character-mesh pack ([character-mesh.md](character-mesh.md)); the shifted label points at 0876, which is not it |
+| 0875..0888 | `player_data`/`sound_data2` | `sound_data2` (VAB streams) |
+| 0889..0890 | `sound_data2`/`level_up` | `level_up` (large VAB carriers) |
+| 0891 | `level_up` | `monster_se` = `monster.snd`, the 206-bank monster-SE archive |
+| 0892 | `level_up` | `card_data` - the memory-card screen's **JIS X 0208 level-1 kanji font**, a two-member [`container-formats::pack`](pack.md) of 4bpp TIMs. Loaded by raw TOC `0x37E` at mode-22 CARD INIT; see [data-field.md](data-field.md#entry-0892-card_data-is-a-pack-not-a-truncated-stream). The entry is 67,584 bytes; a 12 MB reading of it is the [over-read entry-size expression](prot.md#tocp5---tocp3--4-is-not-an-entrys-size) |
+| 0893..0894 | `monster_se`/`card_data` | `bat_back_dat` = `summon.dat`/`readef.DAT` mid-cast backdrop streams |
+| 0895..0969 | `bat_back_dat`/`xxx_dat` | `xxx_dat` - slot 0 (extraction 0895) is the boot `init.pak` bundle loaded through overlay-slot param 0 ([`boot.md`](../subsystems/boot.md#boot-initpak-prot-0895)); overlay code blobs follow ([MIPS overlay](mips-overlay.md), [overlay pointer-table](overlay-ptr-table.md)) |
+| 0970..0971 | `xxx_dat` | `move_program_no` - a `\DATA\MOV*.STR` FMV program/path table + debug strings. The block names **MOV**ie program numbers ([str-fmv-table.md](str-fmv-table.md)), not Tactical-Arts moves (`move.mdt`); extraction `0972/0973` under that filename label are `other_game` overlays |
+| 0972..0977 | `move_program_no`/`other_game` | `other_game` - casino/minigame overlays; extraction 0973/0974 open with literal `OTHER2` / `OTHER3` banners |
+| 1070..1192 | `music_01`/`vab_01` | `vab_01` (121/121 VAB-headed) |
+
+### Exceptions and caveats
+
+What the quantitative pass leaves over (none of it contradicts the uniform −2):
+
+- `level_up` → extraction 0890 is a DATA_FIELD streaming carrier (its VABs are wrapped inside), so bare-magic checks miss it at *every* shift.
+- Extraction 0888 (in `sound_data2`) and 1062 (in `music_01`) carry no VAB header at any shift, and both are identified: 0888 is [`bse.dat`](bse-dat.md), the battle SFX descriptor bank, and 1062 is a **SEQ-only** `music_01` entry - sound-test track 72 (`ALNDRA`, one of the borrowed placeholder cues in [`music-tracks.md`](../reference/music-tracks.md#notable-entries)), which borrows another entry's bank instead of shipping one. Each also ends in a foreign `VagAtr` tail copied from a neighbour, which is what a bare-magic sweep sees; see [`bse-dat.md`](bse-dat.md#the-bytes-past-the-table-are-not-this-banks).
+- `other_game`: only 2 of 6 entries carry an `OTHER<n>` banner; the rest are banner-less minigame data, undecidable by name.
+- Extraction 0893 (`summon.dat`) opens with a `[u32 2][u16 table…]` shape that mimics a sound-address bank - a shift-0 reading "confirms" `monster_se` on it spuriously; the byte-pins show texture streaming slots. Trust byte-pins over shape coincidences.
+- One v12-shaped header sits at extraction 1227 (`other7` region), outside the scene region.
+- Opaque names (`other1`/`other4`/`other5`/`other6`/`other7`, `card_data`) are unscoreable; nothing about them conflicts with −2.
+- `other7` (extraction 1226+, define 1228) is a dev-leftover **earlier revision of `koin3`'s field MAN**: its 8 partition-2 records are a name-exact prefix subset of `koin3`'s 12 (koin3 appends four later records), and its partition-1 pool shares koin3's gate flags (`0x431`/`0x4CA`/`0x3DA` at matching record shapes). No captured code loads it (no path string, no raw-index loader) - orphaned content, consistent with its leftover-JP text.
+
+### Engine consequence: scene windows are the retail block
+
+`Scene::load` (engine-core) converts the raw-TOC block range to the
+extraction frame (`raw - 2`) so a scene's entries are its **retail** block:
+the first entry is the scene's `.MAP` file, the second typically its v12
+trigger sidecar. An unshifted window is two entries late - it drops those
+and bleeds in the next block's first two, which mis-frames any scene whose
+load-bearing entry sits at a block edge (an unshifted `rikuroa` window picks up
+`geremi`'s v12 sidecar and loads Jeremi's MAN under the `rikuroa` label; the
+same bleed produces a false "suimon == dolk2 MAN" identity). The two head
+defines (`init_data 0`, `gameover_data 1`) sit inside the TOC header rows
+where the conversion has no content to land on; those blocks keep their
+unshifted legacy windows.
+
+## The loader mangles long names
+
+`FUN_8001D8FC` reads `CDNAME.TXT` into a 4 KB stack buffer and fills a table of
+16-byte records at `0x80088758`. The table is BSS, so it starts zeroed. Per
+`#define` line the loader touches it exactly twice, and the order matters:
+
+1. **Copy the name - unbounded, unterminated.** The loop at `0x8001D980` stores
+   `sb v1,0x0(v0)` with `v0 = 0x80088758 + count*0x10 + i`, advancing while the
+   source byte is not `' '`. There is no length check anywhere in the function
+   and **no NUL is ever written**. A name is terminated only by table bytes the
+   copy did not reach.
+2. **Store the index over `+0xC`/`+0xD`.** `sb a0,0xc(v0)` and `sb v1,0xd(v0)`
+   at `0x8001DA78`/`0x8001DA90` run *after* the copy, so they land on top of
+   name bytes 12 and 13 whenever the name is that long.
+
+Reading a record back as a C string therefore gives this, and **not** a name
+truncated to the index offset:
+
+| Name length | What the record holds |
+|---|---|
+| ≤ 11 | The name, terminated by a table zero. Clean. |
+| 12–13 | The name with the index's two bytes overlaid at 12..13 and no terminator of its own, so the read runs into them. |
+| 14–15 | As above, plus every byte from `+0xE` on, which is past the index store and survives it. |
+| ≥ 16 | Spills into the next record; see below. |
+
+**Clean C-string capacity is 11 bytes, not 12.** A 12-byte name is not "just
+fitting" - it loses its terminator to the index's low byte. It comes back clean
+only in the accidental case where that low byte is zero.
+
+Five shipped names exceed 11 bytes, and none of them round-trips:
+
+| `#define` name | Index | In-RAM C string |
+|---|---|---|
+| `gameover_data` | 1 | `gameover_dat` + `01` |
+| `monster_data` | 869 | `monster_data` + `65 03` |
+| `bat_back_dat` | 895 | `bat_back_dat` + `7F 03` |
+| `move_program_no` | 972 | `move_program` + `CC 03` + `o` |
+| `monster_test` | 980 | `monster_test` + `D4 03` |
+
+`move_program_no` is the case that most clearly refutes a truncation reading:
+its byte 14 (`o`) sits past the index store and is still there.
+
+Names of 16 bytes or more spill into the following record, because indexing is
+flat from the table base with no bounds check. The next record's own name
+overwrites the spill from byte 0, and its index store overwrites bytes 12..13 -
+so whatever the spill left between those two ranges survives. No shipped name is
+long enough to trigger this, but a modded `CDNAME.TXT` can.
+
+Two further divergences from a tolerant reader: the loop condition **is** the
+`#` test, so the first line not starting with `#` ends the map (there is no
+skip-and-continue); and a line whose name is empty still emits a record, since
+only the copy loop is skipped while the index store and record counter run.
+
+Tooling in this repo uses the tolerant `parse_str`, which keeps the full
+`#define` spelling. Anything comparing a CDNAME name against what retail holds
+in RAM must go through `retail_name_table` / `parse_retail_str` instead - those
+return names as **bytes**, since the index bytes left inside a name are
+routinely not valid UTF-8. The disc-gated `cdname_retail_parse_disc` test pins
+each shipped name against an independent byte-level record model, and
+`prot-extract retail-names` prints the two readings side by side.
+
+Keeping them as bytes matters at the point of *display* too. Rendering a
+mangled record through a lossy UTF-8 conversion folds every non-ASCII index byte
+to `U+FFFD`, and masking that back to 8 bits prints `fd` for all of them - so a
+`0x03CC` index reads as `fd 03`, a single wrong byte that still looks like a
+plausible little-endian pair and disagrees with the table above without looking
+like a bug.
+
+### An index can be declared twice
+
+The retail table is **record**-indexed and the tolerant map is **index**-keyed,
+so the two do not have the same cardinality. `CDNAME.TXT` declares index `990`
+twice - `music_test` then `music_01` - so the retail loader emits two records
+while `parse_str`'s `BTreeMap<u32, String>` keeps only the later name. Two
+things follow. Comparing the readers *by index* mis-pairs the earlier record and
+reports a sixth divergence that does not exist; compare by declaration order
+instead. And a lookup of "the name at index 990" answers `music_01` while
+retail's own record 117 holds `music_test`, which is worth knowing before
+treating a name as an identity.
+
+### The table is populated on retail hardware
+
+The mangled names above are what retail RAM holds. `FUN_8001D8FC` has exactly one caller (`0x8001D6FC`) and picks its source on `_DAT_8007B8C2`:
+
+| `_DAT_8007B8C2` | Source | Path |
+|---|---|---|
+| non-zero (retail) | `cdname.txt` off the disc | ISO stack, `FUN_8003D3C4` |
+| zero (dev station) | `h:\prot\cdname.txt` | `FUN_8003E6BC`, a host-PC read over the SN/PsyQ debug-station link ([`boot.md`](../subsystems/boot.md#debug-flags)) |
+
+`main()` writes the flag to `1` at cold boot: `jal 0x8003F084` - a two-instruction leaf whose whole body is `jr ra; li v0,0x1` - immediately followed by `sh v0,0x5aa(gp)` at `0x80015F08`. That is the flag's **only** writer. A sweep of `SCUS_942.54` and all 83 extracted overlay images, covering the `disp(gp)` / `lui`+load / materialised-base forms and the five absolute forms (literal word, `lui`+`addiu`/`ori`, `jal`, `j`, PC-relative branch), finds 70 access sites: 44 in SCUS (one `sh` store, 43 `lh` reads) and 26 `lh` reads across eleven overlays (`0895`, `0899`, `0902`, `0970`, `0971`, `0975`, `0976`, `0977`, `0978`, `0979`, `0980`). No image outside `SCUS_942.54` stores to it. So the flag is `1` on every path and the loader takes the disc arm.
+
+An absolute-form sweep alone finds no writer, because a `disp(gp)` store carries no address; the flag is not writer-less ([`tooling/ghidra.md`](../tooling/ghidra.md#decompiler-artifacts-that-have-produced-false-claims)).
+
+## Block names can be misleading
+
+A block name describes the developer's organisation, not the runtime semantics of every entry inside the block - and any name read off an extraction *filename* must first be corrected by the +2 numbering shift above (`vab_01` "without VAB headers", the `move_program_no` layout mismatch and `0895_bat_back_dat` = init.pak are all the filename shift, not dev mislabeling). When the block name conflicts with what the bytes actually look like, trust the bytes: re-derive structure from the leading magic + the loader-call constant in SCUS, not from the CDNAME label.
+
+A name can also mislead in the opposite direction - by not being what retail holds. Any comparison against an in-RAM name has to account for the loader's [record mangling](#the-loader-mangles-long-names) first; five shipped names are affected.
+
+## Per-scene asset reservations
+
+Most scene blocks reserve 6–8 PROT slots for asset variants. Unused slots get filled with the dev placeholder pattern documented in [pochi-filler](pochi.md). The `edstati3` block (likely "ending station 3", possibly cut content) is almost entirely pochi-filled.
+
+## See also
+
+- [PROT TOC](prot.md) - the index this name map labels.
+- [Disc layout](disc.md) - the on-disc geometry that holds both files.
+- [`subsystems/asset-loader.md`](../subsystems/asset-loader.md) - the loader that resolves CDNAME labels to PROT entries.
+- [`subsystems/boot.md`](../subsystems/boot.md) - the boot sequence that loads the TOC.

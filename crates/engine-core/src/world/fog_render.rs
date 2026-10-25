@@ -1,0 +1,186 @@
+//! The field fog pool's scene-entry install and per-frame render step, as
+//! `World` methods - the seam both hosts draw the fog through.
+//!
+//! Retail splits the system across three sites: MAIN INIT allocates the pool
+//! and the MAN installer (`FUN_8003AEB0`) hands the scene's section-4 table
+//! to `DAT_80073ED8` and clears the gate; the ambient emitter spawns into
+//! the pool from the actor pass; and the field render pass (`0x80026EBC` in
+//! `FUN_80026CE4`) ages, moves and draws the pool when the game mode is `3`
+//! and the gate word is set. The first two land here and in
+//! `World::tick_cutscene_elements`; the third is [`World::fog_render_step`],
+//! which each host calls from its draw path with the camera it is about to
+//! draw the scene through, so the sheets project through the same matrix
+//! as the geometry.
+
+use super::*;
+use legaia_engine_camera::psx_camera::FieldCameraView;
+use legaia_engine_field::fog_particles::{
+    FOG_CAP_DEFAULT, FOG_DPAD_MASK, FogFrameEnv, FogQuad, FogView,
+};
+use legaia_engine_mode::mode::SceneMode;
+
+/// MAN sibling-section index (`sibling_sections()[3]`) that installs into
+/// `DAT_80073ED8` - section 4 of the six.
+const FOG_REGION_SIBLING_SECTION: usize = 3;
+
+impl World {
+    /// The seated player's world position (`+0x14 / +0x16 / +0x18` of the
+    /// player actor) as the fog code reads it: the player actor's move
+    /// state, which is where scene entry seats the player and the field
+    /// loop moves it; the VM ctx position is the fallback for a world with no
+    /// player actor.
+    pub fn fog_player_world_pos(&self) -> [i32; 3] {
+        let slot = usize::from(self.player_actor_slot.unwrap_or(0));
+        match self.actors.get(slot) {
+            Some(a) => [
+                i32::from(a.move_state.world_x),
+                i32::from(a.move_state.world_y),
+                i32::from(a.move_state.world_z),
+            ],
+            None => [
+                i32::from(self.field_ctx.world_x as i16),
+                i32::from(self.field_ctx.world_y as i16),
+                i32::from(self.field_ctx.world_z as i16),
+            ],
+        }
+    }
+
+    /// Scene-entry reset: a fresh pool, the gate clear, no regions, the
+    /// default cap - what MAIN INIT's allocation (`0x801D7364`) and the field
+    /// reset's `sw zero,-0x47ac` + `sw a0,-0x4350` (`0x8003B690` /
+    /// `0x8003B6E8`) leave behind on every field entry.
+    ///
+    /// REF: FUN_801D6704, FUN_8003AEB0
+    pub fn reset_fog_for_scene_entry(&mut self) {
+        self.fog.reset();
+        self.fog.gate = false;
+        self.fog.regions.clear();
+        self.fog.cap = FOG_CAP_DEFAULT;
+    }
+
+    /// Install the scene MAN's section-4 fog-region table - the
+    /// `DAT_80073ED8` / `DAT_80073EDC` pair `FUN_8003AEB0` sets from the
+    /// section (`+3` = count, records from `+4`) - and the pool cap the same
+    /// installer derives from the MAN header
+    /// ([`legaia_engine_field::fog_particles::fog_cap_for_man`]).
+    ///
+    /// REF: FUN_8003AEB0
+    pub fn install_fog_regions(
+        &mut self,
+        man_file: &legaia_scene_formats::man_section::ManFile,
+        man: &[u8],
+    ) {
+        self.fog.regions = man_file
+            .sibling_sections()
+            .get(FOG_REGION_SIBLING_SECTION)
+            .and_then(|s| s.body(man))
+            .map(legaia_render_kernels::fog_volume::parse_fog_regions)
+            .unwrap_or_default();
+        // `_DAT_8007BCB0`, seated by the same installer from the MAN's
+        // header byte `+1` (`0x8003B6BC..0x8003B6E8`).
+        self.fog.cap = legaia_engine_field::fog_particles::fog_cap_for_man(man);
+    }
+
+    /// One rendered frame of the fog pool through `view` - the field render
+    /// pass's `0x80026EA4..0x80026F28`: nothing outside game mode `3` or
+    /// while the gate word is clear; otherwise the pool walk with this
+    /// frame's `dt`, player position, held pad, camera vertical offset and
+    /// global tint.
+    ///
+    /// Game mode `3` is both [`SceneMode::Field`] and the kingdom overworld
+    /// ([`SceneMode::WorldMap`]): retail runs the overworld as an ordinary
+    /// field-run scene, and on the `map01` resident state
+    /// (`keikoku_chest_preload`) the gate is up and all `0x48` records of the
+    /// raised cap are live, every one at the overworld spawner's lifted
+    /// height. `view` is the frame's field-frame pose
+    /// ([`legaia_engine_field::camera_frame::FieldCameraFrame::field_view`]); it is also
+    /// kept as the camera the next spawn's overworld depth test reads.
+    ///
+    /// Returns the quads to composite this frame, also kept in
+    /// [`World::fog_quads`]. The `dt` is every tick since the previous call
+    /// (retail's `DAT_1F800393` as the render pass sees it); a call with no
+    /// tick in between re-emits the same frame.
+    ///
+    /// REF: FUN_80026CE4 (the pass; its fog stage at `0x80026EA4`)
+    pub fn fog_render_step(&mut self, view: &FieldCameraView) -> &[FogQuad] {
+        let dt = self.fog.pending_dt.min(u32::from(u8::MAX)) as u8;
+        self.fog.pending_dt = 0;
+        self.fog.last_dt = dt;
+        self.fog.depth_view = Some(*view);
+        // The overworld map display stops the pass: its field caller
+        // `FUN_801D0D38` is reached from the walk frame `FUN_801D1344`, which
+        // the mode-13 handler does not run (and whose bytes PROT 0981 has
+        // replaced).
+        if !Self::fog_mode(self.mode) || !self.fog.gate || self.world_map.map_display.is_some() {
+            self.fog.quads.clear();
+            return &self.fog.quads;
+        }
+        // `_DAT_8007BCB8..BA`: the op `0x4C 0x12` global multiply tint,
+        // `0x80` neutral - the same ramp the scene grade reads.
+        let tint = self
+            .presentation
+            .tint
+            .as_ref()
+            .map(|t| {
+                t.factor()
+                    .map(|f| (f * 128.0).round().clamp(0.0, 255.0) as u8)
+            })
+            .unwrap_or([0x80; 3]);
+        let env = FogFrameEnv {
+            dt,
+            player: self.fog_player_world_pos(),
+            dpad_held: self.input.retail_pad().held & FOG_DPAD_MASK != 0,
+            y_offset: self.camera.offset_ease,
+            tint,
+            window: self.terrain.region_attributes.box_bytes,
+        };
+        let proj = self.field_fx_view(view);
+        self.fog.render_step(&proj, &env)
+    }
+
+    /// Re-run the frame's render step over a pool whose records were just
+    /// replaced (`FogPool::install_snapshot`), with the `dt` the frame's own
+    /// step used - capture alignment for the retail comparison's frame,
+    /// never a game path. The tick's step already aged and drew the
+    /// engine's own records; the snapshot replaces them, and the frame
+    /// draws the retail records aged, drifted and lit by this frame's step,
+    /// as retail's render pass drew them. The step runs once per tick
+    /// everywhere else, so this is the one place a frame steps twice.
+    pub fn restep_fog_render(&mut self, view: &FieldCameraView) -> &[FogQuad] {
+        self.fog.pending_dt = u32::from(self.fog.last_dt);
+        self.fog_render_step(view)
+    }
+
+    /// The projection the field screen-space effects (fog sheets, drop
+    /// shadows) draw through for a frame whose field-frame pose is `view`,
+    /// with its depths scaled onto the mesh frame the hosts draw the scene
+    /// through.
+    ///
+    /// Both hosts hand these effects `FieldCameraFrame::field_view` of a
+    /// frame resolved with no cutscene view, so in [`SceneMode::WorldMap`]
+    /// that frame is the overworld walk frame, whose matrix composes the 6x
+    /// world scale (`camera_frame::world_map_walk_vp`): its `clip.w` is six
+    /// times the field view's. Screen positions agree either way; a depth
+    /// taken at the field view's `w` would sit six times nearer than the
+    /// continent under it in the depth buffer, and pass every test.
+    pub fn field_fx_view(&self, view: &FieldCameraView) -> FogView {
+        let scale = if self.mode == SceneMode::WorldMap {
+            legaia_engine_field::camera_frame::WORLD_MAP_WORLD_SCALE
+        } else {
+            1.0
+        };
+        FogView::from_field_view(view).with_depth_scale(scale)
+    }
+
+    /// Whether `mode` is one the fog pass runs in - retail's game mode `3`,
+    /// which the port splits into the field and the kingdom overworld. The
+    /// hosts gate their draw-path call on this so they cannot disagree.
+    pub fn fog_mode(mode: SceneMode) -> bool {
+        matches!(mode, SceneMode::Field | SceneMode::WorldMap)
+    }
+
+    /// The quads the last [`World::fog_render_step`] produced.
+    pub fn fog_quads(&self) -> &[FogQuad] {
+        &self.fog.quads
+    }
+}

@@ -1,0 +1,950 @@
+//! Battle-action state-machine `step` dispatcher, command-queue resolution, and shared transition/timer helpers.
+
+use super::*;
+
+/// Resolve a player's directional command sequence into an action queue,
+/// applying Miracle Art and Super Art expansion in the canonical order.
+///
+/// This is the entry point the battle UI layer calls *before* feeding the
+/// queue to the action state machine via `ctx.queued_action`. It runs the
+/// **byte-level** appliers ported from the retail queue-builder
+/// `FUN_801EED1C`, on a raw `actor[+0x1DF..+0x1F2]`-shaped byte window, in
+/// retail's own finish order:
+///
+/// 1. Translate raw commands to directional [`ActionConstant`] bytes and
+///    append `[RegularStarter, art]` pairs per the chained art selection,
+///    capped at [`QUEUE_SCAN_LEN`] - retail's build loop bound.
+/// 2. **Miracle Art replacement** ([`apply_miracle_replace`], the
+///    `0x801EF4E8` block): when the command sequence is the character's
+///    Miracle string, the whole 16-byte window is overwritten from the
+///    resident Miracle row, padding included.
+/// 3. **MSB clear** ([`clear_queue_msb`], the `0x801EF85C` sweep) - strips
+///    the on-disc `0x8C..0x8F` quirk off the Miracle row's direction bytes,
+///    then the **marked-starter reorder** ([`reorder_marked_starters`], the
+///    `0x801EF8A0` sweep) over the build loop's side-array marks.
+/// 4. **Super Art find/replace at tail** ([`apply_super_tail_replace`], the
+///    `jal 0x801EF9E4` at `0x801EF9AC`), run **once** and in **table order**,
+///    unconditionally - retail does not skip it after a Miracle, and the
+///    Miracle row's tail matches no `find` row.
+/// 5. Decode the byte window back to typed constants, stopping at the first
+///    `0x00` (the queue terminator the action SM scans for).
+///
+/// Two behaviours here are retail's, and differ from the structural
+/// `legaia_art` matchers this used to call:
+///
+/// - **first matching row wins, in resident-table order.** The applier's row
+///   loop terminates on the first full tail match (`a1 = 5` at `0x801EFBD8`);
+///   `SuperMatcher::try_trigger_at_tail` ranks by longest `find` instead.
+///   Over the shipped tables the two agree - `super_applier_agrees_with_
+///   structural_matcher` pins that - but the disassembly is the baseline.
+/// - **one application, not a fixpoint.** `FUN_801EF9E4` is called exactly
+///   once per queue build and applies at most one replace; the previous
+///   `SuperMatcher::expand_to_fixpoint` call could apply several.
+///
+/// `chained_arts` are the art [`ActionConstant`]s the player has
+/// successfully chained this turn (e.g. `[Art22, Art28]` for Spin Combo →
+/// Charging Scorch). Each is bracketed with [`ActionConstant::RegularStarter`]
+/// when assembled into the queue, matching the retail builder.
+///
+/// [`ActionConstant`]: legaia_art::ActionConstant
+/// [`ActionConstant::RegularStarter`]: legaia_art::ActionConstant::RegularStarter
+///
+/// REF: FUN_801EED1C (the retail builder this reproduces the finish order of)
+pub fn resolve_action_queue(
+    character: legaia_art::Character,
+    command_input: &[legaia_art::Command],
+    chained_arts: &[legaia_art::ActionConstant],
+) -> legaia_art::ActionQueue {
+    use legaia_art::{ActionConstant, ActionQueue};
+
+    // Step 1: build the raw byte window. Retail's build loop is bounded by
+    // the same 16-byte scan window the appliers use.
+    let staged = command_input
+        .iter()
+        .map(|cmd| cmd.as_action().as_byte())
+        .chain(
+            chained_arts
+                .iter()
+                .flat_map(|art| [ActionConstant::RegularStarter.as_byte(), art.as_byte()]),
+        );
+    let mut bytes = [0u8; ACTION_QUEUE_CAP];
+    for (slot, b) in bytes[..QUEUE_SCAN_LEN].iter_mut().zip(staged) {
+        *slot = b;
+    }
+
+    // Steps 2-4: the Miracle / MSB / Super finish on the window. This
+    // structural entry point has no character record to read the Miracle
+    // marker off, so it runs with the marker **armed** - which is what it
+    // did before the gate existed. The live arts path
+    // (`World::build_arts_action_queue`) reads the real marker.
+    // The marks are dropped here: this structural entry point has no actor to
+    // hang them on, and its callers never run the Attack x2 refill.
+    let _ = finish_action_queue(character, command_input, true, &mut bytes);
+
+    // Step 5: decode up to the terminator.
+    let mut queue = ActionQueue::new();
+    for &b in bytes.iter() {
+        if b == 0 {
+            break;
+        }
+        // Every byte reachable here comes from the modeled tables or from a
+        // typed `ActionConstant`, so the decode cannot fail; an unmapped byte
+        // would mean a table defect, and dropping the tail is the safe read.
+        let Some(action) = ActionConstant::from_byte(b) else {
+            break;
+        };
+        queue.push(action);
+    }
+    queue
+}
+
+/// The **finish** of the retail queue-builder `FUN_801EED1C` on a caller-built
+/// queue window - the three passes that run after the per-command build
+/// loop, in retail order:
+///
+/// 1. the Miracle replacement (`0x801EF4E8..0x801EF524`, [`apply_miracle_replace`]) -
+///    gated on **both** halves of retail's condition: `miracle_armed` is the
+///    per-slot marker `ctx[+0x25F + slot]` ([`miracle_marker_armed`], written
+///    at battle-actor seeding from the character's Ra-Seru equipment byte),
+///    and the whole-string match of `command_input` against the character's
+///    Miracle command table stands in for the builder's own combo compare
+///    against the ordinal-`0` art record;
+/// 2. the MSB-clear sweep (`0x801EF85C..0x801EF898`, [`clear_queue_msb`]) and
+///    the marked-starter reorder (`0x801EF8A0..0x801EF968`,
+///    [`reorder_marked_starters`]) over [`build_starter_marks`];
+/// 3. the Super tail-replace (`jal 0x801EF9E4` at `0x801EF9AC`,
+///    [`apply_super_tail_replace`]), once, first matching row in table order.
+///
+/// `bytes` is the window the build loop produced - for the live arts path
+/// that is [`legaia_art::tokenize`]'s output (the leading arrows kept, the
+/// `0x19` / `0x1A` starter over each matched art's last arrow, the art
+/// constant inserted after it), copied into the 19-byte stream shape.
+/// [`resolve_action_queue`] is the structural caller (arrows + already-chained
+/// art constants); the engine's arts arming is the byte-exact one.
+///
+/// Returns the side array as the builder leaves it - the marks the Attack x2
+/// refill reads a whole action later. It is a **return value** rather than a
+/// local because retail's `0x801F6990` outlives the builder, and the two mark
+/// values it distinguishes ([`BUILD_STARTER_MARK`] / [`SUPER_STARTER_MARK`])
+/// cannot be recovered from the finished queue bytes: a Super's starter and a
+/// newly-learned art's starter are both [`SPECIAL_STARTER`].
+///
+/// REF: FUN_801EED1C (the builder whose tail this is)
+pub fn finish_action_queue(
+    character: legaia_art::Character,
+    command_input: &[legaia_art::Command],
+    miracle_armed: bool,
+    bytes: &mut [u8; ACTION_QUEUE_CAP],
+) -> [u32; ACTION_QUEUE_CAP] {
+    finish_action_queue_with_trigger(character, command_input, miracle_armed, bytes).0
+}
+
+/// [`finish_action_queue`], also reporting the builder's **special-trigger
+/// flag** - retail's `0x801F696C`
+/// ([`BattleActionCtx::super_trigger`](super::BattleActionCtx::super_trigger)).
+/// The builder clears it at its head (`sw zero,0x696c` at `0x801EED88`) and
+/// sets it on the Miracle arm (`0x801EF5B8`); the Super applier
+/// `FUN_801EF9E4` it calls sets it on a tail match (`0x801EFBD4`, which
+/// latches even for an empty replace row); the third writer, `0x801F0518`, is
+/// the auto-combo tail `FUN_801F0450`.
+///
+/// PORT: FUN_801EED1C (the `0x801F696C` writes at `0x801EED88` / `0x801EF5B8`)
+/// REF: FUN_801EF9E4 (the `0x801EFBD4` write)
+pub fn finish_action_queue_with_trigger(
+    character: legaia_art::Character,
+    command_input: &[legaia_art::Command],
+    miracle_armed: bool,
+    bytes: &mut [u8; ACTION_QUEUE_CAP],
+) -> ([u32; ACTION_QUEUE_CAP], bool) {
+    use legaia_art::MiracleMatcher;
+    let mut trigger = false;
+    // The side array `0x801F6990` as the build loop leaves it. Retail writes
+    // it incrementally during the build and the Miracle copy does **not**
+    // touch it, so it is reconstructed here - before the copy overwrites the
+    // window it describes.
+    let mut starter_marks = build_starter_marks(bytes);
+    if miracle_armed
+        && MiracleMatcher::with_default_table()
+            .find(character, command_input)
+            .is_some()
+    {
+        apply_miracle_replace(bytes, &miracle_row_for(character));
+        trigger = true;
+    }
+    clear_queue_msb(bytes);
+    reorder_marked_starters(bytes, &starter_marks);
+    let (find_rows, replace_rows) = super_rows_for(character);
+    if apply_super_tail_replace(bytes, &mut starter_marks, &find_rows, &replace_rows).is_some() {
+        trigger = true;
+    }
+    (starter_marks, trigger)
+}
+
+/// Dispatch one frame of the battle action state machine.
+///
+/// Reads `ctx.action_state`, runs the corresponding case body, and may write
+/// a new `action_state` value (transitioning to the next state for the next
+/// frame).
+///
+/// Returns a [`StepOutcome`] describing what happened.
+pub fn step<H: BattleActionHost + ?Sized>(host: &mut H, ctx: &mut BattleActionCtx) -> StepOutcome {
+    let from = ctx.action_state;
+    // REF: FUN_801E295C - retail dispatches `ctx[7]` through a 256-entry `jr`
+    // table at 0x801CED44 with no default; unmapped bytes index a slot that
+    // falls to the shared post-switch epilogue (an inert no-op), so surfacing
+    // them here as UnknownState is a safe superset of retail's behaviour.
+    let Some(state) = ActionState::from_byte(from) else {
+        return StepOutcome::UnknownState { state: from };
+    };
+    // The pass's attacker and target, as the prologue loads them
+    // (`0x801E2994..0x801E29C0`): the shared tail's make-way step skips
+    // these two whatever the state body does to the context.
+    let tail_attacker = ctx.active_actor;
+    let tail_target = host.actor(tail_attacker).map_or(0xFF, |a| a.active_target);
+    let out = step_state(host, ctx, state);
+    make_way_step(host, ctx, tail_attacker, tail_target);
+    out
+}
+
+/// The `switch (ctx[7])` half of [`step`]: one state body.
+fn step_state<H: BattleActionHost + ?Sized>(
+    host: &mut H,
+    ctx: &mut BattleActionCtx,
+    state: ActionState,
+) -> StepOutcome {
+    match state {
+        ActionState::Begin => begin(host, ctx),
+        ActionState::PreActionWait => pre_action_wait(host, ctx),
+        ActionState::QueuedFromMenu => queued_from_menu(ctx),
+        ActionState::ActionSeed => action_seed(host, ctx),
+
+        ActionState::AttackFace => attack_face(host, ctx),
+        ActionState::AttackWindup => attack_windup(host, ctx),
+        ActionState::AttackAdvance => attack_advance(host, ctx),
+        ActionState::AttackCloseRange => attack_close_range(host, ctx),
+        ActionState::AttackStrike => attack_strike(host, ctx),
+        ActionState::AttackShortStep => attack_short_step(host, ctx),
+        // `0x1E`, `0x1F` and `0x20` leave through the shared tail at
+        // `0x801E5F64` on (nearly) every pass - the strike loop's hold and
+        // terminator exits (`0x801E39AC`, `0x801E3A68`, `0x801E3A80`),
+        // `0x1F`'s hold and exit (`0x801E3AF8`, `0x801E3B18`), `0x20`'s
+        // hold (`0x801E56C8`) and its way into the Done band
+        // (`0x801E55A0..0x801E5658`) - and that tail `jal`s the rate
+        // restore `FUN_801E93C8`. So the battle returns to normal speed the
+        // pass the acting party member's committed clip drops below `0x10`
+        // (its art clip has ended), not at the Done band: a monster killed
+        // by an art's last hit plays its knockdown at full speed.
+        ActionState::AttackChain => {
+            let out = attack_chain(host, ctx);
+            restore_action_anim_rates(host, ctx);
+            out
+        }
+        ActionState::AttackRecovery => {
+            let out = attack_recovery(host, ctx);
+            restore_action_anim_rates(host, ctx);
+            out
+        }
+        ActionState::AttackReturn => {
+            let out = attack_return(host, ctx);
+            restore_action_anim_rates(host, ctx);
+            out
+        }
+
+        ActionState::MagicCastBegin => magic_cast_begin(host, ctx),
+        ActionState::MagicPreCastWait => magic_pre_cast_wait(host, ctx),
+        ActionState::MagicAnimChain => magic_anim_chain(host, ctx),
+        ActionState::MagicSustain => magic_sustain(host, ctx),
+        ActionState::MagicHitLoop => magic_hit_loop(host, ctx),
+        ActionState::MagicRecovery => magic_recovery(host, ctx),
+        ActionState::MagicExit => magic_exit(host, ctx),
+
+        ActionState::SummonInvoke => summon_invoke(host, ctx),
+        ActionState::SummonFadeIn => summon_fade_in(host, ctx),
+        ActionState::SummonActorFreeze => summon_actor_freeze(host, ctx),
+        ActionState::SummonSustain => summon_sustain(host, ctx),
+        ActionState::SummonReturn => summon_return(host, ctx),
+        ActionState::SummonVerifyAlive => summon_verify_alive(host, ctx),
+        ActionState::SummonDone => summon_done(host, ctx),
+
+        ActionState::SpiritPreArm => spirit_pre_arm(host, ctx),
+        ActionState::SpiritWait => spirit_wait(host, ctx),
+        ActionState::SpiritFire => spirit_fire(host, ctx),
+        ActionState::SpiritFireDamage => spirit_fire_damage(host, ctx),
+        ActionState::SpiritPostDamage => spirit_post_damage(host, ctx),
+
+        ActionState::SpiritArtsEntry => spirit_arts_entry(host, ctx),
+        ActionState::SpiritArtsSustain => spirit_arts_sustain(host, ctx),
+        ActionState::SpiritArtsFlush => spirit_arts_flush(host, ctx),
+
+        ActionState::DoneCleanup => done_cleanup(host, ctx),
+        ActionState::DoneFadeDown => done_fade_down(host, ctx),
+        ActionState::DoneSeruAbsorb => done_seru_absorb(host, ctx),
+        ActionState::EndOfAction => end_of_action(host, ctx),
+
+        ActionState::RunBegin => run_begin(host, ctx),
+        ActionState::RunWait => run_wait(host, ctx),
+        ActionState::RunEscape => run_escape(host, ctx),
+        ActionState::CaptureStart => capture_start(host, ctx),
+        ActionState::CaptureWait => capture_wait(host, ctx),
+        ActionState::CaptureSustain => capture_sustain(host, ctx),
+        ActionState::CaptureEnd => capture_end(host, ctx),
+
+        ActionState::MagicCaptureBranch => magic_capture_branch(host, ctx),
+        ActionState::MagicCaptureFade => magic_capture_fade(host, ctx),
+        ActionState::MagicCapturePhase2 => magic_capture_phase2(host, ctx),
+        ActionState::MagicCaptureFinalize => magic_capture_finalize(host, ctx),
+
+        ActionState::IdleHold => idle_hold(host, ctx),
+        ActionState::RoundEnd => round_end(host, ctx),
+    }
+}
+
+// --- helper macros + utilities ----------------------------------------------
+
+pub(super) fn transition(ctx: &mut BattleActionCtx, to: ActionState) -> StepOutcome {
+    let from = ctx.action_state;
+    ctx.action_state = to.as_byte();
+    StepOutcome::Transition {
+        from,
+        to: to.as_byte(),
+    }
+}
+
+pub(super) fn stay(_ctx: &BattleActionCtx) -> StepOutcome {
+    StepOutcome::Stay
+}
+
+/// Decrement `frame_timer` by `host.frame_dt()`, return `true` if it crossed
+/// zero (i.e. went from non-negative to negative).
+pub(super) fn tick_frame_timer<H: BattleActionHost + ?Sized>(
+    host: &mut H,
+    ctx: &mut BattleActionCtx,
+) -> bool {
+    let prev = ctx.frame_timer;
+    let dt = host.frame_dt();
+    ctx.frame_timer = ctx.frame_timer.saturating_sub(dt);
+    prev >= 0 && ctx.frame_timer < 0
+}
+
+// --- state handlers ---------------------------------------------------------
+
+/// The **formation arm** of retail state `0x00` - the whole of
+/// `0x801E2AC0..0x801E2B48`, in one place, over the one byte pair retail has.
+///
+/// Two stores, in this order:
+///
+/// 1. **Seed the turn cursor** `ctx[+0x1A]` from the formation-advantage byte
+///    `ctx[+0x290]` (`0x801E2ACC` reads it). The switch has four arms and only
+///    three of them store: `0` seeds the cursor at the head of the order
+///    (`0x801E2B08`), `1` at `ctx[+0x00]` - the party count - (`0x801E2B0C`
+///    /`0x801E2B14`) and `2` at `ctx[+0x01]` - the monster count -
+///    (`0x801E2B18`/`0x801E2B20`), so an ambushed side starts its round partway
+///    down the order. Any other byte leaves the cursor alone (`0x801E2AEC`
+///    jumps clear of all three stores).
+/// 2. **Latch** `+0x290` into `+0x291` (`0x801E2B30`/`0x801E2B38`) and *then*
+///    clear the original (`0x801E2B48`). The latched copy is what the escape
+///    roll reads as "escape assured" (value `2` = the party opened with a
+///    pre-emptive strike), so the copy must happen before the clear - see
+///    [`BattleActionCtx::formation_latched`].
+///
+/// `ctx[+0x00]` / `ctx[+0x01]` are not modelled on [`BattleActionCtx`]; the
+/// caller passes the seated counts (in the engine, the host's party count and
+/// the slots above it).
+///
+/// Runs at most once per round - see [`BattleActionCtx::formation_armed`] for
+/// why the port needs a flag where retail does not. Engines that stage the
+/// round themselves call [`round_state_zero`] at the round's `0xFE` (retail's
+/// placement: the commit confirm's Begin moves the flow to `0xFE`, which arms
+/// `ctx[7] = 0` at `0x801D3224`, so state `0x00` runs after the last command
+/// and before the round's first action); [`begin`] runs it otherwise.
+///
+/// PORT: FUN_801E295C (`0x801E2AC0..0x801E2B48`)
+pub fn begin_formation_arm(
+    seated_party: u8,
+    seated_monsters: u8,
+    ctx: &mut BattleActionCtx,
+) -> bool {
+    if ctx.formation_armed {
+        return false;
+    }
+    ctx.formation_armed = true;
+    match ctx.formation_advantage {
+        0 => ctx.turn_cursor = 0,
+        1 => ctx.turn_cursor = seated_party,
+        2 => ctx.turn_cursor = seated_monsters,
+        _ => {}
+    }
+    ctx.formation_latched = ctx.formation_advantage;
+    ctx.formation_advantage = 0;
+    true
+}
+
+/// Retail's state `0x00` as one call, at the round's start: the AI queue
+/// assembler's auto-fill leg (`jal 0x801f0450` at `0x801E2AB8`, the state's
+/// opening instruction) and then the formation arm.
+///
+/// Retail reaches `0x00` **every round** - the commit confirm's Begin stores
+/// flow `0xFE` (`0x801D31AC`) and `0xFE` writes `ctx[7] = 0` (`0x801D3224`) -
+/// so the delegated members' queues are rebuilt each round, and round two's
+/// pass copies the `+0x290` round one cleared over `+0x291`: a pre-emptive
+/// strike's assured escape lasts one round.
+///
+/// A no-op when the round's pass already ran ([`BattleActionCtx::formation_armed`]);
+/// the host clears that flag at the round boundary. Returns whether it ran.
+///
+/// PORT: FUN_801E295C (state `0x00`, `0x801E2AB8..0x801E2B48`)
+pub fn round_state_zero<H: BattleActionHost + ?Sized>(
+    host: &mut H,
+    ctx: &mut BattleActionCtx,
+) -> bool {
+    if ctx.formation_armed {
+        return false;
+    }
+    auto_fill_party_queues(host, ctx);
+    begin_formation_arm_for(host, ctx)
+}
+
+/// [`begin_formation_arm`] with the two seated counts read off a host.
+///
+/// `ctx[+0x00]` / `ctx[+0x01]` are the counts battle setup seated, so the
+/// monster figure is the number of **occupied** monster slots, not the width
+/// of the slot table - the engine's `slot_count()` is the fixed 8-slot table
+/// and the tail of it is empty in most formations.
+pub fn begin_formation_arm_for<H: BattleActionHost + ?Sized>(
+    host: &H,
+    ctx: &mut BattleActionCtx,
+) -> bool {
+    let party = host.party_count();
+    let monsters = (party..host.slot_count())
+        .filter(|&slot| host.actor(slot).is_some_and(|a| a.liveness != 0))
+        .count() as u8;
+    begin_formation_arm(party, monsters, ctx)
+}
+
+/// The **auto-fill arm** of the AI queue assembler, over every party slot -
+/// `FUN_801F0450`'s `record[+0xF8] & 0x2000` leg
+/// (`0x801F04A0..0x801F06D4`), driven from its retail call site.
+///
+/// For each party slot whose roster character carries the auto-fight passive
+/// and whose actor is not status-vetoed, this stamps action category `3`
+/// (Attack), rolls a target over the monster slots, and fills
+/// `actor[+0x1DF..]` with biased learned-art bytes from the character's
+/// displayed-skill list ([`crate::battle_arts_auto_combo::auto_fill_queue`]).
+///
+/// The **pool arm** - the AP-budgeted `DAT_801C9360[slot][cmd]` draw the same
+/// function takes when the passive is clear - is not driven from here: it
+/// needs the equipped swing records and the guard masks, which `engine-core`
+/// holds, so `World::run_auto_attack_pool_arms` runs it at the same seam.
+///
+/// The seats this leg takes are recorded in
+/// [`BattleActionCtx::delegated_seats`]; the host's turn dispatch plays their
+/// stream as it stands, which is what retail's seed does (the builder
+/// `FUN_801EED1C` finds no arrow string to tokenize in a stream of action
+/// constants and leaves it alone).
+///
+/// The target roll consumes one host RNG draw per selected slot and the
+/// fill consumes two per iteration, in retail's own order (stop roll, then
+/// index roll), so a host with a deterministic RNG stays deterministic.
+///
+/// PORT: FUN_801F0450 (the auto-fill leg + its per-slot loop)
+/// REF: FUN_801DB124 (the dead-target redirect the target roll feeds)
+fn auto_fill_party_queues<H: BattleActionHost + ?Sized>(host: &mut H, ctx: &mut BattleActionCtx) {
+    use super::pool_ops::{RedirectQuery, redirect_dead_target};
+    use crate::battle_arts_auto_combo::{
+        ART_ACTION_BIAS, auto_fill_queue, gate_selects_auto_fill, roll_target_slot,
+    };
+    let party = host.party_count();
+    // The roll's modulus is `ctx[+0x01]` (`lbu v1,0x1(v1)` at `0x801F0538`),
+    // the **seated** monster count battle setup wrote - a fallen monster
+    // keeps its seat - and the seat it lands on is a retail pool slot
+    // (`+ 3` at `0x801F0570`). The host seats its monsters straight after
+    // the party, so both the liveness test and the stored target go through
+    // the same translation `World::redirect_dead_battle_target` uses.
+    // Counting only the *living* monsters here narrowed the roll onto the
+    // first seats: with the front monsters down and one standing behind
+    // them, every roll landed on a dead seat and the redirect's unbounded
+    // retry never returned.
+    use crate::battle_slot::RETAIL_FIRST_MONSTER;
+    let seats = crate::battle_slot::SeatMap::new(party);
+    let monsters = (party..host.slot_count())
+        .filter(|&s| {
+            host.actor(s)
+                .is_some_and(|a| a.max_hp != 0 || a.liveness != 0)
+        })
+        .count() as u8;
+    let alive: Vec<bool> = (0..host.slot_count())
+        .map(|s| host.actor(s).is_some_and(|a| a.liveness != 0))
+        .collect();
+    // An empty party seat has no engine slot; it is never alive.
+    let to_engine = |retail: u8| seats.engine(retail).unwrap_or(retail);
+    let retail_alive = |retail: u8| {
+        seats
+            .engine(retail)
+            .and_then(|e| alive.get(usize::from(e)).copied())
+            .unwrap_or(false)
+    };
+    let monster_standing = (0..monsters).any(|m| retail_alive(RETAIL_FIRST_MONSTER + m));
+    ctx.delegated_seats = 0;
+    for slot in 0..party {
+        let Some(status) = host.actor(slot).map(|a| a.field_flags) else {
+            continue;
+        };
+        if !gate_selects_auto_fill(host.character_ability_bits_high(slot), status) {
+            continue;
+        }
+        // `li v0,0x1` / `sw v0,0x696c(v1)` at `0x801F0514..0x801F0518`: the
+        // first store past the `+0x16E & 0x404` veto raises the builder's
+        // special-trigger flag `0x801F696C`, which the strike loop's drift
+        // reads at `0x801E3840`. The builder `FUN_801EED1C` clears it at its
+        // head (`0x801EED88`) and the seed `0x0C` calls that builder for
+        // every party seat, a delegated one included (`jal 0x801eed1c` at
+        // `0x801E2C7C`, gated only on seat `< 3`), so the flag stands until
+        // the round's first party dispatch.
+        ctx.super_trigger = true;
+        ctx.delegated_seats |= 1 << slot;
+        // Retail's order: category and target are written first
+        // (`0x801F0528` / `0x801F0578`), and the learned-arts count gate that
+        // can end the slot comes after (`0x801F05AC`) - so a delegated member
+        // with an empty list still ends up with a committed Attack.
+        let draw = host.rng() as i32;
+        let rolled = roll_target_slot(monsters, draw);
+        // The roll goes straight through the dead-target redirect
+        // (`jal 0x801db124` at `0x801F0574`) - a third call site for it, and
+        // unlike the turn picker's two this one carries no `ctx[+0x06]`
+        // command-flow gate, so the redirect is unconditional here.
+        // A side with nobody standing has already ended the fight; retail's
+        // retry would spin on it, the port never does.
+        let target = if monster_standing {
+            redirect_dead_target(
+                RedirectQuery {
+                    target_slot: rolled,
+                    category: ActionCategory::Attack.as_byte(),
+                    param0: 0,
+                },
+                party,
+                monsters,
+                || host.rng() as i32,
+                retail_alive,
+                |_| 0,
+            )
+            .unwrap_or(rolled)
+        } else {
+            rolled
+        };
+        if let Some(actor) = host.actor_mut(slot) {
+            actor.action_category = ActionCategory::Attack.as_byte();
+            actor.active_target = to_engine(target);
+        }
+        let char_id = host.roster_character_id(slot);
+        let learned = host.learned_arts(slot);
+        if learned.is_empty() {
+            continue;
+        }
+        let filled = {
+            let mut rng = || host.rng() as i32;
+            auto_fill_queue(char_id, &learned, &mut rng)
+        };
+        debug_assert!(filled.bytes.iter().all(|&b| b >= ART_ACTION_BIAS));
+        if let Some(actor) = host.actor_mut(slot) {
+            actor.params = [0; ACTION_PARAM_BYTES];
+            for (dst, src) in actor.params.iter_mut().zip(filled.bytes.iter()) {
+                *dst = *src;
+            }
+        }
+    }
+}
+
+pub(super) fn begin<H: BattleActionHost + ?Sized>(
+    host: &mut H,
+    ctx: &mut BattleActionCtx,
+) -> StepOutcome {
+    // Reset ctx counters at +0x6DA..+0x6DB.
+    ctx.combo_timer = 0;
+    // Seed the turn cursor from the formation advantage, then latch it away.
+    // The AI queue assembler runs in the same once-per-round pass, and it
+    // runs first: retail's opening instruction of state `0x00` is
+    // `jal 0x801f0450` (`0x801E2AB8`), ahead of the formation arm. A host
+    // that already ran the round's pass (`round_state_zero`) makes this a
+    // no-op for every later action of the round.
+    round_state_zero(host, ctx);
+    // Branch to QueuedFromMenu if menu still open, otherwise PreActionWait.
+    if ctx.menu_open != 0 {
+        transition(ctx, ActionState::QueuedFromMenu)
+    } else {
+        transition(ctx, ActionState::PreActionWait)
+    }
+}
+
+pub(super) fn pre_action_wait<H: BattleActionHost + ?Sized>(
+    host: &mut H,
+    ctx: &mut BattleActionCtx,
+) -> StepOutcome {
+    if host.previous_action_cleared(1) {
+        transition(ctx, ActionState::ActionSeed)
+    } else {
+        stay(ctx)
+    }
+}
+
+pub(super) fn queued_from_menu(ctx: &mut BattleActionCtx) -> StepOutcome {
+    if ctx.menu_open == 0 {
+        transition(ctx, ActionState::PreActionWait)
+    } else {
+        stay(ctx)
+    }
+}
+
+/// Raise the per-action target banner at the tail of [`action_seed`].
+///
+/// The plan comes from [`crate::battle_cue_group::plan_target_banner`], the
+/// port of `FUN_801E6D84`; each HUD element id it lists is raised through
+/// [`BattleActionHost::ui_element`], which is the port's channel for retail's
+/// `FUN_801D8DE8` (the same channel the run / spirit / attack arms already
+/// use). Two of the retail routine's inputs are abstracted rather than read,
+/// and neither reaches the id list:
+///
+/// * `ctx[+0x24B]`, the override target slot the `target == 9` arms consult,
+///   has no `BattleActionCtx` field and is passed as `0` - the arm retail
+///   takes when nothing has overridden the target.
+/// * the banner *width* term is `FUN_80035F04` over the target's `+0x1BC`
+///   animation descriptor, which this crate has no pool to walk. It is passed
+///   as `0`, and the resulting `banner_width` is not consumed: the engine's
+///   HUD sizes its own banners.
+///
+/// The engine compacts its battle seating (monsters start at `party_count`,
+/// retail always at slot 3), so slot inputs are re-expressed in retail's
+/// numbering on the way in and the plan's `slots` are left alone - only the
+/// id list is used here.
+///
+/// REF: FUN_801E6D84
+fn raise_target_banner<H: BattleActionHost + ?Sized>(
+    host: &mut H,
+    actor_slot: u8,
+    party_count: u8,
+) {
+    use crate::battle_cue_group::{BannerInputs, plan_target_banner};
+    let Some(actor) = host.actor(actor_slot) else {
+        return;
+    };
+    let (action_category, action_id, target) =
+        (actor.action_category, actor.params[0], actor.active_target);
+    let mut monster_alive = [false; 4];
+    for (i, alive) in monster_alive.iter_mut().enumerate() {
+        *alive = host
+            .actor(party_count + i as u8)
+            .is_some_and(|a| a.liveness != 0);
+    }
+    // The plan's slot tests are written in retail's fixed numbering (monsters
+    // at 3..=6, the sentinels 8 and 9 above them), so re-express both slot
+    // inputs in it. The sentinels pass through untouched.
+    let seats = crate::battle_slot::SeatMap::new(party_count);
+    let to_retail = |slot: u8| -> u8 { seats.retail(slot).get() };
+    let plan = plan_target_banner(
+        &BannerInputs {
+            active_slot: to_retail(actor_slot),
+            action_category,
+            action_id,
+            target: to_retail(target),
+            ctx_override_slot: 0,
+            monster_alive,
+        },
+        0,
+    );
+    for id in plan.hud_elements {
+        host.ui_element(id, 0);
+    }
+    // `plan.ctx_18` is dropped: `ctx[+0x18]` has no `BattleActionCtx` field
+    // (the port's `+0x18` is the battle actor's `ui_element_id`, a different
+    // byte), and nothing in the engine reads a context HUD-state byte.
+}
+
+/// Retail's class-byte discriminator inside the action-seed's **Magic** arm
+/// (`overlay_battle_action_801e295c.txt` `0x801E2EB0..0x801E2F08`).
+///
+/// The arm stores `0x28` ([`ActionState::MagicCastBegin`]) first
+/// (`0x801E2EBC`), then reads the spell's class byte off the static table
+/// (`lbu v0,0x0(v0)` at `0x801E2EE4`, base `0x800754C8 + id*0xC`) and
+/// overrides it to `0x3C` ([`ActionState::SpiritPreArm`]) only when **both**
+/// tests pass:
+///
+/// ```text
+/// 801e2eec  sltiu v0,v0,0x14         ; class < 0x14 ?
+/// 801e2ef0  beq   v0,zero,801e2f24   ;   no  -> keep 0x28
+/// 801e2ef4  sltiu v0,a0,0x65         ; id < 0x65 ?
+/// 801e2ef8  beq   v0,zero,801e2f24   ;   no  -> keep 0x28
+/// 801e2efc  li    v0,0x3c            ; both  -> 0x3C
+/// ```
+///
+/// `LAB_801E2F24` is the *keep-`0x28`* fall-through (it is also where the
+/// Attack arm lands), not the `0x3C` store - a reading worth stating because
+/// the inverted one ("`class > 0x13` **or** `id > 100` → `0x3C`") is the
+/// opposite of what the branches do.
+///
+/// The two bands agree on the parts that matter to simulation - both debit
+/// the ability-bit-scaled MP cost and both raise the `0x4C` HUD label - so the
+/// override is about which animation/timing band drives the cast, not about
+/// what it costs. The player Seru block (`0x81..=0x8b`) fails the `id < 0x65`
+/// test and always takes `0x28`.
+///
+/// A host with no spell table ([`BattleActionHost::spell_class_byte`] =
+/// `None`) cannot evaluate the first test, so it keeps `0x28` - retail's own
+/// non-override branch.
+///
+/// REF: FUN_801E295C (`0x801E2EB0..0x801E2F08`)
+fn magic_seed_band<H: BattleActionHost + ?Sized>(
+    host: &H,
+    ctx: &mut BattleActionCtx,
+    actor_slot: u8,
+) -> ActionState {
+    // `sb zero,0xd(v0)` at `0x801E2EC8` - the Magic arm pins the camera
+    // variant to `0` ahead of both of its routes, so a cast is never framed
+    // from the mirrored side.
+    ctx.camera_variant = 0;
+    let spell_id = host.actor(actor_slot).map_or(0, |a| a.params[0]);
+    match host.spell_class_byte(spell_id) {
+        Some(class) if class < 0x14 && spell_id < 0x65 => ActionState::SpiritPreArm,
+        _ => ActionState::MagicCastBegin,
+    }
+}
+
+/// The **Item** arm's twin of [`magic_seed_band`] (`0x801E2E30..0x801E2EAC`).
+///
+/// Like the Magic arm it stores its default first (`0x3C` =
+/// [`ActionState::SpiritPreArm`], at `0x801E2E40`) and overrides only for one
+/// shape: `(id + 0x68) & 0xFF < 2`, i.e. item id `0x98` or `0x99`
+/// (`0x801E2E6C..0x801E2E78`). Those two take `0x28` instead, and the arm
+/// stages them as a **summon**: `actor[+0x1E0] = 9` (the sub-route byte the
+/// pre-cast wait tests to reach `SummonInvoke`) and `actor[+0x1DF] -= 2`, so
+/// the cast band sees id `0x96` / `0x97`.
+///
+/// The arm also carries the action's **camera-angle variant**
+/// ([`BattleActionCtx::camera_variant`], retail `ctx[+0xD]`): an
+/// unconditional `jal 0x80056798` at `0x801E2E3C` folded to `(rand % 2) * 2`
+/// and stored at `0x801E2E60`, then overwritten with `0` on the summon route
+/// (`sb zero,0xd(v0)` at `0x801E2E94`). The draw is unconditional and its
+/// result never reaches the branch - the id test at `0x801E2E6C` is what
+/// picks the route - but it does advance the shared `rand()` cursor, so a
+/// port that skips it desynchronises the stream from the first item action
+/// onwards.
+///
+/// REF: FUN_801E295C (`0x801E2E30..0x801E2EAC`)
+fn item_seed_band<H: BattleActionHost + ?Sized>(
+    host: &mut H,
+    ctx: &mut BattleActionCtx,
+    actor_slot: u8,
+) -> ActionState {
+    // `0x801E2E3C..0x801E2E60` - the draw comes first, before the id test,
+    // and lands as `(rand % 2) * 2` (so `0` or `2`, the two variants whose
+    // camera keeps the default yaw).
+    ctx.camera_variant = ((host.rng() % 2) * 2) as u8;
+    let item_id = host.actor(actor_slot).map_or(0, |a| a.params[0]);
+    if item_id.wrapping_add(0x68) >= 2 {
+        return ActionState::SpiritPreArm;
+    }
+    // The summon route re-stamps the variant to `0` (`0x801E2E94`).
+    ctx.camera_variant = 0;
+    if let Some(actor) = host.actor_mut(actor_slot) {
+        actor.sub_route = 9;
+        actor.params[0] = item_id.wrapping_sub(2);
+    }
+    ActionState::MagicCastBegin
+}
+
+/// The HUD element a **party** attack raises at the action seed
+/// (`li a0,0x7` / `jal 0x801d8de8` with `a1 = 0` at
+/// `0x801E2F34..0x801E2F40`) and the Done band tears down again.
+pub const ATTACK_UI_ELEMENT: u8 = 7;
+
+/// The **Spirit** arm's twin of [`item_seed_band`] / [`magic_seed_band`]
+/// (`0x801E2F54..0x801E3028`).
+///
+/// Its tail carries two writes the port used to skip, both in the same
+/// three-instruction window at `0x801E2FF0..0x801E3024`:
+///
+/// ```text
+/// 801e2ff0  lbu   v0,0x8(s5)      ; ctx[+0x19]
+/// 801e2ff8  addiu v0,v0,0x1
+/// 801e2ffc  jal   0x80056798      ; rand()
+/// 801e3000  _sb   v0,0x8(s5)      ;   ctx[+0x19] += 1  (delay slot)
+/// 801e3008..801e3018              ; v0 = rand() % 2 (signed remainder)
+/// 801e3020  sll   v0,v0,0x1       ; * 2
+/// 801e3024  sb    v0,0xd(v1)      ; ctx[+0xD] = 0 or 2
+/// ```
+///
+/// The draw is **unconditional** and never reaches a branch - exactly the
+/// shape the Item arm's `0x801E2E3C` draw has - so the only thing that makes
+/// it observable outside the framing is that it advances the shared `rand()`
+/// cursor. A port that skips it desynchronises the RNG stream from the first
+/// Spirit action of a battle onwards.
+///
+/// The `% 2 * 2` lands on `0` or `2`, i.e. the two
+/// [`BattleActionCtx::camera_variant`] values that keep the default yaw and
+/// differ only in pitch - a Spirit action is never framed from the mirrored
+/// side.
+///
+/// PORT: FUN_801E295C (`0x801E2FF0..0x801E3024`)
+fn spirit_seed_band<H: BattleActionHost + ?Sized>(
+    host: &mut H,
+    ctx: &mut BattleActionCtx,
+) -> ActionState {
+    // The head of the arm (`0x801E2F64..0x801E2FEC`): size placement record
+    // `0x0F` - the AP bar - off the actor's live AGL `+0x154` less 6, or off
+    // the extended gauge when the `+0x1F9` charge byte is up, then raise the
+    // bar (`0x0F`) and the AP plate (`0x52`), parking the plate's handle at
+    // `0x801F6968`. The plate's `+0x10` value is the actor's Spirit gauge.
+    let slot = ctx.active_actor;
+    if let Some(a) = host.actor(slot) {
+        ctx.spirit_bar_width = if a.spirit_shield != 0 {
+            extended_gauge(a.agl_base)
+        } else {
+            (a.agl as i16).wrapping_sub(SPIRIT_BAR_WIDTH_BIAS)
+        };
+        ctx.spirit_plate_value = a.spirit_gauge.min(i16::MAX as u16) as i16;
+    }
+    host.ui_element(SPIRIT_AP_BAR_ELEMENT, 0);
+    host.ui_element(SPIRIT_AP_PLATE_ELEMENT, 0);
+    ctx.spirit_action_count = ctx.spirit_action_count.wrapping_add(1);
+    ctx.camera_variant = ((host.rng() % 2) * 2) as u8;
+    ActionState::SpiritArtsEntry
+}
+
+pub(super) fn action_seed<H: BattleActionHost + ?Sized>(
+    host: &mut H,
+    ctx: &mut BattleActionCtx,
+) -> StepOutcome {
+    let actor_slot = ctx.active_actor;
+    let Some(actor) = host.actor(actor_slot) else {
+        return stay(ctx);
+    };
+    // A dead acting actor never dispatches into an action band. Retail holds
+    // this invariant one function upstream, structurally: every battle-order
+    // recompute (`FUN_801DABA4`, `overlay_battle_action_801daba4.txt`) sweeps
+    // the actor table and, for each dead slot still holding an unspent
+    // initiative key (`lhu v0,0x14c(v1); bne v0,zero,<skip>` at `0x801DABD8`
+    // + `lhu v0,0x16c(v1); beq v0,zero,<skip>` at `0x801DABE8`), zeroes the
+    // key (`sh zero,0x16c(v1)` at `0x801DABF8`), bumps the round-skip count
+    // `ctx[+0x25]` (`0x801DAC2C..0x801DAC38`), and for a staged Item action
+    // refunds the item and clears the category byte
+    // (`jal 0x800421D4` / `sb zero,0x1de(v0)` at `0x801DAC54..0x801DAC68`).
+    // A dead actor therefore can never be picked into `ctx[+0x274]`, which is
+    // the only writer of the acting slot this state copies (`0x801E2C50`) -
+    // so retail's seed body needs no liveness test of its own. The port's
+    // hosts CAN kill an actor between arming and seed (an external HP write,
+    // a harness force-kill - the wave-measured shape: a monster dead at
+    // battle entry still ran its staged multi-strike), so the invariant is
+    // enforced here at the dispatch point, and it routes exactly where
+    // retail's *cleared-action* category-0 arm routes: state `0x50`
+    // (`li v0,0x50; sb v0,0x7(v1)` at `0x801E2E24..0x801E2E2C`), the Done
+    // band - no attack, no cast, the turn is simply spent.
+    //
+    // REF: FUN_801DABA4 (the dead-slot sweep that is this gate in retail)
+    if actor.liveness == 0 {
+        return transition(ctx, ActionState::DoneCleanup);
+    }
+    let category = ActionCategory::from_byte(actor.action_category);
+    let field_flags = actor.field_flags;
+    let party_count = host.party_count();
+
+    // Setup hooks.
+    if actor_slot < party_count {
+        host.party_setup(actor_slot);
+    } else if (field_flags & 0x380) != 0 {
+        host.monster_setup(actor_slot);
+    }
+
+    // Retail's next straight-line block, between the setup hooks
+    // (`jal 0x801EED1C` / `jal 0x801E7320` at `0x801E2C7C` / `0x801E2CA0`)
+    // and the framing call below - the draw order matters because
+    // `monster_setup` is itself an RNG consumer.
+    //
+    // `sb zero,0x15(s5)` at `0x801E2CFC` (`s5 = ctx + 0x11`): every action
+    // starts with the level-up banner element cleared, so the extended Done
+    // tail belongs to the action that actually raised a banner.
+    ctx.levelup_banner_element = 0;
+    // `jal 0x80056798` / `sb v0,0xd(a0)` at `0x801E2D04..0x801E2D30` - the
+    // per-action camera-angle variant, rolled `rand() % 4` before the
+    // category dispatch. Each category arm below may narrow it further.
+    ctx.camera_variant = (host.rng() % 4) as u8;
+
+    // Per-action camera framing (`FUN_801F0348` at `801e2d2c`). Retail runs
+    // this unconditionally on the seed path, ahead of - and independent of -
+    // the gated `FUN_801EFE44` bounds walk below.
+    // Read `+0x1DD` *after* the setup hooks: `monster_setup` is where the
+    // engine expands a monster's targeting class into a concrete slot, and
+    // retail's `801f0348` reads the live byte.
+    let target_slot = host.actor(actor_slot).map_or(8, |a| a.active_target);
+    let frame_height = crate::battle_formulas::camera_height_for_frame(
+        actor_slot,
+        target_slot,
+        party_count,
+        |slot| host.monster_size_class(slot),
+    );
+    ctx.camera_frame_height = frame_height;
+    host.camera_frame_height(frame_height);
+
+    // The formation recentre `FUN_801EFE44` (`jal 0x801efe44` at
+    // `0x801E2D44`), skipped for Run (`+0x1DE == 5`, `0x801E2D3C`); the
+    // monster Run arm runs it itself below.
+    if !matches!(category, ActionCategory::Run) {
+        host.seed_formation_recentre(actor_slot);
+    }
+
+    // Idle pose.
+    host.pose(actor_slot, Pose::Idle);
+
+    // Per-action target banner. Retail's seed body ends every category arm at
+    // the same `jal 0x801e6d84` (`overlay_battle_action_801e295c.txt`
+    // `0x801E3028`) before jumping to the epilogue, so the plan is raised here
+    // rather than per-band.
+    raise_target_banner(host, actor_slot, party_count);
+
+    // Dispatch into the appropriate band.
+    let next = match category {
+        ActionCategory::TacticalArts => {
+            // Skip - UI input chain handles the chain. Retail's category-0
+            // arm still stamps the UI cursor anchor and pins the camera
+            // variant to `0` (`sb zero,0xd(v1)` at `0x801E2E1C`).
+            ctx.camera_variant = 0;
+            ActionState::DoneCleanup
+        }
+        ActionCategory::Item => item_seed_band(host, ctx, actor_slot),
+        ActionCategory::Magic => magic_seed_band(host, ctx, actor_slot),
+        ActionCategory::Attack => {
+            // Set ctx combo timer and emit weapon-slash UI for party.
+            ctx.combo_timer = 2;
+            if actor_slot < party_count {
+                if let Some(actor) = host.actor_mut(actor_slot) {
+                    actor.ui_element_id = ATTACK_UI_ELEMENT;
+                }
+                host.ui_element(ATTACK_UI_ELEMENT, 0);
+                // `li v0,0x7` / `sb v0,0x7(s5)` at `0x801E2F48..0x801E2F50`:
+                // the id is stamped on the **context**, which is where the
+                // Done band's teardown reads it back from.
+                ctx.action_ui_element = ATTACK_UI_ELEMENT;
+            }
+            ActionState::AttackFace
+        }
+        ActionCategory::Spirit => spirit_seed_band(host, ctx),
+        ActionCategory::Run => {
+            if actor_slot < party_count {
+                ActionState::RunBegin
+            } else {
+                // `jal 0x801efe44` at `0x801E2DE8`, the monster arm only.
+                host.seed_formation_recentre(actor_slot);
+                ActionState::CaptureStart
+            }
+        }
+        ActionCategory::ItemRetargetA | ActionCategory::ItemRetargetB => {
+            // Should never hit ActionSeed with these; but if they do, treat
+            // as Item route.
+            ActionState::SpiritPreArm
+        }
+    };
+    // Capture harness: a replay that knows the variant retail's seed rolled
+    // lands it over the engine's own roll, after every draw above was made
+    // (`BattleActionCtx::camera_variant_pin`). Nothing in play sets it.
+    if let Some(pin) = ctx.camera_variant_pin {
+        ctx.camera_variant = pin;
+    }
+    transition(ctx, next)
+}

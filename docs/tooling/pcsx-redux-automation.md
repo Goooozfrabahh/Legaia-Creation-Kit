@@ -1,0 +1,1993 @@
+# PCSX-Redux automation
+
+PCSX-Redux ships a Lua scripting API + a breakpoint debugger over the live
+PSX CPU. The `scripts/pcsx-redux/` directory contains closed-loop probes
+that use this combination to answer questions static analysis can't:
+*"what code reads this address?"*, *"when does this RAM region get
+populated?"*, *"what's the dispatch path between two functions?"*.
+
+The same shape applies across the catalogue: a Lua autorun script
+loads a save state, arms a set of breakpoints, captures N VSyncs of
+data, and writes a CSV / snapshot file. A wrapper shell script
+launches the emulator headless with the right flags.
+
+```mermaid
+flowchart LR
+    run["run_probe.sh"] --> stage["stage disc in a private dir (no stray .ppf)"]
+    stage --> emu["PCSX-Redux: interpreter + debugger"]
+    emu --> boot["WAIT_BOOT: count vsyncs"]
+    boot --> load["load save state, arm breakpoints"]
+    load --> cap["capture N vsyncs: hits to CSV"]
+    cap --> done["final snapshot, PCSX.quit"]
+    done --> an["probe.py / offline analysis"]
+```
+
+This page documents the pattern, the harness, and the catalogue. Three traps
+apply to every probe and are worth knowing before reading a result:
+
+- **A save state replays the RAM of the disc that booted it.** Disc edits are
+  masked until the game re-loads them; verify from a cold boot or a memory-card
+  load ([patched-disc taint](#patched-disc-taint)).
+- **PCSX-Redux applies a `.ppf` sitting beside the image it is handed**, logging
+  only `[+ppf]`. The runner stages the disc to prevent it
+  ([the harness](#the-harness)).
+- **Both `-interpreter` and `-debugger` are required** for Lua breakpoints to
+  fire ([why PCSX-Redux](#why-pcsx-redux)).
+
+## Contents
+
+- [Why PCSX-Redux](#why-pcsx-redux)
+- [Setup](#setup)
+- [The harness](#the-harness)
+- [The probe pattern](#the-probe-pattern)
+- [Fast whole-playthrough capture (two-tier model)](#fast-whole-playthrough-capture-two-tier-model)
+- [Patched-disc taint](#patched-disc-taint)
+- [Catalogue](#catalogue)
+  - [Runtime probes (Lua autorun)](#runtime-probes-lua-autorun)
+  - [Save-state to Python (offline analysis)](#save-state-to-python-offline-analysis)
+  - [One-shot wrappers](#one-shot-wrappers)
+  - [GDB-stub bridge (`gdb_probe.py`)](#gdb-stub-bridge-gdb_probepy)
+  - [Analysing probe outputs (`probe.py`)](#analysing-probe-outputs-probepy)
+- [Authoring a new probe](#authoring-a-new-probe)
+- [See also](#see-also)
+
+## Why PCSX-Redux
+
+Three properties make it the right tool for runtime probes:
+
+- **Open-source + scriptable.** The Lua API exposes the CPU register
+  file, main RAM as a file-like object, and a breakpoint manager.
+- **Interpreter CPU + debug mode.** The interpreter (`-interpreter`)
+  is the only CPU back-end that hits Lua breakpoints, and the
+  interpreter only invokes the debug-process hook when
+  `DebugSettings::Debug` is set (`-debugger`). Both flags are required;
+  silently neither alone fires Lua breakpoints. (Source:
+  `psxinterpreter.cc:1652` - `if constexpr (debug)`.)
+- **Save-state load from Lua.** `PCSX.loadSaveState(zReader(file))`
+  loads a `.sstate` file at runtime, which lets the autorun script
+  reach any captured game state without driving the GUI.
+
+Mednafen's binary save-state format is supported for offline RAM scans
+via the [`mednafen-state`](mednafen-automation.md) crate, but its
+runtime debugger is GUI-only; PCSX-Redux is where the breakpoint
+probes run.
+
+## Setup
+
+The expected on-disk layout (matches the run-script defaults):
+
+```
+~/Tools/pcsx-redux/pcsx-redux                  # locally-built binary
+~/Tools/pcsx-redux/<TITLE_ID>.sstate<N>        # PCSX-Redux quicksave (F1..F10 in-emulator)
+~/.mednafen/firmware/SCPH1001.BIN              # PSX BIOS, reused from mednafen
+~/Downloads/Legend of Legaia (USA)/            # disc image
+```
+
+The `<TITLE_ID>` is the PSX disc's product code (e.g. `SCUS94254` for the USA
+release of Legaia); PCSX-Redux writes one file per quicksave slot when you
+press the assigned F-key in the running emulator. Each probe's documentation
+calls out which game state the save needs to be in - pick a save you've
+prepared locally that matches.
+
+Override any of these via env vars (`PCSX_REDUX`, `LEGAIA_BIOS`,
+`LEGAIA_SSTATE`, `LEGAIA_ISO`). The repo doesn't ship the binary or
+BIOS or disc; those stay local.
+
+### Two `.sstate` shapes - gzipped and bare
+
+A `.sstate` holds PCSX-Redux's protobuf state **either gzipped or bare**, and
+which one depends on how it was written. Quicksave slots (the F-key saves above)
+are gzipped. States a Lua probe writes from a snapshot call are not - they open
+with the bare protobuf `0a 1b 0a 17 "PCSX"` and run ~19 MB, and that is what
+every `captures/**/snap_*.sstate` and `autosave_*.sstate` in this repo is.
+
+Any reader that assumes gzip therefore rejects most of the capture corpus with
+`invalid gzip header` while working fine on the handful of quicksaves - a
+failure shaped like "that state is corrupt" rather than "my reader handles one
+of two formats". `legaia_pcsx_redux::SaveState` dispatches on the `1f 8b` magic and
+opens both.
+
+The corpus-wide consequence is worth stating plainly: a gzip-only reader indexes
+only the quicksave minority, so the scene index it produces silently under-reports
+the corpus by more than half.
+
+### A `.sstate` carries the scratchpad too
+
+"Mednafen states carry `ScratchRAM.data8`, a PCSX-Redux `.sstate` carries main
+RAM only" is a statement about **our reader**, not about the format, and it has
+been used to route work to the wrong emulator. The state's `Memory` message
+carries a fourth field beside RAM / ROM / EXP1 - a 64 KiB `hardware` blob bound
+to the same buffer `PCSX.getScratchPtr()` hands a probe - so the scratchpad is
+in the file, at offset `0x000..0x3FF` of that blob.
+
+It is easy to confirm on any capture without a decoder: take a scratchpad word
+whose value you know (say the field-env pointer a probe read at `0x1F8003EC`),
+search the raw state for it, and check whether `hit - 0x3EC` starts a 64 KiB
+run whose first `0x400` bytes are dense and whose remaining `0xFC00` are almost
+all zero - the scratchpad-plus-I/O-map shape. On a `teien` field-run state that
+lands one blob, and reading `+0x3E8` out of it returns the same visible-tile
+window the live probe logged. What is missing is only a reader:
+`legaia_pcsx_redux::SaveState` exposes `main_ram()` and nothing else, so a
+scratchpad-dependent question still needs either a live probe (which reads it
+directly) or a new accessor.
+
+### Save-state library (immutable backups)
+
+PCSX-Redux quicksave slots (`<TITLE_ID>.sstate<N>`) and mednafen `mc{N}`
+cards are **ephemeral** - the next time you save in that slot, the bytes
+are gone, and a save you reverse-engineered against has to be recaptured
+from scratch. To stop that, back interesting states up into a
+fingerprint-named library:
+
+```
+scripts/manage-states.py backup pcsx-redux ~/Tools/pcsx-redux/SCUS94254.sstate6 \
+    --label field_walled_collision_pin
+scripts/manage-states.py library          # list what's backed up + catalogue status
+scripts/manage-states.py library --audit  # scenario-centric: emulator-aware catalogue
+                                          # status + PCSX-probe-usability + orphan/missing gaps
+```
+
+`library --audit` is the inverse view: it walks every manifest scenario and
+classifies it as CATALOGED (for which emulator), EPHEMERAL-ONLY (a live-slot
+pointer never backed up), BACKUP-MISSING (fingerprint recorded but the file is
+gone), or NO-SAVE (a pure phase marker). It flags which scenarios are usable
+for a PCSX-Redux breakpoint probe - a **mednafen-only** backup is catalogued
+but **cannot** be loaded by `run_probe.sh` (PCSX-Redux needs a `pcsx-redux`
+`.sstate`), which is the most common "but it IS backed up" surprise.
+
+`backup` copies the file to `saves/library/<emulator>/<sha256>.<ext>`
+(immutable; the sha256 is the filename, so it never collides or gets
+overwritten) and records the fingerprint on the named `scripts/scenarios.toml`
+scenario as `backup_fingerprint`. The library directory is **gitignored**
+(it holds Sony game RAM); the committed pointer is the manifest's
+`backup_fingerprint` field. When a scenario has one, both
+`scripts/manage-states.py` and `run_probe.sh --scenario` resolve the
+**library copy in preference** to the live slot - so probes keep working
+after you've saved over the original slot. From a git worktree, which has no
+library of its own, `run_probe.sh` looks in the main checkout's next. See the field schema +
+workflow at the top of [`scripts/scenarios.toml`](../../scripts/scenarios.toml).
+
+## The harness
+
+[`scripts/pcsx-redux/run_probe.sh`](../../scripts/pcsx-redux/run_probe.sh)
+is the canonical wrapper. Despite the name, every other Lua autorun
+re-uses it via the `LEGAIA_LUA` override:
+
+```bash
+LEGAIA_SSTATE=$HOME/Tools/pcsx-redux/<your-saved-state>.sstate \
+LEGAIA_LUA=scripts/pcsx-redux/autorun_world_map_fog_probe.lua \
+LEGAIA_OUT=/tmp/fog_probe.csv \
+LEGAIA_FRAMES=600 \
+    bash scripts/pcsx-redux/run_probe.sh
+```
+
+The wrapper:
+
+1. Verifies the binary / BIOS / save state / Lua file all exist
+   (fails early with a clear error if any one is missing).
+2. Stages the disc: it symlinks the `--iso` image as `disc.bin` into a
+   private temporary directory and hands the emulator that path, never the
+   one you named. PCSX-Redux's `PPF::load` (`src/cdrom/ppf.cc`) replaces the
+   image path's extension with `.ppf` and applies that file whenever it
+   exists, logging only `[+ppf]`; the randomizer CLI writes its `.ppf`
+   beside its input disc by default, so without staging, a patch file sitting beside the
+   retail `.bin` patches every probe that names the retail path. A patch reaches a
+   run only through `--ppf PATH` (staged as `disc.ppf`). The banner names
+   the source image and any sibling `.ppf` it bypassed, and the runner warns
+   if the log still shows `[+ppf]` without `--ppf`.
+3. Launches PCSX-Redux with `-interpreter -debugger -run -bios
+   <SCPH> -iso <bin> -dofile <lua> -stdout` and pipes the emulator
+   log to `pcsx.log` inside the run's output directory - or to
+   `logs/pcsx_<probe-stem>.log` when `LEGAIA_OUT` pins a single output
+   file instead (`--log PATH` overrides either).
+4. On exit, prints the CSV row count and greps the log for the probe's
+   own `=== probe hits ===`-style banner, echoing it back as a
+   `=== probe summary ===` block.
+
+The `-stdout` flag is what makes the autorun's `PCSX.log(...)`
+calls visible to the parent shell.
+
+## The probe pattern
+
+Every autorun script under `scripts/pcsx-redux/` follows the same
+state machine:
+
+1. **WAIT_BOOT** - vsync listener counts up while the emulator
+   boots the BIOS to a known state (typically 60 vsyncs = 1s).
+2. **ARMED_LOADED** - load the save state, read the register
+   file, compute breakpoint addresses (often GP-relative), arm the
+   probes, write an initial snapshot. Capture for `LEGAIA_FRAMES`
+   vsyncs while breakpoints log hits to the CSV.
+3. **DONE** - disarm breakpoints, write a final snapshot,
+   `PCSX.quit(0)`.
+
+This pattern is factored out as a shared library at
+[`scripts/pcsx-redux/lib/probe.lua`](../../scripts/pcsx-redux/lib/probe.lua),
+which is an umbrella that re-exports the per-concern submodules under
+[`scripts/pcsx-redux/lib/probe/`](../../scripts/pcsx-redux/lib/probe/) -
+`env`, `mem`, `sstate`, `pad`, `bp`, `csv`, `snapshot`, `sm`, `watch`, `step`,
+and `symbols`, plus `spu` (not re-exported; `require("probe.spu")`), which
+streams the SPU sub-message of a live state in the `LEGSPU01` layout. A new probe doesn't reimplement the state machine, the
+memory readers + writers, the save-state loader, the pad-override helpers, the
+CSV writer, or the live-snapshot writer - it imports them:
+
+```lua
+package.path = package.path .. ";scripts/pcsx-redux/lib/?.lua"
+local probe = require("probe")
+
+local csv = probe.csv_open("/tmp/x.csv", "addr,pc,ra")
+
+probe.run({
+    sstate         = probe.getenv("LEGAIA_SSTATE", DEFAULT),
+    capture_frames = probe.getenv_num("LEGAIA_FRAMES", 600),
+    snapshot_path  = "/tmp/x.hits.txt",
+    on_arm = function()
+        local descs = {}
+        for _, addr in ipairs({ 0x801E76D4 }) do
+            local d = { addr = addr, name = string.format("0x%08X", addr),
+                        hits_ref = { n = 0 } }
+            probe.arm_breakpoint(addr, "Exec", 4, d.name, function()
+                d.hits_ref.n = d.hits_ref.n + 1
+                local r = PCSX.getRegisters()
+                csv:row("0x%08X,0x%08X,0x%08X",
+                    addr, tonumber(r.pc), tonumber(r.GPR.n.ra))
+            end)
+            descs[#descs + 1] = d
+        end
+        return descs
+    end,
+    on_done = function() csv:close() end,
+})
+```
+
+`probe.ram_offset(addr)` is `bit.band(addr, 0x1FFFFFFF)` - strips
+the KSEG segment selector so KSEG0 (`0x80xxxxxx`) and KSEG1
+(`0xA0xxxxxx`) map to the same physical byte. Always work in
+absolute PSX virtual addresses on input; convert at the boundary.
+
+### Call-context capture
+
+`probe.capture_call_context(label)` returns a multi-line text snapshot
+of the CPU at the moment of a breakpoint hit:
+
+* All 32 GPRs by MIPS name (`zero`, `at`, `v0`, …, `ra`), four per
+  row.
+* The 8 instruction words straddling PC (`pc-0x20..pc+0x60`), one row
+  per 16 bytes, with a `<- pc` marker on the row containing PC. Lets
+  the reader see the calling instruction context without round-tripping
+  through Ghidra.
+* The 32 stack words at `sp` (`sp..sp+0x80`), 4 per row. The MIPS
+  calling convention saves `ra` into a sp-relative prologue slot for
+  any non-leaf function, so this captures the visible ra-chain
+  without DWARF unwind info. Walking the chain still requires
+  reading the prologue offsets out of the disassembly post-hoc, but
+  the bytes you need to do that are already in the snapshot.
+
+`probe.append_call_context(path, snap)` is the matching writer; it
+opens the file in append mode so multi-shot probes can stack
+snapshots without overwriting earlier ones. The slot-4 reader and the
+XP-table probe both use this for first-hit detail dumps.
+
+### Write-watchpoint logging (`probe.watch`)
+
+The recurring "*what writes this address?*" probe arms a Write breakpoint
+and, in the callback, logs `(elapsed, label, addr, pc, ra, prev_value)` - the PRE-store value, since the debug hook runs before the instruction - to a
+CSV plus a first-N call-context dump. `probe.watch` factors that closure out
+(it composes `bp` + `mem` + `snapshot`, adding no new emulator interaction):
+
+```lua
+local w = probe.watch.new{
+    csv         = probe.csv_open(probe.out_path("hits.csv"),
+                                 "tick,label,addr,pc,ra,value"),
+    detail_path = probe.out_path("hits.detail.txt"),  -- optional
+    elapsed     = function() return g_elapsed end,
+}
+w:arm(player_ptr + 0x14, 2, "playerX")  -- width 1/2/4; kind defaults "Write"
+-- ... at end: print("total writes:", w:total())
+```
+
+### Instruction tracing + write attribution (`probe.step`)
+
+PCSX-Redux's Lua FFI exposes **no native single-step** (only `pauseEmulator` /
+`resumeEmulator` and non-pausing breakpoints - the internal `m_debug->stepIn()`
+is not bound). `probe.step` reconstructs the two things single-stepping is used
+for, on top of breakpoints, so fine-grained RE stays scriptable instead of
+needing the GUI debugger:
+
+```lua
+-- Observational single-step over a code region: an Exec BP on every 4-byte
+-- instruction in [lo, hi); each fires in execution order with LIVE
+-- pre-execution registers. opts.gate() restricts recording to a window.
+local tr = probe.step.trace(0x801de840, 0x801df000, { gate = on_door_frame })
+
+-- Width-correct range write-finder: arms width-`unit` (default 2) Write BPs
+-- across [addr, addr+len) so a store of unknown width/alignment to a struct
+-- is caught with the correct faulting PC + live registers + post-store bytes.
+local fw = probe.step.find_writer(player + 0x10, 0x10, { on_write = log })
+-- ... fw:count() / fw:records() / fw:dump(path)
+```
+
+Two gotchas these encode:
+
+- **Watch *width* matters as much as address.** A `Write` BP only matches
+  accesses overlapping `[addr, addr+width)`, and PCSX supports width 1/2/4 only
+  - a width-2 watch at exactly `+0x14` **misses** a wider/offset store into the
+  same struct. `find_writer` covers a range by arming a unit BP per slot. (This
+  is what hid the Mei's-house door reposition behind a 2-byte no-op re-store;
+  the range watch found the real writer - a field-VM `0x23 MOVE_TO` - in one run.)
+- **A Write BP fires *at* the store with live registers** (not after the
+  function returns); read `getRegisters()` directly. The earlier "stale
+  registers" symptom was a misread - the store instruction simply didn't use the
+  register in question.
+
+### Early-quit signal
+
+`probe.run` polls `ctx.request_quit` each vsync and exits the
+capture loop on the next tick if it's set. Probes use this to bail as
+soon as their stop condition is met (e.g. every probe in a sweep has
+hit at least once), instead of waiting for `LEGAIA_FRAMES` to elapse:
+
+```lua
+on_capture = function(ctx, _elapsed)
+    if every_probe_hit() then
+        ctx.request_quit = true
+    end
+end,
+```
+
+### Symbolic breakpoint addresses
+
+Hard-coded `0x801DA51C`-style breakpoint targets break across overlay
+re-imports that shift function entry points. The symbol resolver
+accepts Ghidra-canonical names from two sources:
+
+* **Function entry points** (`FUN_801DA51C`, slot-4 `k10_shared` labels,
+  named overlays). Source: per-function dump headers under
+  `ghidra/scripts/funcs/*.txt`.
+* **Global data labels** (`DAT_8007078C` / `_DAT_8007BCD0`, both case
+  forms accepted). Source: the same dump-header walk, plus a regex
+  harvest of `DAT_xxxxxxxx` references from the decomp body content
+  (so DAT names show up even before `dump_globals.py` has been run
+  for a given program), plus a dedicated `dump_globals.py` Jython
+  script for authoritative names + lengths.
+
+Three ways to use it:
+
+```lua
+-- Bespoke autorun:
+local symbols = require("probe.symbols").load()
+probe.arm_breakpoint(symbols.FUN_801DA51C, "Exec", 4, "world_map_sm", cb)
+```
+
+```toml
+# .probe.toml: addr/base accept either an int or a symbol-name string.
+[[breakpoint]]
+addr = "FUN_801DD35C"     # resolves at spec-load time
+kind = "Exec"
+[[breakpoint]]
+addr  = "_DAT_801EF16C"
+kind  = "Read"
+width = 4
+```
+
+```bash
+# Regenerate after adding new dumps (covers funcs/* dumps and globals_*).
+python3 scripts/pcsx-redux/build-symbols.py
+```
+
+```bash
+# Authoritative globals (one-time per program; optional but lossless):
+docker compose exec ghidra /ghidra/support/analyzeHeadless /projects legaia \
+    -process SCUS_942.54 -noanalysis -postScript /scripts/dump/dump_globals.py
+# ... or pass `-process overlay_<name>.bin` for per-overlay globals.
+python3 scripts/pcsx-redux/build-symbols.py
+```
+
+The resolver fails loudly on a typo'd symbol name - arming a
+breakpoint at `nil` otherwise silently captures zero hits and the probe
+runs to completion with no diagnostic. The hex portion of the name is
+case-insensitive: docs use `FUN_801DD35C`, Ghidra emits
+`FUN_801dd35c`, both resolve identically.
+
+`scripts/pcsx-redux/probes/_check_specs.py` cross-validates every
+`.probe.toml` spec's symbol references against `symbols.json` so a
+typo'd symbol fails CI rather than the probe run.
+
+### Things that catch people out
+
+- **One vsync is not one game frame, so "sample for a vsync" can sample
+  nothing.** The `GPU::Vsync` event a probe's state machine ticks on fires
+  several times per rendered frame under the interpreter, and a per-frame
+  render pass therefore runs on only some of them. A census that opens a
+  window on one `on_capture` and closes it on the next records zero hits most
+  of the time - and zero hits reads exactly like "the code never ran", which
+  is the wrong conclusion to draw about a routine that is in fact running
+  every frame. Bracket the window on the routine's **own caller** instead:
+  arm a breakpoint on the call site, count entries, and record between entry
+  *n* and entry *n+1*. That is one complete pass by construction, whatever
+  the vsync cadence is doing. (`autorun_field_ground_cells.lua` reads 1536
+  cells per pass this way; the vsync-bracketed version of the same probe read
+  0, then 784, then 0 again.)
+- **A framebuffer capture shows the *displayed* buffer, which lags the draw.**
+  `PCSX.GPU.takeScreenShot()` returns what is on screen, and a game tick spans
+  several vsyncs at 30fps, so grabbing on the first vsync after the frame you
+  want yields an *earlier* frame. Mid-animation this is silent and dangerous:
+  the capture looks right and measures wrong (the confirm-dialog panels came
+  out one 16px slide step low per frame of lag). Capture something static, or
+  let the state settle for a dozen vsyncs and confirm it stopped moving.
+- **An uninitialised global is not a state flag.** Overlay-resident animation
+  timers and their kin hold stale bytes from whatever last used that address
+  until their screen first runs, so polling one as "is this UI up?" happily
+  compares against garbage and captures the wrong screen with full confidence
+  (`DAT_801ef1a4` reads `0x8e45b450` on the field). Trigger on an exec
+  breakpoint at the code that draws the thing instead - it cannot fire unless
+  the thing is really being drawn, and it hands you the live arguments too.
+- **Verify a save state's identity before blaming the probe.** Slots get
+  overwritten, so a filename or an old comment ("sstate9 = the load screen")
+  rots silently; the symptom is a breakpoint that never fires.
+  `autorun_identify_state.lua` answers it in one run. Prefer the fingerprinted
+  [library](#save-state-library-immutable-backups) over live slots.
+- **Breakpoint width matters.** `lbu` from a watched word triggers
+  only when the width-1 byte falls inside the breakpoint's range.
+  Arming a width-4 probe at an LW target works; arming a width-1
+  probe at an LBU target works; mismatches silently miss hits.
+- **GP-relative addresses are decided at runtime.** A naive
+  hard-coded address can be wrong across overlay swaps. Read `gp`
+  from `PCSX.getRegisters()` after the save-state load, then
+  compute breakpoint addresses from there.
+- **Sign-extended u64s in Lua.** PCSX-Redux returns CPU register
+  values as signed Lua numbers (64-bit doubles). `gp = 0xFFFFFFFF8007B318`
+  is the sign-extended display of `0x8007B318`. Use `bit.band(v,
+  0xFFFFFFFF)` to normalise before formatting.
+- **In-RAM guard predicates.** Pure bitwise comparisons against
+  literals like `0x80000000` interact with Lua's 32-bit signed
+  return shape from `bit.band` - the literal is the
+  unsigned 2147483648 while the bit-result is the signed
+  -2147483648, so `~=` returns true even when the addresses match.
+  Use the explicit `bit.band(addr, 0x1FFFFFFF) < RAM_SIZE` form
+  from the existing helpers; don't reinvent it.
+- **`GPU::Vsync` events fire on game-driven `VSync(0)` calls, not 60 Hz hardware.** PCSX-Redux delivers `GPU::Vsync` when the game calls libcd's `VSync(0)` syscall, which is sparse during boot init / CD-DMA phases. A probe waiting on `vsync_count >= 600` to fire during boot can sit for minutes of wall time even when emulator-time has advanced past the target. For boot-phase timing use a memory watchpoint at a known transition register (e.g. `_DAT_801EF16C` title countdown) instead of a vsync-count target - the watchpoint fires precisely when the game writes the state transition.
+- **Keep the `createEventListener` return value alive - a GC'd handle silently kills the listener.** `PCSX.Events.createEventListener` returns a proxy object whose `__gc` deletes the underlying C++ listener (see `src/core/eventslua.cc`). Discard it and the listener dies at the next Lua GC cycle: the probe goes silent mid-session with no error, exactly when allocation churn triggers a collect.
+  A forced-`collectgarbage` A/B test kills an unanchored listener on the first pass while an anchored one survives indefinitely. GC of the proxy from inside an event dispatch can also corrupt the event bus and segfault the emulator (the `eventslua.cc` nested-GC comment). The shared probes anchor every handle in the global `PROBE_LISTENER_ANCHORS` table - follow that pattern in new probes.
+- **Unpatched PCSX-Redux caps every Lua listener session at ~32.7k vsync events.** The event dispatch in `src/core/eventslua.cc` pushes the `EVENT_LISTENERS` table + the listener-info table per event and never pops them - 2 leaked Lua stack slots per dispatch, hitting LuaJIT's ~65500-slot ceiling at almost exactly tick 32716 (the error dump is a wall of `N: (Table)` lines, then a fatal escaped exception; on a live display it takes the whole app down). Deterministic and content-independent - any long-running probe dies there.
+  The local build carries a rebalance patch (`int base = L.gettop()` before dispatch, pop back to `base` after; verified alive past tick 33500 by a forced counter probe). Rebuilding PCSX-Redux from clean upstream REINTRODUCES the cap until the patch is upstreamed - re-apply it after any emulator update.
+- **Don't `readAt(2 MiB, 0)` inside a vsync callback.** A single 2 MiB `PCSX.getMemoryAsFile():readAt(...)` call permanently degrades subsequent `GPU::Vsync` event delivery in the same emulator launch - subsequent callbacks fire rarely or not at all. This is the listener-GC trap above wearing a different hat: the multi-MiB garbage burst triggers the collect that kills an unanchored listener. With the handle anchored, prefer small reads anyway (64 KiB at a time is safe) - full-RAM materialisation per vsync still stalls the frame.
+- **`Support.File.open(path, "CREATE")` does not truncate.** `CREATE` opens
+  `O_RDWR | O_CREAT` and only `TRUNCATE` adds `O_TRUNC` (`src/support/uvfile.cc`
+  in the PCSX-Redux tree), so a checkpoint written over a longer earlier one
+  keeps that state's tail. The file still parses on the host (`pcsxr-state
+  info` reads its RAM), but PCSX-Redux loads it as a zeroed machine. Every
+  checkpoint writer here opens `"TRUNCATE"`, as `probe.sstate.save` always
+  did.
+- **A movie frame is a 24-bit screenshot.** Under the MDEC display mode
+  `takeScreenShot` returns `width * height * 3` bytes while its `bpp` field
+  still reads `16`; size the decode off the byte count, not the field.
+- **PCSX.quit(0) doesn't always exit the process.** Wrap every probe invocation with `timeout --kill-after=10s <budget>` so a hung emulator gets reliably killed. The captured data is already on disk by the time PCSX.quit fires - the timeout-kill is purely cleanup.
+- **`--fast` must FORCE `-dynarec`, not just omit `-interpreter`.** PCSX-Redux
+  persists CPU + debugger choice in `pcsx.json` (`"Dynarec": false`,
+  `"Debug": true` once the debugger has ever been used). With no CPU flag on
+  the command line those saved values win, so a run launched `--fast` still
+  comes up on the interpreter with the debugger enabled - the top bar reads
+  `CPU: Interpreted` and fps stays at the slow-core rate. `run_probe.sh --fast`
+  therefore passes `-dynarec` explicitly to override the persisted setting
+  per-run (the interpreter path still forces `-interpreter -debugger` its own
+  way). Always confirm the top bar reads **`CPU: Dynarec`**. The dynarec runs
+  happily with the debugger window still open (no BPs = nothing to
+  single-step); leaving the debugger unchecked is cleaner and drops it out of
+  the sporadic scene-transition crash surface, and is safe because the exec-bp
+  probes re-enable it per-run.
+- **Config isolation makes the community kit config-independent.** The
+  `-dynarec` override above pins the *CPU*, but a volunteer's persisted
+  `pcsx.json` still rides in for everything else - a broken hardware-GPU pick, a
+  low frame limit, leftover debugger windows - because PCSX-Redux reads its
+  whole profile (settings + memcards + imgui layout) from `getPersistentDir()`
+  (`src/core/system.cc`): `$HOME/.config/pcsx-redux` on Linux, `%APPDATA%\pcsx-redux`
+  on Windows. It does **not** honour `XDG_CONFIG_HOME`. The override hook is the
+  `-portable <PATH>` flag, which repoints `getPersistentDir()` at any dir
+  (`src/core/arguments.cc`: the flag's value sets both `m_portable` and
+  `m_portablePath`). So `run_probe.sh --fast` (and `run_probe.ps1 -Fast`) now
+  default to **isolation**: they write a minimal fast profile - `Dynarec` on,
+  `Debug` off, ship-default renderer, `Scaler` 100 (`LEGAIA_SCALER=N` overrides
+  the speed-scaler percent - 300 = 3x for a human-navigated poll-tier cruise;
+  BP-tier probes should stay at 100), auto-update off; every
+  unset key falls back to the emulator's compile-time ship default
+  (`src/core/psxemulator.h`), so nothing drifts from a volunteer's oddities -
+  into `LEGAIA_PCSX_PROFILE_DIR` (default `captures/.pcsx-profile`) and launch
+  `-portable` at it. Memory cards are pointed at the real config dir via
+  **absolute** `Mcd1`/`Mcd2` paths (`memorycard.cc` only prepends the persistent
+  dir to *relative* names), so card saves still load and save. Opt out with
+  `--no-isolate-config` / `-NoIsolateConfig` (or `LEGAIA_NO_ISOLATE=1`) to use
+  your own saved layout; force the OpenGL renderer with
+  `LEGAIA_PCSX_HARDWARE_GPU=1`. The isolated profile is rewritten fresh every
+  run, so the pins can't drift even after PCSX rewrites `pcsx.json` on exit.
+
+## Fast whole-playthrough capture (two-tier model)
+
+Some questions - "which story flag/item/party change happens in which scene" across a long play session - are answered by a *human playing the game*, the one thing the harness can't automate. Two probes split that work by cost:
+
+- **Tier 1 - `autorun_state_poll.lua` (fast, `--fast`/dynarec, ~full speed):**
+  arms **no breakpoints**. Every `GPU::Vsync` it diffs a fixed set of
+  progression cells against the previous frame - the story-flag bank
+  (`0x80085758`, idx space identical to the exec-bp writer's `a0`), the
+  battle-id staging byte (`0x8007B7FC`), gold (`0x8008459C`), item inventory
+  (`0x80085958`, consumables + start of the key-item page), and party
+  count/ids (`0x80084594`/`0x80084598`) - plus scene (`0x8007050C`) and mode
+  (`0x8007B83C`) transitions. On each field->battle mode edge it also emits one
+  **`battle`** row carrying the formation table (`0x8007BD0C[4]`, the
+  first-monster ids that identify boss vs random - sampled once the battle
+  scene is active so they are the new fight's) plus a best-effort read of the
+  staging id. Per-frame diffing naturally filters intra-frame churn. The
+  staging byte, unlike everything else, is written and consumed *within one
+  frame*, so the per-vsync `battleid` diff comes up empty and the `battle`
+  row's staging field usually reads 0 - the writer needs the exec-bp firehose
+  (Tier 2), not this poll; the poll's win here is the formation identity. Because it uses no breakpoints it runs under the recompiler at full
+  speed (dynarec even sustains 3x), so it is the probe to hand to community
+  volunteers for a whole-playthrough sweep. Output `state_poll.csv`
+  (`tick,kind,idx,value,delta,mode,scene,note`) carries no Sony bytes - only
+  flag/item ids, scene names, ticks. Trade-off: it captures *what* changed and
+  *where*, not the writer. Maintainer cruise knob (off by default, so volunteer
+  runs stay pure read-only): `LEGAIA_POINT_CARD_MAX=1` pins the Point Card
+  counter `_DAT_800845B4` at its cap every vsync (ported from the firehose), so
+  a Point Card (item `0xFE`) strike one-shots any boss when you want to blow
+  through fights on your own capture pass. It writes only that counter, none of
+  the CSV cells.
+  The poll also captures, per frame, several context streams (all default-on,
+  each toggleable) so a single playthrough answers more at once: a **`pos`**
+  row on every player tile-crossing in field mode (player ptr `0x8007C364`, X
+  `+0x14` / Z `+0x18` s16, `tile = (pos-0x40)>>7`) - which pins each flag beat
+  to *where* it fired (door/trigger attribution with no second pass); a
+  **`bgm`** row on each global BGM-id change (`0x8007BAC8`, the music_labels
+  census join); an **`fmv`** row on each FMV-trigger-id change (`0x8007BA78`,
+  the field-VM op `0x4C 0xE2` target - live-confirms the disc-mined per-scene
+  trigger assignment `man_field_scripts::scene_fmv_triggers`,
+  [str-fmv-table.md](../formats/str-fmv-table.md)); **`input`** rows for pad
+  press/release edges (`0x8007B850`) and
+  a **`pick`** row sampling the dialogue picker cursor (`*(0x801C6EA4)+0x0C`) at
+  a confirm press (branch/answer attribution). It tags a flag frame
+  `note=bulkload` when it flips `>= LEGAIA_BULK_FLAGS` flags (a save-load/init
+  dump, not a beat) so the analyzer filters the noise. And it **auto-snapshots**
+  a fingerprinted save state on rare events - a never-seen scene, a lone-boss
+  formation, a first-time target-set flag (`LEGAIA_SNAP_FLAGS`, default the
+  known spine gates **plus** the open writer-less gates `0x50A`/`0x5D6` (a
+  non-bulk organic SET of either brackets a code-path-writer hunt) and the
+  statically-resolved `0x370` (writer pinned: the `doman` variant P1[15] Usha
+  self-latch - the autosnap here is a play-order confirmation of the known
+  writer, not a writer hunt)),
+  a first nonzero battle-id staging byte (which would settle
+  the open "does any retail battle write `DAT_8007B7FC`?" question), a
+  first-run `0x400` status set (below), or a first-per-slot arts-input press
+  (an arts-command-input-open bracket on whatever card the volunteer plays) -
+  capped at `LEGAIA_SNAP_MAX`, so every
+  volunteer run grows the mid-beat state library for free (`LEGAIA_AUTOSNAP=0`
+  to disable).
+  Character-progression cells beyond level/spell are diffed too: per-roster-slot
+  cumulative **`xp`** (record `+0x0`; the per-battle grant the level byte only
+  shows at a threshold) and **`equip`** bytes (`+0x196..0x19D`, one row per
+  changed equip slot), plus persistent **`counter`** cells on change (fishing
+  points `0x8008444C`, casino coins `0x800845A4`, Point Card `0x800845B4`) -
+  live validation for the loot/level/equip/minigame table RE on any run.
+  While a battle scene is active a **battle-detail stream** diffs each
+  battle-actor slot (pointer table `0x801C9370`, 0..2 party / 3..7 monsters):
+  a **`status`** row on each `+0x16E` mechanical-status-word change (Venom /
+  Toxic / Stone / Rot / AI-delegation / Curse timelines; a first-run raise of
+  the **`0x400` guard-disable bit** auto-snapshots - the exact before/after
+  bracket the open applier hunt needs), an **`hp`** row on each `+0x14C`
+  current-HP change (a per-hit damage/heal/DoT timeline; note carries max HP),
+  and an **`aq`** row on each change of a *party* actor's action-parameter
+  queue window (`+0x1DF..+0x1F2`, slots 0..2; note = the full 20-byte window
+  hex). Arts inputs land in that window as raw direction bytes `0x0C..0x0F`
+  and a commit rewrites it into starter form (`0x19` art starter / `0x1A`
+  Super-Art special starter), so any Super Art the player performs hands back
+  its committed queue bytes - the byte-exact `replace`-string validation the
+  Super-Art capture batch otherwise needs dedicated sessions for
+  ([super-art-queue-capture.md](super-art-queue-capture.md)).
+  Baselines drop on battle exit so cross-fight pointer reuse can't fake rows.
+  On the kingdom overworld scenes (`mapNN`, field mode) a **`wmcam`** row
+  captures the walk-view camera tuple - rotation trio `0x8007B790/92/94`,
+  projection H `0x8007B6F4`, eye-space TR trio `0x800840B8/BC/C0`, view-mode
+  flag `0x801F2B94` - once on entry, then on any change (min 10-frame gap, so
+  a held zoom logs a ~6/s trajectory). The retail pitch/TR zoom dynamics are
+  pinned at only two save-state anchors
+  ([world-map.md](../subsystems/world-map.md) walk-view camera); any volunteer
+  zoom/rotate fills in the path between them. A **`dt`** row logs the
+  scratchpad frame-step byte `0x1F800393` (the multiplier every dt-scaled
+  timer/animation consumes: world-map CLUT cadence, fishing tension,
+  battle-action waits) - one baseline row per run, then whenever a new value
+  holds 30 consecutive frames (so unstable load-time pacing can't chatter).
+  Toggles: `LEGAIA_TRACE_POS`/`_BGM`/`_INPUT`/`_BATTLE` (`0` = off).
+  **Regression self-test** (run after ANY edit to the poll probe or
+  `lib/probe/*`, before volunteer handoff): `bash
+  scripts/pcsx-redux/run_state_poll_selftest.sh` - a wrapper lua
+  (`autorun_state_poll_selftest.lua`) `dofile()`s the real probe on a field
+  save state and pokes every watched RAM cell (Lua pokes bypass the CPU),
+  walks via pad override for organic `pos` rows, then loads a battle state
+  mid-run (exercising the battle-entry latch + bulk-load tagging; the full
+  state load also wipes every field-phase poke) and pokes the battle-actor
+  streams. `check_state_poll_selftest.py` then asserts every CSV stream and
+  every autosnap trigger fired (target-flag snap redirected to the
+  retail-unused flag 4001 via `LEGAIA_SNAP_FLAGS`). A couple of minutes end
+  to end, no human at the pad; a silently broken stream otherwise costs a
+  volunteer's whole playthrough.
+- **Tier 2 - `autorun_flag_firehose.lua` (slow, interpreter+debugger, ~10 fps):** exec-breakpoints on `FUN_8003CE08`/`_CE34` capture the writer `ra` for the specific flags Tier 1 fingered. Run in short targeted bursts, not a full playthrough.
+- **Tier 2 provenance - `autorun_flag_reader_watch.lua` (slow, interpreter+debugger):**
+  the full story-flag provenance probe. Arms all THREE flag helpers
+  **unfiltered** - `FUN_8003CE64` (TEST -> reader `ra`) plus
+  `FUN_8003CE08`/`_CE34` (SET/CLEAR -> writer `ra`, the firehose merged in) -
+  deduped per `(kind, flag, ra)` with count-suppressed rows, so one
+  interpreter trek banks reader+writer provenance for EVERY flag the segment
+  touches, answering questions not yet asked. (The static census cannot
+  backstop runtime reads: its bytecode walker desyncs in dialogue-heavy MANs,
+  so "zero TEST sites" is not proof of no reader - see
+  `flag_test_bytescan` in `crates/engine-field/src/man_field_scripts/`.)
+  `LEGAIA_FLAG` takes a **comma list** of target flags; targets additionally
+  get a per-byte read-watch (inlined readers that bypass the helper),
+  prioritized call-context detail, and a **first-hit auto-snapshot**. Every
+  row carries mode/scene plus the player tile (`note` column, field mode).
+  New-scene auto-snapshots bank a state at the mouth of each area reached so
+  a follow-up run resumes adjacent instead of replaying the trek, and
+  `manifest.txt` records the config + source sstate (the resume/provenance
+  chain between runs). Two further streams ride the same session:
+  a **write-watch allowlist** (`LEGAIA_WATCH_WRITES="0xADDR:width[:name],..."`,
+  default the battle-id staging byte + formation table - the firehose's two
+  watches, so this probe supersedes it) whose `write` rows carry the writer
+  `pc`/`ra`, the pre-store value at the hit, and the committed value re-read
+  at the vsync drain (the bp fires mid-store, so hit-time reads are stale);
+  and a **VRAM upload log** - exec-bps on the libgpu writers LoadImage
+  `FUN_800583C8` / MoveImage `FUN_80058490` emitting `vram`/`vrammove` rows
+  with the rect + uploader `ra`, deduped per `(ra, rect)`, giving
+  texture/CLUT upload provenance for every scene crossed. The VRAM bps
+  **auto-disarm** while the game-mode byte sits in the STR/FMV modes
+  (`0x1A`/`0x1B`) and re-arm on the next field frame - a hot LoadImage
+  exec-bp during XA/FMV streaming segfaults the emulator. Each fight also
+  emits one **`battle` identity row** once the battle scene is active
+  (committed formation ids + entry mode + the **last field tile** before
+  the mode left field = the encounter's spawn spot; lone-formation fights
+  auto-snapshot as boss-shaped) - the committed-value complement to the
+  `form` watched write, whose `ra` is the encounter-provenance deliverable.
+  **Overlay residency** rides along too: a 512-byte FNV-1a checksum of each
+  runtime overlay slot (A `0x801CE818`, B `0x801F69D8` - the bases in
+  `crates/asset/data/static-overlays.toml`), re-taken on scene/mode changes
+  plus a slow heartbeat, emitted as `overlay` rows on change. The
+  field/menu/battle/cutscene/minigame overlays all VA-alias slot A, so a
+  bare overlay-region address is ambiguous; the checksum names the sibling
+  resident when each hit fired (`LEGAIA_TRACE_OVERLAY=0` off).
+  And **field-VM script-PC capture**: when a flag helper's caller is
+  overlay-resident, the probe scans the saved registers for a pointer whose
+  bytes decode as the very flag op being executed (class nibble + operand
+  == `a0` - self-validating across every sibling's VM copy and call site;
+  at the primary flag-op cluster `s0` = the opcode VA and `s8` = the
+  dispatcher's `pc_offset`, see
+  [`script-vm.md`](../subsystems/script-vm.md)). Hits gain `vm=`/`vmo=`
+  note tokens - the exact script-buffer VA and byte offset of the bytecode
+  op - joining runtime provenance to MAN offsets, the ground truth the
+  static census cannot give where its opcode walker desyncs.
+  Toggles: `LEGAIA_ALL_TESTS`/`LEGAIA_WRITERS`/`LEGAIA_DIRECT_READ`/
+  `LEGAIA_AUTOSNAP`/`LEGAIA_TRACE_VRAM` (`0` = off),
+  `LEGAIA_WATCH_WRITES=off`.
+
+**Core contract (dynarec vs interpreter).** Lua breakpoints fire ONLY under
+`-interpreter -debugger`; the recompiler runs them past silently. The
+separation is enforced in three layers so a mismatch can't produce silent
+garbage: (1) `run_probe.sh` forces the core explicitly in both directions
+(`--fast` passes `-dynarec` because the persisted `pcsx.json` otherwise wins;
+the default passes `-interpreter -debugger`) and **exports `LEGAIA_CORE`**;
+(2) the breakpoint probes (`autorun_flag_reader_watch.lua`,
+`autorun_flag_firehose.lua`) **hard-refuse to arm** when `LEGAIA_CORE=dynarec`
+or `interpreter-nodebug`,
+and the poll tier logs an advisory when launched on the interpreter (works,
+just ~10x slow); (3) for hand launches with no `LEGAIA_CORE`, the provenance
+probe runs a **liveness canary** - with the unfiltered TEST bp armed,
+field-mode gate tests fire every frame, so a long post-arm silence triggers
+loud repeating "BPs are dead, relaunch without --fast" warnings. Every run's
+`manifest.txt` records the core it actually ran on.
+
+A third mode, **`--timing`**, runs the interpreter with the debugger hook
+OFF (`-interpreter -no-debugger` - the explicit `-no-debugger` matters, since
+omitting the flag falls back to the persisted `pcsx.json` value): the
+interpreter's guest-visible cycle accounting at much better host speed than
+the default core. Lua breakpoints do not fire, so it is for poll-only
+probes - specifically for testing whether a repro is **timing-sensitive
+across CPU cores** (a bug that reproduces under the loose dynarec cycle
+accounting but not under the interpreter, or vice versa, is racing an
+emulated-timing window). Exports `LEGAIA_CORE=interpreter-nodebug`; mutually
+exclusive with `--fast`.
+
+The flag window is capped at `0x200` bytes (idx `0..4095`) deliberately: the char-record slot-3 tail ends exactly at the flag base and the item inventory begins exactly `0x200` above it, so `0x200` is the largest window that is pure story-flag bytes with no overlap onto volatile record/inventory cells. Widening re-introduces inventory double-counting.
+
+**Version guard (`lib/probe/version.lua`).** Every probe hard-codes
+USA-`SCUS_942.54` addresses; a JP/EU/PAL or wrong-revision disc would arm on
+the wrong code and log silent garbage. Both the poll tier and the firehose
+call `version.check()`, which fingerprints 6 always-resident code words at
+each of `0x8003CE08`/`_CE34`/`_CE64`. Residency is gated on the fingerprinted
+*code* being loaded (not merely an anchor string, which lands during boot
+before `.text`), so it never latches on the all-zero partial-load window.
+Modes: **locked** (`USA_FINGERPRINT` set - the shipped default; mismatch =
+hard refusal), **unlocked** (empty - warns but still fail-closes on a
+non-Legaia anchor), **record** (`LEGAIA_FP_RECORD=1` - prints the fingerprint
+and refuses to arm, for relocking after a rebuild). The volunteer-facing
+runbook is [`scripts/pcsx-redux/COMMUNITY-CAPTURE.md`](../../scripts/pcsx-redux/COMMUNITY-CAPTURE.md).
+
+```bash
+# Tier 1 - fast community sweep (verify top bar = CPU: Dynarec):
+LEGAIA_NO_SSTATE=1 timeout --kill-after=15s 14400s \
+  bash scripts/pcsx-redux/run_probe.sh --fast \
+    --lua scripts/pcsx-redux/autorun_state_poll.lua
+
+# Relock the version fingerprint after an emulator/disc change:
+LEGAIA_FP_RECORD=1 LEGAIA_NO_SSTATE=1 \
+  bash scripts/pcsx-redux/run_probe.sh --fast \
+    --lua scripts/pcsx-redux/autorun_state_poll.lua
+# -> paste [state_poll] fingerprint = <hex> into version.USA_FINGERPRINT
+```
+
+**Offline analysis (`analyze_state_poll.py`).** A `state_poll.csv` is a raw
+per-frame event log; `scripts/pcsx-redux/analyze_state_poll.py <csv-or-dir>`
+turns it into the timelines a reverse-engineer actually reads: a **scene
+timeline** (contiguous occupancy windows), **battle windows** (the frames the
+game-mode byte sat in the battle-orbit modes `0x14`/`0x15`) annotated with the
+per-fight **`battle` identity rows** (formation ids, with a `*` on lone-enemy
+fights = the likely bosses), a **story-flag census** that separates one-off
+story beats from the bulk flag dumps a
+save-load / scene-init writes in a single frame (any tick flipping `>= 20`
+flags **or** carrying the probe's `note=bulkload` tag is treated as a load
+frame and reported separately, not as a beat), and the item / gold / party
+change lists. Each story-flag beat is annotated with the **player tile** it
+fired at (joined from the `pos` stream, scene-scoped) and a **known-flag
+label** - a sticky beat with no label is surfaced as a `[lead]` (a candidate
+unmapped gate; extend the label map with `--labels FILE`). Extra sections cover
+the **BGM timeline**, **picker choices**, **auto-snapshots**, **XP grants +
+equipment changes**, the **counters** (fishing points / casino coins / Point
+Card), the **FMV triggers** (fmv-id changes joined to the firing scene -
+the live confirmation column for the disc-mined trigger corpus), the
+**battle status timeline** (each `+0x16E` word decoded to its named
+bits, with any raise of the open `0x400` guard-disable bit called out as a
+report-this lead), the **arts commits** (aq-stream rows whose queue window is
+in starter form, Super Arts flagged for tail-matching against
+`crates/art/src/super_art.rs`), and (opt-in) the per-scene **walk track**, raw
+**input edges**, and the per-hit **HP timeline**. `--json` emits the same structure
+for downstream tooling; `--only scenes,battles,flags,status,counters,...`
+selects sections. The
+analysis functions are pure and importable, exercised by
+`test_analyze_state_poll.py` on synthetic rows (`python3
+scripts/pcsx-redux/test_analyze_state_poll.py`, no capture or disc needed).
+
+**Offline analysis (`analyze_reader_watch.py`).** The provenance probe's
+sibling: `scripts/pcsx-redux/analyze_reader_watch.py <csv>` aggregates a
+`flag_reader_watch.csv` into per-flag **site tables** - each distinct
+`(kind, flag, pc, ra)` with its count (exact inside the unsuppressed prefix,
+`>=N` past it), first tick/scene, and tiles - and **labels every site against
+the already-cataloged functions** (the flag helpers, the field-VM op-`0x70`
+TEST handler return `0x801E35E8`, the walk-on tile-trigger dispatch
+`0x801D218C` and its `FUN_8003BDE0` gate-bit reads, the bulk `lbu;sb`
+save-scan memcpy). Anything uncataloged prints `[NEW]` with a coarse region
+(SCUS-resident vs overlay + the containment-attribution pointer), so a new
+reader/writer function is visible at a glance. `byteread` sites carry a
+reminder that the byte holds 8 flags (verify the mask at `pc`). Watched
+writes get their own section (name, writer sites, pre/committed values), as
+do VRAM uploads (per-uploader rect lists, with single-row narrow rects
+tagged `[CLUT?]` and `y>=448` rects `[CLUT-region]`) and battles (one line
+per fight, boss-shaped lone formations starred). `--only
+targets|background|writes|vram|battles|snaps`, `--labels FILE` (`0xADDR
+text` lines), `--json`.
+
+Two capabilities make it a cumulative database rather than a per-run report.
+**Cross-run merge**: pass several csvs or run *directories* (scanned
+recursively) and the sites union - counts sum per run, every site lists the
+runs that saw it, and `--merged-out FILE` persists the merged JSON. Each
+trek permanently grows one provenance map instead of answering one
+question. **Overlay-residency attribution**: the probe's `overlay` rows
+carry per-slot checksums; the committed
+[`overlay-map.txt`](../../scripts/pcsx-redux/overlay-map.txt) (FNV-1a32 of
+each raw overlay's first 512 as-loaded bytes - derived checksums only, no
+Sony bytes, same policy class as the TOML's sha256 fingerprints; regenerate
+with `--gen-overlay-map <extracted-dir>` after a static-overlays.toml
+change) resolves them to labels, so every overlay-region hit prints
+`resident=[menu (PROT 899 ...)]` - the VA-alias disambiguation that
+previously needed a manual `attribute_overlay_hits.py` pass. An unmapped
+checksum degrades visibly (`csum:XXXXXXXX?`). `--overlay-map FILE`
+overrides the committed map.
+Pure functions, exercised by `test_analyze_reader_watch.py` on synthetic rows.
+
+## Patched-disc taint
+
+A capture can measure a patched game while every log line names the retail
+image. Two routes carry a patch in, and they fail differently:
+
+- **The image route.** PCSX-Redux applies `<image stem>.ppf` from beside the
+  image it loads (logged only as `[+ppf]` on the `Loaded CD Image` line), and
+  `legaia-patcher randomize` writes its `.ppf` beside its **input** disc unless
+  `--patch` names another path. Every probe that handed the emulator the
+  retail path while a randomizer run had left a `.ppf` there read patched
+  sectors - including runs that passed no `--iso` at all, because the
+  runner's default `--iso` was that path until [the harness](#the-harness)
+  started staging.
+- **The state route.** `SCUS_942.54` is read from the disc once, at boot. A
+  save state made on a patched disc carries the patched executable in RAM
+  forever, whatever disc it is later loaded onto, and so does every state
+  checkpointed from it. Overlays and scene data are re-read on the next load
+  that needs them; the executable never is. Staging the disc does nothing for
+  this route.
+
+A patched byte matters only if the run reads it. For the image route that
+means a disc read after the state load (a scene or battle load, a cold boot);
+for the state route it means executing or reading a patched SCUS site, or an
+overlay the state already holds from the patched disc.
+
+[`patch_taint_audit.py`](../../scripts/pcsx-redux/patch_taint_audit.py)
+measures both: `states` compares the resident SCUS of every library state
+against the retail executable at a fixed table of patcher sites, `logs`
+lists every `[+ppf]` run, and `ppf` decodes a patch file into ISO files,
+PROT entries and SCUS addresses. The manifest records the result per
+scenario as `resident_patch` ([`scripts/scenarios.toml`](../../scripts/scenarios.toml)).
+No disc bytes are printed; the output is addresses, lengths and labels.
+
+A site table only finds the patches it already names, so `scan` asks the
+question without one. It compares **every** resident SCUS byte against the
+retail executable, masks the bytes the game writes into its own image at run
+time - learned as the union of what the site-clean states hold differently,
+which is data words and the in-place value bytes of format strings such as
+the equipment captions' `0xC1 NN` slots - and reports what is left outside
+the mask and the site table, per state. A leave-one-out pass over the
+site-clean states is the control for the mask: a byte only one clean state
+holds differently falls in the data band from `0x80070000` up in every
+case, never in code. So every state `states` calls retail is retail in its
+whole executable, not only at the sites.
+
+`scan` is also how three windows of the site table were found, each a
+build rewriting more than its hook list: the arts randomizer's display half
+(the arts-name glyph strings `0x80013620` up, which `glyph_patches` rewrites
+in place), shiny-seru's arena 2 and its earlier layout in the victory
+mouth-table padding, and the party swap's new-game template rows. The last
+leftovers it reports are three bytes in one dome state and one in one party
+swap state, both in the data band.
+
+### Resident patch families in the save-state library
+
+A patched state is identified by what its resident SCUS carries at the
+patcher's own hook sites, and - where one exists - by an exact byte match
+against a patched image built by the same feature.
+
+| Family (`resident_patch`) | Resident signature | What else the build rewrites | Carried by |
+|---|---|---|---|
+| shiny-seru + enemy-ally charm | SCUS hooks `0x800321D4`, `0x8004AD0C`, `0x80051990`, `0x80051A20` + the four SCUS arenas and arena 2 (`0x8007AFF8`); resident `0898` at six hook sites. Byte-identical to a shiny + charm build at every one of that build's SCUS bytes | PROT 0867 (monster archive, repacked), 0898, 0899 | the three `rikuroa_*` beats, `dolk2_market_noa`, the five `minigame_*_pcsx` states (the S1..S5 anchors and `first_town_interactive` were re-shot retail - [below](#re-shooting-the-s1s5-anchors-on-an-unpatched-image)) |
+| shiny-seru (earlier layout) | `0x800321D4`, `0x8004AD0C`, `0x80051A20`, gap-1 arena, the victory mouth-table padding from `0x800781B0` | as above, earlier layout | the three `shiny_refactor_gimard_*` states |
+| arts AP override | SCUS arena 1 routines; resident `0898` guard / debit / refund sites `0x801EF410` / `0x801EF490` / `0x801EF988` | PROT 0898 | the four `battle_gaza2_*` states |
+| starting bag + warp preset | the new-game seed code `0x80034ADC` and `0x80034B04` | none resident - the edit acts once, at NEW GAME | `karisto_sol_pre_encounter`, `sol_to_karisto_worldmap`, `octam_to_sebucus_worldmap`, the three `casino_*` states, `baka_fighter_entry_pretransition`, the two Super / Miracle Art battle states; `scan` finds nothing else in their executables |
+| starting bag + warp preset + arts randomizer | the seed code above and the arts-name glyph strings from `0x80013620` | the player battle files' arts combos (the matcher half) | the four mednafen `overworld_battle_bg_angle_*` states |
+| location rename | the quick-travel name cells at `0x80073B18` | the kingdom and scene MAN name carriers ([`place-names.md`](../formats/place-names.md)) | the three `cort_evolved_*` states (`teien_field_run` was re-shot retail) |
+| delilas party swap + cast | `0x80012DD0`, `0x80054008`, gap-1 arena, the new-game template rows and arts glyph strings | player battle files, cast modules | the nine `delilas_*` states (made on purpose) |
+| enemy-ally charm | `0x80051990` + its arena | - | `enemy_ally_charm_gobu_slime` (made on purpose) |
+
+What a family can and cannot move:
+
+- **Field-only claims** (story flags, NPC seats, locomotion, scene entry)
+  read none of these sites. The shiny + charm hooks act at battle load, at
+  the animation commit and in battle menus; the seed edit ran once, before
+  the capture; the rename changes name text only.
+- **Battle claims** on a shiny + charm or arts-AP state run patched `0898`
+  code at the listed sites. The charm skips single-enemy fights by design
+  (so `s5_tetsu_battle`, the one-enemy Tetsu spar, is never charmed), and
+  the shiny hooks act on Seru capture and fade.
+- **Inventory and progression** on a starting-bag state began from a
+  non-retail bag and a pre-unlocked warp list.
+- **Byte comparisons of a resident overlay** against the disc see the hook
+  windows as differences - the `s5_tetsu_battle` resident `0898` differs
+  from the retail image at six places of eight bytes or fewer.
+
+### What the retail image's sibling `.ppf` patched
+
+The captures fall into four windows during which a `.ppf` sat beside the
+retail image, separated by windows with none (`patch_taint_audit.py logs`).
+A `.ppf` is overwritten by the next `randomize` run on that input and
+deleted by hand, so each window's content has to be recovered from what
+the runs themselves left behind.
+
+| Window (run families) | Patch | Evidence |
+|---|---|---|
+| door / house-door traces, `battle_render_capture`, `party_attack_damage_trace`, `summon_model_base`, the `super_art_*` queue runs, `minigame_overlay_capture` | unknown beyond SCUS: the states made in it carry the starting bag + warp preset seed and no other SCUS patcher site | resident SCUS of the states the window produced |
+| charm / shiny validation runs, `prescript_read_watch`, the S1..S5 capture runs, `tetsu_*`, `flag_firehose`, `spine_flag_writers`, early `state_poll` | the shiny-seru + enemy-ally charm build | cold-boot `state_poll` snapshots and the S-segment snapshots carry that build's SCUS byte-exact |
+| `gaza2_*`, `location_banner_source`, `tile_shatter_page`, late `state_poll`, `delilas_battle_load`, `custom_items_cast_experiment`, `arts_voice_cue` | arts AP override early in the window, location rename by its cold boots; later runs unknown | resident SCUS and `0898` of the `battle_gaza2_*` states; cold-boot `state_poll` snapshots |
+| `w3a`, `w1d`, `lane-a` | oscillating AP costs, seed 7 (decoded below) | the `.ppf` itself |
+
+The current sibling `.ppf` is `randomize --oscillating-ap` (seed 7). It
+rewrites SCUS only at the battle-loader setup hook `0x80051A20`, the
+arts-list read-out `0x800344D8` and the four arenas, and PROT 0898 at the
+damage site `0x801EDA10` and the guard / debit / refund sites
+([`oscillating_ap.rs`](../../crates/arts-patch/src/oscillating_ap.rs)).
+
+### Verdicts on capture-graded claims
+
+A claim is at risk only when its run read a patched byte and the claim is
+about behaviour that byte changes. Each row below was re-checked against
+that test.
+
+| Claim (page) | Rests on | Verdict |
+|---|---|---|
+| Story-flag play order from the poll corpus ([`re-settled-threads.md`](../reference/re-settled-threads.md), [`world-map.md`](../subsystems/world-map.md)) | cold-boot `state_poll` runs under the location-rename patch | stands: the patch rewrites name text; flag writes are script ops it does not touch |
+| Story-flag writers are the field VM's own `0x5x` / `0x6x` arms ([`script-vm.md`](../subsystems/script-vm.md)) | `flag_firehose` / `spine_flag_writers` under the shiny + charm build | stands: the build rewrites no scene MAN and no field overlay |
+| Super / Miracle Art queue bytes ([`super-art-queue-capture.md`](super-art-queue-capture.md)) | starting-bag battle states, image-route runs of unknown patch | stands: both states hold the retail `0898` at every patcher site, and the queue matched tables sourced independently byte-exact |
+| `model_sel` base `gp[0x754]` ([`move-power.md`](../formats/move-power.md)) | `summon_model_base` under an unknown patch | stands: pinned again by `crates/mednafen/tests/summon_model_base.rs` on retail-clean mednafen states |
+| Gaza 2 park / approach mechanics ([`battle-action.md`](../subsystems/battle-action.md)) | the `battle_gaza2_*` states (arts AP override resident) | stands by inference: the override changes party arts AP accounting; the park is the monster's Move clip and reach test |
+| Battle camera trios and the `0967` resident identity ([`battle.md`](../subsystems/battle.md)) | `s5_tetsu_battle` (shiny + charm resident) | stands: `0967` is outside the build and no hook sits in the camera path; a one-enemy fight is never charmed |
+| `0874` registrar counts, cast-arm gating, cast voice cues | `w3a` / `w1d` / `lane-a` runs under the oscillating-AP `.ppf` | stands for every in-battle run (the state already held `0898` and the executable, and neither is re-read); `w3a/registrar_sol` is void - see below |
+
+**The one run the patch visibly broke.** `w3a/registrar_sol` crossed a
+field-to-battle load from `karisto_sol_pre_encounter`: the battle load read
+the patched `0898` from the image, and its oscillating-AP guard detour
+jumped into SCUS arena 1, which the state held as retail. The emulator
+logged `ReservedInstruction` at `0x8007AF3C`, where the zero run of the
+arena ends. It is the only first-chance exception at a battle load in any
+retail-path capture, and no capture on an unpatched image logs one at a
+battle load. The runner's isolated profile zeroes the emulator's
+first-chance exception mask on the reading that a retail battle load raises
+one; re-run with the default mask armed (`LEGAIA_PCSX_FIRST_CHANCE=7408`)
+on a staged image, the same field-to-battle load from
+`karisto_sol_pre_encounter` reaches BattleMode without one. The zero mask
+stays the default so a probe of a deliberately patched disc keeps running.
+
+### Re-shooting the S1..S5 anchors on an unpatched image
+
+The S1..S5 playthrough anchors and `teien_field_run` are re-captured on a
+staged, unpatched image; each label in the manifest now points at the new
+file, the old files stay in the library unreferenced, and every re-shot
+state reads `retail` in `patch_taint_audit.py states`. Each lands on the
+moment the capture it replaces pinned - the same scene, mode and player
+position, and for S5 the same battle context word - so the oracles that
+read them pass unchanged apart from the fingerprint.
+
+| Anchor | Driver | Input | Matches the replaced capture on |
+|---|---|---|---|
+| `s1_newgame_field` | `autorun_play_from_boot.lua` (interpreter, `LEGAIA_FASTBOOT=1`) | START+CROSS through the title, CROSS in the field | `opdeene`, mode `0x03`, `(5824, 1984)` |
+| `s2_rimelm_town01` | `autorun_chain_fast.lua` (`--fast`) | CROSS every 20 vsyncs | `town01`, `(12352, 2368)` |
+| `s3_rimelm_freeroam` | `autorun_s3_fast.lua` (`--fast`) | CROSS on End, UP + CROSS on the confirm, CROSS through the dialogue | `(4160, 11840)`, name `Vahn` |
+| `s4_rimelm_door_transition` | `autorun_chain_fast.lua` (`--fast`, `LEGAIA_HOLD_BTN=DOWN LEGAIA_CKPT_WARP=1`) | DOWN held to the front-door warp | `(3264, 3520)` after the warp |
+| `s5_tetsu_battle` | `autorun_replay_inputs.lua` (interpreter) | the recorded human route, unchanged | mode `0x15`, `battle_ctx` `0x800EB654`; resident `0898` byte-identical to the disc |
+| `teien_field_run` | `autorun_boot_continue.lua` (`--fast`), card block 3 of `playthrough-ladder-pro00-14.mcr` restamped to `-00` | the calibrated CONTINUE ladder | `(6180, 3994)`, the object-grid counts, `0900` at slot B |
+
+Four things the re-shoot settled about the drivers:
+
+- **The interpreter core is the bottleneck, not the game.** With the box
+  loaded, the breakpoint drivers ran the opening at a few frames per
+  second; S2 did not reach `town01` inside a 25-minute budget. Under
+  `--fast` a `GPU::Vsync` listener is delivered through the prologue's XA
+  streams, so the vsync drivers reach the same states in minutes. Only
+  S1 (the title tick) and S5 (the recorded route is clocked on field
+  ticks) still need the breakpoint core.
+- **A blind press on the name-entry screen types into the name.** The
+  first `--fast` S3 pressed UP + CROSS on a timer; whenever the confirm was
+  not open, UP moved the glyph cursor off End and CROSS appended a glyph,
+  and the state that reached free-roam carried the name `Vahn(*'#` in
+  record `+0x2A7` and on every later HUD. The driver now keys each press
+  on the name-entry actor's own sub-state. The interpreter driver's write
+  of `0` to the confirm cursor `_DAT_8007B458` does not take on this path:
+  the frame still shows the cursor on No.
+- **A checkpoint 50 vsyncs after an intra-scene warp does not resume.**
+  Loaded, it puts the scene name back and then reboots the machine (mode
+  `0x10`, the publisher logos); the same state taken 200 vsyncs after the
+  warp resumes to field mode. Load every new checkpoint once before
+  cataloguing it.
+- **The grid-BFS door-nav under a vsync clock did not find the door** in
+  its frame budget; holding DOWN from the S3 spawn walks straight onto the
+  front-door tile. The S4 walk is D-pad only in both versions.
+
+What the re-shoot could not reach from a card or a cold boot without
+human play: the `rikuroa_*` beats (a boss fight and its cutscenes),
+`dolk2_market_noa` (a story scene), the `cort_evolved_*` states (the final
+dungeon's cutscene and boss), the `minigame_*_pcsx` load transitions, the
+`battle_gaza2_*` park states, and the mednafen `overworld_battle_bg_angle_*`
+states (PCSX-Redux cannot write a mednafen state). None of their field-only
+claims reads a patched site ([above](#resident-patch-families-in-the-save-state-library)).
+
+## Catalogue
+
+The committed scripts live in
+[`scripts/pcsx-redux/`](../../scripts/pcsx-redux/). Each Lua file
+documents its purpose in a header comment block; the catalogue here
+is the high-level index.
+
+### Runtime probes (Lua autorun)
+
+Every row runs through [`run_probe.sh`](#one-shot-wrappers):
+`bash scripts/pcsx-redux/run_probe.sh --lua scripts/pcsx-redux/<script> [--scenario <label>]`.
+The tables are grouped by what is being measured. Columns:
+
+- **Captures** - what the script arms or polls.
+- **Run** - the state it wants, its mode and its main environment knobs. `interp` is the
+  default interpreter + debugger run (breakpoints fire); `--fast` marks a poll-only script
+  that also runs under the recompiler; `cold` means `LEGAIA_NO_SSTATE=1`.
+- **Output / answer** - the artifact, and the page that owns the finding. A row ending in
+  *detail* has a longer write-up under [Runtime probe details](#runtime-probe-details).
+
+Findings live on the linked subsystem and format pages; this catalogue only says which
+instrument produced them.
+
+#### Utilities and input drivers
+
+| Probe | Captures | Run | Output / answer |
+|---|---|---|---|
+| [`autorun_identify_state.lua`](../../scripts/pcsx-redux/autorun_identify_state.lua) | `game_mode`, CDNAME scene, which overlay entry points tick | any state | What a state really **is** - first aid for "my breakpoint never fired" (states get overwritten, see [the library](#save-state-library-immutable-backups)) | |
+| [`autorun_pad_walk.lua`](../../scripts/pcsx-redux/autorun_pad_walk.lua) | Scripted pad sequence; every `game_mode` transition, player position, distinct pad words | `LEGAIA_PAD_SCRIPT="<vsync>:<BUTTON>[:<hold>]"`, optional `LEGAIA_WATCH_FN` exec watches | Reaches a screen no state is parked on. More than one distinct pad word proves the presses arrived | |
+| [`autorun_film.lua`](../../scripts/pcsx-redux/autorun_film.lua) | A screenshot every `LEGAIA_SHOT_EVERY` vsyncs under a pad schedule (`LEGAIA_PAD_SCRIPT="V:BTN,A-B:BTN"`), optional battle-actor pokes (`LEGAIA_POKES="V:SLOT:OFF:VAL"`, e.g. a boss's HP to 1) | `--fast`, any state | The retail side of "does the port look like this?": the same pad-script and screenshot-cadence shape as `play-window`'s `--pad-script` / `--screenshot-every`. Convert with `raw2png.py` | |
+| [`autorun_effect_pool_film.lua`](../../scripts/pcsx-redux/autorun_effect_pool_film.lua) | The battle effect pool's live children one line a vsync (`pool.txt`), a screenshot beside each from `LEGAIA_SHOT_FROM` | `--fast`, an earlier state of the same cast | Ground truth for a capture's displayed effect children: `effect_pool_film_match.py <pool.txt> <ram.bin>` finds the vsync whose pool equals the capture's RAM pool and prints the lines before it | |
+| [`autorun_drawn_pose_film.lua`](../../scripts/pcsx-redux/autorun_drawn_pose_film.lua) | Per battle pass, in execution order: the frame-end flip, each seat's anim tick and pose decode cursors, the decode's display trio, the damage readout's trio read, ring timer and projected square (`film.txt`); a screenshot a vsync from `LEGAIA_SHOT_FROM` | interpreter (breakpoints); optional `LEGAIA_SPELL` / `LEGAIA_POKE32` inject at seat 0's `0x0A` | Which pass's pose and trio a frame drew: the tick advances, the readout reads the previous pass's trio, then the decode draws the advanced cursor | |
+| [`autorun_w5b_field_watch.lua`](../../scripts/pcsx-redux/autorun_w5b_field_watch.lua) | One configurable field watch: write watches logging the landed value, exec / read breakpoints, per-vsync samples, pad holds, position and memory pokes | see detail | A retail check for a disassembly claim without a new probe - [detail](#autorun_w5b_field_watchlua) | |
+| [`autorun_dump_full_ram.lua`](../../scripts/pcsx-redux/autorun_dump_full_ram.lua) | Full 2 MiB main RAM | any state | One snapshot. **One dump per launch** (the `readAt(2 MiB)` caveat in [traps](#things-that-catch-people-out)) | |
+| [`autorun_dump_full_ram_hold.lua`](../../scripts/pcsx-redux/autorun_dump_full_ram_hold.lua) | Holds a direction for `LEGAIA_HOLD` vsyncs, then dumps main RAM | a pre-transition state | Post-warp RAM; pairs with `locate_slot4_base.py` | |
+| [`autorun_boot_walk_snapshots.lua`](../../scripts/pcsx-redux/autorun_boot_walk_snapshots.lua) | RAM + register snapshots at each of `LEGAIA_TARGETS` vsyncs | see detail | [detail](#autorun_boot_walk_snapshotslua) | |
+| [`autorun_dump_storyflags.lua`](../../scripts/pcsx-redux/autorun_dump_storyflags.lua) | Story-flag bank (`0x80085758`, `0x400` bytes) + lead character record header | any state | `flags_<tag>.txt`, for diffing which scripted beat two states differ by | |
+| [`autorun_record_inputs.lua`](../../scripts/pcsx-redux/autorun_record_inputs.lua) | Per-frame button mask `0x8007B850` (frame 0 = first field tick after load); auto-quits a few seconds into a battle | **interactive** window, interp | `frame,held_hex` CSV of a human-played sequence | |
+| [`autorun_replay_inputs.lua`](../../scripts/pcsx-redux/autorun_replay_inputs.lua) | Replays that CSV through `pad.force` / `pad.release`, then checkpoints | headless; `LEGAIA_CKPT_FRAME=N` checkpoints at field tick N | Deterministic replay. RAM writes to the mask do not stick: `FUN_8001822C` rebuilds it from the pad. Source of `town01_tetsu_topic_prompt` (frame 1290) | |
+| [`autorun_btnmap.lua`](../../scripts/pcsx-redux/autorun_btnmap.lua) | Forces each pad button alone and reads `0x8007B850` | any field state | The mask is the byte-swapped controller word: index `b` -> `1<<(b+8)` for `b<8`, else `1<<(b-8)`. UP `0x1000`, RIGHT `0x2000`, DOWN `0x4000`, LEFT `0x8000`, CROSS `0x0040`, CIRCLE `0x0020` | |
+| [`autorun_talk_to_npc.lua`](../../scripts/pcsx-redux/autorun_talk_to_npc.lua) | Walks to one field NPC (named by script pointer `+0x90`), confirms, checkpoints the frames after | route = steer, `LEGAIA_ROUTE`, `LEGAIA_WAYPOINTS` or `LEGAIA_POKE_POS` | States for offline VRAM crops of the box; box-open signal is `*0x801C6EA4 +0x62`. Retail side of the `town01` `P1[16]` frame pair | |
+| [`autorun_scene_name_hijack.lua`](../../scripts/pcsx-redux/autorun_scene_name_hijack.lua) | Rewrites a door's inline destination name to load a scene no state reaches | see detail | [detail](#autorun_scene_name_hijacklua) | |
+| [`autorun_play_from_boot.lua`](../../scripts/pcsx-redux/autorun_play_from_boot.lua) | Bespoke per-vsync driver: polls `game_mode`, mashes START+CROSS through logos / title / FMV / NEW GAME, checkpoints at a target mode | cold with `-fastboot` (`LEGAIA_FASTBOOT=1`), `LEGAIA_TICK_BP` for the title's vsync-blind window; chains from `LEGAIA_SSTATE` | Reloadable field checkpoint ([S1](playthrough-coverage.md#driving-from-boot-segment-s1)) | |
+| [`autorun_chain_fast.lua`](../../scripts/pcsx-redux/autorun_chain_fast.lua) | Vsync-only sibling of the above: presses advance every `LEGAIA_MASH_EVERY` vsyncs (`LEGAIA_MASH_BTN` in field / battle), optional `LEGAIA_HOLD_BTN`; checkpoints on scene / mode / actor flag or a warp (`LEGAIA_CKPT_WARP=1`, a jump over 300 units) | `--fast` | Segment checkpoints; drives S2 through the prologue XA streams ([re-shoot](#re-shooting-the-s1s5-anchors-on-an-unpatched-image)) | |
+| [`autorun_translation_playcheck.lua`](../../scripts/pcsx-redux/autorun_translation_playcheck.lua) | Screenshots on every mode / scene change of a **translated disc**. `newgame` cold-boots and pad-walks title -> name select -> prologue -> first town -> pause menu; `menu` opens the pause menu from a field state; `state` mashes CROSS | software renderer at 1x (`takeScreenShot` is empty under the speed scaler and throws under OpenGL) | Screenshots. Only `newgame` draws the disc's own SCUS text - a state carries the SCUS of the disc that made it | |
+
+#### Playthrough coverage, anchors and story flags
+
+| Probe | Captures | Run | Output / answer |
+|---|---|---|---|
+| [`autorun_trace_segment.lua`](../../scripts/pcsx-redux/autorun_trace_segment.lua) | Non-pausing exec-bp on every gap-set function entry ([`build_gap_worklist.py`](../../scripts/pcsx-redux/build_gap_worklist.py)) across one opening segment | interp; `LEGAIA_INPUTS` optional; cold for S1 | `addr, hits, first_frame, first_mode, first_ra, stem` + `.modes.txt` ([`playthrough-coverage.md`](playthrough-coverage.md)) | |
+| [`trace_scenario.sh`](../../scripts/pcsx-redux/trace_scenario.sh) | The whole gap set against one catalogued checkpoint, as windowed `autorun_trace_segment.lua` passes (`<= ~120` exec-bps each, 3-try boot retry) | `bash scripts/pcsx-redux/trace_scenario.sh s1_newgame_field` | `captures/trace/<label>/union.csv` | |
+| [`autorun_state_poll.lua`](../../scripts/pcsx-redux/autorun_state_poll.lua) | Per-vsync diff of all progression state (flags, battle id, gold, items, party, level, spell, xp, equip, counters, scene, mode, bgm, fmv); a `battle` identity row per field->battle edge; in-battle status / HP (`+0x16E` / `+0x14C`) and action-queue windows (`+0x1DF..+0x1F2`) | `--fast` | Tier 1 of the [two-tier model](#fast-whole-playthrough-capture-two-tier-model); the community-handoff probe | |
+| [`autorun_state_poll_selftest.lua`](../../scripts/pcsx-redux/autorun_state_poll_selftest.lua) | `dofile()`s the poll probe, pokes every watched cell, loads a battle state mid-run, drives pad walks | `run_state_poll_selftest.sh`; verdict `check_state_poll_selftest.py` | Every stream and autosnap must fire. Run before a volunteer handoff | |
+| [`autorun_flag_firehose.lua`](../../scripts/pcsx-redux/autorun_flag_firehose.lua) | Exec-bp on every story-flag write with writer `ra`; battle-id staging watch | interp (slow) | Tier 2: writer provenance for flags the poll tier fingers | |
+| [`autorun_flag_reader_watch.lua`](../../scripts/pcsx-redux/autorun_flag_reader_watch.lua) | Unfiltered test / set / clear helper bps (reader + writer `ra`), per-target read watches, write allowlist (battle id + formation), VRAM upload log, per-fight identity rows with spawn tile, overlay-residency checksums, auto-snapshots | interp (slow); refuses dynarec, carries a BP-liveness canary | Run `manifest.txt`; summarise / merge with `analyze_reader_watch.py` | |
+| [`autorun_spine_flag_writers.lua`](../../scripts/pcsx-redux/autorun_spine_flag_writers.lua) | Write watch on `0x8007b7fc` (Zeto battle id) + exec-bps on setter `FUN_8003CE08` filtered `a0 == 322` / `a0 == 1154` (flags `0x142` / `0x482`), each with caller `ra` | interactive card-save play; no self-quit | [`spine-flag-writers-capture.md`](spine-flag-writers-capture.md) | |
+| [`autorun_s3_recon.lua`](../../scripts/pcsx-redux/autorun_s3_recon.lua) | Off the field tick `FUN_8001698C`: player engaged flag (`*0x8007C364 +0x10 & 0x80000`), dialog byte / picker cursor / interact flag (`*0x801C6EA4 +0x62` / `+0xc` / `+0x60`), pager global, player XZ | `LEGAIA_MASH=1` mashes CROSS+CIRCLE; `LEGAIA_SWEEP=1` cycles button groups | Free-roam vs dialogue vs cutscene wait ([S3](playthrough-coverage.md#s3-captured-the-town01-opening-is-the-name-entry-screen)) | |
+| [`autorun_s3_pc.lua`](../../scripts/pcsx-redux/autorun_s3_pc.lua) | Histogram of `(base, pc)` entries to the field-VM dispatcher `FUN_801DE840` (`a0=record_base, a1=pc, a2=ctx`) at a stall | interp | The instruction a parked script waits on; `a1` maps to `man-scripts --disasm-partition N`. S3 parks on `STATE_RESUME` (op 0x49) in town01 `P2[3] +0x02C6` | |
+| [`autorun_s3_capture.lua`](../../scripts/pcsx-redux/autorun_s3_capture.lua) | Completes town01 name entry: `End` with CROSS (confirm mask `0x44` at `0x800846D0`), holds Yes/No toggle `_DAT_8007B458 = 0` (advances `actor+0x50` `0x22 -> 0x1A`), waits for `0x80000` to clear | from S2 | Anchor `s3_rimelm_freeroam`. Recon companions: `autorun_s3_namegrid.lua`, `autorun_s3_btnmask.lua`, `autorun_s3_substate.lua` | |
+| [`autorun_s3_fast.lua`](../../scripts/pcsx-redux/autorun_s3_fast.lua) | Same screen by pad input only, gated on the name-entry actor's sub-state (callback `+0x0C = FUN_801F159C`, `+0x54`: `1` grid, `2..4` confirm) | `--fast` | S3 at recompiler speed ([re-shoot](#re-shooting-the-s1s5-anchors-on-an-unpatched-image)) | |
+| [`autorun_s4_gridrecon.lua`](../../scripts/pcsx-redux/autorun_s4_gridrecon.lua) | Position width (`player+0x14` / `+0x18` are **16-bit signed**; `+0x16` between them is the footing height), walkability grid `*(_DAT_1f8003ec)+0x4000` (nibble census + ASCII map), pad->world `(dX,dZ)` per direction | a field anchor | Groundwork for door-nav; doubles as an S4 state validator ([`field-locomotion.md`](../subsystems/field-locomotion.md)) | |
+| [`autorun_s4_doornav.lua`](../../scripts/pcsx-redux/autorun_s4_doornav.lua) | BFS over the `+0x4000` grid, walks boundary tiles nearest-first with adaptive pad input and CROSS pulses; a transition = scene-name change or a `>300`-unit one-tick jump | from S3 | Anchor `s4_rimelm_door_transition` ([S4](playthrough-coverage.md#s4-captured-the-grid-bfs-door-nav-walks-out-of-vahns-house)) | |
+| [`autorun_s4_recon.lua`](../../scripts/pcsx-redux/autorun_s4_recon.lua) / [`_capture`](../../scripts/pcsx-redux/autorun_s4_capture.lua) / [`_padmap`](../../scripts/pcsx-redux/autorun_s4_padmap.lua) / [`_navsweep`](../../scripts/pcsx-redux/autorun_s4_navsweep.lua) | D-pad sweep / wander / pad->world measurement / coverage sweep, logging scene, mode and `player+0x14` / `+0x18` | superseded | They read the position as u32, folding `+0x16` into X; do not reuse their camera-remap or 16.16 conclusions. Use `autorun_s4_doornav.lua` | |
+| [`autorun_s5_encounter.lua`](../../scripts/pcsx-redux/autorun_s5_encounter.lua) | Wanders the town01 exterior pulsing CROSS, watching `game_mode 0x8007B83C == 0x15` or battle ctx `0x8007BD24 != 0` | from S4 | Rim Elm has no random encounters at this story point: 148 steps, mode stayed `0x03` ([S5](playthrough-coverage.md#s5-the-first-battle-is-the-scripted-tetsu-spar-not-a-random-encounter)) | |
+| [`autorun_s5_actors.lua`](../../scripts/pcsx-redux/autorun_s5_actors.lua) | Live actor table (`DAT_801c93c8`, count `_DAT_8007b6b8`): `s16` position, flags `+0x10` (moving-class bit `0x20000`), heading `+0x26`, object index `+0x60`; player tile and `player+0x98` | a field anchor | Locates an NPC (used for the sparring partner) | |
+| [`autorun_s5_tetsu.lua`](../../scripts/pcsx-redux/autorun_s5_tetsu.lua) | Navigates to Tetsu's tutorial tile (world `(2752,1856)` = tile `(21,14)`), faces him, pulses CROSS | from S4 | Engages the dialogue but cannot start the fight: the prompt is a 4-item list whose 3rd entry is the training fight. S5 comes from record / replay (`s5_tetsu_battle`) | |
+| [`autorun_s5_spar.lua`](../../scripts/pcsx-redux/autorun_s5_spar.lua) | Navigates to talk tile `(21,13)`; logs `*(0x801C6EA4)+0x62` / `+0x0C` / `+0x60` and pager `0x801F2740` | from S4 | The spar does not start from the S4 anchor: nav funnels to `(21,15)` and no picker surfaces ([S5](playthrough-coverage.md#s5-the-first-battle-is-the-scripted-tetsu-spar-not-a-random-encounter)) | |
+
+#### Boot, title, menus and dialogue
+
+| Probe | Captures | Run | Output / answer |
+|---|---|---|---|
+| [`autorun_grey_ramp_writer.lua`](../../scripts/pcsx-redux/autorun_grey_ramp_writer.lua) | Exec-bp on the VRAM upload body `FUN_80059BD4`: every upload covering one pixel (`(451, 507)`, edit `PX` / `PY`) with `ra` | cold | The boot logos' PROKION CLUT is the grey ramp on row 507 ([boot.md](../subsystems/boot.md#the-vram-upload)) | |
+| [`autorun_countdown_trigger.lua`](../../scripts/pcsx-redux/autorun_countdown_trigger.lua) | Watchpoint-driven RAM + screenshot snapshot | see detail | `FUN_801DD35C` is the title-overlay tick - [detail](#autorun_countdown_triggerlua) | |
+| [`autorun_title_overlay_writer_hunt.lua`](../../scripts/pcsx-redux/autorun_title_overlay_writer_hunt.lua) | The SCUS-side title-overlay loader | see detail | [detail](#autorun_title_overlay_writer_huntlua) | |
+| [`autorun_title_staging_capture.lua`](../../scripts/pcsx-redux/autorun_title_staging_capture.lua) | The PROT source of the title overlay | see detail | [detail](#autorun_title_staging_capturelua) | |
+| [`autorun_load_screen_dump.lua`](../../scripts/pcsx-redux/autorun_load_screen_dump.lua) | Load-screen panel border + slot-pill source sprites | see detail | [detail](#autorun_load_screen_dumplua) | |
+| [`autorun_confirm_dialog_dump.lua`](../../scripts/pcsx-redux/autorun_confirm_dialog_dump.lua) | Save screen's confirm prompt at rest + the panel drawer's live args | walks field -> pause menu (SELECT) -> Save/Load -> block | Both `FUN_801E1C1C` mode-3 panels ([`save-screen.md`](../subsystems/save-screen.md#messagebox-panel-geometry-fun_801e36c4)); pairs with `scan_panel_rects.py`, `decode_load_screen.py --stem` | |
+| [`autorun_save_point_press.lua`](../../scripts/pcsx-redux/autorun_save_point_press.lua) | From a save point: taps each facing then Cross until op `0x49` parks, backs out with Circle. Rows on the park store `0x801E09A8`, enter half `FUN_801F1278`, state pick `FUN_801F1F4C`, pause session `FUN_801ED308`, retire exits `0x801F16AC` (Done) / `0x801F1688` (park clear), each with `a0[+0x50]`; mode + `_DAT_8007B450` per change | `town01_field_card_boot`, interp | The menu opens with no Start press ([`field-menu.md`](../subsystems/field-menu.md#which-screen-opens-a-window)). `0x801E08D8` hits in mode `23` are the menu overlay's bytes | |
+| [`autorun_throw_out_cursor.lua`](../../scripts/pcsx-redux/autorun_throw_out_cursor.lua) | Whether the item cursor `_DAT_8007BB88` is a bag slot or a list row | see detail | [detail](#autorun_throw_out_cursorlua) | |
+| [`autorun_dialog_typewriter_trace.lua`](../../scripts/pcsx-redux/autorun_dialog_typewriter_trace.lua) | Field pager reveal counter `_DAT_801F2748` and short-row hold `_DAT_801F275C` per vsync, with `scroll` / `press` columns | an NPC-dialogue state; `LEGAIA_SKIP_PAGES` injects confirms | Sequences matched by `dialog_typewriter_pacing_disc` and `dialog_window_disc` ([`dialog-font.md`](../formats/dialog-font.md#typewriter-pacing)) | |
+| [`autorun_dialog_picker_open.lua`](../../scripts/pcsx-redux/autorun_dialog_picker_open.lua) | Field pager `FUN_801D84D0` around a picker: state, auto-press word, cursor, the pager actor's slide fields and box origin, per vsync | `--fast`; `LEGAIA_PICKER_RETALK`, `LEGAIA_PICKER_SHOTS`, `LEGAIA_PICKER_CKPT` | Slide states ([`mes.md`](../formats/mes.md#the-picker-slide-states-0x11--0x13--0x15--0x17)); source of `retock_inn_stay_prompt` | |
+| [`autorun_pal_glyph_cells.lua`](../../scripts/pcsx-redux/autorun_pal_glyph_cells.lua) | On an official PAL image: at an exec-bp after the SCES text preprocessor returns, logs each line buffer and rewrites its first three letters to `0xD7`, `0xF8`, `0xDD` | cold, `--iso` a scratch PAL copy (French addresses by default); `LEGAIA_POKE=0` baseline; interp | Retail PAL draws placeholder boxes for `0xD7` / `0xF8` ([`dialog-font.md`](../formats/dialog-font.md#the-pal-renderer)) | |
+
+#### Field: scripts, movement, camera and rendering
+
+| Probe | Captures | Run | Output / answer |
+|---|---|---|---|
+| [`autorun_player_pos_watch.lua`](../../scripts/pcsx-redux/autorun_player_pos_watch.lua) | Writers of the player position | see detail | Free-movement integrator `FUN_801d01b0` - [detail](#autorun_player_pos_watchlua) | |
+| [`autorun_field_pad_ring.lua`](../../scripts/pcsx-redux/autorun_field_pad_ring.lua) | The camera-relative pad remap's output per held direction at every rotation index | see detail | [detail](#autorun_field_pad_ringlua) | |
+| [`autorun_house_door_writer.lua`](../../scripts/pcsx-redux/autorun_house_door_writer.lua) | Intra-town door mechanism | see detail | Field-VM `0x23 MOVE_TO` - [detail](#autorun_house_door_writerlua) | |
+| [`autorun_man_source.lua`](../../scripts/pcsx-redux/autorun_man_source.lua) | A field scene's runtime MAN source (`_DAT_8007b898`) | see detail | [detail](#autorun_man_sourcelua) | |
+| [`autorun_town01_script_flow.lua`](../../scripts/pcsx-redux/autorun_town01_script_flow.lua) | A field scene's script execution model | see detail | [detail](#autorun_town01_script_flowlua) | |
+| [`autorun_field_pack_projection.lua`](../../scripts/pcsx-redux/autorun_field_pack_projection.lua) | The scene-asset loader's on-disc -> RAM projection | see detail | [detail](#autorun_field_pack_projectionlua) | |
+| [`autorun_door_menu_refusal.lua`](../../scripts/pcsx-redux/autorun_door_menu_refusal.lua) | Uses a Door of Light (the `autorun_door_item_use.lua` pad script), then presses menu on arrival: `FUN_801D01B0` entries, deny buzzes, accepts and the player's `+0x10` per vsync | interp; `LEGAIA_SCRIPTS=1` logs `FUN_80039B7C` script steps; `LEGAIA_WATCH=<vsync>:<addr>` | The post-`map01` refusal is cave-mouth record `P2[9]` holding the engaged bit ([`field-locomotion.md`](../subsystems/field-locomotion.md#the-menu-after-a-door-of-light-arrival)) | |
+| [`autorun_uru_exit_probe.lua`](../../scripts/pcsx-redux/autorun_uru_exit_probe.lua) | Sweeps the four D-pad directions for `LEGAIA_SWEEP` vsyncs, holds the one that closes on `LEGAIA_TARGET_X` / `_Z`; exec-bps on `FUN_8003BDE0` (`x, z, record, gate`) and `FUN_8001FD44` (destination + `ra`) | field-run state, interp | Uru Mais exit: band `(36,5)`, record 42, `ra = 0x801DEB1C` (the `0x3F` arm) - the `.PCH` sidecar path ([`world-map.md`](../subsystems/world-map.md#uru-mais-and-jouine-exits-carried-by-the-pch-sidecar)) | |
+| [`autorun_w7c_kor5_tail.lua`](../../scripts/pcsx-redux/autorun_w7c_kor5_tail.lua) | Spoke walk (tile-poke route + flag firehose) with exec-bps on record dispatcher `FUN_8003BDE0` and trigger lookup `FUN_801D5630`, per-second player flags, `LEGAIA_CKPT_FLAG` | interp. Opt-ins: `LEGAIA_WAIT_UNLOCK` ([why](../subsystems/field-locomotion.md#a-crossing-made-under-the-movement-lock-is-consumed)), `LEGAIA_BATTLE_HP1` (synthetic), `LEGAIA_POOL_WATCH` (slow); `LEGAIA_POLL_FLAGS` / `LEGAIA_CKPT_EVERY` for a `--fast` pass | Walks the `kor5` chain with no flag poke, and `korb2` -> `doman` over `map03` | |
+| [`autorun_field_submode_park.lua`](../../scripts/pcsx-redux/autorun_field_submode_park.lua) | Read + Write bps on live `*(0x801C6EA4) + 0x2E` / `+0x40` (re-armed when the scene pointer moves) + exec taps on the four op-`0x49` park / install sites | interp | The parked word is write-only ([`field-locomotion.md`](../subsystems/field-locomotion.md#the-submode-return-state---a-parked-word-nothing-reads)) | |
+| [`autorun_gated_clip_step.lua`](../../scripts/pcsx-redux/autorun_gated_clip_step.lua) | Field clip tick `FUN_800204F8` at entry (`a0` = actor) and epilogue `0x80020730` (`s0` = actor): cursor `+0x68` before / after, control `+0x62`, clip `+0x4C` with gate, frame count, divisor, rate `+0x6A`, frame step `DAT_1F800393` | interp | One CSV row per call; `analyze_gated_clip_step.py` checks the scaled-step rule ([`anm.md`](../formats/anm.md#the-frame-blender-two-entries-one-gate)) | |
+| [`autorun_w1a_fog_pool_poll.lua`](../../scripts/pcsx-redux/autorun_w1a_fog_pool_poll.lua) | Fog pool per vsync: script gate `_DAT_8007B854`, live count `_DAT_8007BCA8`, spawner cap `_DAT_8007BCB0`, free-stack top, alive census of the 80 records, `DAT_1F800393`, a "frame ran" bit | `--fast`; measured on `vell_fog_field` | `alive` is the population; `live` is sampled at the vsync IRQ and can be partial ([density](../subsystems/field-ambient-fx.md#pool-density-against-retail)) | |
+| [`autorun_field_camera_tr.lua`](../../scripts/pcsx-redux/autorun_field_camera_tr.lua) | What composes the field camera's GTE `TR` from the live camera words on one frame | see detail | [detail](#autorun_field_camera_trlua) | |
+| [`autorun_scene_entry_eye_seed.lua`](../../scripts/pcsx-redux/autorun_scene_entry_eye_seed.lua) | Which of the two scene-entry camera-eye seeds runs last; what the first field view reads | see detail | [detail](#autorun_scene_entry_eye_seedlua) | |
+| [`autorun_view_build_attribution.lua`](../../scripts/pcsx-redux/autorun_view_build_attribution.lua) | `FUN_800172C0` entry (caller `ra` + camera words), `0x80017348` (the `TR` left in the GTE), TMD renderer `FUN_8002735C`, OT link helper `FUN_8003D2C4` | interp | A field frame runs two to five view builds from five sites ([census](../subsystems/cutscene.md#what-a-build-census-actually-measures)); zero `FUN_8002735C` entries is real ([why](../subsystems/renderer.md#which-mesh-leaf-a-frame-actually-enters)) | |
+| [`autorun_w4c_mesh_path_census.lua`](../../scripts/pcsx-redux/autorun_w4c_mesh_path_census.lua) | Counts the mesh leaves `FUN_8002735C`, `FUN_80029888`, `FUN_80043390` and reads the branch register at gates `0x8001B454`, `0x8001BC64`, `0x80048EA4`, bucketed by game mode | interp; each tap carries its expected word, so a mis-based tap reports a mismatch | Which leaf a mode enters, and why | |
+| [`autorun_w4d_light_kind_hits.lua`](../../scripts/pcsx-redux/autorun_w4d_light_kind_hits.lua) | Whether the four light-capable prim handlers (kinds 8..11) execute | see detail | [detail](#autorun_w4d_light_kind_hitslua) | |
+| [`autorun_prim_pool_writers.lua`](../../scripts/pcsx-redux/autorun_prim_pool_writers.lua) | Writes across the 341 KB GPU prim pool at `0x800AD400+` | interp | The eight overlay-resident high-mode renderers are the writers (matches `FUN_80043390`'s dispatch table) | |
+| [`autorun_field_ground_cells.lua`](../../scripts/pcsx-redux/autorun_field_ground_cells.lua) | Plays to `game_mode 0x03`, dumps the object grid `*(0x1F8003EC)+0x8000`, brackets one pass of PROT 0900's ground emitter and logs each visited cell + whether it emitted | field-init state; optional state + RAM dump | `teien` object-grid gate ([`renderer.md`](../subsystems/renderer.md#no-draw-channel-is-gated-on-object-grid-bit-0x0800)) | |
+| [`autorun_ground_pass_liveness.lua`](../../scripts/pcsx-redux/autorun_ground_pass_liveness.lua) | Exec-hit totals on both ground emitters, both packet-commit sites and their caller, every 30 vsyncs | interp | Separates "the pass never runs" from "it ran between two samples" | |
+| [`autorun_gpu_call_census.lua`](../../scripts/pcsx-redux/autorun_gpu_call_census.lua) | libgpu entry points: `LoadImage` / `StoreImage` / `MoveImage` / `PutDispEnv` / GP1 / direct GP0 list with each `RECT` or command word; every `FUN_8002C69C` window emit with style id, jump-table kind, tile set | interp | A one-shot blit cannot fall between samples. [`(384, 0)` question](../subsystems/minigame-muscle-dome.md#a-call-site-census-closes-the-sampling-question), [report chrome arm](../subsystems/level-up.md#which-arm-lays-it-window-style-0x03-jump-table-slot-0) | |
+| [`autorun_model_pack_registrar.lua`](../../scripts/pcsx-redux/autorun_model_pack_registrar.lua) | Entries to the party-model registrar `0x8001EAFC`: gating mode word, pack pointer `gp+0x6BC`, count, first member offsets | interp | Zero entries across a random encounter and across a door warp; a cold boot is the untested path | |
+
+#### World map
+
+| Probe | Captures | Run | Output / answer |
+|---|---|---|---|
+| [`autorun_world_map_probe.lua`](../../scripts/pcsx-redux/autorun_world_map_probe.lua) | Reads of `_DAT_8007BCD0..D8` (gate-arm params), writes of gate flag `_DAT_801F351C`, four `FUN_801D7EA0` entries | world-map state (the runner's default) | The POLY_FT4 emitter's one-shot gate + its three-param block | |
+| [`autorun_world_map_fog_probe.lua`](../../scripts/pcsx-redux/autorun_world_map_fog_probe.lua) | Five fog fields (GP-relative `-0x2E0 / -0x2DC / -0x2D1 / -0x2BC / +0x90`) + 1 KiB LUT dump | world-map state | The per-Z fog-tint LUT the leaves at `0x801F7644..0x801F8690` consult | |
+| [`autorun_ocean_moveimage.lua`](../../scripts/pcsx-redux/autorun_ocean_moveimage.lua) | The three libgpu transfer wrappers (`MoveImage FUN_80058490` / `LoadImage` / `StoreImage`): vsync, source RECT (scratchpad `0x1F8000xx`), destination; per-vsync `dt` (`0x1F800393`); in-capture states | interp only | Kingdom slot-5 CLUT-walk cadence on all three kingdoms: `ceil(hold/dt)*dt` intervals, reset-to-zero accumulators, shared spawn epoch ([`world-map.md`](../subsystems/world-map.md)) | |
+| [`autorun_lzs_and_bundle_probe.lua`](../../scripts/pcsx-redux/autorun_lzs_and_bundle_probe.lua) | LZS decode entries + bundle dispatcher `FUN_8001F05C` during world-map load | across a world-map load | Which PROT entries get LZS-decoded for the bundle | |
+| [`autorun_slot4_consumer_pcs.lua`](../../scripts/pcsx-redux/autorun_slot4_consumer_pcs.lua) | Kingdom-agnostic slot-4 consumer PCs | see detail | [detail](#autorun_slot4_consumer_pcslua) | |
+| [`autorun_slot4_dispatcher_args.lua`](../../scripts/pcsx-redux/autorun_slot4_dispatcher_args.lua) | The cluster-A dispatcher's call args before the kind handlers clobber them | see detail | [detail](#autorun_slot4_dispatcher_argslua) | |
+| [`autorun_dump_slot4.lua`](../../scripts/pcsx-redux/autorun_dump_slot4.lua) | The slot-4 RAM region | world-map state | Ground-truth buffer for `verify_slot4_in_ram.py` | |
+| [`autorun_slot4_source_map.lua`](../../scripts/pcsx-redux/autorun_slot4_source_map.lua) | Read bps tiled across the slot-4 window (full GPR set per hit) + exec-bp on streaming dispatcher `FUN_8001E54C`; drives the held-direction warp | pre-transition state | Slot 4 is read in place by the animated-mesh renderer `FUN_8001B964` and pose decoder `FUN_8001BE80` - it is the scene's ANM bank ([`world-map-overlay.md`](../formats/world-map-overlay.md)) | |
+| [`locate_slot4_base.py`](../../scripts/pcsx-redux/locate_slot4_base.py) | Searches a post-warp RAM dump for the disc-decoded slot-4 payload (unanimous body vote) | offline, after `autorun_dump_full_ram_hold.lua` | Resident bases: Drake `0x8011A624`, Sebucus `0x80119CE4`, Karisto `0x80108D84` | |
+
+#### Battle: load, formation and data sources
+
+| Probe | Captures | Run | Output / answer |
+|---|---|---|---|
+| [`autorun_natural_encounter_cells.lua`](../../scripts/pcsx-redux/autorun_natural_encounter_cells.lua) | No pokes: holds `LEGAIA_DIR` until the game rolls a battle; formation cells at each mode change + battle main, per-enemy record pointers | a state parked near an encounter roll | Ground-truth companion to the forced installs | |
+| [`autorun_delilas_battle_load.lua`](../../scripts/pcsx-redux/autorun_delilas_battle_load.lua) | Replays a rolled encounter's install (formation cells `0x8007BD0C..0F` + `game_mode = 8`) with any id list; mode chain, battle heap (free-ring walk, `malloc`-fail bps), record pointers `0x801C9370` / `0x801C9348` | plain field / world-map save; `LEGAIA_IDS`, `LEGAIA_PARTY`, `LEGAIA_POKES`, `LEGAIA_MASH` | Verdict CSV row. Retail authors at most 2 distinct ids per formation; 3 (162 / 163 / 164, ~345 KB decoded) exceeds the heap ([`battle.md`](../subsystems/battle.md#the-battle-heap-budget---why-a-formation-of-large-distinct-bosses-cannot-load)) | |
+| [`autorun_formation_cell_writers.lua`](../../scripts/pcsx-redux/autorun_formation_cell_writers.lua) | The same forced install + Write watches on the four formation cells | interp | `FUN_80055B6C` (writes at `0x80055D14/18`) rebuilds species order, collapsing a 3-distinct formation to `[c2, c2, c0]` on half of all rolls | |
+| [`autorun_rim_elm_ambush_seats.lua`](../../scripts/pcsx-redux/autorun_rim_elm_ambush_seats.lua) | Exec-bps on field-VM op `0x3E` arm `0x801E0710`, battle init `FUN_800513F0`, seat-loop row fetch `0x80051850`, formation roll `FUN_80051D84`; write watch on `DAT_8007BD60`; per-vsync seats of pool slots `0..7` | `rim_elm_queen_bee_battle` (town0c, map define `0x15`), interp | `3E FF 03`, first monster `0x3F`, `DAT_8007BD60` bit 7 clear, seat row 8, `_DAT_8007BAC0` raised to `0x200` by the roll ([`battle.md`](../subsystems/battle.md#the-ra-seru-forbidden-bit-of-the-special-battle-word)) | |
+| [`autorun_battle_pack_walk_baseline.lua`](../../scripts/pcsx-redux/autorun_battle_pack_walk_baseline.lua) | The battle loader's two pack walks at their `jal` sites (`0x80052584` byte-offset over `*0x8007B878`, `0x800525D8` word-offset over the arena), reconstructing `base + operand` from the delay slot; write watch on `0x8007B878` | a battle-load state, interp | On a retail load exactly one of the three `0x8007B878` writers fires. Baseline for a rebuilt PROT 0874 | |
+| [`autorun_battle_mesh_dump.lua`](../../scripts/pcsx-redux/autorun_battle_mesh_dump.lua) | Cold boot -> **memory-card** load -> forced battle -> 2 MiB RAM dump | `LEGAIA_MCD1`; see [the card tier](#memory-card-capture-tier) | What the loader builds from the disc under test, unmasked by a state's stale RAM | |
+| [`autorun_monster_record_source.lua`](../../scripts/pcsx-redux/autorun_monster_record_source.lua) | The monster stat archive's disc source | see detail | PROT entry `0867_battle_data` - [detail](#autorun_monster_record_sourcelua) | |
+| [`autorun_battle_reward_source.lua`](../../scripts/pcsx-redux/autorun_battle_reward_source.lua) | The victory reward path | see detail | [detail](#autorun_battle_reward_sourcelua) | |
+| [`autorun_xp_table_reader.lua`](../../scripts/pcsx-redux/autorun_xp_table_reader.lua) | Tiled read-bp scan over `0x8007123C..0x80071300` | see detail | The XP curve is `DAT_80076AF4` - [detail](#autorun_xp_table_readerlua) | |
+| [`autorun_battle_palette_source.lua`](../../scripts/pcsx-redux/autorun_battle_palette_source.lua) | The scene bundle's LZS decompress into the work arena at load | see detail | Does not pin the party palette - [detail](#autorun_battle_palette_sourcelua) | |
+| [`autorun_battle_char_clut_source.lua`](../../scripts/pcsx-redux/autorun_battle_char_clut_source.lua) | Disc source of the battle-form party CLUT band (VRAM rows 490..497) | see detail | [detail](#autorun_battle_char_clut_sourcelua) | |
+| [`autorun_battle_party_mesh_install.lua`](../../scripts/pcsx-redux/autorun_battle_party_mesh_install.lua) | The battle-form party-mesh install callsite | see detail | [detail](#autorun_battle_party_mesh_installlua) | |
+| [`autorun_tile_shatter_page.lua`](../../scripts/pcsx-redux/autorun_tile_shatter_page.lua) | Walks into a random encounter, breaks on tile-shatter tick `FUN_801D0D24`; states on shatter frames 1 / 8 / 24, every LoadImage / MoveImage rect, scratch view matrix + near-cutoff halfword per frame | `karisto_sol_pre_encounter`, interp | The `(448,0)` shade page is `field_char_textures` entry 0 ([`cutscene.md`](../subsystems/cutscene.md#what-style-2s-emitter-builds)) | |
+
+#### Battle: flow, camera, UI and animation
+
+| Probe | Captures | Run | Output / answer |
+|---|---|---|---|
+| [`autorun_battle_state_stream.lua`](../../scripts/pcsx-redux/autorun_battle_state_stream.lua) | Per-vsync typed battle state via [`probe.battle_state`](../../scripts/pcsx-redux/lib/probe/battle_state.lua), diffed into newline-delimited JSON (deltas + a full sweep every `LEGAIA_STREAM_SWEEP` vsyncs and on battle enter) | `--fast` | The shared live battle-state event source - [detail](#autorun_battle_state_streamlua) | |
+| [`autorun_battle_render_capture.lua`](../../scripts/pcsx-redux/autorun_battle_render_capture.lua) | The battle camera, byte-exact | see detail | [detail](#autorun_battle_render_capturelua) | |
+| [`autorun_battle_cam_orbit.lua`](../../scripts/pcsx-redux/autorun_battle_cam_orbit.lua) | Per-vsync battle-camera yaw beside its two retail writers | see detail | The idle-orbit rate as a measurement - [detail](#autorun_battle_cam_orbitlua) | |
+| [`autorun_battle_intro_banner.lua`](../../scripts/pcsx-redux/autorun_battle_intro_banner.lua) | Exec-bps on text-actor spawner `FUN_8003541C` (`$ra`, id, class, seat, box, kind) and teardown `FUN_800355F0`; per-vsync walk of the live list at `gp[+0x148] = 0x8007B460` | a pre-battle state (none is parked on the intro), interp; `LEGAIA_FRAMES` | `w1d_spawns.csv`, `w1d_list.csv`. `FUN_801D9D3C` spawns the intro name banner from immediates ([`battle.md`](../subsystems/battle.md#the-battle-intro-enemy-name-banner)) | |
+| [`autorun_results_window_emitter.lua`](../../scripts/pcsx-redux/autorun_results_window_emitter.lua) | Exec-bp on the OT linker `AddPrim` = `FUN_8003D2C4`, folded by `$ra` with first / last vsync; two full-detail windows (`LEGAIA_FULL_A_LO/HI`, `LEGAIA_FULL_B_LO/HI`) record each packet's GP0 command, colour, XY | interp; `LEGAIA_FRAMES` | `results_window_emitter.csv`. The SCUS window emitter `FUN_8002C69C` runs in battle ([`level-up.md`](../subsystems/level-up.md)) | |
+| [`autorun_victory_timeline.lua`](../../scripts/pcsx-redux/autorun_victory_timeline.lua) | Battle END sequence per vsync: `0xFE` signal, cause / phase word `_DAT_8007BD2C`, `DAT_8007BD60`, results hold `0x8007BD6C`, pose actor `+0x1DA` / `+0x1D9`, fade template, `game_mode` | a state that resolves on its own; `--fast` | The results-sequencer timeline in [`battle.md`](../subsystems/battle.md) | |
+| [`autorun_w4d_cort_flow_writer.lua`](../../scripts/pcsx-redux/autorun_w4d_cort_flow_writer.lua) | What moves the command-flow byte off the evolved-Cort park value `0x0C` | see detail | [detail](#autorun_w4d_cort_flow_writerlua) | |
+| [`autorun_melee_string_trace.lua`](../../scripts/pcsx-redux/autorun_melee_string_trace.lua) | Per vsync: attacker and target live / body pairs, facing, committed / queued clip, `+0x1DC`, anim cursor; every `FUN_8004E2F0` return with its caller; every `FUN_80050BB8` push | a mid-fight state; `interp`; `LEGAIA_QUEUE=0d0f0e` injects a swing string at the attacker's `0x0A`, `LEGAIA_TARGET_HP` keeps the target standing until then (`gimard_burning_attack`) | The strike loop's commit reach snap in [`battle-action.md`](../subsystems/battle-action.md) |
+| [`autorun_w4d_melee_grunt_gate.lua`](../../scripts/pcsx-redux/autorun_w4d_melee_grunt_gate.lua) | Which `s7` definition an ordinary party swing carries into the melee grunt gate | see detail | [detail](#autorun_w4d_melee_grunt_gatelua) | |
+| [`autorun_w7c_steal_oracle.lua`](../../scripts/pcsx-redux/autorun_w7c_steal_oracle.lua) | Optional synthetic gates (steal passive bit, Items Up bit, enemy HP, forced `rand() % 100`); every step of the death-commit steal arm of `FUN_8004AD80`, every steal-table reader, every bag writer | battle state | [`steal-table.md`](../formats/steal-table.md#retail-steal-capture) | |
+| [`autorun_juggle_window.lua`](../../scripts/pcsx-redux/autorun_juggle_window.lua) | 1-byte Write watch on `+0x1F7` of each populated actor in `&DAT_801C9370[0..11]` (writer `pc` + anim-tick registers) + exec-bp on juggle store `0x801ECA80` | `battle_noa_miracle_art_combo`, `party_basic_attack_vs_gobu_gobu` (with `LEGAIA_PRESS_X=1`), `rim_elm_queen_bee_battle` | [`battle-formulas.md`](../subsystems/battle-formulas.md#the-juggle-window---what-makes-a-monster-juggleable) | |
+| [`autorun_anim_node_tick_caller.lua`](../../scripts/pcsx-redux/autorun_anim_node_tick_caller.lua) | Entry of the anim-node tick `FUN_80047430` (no static `jal`): dedupes by `$ra`, decodes the branch at `$ra-8`, dumps the ra-chain | `party_basic_attack_vs_gobu_gobu` | The indirect dispatch site ([`open-rev-eng-threads.md`](../reference/open-rev-eng-threads.md)) | |
+| [`autorun_super_art_action_queue.lua`](../../scripts/pcsx-redux/autorun_super_art_action_queue.lua) | Reads + range-watches the party actors' `actor[+0x1DF..+0x1F2]` stream via the `0x801C9370` table | arts-input battle state | The real Super / Miracle queue; Noa's Miracle matches `miracle.rs` byte-exact ([runbook](super-art-queue-capture.md)) | |
+| [`autorun_super_art_input_replay.lua`](../../scripts/pcsx-redux/autorun_super_art_input_replay.lua) | Optional injected directions (`LEGAIA_INPUT_SEQ`, edge-only pad override); CSV of every change to all three `+0x1DF..+0x1F2` queues | arts-input state. Catalogued states' bars (Gala 5 / Noa 8 blocks) are too short for a Super (9-15 inputs); the pad override can segfault after ~7-9 press cycles, so prefer manual input | Injected directions append 1:1 as raw queue bytes; with an empty sequence it is a pure observer | |
+| [`autorun_approach_hazard.lua`](../../scripts/pcsx-redux/autorun_approach_hazard.lua) | Plays a fight by itself (a masher keyed on the command-flow byte `ctx[+0x06]`, ring choice per member from `LEGAIA_PLAN`) and logs every actor's `+0x1D9` / `+0x1DA` / `+0x1DC`, each rise and fall of `+0x1DC` bit 2, every approach start and any `0x19` park | `--fast`, a battle at its round prompt | How long the exit-to-idle flag lives against the action states ([`battle-action-exit-gates.md`](../subsystems/battle-action-exit-gates.md#why-a-hit-alone-cannot-arm-it)) | |
+| [`autorun_super_art_queue_builder.lua`](../../scripts/pcsx-redux/autorun_super_art_queue_builder.lua) | Watches `ctx[+0x274]` (`*(0x8007BD24)+0x274`) | battle state | A turn-order diagnostic: that word is the active-actor index (`FUN_801DABA4`), not the art queue ([runbook](super-art-queue-capture.md)) | |
+| [`autorun_battle_moveimage_trace.lua`](../../scripts/pcsx-redux/autorun_battle_moveimage_trace.lua) | Every libgpu `MoveImage` (`FUN_80058490`): caller RA, source RECT, dest | `LEGAIA_TRACE_LOADIMAGE=1` adds `LoadImage` (slow) | Move-VM op `0x40` is the animated-texture strip primitive ([`move-vm.md`](../subsystems/move-vm.md)) | |
+| [`autorun_summon_model_base.lua`](../../scripts/pcsx-redux/autorun_summon_model_base.lua) | Exec-bp on the shared spawn stager `FUN_80021B04`: `$gp`, the `gp+0x754` global (`model_sel` additive base), its value, the part record's `model_sel` / `flags` | `gimard_summon_start` or an enemy special-attack frame | The base both summon and move-power effect records share | |
+| [`autorun_w1a_koru_strip.lua`](../../scripts/pcsx-redux/autorun_w1a_koru_strip.lua) | Installs a formation (default Koru `0xB6`) as a rolled encounter does, mashes the command flow; turn counter `ctx[+0x28A]`, phase `ctx[+6]`, the strip's two digit globals; checkpoint per round + every `LEGAIA_CKPT_EVERY` | field state, `--fast`; the formation is synthetic | The `Turns Left / HP Left` strip ([muscle-dome page](../subsystems/minigame-muscle-dome.md#what-the-strip-looks-like-in-retail)) | |
+
+#### Cast modules and battle voice
+
+Background for this group: [`cast-module.md`](../subsystems/cast-module.md).
+
+| Probe | Captures | Run | Output / answer |
+|---|---|---|---|
+| [`autorun_w3a_cast_oracle.lua`](../../scripts/pcsx-redux/autorun_w3a_cast_oracle.lua) | **Drives** a cast: rewrites the acting party seat's queued action (`+0x1DE` / `+0x1DF` / `+0x1DD`) at the seed gate `ctx[7] == 0x0A`. Per-vsync module phase + actor mirror, a row per module tick (five prologue VAs armed), every damage-wrapper call + return; dumps the `0x801CF4EC` arm table with decoded `jal` targets | battle state, interp | The per-arm table in [frame gating](../subsystems/cast-module.md#frame-gating-measured) | |
+| [`autorun_capture_arm_gating.lua`](../../scripts/pcsx-redux/autorun_capture_arm_gating.lua) | Enemy-cast sibling: converts the monster seat's already-rolled action; counts dwell in module ticks off the single dispatcher `FUN_801F2160` (`jal 0x801F2160` occurs once in PROT 0898, at `0x801E50C8`); twelve body VAs armed; countdown word + frame-step pair | battle state, interp | [The fourteen measured arms](../subsystems/cast-module.md#the-fourteen-measured) | |
+| [`autorun_rage_delegated_pick.lua`](../../scripts/pcsx-redux/autorun_rage_delegated_pick.lua) | Pokes the Rage passive (`record +0xF8 \|= 0x2000`) into the seats of `LEGAIA_RAGE_SEATS` and the bare delegation group (`actor +0x16E \|= 0x380`) into those of `LEGAIA_STATUS_SEATS`, drives the round prompt off `LEGAIA_PAD_SCRIPT`, and write-watches every party seat's `+0x1DD..+0x1E6` with the `FUN_801F0450` / `FUN_801EED1C` entries and a flow / action-SM / stream timeline | `battle_gaza2_prompt`, interp | [What a Rage seat's turn plays](../subsystems/battle-action-helpers.md#what-a-rage-seats-turn-plays) |
+| [`autorun_player_special_cast.lua`](../../scripts/pcsx-redux/autorun_player_special_cast.lua) | Forces a party actor's action to a capture-class boss cast (category 2, spell `0x7A`) | natural battle state | Module PROT 959 runs it end to end | |
+| [`autorun_special_cast_stall.lua`](../../scripts/pcsx-redux/autorun_special_cast_stall.lua) / [`_chain_dump`](../../scripts/pcsx-redux/autorun_special_cast_chain_dump.lua) / [`_row_poke`](../../scripts/pcsx-redux/autorun_special_cast_row_poke.lua) | Read-bp on the wild `0x08044880` at the phase boundary (pc / ra); every actor's render fields + the effect pool; a re-pointed action-bank row before the cast | battle state, interp | Attribution of the player-cast hang at entry `0x0B` | |
+| [`autorun_special_cast_alias_row.lua`](../../scripts/pcsx-redux/autorun_special_cast_alias_row.lua) | Forced cast from `LEGAIA_CAST_SLOT`, optional row-`0x0B` -> row-`0x0A` alias, optional RAM injection (blob or word pokes), finale trace | battle state | Experiment rig for the same hang | |
+| [`autorun_special_cast_enemy_control.lua`](../../scripts/pcsx-redux/autorun_special_cast_enemy_control.lua) | Forces the first monster-seat actor to the same cast (`+0x1DE/+0x1DF/+0x1DD` pokes) | battle state | The control: a player-cast anomaly checked against the retail caster kind | |
+| [`autorun_delilas_enemy_cast_watch.lua`](../../scripts/pcsx-redux/autorun_delilas_enemy_cast_watch.lua) | Phase `ctx+7`, module phase `ctx+0x279`, the slot-B word, a change-log of caster and victim `+0x1D8..+0x1F4` | a natural enemy cast | The staging timeline; ordered the walk tables in [monster-animation.md](../formats/monster-animation.md#a-special-attack-can-be-a-chain-of-entries) and exposed 960's paired stage / confirm gate | |
+| [`autorun_enemy_steal_bag_draw.lua`](../../scripts/pcsx-redux/autorun_enemy_steal_bag_draw.lua) | Seeds bag slots with holes, forces PROT 0941's enemy Steal; every draw of the rejection sampler (`0x801F7864`, up to `0x400` attempts) with its three tests, the `FUN_80042310` consume call, the active window `gp[+0x2D2..+0x2D6]` | battle state, interp | The draw is over all 256 slots, the removal is window-bounded | |
+| [`autorun_slippery_budget_gate.lua`](../../scripts/pcsx-redux/autorun_slippery_budget_gate.lua) | Write watch on slot-B effect budget `_DAT_8007BDC0` + exec-bps on gate read `0x8004818C` and the `jal 0x801F7B88` at `0x800481A0`, each with the loader-B tracker | battle state, interp | The arm is an in-battle per-frame path the battle-end signal closes ([`cast-module.md`](../subsystems/cast-module.md#the-arm-is-an-in-battle-frame-path-not-a-teardown)) | |
+| [`autorun_w3a_slippery_call_frame.lua`](../../scripts/pcsx-redux/autorun_w3a_slippery_call_frame.lua) | The cast oracle's injection aimed at action id `0x92`, so PROT 0920 is resident and `_DAT_8007BDC0` non-zero; bps on `0x8004818C`, `0x800481A0`, `0x801F7B88` | battle state, interp | SCUS's one fixed-VA call into slot B firing (the only Slippery mid-cast backup is a mednafen state) | |
+| [`autorun_cast_voice_xa.lua`](../../scripts/pcsx-redux/autorun_cast_voice_xa.lua) | One Seru cast's CD-XA chain: cast-audio dispatcher `FUN_801F3990`, cue dispatcher `FUN_8004FCC8` (both decline gates at entry), clip starter `FUN_8003D53C` with `(clip slot, filter channel, duration)` | injected cast, interp | Confirms [the cue census](../subsystems/cast-module.md#the-casts-own-cd-xa-voice); the character-banded cue does not fire on a cast | |
+| [`autorun_spirit_item_cue_band.lua`](../../scripts/pcsx-redux/autorun_spirit_item_cue_band.lua) | Hijacks the action **category** at seed state `0x0C` (arm head `0x801E2BFC`) to reach jump-table slot `0x3D`, the one caller of `FUN_801F3990`; taps both category arms, `0x3C`, `0x3D`, the guard store, the dispatcher, its band `jal`, the clip starter | battle state, interp | Every driven item action fires the band. A Magic injection cannot reach it: the category-2 override to `0x3C` needs a spell id `< 0x65` | |
+| [`autorun_cast_cue_band_sweep.lua`](../../scripts/pcsx-redux/autorun_cast_cue_band_sweep.lua) | Whether the character-banded cue band ever fires on a player cast | see detail | [detail](#autorun_cast_cue_band_sweeplua) | |
+| [`autorun_panel_still_arm_census.lua`](../../scripts/pcsx-redux/autorun_panel_still_arm_census.lua) | Both of PROT 0978's streaming families (four `int.tim` index sites with their `LoadImage` calls, four field-restore ones), phase machine `FUN_801F6B24` + its counter; residency-gated | interp; `LEGAIA_OT_EVERY` adds a coarse `DrawOTag` tally (its silence is not evidence) | Makes "the panel still never loads here" a recorded zero. Slot B is shared, so ungated bps at these VAs count another image's code | |
+
+#### Audio
+
+| Probe | Captures | Run | Output / answer |
+|---|---|---|---|
+| [`autorun_audio_trace.lua`](../../scripts/pcsx-redux/autorun_audio_trace.lua) | Multi-frame retail trace for the audio-trace parity oracle | see detail | [detail](#autorun_audio_tracelua) | |
+| [`autorun_keyon_census.lua`](../../scripts/pcsx-redux/autorun_keyon_census.lua) | Exec-bps on libsnd note-on `FUN_80066308`, allocator verdict `0x80066C84`, `SpuSetKey` `FUN_8006B854`; SFX cue key-ons `FUN_80065034`, ring pushes + ring-id write watch, motion-VM cue pushes, CD-XA one-shots; clock rows with BGM id, PROT index, mute masks | interp; reads no SPU state, so counts are exact at any speed | Input to `legaia-engine audio-trace --retail-keyon-csv` ([audio.md](../subsystems/audio.md#count-the-key-ons-not-the-edges)) | |
+| [`autorun_audio_level_watch.lua`](../../scripts/pcsx-redux/autorun_audio_level_watch.lua) | Injects a summon from a pre-cast battle state; write watches on the duck cell `0x8007B910` and the applied level `0x8007B6EC` (pc / ra per store), one row per vsync with both words and each sequence record's `+0x58` | interp (the watches are Lua breakpoints) | Pins `FUN_8001698C`'s once-a-frame level apply ([audio.md](../subsystems/audio.md#a-sequence-volume-change-re-volumes-the-held-notes)) | |
+| [`autorun_movie_bgm_audibility.lua`](../../scripts/pcsx-redux/autorun_movie_bgm_audibility.lua) | Starts a mid-game movie by the `4C E2` op's two stores (`LEGAIA_FMV`), a tile poke (`LEGAIA_POKE_POS`) or CROSS taps (`LEGAIA_MASH_EVERY`); streams the SPU (`LEGSPU01`, [`probe.spu`](../../scripts/pcsx-redux/lib/probe/spu.lua)) with mode + BGM words | `LEGAIA_CALL` / `LEGAIA_FLAGS_OR` run one op-`0x35` arm first (interp only) | Whether the field score is audible under a movie ([`audio.md`](../subsystems/audio.md#movies-and-the-score)) | |
+
+#### Minigames
+
+| Probe | Captures | Run | Output / answer |
+|---|---|---|---|
+| [`autorun_minigame_overlay_capture.lua`](../../scripts/pcsx-redux/autorun_minigame_overlay_capture.lua) | The resident minigame overlay image | see detail | [detail](#autorun_minigame_overlay_capturelua) | |
+| [`autorun_minigame_fishing.lua`](../../scripts/pcsx-redux/autorun_minigame_fishing.lua) | Exec-bps on mode SM `FUN_801cf3bc` + tension tick `FUN_801d4004` (dedup by `$ra`, gauge `DAT_801d9168`); write watch on the fishing-point score `_DAT_8008444c` | `minigame_fishing_pcsx` | Tension and scoring writers ([`minigame-fishing.md`](../subsystems/minigame-fishing.md)) | |
+| [`autorun_fishing_lure_drift.lua`](../../scripts/pcsx-redux/autorun_fishing_lure_drift.lua) | Exec taps on the sign branch arms (`0x801D2E34` add / `0x801D2E48` subtract) with the counter each was reached with, walk-grid verdict `0x801D2E18`, store `0x801D2E58`, cast spawn `0x801CFC50`; drives the SM by its mode word | `minigame_fishing_pcsx` | The cast lure's sideways drift, measured | |
+| [`autorun_minigame_dance.lua`](../../scripts/pcsx-redux/autorun_minigame_dance.lua) | Exec-bps on beat-clock SM `FUN_801cf470` + hit judge `FUN_801d1960` (player / lane / variant args, groove gauge `DAT_801d544c`); dumps step chart `DAT_801d509c` + bonus table | `minigame_dance_pcsx` | Rating inputs ([`minigame-dance.md`](../subsystems/minigame-dance.md)) | |
+| [`autorun_dance_countin_frame.lua`](../../scripts/pcsx-redux/autorun_dance_countin_frame.lua) | A row per banner-animator call `FUN_801D2D98` (the envelope's whole input), a row per `FUN_801D2F38` emit `(x, widget, record, brightness)`, a main-RAM dump on the N-th call | the dance load-transition state (no state sits inside the count-in) | The animator advances its input by **3** per call, one call every three vsyncs; rows reproduce the ported envelope | |
+| [`autorun_dance_texpage_upload.lua`](../../scripts/pcsx-redux/autorun_dance_texpage_upload.lua) | `LoadImage` (`FUN_800583C8`), `MoveImage` (`FUN_80058490`), transfer handler (`FUN_80059BD4`); aggregates per `(kind, ra, rect)`, flags rects touching the `(960, 256)` page | interp | A zero is evidence only once a loading run has shown the taps firing | |
+| [`autorun_minigame_slot_machine.lua`](../../scripts/pcsx-redux/autorun_minigame_slot_machine.lua) | Exec-bps on reel SM `FUN_801cf0d8`, win eval `FUN_801d13e8`, LCG `FUN_801d30cc`; write watch on coin bank `_DAT_800845A4`; dumps payout-byte table `DAT_801d3598` | `minigame_slot_machine_pcsx` | Payout table + RNG ([`minigame-slot-machine.md`](../subsystems/minigame-slot-machine.md)) | |
+| [`autorun_minigame_baka.lua`](../../scripts/pcsx-redux/autorun_minigame_baka.lua) | Exec-bps on round SM `FUN_801d3468` + RPS resolver `FUN_801d3a14` (round index, attack types); write watch on gold `_DAT_80084440`; dumps AI move-pattern table `DAT_801d76e8` | `minigame_baka_pcsx` | Round and payout constants ([`minigame-baka-fighter.md`](../subsystems/minigame-baka-fighter.md)) | |
+| [`autorun_minigame_muscle_dome.lua`](../../scripts/pcsx-redux/autorun_minigame_muscle_dome.lua) | Exec-bps on round SM `FUN_801d0748` (phase `ctx+6`) + driver `FUN_801d388c`; resolves `ctx` -> fighter actor and reads the `+0x1df` queue; dumps tables `DAT_801f4b8c` / `DAT_801f4b94` | `minigame_muscle_dome_pcsx` | Per-round commit ([`minigame-muscle-dome.md`](../subsystems/minigame-muscle-dome.md)). The script's "deck / card" names are labels only: the mode is an arena ladder on the battle round SM | |
+| [`autorun_muscle_arena_shots.lua`](../../scripts/pcsx-redux/autorun_muscle_arena_shots.lua) | Runs the load-transition state forward tapping Cross; a screenshot every 240 vsyncs (`shot_<vsync>.screen` + meta, decode with `decode_pcsx_screen.py`) | `minigame_muscle_dome_pcsx`, `--fast` | Retail look of the arena (mist-free interior, [backdrop](../subsystems/minigame-muscle-dome.md#arena-backdrop-extraction-1225)) and HUD wording (`AP` bar, `ROUND` / `INTERVAL`, `TOTAL`) | |
+| [`autorun_w4d_dome_decal_flag.lua`](../../scripts/pcsx-redux/autorun_w4d_dome_decal_flag.lua) | The backdrop object-1 trim flag `_DAT_8007B64B` during a contest | see detail | [detail](#autorun_w4d_dome_decal_flaglua) | |
+
+#### Patched-disc verification
+
+These run a **patched** image. A save state carries retail RAM, so each either cold-boots,
+loads a memory card, or re-applies the patch's resident bytes (`LEGAIA_POKES`, the output of
+`legaia-patcher scus-pokes`). Background: [patched-disc taint](#patched-disc-taint) and
+[`randomizer.md`](randomizer.md).
+
+| Probe | Captures | Run | Output / answer |
+|---|---|---|---|
+| [`autorun_super_arts_pack_load.lua`](../../scripts/pcsx-redux/autorun_super_arts_pack_load.lua) | Head bytes + first name string of the block at `0x801FD000` at the injected battle-load stub's return; checks the landing zone is clear first | patched disc + retail `karisto_sol_pre_encounter`, `LEGAIA_POKES`, holds RIGHT into an encounter | The stub streams the block ([Super Arts Pack](randomizer.md#super-arts-pack-by-zetaphoenix)) | |
+| [`autorun_oscillating_ap_roll.lua`](../../scripts/pcsx-redux/autorun_oscillating_ap_roll.lua) | Exec-bps on the roll's entry in `SLOT6` and the setup site's resume word: the 16-byte side table + counter (expects 16 draws); counts guard / debit / damage hits | same shape as the pack probe | The per-battle roll runs ([oscillating AP](randomizer.md#oscillating-ap-costs)) | |
+| [`autorun_oscillating_ap_damage.lua`](../../scripts/pcsx-redux/autorun_oscillating_ap_damage.lua) | `s0 - s1` at the damage routine's entry and its return word; derives each strike's row from the art bank at `record0[+0x58]` | `battle_vahn_tri_somersault_super` + `LEGAIA_POKES` + the four 0898 detour words; `LEGAIA_FORCE_GRANT=0` is the cost-side control | An art's strike is `floor(dmg * pct / 100)`; a swing or connector is untouched | |
+| [`autorun_enemy_hp_bar_inject.lua`](../../scripts/pcsx-redux/autorun_enemy_hp_bar_inject.lua) | Writes the planned edits into RAM (from the module's `dump_ram_edits` test); screenshots + CSV of every gauge / icon / projector call | mid-battle state | Direct test of the routine ([enemy HP bars](randomizer.md#enemy-hp-bars)). The pass runs with the **stack in the scratchpad**: read its frame with the scratchpad reader. Cold-boot check: `capture_battle_mesh.sh` | |
+| [`autorun_shiny_recon.lua`](../../scripts/pcsx-redux/autorun_shiny_recon.lua) | Static: whether each of the 8 shiny detour sites is patched (`j`) and whether SCUS gap `0x80077728` carries routines. Live: the shiny marker `+0x226` on a boosted enemy, the `0x80` flag in party Seru level bytes (`record+0x161`) | the booted patched disc (`legaia_shiny_100.bin`) | Shiny-Seru install check; the `+35%` damage is read-side | |
+| [`autorun_cast_hook_live.lua`](../../scripts/pcsx-redux/autorun_cast_hook_live.lua) | RAM-injects the SCUS-gap stub + the 0898 applier-call redirect, watches a queued attack go through the hook | battle state | Live test of the cast-route queue hook | |
+| [`autorun_delilas_cast_e2e.lua`](../../scripts/pcsx-redux/autorun_delilas_cast_e2e.lua) | Battle load of the restructured player battle file through retail's own loader / rebaser | FIELD state on the patched ISO | Validates load survival only: a forced-context player cast parks at phase `0x70` on a retail disc too, so judge playout on a naturally entered battle | |
+| [`autorun_delilas_dome_course.lua`](../../scripts/pcsx-redux/autorun_delilas_dome_course.lua) | Pokes the arena warp (`_DAT_8007BA34 = 5`, mode `0x18`) and RAM-installs the SCUS cave routines the state lacks | patched Delilas disc, plain field save | Drives the real Muscle Dome course | |
+| [`autorun_delilas_gi_trace.lua`](../../scripts/pcsx-redux/autorun_delilas_gi_trace.lua) / [`_reward_trace`](../../scripts/pcsx-redux/autorun_delilas_reward_trace.lua) / [`_special_trace`](../../scripts/pcsx-redux/autorun_delilas_special_trace.lua) / [`_unpark`](../../scripts/pcsx-redux/autorun_delilas_unpark.lua) | The Gi-round HP-gated lockout arm; the win settlement; the signature-special softlock (`FUN_80050E2C` tag-search bp); the parked double-team round | same forced warp | Dome-course instrumentation. Weaken with one-shot 1-HP writes: blind mid-battle HP writes wedge the settle bookkeeping | |
+
+#### Inventory out-of-bounds and debug flags
+
+The arbitrary-write investigation over the unchecked item-add helper `FUN_800421D4`.
+
+| Probe | Captures | Run | Output / answer |
+|---|---|---|---|
+| [`autorun_debug_bit_poke.lua`](../../scripts/pcsx-redux/autorun_debug_bit_poke.lua) | Asserts `_DAT_8007B8C2` (dev / retail loader flag) and / or `_DAT_8007B98F` (debug-menu enable) every vsync | stable field state; stays running for a human | `_DAT_8007B98F = 1` brings up the debug menu on SELECT+△ in the NA retail build | |
+| [`autorun_inventory_fill.lua`](../../scripts/pcsx-redux/autorun_inventory_fill.lua) | Fills the 72 two-byte slots `0x80085958..0x800859E7` with Water Talisman ids; maxes gold + casino coins | setup step | The next item-add runs `FUN_800421D4` out of bounds | |
+| [`autorun_inventory_oob_writer.lua`](../../scripts/pcsx-redux/autorun_inventory_oob_writer.lua) | `probe.step.find_writer` on the key-item window `0x800859E8..0x800859F8`; flags stores from `0x800422BC` (the helper's unguarded id store) | after the fill, interp | Two callers reach it: casino exchange CROSS (id `0x9C` to `0x800859E8`) and unequip via the START menu (id `0xD0` to `0x800859EA`) | |
+| [`autorun_key_item_consumer_hunt.lua`](../../scripts/pcsx-redux/autorun_key_item_consumer_hunt.lua) | Fills the bag, optionally seeds key-item slot 0; Read bps on `0x800859E8..+0x18`, passive Write bps on `0x8007B8C2` / `0x8007B98F`; PC + RA per read | interp | Unique-PC summary of native readers of the OOB-writable bytes | |
+| [`autorun_flag_bank_watcher.lua`](../../scripts/pcsx-redux/autorun_flag_bank_watcher.lua) | Exec-bps on `FUN_8003CE08/CE34/CE64` (flag SET / CLR / TST); logs only indices at or above 5248 (the OOB-reachable start) | interactive: debug menu (SELECT+△), warp to credits | `*** OOB-REACHABLE ***` lines | |
+
+#### Runtime probe details
+
+##### `autorun_w4d_cort_flow_writer.lua`
+
+- **Probes:** width-1 Write watch on `ctx+0x06` (`ctx = *_DAT_8007BD24`), armed the
+  moment the pointer is live; per-vsync poll of flow / action state / intro timer
+  `+0x6D6` / stage phase `+0x289` / loader-B tracker + a 16-word FNV of slot B;
+  with `LEGAIA_STAGE=1`, exec-BPs on the PROT 0968 stage module's entry, its seven
+  phase arms and its hand-back store.
+- **What it answered:** the value logged is the one **about to be stored**, decoded
+  from the store instruction's source register, because the debug hook runs before
+  the store. The run is input-free until the park reproduces and then sweeps ten
+  buttons (`LEGAIA_IDLE` / `LEGAIA_SWEEP`; `LEGAIA_IDLE=-1` never sweeps), which is
+  what separates "waiting for a press" from "waiting for a clock". Settled the park
+  - see [`battle.md`](../subsystems/battle.md#flow-0x0c-is-the-boss-stage-modules-baton).
+  Writes `w4d_cort_flow.csv` / `.log` / `.detail.txt`. Interpreter mode.
+
+##### `autorun_w4d_dome_decal_flag.lua`
+
+- **Probes:** exec-BP at `0x80051ACC` - the branch that consumes the byte, with `v1`
+  still holding it, so each row carries both the value and the arm the loader took;
+  exec-BP on the loader entry `FUN_800513F0`; a width-1 Write watch on
+  `_DAT_8007B64B`.
+- **What it answered:** the write watch is a data watch rather than an exec-BP at
+  the known writer's overlay VA on purpose - slot A is VA-aliased across the field,
+  battle and arena modules, so an address alone names no module. A Cross cadence
+  advances the arena dialogue (`LEGAIA_ADVANCE=0` disables). Upgraded the arena's
+  object-1 trim from Inferred to capture - see
+  [`minigame-muscle-dome.md`](../subsystems/minigame-muscle-dome.md#object-1-is-trimmed-by-the-loader-_dat_8007b64b).
+  Interpreter mode.
+
+##### `autorun_w4d_melee_grunt_gate.lua`
+
+- **Probes:** exec-BPs on all seventeen `s7` definition sites in `FUN_801EC3E4`, on
+  the gate (`0x801EEA88` / `0x801EEAA0`), on both emission sites (`0x801EEB44`
+  grunt / `0x801EEBE8` sting) and on the `+0x1DA` commit `0x801EEC6C`.
+- **What it answered:** each gate visit records the **last definition that
+  executed**, i.e. the live reaching definition rather than an argued one, beside
+  the gate operands, the `s4` actor's `+0x1F3` / `+0x1DA` / `+0x1DB` / `+0x1DE`,
+  `_DAT_8007BC20` and `_DAT_8007BD84`. `LEGAIA_ADVANCE=2` interleaves Cross and
+  Left, which drives both the command ring and the directional arts screen. See
+  [`battle-action.md`](../subsystems/battle-action.md#the-sound-a-melee-swing-makes-and-which-half-of-it-the-port-has).
+  Interpreter mode, battle states only - the addresses are slot-A overlay VAs.
+
+##### `autorun_w5b_field_watch.lua`
+
+- **Probes:** `LEGAIA_WATCH` write watches (`addr:width:label`), each row
+  carrying the writer `pc` / `ra` and the value that **lands** - the debug hook
+  fires before the store, so the probe decodes the `sb` / `sh` / `sw` at `pc`
+  and reads its source register; `LEGAIA_EXEC` exec-BPs and `LEGAIA_READ` read
+  watches logging `a0..a3`, `v0`, `s1`, `s5..s8`; `LEGAIA_SAMPLE` per-vsync
+  words, addressed absolutely, player-relative (`P+0x10`) or through a pointer
+  word (`*0x801C6EA4+0x8`).
+- **Drives:** `LEGAIA_PRESS` pad holds with `+`-joined chords
+  (`330:DOWN+R1:150`), `LEGAIA_POKE` player position pokes, `LEGAIA_MEMPOKE`
+  one-shot memory writes (the encounter step counter, a story flag),
+  `LEGAIA_SHOTS` / `LEGAIA_CKPTS` screenshots and raw checkpoints,
+  `LEGAIA_ACTORS` a dump of the six field actor lists, `LEGAIA_TRIGGERS` the
+  scene's kind-0 / kind-1 / kind-2 trigger tables read out of the live field
+  buffer `*(0x1F8003EC)`. Frame numbers are vsyncs since the state load.
+- **Position pokes and the region box:** a position poke that moves the
+  player to another region of a scene without passing through a map door
+  leaves the region box (`0x1F800384..87`) stale. Actors outside the old box
+  keep the visibility-cull bit set by `FUN_801D79E8`, and the collision and
+  interact box tests (`FUN_801CF754`, `FUN_801CF9F4`) skip culled actors, so
+  the player walks through NPCs that would block a played game. Poke the
+  player onto a kind-0 map-door tile instead and let the game's own warp land
+  and re-latch the box.
+- **What it answered:** the clip-base writers and the per-tick system-channel
+  reset, the timed kind-0 warp's timings and the idle clip through it
+  ([`field-locomotion.md`](../subsystems/field-locomotion.md#retail-capture-of-the-base-writers));
+  a `town01` player arc tick for tick
+  ([`script-vm.md`](../subsystems/script-vm.md#0x43-sub-01ab---scripted-arc-jump));
+  where retail ends the `retock` innkeeper's talk; the slot-2 / slot-6
+  residency across a battle and a minigame warp
+  ([`audio.md`](../subsystems/audio.md#retail-capture-of-the-slot-2--slot-6-residency)).
+  Interpreter mode when any watch or breakpoint is armed; vsync-only runs
+  (pokes, checkpoints) work under `--fast`.
+
+##### `autorun_w4d_light_kind_hits.lua`
+
+- **Probes:** exec-BPs on the four light-capable prim handlers `0x8004409C` /
+  `0x8004423C` / `0x80044434` / `0x800445B0`, plus a control group on the bank-0 fog
+  handlers for kinds 12..19 and kind 16 bank 1.
+- **What it answered:** exec-BPs cannot miss an execution where the `dirty_exec_hot`
+  histogram can only say "not seen". The control group shares one counter and
+  self-disarms at `LEGAIA_CONTROL_CAP` hits, so a zero on the lit set is a
+  measurement and not a dead instrument, and the probe counts field-mode and
+  kingdom-overworld frames separately so a run that spent its budget inside a random
+  encounter cannot read as a clean world-map zero. `LEGAIA_WARP_BTN` is held until
+  the scene changes (`NONE` when already on the overworld), then D-pad legs of
+  `LEGAIA_LEG` vsyncs walk the map. See
+  [`renderer.md`](../subsystems/renderer.md#no-handler-in-the-lit-set-executes-on-a-kingdom-overworld).
+  Interpreter mode.
+- **The control is re-armed after the warp, from a different list**
+  (`LEGAIA_CONTROL_POST`, `LEGAIA_CONTROL_REARM`). The first window's SCUS fog
+  handlers fire in the town scene and then go silent on the overworld, because the
+  kingdom map renders through PROT 0901's overlay-resident replacements - so on the
+  map itself they are a control that proves nothing. The post-warp window arms those
+  eight replacements instead, and all eight fire on `map03`, which is what makes the
+  lit set's zero in the same run a measurement rather than a dead breakpoint.
+
+##### `autorun_slot4_consumer_pcs.lua`
+
+- **Probes:** Exec bps at the cluster-A + cluster-B LW PCs identified during the slot-4 RE.
+- **What it answered: Kingdom-agnostic** - hits the same SCUS function PCs regardless of where slot 4 lives in RAM for the destination kingdom. Confirmed cross-kingdom: cluster A and B fire on Drake, Sebucus (town → map02) and Karisto (town → map03) with the same caller RAs (cluster B's RA `0x80059C00` is byte-identical across all three; cluster A's RAs `0x8001B47C` inside `FUN_8001ada4` + `0x801F78D4` world-map overlay are present in every kingdom). Hit-count scales with per-kingdom record count. Output CSV is `probe_idx, cluster, pc, name, ra, a0..a3, s8`; `.detail.txt` sidecar captures first-hit call-context per PC. `LEGAIA_PC_CAP=N` raises the default 200-hit-per-PC cap for uncapped totals.
+
+##### `autorun_slot4_dispatcher_args.lua`
+
+- **Probes:** Exec bp at `0x80043390` (cluster A dispatcher entry).
+- **What it answered:** Captures the *original* call args before the kind handlers clobber `a1` / `a2`: caller RA, descriptor pointer `a0`, packed `cmd_flags` (`a1`), `fade_flags` (`a2`), and the first command word's `kind` / `count`. Use this to classify which of the four dispatcher banks (`0x00` / `0x50` / `0xA0` / `0xF0`) each call lands in. `LEGAIA_DISP_CAP=N` raises the default 200000-hit cap.
+
+##### `autorun_xp_table_reader.lua`
+
+- **Probes:** Read bps tiled across `0x8007123C..0x80071300`.
+- **What it answered:** Originally written to pin the runtime XP-table reader. **Superseded** - the real XP curve is `DAT_80076AF4`, read by the overlay applier `FUN_801E9504`; the old `0x8007123C` target is an off-by-`0x800` artefact over a sin-LUT slice (see [`subsystems/level-up.md`](../subsystems/level-up.md#xp-table)). Re-target the bps to `0x80076AF4` before re-running. The CSV / detail-sidecar shape of the probe is generic and reusable for any tiled-read-bp scan.
+
+##### `autorun_field_pack_projection.lua`
+
+- **Probes:** Exec bp at `FUN_8001F7C0` (scene asset loader) entry; one-shot Exec bp at the loader's return address; dumps post-load RAM window.
+- **What it answered:** Captures the loader's on-disc &rarr; RAM projection that a single save state can't observe. `LEGAIA_HOLD_BUTTON` / `LEGAIA_HOLD` drive the warp-tile input from inside the probe; the run quits ~30 vsyncs after the first post-load dump. Diff via [`scripts/pcsx-redux/diff_field_pack_projection.py`](../../scripts/pcsx-redux/diff_field_pack_projection.py) against the on-disc PROT bytes. What that window actually holds is the scene's GP0-primitive scratch, on every scene - `_DAT_8007B8D0 - 0x12800` is the field-file scratch base, not a pack base ([`field-pack.md`](../formats/field-pack.md)), which is why world-map scenes look no different from towns here.
+
+##### `autorun_boot_walk_snapshots.lua`
+
+- **Probes:** Multi-snapshot RAM-and-register probe; dumps at each emulator vsync in `LEGAIA_TARGETS` (comma-separated) with chunked reads spread across vsync callbacks.
+- **What it answered:** Walks a save state through several timeline points in one emulator launch. **Known limitation**: the chunked-read workaround works for ~2-4 close-together snapshots but degrades past ~10 chunks; for high-vsync targets prefer chained single-shots of `autorun_dump_full_ram.lua`.
+
+##### `autorun_countdown_trigger.lua`
+
+- **Probes:** Memory write-watchpoint at `LEGAIA_WATCH_ADDR` (default `0x801EF16C`, the title-attract countdown); width-2 `Write` BP. Optional screenshot via `PCSX.GPU.takeScreenShot()` taken inside the BP callback before the deferred RAM dump.
+- **What it answered: Watchpoint-driven RAM + screenshot snapshot** - fires the dump at the exact moment the game writes the watched register. `LEGAIA_HIT_SKIP` ignores the first N hits before snapshotting (default `1` to skip the boot-time DMA write). `LEGAIA_DUMP_BASE` / `LEGAIA_DUMP_LEN` restrict the dump window (default `0x801C0000` / `0x40000` = overlay window). Decode the screen to PNG via [`scripts/pcsx-redux/decode_pcsx_screen.py`](../../scripts/pcsx-redux/decode_pcsx_screen.py). Pinned `FUN_801DD35C` as the title-overlay tick - see [`subsystems/boot.md` § Tick function](../subsystems/boot.md#tick-function).
+
+##### `autorun_player_pos_watch.lua`
+
+- **Probes:** Write-watchpoint on the player actor world-position fields (`*(0x8007C364) + 0x14` X / `+0x18` Z), armed lazily in `on_capture` after the save loads (the target is a runtime pointer deref). Cycles the four d-pad directions (camera facing unknown) so at least one produces a position write.
+- **What it answered: Pinned the town/field free-movement integrator** - hits land in `FUN_801d01b0` (overlay 0897) at the four `sh player[+0x14/0x18]` stores `0x801D0684/06E4/0744/07B4`, with collision via `FUN_801cfe4c`. CSV columns `tick, axis, write_addr, pc, ra, prev_val` + a `.detail.txt` call-context sidecar. Run against a save parked in a walkable field/town. See [`subsystems/field-locomotion.md`](../subsystems/field-locomotion.md).
+
+##### `autorun_house_door_writer.lua`
+
+- **Probes:** `probe.step.find_writer` over the player position block `*(0x8007C364)+0x10..+0x20` (range write-watch, robust to store width/alignment), holding Up to enter a Rim Elm house. Writes each store **incrementally** (so a manually-closed window keeps the data).
+- **What it answered: Cracked the intra-town (house/interior) door mechanism** - entering a house is a field-VM `0x23 MOVE_TO` to the interior tile (the writer lands in `FUN_801de840` `case 0x23` at `0x801debc4`), not a scene change - same op class as the `0x3F` scene-change the door randomizer handles. Earlier write-watchpoints missed it (width-2 watch caught only a 2-byte no-op re-store); the range watch found the real writer in one run. See [`autorun_house_door_trace.lua`](../../scripts/pcsx-redux/autorun_house_door_trace.lua) (companion).
+
+##### `autorun_man_source.lua`
+
+- **Probes:** Exec breakpoint at the asset-type dispatcher `FUN_8001F05C`, filtered to the MAN dispatch (`a1 >> 24 == 3`). On hit logs `a0` (source pointer), size, `a2`/`a3` flags, caller RA, and the resulting `_DAT_8007b898` buffer, captures call context, and dumps the source bytes; also dumps the resident MAN at capture start. Drive a transition with `LEGAIA_HOLD_BUTTON` / `LEGAIA_HOLD`.
+- **What it answered: Pinned a field scene's runtime MAN source** (`_DAT_8007b898`). Caller is `FUN_80020224`, the `scene_asset_table` walker that reads the table base from `_DAT_8007b85c` and feeds the dispatcher `source = table_base + descriptor.data_offset`. Captured a standalone-town load: the MAN's LZS stream byte-matches a [`count=6 scene_asset_table`](../formats/scene-bundles.md) descriptor in the town's own PROT block - the variant a strict count-7 detector skipped. Run against the `overworld_into_town_man_load` scenario (Down ~0.75s into a town entrance).
+
+##### `autorun_title_overlay_writer_hunt.lua`
+
+- **Probes:** Write bps at 8 anchor addresses across the title-overlay code region (`0x801CC000..0x801EF018`).
+- **What it answered:** Pins the SCUS-side title-overlay loader: any write into the overlay window fires a BP whose `pc` + `ra` + call-context dump identify the writer function. Run cold-boot (`LEGAIA_NO_SSTATE=1`) since in-game saves are past the load point.
+
+##### `autorun_monster_record_source.lua`
+
+- **Probes:** Exec bps at the monster init `FUN_80054CB0` (logs the live record: name / HP / MP / stats), the battle archive loader `FUN_800542C8`, the relative disc-seek `FUN_8003E964` (`a0 = (id-1)*40` sectors → monster id), the generic disc read `FUN_8003E800` (logs the CdlLOC → disc LBA → PROT.DAT offset for 40-sector reads), and the retail host-trap open `FUN_800608F0`.
+- **What it answered: Pinned the monster stat archive** to PROT entry `0867_battle_data` (extended footprint): per-id `0x14000` LZS slot at `(id-1)*0x14000`. Run against a battle save (Rim Elm scripted fights). Three decoded records match the live actor stats byte-for-byte. The `monster_data` label (PROT 869) is a stub. See [`subsystems/battle.md` § Monster archive](../subsystems/battle.md#monster-archive-prot-entry-867).
+
+##### `autorun_battle_reward_source.lua`
+
+- **Probes:** Write breakpoints on the staged accumulator `0x80084440` (the minigame-winnings stage; at the time read as an "XP accumulator"), party gold `0x8008459C`, the casino-coin bank `0x800845A4`, and a candidate gold accumulator; each hit logs the writing PC + all GPRs + the new value, and the staged totals are snapshotted each second. Exec bps at `FUN_80026018` (then believed a battle commit - actually the mode-24 minigame exit handler, which a battle never calls) and monster-init `FUN_80054CB0`.
+- **What it answered: Confirmed the victory reward path.** Run against the `rim_elm_gimard_victory` scenario (a lone-enemy fight captured mid-combo so it resolves without input). Gimard's gold went `500 → 515` (+15) via a write at `FUN_8004E568`, matching the record's base gold (`+0x44`=60) through the lone-enemy `floor((gold>>1)/2)` formula. Pinned the reward fields to record `+0x44..+0x49` (gold / EXP / drop id / drop %). See [`subsystems/battle-formulas.md` § Victory spoils](../subsystems/battle-formulas.md#victory-spoils-rewards).
+
+##### `autorun_title_staging_capture.lua`
+
+- **Probes:** Exec bp at `FUN_8001A55C` (LZS decoder); per-decode src buffer dump.
+- **What it answered:** Pins the PROT source of the title overlay. Each fired decode dumps the compressed source bytes to `<OUT_DIR>/decode_NNN_*.bin`; an offline script byte-matches against PROT entries. Run cold-boot.
+
+##### `autorun_battle_palette_source.lua`
+
+- **Probes:** Write breakpoints on the party-palette blocks `0x800EBEE8` / `0x800EC0C8` / `0x800EC2A8` (Vahn / Noa / Gala); each hit logs the writing PC + all GPRs and flags any register whose 32 bytes match the block (the source). On the first LZS-range write it dumps the loaded source buffer `0x80180000..0x80186000`.
+- **What it answered:** Run against `rim_elm_queen_bee_battle` (auto-starts, no input). **Caveat:** in that capture the writes to `0x800EBEE8` come from `FUN_8001A55C` reading the loaded `town0c` scene bundle (PROT 0022 from `0x23430`), but the resulting value (`0x7965481F`) is **scene data, not the party palette** - `0x800EBEE8` is a *shared* work-arena address. So this probe confirms the scene bundle is LZS-decompressed into the arena at load, but does **not** pin the party palette (which is character-intrinsic, `0x409d…`, and is *not* a stored disc blob - see [`formats/character-mesh.md`](../formats/character-mesh.md), proven via the `lzs-decode find` brute). To pin the palette, write-watchpoint the *final* party-palette write in a **clean Tetsu/Drake fight**,
+  not the queen_bee context. The companion `autorun_battle_palette_lzs_src.lua` (Exec bp at the LZS entry) crashes under the battle's heavy decode load.
+
+##### `autorun_load_screen_dump.lua`
+
+- **Probes:** Loads sstate9 (parked on the Continue → Load screen), settles `LEGAIA_FRAMES` vsyncs, then dumps the rendered framebuffer via `PCSX.GPU.takeScreenShot()` + full 2 MiB main RAM.
+- **What it answered:** Ground-truth capture for pinning the load-screen panel border + slot-pill source sprites. Output `load_screen_fb.raw` + `.meta` decode to PNG via [`scripts/pcsx-redux/decode_load_screen.py`](../../scripts/pcsx-redux/decode_load_screen.py). The framebuffer pixels match PSX 320×240 coords 1:1, so sprite-rect dst positions can be measured directly. For full ground-truth VRAM (not just the rendered framebuffer), pair with `extract_vram_from_sstate.py` + `decode_vram.py` on the same save state - that pipeline pinned the load-screen panel CLUT to row 2 of the system-UI TIM at `PROT.DAT[0x018E0]`. The probe arms no breakpoints, so it runs with `--fast` for ~30s end-to-end.
+  See [`subsystems/save-screen.md` § Sprite asset sources](../subsystems/save-screen.md#sprite-asset-sources-continue--load-screen).
+
+##### `autorun_town01_script_flow.lua`
+
+- **Probes:** Exec bps at the scene-load init `FUN_8003aeb0`, the system-script prologue runner `FUN_8003ab2c`, the per-frame VM step `FUN_801de840` (deduped into a per-context table keyed by `a2` = ctx ptr: script_id `ctx+0x50`, bytecode `ctx+0x90`, pc range, hits), and the three nibble-7 collision-grid write sites `0x801e1d00 / 0x801e1d74 / 0x801e1e84`. Dumps the live collision grid (`*_DAT_1f8003ec + 0x4000`, scratchpad-resolved) at first + last frame with a wall-tile count + ASCII map.
+- **What it answered:** Pins a field scene's **script execution model** - which contexts run, their scripts, and whether walls are painted per-frame or only at load. On the `field_walled_collision_pin` scenario it showed: 7455 painted wall tiles, a single steady-state context (script_id `0xFB`, bytecode `0x8010F092`, looping pc `0x102..0x297` - matching the from-scratch engine's static trace), and **zero** nibble-7 paints while standing still (walls are load-time only). To capture the load-time paint flow, replay a pre-transition save / drive a step into a scene exit so `FUN_8003aeb0` + the nibble-7 BPs fire. See [`subsystems/field-locomotion.md`](../subsystems/field-locomotion.md).
+
+##### `autorun_battle_char_clut_source.lua`
+
+- **Probes:** [`autorun_battle_char_clut_source.lua`](../../scripts/pcsx-redux/autorun_battle_char_clut_source.lua) holds a walk direction to trigger a random encounter, then exec-bps the disc seek/read primitives (`FUN_8003E8A8` / `FUN_8003E964` / `FUN_8003E800`) to log every CdlLOC → absolute LBA → `PROT.DAT` offset over the battle-init window.
+- **What it answered: Pins the disc source of the battle-form party CLUT band** (VRAM rows 490..497, x=0..255). Save-state analysis proved these palettes are battle-context-loaded, persist in VRAM, and are NOT in main RAM in any captured save (transient decompress→DMA→free), nor verbatim on disc except Vahn's row 490 (map01/map02 sec0). **Run against a field sstate where the band is NOT yet resident** (the band is absent right after boot / before the first battle) so battle-init forces a fresh disc load. Map the logged LBAs to PROT entries with [`map_clut_disc_reads.py`](../../scripts/pcsx-redux/map_clut_disc_reads.py) (`--vram <mc_vram.bin>` confirms which entry's decompressed section holds the row-492 palette).
+  See [`reference/open-rev-eng-threads.md`](../reference/open-rev-eng-threads.md) "Battle character image + CLUT source".
+
+##### `autorun_battle_party_mesh_install.lua`
+
+- **Probes:** [`autorun_battle_party_mesh_install.lua`](../../scripts/pcsx-redux/autorun_battle_party_mesh_install.lua) write-watchpoints the three party TMD-pointer slots `DAT_8007C018[0..2]` plus an exec-bp on `tmd_register` (`FUN_80026B4C`) filtered to party indices (`DAT_8007B774 ∈ {0,1,2}`) and one on the battle loader `FUN_800520F0`. Loads a field save that auto-starts a battle (`--scenario rim_elm_queen_bee_battle`) so the field→battle transition is captured live; logs the installed pointer (`a0`), the **real caller** `ra` (from `tmd_register` entry, before its prologue saves `ra`), and a call-context snapshot.
+- **What it answered: Pins the battle-form party-mesh install callsite** - long mis-assumed to live in an uncaptured overlay. The party meshes are registered through the generic `tmd_register` from two **static SCUS** state-handlers: `FUN_800513F0` (lead/active actors, `tmd_register(*(actor+0x50)+0x18)` in a `while<3` loop, alongside the `FUN_80052FA0` palette decode; caller `ra=0x8005148C`) and `FUN_800542C8` (additional members, per-member loop `tmd_register(*(*rec+4))`; caller `ra=0x80054804`). Both are dispatched indirectly, so a static `0x8007C018` xref finds no writer. Installed pointers byte-match the battle form (Vahn → `0x80165F48`, the value a battle save holds).
+  **Caveat:** the write-watchpoint's `value` column shows the *pre-write* (old field) pointer because PCSX-Redux fires Write BPs pre-commit; the `tmd_register`-entry `a0` is the authoritative new value. See [`formats/character-mesh.md` § Battle form](../formats/character-mesh.md#assembly---object-local-pieces-posed-by-the-characters-own-battle-streams).
+
+##### `autorun_battle_render_capture.lua`
+
+- **Probes:** [`autorun_battle_render_capture.lua`](../../scripts/pcsx-redux/autorun_battle_render_capture.lua) reads the battle-render state from **inside the `func_0x801d02c0` grid-render breakpoint** (at frame 0 the camera globals + battle ctx hold stale field state and `_DAT_8007b83c` reads `0x00`): the camera globals (pitch `0x8007b790` / yaw `0x8007b792` / roll `0x8007b794` / TR `0x800840b8..c0` / H `0x8007b6f4`), the `func_0x801d02c0` grid dims + tile-constant scratchpad (`probe.read_scratch_u32`, NOT `read_u32` - the `0x1f80xxxx` scratchpad needs `PCSX.getScratchPtr`), and the battle actor structs (scanning the ctx for pointers whose `+0x72` scale is `~0x1000`).
+- **What it answered: Live-confirms the exact battle camera byte-exact.** Run on a real `map01` overworld battle save: `mode=0x15 pitch=32 roll=0 TR=(0,1280,7680) H=256`; grid `28×28` cells (`0x200` pitch); actors at scale `+0x72=0x1000` (1.0, not scaled - large on-screen size comes from the meshes); dome at `DAT_8007C018[2]`. Validates the RE'd camera in [`subsystems/battle.md` § Battle camera](../subsystems/battle.md#battle-camera-exact).
+
+##### `autorun_battle_cam_orbit.lua`
+
+- **Probes:** [`autorun_battle_cam_orbit.lua`](../../scripts/pcsx-redux/autorun_battle_cam_orbit.lua) samples the camera yaw `0x8007B792` (plus pitch, `TR.z`, the battle ctx flow byte `+6` and action state `+7`, the frame step `0x1F800393`) every vsync, with Exec breakpoints on the two retail stores that decrement it - the action SM prologue's at `0x801E2A6C` and the battle tick's at `0x801D07CC` - counted per row.
+- **What it answered:** the Begin/Run prompt's orbit rate and which writer drives it. On `battle_gaza2_prompt` (240 vsyncs, `ctx[+6] == 0x1E`, `ctx[7] == 0x00`) only the battle tick's store fires - the action SM is not run while the flow byte owns the frame - once per tick, the yaw dropping `2 × frame_step` each time: `−2` per display frame, the `−4` per camera step the engine's `ORBIT_STEP` runs. The two writers never sum. See [battle.md](../subsystems/battle.md#battle-camera-exact).
+
+##### `autorun_audio_trace.lua`
+
+- **Probes:** [`autorun_audio_trace.lua`](../../scripts/pcsx-redux/autorun_audio_trace.lua) calls `PCSX.createSaveState()` every `LEGAIA_INTERVAL` vsyncs; walks the protobuf in-place via FFI pointer arithmetic; slices out only the SPU sub-message (~600 KiB per capture vs. 20 MiB for the full state); appends to one binary stream prefixed with `LEGSPU01`.
+- **The slice is a Lua table, not a C API.** `PCSX.createSaveState()` returns a table whose metatable carries the payload directly: `.size` is a number, `.data` a `const void*` cdata, and `__len` gives the size again. There are no `getSliceSize` / `getSliceData` symbols in the shipped binary, and an `ffi.cdef` for them makes every capture throw `undefined symbol: getSliceSize`. The vsync listener swallows a Lua error into a bare `Runtime error while running LUA code` line with no message and no traceback, so that failure mode looks exactly like a slow capture while the output file sits at zero frames - which is why the capture body now runs under `pcall` and logs what threw.
+- **What it answered:** Multi-frame retail-trace input for the I1b(b) audio-trace parity oracle. Pair with [`extract_audio_trace_from_sstates.py`](../../scripts/pcsx-redux/extract_audio_trace_from_sstates.py) to decode into the JSONL `AudioTraceFrame` shape that `legaia-engine audio-trace --retail-jsonl` consumes. The probe runs against any save state - best signal comes from one parked mid-BGM. PCSX-Redux's Lua API does not expose the SPU register file directly, so `createSaveState` is the load-bearing primitive; the FFI walk avoids materialising the full 20 MiB state per vsync (which would degrade `GPU::Vsync` delivery via Lua GC pressure, same shape as the `readAt(2 MiB)` caveat above).
+
+##### `autorun_minigame_overlay_capture.lua`
+
+- **Probes:** [`autorun_minigame_overlay_capture.lua`](../../scripts/pcsx-redux/autorun_minigame_overlay_capture.lua) polls `game_mode` (`0x8007B83C`) per vsync from a minigame-entry save (or a by-hand run with `LEGAIA_NO_SSTATE=1`). On the first `0x18`/`0x19` read it logs the trigger vsync + the `0x3E` sub-id (`0x8007BA34`) + both overlay slot pointers, then dumps the overlay window `0x801C0000..0x80200000` at trigger-relative vsyncs (`LEGAIA_DUMP_OFFSETS`, default `0,10,30`), then one full main-RAM dump.
+- **What it answered:** The mode-24 (OTHER INIT) entry window for the Baka Fighter transition. **Live-confirmed** the `0x3E` operand−100 sub-id model (`0x8007BA34 = 4` through the whole window) and **refuted** the "PROT 0896 = mode-24 OTHER overlay" hypothesis: the SCUS-resident init (its `"other init end"` debug print) streams the per-minigame overlay directly into slot A, and 0896's bytes appear at no offset in any dump (`overlay_residency.py`).
+  Caveat: PCSX-Redux never exits on its own - the probe self-quits only after its LAST scheduled dump, so a long dump schedule under the slow interpreter can outlive the operator's patience (the session gets closed by hand and the tail dumps never land). Keep the offsets early or arm `request_quit` on the decisive dump. See [`reference/open-rev-eng-threads.md`](../reference/open-rev-eng-threads.md) "PROT 0896 identity".
+
+##### `autorun_battle_state_stream.lua`
+
+- **Probes:** a pure per-VSync poll - no breakpoints - so it is hot-path-safe and runs under `--fast` (recompiler) as well as the default interpreter. Each frame it calls [`probe.battle_state`](../../scripts/pcsx-redux/lib/probe/battle_state.lua)`.read()`, which reads the pinned battle globals (offsets in [`battle.md`](../subsystems/battle.md)): the actor pointer table `&DAT_801C9370` (8 slots, 0..2 party / 3..7 enemy), the battle ctx pointer `_DAT_8007BD24` (action ids `+0x06`/`+0x07`, active slot `+0x13`, turn `+0x09`), the per-monster-ordinal id array `DAT_8007BD0C`, the orbit-camera render mode `_DAT_8007B83C` (`0x15` in battle), and per-actor HP/MP/action/status/position.
+- **Output:** it diffs `signature()` frame-to-frame and writes newline-delimited JSON: a `delta` record on any meaningful change, a `full` sweep every `LEGAIA_STREAM_SWEEP` vsyncs (default 120), and a `full` sweep on every battle-enter (so a late or dropped consumer self-recovers). Position is excluded from the change key (id-and-scalar vocabulary only).
+- **Why it exists:** the shared EVENT SOURCE for the two delivery PRDs - the VRChat live battle diorama (a MIDI register stream) and the wgpu/OpenXR spectator viewport (UDP `BattleState` packets). The extraction layer is deliberately transport-free so neither target forks the probe; a MIDI/UDP encoder consumes `battle_state.read()` directly. It doubles as the reusable capture harness for the open battle RE threads (F-RAGE delegated-pick variability, F-RENDERMODE enemy summon, F-PAL) - point it at a mid-cast save and read the stream. Extraction logic is validated offline against a synthetic battle RAM image (stub `probe.mem`, assert `read`/`signature`/`to_json`); the offsets themselves are live-pinned in `battle.md`.
+- **Live validation:** confirmed on the `party_basic_attack_vs_gobu_gobu` library save - the first record reads `in_battle=true mode=0x15`, enemy slot 3 = monster id 4 (Gobu Gobu) at 76/76, party slot 0 at 128/128, all sane. A multi-frame run on `rim_elm_queen_bee_battle` emitted the periodic full sweeps (v0, v30) and exposed the field-mode gate: that save resumes at mode `0x03` (field), where the actor table holds stale field pointers - `read()` now gates slot `present` on `in_battle` so it reports `battle=false` with no bogus enemies.
+- **Caveat (save-state resume):** PCSX-Redux on the current build often segfaults a few vsyncs into a *resumed* battle save (seen across distinct saves AND a known-good control probe, at different points - it is emulator save-resume instability, not the probe; flushed-per-line output means the records captured before the crash survive). The PRODUCTION path is attaching to a *live* play session (the diorama/spectator use case), where there is no save-resume divergence; the save-state path is only for the RE-capture harness use and is best driven with a short frame budget.
+
+##### `autorun_field_camera_tr.lua`
+
+- **Probes:** three groups on one sampled frame. The ease `FUN_801DB510`'s single
+  exit (`0x801DB8E4`) snapshots the staging descriptor `0x801F3580`, the live eye
+  trio `0x800840B8/BC/C0`, pitch / yaw / roll / `H`, the camera parameter block,
+  the player's `(x, y, z)` and CP2C 0..31. A census group arms every `ctc2`
+  triple in `SCUS_942.54` that writes CP2C 5/6/7 - seventeen sites, found by
+  scanning the image for `(word & 0xFFE007FF) == 0x48C00000` - enabled only
+  inside the sample window, so the first `TR` write after the ease is measured
+  rather than assumed. Named taps then read `TR` after each GTE upload inside the
+  field view builder `FUN_800172C0`. Aliasing VAs are fingerprinted against their
+  expected first word before anything rests on them, and `FUN_80026F50` (the same
+  view-build shape for the other game modes) is armed as a liveness control.
+- **What it answered:** `TR` is `live_eye_trio + (R * focus_trio) >> 12`. The eye
+  trio reaches the matrix translation verbatim as 32-bit words (`FUN_8005B4B8` at
+  `0x80017334`) and is uploaded as `TR` by `FUN_8003D1A4`; the focus trio is the
+  low signed halfwords of `0x80089118 / 1C / 20`, read by three `lhu`; and both
+  the add and the `>> 12` are the single `MVMVA` inside `FUN_8003D344`, whose
+  `MAC1..3` go back over the translation for the final upload by `FUN_8005B6A8`.
+  Held exactly on all sixty sampled frames over `town01`, `uru` and `jouind`,
+  thirty-seven of them with the staging trio different from the live one. Also
+  falsified two premises: the field view builder is `FUN_800172C0`, not
+  `FUN_80026F50` (which fires zero times in a field frame), and on a scripted
+  shot the ease never runs at all while the view builder runs every frame.
+  See [`formats/encounter.md`](../formats/encounter.md#from-the-block-to-the-live-camera-compose-ease-snap).
+
+##### `autorun_cast_cue_band_sweep.lua`
+
+- **Probes:** the cast-audio dispatcher `FUN_801F3990`'s entry, the single
+  `jal 0x8004FCC8` at `0x801F3C18` that every one of its cue arms converges on
+  (so a hit *is* the band firing, and `a0` is the id it resolved), the
+  `actor[+0x1DF] == 0xFE` arm's own `jal 0x8003D53C` at `0x801F3A7C`, the cue
+  dispatcher and the CD-XA clip starter. It also taps the dispatcher's **only**
+  caller - `jal 0x801F3990` at `0x801E3E04`, one arm of the battle-action SM in
+  PROT 0898 - at the arm body and at the store the arm's
+  `actor[+0x1DA] == actor[+0x1D9]` queue-cursor guard gates, so a zero at the
+  dispatcher separates "the arm never ran" from "the arm ran and declined".
+  Casts are driven rather than resumed into: a plan of `seat:spell` pairs is
+  written into the acting seat's queued action one per window while CROSS is
+  tapped, several casts per run. Four byte fingerprints guard the aliasing VAs.
+- **What it answered:** the band's silence is its caller's. Over two driven
+  battles the SM arm does not run, the dispatcher is not entered and the band
+  does not fire, while the same runs record CD-XA clips started by the cast
+  modules' own hardcoded cues - the liveness control that keeps the zero from
+  being a dead instrument. The reference scan behind the caller tap is the
+  load-bearing part: the dispatcher has exactly one reference disc-wide in any
+  of the five forms (`find-address-word-refs.py 0x801F3990`), so the band's
+  reachability is that one arm's reachability and nothing else's. See the
+  cast-voice section of
+  [`cast-module.md`](../subsystems/cast-module.md#the-casts-own-cd-xa-voice).
+
+##### `autorun_throw_out_cursor.lua`
+
+- **Probes:** the two `sb zero` stores the Throw Out confirm makes itself
+  (`0x801D88FC` / `0x801D8910` in PROT 0899, both over
+  `0x80084140 + 0x1818 + _DAT_8007BB88 * 2`), the bag normalizer `FUN_800423E0`
+  and the active-window setter `FUN_8004313C`. The experiment does not need the
+  confirm: it punches holes into the 256-slot bag, walks into the pause Items
+  screen, steps the cursor with DOWN and logs the cursor word beside the id the
+  bag holds at that index every vsync. A cursor that is a slot index never rests
+  on a hole; one that is a list row does as soon as the renderer skips one. The
+  normalizer tap is what tells a null result apart from a compacted bag - if it
+  runs on menu open, retail's rows and slots cannot diverge in the first place.
+- **What it answered:** the cursor is a **bag slot**, and the displayed list
+  hides empty slots. Over a bag holed at slots 1 / 3 / 6, the cursor stepped
+  `0, 2, 4, 5, 7, 8` across six displayed rows and never rested on a zero-id
+  slot, so a row index and the cursor diverge as soon as a hole exists below the
+  selection - and holes do reach the menu, because the compaction helper ran
+  zero times (its one reference disc-wide is a field-VM arm, not the menu-open
+  path). The residency gate is load-bearing: PROT 0899 arrives in slot A only
+  after SELECT, and an ungated breakpoint at a 0899 VA counts the field
+  overlay's code until then. See
+  [`inventory.md`](../subsystems/inventory.md#accessors).
+
+##### `autorun_scene_entry_eye_seed.lua`
+
+- **Probes:** eight exec taps, each gated on the instruction word the
+  extracted image carries at that VA so a slot-A alias is reported instead
+  of counted. Two seed writers - `FUN_80025C24` in `SCUS_942.54` and
+  `FUN_801DE37C` in the field overlay - are tapped at their entry and at
+  their `jr ra`, so the row carries the eye trio `0x800840B8/BC/C0` both
+  before and after each writes it. Their three call sites are tapped too
+  (`0x801D698C` and `0x801D6DA8` inside the field MAIN INIT `FUN_801D6704`,
+  `0x8003B01C` inside `FUN_8003AEB0`), so the ordering is measured at the
+  callers and not only at the callees. The field view builder
+  `FUN_800172C0` and the tap right after it uploads the trio verbatim as GTE
+  `TR` complete the chain. A held direction repeats on a period so a
+  pre-transition state that misses its walk-on band gets several attempts in
+  one capture.
+- **What it answered:** the two writers do **not** race - they run in a
+  fixed order inside one routine, `FUN_80025C24` first and `FUN_801DE37C`
+  second, on all three scene entries captured (`dolk` -> `map01`,
+  `map01` -> `town0c`, `uru` -> `map03`), exactly as the two `jal` offsets
+  in `FUN_801D6704` predict. So `FUN_801DE37C`'s `(0, 0x200, 0x4000)` is the
+  seed that stands. What the first field frame's view reads, though, is
+  **neither**: by the next vsync the follow composer has already replaced
+  the trio, and the `TR` upload carries the composed value. The two writers
+  also agree on the angle trio - both write `(0x1B8, 0x64, 0)` - so the only
+  thing the ordering decides is the eye.
+- **It also falsifies "once per frame".** Run on a settled field state with
+  the budget opened up (`LEGAIA_VIEW_BUDGET=400`, no pad), the view builder
+  is entered **three times per vsync**, once from each of three distinct
+  return addresses - `0x801D0F98` and `0x801D185C` in the field overlay and
+  `0x80016678` in `SCUS_942.54`. Over the 134 vsyncs the budget covered,
+  133 carry exactly three and the 134th is the one the budget cut short.
+  On a scene-entry frame the live camera words can differ *between* two of
+  those builds. `cutscene.md` calls `FUN_800172c0` the "once-per-frame view
+  builder": the composition it describes is unaffected, but the frequency
+  is not a property anything had measured.
+- **Two traps it walked into, both worth reusing:** the visible-tile window
+  `FUN_801DE37C` seeds is **scratchpad** (`0x1F8003E8..EB`), and the
+  main-RAM reader returns zeros there - it has to go through
+  `probe.read_scratch_u32`. And a breakpoint on a `jr ra` fires **before**
+  the delay slot, which for this routine is the fourth window store, so that
+  byte still reads its previous value on the `seed_b` row.
+- **What the seeded window is worth:** `FUN_801DE37C` writes
+  `(-8, -6, 6, 10)` into `0x1F8003E8..EB` on every entry and the scene then
+  replaces it - `map03` runs at `(-18, -12, 18, 32)`, `uru` at
+  `(-21, -6, 19, 31)`. The seed is a floor, not a frame's value.
+
+##### `autorun_field_pad_ring.lua`
+
+- **Probes:** two exec taps on the camera-relative pad remap
+  `FUN_800467E8` in `SCUS_942.54` - its entry and the join its two
+  early-outs and its write-back all reach - each gated on the instruction
+  word the extracted image carries there. The pair is latched, so the `in`
+  row (the pad word `0x8007B850` the routine was handed) and the `out` row
+  (the word it wrote back) come from the **same** call; taking the two taps
+  independently pairs an `in` with some other call's `out`, which is how the
+  first run recorded an `out` whose direction nibble was zero. A third row
+  per cell is taken at the cell's last held vsync, for the settled actor
+  heading.
+- **How the input space is covered.** The rotation index `gp+0x2D8` is
+  scene content - its disc-wide writers are a field-VM `0x4C` arm and the
+  tile-board walker - so a free-roam save sits at whatever its own scene
+  authored, which for a `town01` state is `0`. The probe writes the index
+  itself, one value per cell, and holds each of the eight d-pad directions
+  in turn: eight rotations x eight directions in one capture. That makes
+  the rotations synthetic and the ring walk, the written mask and the
+  resulting heading real. Cells are ordered in opposite pairs so the sweep's
+  net walk is near zero and the player stays in the open; the scene word and
+  game mode ride every row, so a cell that walked into a transition is
+  visible rather than silently mixed in.
+- **Directions are held with `pad.force`, never by writing the mask.**
+  `FUN_8001822C` rebuilds `0x8007B850` from the real pad every frame, so a
+  RAM write to it does not survive to the call.
+- **What it answered:** the port's `World::remap_pad_direction` reproduces
+  retail's written direction nibble on every one of the 64 cells, and the
+  ring table live in RAM at `DAT_800766FC` is byte-identical to the one the
+  port carries and to `SCUS_942.54`'s own bytes. The settled actor heading
+  at `player+0x26` equals the engine's `render_26` plus the documented
+  half-turn on 61 of the 64; the three that differ are the sweep's three
+  largest turns, each still short of its target at the cell's last held
+  vsync, so they measure the turn rate rather than the remap.
+- **One trap worth reusing:** `bit.band` in LuaJIT yields a **signed**
+  32-bit integer, so a fingerprint word with bit 31 set (this routine's
+  entry is `lw v0,0x2d8(gp)` = `0x8F8202D8`) never compares equal to the Lua
+  number literal. Normalise both sides. A tap that gets this wrong reports
+  every hit as an alias and silently records nothing - and the two taps here
+  differ only in that one has the high bit and the other does not, which is
+  exactly the shape that makes the defect look like a genuine finding about
+  the tap that "aliased".
+
+##### `autorun_scene_name_hijack.lua`
+
+Some scenes are unreachable from every catalogued save - `juui1` has no
+library state at all - so nothing shows what retail draws there. The field
+VM's op `0x3F` (named scene change) carries its destination **inline in the
+bytecode**, `[u16 seat][u8 name_len][name bytes]`, so a probe that breaks on
+the VM's per-op dispatcher `FUN_801DE840` can rewrite the name in the live MAN
+buffer before the op consumes it and let retail's own loader do the rest.
+
+- **The swap lands, and the loader honours it.** From
+  `drake_castle_to_worldmap` the door is `index=85 name='map01'` at
+  `bytecode 0x800F5CE7 pc 0x0014`, two vsyncs into the held press. Rewritten
+  to another five-letter scene, the game's own load trace changes with it -
+  `map01` stages VAB `2035`, BGM `2000`, packet size `178`; the replacement
+  staged VAB `2088`, BGM `2011`, packet size `240`. So the bundle under the
+  new name is what loaded.
+- **The frame it produces is still not evidence about that scene.** The seat
+  index belongs to the door's original destination, and this door's
+  destination is a world map, so the replacement is entered through the
+  world-map path and draws nothing: every frame of a 1000-vsync run is pure
+  black outside the player sprite and the HUD. The **control** is what
+  settles it - a hijack into a scene the game draws brightly renders exactly
+  as black, at the same mean luminance and the same fraction of non-black
+  pixels. Writing the seat index too (`LEGAIA_HIJACK_SEAT`) does not fix it
+  from this donor either; the player lands at the same coordinates with seat
+  `0` as with seat `85`. **A brightness or content question needs a
+  field-to-field donor door**, where the index is a field seat.
+- **Run the control every time.** Without it a black frame reads as a finding
+  about the scene, and the same black frame appears for a scene that is not
+  dark at all.
+- **The scene-name word `0x8007050C` is an output, not an input.**
+  `LEGAIA_HIJACK_SCENE_WORD=1` overwrites it instead of the bytecode; the
+  word then reads the replacement name for the rest of the run and the game
+  loads the original scene anyway - the Drake world map, drawn normally. The
+  word is the label the loader writes, so a capture that reads a scene name
+  out of RAM is reading what the loader said, not what it was asked.
+- **Same-length rule.** The name is inline in the bytecode, so a replacement
+  of a different length would need `name_len` changed and would shift every
+  following instruction. The probe refuses the swap and says so rather than
+  corrupting the script.
+- **`bit.band` is signed in LuaJIT**, so `n32(a0)` on a KSEG0 pointer comes
+  back negative and the usual `a0 < 0x80000000` guard then rejects every hit.
+  The first run of this probe reported zero doors while the dispatcher was
+  entered 1072 times. Use `tonumber` for pointers.
+
+###### Finding a donor door without running the probe
+
+The probe's read-only mode lists the doors **one state's run** happens to
+reach; `legaia-patcher doors --input <disc>` lists every op-`0x3F` door on the
+disc, which is the same question answered once for all scenes. The disc carries
+368 of them. 250 are field-to-field - neither end a world map - and of those, 41
+have a five-letter destination, spread over 17 source scenes, so a donor for a
+five-letter target is not scarce; what is scarce is a save state parked next to
+one.
+
+Two consequences for `juui1` in particular:
+
+- **It has an ordinary field-to-field door of its own.** `conc2` reaches it
+  directly (`index 587`, seat `(0x00,0x00)`, MAN offset `0x7F12`), so the scene
+  needs no hijack at all - a state anywhere in `conc2` would enter it through
+  retail's own field path, which is exactly the entry the black-frame result
+  above says the question needs.
+- **No catalogued PCSX-Redux state is one press from a usable donor.** Of the
+  scenes with such a door, only `teien` has a state (`teien_field_run`), and a
+  900-vsync run there holding the probe's default direction enters the VM
+  dispatcher 600 times and sees **zero** op-`0x3F` doors. The player is not
+  near that exit, so the donor has to come from a new capture either way.
+
+### Save-state to Python (offline analysis)
+
+| Script | Input | Output |
+|---|---|---|
+| `dump_kingdom_ram_layout.py` | `.sstate` files for the three kingdoms | Per-kingdom RAM-layout JSON used by the `world-overview` page. |
+| `walk_actor_lists.py` | `.sstate` for a world-map session | Walks the seven actor-list heads + dumps per-actor records (used by `resolve_actor_tmds.py`). |
+| `resolve_actor_tmds.py` | `.sstate` + the kingdom slot-1 TMD pack | Walks `actor[+0x44]` mesh-head chains, finds the containing TMD via backward magic-word search, maps to a pack slot. Output is `site/world-overview-live.json`. |
+| `verify_slot4_in_ram.py` | `autorun_dump_slot4.lua` output | Confirms the live RAM region matches the disc-decoded slot-4 sub-bodies byte-for-byte. |
+| `diff_slot4_ram_vs_disc.py` | Live + disc slot-4 bytes | Generates the byte-level diff visualisation. |
+| `match_prim_groups_to_disc.py` | Live prim-pool dump + disc TMD pack | Matches POLY_FT4 prim groups back to their source TMD bodies. |
+| [`diff_field_pack_projection.py`](../../scripts/pcsx-redux/diff_field_pack_projection.py) | `.post.NN.bin` + `.meta` from the field-pack projection probe; on-disc LZS-decoded PROT entry | Walks `town01`'s pack offset table (`CANONICAL_SCHEMA`, 96 members - the tool still calls it a "97-slot schema", counting the leading count word as a slot); for each member, compares runtime RAM bytes against on-disc bytes and prints a per-member diff sorted by changed-byte count, plus a hex preview of the first divergence. Both this tool and its probe predate the [field-pack correction](../formats/field-pack.md): the window they capture is the scene's **primitive scratch**, not a projection of the pack. |
+| [`analyze_capture_arm_gating.py`](../../scripts/pcsx-redux/analyze_capture_arm_gating.py) | An `autorun_capture_arm_gating.lua` run directory | Per-arm dwell table - ticks, VSyncs, the countdown at the arm's first and last tick, the drain and the summed frame step - plus a CSV. The gate test sums the per-tick steps because the frame step `*(0x1F80037D) * *(0x1F800393)` is adaptive and changes inside one cast; scaling the arm's first step reports a countdown-gated arm as ungated. A run with no ticks is reported as an empty walk rather than skipped, because a zero reads exactly like "the body never ran". |
+| [`decode_pcsx_screen.py`](../../scripts/pcsx-redux/decode_pcsx_screen.py) | `<OUT>.screen` + `.screen.meta` from `autorun_countdown_trigger.lua` (or any probe that calls `PCSX.GPU.takeScreenShot()`) | PNG of the visible framebuffer at the capture moment. Decodes BGR555 (`bpp=16`) or BGR888 (`bpp=24`). Pillow required for PNG output; falls back to raw RGB888 if Pillow is missing. |
+| [`decode_load_screen.py`](../../scripts/pcsx-redux/decode_load_screen.py) | `load_screen_fb.raw` + `.meta` from `autorun_load_screen_dump.lua` | PNG of the rendered load-screen framebuffer. Dependency-free (uses stdlib `zlib` + manual PNG chunks); pixel coordinates match PSX 320×240 framebuffer 1:1. Pairs with the panel-source RE in `subsystems/save-screen.md`. |
+| [`extract_audio_trace_from_sstates.py`](../../scripts/pcsx-redux/extract_audio_trace_from_sstates.py) | The `LEGSPU01`-magic binary stream from `autorun_audio_trace.lua` | JSONL stream of `AudioTraceFrame` records consumed by `legaia-engine audio-trace --retail-jsonl` and the disc-gated `audio_trace_multi` integration test. Walks PCSX-Redux's SPU protobuf schema: 24 × Channel sub-messages (Chan::Data + ADSRInfo + ADSRInfoEx) plus the 512-byte SPU register file (MainVol_L / MainVol_R at offset 0x180/0x182, Reverb_Mode at 0x1AA). Voice "audible" = `ADSRInfoEx.EnvelopeVol > 0` - see [the audibility predicate](#the-audibility-predicate-is-the-envelope-not-the-key-state). |
+| [`extract_vram_from_sstate.py`](../../scripts/pcsx-redux/extract_vram_from_sstate.py) | A PCSX-Redux `.sstate*` file | 1 MiB raw BGR555 VRAM blob (`vram.bin`). Gunzips the save state and finds the GPU.vram protobuf field (canonical tag `0x1A 0x80 0x80 0x40` = field 3, wire-type 2, length 0x100000). Dependency-free. The PCSX-Redux equivalent of `mednafen-state vram-dump`: ground-truth VRAM at any parked state, useful for back-referencing sprite sources and CLUT rows against the extracted TIM corpus. |
+| [`decode_vram.py`](../../scripts/pcsx-redux/decode_vram.py) | `vram.bin` from `extract_vram_from_sstate.py` | 1024×512 PNG of the BGR555 VRAM. Stdlib-only. Pixel coords map 1:1 to PSX VRAM `(fb_x, fb_y)`, so CLUT rows at `fb_y=480+` and texture pages at `fb_x≥640` are visible at a glance. |
+| [`overlay_residency.py`](../../scripts/pcsx-redux/overlay_residency.py) | A PCSX-Redux `.sstate`, a 2 MiB main-RAM dump, or a window dump (`--window-base`); plus an as-loaded PROT overlay payload + its base VA | Per-chunk byte-match report answering "is this overlay RESIDENT at its base in this state?". Matches over non-zero payload bytes only; `--split <va>` separates an entry's unique head from its over-read tail (a 1.00-matching *suffix* usually means a *different* overlay is resident in the next slot window). Reads main RAM straight out of the sstate protobuf. Established the 0897/0899 slot-A swap across the casino prize-exchange flow + the PROT 0896 pre-transition negative. |
+| [`scan_panel_prims.py`](../../scripts/pcsx-redux/scan_panel_prims.py) | A 2 MiB main-RAM dump (e.g. `load_screen_ram.bin`) + optional `--rect X0 Y0 X1 Y1` framebuffer rect | Lists every GP0 textured-sprite primitive (cmd byte `0x64..0x67`) whose dst falls in the rect, decoded into `(dst_x, dst_y, u, v, clut_x, clut_y, w, h)`. Groups by CLUT so the unique source tiles each CLUT references stand out. Used to pin the 9-slice tile geometry of the load-screen panel (14 prims sampling CLUT row 2 of the system-UI TIM) - see [`subsystems/save-screen.md`](../subsystems/save-screen.md#sprite-asset-sources-continue--load-screen). |
+| [`decode_battle_mesh.py`](../../scripts/pcsx-redux/decode_battle_mesh.py) | The 2 MiB RAM dump from `autorun_battle_mesh_dump.lua` | Decodes the assembled in-RAM battle meshes (per-seat part tables) for the battle-mesh differential - the offline half of the [memory-card capture tier](#memory-card-capture-tier). |
+| [`isolate_card_save.py`](../../scripts/pcsx-redux/isolate_card_save.py) | A `.mcd` memory-card image | Copies one save into an otherwise-blank card, so a card-tier boot loads exactly the intended save regardless of what else the source card carries. The load grid places a save by its product-code suffix, not its card block, so `--restamp 0` rewrites the kept save's `...PRO-NN` suffix to `-00` and the calibrated CONTINUE ladder lands on it. |
+
+#### The audibility predicate is the envelope, not the key state
+
+"Which voices is retail sounding right now" has four candidate answers in a
+PCSX-Redux SPU snapshot, and three of them over-count. `Chan::Data.stop` is
+set at key-off and **stays** set once the release tail has drained, so it
+counts finished voices; `Chan::Data.on` is the keyed flag, which a voice can
+hold while its envelope is already at zero; `ADSRInfoEx.state` sits at a
+configured value for voices nothing is driving. Only `ADSRInfoEx.EnvelopeVol`
+(the varint field whose values span `0..0x7FFF` and move on nearly every
+voice) goes to zero when the voice does. Over a town-scene capture the four
+give, per frame: `on || stop` 18-23 of 24 voices, `state != Stopped` 13-24,
+`on` alone 7-22, and the envelope 3-19.
+
+The same question has the same answer on the mednafen side, and it used to
+have a different one there: `ADSR.Phase` in a mednafen PSX state is
+`0 = Attack` .. `3 = Release` with **no** `Off` member, so a `phase != 0` test
+calls every drained voice audible. Both readers now key on the envelope, which
+is also where the engine mixer's own trace draws the line (`Phase::Off`), so
+all three sides of the audio-trace oracle mean the same thing by "active".
+
+### One-shot wrappers
+
+[`run_probe.sh`](../../scripts/pcsx-redux/run_probe.sh) is the single
+canonical shell harness for every probe. It accepts both env vars
+(`LEGAIA_LUA`, `LEGAIA_SSTATE`, `LEGAIA_OUT`, `LEGAIA_OUT_DIR`, …) and
+matching `--lua` / `--sstate` / `--out` / `--out-dir` / `--scenario` /
+`--iso` / `--spec` / `--fast` / `--timing` / `--isolate-config` /
+`--log` flags. Output defaults to `captures/<probe-stem>/<iso-timestamp>/`
+so each run gets a fresh per-run subtree; probes write through
+`probe.out_path`, so `--out-dir` redirects every artifact of a run (CSV,
+screenshots, RAM dumps) at once. The memory-card pair is env-only:
+`LEGAIA_MCD1` / `LEGAIA_MCD2` (no flag form - `-memcard2` is broken in
+this PCSX-Redux build, `main.cc` assigns `argPath1` to slot 2, so card
+choice goes through the config the runner writes).
+
+```bash
+# Default world-map probe (interpreter mode, Lua BPs fire).
+bash scripts/pcsx-redux/run_probe.sh
+
+# Pick a different probe.
+bash scripts/pcsx-redux/run_probe.sh --lua scripts/pcsx-redux/autorun_dump_slot4.lua
+
+# Resolve the save state via a named scenario from scripts/scenarios.toml
+# (a PCSX-Redux-backed scenario; mednafen-only backups can't load here -
+# see `manage-states.py library --audit` for which scenarios qualify).
+bash scripts/pcsx-redux/run_probe.sh --scenario party_basic_attack_vs_gobu_gobu \
+    --lua scripts/pcsx-redux/autorun_battle_state_stream.lua
+
+# Cold-boot a title/boot probe (no save state - runs from power-on).
+LEGAIA_NO_SSTATE=1 bash scripts/pcsx-redux/run_probe.sh \
+    --lua scripts/pcsx-redux/autorun_countdown_trigger.lua
+
+# Cold boot through the title into the game: add -fastboot (the default
+# boot path stalls on an early CD read in headless -run).
+LEGAIA_NO_SSTATE=1 LEGAIA_FASTBOOT=1 bash scripts/pcsx-redux/run_probe.sh \
+    --isolate-config --lua scripts/pcsx-redux/autorun_play_from_boot.lua
+
+# Fast (recompiler) mode - FORCES `-dynarec` (overriding the persisted
+# interpreter+debugger config; confirm top bar = CPU: Dynarec). Lua **BPs
+# do NOT fire** under the recompiler, so this is for vsync-event-only
+# probes: full-RAM dumps and the poll-diff progression capture below.
+bash scripts/pcsx-redux/run_probe.sh --fast \
+    --lua scripts/pcsx-redux/autorun_state_poll.lua
+```
+
+
+
+### Memory-card capture tier
+
+[`capture_battle_mesh.sh`](../../scripts/pcsx-redux/capture_battle_mesh.sh)
+is the chain for observing what a **patched disc** actually loads: cold
+boot the patched image, load a save from a **memory card**, force the
+battle under test, dump the full 2 MiB of RAM
+(`autorun_battle_mesh_dump.lua`), then decode offline
+(`decode_battle_mesh.py`). Three rules make the tier what it is:
+
+- **A save state replays stale RAM and masks the disc bytes under test.**
+  Any content the loader builds at load time (battle meshes, staged
+  record rows, rebased modules) arrives from whatever disc the *state*
+  was made against; only a cold path through the loader observes the
+  patched image. This is the savestate RAM-cache trap in probe form.
+- **PCSX-Redux auto-applies a sibling `.ppf`** sitting next to the image
+  it is handed (`cdrom/ppf.cc`: the image path with its extension replaced
+  by `.ppf`), silently bar a `[+ppf]` log token - an unstaged disc
+  directory can test a different image than the one named on the command
+  line. `run_probe.sh` stages every image itself (see
+  [The harness](#the-harness)); a script that launches the emulator
+  directly must stage too, as `capture_battle_mesh.sh` does.
+- **Card selection is env-only** (`LEGAIA_MCD1`/`LEGAIA_MCD2` - see the
+  wrapper section above for why `-memcard2` cannot be used).
+
+### GDB-stub bridge (`gdb_probe.py`)
+
+[`gdb_probe.py`](../../scripts/pcsx-redux/gdb_probe.py) is the
+one-shot escape hatch. PCSX-Redux exposes a GDB Remote Serial Protocol
+stub on TCP port 3333 (settings: *Emulator → GDB server port*); this
+script speaks the protocol directly. Use it when the `.probe.toml`
+state machine is overkill - ad-hoc reads, single-shot
+"break-here-read-there" investigations, register dumps.
+
+| Subcommand | Use |
+|---|---|
+| `read-mem ADDR LEN [--out F]` | Hex dump or raw bytes to file. ADDR is hex or a Ghidra symbol. |
+| `read-regs` | Dump 38 PSX MIPS GPRs + PC. |
+| `write-mem ADDR HEXBYTES` | Patch memory in-flight. |
+| `when-pc-hits ADDR --read-mem A,L [--out F]` | One-shot: arm exec BP, continue, read on hit, disarm. |
+| `watch ADDR LEN --kind {read,write,access}` | Insert a watchpoint, print the stop reply when it fires. |
+| `selftest` | Run protocol-codec + client self-tests against an in-process mock server (no live emulator needed). |
+
+When to use this vs `.probe.toml`:
+* `.probe.toml` for **repeatable captures** that produce a CSV which
+  `probe.py regress` can gate on.
+* `gdb_probe.py` for **one-shot ad-hoc queries** - no schema, no
+  scenario, no state machine to author.
+
+```bash
+# Read 512 bytes of the kingdom slot-4 region in-flight:
+scripts/pcsx-redux/gdb_probe.py read-mem 0x8011A624 512
+
+# Dump registers right now:
+scripts/pcsx-redux/gdb_probe.py read-regs
+
+# One-shot break-and-read: when the title overlay tick fires, dump the
+# attract-countdown register:
+scripts/pcsx-redux/gdb_probe.py when-pc-hits FUN_801DD35C \
+    --read-mem _DAT_801EF16C,16
+```
+
+Symbol names resolve via the same `ghidra/scripts/symbols/symbols.json` the Lua
+probe layer uses; misses raise with the regenerate-via hint. Hex
+(`0x801DE840`, `801de840`) is always accepted.
+
+### Analysing probe outputs (`probe.py`)
+
+[`probe.py`](../../scripts/pcsx-redux/probe.py) is the Python-side
+companion to a `.probe.toml` run. It operates on the CSV outputs and
+provides four operations the Lua side intentionally doesn't try to do
+in-emulator:
+
+| Subcommand | Use |
+|---|---|
+| `probe.py summary RUN` | Header + row count + canonical fingerprint. |
+| `probe.py fingerprint RUN` | SHA-256 over canonicalised rows. Independent of row order and of `--ignore`d columns. |
+| `probe.py diff BASELINE CURRENT` | Set-diff: added / removed rows. Useful for inspecting why two runs differ. |
+| `probe.py regress BASELINE CURRENT` | Fingerprint compare. Exits 0 on match, 1 on regression. Foundation for Phase G CI gating. |
+
+`--ignore COL[,COL...]` drops named columns before comparison /
+hashing. Use it for fields that naturally vary between runs without
+representing a regression - most commonly `tick` (the per-bp hit
+counter is order-dependent) and sometimes `pc` (when the same code path
+gets reached via different inlining decisions across overlay rebuilds).
+
+```bash
+# Re-run a probe spec, compare against a committed baseline:
+bash scripts/pcsx-redux/run_probe.sh --spec scripts/pcsx-redux/probes/xp_table_readers.probe.toml
+scripts/pcsx-redux/probe.py regress \
+    captures/baselines/xp_table_readers.csv \
+    captures/xp_table_readers/<latest>/xp_table_readers.csv \
+    --ignore tick
+```
+
+## Authoring a new probe
+
+Two shapes are supported, in order of preference:
+
+### Declarative .probe.toml (simple probes)
+
+For "arm N breakpoints, dump K columns to CSV" or "settle then dump a
+RAM region", the probe is a single TOML file under
+[`scripts/pcsx-redux/probes/`](../../scripts/pcsx-redux/probes/) with
+no Lua code at all. The shared
+[`probes/_runner.lua`](../../scripts/pcsx-redux/probes/_runner.lua)
+parses the spec via
+[`lib/probe/toml.lua`](../../scripts/pcsx-redux/lib/probe/toml.lua)
+and dispatches into
+[`lib/probe/spec.lua`](../../scripts/pcsx-redux/lib/probe/spec.lua).
+
+Schema (see
+[`probes/xp_table_readers.probe.toml`](../../scripts/pcsx-redux/probes/xp_table_readers.probe.toml)
+for the breakpoint-fan-out case and
+[`probes/dump_full_ram.probe.toml`](../../scripts/pcsx-redux/probes/dump_full_ram.probe.toml)
+for the RAM-dump case):
+
+```toml
+scenario        = "title_attract"   # informational; LEGAIA_SSTATE wins
+capture_frames  = 600
+output_path     = "my_probe.csv"
+capture_columns = ["tick", "addr", "pc", "ra", "value_u32"]
+
+[detail]                            # optional: first N hits get full
+hits = 8                            # register/code/stack snapshots in a
+path = "my_probe.detail.txt"        # .detail.txt sidecar
+
+[[breakpoint]]                      # individual breakpoint
+addr  = 0x80017EC8
+kind  = "Exec"                      # "Exec" | "Read" | "Write"
+width = 4
+name  = "world_map_tick"
+
+[[breakpoint_range]]                # fan out N adjacent breakpoints
+base     = 0x8007123C
+length   = 196                      # bytes
+stride   = 4                        # bytes per bp
+kind     = "Read"
+name_fmt = "xp+0x%03X"              # %X / %x / %d = byte offset from base
+```
+
+Capture-column vocab (built into
+[`lib/probe/spec.lua`](../../scripts/pcsx-redux/lib/probe/spec.lua)):
+`tick`, `addr`, `offset`, `pc`, `ra`, `sp`, `width`,
+`value_u8` / `value_u16` / `value_u32`.
+
+Run it:
+
+```bash
+bash scripts/pcsx-redux/run_probe.sh \
+    --spec scripts/pcsx-redux/probes/my_probe.probe.toml \
+    --scenario title_attract     # or --sstate /path/to/state.sstate
+```
+
+Validate the schema (without launching PCSX-Redux):
+
+```bash
+python3 scripts/pcsx-redux/probes/_check_specs.py
+```
+
+If `lua5.1` is available, the validator also parses each spec via
+`lib/probe/toml.lua` and asserts the structural output matches Python's
+`tomllib` - catches divergence between the Lua TOML reader and
+the canonical TOML spec.
+
+### Lua autorun (bespoke probes)
+
+For anything more elaborate (per-hit logic that depends on register
+state, multi-state-machine probes, dynamic breakpoint arming, etc.),
+write a Lua autorun. The fastest path:
+
+1. Start from
+   [`scripts/pcsx-redux/autorun_slot4_consumer_pcs.lua`](../../scripts/pcsx-redux/autorun_slot4_consumer_pcs.lua)
+   - the canonical thin probe (~145 lines) that uses the shared
+   library for everything except the per-probe breakpoint body.
+2. Edit the `PROBE_OFFSETS` (or your own probe-address list), the CSV
+   header, and the per-hit row written from inside the breakpoint
+   callback. The boot-delay / capture-vsync / disarm state machine
+   comes from `probe.run({...})` - don't reimplement it.
+3. Run with the harness:
+   ```bash
+   LEGAIA_LUA=scripts/pcsx-redux/autorun_your_thing.lua \
+   LEGAIA_OUT=/tmp/your_probe.csv \
+       bash scripts/pcsx-redux/run_probe.sh
+   ```
+4. Iterate on the live CSV. The harness re-launches the emulator
+   per run; the CSV is overwritten each time. While the probe is
+   running, the snapshot file (`<probe>.hits.txt` next to the CSV)
+   is rewritten every 60 vsyncs - tail it from another shell to
+   watch hit counts climb live.
+
+When the probe surfaces a useful signal, commit the Lua file under
+`scripts/pcsx-redux/` and update the catalogue table above. The CSV
+output itself is gitignored - it's a per-run artifact, not a
+project state.
+
+## See also
+
+- [`playthrough-coverage.md`](playthrough-coverage.md) - the trace-driven-coverage program these gap-set traces feed (segment ledger + gap-burndown).
+- [`mednafen-automation.md`](mednafen-automation.md) - the save-state diff / bisect sibling of these live probes.
+- [`overlay-capture.md`](overlay-capture.md) - capturing overlay RAM slices for Ghidra import.
+- [`docs/reference/memory-map.md`](../reference/memory-map.md) - the RAM addresses the probes break on and watch.

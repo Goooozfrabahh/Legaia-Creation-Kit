@@ -1,0 +1,400 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">tooling</a> &middot; pcsx-redux automation</div>
+  <h1>PCSX-Redux automation</h1>
+  <p class="lede">Reading the game's code tells you what it <em>could</em> do; watching it run tells you what it <em>does</em>. PCSX-Redux is an open-source PlayStation emulator with a Lua scripting API and a breakpoint debugger over the live emulated CPU. A probe script boots Legaia, jumps to a saved moment, plants traps on the addresses in question and logs what the running game actually does - which routine writes a cell, which caller reaches an overlay function, what a patched disc really loads.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Where</dt><dd><code>scripts/pcsx-redux/</code> - Lua autorun probes, the shared <code>lib/probe/</code> library, declarative <code>probes/*.probe.toml</code> specs, Python analysers</dd>
+    <dt>Harness</dt><dd><code>run_probe.sh</code> (every probe runs through it); <code>run_probe.ps1</code> on Windows</dd>
+    <dt>Input</dt><dd>A PCSX-Redux <code>.sstate</code> named by scenario label in <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/scripts/scenarios.toml"><code>scripts/scenarios.toml</code></a>, or a cold boot; the disc image and BIOS stay local</dd>
+    <dt>Output</dt><dd><code>captures/&lt;probe&gt;/&lt;timestamp&gt;/</code>: CSV rows, call-context dumps, RAM / screen snapshots. Gitignored - never Sony bytes in the repo</dd>
+    <dt>Needs</dt><dd><code>-interpreter -debugger</code> for breakpoints; the recompiler (<code>--fast</code>) runs them past silently</dd>
+    <dt>Used by</dt><dd><a href="overlay-capture.html">overlay capture</a>, <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/tooling/playthrough-coverage.md">playthrough coverage</a>, <a href="spine-flag-writers-capture.html">spine flag-writers capture</a>, the engine's audio / VRAM parity oracles</dd>
+    <dt>Sibling</dt><dd><a href="mednafen-automation.html">Mednafen automation</a> answers "what changed" offline from save states; this page answers "who did it" live</dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="overview">
+  <h2>What this solves</h2>
+  <p>Most of Legaia's logic lives in overlays - code the game streams into RAM on demand - so a static search of the executable often finds no caller at all. A live probe sidesteps that: it lets the game run and records the program counter and return address at the moment of interest. Every probe is the same short lifecycle, factored into a shared library so a new one is a few dozen lines.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 720 300" role="img" aria-label="Probe lifecycle: WAIT_BOOT counts vsyncs while the BIOS boots; ARMED_LOADED loads the save state, reads registers and arms breakpoints; the capture loop runs N vsyncs while breakpoint hits append CSV rows; DONE disarms, writes a final snapshot and quits">
+      <defs><marker id="px-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="dg-node" x="20" y="20" width="300" height="56" rx="5"/>
+      <text class="dg-label" x="170" y="44">WAIT_BOOT</text><text class="dg-sub" x="170" y="62">BIOS boots, ~60 vsyncs</text>
+      <rect class="dg-node-accent" x="20" y="116" width="300" height="56" rx="5"/>
+      <text class="dg-label" x="170" y="140">ARMED_LOADED</text><text class="dg-sub" x="170" y="158">load state, read gp, arm breakpoints</text>
+      <rect class="dg-node" x="400" y="116" width="300" height="56" rx="5"/>
+      <text class="dg-label" x="550" y="140">capture N vsyncs</text><text class="dg-sub" x="550" y="158">each hit appends a CSV row</text>
+      <rect class="dg-node-ok" x="400" y="224" width="300" height="56" rx="5"/>
+      <text class="dg-label" x="550" y="248">DONE</text><text class="dg-sub" x="550" y="266">disarm, final snapshot, quit</text>
+      <path class="dg-edge" d="M170 76 L170 114" marker-end="url(#px-arrow)"/>
+      <path class="dg-edge" d="M320 144 L398 144" marker-end="url(#px-arrow)"/>
+      <path class="dg-edge-dim" d="M600 116 L600 96 L660 96 L660 112" marker-end="url(#px-arrow)"/>
+      <text class="dg-edge-label" x="630" y="88" text-anchor="middle">next vsync</text>
+      <path class="dg-edge" d="M550 172 L550 222" marker-end="url(#px-arrow)"/>
+      <text class="dg-edge-label" x="540" y="202" text-anchor="end">request_quit, or N frames elapsed</text>
+    </svg>
+    <figcaption>The state machine every autorun shares, provided by <code>lib/probe/sm.lua</code> through <code>probe.run{...}</code>. A probe only fills in what to arm and what to log per hit.</figcaption>
+  </figure>
+</section>
+
+<section class="doc-section" id="quick-start">
+  <h2>Quick start</h2>
+  <div class="cli"><code>bash scripts/pcsx-redux/run_probe.sh --scenario party_basic_attack_vs_gobu_gobu --lua scripts/pcsx-redux/autorun_battle_state_stream.lua</code></div>
+  <div class="cli"><code>LEGAIA_NO_SSTATE=1 bash scripts/pcsx-redux/run_probe.sh --lua scripts/pcsx-redux/autorun_countdown_trigger.lua</code></div>
+  <p>The first resolves a catalogued save state by label and runs a breakpoint probe on the interpreter; the second cold-boots for a title-screen question. Output lands in a fresh <code>captures/&lt;probe-stem&gt;/&lt;timestamp&gt;/</code> directory and the wrapper echoes the probe's own hit summary when the emulator exits. Wrap long runs in <code>timeout --kill-after=10s</code> - <code>PCSX.quit(0)</code> does not always end the process, and the data is already on disk by then.</p>
+  <details class="disclosure">
+    <summary>Wrapper flags and environment variables</summary>
+    <div class="disclosure-body">
+  <table>
+    <thead><tr><th>Wrapper flag / env</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>--lua</code> / <code>LEGAIA_LUA</code></td><td>The autorun to run (default: the world-map probe)</td></tr>
+      <tr><td><code>--scenario</code> / <code>--sstate</code></td><td>A manifest label (library copy preferred over the live slot) or a state path; <code>LEGAIA_NO_SSTATE=1</code> cold-boots</td></tr>
+      <tr><td><code>--spec</code></td><td>A declarative <code>.probe.toml</code> instead of a Lua file</td></tr>
+      <tr><td><code>--fast</code> / <code>--timing</code></td><td>Recompiler / interpreter-without-debugger cores; breakpoints do not fire in either (see <a href="#cores">cores</a>)</td></tr>
+      <tr><td><code>--out-dir</code> / <code>--out</code> / <code>--log</code></td><td>Redirect every artifact of the run, pin one output file, or pin the emulator log</td></tr>
+      <tr><td><code>LEGAIA_FRAMES</code></td><td>Capture budget in vsyncs</td></tr>
+      <tr><td><code>LEGAIA_MCD1</code> / <code>LEGAIA_MCD2</code></td><td>Memory cards (env-only: this build's <code>-memcard2</code> flag is broken)</td></tr>
+      <tr><td><code>PCSX_REDUX</code>, <code>LEGAIA_BIOS</code>, <code>LEGAIA_ISO</code></td><td>Binary, BIOS and disc paths when they differ from the defaults under <code>~/Tools/pcsx-redux/</code></td></tr>
+    </tbody>
+  </table>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="setup">
+  <h2>Setup and save states</h2>
+  <p>Quicksave slots (<code>&lt;TITLE_ID&gt;.sstate&lt;N&gt;</code>, F-keys in the emulator) are ephemeral: the next save in that slot erases the state a probe was written against. Back up anything worth keeping into the fingerprint-named library and reference it by label.</p>
+  <div class="cli"><code>scripts/manage-states.py backup pcsx-redux ~/Tools/pcsx-redux/SCUS94254.sstate6 --label field_walled_collision_pin</code></div>
+  <div class="cli"><code>scripts/manage-states.py library --audit</code></div>
+  <ul class="bullets">
+    <li><strong>Library copies are immutable</strong> - <code>saves/library/&lt;emulator&gt;/&lt;sha256&gt;.&lt;ext&gt;</code>, gitignored; the manifest carries only the <code>backup_fingerprint</code>.</li>
+    <li><strong>A mednafen-only backup cannot run here.</strong> <code>library --audit</code> says which scenarios have a PCSX-Redux state; it is the usual answer to "but it <em>is</em> backed up".</li>
+    <li><strong>Two <code>.sstate</code> shapes exist.</strong> Quicksaves are gzipped; states a probe writes are bare protobuf (~19 MB). <code>legaia_pcsx_redux::SaveState</code> opens both; a gzip-only reader silently drops most of the corpus.</li>
+    <li><strong>Check identity before blaming the probe.</strong> <code>autorun_identify_state.lua</code> reports the mode, scene and ticking overlay of any state.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="cores">
+  <h2>Which CPU core fires breakpoints</h2>
+  <p>Lua breakpoints reach the CPU only through the interpreter's debug hook. The wrapper forces the core explicitly in every mode and exports <code>LEGAIA_CORE</code>; breakpoint probes refuse to arm on the wrong core, and the provenance probe adds a liveness canary for hand launches.</p>
+  <table>
+    <thead><tr><th>Mode</th><th>Flags passed</th><th>Breakpoints</th><th>Speed</th><th>Use for</th></tr></thead>
+    <tbody>
+      <tr><td>default</td><td><code>-interpreter -debugger</code></td><td>fire</td><td>~10 fps</td><td>Every exec / read / write breakpoint probe</td></tr>
+      <tr><td><code>--fast</code></td><td><code>-dynarec</code> (forced - the persisted <code>pcsx.json</code> otherwise wins)</td><td>silent</td><td>full speed, 3x with <code>LEGAIA_SCALER=300</code></td><td>Vsync-poll probes: RAM dumps, <code>autorun_state_poll.lua</code>, screenshots</td></tr>
+      <tr><td><code>--timing</code></td><td><code>-interpreter -no-debugger</code></td><td>silent</td><td>fast interpreter</td><td>Is a repro timing-sensitive across cores?</td></tr>
+    </tbody>
+  </table>
+  <p><code>--fast</code> also isolates the config: a minimal profile (dynarec on, debugger off, ship-default renderer, absolute memory-card paths) is written to <code>captures/.pcsx-profile</code> and launched with <code>-portable</code>, so a volunteer's saved settings cannot ride in. <code>--no-isolate-config</code> opts out. Always confirm the emulator's top bar reads <code>CPU: Dynarec</code>.</p>
+</section>
+
+<section class="doc-section" id="catalogue">
+  <h2>Probe catalogue</h2>
+  <p>Grouped by the kind of question a probe answers. Each Lua file's header comment carries its full invocation; a probe marked <em>superseded</em> is kept for provenance only. Longer write-ups are in the <a href="#probe-details">per-probe detail</a> disclosure.</p>
+  <table>
+    <thead><tr><th>Family</th><th>Script</th><th>What it answers</th></tr></thead>
+    <tbody>
+      <tr><td id="cat-navigation-state-identification" rowspan="3">Navigation + identity</td><td><code>autorun_identify_state.lua</code></td><td>What a save state <em>is</em>: game mode, scene, which overlay ticks</td></tr>
+      <tr><td><code>autorun_pad_walk.lua</code></td><td>Drives a scripted pad sequence and traces the mode transitions it reaches; the distinct-pad-word census proves presses arrived</td></tr>
+      <tr><td><code>autorun_confirm_dialog_dump.lua</code></td><td>Captures the save screen's confirm prompt at rest plus the panel drawer's live arguments</td></tr>
+      <tr><td id="cat-world-map-slot-4" rowspan="8">World map + slot 4</td><td><code>autorun_world_map_probe.lua</code></td><td>The world-map sprite emitter's one-shot gate flag and its three-parameter block</td></tr>
+      <tr><td><code>autorun_ocean_moveimage.lua</code></td><td>Every VRAM transfer with tick + rects; confirms the ocean CLUT-walk cadence on all three kingdoms</td></tr>
+      <tr><td><code>autorun_world_map_fog_probe.lua</code></td><td>Dumps the per-depth fog-tint lookup table the overlay consults per vertex</td></tr>
+      <tr><td><code>autorun_prim_pool_writers.lua</code></td><td>Which renderers write the GPU primitive pool (the eight overlay-resident high-mode routines)</td></tr>
+      <tr><td><code>autorun_lzs_and_bundle_probe.lua</code></td><td>Which PROT entries are LZS-decoded during a world-map load</td></tr>
+      <tr><td><code>autorun_slot4_consumer_pcs.lua</code>, <code>_dispatcher_args</code>, <code>_source_map</code></td><td>Who reads the slot-4 mesh library: kingdom-agnostic consumer PCs, dispatcher call arguments, and proof it is read in place with no transcode</td></tr>
+      <tr><td><code>autorun_dump_slot4.lua</code>, <code>autorun_dump_full_ram_hold.lua</code>, <code>locate_slot4_base.py</code></td><td>Dump the slot-4 region or the post-warp RAM, then byte-locate the per-kingdom slot-4 base</td></tr>
+      <tr><td><code>autorun_xp_table_reader.lua</code></td><td><em>Superseded</em> - the XP curve lives elsewhere; re-target before re-running</td></tr>
+      <tr><td id="cat-field-scenes-doors-locomotion" rowspan="5">Field scenes, doors, locomotion</td><td><code>autorun_player_pos_watch.lua</code></td><td>Who moves the player: the free-movement integrator and its collision helper</td></tr>
+      <tr><td><code>autorun_house_door_writer.lua</code></td><td>How a house door works: a field-VM <code>MOVE_TO</code>, not a scene change</td></tr>
+      <tr><td><code>autorun_man_source.lua</code></td><td>Where a scene's runtime MAN (script-and-data bundle) is streamed from</td></tr>
+      <tr><td><code>autorun_town01_script_flow.lua</code></td><td>Which script contexts run in a parked scene; walls paint at load only</td></tr>
+      <tr><td><code>autorun_field_pack_projection.lua</code></td><td>The scene loader's disc-to-RAM projection, diffed slot by slot against the disc</td></tr>
+      <tr><td id="cat-battle" rowspan="12">Battle</td><td><code>autorun_monster_record_source.lua</code></td><td>The monster stat archive's PROT entry and per-id slot size</td></tr>
+      <tr><td><code>autorun_battle_reward_source.lua</code></td><td>The victory reward path and the record fields it reads</td></tr>
+      <tr><td><code>autorun_super_art_action_queue.lua</code>, <code>_input_replay</code>, <code>_queue_builder</code></td><td>The per-actor action-parameter queue Super / Miracle Arts expand into; injected directions append 1:1. <code>_queue_builder</code> is a turn-order diagnostic only</td></tr>
+      <tr><td><code>autorun_battle_char_clut_source.lua</code></td><td>Disc source of the party CLUT band (VRAM rows 490..497) via the disc-read primitives</td></tr>
+      <tr><td><code>autorun_battle_party_mesh_install.lua</code></td><td>The call site that installs the party's battle meshes (two static SCUS handlers, dispatched indirectly)</td></tr>
+      <tr><td><code>autorun_battle_render_capture.lua</code></td><td>The exact battle camera and grid, read from inside the render breakpoint</td></tr>
+      <tr><td><code>autorun_battle_palette_source.lua</code></td><td>Shows the scene bundle decompresses into a shared arena; does <em>not</em> pin the party palette</td></tr>
+      <tr><td><code>autorun_summon_model_base.lua</code>, <code>autorun_battle_moveimage_trace.lua</code></td><td>The summon model-select base in the shared spawn stager; the animated-texture strip primitive (move-VM op <code>0x40</code>)</td></tr>
+      <tr><td><code>autorun_battle_state_stream.lua</code></td><td>Breakpoint-free typed battle state as a JSON delta stream - the event source for the VR / VRChat spectators</td></tr>
+      <tr><td><code>autorun_juggle_window.lua</code>, <code>autorun_anim_node_tick_caller.lua</code></td><td>The juggle-window byte and its writer; the indirect caller of the animation-node tick</td></tr>
+      <tr><td><code>autorun_tile_shatter_page.lua</code></td><td>Mid-transition capture of the battle-entry tile-shatter effect and its shade page</td></tr>
+      <tr><td><code>autorun_player_special_cast.lua</code> + the <code>_special_cast_*</code> and <code>_cast_hook_live</code> family</td><td>Can a party actor run a capture-class boss cast, and where a forced cast hangs; live test of the cast-route hook</td></tr>
+      <tr><td id="cat-story-flag-provenance-whole-playthrough-capture" rowspan="4">Story-flag provenance</td><td><code>autorun_state_poll.lua</code> (+ <code>_selftest</code>)</td><td>Tier 1: full-speed per-frame diff of every progression cell across a whole playthrough - see <a href="#two-tier-capture">two tiers</a></td></tr>
+      <tr><td><code>autorun_flag_reader_watch.lua</code></td><td>Tier 2: reader + writer return address for every flag touched, plus VRAM uploads, battle identity and overlay residency</td></tr>
+      <tr><td><code>autorun_flag_firehose.lua</code>, <code>autorun_spine_flag_writers.lua</code></td><td>Writer of every flag SET / CLEAR; the three chapter-1 spine writes in one interactive session</td></tr>
+      <tr><td><code>autorun_dump_storyflags.lua</code></td><td>Dump the flag bank so two states can be diffed for a missed story beat</td></tr>
+      <tr><td id="cat-title-boot-ground-truth-captures" rowspan="5">Title, boot, ground truth</td><td><code>autorun_countdown_trigger.lua</code></td><td>RAM + screenshot at the exact write of a watched cell; pinned the title-overlay tick</td></tr>
+      <tr><td><code>autorun_title_overlay_writer_hunt.lua</code>, <code>autorun_title_staging_capture.lua</code></td><td>The SCUS-side title-overlay loader and its PROT source (cold boot)</td></tr>
+      <tr><td><code>autorun_dump_full_ram.lua</code>, <code>autorun_boot_walk_snapshots.lua</code></td><td>One-shot 2 MiB dump; multi-point dumps across a boot (degrades past ~10 chunks)</td></tr>
+      <tr><td><code>autorun_load_screen_dump.lua</code></td><td>Framebuffer + RAM at the load screen for sprite-source pinning</td></tr>
+      <tr><td><code>autorun_audio_trace.lua</code></td><td>Per-vsync SPU state stream for the audio parity oracle</td></tr>
+      <tr><td id="cat-patched-disc-verification-memory-card-tier" rowspan="3">Patched-disc verification</td><td><code>autorun_battle_mesh_dump.lua</code></td><td>Cold boot, memory-card load, forced battle, RAM dump - the <a href="#memory-card-tier">card tier</a></td></tr>
+      <tr><td><code>autorun_super_arts_pack_load.lua</code></td><td>Does the Super Arts Pack stub stream its block at battle start on the patched disc</td></tr>
+      <tr><td><code>autorun_delilas_battle_load.lua</code>, <code>_formation_cell_writers</code>, <code>_natural_encounter_cells</code>, the <code>_delilas_*</code> family</td><td>Can the loader stage three distinct bosses (battle-heap budget); who rewrites the formation cells; the Delilas dome-course instrumentation</td></tr>
+      <tr><td id="cat-ace-hunt-patched-disc-recon" rowspan="3">ACE hunt + recon</td><td><code>autorun_debug_bit_poke.lua</code></td><td>Poking the debug-menu byte brings up the dev menu on SELECT + Triangle</td></tr>
+      <tr><td><code>autorun_inventory_fill.lua</code>, <code>_inventory_oob_writer</code>, <code>_key_item_consumer_hunt</code>, <code>_flag_bank_watcher</code></td><td>Fill the bag, catch the out-of-bounds item-id store and every native reader of the bytes it reaches</td></tr>
+      <tr><td><code>autorun_shiny_recon.lua</code></td><td>Detour-site status and live shiny-Seru markers on a patched disc</td></tr>
+      <tr><td id="cat-minigames" rowspan="2">Minigames</td><td><code>autorun_minigame_fishing.lua</code>, <code>_dance</code>, <code>_slot_machine</code>, <code>_baka</code>, <code>_muscle_dome</code></td><td>Each minigame's controller state machine, scoring write and static tables (scenarios <code>minigame_*_pcsx</code>)</td></tr>
+      <tr><td><code>autorun_minigame_overlay_capture.lua</code>, <code>autorun_muscle_arena_shots.lua</code></td><td>The minigame overlay entry window (refutes "PROT 0896 is the mode-24 overlay"); arena screenshots</td></tr>
+      <tr><td id="cat-trace-driven-coverage-boot-driver-s3-s5-input-replay" rowspan="5">Trace-driven coverage</td><td><code>autorun_play_from_boot.lua</code>, <code>autorun_trace_segment.lua</code>, <code>trace_scenario.sh</code></td><td>Play an opening segment with a breakpoint on every not-yet-understood function; which ones ran</td></tr>
+      <tr><td><code>autorun_s3_recon.lua</code>, <code>_s3_pc</code>, <code>_s3_capture</code></td><td>What a stalled scene is parked on (field-VM dispatcher histogram); completes name entry</td></tr>
+      <tr><td><code>autorun_s4_gridrecon.lua</code>, <code>_s4_doornav</code></td><td>Grid-BFS door navigation over the walkability grid. The other <code>_s4_*</code> probes are superseded</td></tr>
+      <tr><td><code>autorun_s5_encounter.lua</code>, <code>_s5_actors</code>, <code>_s5_tetsu</code>, <code>_s5_spar</code></td><td>Rim Elm's opening has no random encounters; the first fight is the scripted Tetsu spar</td></tr>
+      <tr><td><code>autorun_record_inputs.lua</code>, <code>autorun_replay_inputs.lua</code>, <code>autorun_btnmap.lua</code></td><td>Record human input, replay it headlessly through the pad (not RAM writes); the pad-mask layout</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure" id="probe-details">
+    <summary>Per-probe detail: what the longer probes arm, what they answered, and the caveat that bit</summary>
+    <div class="disclosure-body">
+      <table>
+        <thead><tr><th>Probe</th><th>Arms</th><th>Answer / caveat</th></tr></thead>
+        <tbody>
+          <tr><td><code>slot4_consumer_pcs</code></td><td>Exec bps at the cluster-A and cluster-B load PCs</td><td>Same SCUS PCs and caller RAs on all three kingdoms (cluster B RA <code>0x80059C00</code>; cluster A RAs <code>0x8001B47C</code> in <code>FUN_8001ada4</code> + <code>0x801F78D4</code>). <code>LEGAIA_PC_CAP=N</code> lifts the 200-hit cap</td></tr>
+          <tr><td><code>slot4_dispatcher_args</code></td><td>Exec bp at <code>0x80043390</code></td><td>Original <code>a0..a2</code> before the kind handlers clobber them; classifies the four dispatcher banks <code>0x00/0x50/0xA0/0xF0</code></td></tr>
+          <tr><td><code>slot4_source_map</code></td><td>Read bps tiled over the slot-4 window + exec bp on <code>FUN_8001E54C</code></td><td>Slot 4 is consumed in place. Tile at the per-kingdom base: Drake <code>0x8011A624</code>, Sebucus <code>0x80119CE4</code>, Karisto <code>0x80108D84</code></td></tr>
+          <tr><td><code>xp_table_reader</code></td><td>Read bps over <code>0x8007123C..0x80071300</code></td><td>Superseded: the XP curve is <code>DAT_80076AF4</code>, read by <code>FUN_801E9504</code>; the old target is a sine-table slice off by <code>0x800</code></td></tr>
+          <tr><td><code>field_pack_projection</code></td><td>Exec bp at <code>FUN_8001F7C0</code> + one-shot bp at its return</td><td>Diff with <code>diff_field_pack_projection.py</code>. World-map scenes are not field-pack formatted - they yield a GP0 primitive pool instead</td></tr>
+          <tr><td><code>player_pos_watch</code></td><td>Write watch on <code>*(0x8007C364)+0x14/+0x18</code>, armed after load</td><td>Hits at the four stores in <code>FUN_801d01b0</code> (<code>0x801D0684/06E4/0744/07B4</code>), collision via <code>FUN_801cfe4c</code></td></tr>
+          <tr><td><code>house_door_writer</code></td><td><code>probe.step.find_writer</code> over <code>player+0x10..+0x20</code></td><td>Writer is <code>FUN_801de840</code> case <code>0x23</code> at <code>0x801debc4</code>. A width-2 watch saw only a no-op re-store; the range watch found it in one run</td></tr>
+          <tr><td><code>man_source</code></td><td>Exec bp at dispatcher <code>FUN_8001F05C</code>, MAN filter <code>a1 &gt;&gt; 24 == 3</code></td><td>Caller <code>FUN_80020224</code> walks the scene asset table from <code>_DAT_8007b85c</code>; caught a count-6 table variant</td></tr>
+          <tr><td><code>town01_script_flow</code></td><td>Exec bps at <code>FUN_8003aeb0</code>, <code>FUN_8003ab2c</code>, <code>FUN_801de840</code> + three collision-grid write sites</td><td>One steady-state context (script <code>0xFB</code>, pc loop <code>0x102..0x297</code>); zero wall paints while standing</td></tr>
+          <tr><td><code>monster_record_source</code></td><td>Exec bps at <code>FUN_80054CB0</code>, <code>FUN_800542C8</code>, seek <code>FUN_8003E964</code>, read <code>FUN_8003E800</code></td><td>PROT 0867, one <code>0x14000</code> LZS slot per id at <code>(id-1)*0x14000</code>; decoded records match live actors byte-for-byte</td></tr>
+          <tr><td><code>battle_reward_source</code></td><td>Write bps on gold <code>0x8008459C</code>, coins <code>0x800845A4</code>, stage <code>0x80084440</code></td><td>Gold write in <code>FUN_8004E568</code>; reward fields at record <code>+0x44..+0x49</code>. <code>FUN_80026018</code> is the minigame exit, not a battle commit</td></tr>
+          <tr><td><code>battle_party_mesh_install</code></td><td>Write watch on <code>DAT_8007C018[0..2]</code>, exec bp on <code>tmd_register FUN_80026B4C</code></td><td>Callers <code>FUN_800513F0</code> (ra <code>0x8005148C</code>) and <code>FUN_800542C8</code> (ra <code>0x80054804</code>). The watch's value column is pre-write; trust the entry <code>a0</code></td></tr>
+          <tr><td><code>battle_char_clut_source</code></td><td>Exec bps on <code>FUN_8003E8A8</code> / <code>FUN_8003E964</code> / <code>FUN_8003E800</code></td><td>Run from a field state where the band is not yet resident; map LBAs with <code>map_clut_disc_reads.py</code></td></tr>
+          <tr><td><code>battle_render_capture</code></td><td>Read inside the <code>func_0x801d02c0</code> grid-render bp</td><td>mode <code>0x15</code>, pitch 32, TR (0, 1280, 7680), H 256, 28x28 grid, actor scale <code>+0x72 = 0x1000</code>. Scratchpad needs <code>read_scratch_u32</code></td></tr>
+          <tr><td><code>battle_palette_source</code></td><td>Write bps on <code>0x800EBEE8 / 0x800EC0C8 / 0x800EC2A8</code></td><td>Writes come from LZS-decoding the scene bundle into a shared arena - scene data, not the palette (which is character-intrinsic, not a disc blob)</td></tr>
+          <tr><td><code>battle_state_stream</code></td><td>Per-vsync poll via <code>lib/probe/battle_state.lua</code> (table <code>&amp;DAT_801C9370</code>, ctx <code>_DAT_8007BD24</code>, ids <code>DAT_8007BD0C</code>)</td><td>Delta records + full sweep every <code>LEGAIA_STREAM_SWEEP</code> vsyncs and on battle entry. Resumed battle saves often segfault - the production path is a live session</td></tr>
+          <tr><td><code>countdown_trigger</code></td><td>Width-2 write bp at <code>LEGAIA_WATCH_ADDR</code> (default <code>0x801EF16C</code>)</td><td><code>LEGAIA_HIT_SKIP</code> skips the boot DMA write; decode screens with <code>decode_pcsx_screen.py</code></td></tr>
+          <tr><td><code>title_overlay_writer_hunt</code>, <code>title_staging_capture</code></td><td>Write bps across <code>0x801CC000..0x801EF018</code>; exec bp at LZS <code>FUN_8001A55C</code></td><td>Cold boot only - in-game saves are past the load. Each decode's source is dumped for offline byte-match</td></tr>
+          <tr><td><code>load_screen_dump</code></td><td>Settle, then screenshot + 2 MiB RAM</td><td>No breakpoints, so <code>--fast</code>. Pair with <code>extract_vram_from_sstate.py</code> for full VRAM (panel CLUT = row 2 of the system-UI TIM at <code>PROT.DAT[0x018E0]</code>)</td></tr>
+          <tr><td><code>audio_trace</code></td><td><code>PCSX.createSaveState()</code> every <code>LEGAIA_INTERVAL</code> vsyncs, FFI-walked to slice the SPU message</td><td>~600 KiB per capture instead of 20 MiB; decode with <code>extract_audio_trace_from_sstates.py</code></td></tr>
+          <tr><td><code>minigame_overlay_capture</code></td><td>Polls game mode; dumps the overlay window at trigger-relative vsyncs</td><td>SCUS-resident init streams the minigame overlay into slot A; PROT 0896's bytes appear nowhere. Keep dump offsets early - the emulator never exits on its own</td></tr>
+          <tr><td>Minigame probes</td><td>Fishing <code>FUN_801cf3bc</code> + <code>FUN_801d4004</code>, score <code>_DAT_8008444c</code>; dance <code>FUN_801cf470</code> + <code>FUN_801d1960</code>; slots <code>FUN_801cf0d8</code> + <code>FUN_801d13e8</code> + LCG <code>FUN_801d30cc</code>; Baka <code>FUN_801d3468</code> + <code>FUN_801d3a14</code>; dome <code>FUN_801d0748</code> + <code>FUN_801d388c</code></td><td>Each pairs a state-machine exec bp with a write watch on the score / coin / gold cell and a one-shot static-table dump</td></tr>
+          <tr><td>ACE family</td><td>Fill 72 consumable slots; <code>find_writer</code> on <code>0x800859E8..0x800859F8</code>; read bps on the first 24 key-item bytes</td><td>Two live OOB writers from <code>0x800422BC</code>: casino exchange (id <code>0x9C</code>) and equip-unequip (id <code>0xD0</code>). Flag helpers <code>FUN_8003CE08/CE34/CE64</code> are watched for indices &gt;= 5248</td></tr>
+          <tr><td>S3 - S5 recon</td><td><code>FUN_8001698C</code> field tick; <code>FUN_801DE840</code> dispatcher histogram; walkability grid at <code>*(_DAT_1f8003ec)+0x4000</code></td><td>Player X/Z are <strong>signed 16-bit</strong> at <code>+0x14/+0x18</code> with the <strong>footing</strong> (floor height, not a heading) at <code>+0x16</code> - reading them as u32 produced the retracted "dynamic camera remap" conclusion. Tetsu's spar is item 3 of a 4-row list a CROSS mash never reaches</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="two-tier-capture">
+  <h2>Whole-playthrough capture: two tiers</h2>
+  <p>"Which story flag, item or party change happens where" over a long play session needs a human at the pad. Two probes split the cost: a full-speed poll that says <em>what</em> changed and <em>where</em>, then a slow breakpoint run aimed only at the flags the poll fingered.</p>
+  <table>
+    <thead><tr><th>Tier</th><th>Probe</th><th>Core</th><th>Captures</th><th>Analyse with</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><code>autorun_state_poll.lua</code></td><td><code>--fast</code>, no breakpoints</td><td>Per-frame diff of flags, gold, items, party, XP, equipment, counters, scene, mode, BGM, FMV, player tile, pad edges, picker choices; in-battle status / HP / arts-queue rows; auto-snapshots on rare events</td><td><code>analyze_state_poll.py</code></td></tr>
+      <tr><td>2</td><td><code>autorun_flag_reader_watch.lua</code></td><td>interpreter</td><td>Reader + writer return address per flag, deduped; write-watch allowlist; VRAM upload log; per-fight identity with spawn tile; overlay-residency checksums; field-VM script offset of the flag op</td><td><code>analyze_reader_watch.py</code> (merges runs into one provenance map)</td></tr>
+    </tbody>
+  </table>
+  <div class="cli"><code>LEGAIA_NO_SSTATE=1 timeout --kill-after=15s 14400s bash scripts/pcsx-redux/run_probe.sh --fast --lua scripts/pcsx-redux/autorun_state_poll.lua</code></div>
+  <ul class="bullets">
+    <li><strong>Version guard.</strong> Both tiers fingerprint six code words at each flag helper and refuse a non-USA or wrong-revision disc (<code>LEGAIA_FP_RECORD=1</code> prints the fingerprint for relocking).</li>
+    <li><strong>The flag window is exactly <code>0x200</code> bytes</strong> - the largest span that is pure story flags, with the character records ending at its base and the inventory starting at its end.</li>
+    <li><strong>Self-test before any volunteer handoff:</strong> <code>run_state_poll_selftest.sh</code> pokes every watched cell and asserts every stream fired. The volunteer runbook is <code>scripts/pcsx-redux/COMMUNITY-CAPTURE.md</code>.</li>
+    <li><strong>The poll cannot see the battle-id staging byte</strong> - it is written and consumed within one frame; Tier 2 catches its writer.</li>
+  </ul>
+  <details class="disclosure">
+    <summary>Details: the cells each tier watches, and the analyser sections</summary>
+    <div class="disclosure-body">
+      <table class="layout">
+        <thead><tr><th>Address</th><th>Stream</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>0x80085758</code></td><td><code>flag</code></td><td>Story-flag bank, <code>0x200</code> bytes; a frame flipping &gt;= <code>LEGAIA_BULK_FLAGS</code> is tagged <code>bulkload</code></td></tr>
+          <tr><td><code>0x8007050C</code> / <code>0x8007B83C</code></td><td><code>scene</code> / <code>mode</code></td><td>Active scene name and game mode</td></tr>
+          <tr><td><code>0x8007BD0C[4]</code> / <code>0x8007B7FC</code></td><td><code>battle</code></td><td>Formation ids sampled once the battle scene is active; staging byte (usually 0 here)</td></tr>
+          <tr><td><code>0x8008459C</code>, <code>0x80085958</code>, <code>0x80084594/98</code></td><td><code>gold</code>, <code>item</code>, <code>party</code></td><td>Gold, inventory page, party count and ids</td></tr>
+          <tr><td>player <code>+0x14</code> / <code>+0x18</code></td><td><code>pos</code></td><td>Tile crossings, <code>tile = (pos - 0x40) &gt;&gt; 7</code>; attributes each flag beat to a spot</td></tr>
+          <tr><td><code>0x8007BAC8</code>, <code>0x8007BA78</code>, <code>0x8007B850</code></td><td><code>bgm</code>, <code>fmv</code>, <code>input</code></td><td>BGM id, FMV trigger id, pad press / release edges</td></tr>
+          <tr><td><code>*(0x801C6EA4)+0x0C</code></td><td><code>pick</code></td><td>Dialogue picker cursor at a confirm press</td></tr>
+          <tr><td>record <code>+0x0</code>, <code>+0x196..0x19D</code></td><td><code>xp</code>, <code>equip</code></td><td>Cumulative XP and equipment slots per roster member</td></tr>
+          <tr><td><code>0x8008444C</code>, <code>0x800845A4</code>, <code>0x800845B4</code></td><td><code>counter</code></td><td>Fishing points, casino coins, Point Card</td></tr>
+          <tr><td>actor <code>+0x16E</code>, <code>+0x14C</code>, <code>+0x1DF..+0x1F2</code></td><td><code>status</code>, <code>hp</code>, <code>aq</code></td><td>Mechanical status word, current HP, party action-queue window (arts inputs, committed Super-Art queues)</td></tr>
+          <tr><td><code>0x8007B790/92/94</code>, <code>0x8007B6F4</code>, <code>0x800840B8..C0</code>, <code>0x801F2B94</code></td><td><code>wmcam</code></td><td>Overworld walk-view camera tuple on entry and on change</td></tr>
+          <tr><td><code>0x1F800393</code></td><td><code>dt</code></td><td>Scratchpad frame-step multiplier, logged when a value holds 30 frames</td></tr>
+          <tr><td>slots A <code>0x801CE818</code> / B <code>0x801F69D8</code></td><td><code>overlay</code> (Tier 2)</td><td>512-byte FNV-1a checksum per overlay slot, resolved to labels by the committed <code>overlay-map.txt</code></td></tr>
+          <tr><td><code>FUN_800583C8</code> / <code>FUN_80058490</code></td><td><code>vram</code> / <code>vrammove</code> (Tier 2)</td><td>LoadImage / MoveImage rect + uploader ra; auto-disarmed during FMV modes <code>0x1A/0x1B</code> (a hot bp there segfaults)</td></tr>
+        </tbody>
+      </table>
+      <p>Toggles: <code>LEGAIA_TRACE_POS/_BGM/_INPUT/_BATTLE/_OVERLAY/_VRAM=0</code>, <code>LEGAIA_AUTOSNAP=0</code>, <code>LEGAIA_SNAP_FLAGS</code>, <code>LEGAIA_SNAP_MAX</code>, <code>LEGAIA_WATCH_WRITES="0xADDR:width[:name],..."</code>, <code>LEGAIA_FLAG</code> (comma list of target flags for read-watches and first-hit snapshots). <code>LEGAIA_POINT_CARD_MAX=1</code> pins the Point Card counter so a strike one-shots any boss on a maintainer's own pass.</p>
+      <p><code>analyze_state_poll.py</code> renders a scene timeline, battle windows with formation ids (lone-enemy fights starred as likely bosses), a story-flag census that separates beats from bulk load frames, XP / equipment / counter changes, BGM and FMV timelines, arts commits and unlabelled sticky beats as <code>[lead]</code>s. <code>analyze_reader_watch.py</code> builds per-flag site tables labelled against the catalogued helpers (<code>0x801E35E8</code> field-VM TEST return, <code>0x801D218C</code> walk-on trigger dispatch, <code>FUN_8003BDE0</code> gate reads), prints uncatalogued sites as <code>[NEW]</code> with overlay residency, and merges runs with <code>--merged-out</code>. Both are pure functions with synthetic-row tests.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="memory-card-tier">
+  <h2>Patched discs: the memory-card tier</h2>
+  <p>A save state replays the RAM of the disc that produced it, so anything the loader builds at load time - battle meshes, staged records, rebased modules - comes from the <em>old</em> disc until the game reloads it. To observe what a patched disc really loads, cold-boot it, load a save from a memory card, force the battle and dump RAM: <code>capture_battle_mesh.sh</code> chains this and <code>decode_battle_mesh.py</code> decodes the result.</p>
+  <ul class="bullets">
+    <li><strong>PCSX-Redux auto-applies a sibling <code>.ppf</code></strong> next to the image it is handed. Point <code>--iso</code> at a scratch copy in a directory you control.</li>
+    <li><strong>Cards are env-only</strong> (<code>LEGAIA_MCD1/2</code>); <code>isolate_card_save.py</code> copies one save onto an otherwise blank card.</li>
+    <li><strong>Bridge SCUS mismatches</strong> with <code>legaia-patcher scus-pokes</code> output (<code>LEGAIA_POKES</code>) when a retail state must resume on a patched disc.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="patched-disc-taint">
+  <h2>Patched-disc taint</h2>
+  <p>A capture can measure a patched game while its log names the retail image. Two routes carry a patch in. The <strong>image route</strong>: PCSX-Redux applies <code>&lt;image&gt;.ppf</code> from beside the image, and the randomizer writes its <code>.ppf</code> beside its input disc, so every unstaged run on that path read patched sectors. The <strong>state route</strong>: the executable is read from the disc once, at boot, so a save state made on a patched disc keeps the patched executable forever - staging the disc does nothing for it.</p>
+  <ul class="bullets">
+    <li><code>patch_taint_audit.py states</code> checks every library state's resident executable at the patcher's own hook sites; the manifest records the result as <code>resident_patch</code>, so a probe can refuse a tainted state.</li>
+    <li><code>patch_taint_audit.py logs</code> lists every run the emulator patched, and <code>ppf</code> decodes a patch file into disc files, PROT entries and executable addresses.</li>
+    <li>A patched byte matters only if the run reads it: re-check a claim against the patch's decoded footprint before discarding it.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="gdb-bridge">
+  <h2>One-shot queries: the GDB bridge</h2>
+  <p>PCSX-Redux also exposes a GDB remote stub on TCP 3333. <code>gdb_probe.py</code> speaks it directly for ad-hoc reads, register dumps and single "break here, read there" questions - no scenario, no state machine. Use a <code>.probe.toml</code> instead when the capture must be repeatable and gated.</p>
+  <div class="cli"><code>scripts/pcsx-redux/gdb_probe.py when-pc-hits FUN_801DD35C --read-mem _DAT_801EF16C,16</code></div>
+  <details class="disclosure">
+    <summary>Subcommands</summary>
+    <div class="disclosure-body">
+  <table>
+    <thead><tr><th>Subcommand</th><th>Does</th></tr></thead>
+    <tbody>
+      <tr><td><code>read-mem ADDR LEN</code> / <code>write-mem ADDR HEX</code></td><td>Read or patch memory in flight; addresses accept Ghidra symbol names</td></tr>
+      <tr><td><code>read-regs</code></td><td>Dump the 38 MIPS registers + PC</td></tr>
+      <tr><td><code>when-pc-hits ADDR --read-mem A,L</code></td><td>Arm an exec breakpoint, continue, read on hit, disarm</td></tr>
+      <tr><td><code>watch ADDR LEN --kind read|write|access</code></td><td>Insert a watchpoint and print the stop reply</td></tr>
+      <tr><td><code>selftest</code></td><td>Protocol codec tests against an in-process mock server</td></tr>
+    </tbody>
+  </table>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="authoring">
+  <h2>Authoring a new probe</h2>
+  <p>Two shapes, in order of preference. A declarative spec covers "arm N breakpoints, log K columns" and "settle then dump"; a Lua autorun covers per-hit logic that depends on register state or dynamic arming.</p>
+  <ol class="steps">
+    <li><b>Pick the shape</b><span>Fixed breakpoints and CSV columns: a <code>.probe.toml</code> under <code>probes/</code>. Anything conditional: copy <code>autorun_slot4_consumer_pcs.lua</code>, the canonical thin probe.</span></li>
+    <li><b>Name addresses symbolically</b><span>Write <code>FUN_801DA51C</code> / <code>_DAT_801EF16C</code>, not hex: the resolver fails loudly on a typo, where a hex slip arms nothing and logs zero hits. Regenerate with <code>build-symbols.py</code> after new dumps.</span></li>
+    <li><b>Arm in <code>on_arm</code></b><span>Read <code>gp</code> from the live registers after the load, compute relative targets, arm with the width the access uses (1/2/4).</span></li>
+    <li><b>Log in the callback</b><span>A write breakpoint fires <em>at</em> the store with live registers. Write rows through <code>csv:row</code>; stack first-hit context with <code>append_call_context</code>.</span></li>
+    <li><b>Quit early</b><span>Set <code>ctx.request_quit = true</code> in <code>on_capture</code> once the stop condition is met.</span></li>
+    <li><b>Run and iterate</b><span><code>run_probe.sh --lua ...</code>; the <code>.hits.txt</code> snapshot rewrites every 60 vsyncs, so tail it from another shell. Commit the Lua file and add a catalogue row; outputs stay gitignored.</span></li>
+  </ol>
+  <details class="disclosure">
+    <summary>Details: the declarative <code>.probe.toml</code> schema</summary>
+    <div class="disclosure-body">
+<pre><code>scenario        = "title_attract"   # informational; LEGAIA_SSTATE wins
+capture_frames  = 600
+output_path     = "my_probe.csv"
+capture_columns = ["tick", "addr", "pc", "ra", "value_u32"]
+
+[detail]                            # optional: first N hits get full
+hits = 8                            # register/code/stack snapshots
+path = "my_probe.detail.txt"
+
+[[breakpoint]]
+addr  = "FUN_801DD35C"              # int or symbol name
+kind  = "Exec"                      # "Exec" | "Read" | "Write"
+width = 4
+name  = "title_tick"
+
+[[breakpoint_range]]                # fan out N adjacent breakpoints
+base     = 0x80076AF4
+length   = 196
+stride   = 4
+kind     = "Read"
+name_fmt = "xp+0x%03X"</code></pre>
+      <p>Column vocabulary: <code>tick</code>, <code>addr</code>, <code>offset</code>, <code>pc</code>, <code>ra</code>, <code>sp</code>, <code>width</code>, <code>value_u8/u16/u32</code>. <code>probes/_check_specs.py</code> validates every spec's schema and symbol references without launching the emulator; with <code>lua5.1</code> present it also cross-checks the Lua TOML reader against Python's. <code>probe.py summary | fingerprint | diff | regress</code> operate on the CSVs (<code>--ignore tick</code> drops order-dependent columns) so a spec can gate against a committed baseline.</p>
+    </div>
+  </details>
+  <details class="disclosure">
+    <summary>Details: the shared library modules and the two single-step substitutes</summary>
+    <div class="disclosure-body">
+      <table>
+        <thead><tr><th>Module</th><th>Provides</th></tr></thead>
+        <tbody>
+          <tr><td><code>env</code>, <code>sstate</code>, <code>pad</code></td><td><code>getenv</code> helpers; save-state load; pad force / release (RAM writes to the pad word do not stick - the game rebuilds it each tick)</td></tr>
+          <tr><td><code>mem</code></td><td>Typed RAM readers and writers; <code>ram_offset</code> strips the KSEG selector so <code>0x80..</code> and <code>0xA0..</code> alias; <code>read_scratch_u32</code> for the <code>0x1F80xxxx</code> scratchpad</td></tr>
+          <tr><td><code>bp</code>, <code>csv</code>, <code>snapshot</code></td><td>Breakpoint arming; CSV writer; live <code>.hits.txt</code> and call-context dumps (32 GPRs, code around PC, 32 stack words - the visible <code>ra</code> chain)</td></tr>
+          <tr><td><code>sm</code></td><td>The <a href="#overview">lifecycle</a> state machine behind <code>probe.run</code></td></tr>
+          <tr><td><code>watch</code></td><td>The "what writes this address" closure: write bp + CSV of <code>(elapsed, label, addr, pc, ra, prev_value)</code> + first-N context</td></tr>
+          <tr><td><code>step</code></td><td>The Lua API binds no single-step. <code>step.trace(lo, hi)</code> arms an exec bp on every instruction of a region (execution-ordered, live registers); <code>step.find_writer(addr, len)</code> tiles unit-width write bps so a store of unknown width or alignment is caught</td></tr>
+          <tr><td><code>symbols</code>, <code>version</code>, <code>battle_state</code></td><td>Ghidra-name resolver; USA disc fingerprint guard; typed battle-state extraction shared by the stream probe</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="gotchas">
+  <h2>Things that catch people out</h2>
+  <table>
+    <thead><tr><th>Trap</th><th>Symptom</th><th>Do this</th></tr></thead>
+    <tbody>
+      <tr><td>Breakpoint width</td><td>A width-2 watch at <code>+0x14</code> misses a wider or offset store into the same struct; <code>lbu</code> misses a width-4 watch</td><td>Match the access width, or cover the range with <code>step.find_writer</code></td></tr>
+      <tr><td>Listener garbage-collected</td><td>Probe goes silent mid-run with no error - the <code>createEventListener</code> proxy's finaliser deletes the C++ listener</td><td>Anchor every handle in the global <code>PROBE_LISTENER_ANCHORS</code> table</td></tr>
+      <tr><td>2 MiB read inside a vsync callback</td><td>Later vsync callbacks fire rarely or never (the garbage burst triggers the collect above)</td><td>One full dump per launch, or 64 KiB chunks</td></tr>
+      <tr><td>~32.7k vsync ceiling</td><td>Unpatched PCSX-Redux leaks two Lua stack slots per event and dies at tick ~32716</td><td>The local build carries a stack-rebalance patch; re-apply after any rebuild</td></tr>
+      <tr><td>Vsync is game-driven</td><td>A boot-phase "wait 600 vsyncs" sits for minutes - events fire on the game's <code>VSync(0)</code> calls, sparse during CD loads</td><td>Trigger on a write watchpoint at a known transition cell instead</td></tr>
+      <tr><td>Screenshot lags the draw</td><td><code>takeScreenShot()</code> returns the <em>displayed</em> buffer, one game tick behind mid-animation</td><td>Capture something static, or settle a dozen vsyncs and confirm it stopped moving</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure">
+    <summary>More traps: sign-extended registers, moving overlay entry points, stale globals</summary>
+    <div class="disclosure-body">
+      <table>
+        <thead><tr><th>Trap</th><th>Symptom</th><th>Do this</th></tr></thead>
+        <tbody>
+      <tr><td>Stale global read as a flag</td><td>An overlay timer holds garbage until its screen first runs, so "is this UI up?" polls compare against noise</td><td>Exec-break on the code that draws the thing</td></tr>
+      <tr><td>Sign-extended registers</td><td><code>gp</code> prints as <code>0xFFFFFFFF8007B318</code>; a <code>~=</code> against <code>0x80000000</code> is true even when equal</td><td><code>bit.band(v, 0xFFFFFFFF)</code>; use the library's in-RAM predicate, not a fresh one</td></tr>
+      <tr><td>Position poke across regions</td><td>The player walks through NPCs: a poke that skips the map door leaves the region box (<code>0x1F800384..87</code>) stale, actors outside it keep the visibility-cull bit, and the collision and interact tests skip culled actors</td><td>Poke the player onto a kind-0 map-door tile and let the game's own warp re-latch the box</td></tr>
+      <tr><td>Overlay entry points move</td><td>A hex breakpoint from an older dump arms at nothing</td><td>Symbolic names; <code>gp</code>-relative targets computed after the load</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <table>
+    <thead><tr><th>Item</th><th>Address / source</th><th>What it proves</th></tr></thead>
+    <tbody>
+      <tr><td>Only the interpreter fires Lua breakpoints</td><td>PCSX-Redux <code>psxinterpreter.cc:1652</code> (<code>if constexpr (debug)</code>)</td><td><code>-interpreter -debugger</code> are both required; the recompiler has no hook</td></tr>
+      <tr><td>Listener finaliser</td><td><code>src/core/eventslua.cc</code></td><td>An unanchored listener dies at the next GC; the per-event stack leak sets the ~32.7k ceiling</td></tr>
+      <tr><td>Config location and <code>-portable</code></td><td><code>src/core/system.cc</code>, <code>src/core/arguments.cc</code></td><td>Why <code>--fast</code> must force <code>-dynarec</code> and how the isolated profile is mounted</td></tr>
+      <tr><td>Sibling PPF auto-apply</td><td><code>cdrom/ppf.cc</code></td><td>A <code>.ppf</code> beside the image patches it silently</td></tr>
+      <tr><td>Flag helpers</td><td><code>FUN_8003CE08</code> SET, <code>FUN_8003CE34</code> CLEAR, <code>FUN_8003CE64</code> TEST; bank <code>0x80085758</code></td><td>Where both provenance tiers break; the six-word version fingerprint lives at these entries</td></tr>
+      <tr><td>Pad mask layout</td><td><code>0x8007B850</code>, rebuilt by <code>FUN_8001822C</code></td><td>Byte-swapped controller word (UP <code>0x1000</code>, CROSS <code>0x0040</code>); replay must drive the pad, not RAM</td></tr>
+      <tr><td>Game anchors</td><td>scene <code>0x8007050C</code>, mode <code>0x8007B83C</code>, player pointer <code>0x8007C364</code>, battle ctx <code>0x8007BD24</code>, actor table <code>0x801C9370</code></td><td>The cells every poll-tier probe keys on; see the <a href="../reference/memory-map.html">memory map</a></td></tr>
+      <tr><td>Overlay slot bases</td><td>A <code>0x801CE818</code>, B <code>0x801F69D8</code> (<code>crates/asset/data/static-overlays.toml</code>)</td><td>Residency checksums disambiguate the VA-aliased field / menu / battle overlays</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Tooling</span>
+    <a href="mednafen-automation.html">Mednafen automation</a>
+    <a href="overlay-capture.html">Overlay capture</a>
+    <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/tooling/playthrough-coverage.md">Playthrough coverage</a>
+    <a href="spine-flag-writers-capture.html">Spine flag-writers capture</a>
+    <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/tooling/super-art-queue-capture.md">Super-Art queue capture</a>
+    <a href="recomp-differential.html">Recomp differential oracle</a>
+    <a href="ghidra.html">Ghidra in Docker</a>
+  </div>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../reference/memory-map.html">Memory map</a>
+    <a href="../reference/functions.html">Function directory</a>
+    <a href="../subsystems/battle.html">Battle</a>
+    <a href="../subsystems/script-vm.html">Field script VM</a>
+    <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/tooling/pcsx-redux-automation.md">Full doc on GitHub</a>
+  </div>
+</section>

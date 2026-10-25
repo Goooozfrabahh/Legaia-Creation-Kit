@@ -1,0 +1,3491 @@
+<!--HEAD: <style>
+/* ---------- playable minigames ---------- */
+.mg-shell { display: flex; flex-direction: column; gap: 1rem; }
+.file-input-group {
+  display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap;
+  padding: 0.75rem; border: 1px solid var(--border); background: var(--bg-card);
+}
+.file-input-group input[type="file"] { color: var(--text-muted); font-family: var(--font-mono); font-size: 0.85rem; }
+.mg-status { color: var(--text-dim); font-family: var(--font-mono); font-size: 0.82rem; }
+
+.mg-tabs { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+.mg-tab {
+  background: var(--bg-card); color: var(--text-muted); border: 1px solid var(--border);
+  padding: 0.4rem 0.9rem; font-family: var(--font-mono); font-size: 0.82rem;
+  border-radius: 3px; cursor: pointer;
+}
+.mg-tab:hover { border-color: var(--accent); color: var(--text); }
+.mg-tab.is-active { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+.mg-tab[disabled] { opacity: 0.35; cursor: not-allowed; }
+
+.mg-panel { display: none; background: var(--bg-card); border: 1px solid var(--border); padding: 1rem; }
+.mg-panel.is-active { display: block; }
+.mg-panel h3 { margin: 0 0 0.35rem; font-size: 1.05rem; color: var(--text); }
+.mg-panel .mg-blurb { color: var(--text-muted); font-size: 0.86rem; line-height: 1.6; margin: 0 0 0.9rem; }
+.mg-panel .mg-blurb code { font-size: 0.8rem; }
+
+.mg-row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; margin: 0.6rem 0; }
+.mg-btn {
+  background: var(--bg-raised, var(--bg-code)); color: var(--text); border: 1px solid var(--border);
+  padding: 0.4rem 0.8rem; font-family: var(--font-mono); font-size: 0.82rem; cursor: pointer;
+  border-radius: 3px; min-width: 3.2rem;
+}
+.mg-btn:hover:not([disabled]) { border-color: var(--accent); }
+.mg-btn[disabled] { opacity: 0.35; cursor: not-allowed; }
+.mg-btn.mg-primary { background: var(--accent); border-color: var(--accent); color: var(--bg); font-weight: 600; }
+.mg-key { display: block; font-size: 0.62rem; color: var(--text-dim); letter-spacing: 0.06em; }
+.mg-btn.mg-primary .mg-key { color: var(--bg); opacity: 0.75; }
+
+.mg-hud {
+  display: flex; gap: 1.2rem; flex-wrap: wrap;
+  font-family: var(--font-mono); font-size: 0.82rem; color: var(--text-muted);
+  padding: 0.5rem 0.65rem; background: var(--bg-code); border: 1px solid var(--border);
+}
+.mg-hud b { color: var(--text); font-weight: 600; }
+.mg-hud .mg-big { font-size: 1.15rem; color: var(--accent); }
+
+.mg-bar { height: 8px; background: var(--bg-code); border: 1px solid var(--border); overflow: hidden; }
+.mg-bar > span { display: block; height: 100%; background: var(--accent); transition: width 90ms linear; }
+.mg-bar.mg-bar-foe > span { background: #d84b4b; }
+
+canvas.mg-canvas {
+  width: 100%; max-width: 520px; height: 300px;
+  background: #0c0e12; border: 1px solid var(--border); display: block; margin: 0 auto;
+  image-rendering: pixelated;
+}
+
+.mg-verdict {
+  font-family: var(--font-mono); font-size: 0.9rem; min-height: 1.4em;
+  color: var(--text-muted); margin-top: 0.4rem;
+}
+.mg-verdict.is-good { color: #6ec896; }
+.mg-verdict.is-bad  { color: #d84b4b; }
+
+/* Baka */
+.mg-fighters { display: grid; grid-template-columns: 1fr auto 1fr; gap: 0.8rem; align-items: center; margin: 0.8rem 0; }
+@media (max-width: 640px) { .mg-fighters { grid-template-columns: 1fr; } }
+.mg-fighter { font-family: var(--font-mono); font-size: 0.8rem; color: var(--text-muted); }
+.mg-fighter .mg-fname { color: var(--text); font-size: 0.9rem; margin-bottom: 0.3rem; }
+.mg-vs { font-family: var(--font-mono); color: var(--text-dim); font-size: 0.95rem; text-align: center; }
+.mg-pips { letter-spacing: 0.2em; color: var(--accent); }
+.mg-select {
+  background: var(--bg-code); color: var(--text); border: 1px solid var(--border);
+  padding: 0.3rem 0.5rem; font: inherit; font-size: 0.82rem; border-radius: 3px; min-width: 18rem;
+}
+.mg-throw { min-width: 5.2rem; }
+
+/* Slots */
+.mg-cabinet {
+  display: block; width: 100%; max-width: 720px; margin: 0.9rem auto;
+  /* The retail machine draws into a 640x240 hi-res framebuffer whose pixels are
+   * half-width, so 640x240 of buffer is a 4:3 picture. Do not "fix" this to 8:3 -
+   * the aspect IS the reason the medallions come out round. */
+  aspect-ratio: 4 / 3; background: #0b0b10;
+  border: 1px solid var(--border); border-radius: 4px;
+  /* The art is PSX texture data - never smooth it. */
+  image-rendering: pixelated; image-rendering: crisp-edges;
+  /* The cabinet IS the button: a click on it is a press, for want of a
+   * spacebar on a phone. */
+  cursor: pointer;
+}
+canvas.mg-cabinet:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.mg-controls {
+  font-family: var(--font-mono); font-size: 0.8rem; line-height: 1.7;
+  color: var(--text-muted); margin: 0.6rem 0 0.2rem;
+  padding: 0.5rem 0.65rem; background: var(--bg-code); border: 1px solid var(--border);
+}
+.mg-controls b { color: var(--text); }
+.mg-controls kbd {
+  font-family: var(--font-mono); font-size: 0.76rem; padding: 0.05rem 0.4rem;
+  border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 3px;
+  background: var(--bg-card); color: var(--text);
+}
+.mg-reels {
+  display: grid; grid-template-columns: repeat(3, 4.2rem); gap: 0.35rem;
+  justify-content: center; margin: 0.9rem auto;
+}
+.mg-cell {
+  height: 3.4rem; display: flex; align-items: center; justify-content: center;
+  font-size: 1.7rem; background: var(--bg-code); border: 1px solid var(--border);
+  border-radius: 3px; color: var(--text);
+}
+.mg-cell.mg-payline { border-color: var(--accent); background: var(--bg-raised, var(--bg-code)); }
+.mg-cell.mg-win { border-color: #6ec896; box-shadow: inset 0 0 0 1px #6ec896; }
+.mg-paytable {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(5.6rem, 1fr)); gap: 0.3rem;
+  font-family: var(--font-mono); font-size: 0.76rem; margin-top: 0.8rem;
+}
+.mg-pay {
+  display: flex; align-items: center; gap: 0.35rem; padding: 0.25rem 0.4rem;
+  background: var(--bg-code); border: 1px solid var(--border); border-radius: 3px;
+  color: var(--text-muted);
+}
+.mg-pay .mg-glyph { font-size: 0.8rem; font-family: var(--font-mono); }
+.mg-pay .mg-glyph-sym {
+  width: 26px; height: 26px; flex: none;
+  image-rendering: pixelated; image-rendering: crisp-edges;
+}
+.mg-pay b { color: var(--text); }
+.mg-pay.mg-pay-bonus { border-color: var(--accent); color: var(--accent); }
+
+.mg-bonus-legend {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.9rem;
+  font-family: var(--font-mono); font-size: 0.76rem; line-height: 1.5;
+  color: var(--text-muted); margin-top: 0.7rem;
+  padding: 0.5rem 0.65rem; background: var(--bg-code); border: 1px solid var(--border);
+  border-radius: 3px;
+}
+.mg-bonus-legend:empty { display: none; }
+.mg-bonus-legend b { color: var(--text); }
+.mg-bonus-chip { display: inline-flex; align-items: center; gap: 0.35rem; }
+.mg-bonus-chip .mg-glyph-sym {
+  width: 24px; height: 24px; flex: none;
+  image-rendering: pixelated; image-rendering: crisp-edges;
+}
+.mg-bonus-note { flex-basis: 100%; color: var(--text-dim); }
+/* The ten bonus numerals, straight off art page 1 - one palette column each,
+   which is why no two are the same colour. */
+.mg-bonus-nums { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 0.25rem; }
+.mg-bonus-nums .mg-glyph-num {
+  width: 34px; height: 34px; flex: none;
+  image-rendering: pixelated; image-rendering: crisp-edges;
+  border: 1px solid var(--border); border-radius: 2px;
+}
+
+.mg-note { color: var(--text-dim); font-size: 0.76rem; line-height: 1.6; margin-top: 0.7rem; }
+/* The long notes are `<div class="mg-note">` wrapping one `<p>` per idea rather
+ * than a single <br><br>-separated wall. The id-bearing div stays one element
+ * because the JS captures its innerHTML as a restorable block. */
+.mg-note > p { margin: 0 0 0.6rem; font-size: inherit; line-height: inherit; color: inherit; }
+.mg-note > p:last-child { margin-bottom: 0; }
+
+/* Baka duel viewport: WebGL fighters below, retail-HUD 2D canvas on top.
+ * The retail frame is 320x240 (4:3). */
+.baka-duel {
+  position: relative; width: 100%; max-width: 640px; margin: 0.9rem auto;
+  aspect-ratio: 4 / 3; background: #0b0b10;
+  border: 1px solid var(--border); border-radius: 4px; overflow: hidden;
+}
+.baka-duel canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.baka-duel .baka-hud-canvas { pointer-events: none; image-rendering: pixelated; image-rendering: crisp-edges; }
+
+/* Dance stage: the 3D dancer bodies on a WebGL canvas below, the retail
+ * 320x240 HUD art on a 2D canvas on top (same layering as the Baka duel). */
+.dance-duel {
+  position: relative; width: 100%; max-width: 640px; margin: 0.9rem auto;
+  aspect-ratio: 4 / 3; background: #0b0b10;
+  border: 1px solid var(--border); border-radius: 4px; overflow: hidden;
+}
+.dance-duel canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.dance-duel .dance-hud-canvas {
+  pointer-events: none; image-rendering: pixelated; image-rendering: crisp-edges;
+}
+
+/* muscle 3D */
+/* Muscle Dome arena: WebGL battle scene below (player battle-form mesh vs a
+ * PROT 867 monster), 2D HUD/text overlay canvas on top - the same layering
+ * as the dance and Baka panels. */
+.muscle-duel {
+  position: relative; width: 100%; max-width: 640px; margin: 0.9rem auto;
+  aspect-ratio: 4 / 3; background: #0b0b10;
+  border: 1px solid var(--border); border-radius: 4px; overflow: hidden;
+}
+.muscle-duel canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.muscle-duel .muscle-hud-canvas { pointer-events: none; }
+/* end muscle 3D */
+
+.mg-psbtn { width: 1.05em; height: 1.05em; vertical-align: -0.22em; margin-right: 0.3em; }
+
+/* fishing 3D */
+/* The fishing pond: the venue's field scene on a WebGL canvas below, the
+ * retail HUD (drawn from the ported draw list) on a 2D canvas on top -
+ * the same layering as the dance stage and the Baka duel. */
+.fishing-stage {
+  position: relative; width: 100%; max-width: 640px; margin: 0.9rem auto;
+  aspect-ratio: 4 / 3; background: #0b0b10;
+  border: 1px solid var(--border); border-radius: 4px; overflow: hidden;
+}
+.fishing-stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.fishing-stage .fishing-hud-canvas { pointer-events: none; }
+/* The point-exchange counter rows (retail: 6 rows/venue, row 0 hidden
+ * until strictly affordable, greyed rows unavailable). */
+.fish-exchange { display: flex; flex-direction: column; gap: 0.3rem; max-width: 640px; }
+.fish-ex-row {
+  display: flex; gap: 0.8rem; align-items: center;
+  font-family: var(--font-mono); font-size: 0.8rem; color: var(--text);
+  padding: 0.3rem 0.5rem; background: var(--bg-code);
+  border: 1px solid var(--border); border-radius: 3px;
+}
+.fish-ex-row.is-off { opacity: 0.45; }
+.fish-ex-row b { min-width: 10rem; }
+.fish-ex-once { color: var(--accent); font-size: 0.7rem; }
+.fish-ex-row .mg-btn { margin-left: auto; padding: 0.15rem 0.6rem; }
+</style>
+<script src="js/pad-bindings.js"></script>
+<script src="js/rom-cache.js"></script>
+<script src="js/disc-info.js"></script>
+<script src="js/load-progress.js"></script>
+<script src="js/legaia-saves.js"></script>
+<script src="js/minigame-saves.js"></script>
+<script src="js/webgl-math.js"></script>
+<script src="js/webgl-shaders.js"></script>
+<script src="js/webgl-tmd.js"></script>
+<script src="js/webgl-tmd-frame-state.js"></script>
+<script src="js/webgl-tmd-assembled-scene.js"></script>
+<script src="js/audio-toggle.js"></script>
+<script src="js/minigame-bgm.js"></script>
+<script src="js/minigame-baka.js"></script>
+<script src="js/minigame-dance.js"></script>
+<script src="js/canvas-abr.js"></script>
+<script src="js/minigame-muscle-sound.js"></script>
+<script src="js/minigame-muscle-canvas-chrome.js"></script>
+<script src="js/minigame-muscle.js"></script>
+<script src="js/minigame-fishing.js"></script>
+<script src="js/legaia-sfx.js"></script>
+-->
+
+<!-- PS1 controller-button sprite. Hidden; referenced via <use href="#btn-*">.
+     Source: site/img/ps1-buttons.svg (inlined so the gradient fill resolves
+     in the same document). -->
+<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" style="display:none" aria-hidden="true">
+  <defs>
+    <radialGradient id="ps1BtnGrad" cx="35%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#5a5a5a"/>
+      <stop offset="60%" stop-color="#242424"/>
+      <stop offset="100%" stop-color="#111111"/>
+    </radialGradient>
+  </defs>
+  <symbol id="btn-triangle" viewBox="-30 -30 60 60">
+    <circle cx="0" cy="0" r="30" fill="url(#ps1BtnGrad)"/>
+    <polygon points="0,-14 -14,10 14,10" fill="none" stroke="#2DCCA7" stroke-width="4.5" stroke-linejoin="round" stroke-linecap="round"/>
+  </symbol>
+  <symbol id="btn-square" viewBox="-30 -30 60 60">
+    <circle cx="0" cy="0" r="30" fill="url(#ps1BtnGrad)"/>
+    <rect x="-12" y="-12" width="24" height="24" rx="2.5" fill="none" stroke="#DF74A6" stroke-width="4.5" stroke-linejoin="round"/>
+  </symbol>
+  <symbol id="btn-circle" viewBox="-30 -30 60 60">
+    <circle cx="0" cy="0" r="30" fill="url(#ps1BtnGrad)"/>
+    <circle cx="0" cy="0" r="13.5" fill="none" stroke="#D84B4B" stroke-width="4.5"/>
+  </symbol>
+  <symbol id="btn-cross" viewBox="-30 -30 60 60">
+    <circle cx="0" cy="0" r="30" fill="url(#ps1BtnGrad)"/>
+    <path d="M -12 -12 L 12 12 M 12 -12 L -12 12" fill="none" stroke="#7798D4" stroke-width="4.5" stroke-linecap="round"/>
+  </symbol>
+</svg>
+
+<header class="page-header">
+  <div class="breadcrumb"><a href="index.html">home</a> &middot; minigames</div>
+  <h1>Minigames &amp; Sol Tower</h1>
+  <p class="lede">
+    Legaia has five minigames - <strong>the Vidna casino slot machine, Noa's dance in Sol Tower,
+    Baka Fighter, fishing at the Buma and Vidna ponds, and the Muscle Dome arena</strong>. All
+    five are <a href="#play">playable right here in your browser</a>: the game's own rules,
+    rewritten from-scratch, playing against the real tables read out of your disc. Below the
+    player is a fan's guide to Sol Tower, its prize counters and its side-quests.
+  </p>
+</header>
+
+<div class="disc-bar">
+  <label for="mg-file">Disc:</label>
+  <input type="file" id="mg-file" accept=".bin,.DAT,.dat">
+  <span class="mg-status" id="mg-status">No disc loaded. Provide a <code>.bin</code> Mode2/2352 image (or a raw <code>PROT.DAT</code>) to play.</span>
+</div>
+
+<section class="doc-section" id="play">
+  <h2>Play them</h2>
+  <p>
+    Pick a disc image above, then a tab. Nothing is uploaded - the image is read in this tab
+    and the games run as WebAssembly. If you have an emulator save, drop it on the save bar:
+    its <strong>casino coin bank funds the session</strong> across the three coin games, and
+    export writes your balance back so the save still loads in an emulator.
+  </p>
+  <div class="hint">
+    <strong>How to read the panels.</strong> Each game opens with what it is in Legaia and how
+    to play it here, then the widget, then a short key list. A collapsed
+    <em>&ldquo;What is real and what is fitted&rdquo;</em> note at the bottom of each panel says
+    which parts are traced from the disc and which were fitted by eye - the rules and tables
+    are always the disc's; some camera seats and layouts are not.
+  </div>
+
+  <!-- The save bar (js/minigame-saves.js): the ALWAYS-VISIBLE rich strip of
+       saves stored in this browser, sitting directly above the player so
+       "load your save here" can't be missed. Each save is a retail-style
+       memory-card tile - the SC block's own baked icon (the lead's face) +
+       party portraits decoded from your disc + lead/level/gold/coins/location.
+       Load imports a save's casino coin bank into the session across all three
+       game tabs; Export writes the session balance back into that save slot
+       (the coin-bank word inside the SC block - the save still loads in
+       an emulator); the tile's download button hands the container back as a
+       file. Nothing is uploaded. -->
+  <div id="mg-save-bar" style="margin-bottom: 1rem;"></div>
+
+  <div class="mg-shell">
+    <div id="mg-main" style="display: none;">
+      <div class="mg-tabs" id="mg-tabs">
+        <button class="mg-tab is-active" type="button" data-game="slot">Slot machine</button>
+        <button class="mg-tab" type="button" data-game="dance">Dance</button>
+        <button class="mg-tab" type="button" data-game="baka">Baka Fighter</button>
+        <button class="mg-tab" type="button" data-game="fishing">Fishing</button>
+        <button class="mg-tab" type="button" data-game="muscle">Muscle Dome</button>
+      </div>
+
+      <!-- ---------------- dance ---------------- -->
+      <section class="mg-panel" data-game="dance">
+        <h3>Sol Fever Disco &mdash; Noa's dance</h3>
+        <p class="mg-blurb">
+          In Sol Tower's disco, Noa dances against two rivals to a step chart the Disco King
+          calls out. Hit each step on the beat: every closed step chain fills the groove gauge,
+          and a full gauge promotes you to a denser, higher-scoring lane (the gauge never falls -
+          only rises). <b>Triangle is the wildcard</b>: three &ldquo;groovy moves&rdquo; a song,
+          worth the big multiplier only when spent <em>on</em> a 4-beat combo slot, and it spins
+          Noa for up to a second during which nothing you press is judged. The two dancers beside
+          you run the same chart for real: <b>beat them.</b>
+        </p>
+        <div class="dance-duel" id="dance-duel">
+          <canvas id="dance-gl" width="640" height="480"></canvas>
+          <canvas id="dance-canvas" class="dance-hud-canvas" width="640" height="480"></canvas>
+        </div>
+        <div class="mg-verdict" id="dance-verdict"></div>
+        <div class="mg-row">
+          <button class="mg-btn mg-throw" type="button" data-dance="1"><svg class="mg-psbtn"><use href="#btn-square"/></svg>Square<span class="mg-key">Z</span></button>
+          <button class="mg-btn mg-throw" type="button" data-dance="2"><svg class="mg-psbtn"><use href="#btn-circle"/></svg>Circle<span class="mg-key">C</span></button>
+          <button class="mg-btn mg-throw" type="button" data-dance="3"><svg class="mg-psbtn"><use href="#btn-triangle"/></svg>Triangle<span class="mg-key">X</span></button>
+          <button class="mg-btn mg-primary" type="button" id="dance-start">Start</button>
+        </div>
+        <div class="mg-row">
+          <label for="dance-mode"><strong>Mode:</strong></label>
+          <select id="dance-mode" class="mg-select">
+            <option value="0">Qualifier</option>
+            <option value="1">Finals</option>
+            <option value="2">How-to (Disco King)</option>
+            <option value="3">Free play</option>
+          </select>
+        </div>
+        <div class="mg-row" id="dance-jukebox-row" hidden>
+          <label for="dance-track"><strong>Track:</strong></label>
+          <select id="dance-track" class="mg-select"></select>
+        </div>
+        <div class="mg-hud">
+          <span>Score <b class="mg-big" id="dance-score">0</b> / 999</span>
+          <span>Rivals <b id="dance-rivals">0 &middot; 0</b></span>
+          <span>Triangles <b id="dance-tri">&#9650;&#9650;&#9650;</b></span>
+          <span>Groove <b id="dance-gauge">0</b></span>
+          <span>Lane <b id="dance-lane">0</b></span>
+          <span>Song <b id="dance-song">0%</b></span>
+        </div>
+        <p class="mg-controls">
+          <b>Keys:</b> <kbd>Z</kbd> Square, <kbd>C</kbd> Circle, <kbd>X</kbd> Triangle. Score
+          caps at 999; the song ends the round.
+        </p>
+        <details class="disclosure">
+          <summary>What is real and what is fitted</summary>
+          <div class="disclosure-body">
+            <div class="mg-note" id="dance-art-note">
+              <p>
+                The step chart, beat clock, timing windows, groove gauge and score tiers are the
+                game's own, read from the dance overlay on your disc. The judge scores the
+                <em>raw</em> chart cell, not the held-sequence symbol the display substitutes on
+                every fourth beat, and each chart symbol is literally a pad-button mask
+                (1&nbsp;=&nbsp;Square, 2&nbsp;=&nbsp;Circle, 3&nbsp;=&nbsp;Triangle).
+              </p>
+              <p>
+                Triangle matches no chart cell: it spends a stock of three, scores small anywhere
+                but big (plus a full groove-gauge step) on the 4-beat combo slot, and the spin it
+                triggers suspends judging entirely. The dancers, floor and HUD come from the
+                dance art pack on the disc. Full trace with addresses and scoring constants:
+                <code>docs/subsystems/minigame-dance.md</code>.
+              </p>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <!-- ---------------- baka fighter ---------------- -->
+      <section class="mg-panel" data-game="baka">
+        <h3>Baka Fighter &mdash; the duel</h3>
+        <p class="mg-blurb">
+          The arcade cabinet in Sol Tower. It is rock-paper-scissors with life meters, best of
+          three rounds: <b>2 beats 1, 3 beats 2, 1 beats 3</b>. The opponent throws from a
+          scripted pattern stored on the disc, so it can be read and predicted. Each hit you
+          take feeds the combo counter behind the <em>next</em> one, and a comeback critical can
+          fire at a sliver of HP. There is no Special button: the Special is the finisher,
+          thrown on its own by whoever empties the other's life meter, and its last strike
+          takes the round.
+        </p>
+        <div class="mg-row">
+          <label for="baka-char"><strong>Fight as:</strong></label>
+          <select id="baka-char" class="mg-select" style="min-width: 8rem;">
+            <option value="0" selected>Vahn</option>
+            <option value="1">Noa</option>
+            <option value="2">Gala</option>
+          </select>
+          <button class="mg-btn mg-primary" type="button" id="baka-start">Start run</button>
+        </div>
+        <p class="mg-blurb" style="margin-top:0.25rem;">
+          Start a run and pick a fighter on the cabinet's own <b>PLAYER SELECT</b> screen
+          (arrows or a click, Cross confirms). After every stage win the tally sheet
+          asks <b>NEXT GAME or PAY OUT</b> (arrows pick, Cross takes it): fight on and the pot
+          rides (<b>lose and it is forfeit</b>), pay out and it banks. The run is the cabinet's
+          own ladder, from its first rung, exactly as in the game.
+        </p>
+        <div class="baka-duel" id="baka-duel" hidden>
+          <canvas id="baka-gl" width="640" height="480"></canvas>
+          <canvas id="baka-hud" class="baka-hud-canvas" width="640" height="480"></canvas>
+        </div>
+        <div class="mg-fighters">
+          <div class="mg-fighter">
+            <div class="mg-fname">You <span class="mg-pips" id="baka-p0-pips"></span></div>
+            <div class="mg-bar"><span id="baka-p0-hp" style="width:100%"></span></div>
+            <div id="baka-p0-meta">&mdash;</div>
+          </div>
+          <div class="mg-vs">vs</div>
+          <div class="mg-fighter">
+            <div class="mg-fname"><span id="baka-p1-name">Opponent</span> <span class="mg-pips" id="baka-p1-pips"></span></div>
+            <div class="mg-bar mg-bar-foe"><span id="baka-p1-hp" style="width:100%"></span></div>
+            <div id="baka-p1-meta">&mdash;</div>
+          </div>
+        </div>
+        <div class="mg-verdict" id="baka-verdict"></div>
+        <div class="mg-row" id="baka-throw-row">
+          <button class="mg-btn mg-throw" type="button" data-baka="1">Throw 1<span class="mg-key">C</span></button>
+          <button class="mg-btn mg-throw" type="button" data-baka="2">Throw 2<span class="mg-key">X</span></button>
+          <button class="mg-btn mg-throw" type="button" data-baka="3">Throw 3<span class="mg-key">Z</span></button>
+        </div>
+        <div class="mg-hud">
+          <span>Stage <b id="baka-stage">&mdash;</b></span>
+          <span>Round <b id="baka-round">1</b></span>
+          <span>Your combo taken <b id="baka-combo">0</b></span>
+          <span>Prize <b id="baka-gold">&mdash;</b> G</span>
+          <span>Pot at risk <b id="baka-pot">0</b> G</span>
+          <span>Banked <b id="baka-bank">0</b> G</span>
+        </div>
+        <p class="mg-controls">
+          <b>Keys:</b> <kbd>C</kbd> / <kbd>X</kbd> /
+          <kbd>Z</kbd> are throws 1 / 2 / 3 - Square, Circle and Cross, the
+          buttons the cabinet reads, laid out side by side. <em>Pot at risk</em> is everything won this run that a loss would wipe;
+          <em>Banked</em> is what PAY OUT has already kept.
+        </p>
+        <details class="disclosure">
+          <summary>What is real and what is fitted</summary>
+          <div class="disclosure-body">
+            <div class="mg-note">
+              <p>
+                <b>The names, ladder and prizes are read off your image.</b> Each roster record
+                opens with a 32-byte ASCII name, and the cabinet serves records 5&ndash;16 in
+                order - across which the prize gold is strictly increasing and sums to
+                <b id="baka-total">&mdash;</b> coins. Records 3 and 4 are the two <em>secret</em>
+                opponents: the cabinet inserts them mid-run after stages 5 and 13 when your
+                running high score is big enough, and serves them again on a second lap after an
+                all-clear. That is why the raw roster's gold column looks jumbled - it is sorted
+                so the secrets sit outside the first lap.
+              </p>
+              <p>
+                <b>The duel is drawn with the cabinet's own assets</b>, decoded from your disc as
+                it runs: your fighter from the battle-form party pack (PROT&nbsp;1204), the
+                opponent from its per-rung pack (PROT&nbsp;1206&hellip;1219), both posed from
+                their real animation banks, plus the arena, the HUD and tally-menu widgets, the
+                overlay's own sound cues and its boss-overture music. The mid-run pot forfeit is
+                pinned to the disassembly: the GAME OVER state zeroes the prize accumulator on
+                its first frame. Full trace: <code>docs/subsystems/minigame-baka-fighter.md</code>.
+              </p>
+              <p>
+                <b>The duel itself is the engine's.</b> The fighters stand at the round setup's
+                traced stand-offs and play their display clips; the arena is the four walls and
+                the floor grid the overlay's epilogue draws, framed by the arena camera (the
+                round-start spin, each special's glide, the result close-up). Hold
+                <kbd>V</kbd> (Triangle) as a round starts for the ring-girl cameo.
+                The native window and the play page draw the same surface. Your PLAYER SELECT
+                pick is your fighter's own roster record - its stats and moves, not just its
+                model.
+              </p>
+              <p>
+                The PLAYER SELECT camera and line-up, the NEXT GAME / PAY OUT menu and the
+                animation slot order are traced and run here; only the text-menu fallback, drawn
+                when the cabinet art is missing, is laid out by the page. When the
+                presentation assets do not decode, the duel falls back to the stat panel above
+                and says so - no stand-in art is drawn.
+              </p>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <!-- ---------------- slot machine ---------------- -->
+      <section class="mg-panel is-active" data-game="slot">
+        <h3>Vidna casino &mdash; slot machine</h3>
+        <p class="mg-blurb">
+          The one-armed bandit in Vidna's casino. Three coins a spin, all <b>five</b> paylines
+          always live (three straight, two diagonal), and you stop each reel yourself. A hidden
+          <b>net-take</b> counter brackets the odds: the more the machine has taken off you, the
+          more generous it rolls, and a big bonus win knocks the counter back down.
+          <b>Three blue kicks</b> earn <b>1 bonus round</b>, <b>three red punches</b> earn
+          <b>3</b>: the reels rotate onto the numeral strip (<b>1&ndash;10</b>) and stopping all
+          three pays their <em>product</em>, 1 to 1000 coins - nothing steers those reels but
+          your timing.
+        </p>
+        <canvas id="slot-canvas" class="mg-cabinet" width="640" height="240"
+                tabindex="0" role="button" aria-label="Slot machine - press space to spin, then once per reel to stop it"></canvas>
+        <div class="mg-reels" id="slot-reels" hidden></div>
+        <div class="mg-verdict" id="slot-verdict"></div>
+        <p class="mg-controls">
+          <b><kbd>Space</kbd> plays the whole machine.</b> Press it to spin, once more per
+          reel to stop them left to right. A win counts itself into the balance; a press
+          finishes the count at once. Those are the cabinet's own buttons:
+          <kbd data-pad-key="Cross">Z</kbd> (Cross) spins and finishes the count,
+          and <kbd data-pad-key="Square">V</kbd> (Square), <kbd data-pad-key="Cross">Z</kbd> (Cross)
+          and <kbd data-pad-key="Circle">X</kbd> (Circle) stop the left, middle and right reel
+          in any order. When the coins run out, a press racks a fresh machine. Clicking the
+          machine counts as a press.
+        </p>
+        <div class="mg-hud">
+          <span>Coins <b class="mg-big" id="slot-balance">0</b></span>
+          <span>Spin costs <b id="slot-cost">3</b></span>
+          <span>Feature mode <b id="slot-feature">0</b></span>
+          <span>Net take <b id="slot-nettake">0</b></span>
+        </div>
+        <p class="hint">
+          <b>How to read the paytable:</b> each row is a symbol and what three of it on a live
+          payline pays. The reel strips, the payout table, the two RNGs and the net-take
+          brackets are all read from the slot overlay on your disc; the symbol art is the
+          casino's own art pack.
+        </p>
+        <div class="mg-paytable" id="slot-paytable"></div>
+        <p class="mg-bonus-legend" id="slot-bonus-legend"></p>
+        <p class="mg-note" id="slot-art-note"></p>
+      </section>
+
+      <!-- ---------------- fishing ---------------- -->
+      <section class="mg-panel" data-game="fishing">
+        <h3>Fishing &mdash; Buma &amp; Vidna ponds</h3>
+        <p class="mg-blurb">
+          Two ponds, one in Buma and one in Vidna, each with its own species and prize counter.
+          <b>Cast</b>, keep working the lure, and when the strike lands the species is picked
+          by a hidden <b>band</b>: reeling in one of four recognised <b>rhythms</b> flashes
+          &ldquo;Good!&rdquo; and pins the band that rhythm names, and a six-condition gate
+          guards each pond's rarest catch. Once hooked it is a tension tug-of-war - <b>reel</b>
+          to bring the fish in, ease off before the line snaps - and the landed catch scores
+          into the same point pool the prize counter spends. Your reel record, lures, rod and
+          lifetime cast counter can come straight from a loaded save.
+        </p>
+        <div class="fishing-stage" id="fishing-stage">
+          <canvas id="fishing-gl" width="640" height="480"></canvas>
+          <canvas id="fishing-canvas" class="fishing-hud-canvas" width="640" height="480"></canvas>
+        </div>
+        <div class="mg-verdict" id="fishing-verdict"></div>
+        <div class="mg-row">
+          <label for="fishing-venue"><strong>Pond:</strong></label>
+          <select id="fishing-venue" class="mg-select" style="min-width: 7rem;">
+            <option value="0" selected>Buma</option>
+            <option value="1">Vidna</option>
+          </select>
+          <label for="fishing-lure"><strong>Lure:</strong></label>
+          <select id="fishing-lure" class="mg-select" style="min-width: 9rem;">
+            <option value="0" selected>Light Lure</option>
+            <option value="1">Normal Lure</option>
+            <option value="2">Heavy Lure</option>
+          </select>
+          <label for="fishing-rod"><strong>Rod:</strong></label>
+          <select id="fishing-rod" class="mg-select" style="min-width: 9rem;">
+            <option value="0" selected>Old Rod</option>
+            <option value="1">Deluxe Rod</option>
+            <option value="2">Legendary Rod</option>
+          </select>
+          <button class="mg-btn mg-primary" type="button" id="fishing-start">Restart</button>
+        </div>
+        <div class="mg-row">
+          <button class="mg-btn mg-primary" type="button" id="fishing-cast">Cast / Lock<span class="mg-key">SPACE</span></button>
+          <button class="mg-btn mg-throw" type="button" id="fishing-reel-a"><svg class="mg-psbtn"><use href="#btn-cross"/></svg>Reel<span class="mg-key"><span data-pad-key="Cross">Z</span> (hold)</span></button>
+          <button class="mg-btn mg-throw" type="button" id="fishing-reel-b"><svg class="mg-psbtn"><use href="#btn-square"/></svg>Reel soft<span class="mg-key"><span data-pad-key="Square">V</span> (hold)</span></button>
+        </div>
+        <p class="mg-controls">
+          <b><kbd data-pad-key="Circle">X</kbd> casts and locks the power meter; hold
+          <kbd data-pad-key="Cross">Z</kbd> (Cross) or <kbd data-pad-key="Square">V</kbd>
+          (Square) to reel.</b> While the lure is out, every fresh press feeds the bite, and a
+          strike can only land while a reel button is held - try the rhythm
+          <em>Cross&nbsp;&middot; pause&nbsp;&middot; Cross</em>, or the Square-tap cadence the
+          <a href="writeups/spirit-fish.html">Spirit-fish write-up</a> decodes. After a catch or
+          a snapped line, <kbd data-pad-key="Circle">X</kbd> casts again. Drag the pond to
+          orbit, wheel to zoom, double-click to re-frame.
+        </p>
+        <div class="mg-hud">
+          <span>Phase <b id="fishing-phase">&mdash;</b></span>
+          <span>Hooked <b id="fishing-fish">&mdash;</b></span>
+          <span>Points <b class="mg-big" id="fishing-points">0</b></span>
+          <span>Best <b id="fishing-best">0</b></span>
+          <span>Casts <b id="fishing-casts">0</b></span>
+        </div>
+        <div class="mg-row" id="fishing-save-row" hidden>
+          <span class="mg-status" id="fishing-save-note"></span>
+          <button class="mg-btn" type="button" id="fishing-save-export" hidden>Write record to save</button>
+        </div>
+        <h4 style="margin: 1rem 0 0.3rem;">Point exchange</h4>
+        <p class="mg-blurb" style="margin-bottom: 0.5rem;">
+          The pond's prize counter: six rows, prices and one-time latches read off your disc,
+          spending the point pool the catches feed. Exactly as in the game, a venue's top prize
+          stays hidden until you can afford it - which is how Vidna's 50,000-point War God Icon
+          escaped every walkthrough. Trades here are one unit at a time; the one-time latches
+          ride along in a save export.
+        </p>
+        <div class="fish-exchange" id="fishing-exchange"></div>
+        <div class="mg-status" id="fishing-prizes" style="margin-top: 0.4rem;"></div>
+        <p class="hint">
+          <b>How to read the species table:</b> one row per fish, with its point value, how
+          hard it pulls, and the strike gate it needs. Which fish bites is
+          <em>lure row &times; band column</em> in the pond's spawn table - the rod only changes
+          how the tension fight goes.
+        </p>
+        <div class="mg-paytable" id="fishing-species"></div>
+        <details class="disclosure">
+          <summary>What is real and what is fitted</summary>
+          <div class="disclosure-body">
+            <div class="mg-note" id="fishing-note">
+              <p>
+                <b>The rules are the retail loop, read off your image:</b> the ten-species table
+                (score value, pull factor, strike gate), the per-pond spawn tables the hook
+                resolves through (lure row &times; band column), the four reel-cadence gesture
+                templates the &ldquo;Good!&rdquo; recogniser matches, the band-roll odds, the
+                strike credit, the gate behind each pond's band-4 rarity, the tension divisors of
+                all three rods, the catch-score formula with its 999,999 cap, and the prize
+                counter - all decoded from the fishing overlay at load. Reference:
+                <code>docs/subsystems/minigame-fishing.md</code>.
+              </p>
+              <p>
+                <b>The pond is the real place:</b> the venue's own field-scene bundle assembled
+                in WebGL, with Vahn, Noa and Gala standing on the shore where the fishing
+                overlay seats them, each in the animation it plays there, seen through the
+                venue's own camera from behind the party.
+              </p>
+              <p>
+                <b>Traced and run here:</b> the fishing line (retail's line packet off the rod
+                tip), the strike-denominator ladder, the HUD sprites, the line break - a
+                1-in-10 roll each frame at the tension ceiling, which spends one of the equipped
+                lure (this page keeps its own lure count, starting at 99) - and the ambient
+                ripples the angler's idle tick rolls out on the water: the overlay's own ripple
+                records, run through the engine's move VM into the procedural rings they build,
+                exactly as the other two hosts run them.
+                <b>Fitted rather than traced:</b> the bobber, the fight's reel-in rates, the
+                fish-behaviour branch order (its pull / dart / sink formulas are per-species disc
+                data), and the ripple's shading - each ring triangle fills with its mean packet
+                colour, since the canvas has no Gouraud fill.
+              </p>
+            </div>
+          </div>
+        </details>
+        <div class="see-also">
+          <span class="see-also-label">Reference</span>
+          <a href="subsystems/minigame-fishing.html">Fishing runtime write-up</a>
+          <a href="writeups/spirit-fish.html">The Spirit fish gate</a>
+          <a href="world.html">World guide (fishing spots)</a>
+        </div>
+      </section>
+
+      <!-- ---------------- muscle dome ---------------- -->
+      <section class="mg-panel" data-game="muscle">
+        <h3>Muscle Dome &mdash; the arena battle</h3>
+        <p class="mg-blurb">
+          Sol Tower's arena. Retail presents it as a <b>standard Legaia battle</b> - the usual
+          battle screen, its command chips gated by the battle's own restriction word - and
+          so does this panel: the
+          black <em>&ldquo;Welcome to the Muscle Dome!&rdquo;</em> intro card, the command
+          cluster (Item / Attack / Ra-Seru / Spirit), the name/HP/MP plate and the AP gauge. You field
+          one character in their <b>assembled battle form</b> against one of the game's monsters,
+          both drawn and animated from your disc. Choose <b>Attack</b> and enter directions
+          under an <b>AP budget seeded from your fighter's AGL</b>; a sequence that spells a
+          Tactical Art raises the <b>&ldquo;HYPER ARTS!!&rdquo;</b> banner, and every command
+          resolves through the game's <em>actual battle engine</em> - the per-move power table,
+          the arts damage roll, the element-affinity matrix and the damage finisher.
+        </p>
+        <div class="mg-row">
+          <label for="muscle-char"><strong>Fight as:</strong></label>
+          <select id="muscle-char" class="mg-select" style="min-width: 7rem;">
+            <option value="0" selected>Vahn</option>
+            <option value="1">Noa</option>
+            <option value="2">Gala</option>
+          </select>
+          <label for="muscle-level"><strong>at level</strong></label>
+          <input type="number" id="muscle-level" class="mg-select" style="min-width: 4.5rem;"
+                 min="1" max="99" value="30">
+          <label for="muscle-course"><strong>on course</strong></label>
+          <select id="muscle-course" class="mg-select" style="min-width: 7rem;">
+            <option value="0" selected>Beginner</option>
+            <option value="1">Expert</option>
+            <option value="2">Master</option>
+          </select>
+          <label for="muscle-foe"><strong>or one foe</strong></label>
+          <select id="muscle-foe" class="mg-select"></select>
+          <button class="mg-btn mg-primary" type="button" id="muscle-restart">New contest</button>
+        </div>
+        <div class="muscle-duel" id="muscle-duel">
+          <canvas id="muscle-gl" width="640" height="480"></canvas>
+          <canvas id="muscle-hud" class="muscle-hud-canvas" width="640" height="480"></canvas>
+        </div>
+        <div class="mg-verdict" id="muscle-verdict"></div>
+        <p class="mg-controls">
+          <b>Fight until someone drops.</b> A dome round is an ordinary battle with no turn
+          limit - <em>HP Left</em> is how much of your <b>opponent</b> is still standing, and
+          emptying it is the whole win condition. Between <em>fights</em> the arena's
+          <b>INTERVAL</b> screen counts the cleared round up, and
+          <kbd data-pad-key="Cross">Z</kbd> stages the next one. Drag the arena to orbit,
+          wheel to zoom.
+        </p>
+        <ul class="bullets" style="font-size: 0.86rem;">
+          <li><kbd data-pad-key="Cross">Z</kbd> skips the intro card, reviews the queue, and
+            confirms <b>Begin&nbsp;/&nbsp;Reselect</b> (<kbd>Esc</kbd> backs out).</li>
+          <li>In the command menu <kbd>&larr;</kbd> is <b>Attack</b>, <kbd>&rarr;</kbd> is
+            <b>Ra-Seru</b> (the magic list - pick with <kbd>&uarr;</kbd>/<kbd>&darr;</kbd>,
+            cast with <kbd data-pad-key="Cross">Z</kbd>), <kbd>&darr;</kbd> is
+            <b>Spirit</b> (end selection and fight). A cast spends <b>MP, not AP</b>, and
+            replaces the whole direction string - which is what retail's arm does.</li>
+          <li>Attack opens the <b>Auto&nbsp;/&nbsp;Command</b> pick (<kbd>&larr;</kbd>/<kbd>&rarr;</kbd>).
+            Command is the real input screen: the <b>arrow keys</b> (or <kbd>1</kbd>&ndash;<kbd>4</kbd>)
+            enter directions onto the input bar while the AP budget covers their cost; entry
+            ends by itself when nothing is affordable, exactly as retail does.</li>
+          <li><kbd data-pad-key="Triangle">C</kbd> is the <b>Triangle</b> button - the
+            learned-arts list overlay, paging on each press.</li>
+          <li>A settled turn goes straight back to the command menu - retail has no beat
+            between turns.</li>
+        </ul>
+        <div class="mg-row">
+          <button class="mg-btn mg-primary" type="button" id="muscle-confirm">Fight / Next<span class="mg-key" data-pad-key="Cross">Z</span></button>
+        </div>
+        <div class="mg-hud">
+          <span>Round <b id="muscle-round">1</b>/<b id="muscle-length">8</b></span>
+          <span>Banked <b id="muscle-tally">0</b></span>
+          <span>Coins <b id="muscle-coins">0</b></span>
+          <span>Turn <b id="muscle-turn">0</b></span>
+          <span>HP Left <b id="muscle-hp-left">100</b>%</span>
+          <span>Your AP <b id="muscle-budget">0</b></span>
+          <span>Entered <b id="muscle-queue">0</b></span>
+          <span>Caption <b id="muscle-reward">&mdash;</b></span>
+        </div>
+        <details class="disclosure">
+          <summary>What is real and what is fitted</summary>
+          <div class="disclosure-body">
+            <div class="mg-note" id="muscle-note">
+              <p>
+                <b>The fight is your disc's.</b> The four-direction deal, the AP gate and the
+                action queue are the arena's own rules; each command resolves through the ported
+                battle engine - its power from the battle overlay's move-power table, the damage
+                roll and finisher from the shared battle formulas, the elemental nudge from the
+                8&times;8 affinity matrix. Your fighter's body is the assembled battle form (the
+                player battle file's equipment sections spliced and posed from its own action
+                streams), each direction plays <em>that command's own swing record</em>, and your
+                stats are the new-game template levelled through the game's growth curves. The
+                opponent fights with its monster record's boosted battle stats, and a committed
+                sequence is matched against the arts-name table's own combo strings to raise the
+                arts banner.
+              </p>
+              <p>
+                <b>The arena is the game's own too.</b> The fenced dirt ring is the Sol Muscle
+                Dome's real battle backdrop (PROT&nbsp;1225, the tail slot of the dome's
+                <code>other6.lzs</code> file), drawn with its own texture pages and its lamp-glow
+                prims blended additively the PSX way; the ground is the retail battle ground
+                grid sampling the backdrop's own dirt tile. That stream's second object - a ring
+                of dust decals - is omitted here, and retail omits it too: its battle scene
+                loader drops object&nbsp;1 from the backdrop's bound part list unless the
+                encounter record's own option bit asks for it. A live capture of a dome
+                contest reads that option byte as clear at the loader's own test and sees it
+                written not once all match, so the trim really is what retail does here -
+                and the retail match capture shows no dust. The sound is the dome's own cue set
+                (PROT&nbsp;0868 UI blips, the shared PROT&nbsp;0869 impact cue) with the battle
+                theme as BGM.
+              </p>
+              <p>
+                <b>The chrome is the game's art.</b> Every chip, plate, badge, numeral and
+                banner strip on the HUD is decoded from your disc - the widget page in
+                <code>PROT.DAT</code>'s system-TIM gap, the small battle font, the menu-glyph
+                digits, the battle-effect bank's <b>SUPER / HYPER / MIRACLE ARTS!!</b> strips and
+                damage numerals (PROT&nbsp;0870), and the dome's own cursive welcome, INTERVAL
+                heading and ROUND word (extraction&nbsp;1220). Screen positions come from the
+                battle HUD element table plus packet captures of a real dome match and a real
+                arts input screen, down to the hexagon chips, the maroon input bar, the pennants
+                and the Hyper Arts list window.
+              </p>
+              <p>
+                <b>Traced and run here:</b> the camera seat, fighter spacing and facing
+                (the battle camera director's formation seats), the knockdown clip pick, and
+                the three UI blips - accept (<code>0x21</code>), highlight-moved
+                (<code>0x22</code>) and refused-or-back (<code>0x23</code>).
+                <b>Fitted rather than traced:</b> the banner's speed-line rays and the
+                SUPER/MIRACLE word composition (only the HYPER strip is packet-pinned); the
+                review screen's geometry; the caption Seru
+                (the arena grants no Seru - the value is only a caption index, and which one
+                retail writes is not pinned); and the arts list showing every table art - the
+                page does not model arts <em>learning</em>.
+                <b>Traced and run here too:</b> the opponent's turn - the ordinary battle's
+                monster AI over the monster's own record (its magic roll, its per-monster
+                script, and its AGL-budgeted strikes from its own attack entries) - the
+                direction chips' 16-frame slide-in, each committed pennant's 24-frame glide from
+                the pressed chip, the Begin / Reselect plates, the level growth's small
+                zero-mean random spread, and <b>Auto</b>: the review shows the command string
+                saved on the previous round's review confirm (which is also why a reopened
+                input screen starts with the last round's pennants), and the round itself
+                rebuilds the string from a weighted, AP-budgeted draw of the four directions
+                with learned arts spliced in - the battle's own Auto. This page counts every
+                art as learned.
+                <b>The Ra-Seru chip is live now,</b> on this page and in the native
+                window: the shared session carries retail's three gates (the member's
+                Ra-Seru, the sealed-magic status bit, the restriction word's magic bit),
+                prices the list by the accessory MP-saver discount and resolves the cast
+                through the same rule the ordinary battle folds with. Which chip wears the
+                red X is the restriction word's, not a course table. The word is seeded at
+                arena entry from three story flags, and the highest seed carries the magic
+                bit, so retail's dome <em>does</em> cross the Ra-Seru chip out once the
+                Master course is unlocked; every seed also carries the Item bit.
+                The sibling gap is closed - the queue the turn resolves
+                is now the retail tokenizer's wherever the fighter's art records are loaded - the
+                arena door and the native window - so a recognised art contributes its own power
+                row instead of the swings it consumed. This page's standalone dome panel still
+                reads its arts from the name table, which has no action constants, so its banner
+                is real recognition while its damage is still swings.
+                Its hub screens also run retail's own fade/hold envelopes rather than a frame
+                count the page picked. Without a disc the chrome
+                falls back to a canvas approximation; when the 3D bodies or backdrop do not
+                decode, the fight falls back to the text HUD or plain tiles and says so.
+              </p>
+            </div>
+          </div>
+        </details>
+        <div class="see-also">
+          <span class="see-also-label">Reference</span>
+          <a href="subsystems/minigame-muscle-dome.html">Muscle Dome internals</a>
+          <a href="subsystems/battle-formulas.html">Battle formulas</a>
+          <a href="subsystems/arts-command-gauge.html">Arts AP gauge</a>
+          <a href="formats/monster-animation.html">Monster animation</a>
+          <a href="formats/move-power.html">Move-power table</a>
+          <a href="formats/character-mesh.html">Character mesh (battle form)</a>
+        </div>
+      </section>
+    </div>
+  </div>
+</section>
+
+<section class="doc-section" id="overview">
+  <h2>At a glance</h2>
+  <p>
+    Where each game lives, what you are really playing against, and where the coins go. One
+    casino coin bank is shared by the slot machine, Baka Fighter and the Muscle Dome; fishing
+    keeps its own point pool.
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Game</th><th>Where</th><th>What the disc supplies</th><th>Pays into</th></tr></thead>
+      <tbody>
+        <tr><td><a href="#play">Slot machine</a></td><td>Vidna casino</td><td>Reel strips, payout table, two RNGs, net-take odds brackets</td><td>Casino coins</td></tr>
+        <tr><td><a href="#play">Noa's dance</a></td><td>Sol Tower, Sol Fever Disco</td><td>Step chart, beat clock, timing windows, rival choreography</td><td>Story reward</td></tr>
+        <tr><td><a href="#play">Baka Fighter</a></td><td>Sol Tower cabinet</td><td>Roster of 17 fighters with prizes and throw patterns; 12-rung first lap + 2 secret rungs</td><td>Casino coins</td></tr>
+        <tr><td><a href="#play">Fishing</a></td><td>Buma pond, Vidna pond</td><td>Ten species, per-pond spawn tables, four reel rhythms, two prize counters</td><td>Fishing points</td></tr>
+        <tr><td><a href="#play">Muscle Dome</a></td><td>Sol Tower arena</td><td>Three courses of 8 / 8 / 13 real monsters, score table, the whole battle engine</td><td>Casino coins</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="card-grid">
+    <a class="card" href="#sol-tower">
+      <div class="card-title">Sol Tower map</div>
+      <div class="card-body">Floor-by-floor layout, B2 through Roof, plus the named side-quest chains - Mary's Diary, the Music Score reunion, Sol Fever Disco, Sol Broadway, the Genesis Tree, and the Warrior's Square Gaza fight.</div>
+    </a>
+    <a class="card" href="#slot-machines">
+      <div class="card-title">Prize counters</div>
+      <div class="card-body">Vidna casino + the Sol Tower Muscle Dome counter. Two different prize ladders over the same coin pool, each topping out at the 100,000-coin Earth Egg.</div>
+    </a>
+    <a class="card" href="#muscle-dome">
+      <div class="card-title">Muscle Dome courses</div>
+      <div class="card-body">Beginner / Expert / Master line-ups, clear rewards, and what each course forbids. Master's War God Icon first-clear is conditional on Jette's defeat.</div>
+    </a>
+    <a class="card" href="#baka-fighter">
+      <div class="card-title">Baka Fighter ladder</div>
+      <div class="card-body">The walkthrough's round-by-round button sequences, kept as a cross-check against the roster the cabinet really serves.</div>
+    </a>
+  </div>
+</section>
+
+<section class="doc-section" id="sol-tower">
+  <h2>Sol Tower</h2>
+  <p>
+    Sol is a city built as a tower: a basement reached by service elevator, then floor after
+    floor of vendors, the arena, the disco, the Baka Fighter cabinet and a handful of
+    side-quests that belong nowhere else. The map below is floor by floor, B2 to Roof; the
+    <a href="viewer.html?scene=kor">asset viewer</a> can be pre-filtered to its first scene (<code>kor</code>; Sol spans the <code>kor*</code> / <code>koin*</code> blocks).
+  </p>
+  <div class="tile-grid" id="sol-tower-floors">
+    <!-- Filled from minigames.json/sol_tower.floors -->
+  </div>
+
+  <h3 id="side-quests">Side-quest chains</h3>
+  <p>
+    Sol Tower is the hub for several multi-step quests that thread back through other towns.
+    Each row is the sequence of beats; rewards reference items in the curated tables.
+  </p>
+  <div id="sol-tower-side-quests">
+    <!-- Filled from minigames.json/sol_tower.side_quests -->
+  </div>
+</section>
+
+<section class="doc-section" id="slot-machines">
+  <h2>Prize counters</h2>
+  <p>
+    Casino coins are only worth what you trade them for. The <strong>Vidna casino</strong>
+    exchanges coins won at its slots for items; the <strong>Sol Tower</strong> counter on the
+    Muscle Dome floor spends the same coin pool (also earned in Muscle Dome runs and Baka
+    Fighter) on a higher-value ladder. Both ladders top out at the 100,000-coin Earth Egg.
+  </p>
+  <div class="hint">
+    The <strong>Sol</strong> rows are the Muscle Dome prize-exchange counter, not a slot
+    machine - the slot machine only pays out coins. The same pool funds Muscle Dome entry
+    fees, Baka Fighter games and counter purchases.
+  </div>
+  <div id="slot-machine-tables"></div>
+</section>
+
+<section class="doc-section" id="muscle-dome">
+  <h2>Muscle Dome courses</h2>
+  <p>
+    Three fixed arenas, each a ladder of ordinary battles against one monster at a time -
+    8 rounds on Beginner and Expert, 13 on Master. The walkthrough data below records
+    Beginner and Expert disabling equipment and items but allowing magic, with Master adding
+    a magic ban; accessories are always permitted. The disc backs both bans, from the arena's
+    own entry: it seeds the special-battle word from the three course-unlock story flags, and
+    every one of those seeds carries the <em>Item</em>-forbidden bit while the Master one also
+    carries the magic-forbidden bit. (The executable's battle init raises the magic bit too,
+    but keyed on the first enemy's monster id - ids the dome ladder never fields.) The line-ups
+    are cross-checked against the roster table on the disc, which agrees in every slot.
+  </p>
+  <div id="muscle-dome-courses"></div>
+
+  <h3 id="muscle-paradise-secrets">Muscle Paradise secrets</h3>
+  <div id="muscle-secrets"></div>
+  <details class="disclosure">
+    <summary>How the disc decides a course</summary>
+    <div class="disclosure-body">
+      <p>
+        The highest course your story flags have unlocked is the one offered. The Master course
+        can also stop early: three story flags each cap it (at round 8, 11 or 12) if they are
+        missing when the run reaches that round, and retail lets a later cap overwrite an
+        earlier one, so a run missing all three stops at 12 rather than 8. A cleared round's
+        tally screen shows six count-up rows - three of them are healing back into your
+        fighter's HP, not score, so a dome contest costs no permanent HP.
+      </p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="baka-fighter">
+  <h2>Baka Fighter</h2>
+  <p>
+    Rock-paper-scissors with life meters, played up a ladder that pays out coins on a full
+    clear. Round 5 is Xain, Round 14 is Songi.
+  </p>
+  <p class="hint">
+    The round table below is the <a href="reference/gamedata.html">curated walkthrough data</a>,
+    which describes each round as a button sequence to reproduce. It is a cross-check, not the
+    primary source: the <a href="#play">playable duel</a> above is driven by the roster the
+    cabinet's own overlay carries, read out of your disc. Where the two disagree, the disc
+    wins.
+  </p>
+  <div id="baka-fighter-meta" class="notice"></div>
+  <div id="baka-fighter-rounds"></div>
+
+  <h3 id="baka-fighter-meshes">The fighters (3D meshes)</h3>
+  <p>
+    The cabinet's fighters <strong>reuse the party's battle character models</strong>: playing
+    as Vahn, Noa or Gala loads the pre-assembled default-gear sibling pack of the models the
+    turn-based battles use. The PLAYER SELECT roster is exactly these models.
+  </p>
+  <div class="notice">
+    <strong>View them in 3D.</strong> These models render textured and animated on the
+    <a href="characters.html#baka-fighter-meshes">characters page</a> - open your disc image,
+    pick a slot, and toggle <em>battle form</em> or <em>Baka Fighter</em> to orbit and play each
+    fighter's animation.
+  </div>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="formats/character-mesh.html">Character mesh format</a>
+    <a href="formats/anm.html">ANM animation</a>
+    <a href="characters.html">Characters viewer</a>
+  </div>
+</section>
+
+<section class="doc-section" id="internals">
+  <h2>How these run</h2>
+  <p>
+    Each minigame's runtime - per-frame state machine, scoring math, data tables - is traced
+    from the game's overlay code and rewritten from-scratch in Rust. The same engine runs
+    natively in <code>play-window</code> (dance <code>K</code>, fishing <code>L</code>, slot
+    machine <code>O</code>, Baka Fighter <code>B</code>, Muscle Dome <code>M</code>) and here
+    in the browser as WebAssembly. What each one is, in one line:
+  </p>
+  <ul class="bullets">
+    <li><strong>Fishing</strong> - a reel tug-of-war against a tension gauge, with per-species parameter tables and two per-venue prize counters decoded from the disc - including a <strong>hidden 50,000-point War God Icon at Vidna</strong> the walkthrough prize lists miss.</li>
+    <li><strong>Slot machine</strong> - a reel state machine with two RNGs and a per-symbol payout table; the feature odds bracket on a hidden net-take counter, and the per-spin balance only commits to the shared coin bank at the cash-out counter. The cabinet is a real 3D scene: the reels are textured cylinders and the paylines projected 3D lines.</li>
+    <li><strong>Baka Fighter</strong> - rock-paper-scissors, best of three, against a roster of 17 scripted opponents, each with its own prize and throw pattern; two of them are secret rungs gated on your high score.</li>
+    <li><strong>Dance</strong> - a beat clock with an accuracy-weighted timing judge, a baked step chart selected by lane, and per-tier score multipliers. The rivals score for real.</li>
+    <li><strong>Muscle Dome</strong> - not a card battle and not turn-limited: a ladder of ordinary battles, three courses of 8 / 8 / 13 rounds, each staging one real monster into the normal battle formation. You enter a directional command string under an AP budget, it plays out through the regular battle engine, and the round ends when one side is knocked out.</li>
+  </ul>
+  <div class="see-also">
+    <span class="see-also-label">Runtime write-ups (repo docs)</span>
+    <a href="subsystems/minigame-fishing.html">Fishing</a>
+    <a href="subsystems/minigame-slot-machine.html">Slot machine</a>
+    <a href="subsystems/minigame-baka-fighter.html">Baka Fighter</a>
+    <a href="subsystems/minigame-dance.html">Dance</a>
+    <a href="subsystems/minigame-muscle-dome.html">Muscle Dome</a>
+  </div>
+  <div class="see-also">
+    <span class="see-also-label">On this site</span>
+    <a href="reference/gamedata.html#casino-schema">Game-data reference (casino schema)</a>
+    <a href="formats/encounter.html">Encounter records</a>
+    <a href="subsystems/script-vm.html">Field VM (story-flag gates)</a>
+    <a href="subsystems/battle.html">Battle scene loader</a>
+    <a href="play.html">Play the game</a>
+  </div>
+</section>
+
+<script>
+/* ==================================================================
+ * Playable minigames.
+ *
+ * The rules live in Rust (`legaia-engine-core`: dance / baka_fighter /
+ * slot_machine), reached through the `LegaiaMinigames` WASM class
+ * (crates/web-minigames/src/lib.rs). Every table each game plays with
+ * is decoded from the visitor's own disc at load time - the step chart
+ * out of PROT 0980, the fighter roster out of 0976, the payout table out
+ * of 0975. This file is presentation only: it ticks each engine at frame
+ * rate, feeds it input, and draws whatever state JSON comes back.
+ * ================================================================== */
+(function () {
+  const fileInput = document.getElementById('mg-file');
+  const statusEl  = document.getElementById('mg-status');
+  const mainEl    = document.getElementById('mg-main');
+  const tabsEl    = document.getElementById('mg-tabs');
+
+  let api = null;         /* LegaiaMinigames */
+  let active = 'slot';    /* which panel is showing */
+  let raf = null;
+
+  /* ---------------- shared ---------------- */
+
+  const $ = (id) => document.getElementById(id);
+
+  function setTab(game) {
+    active = game;
+    tabsEl.querySelectorAll('.mg-tab').forEach(b =>
+      b.classList.toggle('is-active', b.dataset.game === game));
+    document.querySelectorAll('.mg-panel').forEach(p =>
+      p.classList.toggle('is-active', p.dataset.game === game));
+    /* Leaving the dance stops its BGM loop. */
+    if (game !== 'dance' && typeof danceR !== 'undefined' && danceR) danceR.stopAll();
+    /* Leaving the slot machine / duel stops their track (and the slot's
+     * spin-motor loop); entering one pre-mixes its track off the tab click
+     * so the first spin doesn't hitch. */
+    if (MgBgm.playing() && MgBgm.playing() !== game) MgBgm.stop();
+    if (game !== 'slot' && typeof slotSpinStop === 'function') slotSpinStop();
+    if (api) MgBgm.prerender(game);
+  }
+  tabsEl.addEventListener('click', (e) => {
+    const b = e.target.closest('.mg-tab');
+    if (b && !b.disabled) setTab(b.dataset.game);
+  });
+
+  /* Page-level sound toggle (js/audio-toggle.js), parked at the end of the
+   * tab row. Every game's audio trigger checks LegaiaSound.isSoundOn(). */
+  if (window.LegaiaSound) LegaiaSound.attach(tabsEl);
+
+  function verdict(el, text, cls) {
+    el.textContent = text;
+    el.className = 'mg-verdict' + (cls ? ' is-' + cls : '');
+  }
+
+  /* ---- minigame BGM (slot machine + Baka Fighter) ----
+   *
+   * The dance renders its own two-song BGM inside js/minigame-dance.js;
+   * these two come off the shared WASM surface (minigame_bgm_*), each track
+   * disc-pinned: the duel overlay starts music_01 slot 55 ("Sol disco
+   * fever") itself via FUN_801CF00C, and the slot machine starts nothing -
+   * it inherits the casino floor's "Sol casino" track (koin1's op-0x35 BGM
+   * 2018). Both render once per game through the from-scratch SPU + sequencer
+   * off the visitor's disc, then loop as a WebAudio buffer (the render
+   * window is shorter than either song). Muting or leaving the game's tab
+   * stops the loop. */
+  const MgBgm = (() => {
+    let ctx = null;
+    let cur = null;                /* { game, src } while sounding */
+    const RENDER_SECONDS = 45;     /* loop-detection budget */
+
+    /* Each game's disc-pinned global BGM id (2000 + music_01 sound-test slot).
+     * The bank map is piecewise - an extraction entry here is 988 + slot, not
+     * 990 + slot - so an id back-derived from an extraction number must use
+     * the former or it lands two tracks early.
+     *  - baka: the duel overlay init (FUN_801CF00C) loads raw index 0x415 =
+     *    extraction 1043 = slot 55, "Sol disco fever" (a Sol minigame).
+     *  - slot: the overlay starts nothing; it inherits the casino floor
+     *    (0543_koin1 op-0x35 BGM 2018 = slot 18, "Sol casino"). 2018 is read
+     *    straight off the scene script, so it is already in id space.
+     * Both render through the from-scratch SPU and loop seamlessly (MgBgm2). The
+     * dance carries its own jukebox inside js/minigame-dance.js. */
+    /* Muscle Dome reuses the battle engine, so it plays a battle theme: global
+     * BGM 2026 = music_01 slot 26 (M26B1, the standard random-battle theme;
+     * see docs/subsystems/minigame-muscle-dome.md). Fishing inherits its venue
+     * scene's BGM, which the overlay doesn't pin, so it carries no track. */
+    /* The track per game is the engine's (`minigame_bgm_id`, over
+     * `MinigameSubId::standalone_bgm_id`); `-1` = none. */
+    function gameBgm(game) {
+      if (!api || typeof api.minigame_bgm_id !== 'function') return 0;
+      const id = api.minigame_bgm_id(game);
+      return id > 0 ? id : 0;
+    }
+
+    function audio() {
+      if (!ctx) {
+        const Ctor = window.AudioContext || window.webkitAudioContext;
+        if (!Ctor) return null;
+        ctx = new Ctor();
+      }
+      if (ctx.state === 'suspended' && ctx.resume) ctx.resume();
+      return ctx;
+    }
+    function soundOn() {
+      return !window.LegaiaSound || LegaiaSound.isSoundOn();
+    }
+    const prerendered = {};
+    function prerender(game) {
+      const bgm = gameBgm(game);
+      if (!bgm || prerendered[game] || !window.MgBgm2) return;
+      prerendered[game] = true;
+      const a = audio();
+      if (!a) return;
+      setTimeout(() => { try { MgBgm2.render(api, a, bgm, RENDER_SECONDS); } catch (e) { /* skip */ } }, 400);
+    }
+    function start(game) {
+      if (cur && cur.game === game) return true;
+      stop();
+      if (!soundOn() || !window.MgBgm2) return false;
+      const a = audio();
+      const bgm = gameBgm(game);
+      if (!a || !bgm) return false;
+      const entry = MgBgm2.render(api, a, bgm, RENDER_SECONDS);
+      const src = MgBgm2.start(a, entry, 0.5);
+      if (!src) return false;
+      cur = { game: game, src: src };
+      return true;
+    }
+    function stop() {
+      if (cur && cur.src) { try { cur.src.stop(); } catch (e) { /* done */ } }
+      cur = null;
+    }
+    if (window.LegaiaSound) LegaiaSound.onChange((on) => { if (!on) stop(); });
+    return { start, stop, prerender, playing: () => (cur ? cur.game : null) };
+  })();
+
+  /* One rAF loop drives whichever game is on screen. Each engine is
+   * frame-stepped as the retail 60 Hz overlay steps it: the engine's shared
+   * wall-clock stepper (`drain_sim_steps`, the play page's and the native
+   * window's `SimStepper`) says how many game frames this display frame runs
+   * - none on half the frames of a 120 Hz panel, up to its backlog cap on a
+   * slow one. Stepping once per rAF ran every game at the monitor's rate. A
+   * cached bundle without the export keeps one frame per rAF.
+   *
+   * Only fishing takes the catch-up frames: its frame function steps the
+   * pond in a loop and draws once. The other four draw inside their frame
+   * function (the dance count-in even steps inside its draw), so a catch-up
+   * frame would be a whole extra 3D / raster pass - on a machine already too
+   * slow for 60 Hz that spirals. They run at most one frame per rAF, so a
+   * slow machine plays them in slow motion, as it always did. */
+  let simLast = 0;
+  function loop() {
+    if (api) {
+      pollMgGamepad();
+      const now = performance.now();
+      let steps = 1;
+      if (typeof api.drain_sim_steps === 'function') {
+        steps = simLast ? api.drain_sim_steps(now - simLast) : 1;
+      }
+      simLast = now;
+      if (active === 'fishing') {
+        if (steps > 0) fishingFrame(typeof api.drain_sim_steps === 'function' ? steps : 0);
+      } else {
+        for (let s = 0; s < Math.min(steps, 1); s++) {
+          if (active === 'dance') danceFrame();
+          else if (active === 'baka') bakaFrame();
+          else if (active === 'slot') slotFrame();
+          else if (active === 'muscle') muscleFrame();
+        }
+      }
+    }
+    raf = requestAnimationFrame(loop);
+  }
+
+  /* ================= dance ================= */
+
+  /* The presentation is the game's own: the HUD page + widget table + face
+   * strips + cue bank decode from the visitor's disc and render through
+   * js/minigame-dance.js (window.MgDance). This block is glue: it ticks the
+   * rules engine, routes presses, and falls back to bare glyphs - saying so
+   * - when the art pack doesn't decode. */
+  const DANCE_GLYPH = { 1: '■', 2: '●', 3: '▲' };
+  const DANCE_COLOR = { 1: '#7798d4', 2: '#df74a6', 3: '#2dcca7' };
+
+  let danceChart = null;            /* {rows: [[u8 x32], ...]} */
+  let danceLive = false;
+  let danceR = null;                /* MgDance renderer (null = glyph fallback) */
+
+  /* Decode the retail presentation once per disc (called from loadDisc). */
+  function danceLoadArt() {
+    danceR = null;
+    const note = $('dance-art-note');
+    if (window.MgDance) {
+      const r = MgDance.create(api, $('dance-canvas'), $('dance-gl'));
+      if (r.loadAssets()) danceR = r;
+    }
+    const stock = note.dataset.base || (note.dataset.base = note.innerHTML);
+    if (!danceR) {
+      note.innerHTML =
+        'This disc’s <b>dance art pack (PROT&nbsp;1230) did not decode</b>, so the ' +
+        'stage below falls back to the site’s own glyphs - no stand-in sprites are drawn.' +
+        '<br><br>' + stock;
+      return;
+    }
+    const sfxN = JSON.parse(api.dance_sfx_json()).length;
+    note.innerHTML = stock +
+      '<br><br><b>Everything on the stage is the game’s own art</b>, decoded from your disc at ' +
+      'runtime: the HUD boxes, notes, count-in and banners are cells of the 31-TIM pack ' +
+      '(PROT&nbsp;1230) drawn at the overlay’s own traced widget positions. ' +
+      (sfxN
+        ? 'The <b>sound</b> is the overlay’s own cue bank (PROT&nbsp;1228/1231). '
+        : 'The <b>sound did not decode</b> from this image, so the stage is silent rather ' +
+          'than beeping at you. ') +
+      (danceR.bgmOk()
+        ? 'The <b>music</b> is the overlay’s own SEQ+VAB entry, rendered through the ' +
+          'from-scratch SPU and looped; the <b>Track</b> selector is a jukebox over the same ' +
+          '<code>music_01</code> bank. '
+        : 'The BGM entry did not decode from this image, so the run plays without music. ') +
+      (danceR.bodyOk()
+        ? '<br><br><b>The dancers are the retail cast, and they dance</b>: Noa’s own field ' +
+          'model beside the dance hall’s dedicated dancer NPCs, playing clips from the ' +
+          'scene’s 60-record choreography bundle (PROT&nbsp;1229). ' +
+          (danceR.hallOk()
+            ? 'The <b>hall around them is the real one</b> - the host field scene’s own ' +
+              'environment mesh pack and textures. '
+            : 'The hall geometry itself did not resolve from this image, so the cast ' +
+              'dances on a neutral ground. ') +
+          'Drag to orbit, double-click to re-frame. '
+        : '<br><br>The dancer <b>cast</b> did not decode from this image, so the HUD sits ' +
+          'on a neutral ground rather than a faked floor; the three faces under the score ' +
+          'boxes are the real face-stamp windows off the dancers’ head textures. ') +
+      '<br><br><b>The two competitors are running for real</b> - retail judges every dancer ' +
+      'through the same award routine, feeding the CPU dancers a pad word synthesised from ' +
+      'the same chart - so hands off the pad and they will beat you. Approximated here: the ' +
+      'rating banner and star fade (the READY count-in runs retail\u2019s envelope). Full trace: ' +
+      '<code>docs/subsystems/minigame-dance.md</code>.';
+    danceLoadJukebox();
+  }
+
+  /* Populate the dance track selector from dance_jukebox_json() (the two
+   * overlay tracks + the Sol-disco floor family, each a music_01 slot that
+   * decodes on this disc). Hidden when the jukebox is empty or the WASM
+   * surface predates it. */
+  function danceLoadJukebox() {
+    const row = $('dance-jukebox-row'), sel = $('dance-track');
+    if (!row || !sel || !danceR || typeof api.dance_jukebox_json !== 'function') {
+      if (row) row.hidden = true;
+      return;
+    }
+    let tracks = [];
+    try { tracks = (JSON.parse(api.dance_jukebox_json()).tracks) || []; } catch (e) { tracks = []; }
+    if (!tracks.length) { row.hidden = true; return; }
+    sel.innerHTML = '';
+    for (const t of tracks) {
+      const o = document.createElement('option');
+      o.value = String(t.bgm);
+      o.textContent = t.role + ' - ' + t.label;
+      sel.appendChild(o);
+    }
+    row.hidden = false;
+    danceR.setBgmTrack(parseInt(sel.value, 10));
+    sel.onchange = () => { if (danceR) danceR.setBgmTrack(parseInt(sel.value, 10)); };
+  }
+
+  /* Tutorial buttons pressed since the last frame: 1 = a face button
+   * (advance / confirm), 2 = cursor back (Left), 4 = cursor on (Right). */
+  let danceTutBits = 0;
+  function danceStart() {
+    const modeSel = $('dance-mode');
+    const mode = modeSel ? parseInt(modeSel.value, 10) || 0 : 0;
+    danceTutBits = 0;
+    const ok = api && (typeof api.dance_start_mode === 'function'
+      ? api.dance_start_mode(mode, false)
+      : api.dance_start(false));
+    if (!ok) {
+      verdict($('dance-verdict'), 'The step chart did not decode from this disc.', 'bad');
+      return;
+    }
+    danceChart = JSON.parse(api.dance_chart_json());
+    danceLive = true;
+    $('dance-start').textContent = 'Restart';
+    if (danceR) {
+      const st = JSON.parse(api.dance_state_json());
+      const secs = Math.ceil(st.song_len / 600) + 1;
+      if (danceR.bgmOk()) {
+        /* Rendering the SEQ through the SPU blocks for a moment - say so
+         * first, then start the count-in. */
+        verdict($('dance-verdict'), 'Mixing the song from your disc…', '');
+        setTimeout(() => {
+          danceR.startRun(secs);
+          verdict($('dance-verdict'), 'Dance!', '');
+        }, 30);
+      } else {
+        danceR.startRun(secs);
+        verdict($('dance-verdict'), 'Dance!', '');
+      }
+    } else {
+      verdict($('dance-verdict'), 'Dance!', '');
+    }
+  }
+
+  /* Presses are judged on the game frame, not on the key event: the play
+   * hosts' `World::tick_dance` advances the beat clock first, then judges at
+   * most ONE press from that frame's edges, Triangle before Square before
+   * Circle (retail's scan order). The page used to judge every key event the
+   * moment it arrived - before the frame's advance, and as many per frame as
+   * the keyboard delivered - so the same input could score differently here.
+   * `dancePress` latches the press; `danceFrame` judges it after its tick. */
+  let dancePending = 0;   /* bit (1 << sym) per pressed symbol this frame */
+  function dancePress(sym) {
+    if (!api || !danceLive) return;
+    if (danceR && danceR.introGate) return;   /* count-in: not judging yet */
+    if (sym >= 1 && sym <= 3) dancePending |= 1 << sym;
+  }
+  function danceJudgePending() {
+    const bits = dancePending;
+    dancePending = 0;
+    if (!bits || !api || !danceLive) return;
+    if (danceR && danceR.introGate) return;
+    const sym = (bits & (1 << 3)) ? 3 : (bits & (1 << 1)) ? 1 : 2;
+    const stBefore = JSON.parse(api.dance_state_json());
+    const r = api.dance_press(sym);
+    if (danceR) danceR.onPress(r, stBefore, sym);
+    if (r === 'sequence')        verdict($('dance-verdict'), 'PERFECT', 'good');
+    else if (r === 'hit')        verdict($('dance-verdict'), 'HIT', 'good');
+    else if (r === 'miss')       verdict($('dance-verdict'), 'MISS', 'bad');
+    else if (r === 'groovy')     verdict($('dance-verdict'), 'GROOVY MOVE!', 'good');
+    else if (r === 'groovy_off') verdict($('dance-verdict'), 'Groovy move - off the combo slot', '');
+    else if (r === 'no_charge')  verdict($('dance-verdict'), 'No groovy moves left', 'bad');
+    /* 'ignored' = mid-groovy-move: retail judges nothing, so neither do we. */
+  }
+
+  function danceFrame() {
+    const st = JSON.parse(api.dance_state_json());
+    if (st.live) {
+      /* Every body's clip runs every frame, count-in included - the run's
+       * own clip driver, as `World::tick_dance` steps it for the play hosts. */
+      if (typeof api.dance_body_clips_tick === 'function') api.dance_body_clips_tick(1);
+      /* Hold the beat clock through the engine's READY / GO! count-in. */
+      if (!st.over && !(danceR && danceR.introGate)) {
+        api.dance_tick(1);
+        danceJudgePending();
+      } else if (st.over && danceLive) {
+        danceLive = false;
+        const rvs = (st.rivals || []).map(r => r.score).join(' and ');
+        verdict($('dance-verdict'),
+          st.winning
+            ? `Song over - ${st.score} points against ${rvs}. You won the floor!`
+            : `Song over - ${st.score} points against ${rvs}. They out-danced you.`,
+          st.winning ? 'good' : 'bad');
+        /* Persist the run (the "Your games" strips read this). */
+        if (window.LegaiaSaves) {
+          const d = LegaiaSaves.getMinigames().dance || {};
+          LegaiaSaves.putMinigame('dance', {
+            lastScore: st.score,
+            bestScore: Math.max(d.bestScore || 0, st.score),
+            plays: (d.plays || 0) + 1,
+          });
+        }
+      }
+      $('dance-score').textContent = st.score;
+      $('dance-gauge').textContent = st.gauge;
+      $('dance-lane').textContent  = st.lane;
+      $('dance-song').textContent  = Math.round(100 * st.song_timer / st.song_len) + '%';
+      const rv = st.rivals || [];
+      $('dance-rivals').textContent = rv.map(r => r.score).join(' \u00b7 ') || '0 \u00b7 0';
+      $('dance-tri').textContent =
+        '\u25b2'.repeat(st.triangles) + '\u25b3'.repeat(3 - st.triangles) +
+        (st.lock ? ' (spinning)' : '');
+    }
+    /* The how-to run's Disco King actor (FUN_801D0750), stepped beside the
+     * run - count-in included - as World::step_dance_tutorial does. */
+    let tutorialOn = false;
+    if (st.live && typeof api.dance_tutorial_active === 'function' && api.dance_tutorial_active()) {
+      const cue = api.dance_tutorial_step(danceTutBits);
+      danceTutBits = 0;
+      if (cue) {
+        if (cue >= 0x200) { if (danceR && danceR.playId) danceR.playId(cue); }
+        else if (api.minigame_sfx_cue) api.minigame_sfx_cue(cue);
+      }
+      tutorialOn = true;
+    }
+    if (danceR) danceR.draw(st.live ? st : null, danceChart);
+    else danceDrawFallback(st.live ? st : null, danceChart);
+    if (tutorialOn) danceTutorialOverlay();
+  }
+
+  /* The tutorial's captions / options / cursor through the shared
+   * engine-ui::dance::dance_tutorial_draws_for, composited over the HUD canvas. */
+  let danceTutCanvas = null;
+  function danceTutorialOverlay() {
+    const c = $('dance-canvas');
+    if (!c || typeof api.dance_tutorial_rgba !== 'function') return;
+    const px = api.dance_tutorial_rgba(c.width, c.height);
+    if (!px.length) return;
+    if (!danceTutCanvas) danceTutCanvas = document.createElement('canvas');
+    danceTutCanvas.width = c.width;
+    danceTutCanvas.height = c.height;
+    const tg = danceTutCanvas.getContext('2d');
+    tg.putImageData(new ImageData(new Uint8ClampedArray(px), c.width, c.height), 0, 0);
+    c.getContext('2d').drawImage(danceTutCanvas, 0, 0);
+  }
+
+  /* The pre-art glyph highway - only drawn when the art pack didn't decode
+   * (the note names the missing entry; nothing is faked). */
+  function danceDrawFallback(st, chart) {
+    const c = $('dance-canvas');
+    const g = c.getContext('2d');
+    const W = c.width, H = c.height;
+    g.fillStyle = '#0c0e12';
+    g.fillRect(0, 0, W, H);
+    const judgeY = H - 90;
+    const laneW = 150, laneGap = 30;
+    const totalW = 3 * laneW + 2 * laneGap;
+    const x0 = (W - totalW) / 2;
+    const laneX = (i) => x0 + i * (laneW + laneGap);
+    for (let i = 0; i < 3; i++) {
+      g.fillStyle = 'rgba(255,255,255,0.03)';
+      g.fillRect(laneX(i), 0, laneW, judgeY + 40);
+    }
+    g.strokeStyle = 'rgba(255,255,255,0.35)';
+    g.lineWidth = 2;
+    g.beginPath();
+    g.moveTo(x0 - 8, judgeY); g.lineTo(x0 + totalW + 8, judgeY);
+    g.stroke();
+    g.font = '26px monospace';
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    for (let i = 0; i < 3; i++) {
+      const sym = i + 1;
+      g.fillStyle = DANCE_COLOR[sym];
+      g.fillText(DANCE_GLYPH[sym], laneX(i) + laneW / 2, judgeY + 34);
+    }
+    if (!st || !chart || !chart.rows.length) {
+      g.fillStyle = 'rgba(255,255,255,0.45)';
+      g.font = '16px monospace';
+      g.fillText('Press Start', W / 2, H / 2 - 30);
+      return;
+    }
+    const row = chart.rows[Math.min(st.lane, chart.rows.length - 1)];
+    const frac = st.phase / st.period;
+    const spacing = (judgeY - 20) / 7;
+    for (let ahead = 0; ahead <= 7; ahead++) {
+      const beat = st.beat + ahead;
+      const sym = row[beat % row.length];
+      if (!sym) continue;
+      const y = judgeY - (ahead - frac) * spacing;
+      if (y < -20 || y > judgeY + 6) continue;
+      g.fillStyle = DANCE_COLOR[sym];
+      g.beginPath();
+      g.roundRect(laneX(sym - 1) + 30, y - 14, laneW - 60, 28, 5);
+      g.fill();
+      g.fillStyle = '#0c0e12';
+      g.font = 'bold 18px monospace';
+      g.fillText(DANCE_GLYPH[sym], laneX(sym - 1) + laneW / 2, y);
+    }
+  }
+
+  $('dance-start').addEventListener('click', danceStart);
+  document.querySelectorAll('[data-dance]').forEach(b =>
+    b.addEventListener('click', () => dancePress(parseInt(b.dataset.dance, 10))));
+
+  /* ================= baka fighter ================= */
+
+  let bakaLive = false;
+  let bakaRoster = [];
+  let bakaNames = [];
+  let bakaLadder = [];
+  /* Run state. `bakaMode`:
+   *   'idle'    - nothing running;
+   *   'cabinet' - a run on the engine's cabinet (`BakaFight::frame`, the
+   *               play hosts' kernel): front end, every rung, the tally and
+   *               the NEXT GAME / PAY OUT sheet, until its exit state. */
+  let bakaMode = 'idle';
+  let bakaSel = 0;           /* PLAYER SELECT highlight (0..2) */
+  let bakaCabEdge = 0;       /* packed pad edge for the cabinet's next frame */
+  let bakaCab = null;        /* last parsed baka_cabinet_json */
+  let bakaPchar = 0;         /* the fighter picked for this run */
+  let bakaHeld = 0;          /* packed held pad word (0x10 = Triangle) */
+  /* The 3D duel view (js/minigame-baka.js): real meshes + retail HUD off the
+   * disc. Null / not-ok leaves the stat-panel presentation in charge. */
+  let bakaView = null;
+  let bakaMeta = null;
+
+  /* ---- sound ----
+   *
+   * One source: the engine's cue drain. The rules kernel queues the hit cue
+   * from inside its damage kernel (FUN_801D3B18) and the cabinet queues its
+   * menu blips and tally ticks, exactly where retail writes the cue ring
+   * `_DAT_8007B6D8`; `baka_frame` drains them into the page's live SPU
+   * (`minigame_sfx_cue`, the same catalog path the play hosts take). The
+   * page used to fire the same hit again by event name through
+   * js/legaia-sfx.js, plus two stings retail never plays (a round start and
+   * a match loss) - with the SPU open, every hit sounded twice.
+   * The NEXT GAME / PAY OUT sheet is the cabinet's own too, so its blips
+   * come off the same drain. */
+  const BAKA_PAGE_CUES = { confirm: 0x20, cursor: 0x21 };
+  function bakaSfxLoad() {
+    return Promise.resolve(!!(window.MgSpu && MgSpu.ready(api)));
+  }
+  function bakaSfx(event) {
+    const id = BAKA_PAGE_CUES[event];
+    if (id != null && window.MgSpu) MgSpu.cue(api, id);
+  }
+
+  function bakaName(id) {
+    return bakaNames[id] || `Fighter ${id}`;
+  }
+
+  /* Coins actually banked (a pay-out or the all-clear) persist into the
+   * shared minigame record, then into the loaded save's coin session (the
+   * save bar exports it) - or the pending-coins pool when no save is
+   * loaded, which the next save-load absorbs. */
+  function bakaPersistBank(banked) {
+    if (!window.LegaiaSaves || !(banked > 0)) return;
+    const b = LegaiaSaves.getMinigames().baka || {};
+    LegaiaSaves.putMinigame('baka', {
+      bestBank: Math.max(b.bestBank || 0, banked),
+      totalBanked: (b.totalBanked || 0) + banked,
+    });
+    const cs = LegaiaSaves.coinSession();
+    if (cs) {
+      LegaiaSaves.updateCoinSessionCoins(Math.min(cs.coins + banked, 9999999));
+      slotResyncPending = true;      /* the slot machine re-racks the new bank */
+    } else {
+      LegaiaSaves.addCoinsWon(banked);
+    }
+  }
+
+  function bakaFillRoster() {
+    bakaSfxLoad();               /* render the duel's cues in the background */
+    bakaRoster = JSON.parse(api.baka_roster_json());
+    /* The roster records DO carry names - a 32-byte ASCII string at record +0x00,
+     * in the bytes ahead of the stat block the table parser starts at. */
+    bakaNames = JSON.parse(api.baka_names_json());
+    /* ...and the cabinet serves them in a specific order. The stage counter is
+     * seeded to 2 and the fighter is `roster = stage + 3`, so the first lap is
+     * roster 5..16 - across which the prize gold is strictly monotonic. Roster 3
+     * and 4 are only reachable after the all-clear wraps the counter, which is
+     * exactly why reading the roster's gold column straight down looks jumbled.
+     * This IS the ladder the run climbs, one rung at a time, in this order. */
+    bakaLadder = JSON.parse(api.baka_ladder_json());
+
+    const firstLap = bakaLadder.slice(0, 12)
+      .reduce((n, r) => n + (bakaRoster[r.roster] ? bakaRoster[r.roster].gold : 0), 0);
+    $('baka-total').textContent = firstLap;
+  }
+
+  /* The whole run is the engine's cabinet: attract card, PLAYER SELECT,
+   * every rung's duel, the result tally, the NEXT GAME / PAY OUT sheet, the
+   * next rung and the game-over / all-clear sequence - `BakaFight::frame`,
+   * the per-frame step the play hosts' world tick runs, through
+   * `baka_frame(edge, held)`. The page supplies the packed pad words and
+   * draws; the pot (the play hosts' winnings accumulator) lives WASM-side.
+   * The page used to leave the cabinet after its select and run a page-side
+   * ladder (`LadderRun`) with its own pot, its own HTML NEXT GAME / PAY OUT
+   * menu and a free starting rung - a second rule set; it is gone. */
+  const BAKA_PACKED = {
+    Left: 0x8000, Right: 0x2000, Up: 0x1000, Down: 0x4000,
+    Cross: 0x40, Circle: 0x20, Square: 0x80, Triangle: 0x10,
+    Start: 0x800, Select: 0x100, L1: 0x04, L2: 0x01,
+  };
+  /* Throws 1 / 2 / 3 are the cabinet's Square / Circle / Cross. */
+  const BAKA_THROW_BUTTON = { 1: 'Square', 2: 'Circle', 3: 'Cross' };
+  let bakaViewDuel = false;   /* the view has loaded the duel scene */
+  let bakaSeatedFoe = -1;     /* opponent the view's duel scene was loaded for */
+
+  function bakaOpenCabinet() {
+    if (typeof api.baka_start_cabinet !== 'function' || !api.baka_start_cabinet()) {
+      verdict($('baka-verdict'), 'The roster tables did not decode from this disc.', 'bad');
+      return false;
+    }
+    let ok = false;
+    try {
+      if (window.MinigameBakaView) {
+        if (!bakaView) bakaView = new MinigameBakaView($('baka-gl'), $('baka-hud'));
+        ok = bakaView.loadCabinet(api);
+      }
+    } catch (err) {
+      console.warn('baka cabinet view failed:', err);
+      ok = false;
+    }
+    bakaMode = 'cabinet';
+    bakaLive = false;
+    bakaCab = null;
+    bakaCabEdge = 0;
+    bakaViewDuel = false;
+    bakaSeatedFoe = -1;
+    $('baka-duel').hidden = !ok;
+    $('baka-pot').textContent = 0;
+    $('baka-start').textContent = 'Press start';
+    /* The cabinet's cold entry arms the minigame track (state 0x00). */
+    MgBgm.start('baka');
+    verdict($('baka-verdict'),
+      'Start or Cross on the title card; then Left / Right picks a fighter and Cross confirms.', '');
+    return true;
+  }
+
+  function bakaStart() {
+    if (window.MgSpu) MgSpu.ready(api);   /* inside the gesture */
+    if (bakaMode === 'cabinet') {         /* the button is the cabinet's Cross */
+      bakaCabEdge |= BAKA_PACKED.Cross;
+      return;
+    }
+    bakaOpenCabinet();
+  }
+
+  function bakaChoose(t) {
+    if (!api || bakaMode !== 'cabinet') return;
+    const b = BAKA_THROW_BUTTON[t];
+    if (b) bakaCabEdge |= BAKA_PACKED[b];
+  }
+
+  const THROW_NAME = { 1: 'Throw 1', 2: 'Throw 2', 3: 'Throw 3', 4: 'Special' };
+
+  function bakaFrame() {
+    if (bakaMode !== 'cabinet') return;
+    const edge = bakaCabEdge;
+    bakaCabEdge = 0;
+    const out = JSON.parse(api.baka_frame(edge, bakaHeld));
+    const cab = JSON.parse(api.baka_cabinet_json());
+    bakaCab = cab;
+    const st = JSON.parse(api.baka_state_json());
+    let chrome = [];
+    try { chrome = JSON.parse(api.baka_chrome_json()); } catch (e) { chrome = []; }
+    $('baka-pot').textContent = out.winnings;
+
+    if (cab.front_end) {
+      if (bakaView && bakaView.ok) bakaView.frameCabinet(cab, chrome);
+      if (cab.lineup) {
+        bakaSel = cab.lineup[0];
+        $('baka-char').value = String(bakaSel);
+        $('baka-start').textContent = 'Confirm fighter';
+      }
+    } else {
+      bakaPchar = cab.player;
+      $('baka-char').value = String(cab.player);
+      $('baka-start').textContent = 'Restart run';
+      /* A new pairing (the select's pick, or the cabinet's next rung):
+       * stand the view's duel scene up for it. */
+      if (bakaView && (!bakaViewDuel || cab.opponent !== bakaSeatedFoe)) {
+        try { bakaViewDuel = bakaView.load(api, cab.player, cab.opponent); }
+        catch (err) { console.warn('baka duel view failed:', err); bakaViewDuel = false; }
+        bakaSeatedFoe = cab.opponent;
+        $('baka-duel').hidden = !bakaViewDuel;
+        $('baka-p1-name').textContent = bakaName(cab.opponent);
+        const rung = bakaLadder.findIndex(r => r.roster === cab.opponent);
+        bakaMeta = { stage: rung >= 0 ? rung + 1 : 1, final: cab.opponent === 16 };
+        $('baka-stage').textContent = rung >= 0 ? `${rung + 1}/${bakaLadder.length}` : '—';
+        verdict($('baka-verdict'), `Fight ${bakaName(cab.opponent)}!`, '');
+        bakaLive = true;
+      }
+      if (bakaView && bakaView.ok && bakaViewDuel) {
+        /* The engine's round chrome and the cabinet's own cells (the NEXT
+         * GAME / PAY OUT sheet after a win) ride along with the stage meta. */
+        bakaView.frame(st.live ? st : null,
+          Object.assign({}, bakaMeta, {
+            chrome, cells: cab.cells || [], hud: cab.draws_hud !== false, potDigits: cab.pot_digits || [],
+          }));
+      }
+    }
+
+    if (out.forfeit) {
+      verdict($('baka-verdict'), 'GAME OVER - the pot is forfeit.', 'bad');
+    }
+    if (out.exit) {
+      /* The cabinet's exit state: the winnings bank, as the play hosts' exit
+       * warp pays the accumulator into the casino coin bank. */
+      const banked = out.winnings;
+      bakaPersistBank(banked);
+      $('baka-bank').textContent = banked;
+      $('baka-pot').textContent = 0;
+      verdict($('baka-verdict'),
+        banked > 0 ? `Run over - ${banked} coins banked.` : 'Run over.', banked > 0 ? 'good' : '');
+      $('baka-start').textContent = 'Start run';
+      bakaMode = 'idle';
+      bakaLive = false;
+      if (MgBgm.playing() === 'baka') MgBgm.stop();
+      return;
+    }
+
+    if (cab.front_end || !st.live) return;
+    const pct = (hp) => Math.max(0, Math.min(100, 100 * hp / st.hp_start)) + '%';
+    $('baka-p0-hp').style.width = pct(st.hp[0]);
+    $('baka-p1-hp').style.width = pct(st.hp[1]);
+    $('baka-p0-pips').textContent = '●'.repeat(st.wins[0]) + '○'.repeat(2 - st.wins[0]);
+    $('baka-p1-pips').textContent = '●'.repeat(st.wins[1]) + '○'.repeat(2 - st.wins[1]);
+    /* Your own commitment is shown; theirs is not - reading the CPU's throw
+     * before it lands is not a thing the arcade cabinet lets you do. */
+    $('baka-p0-meta').textContent = st.chosen[0] ? THROW_NAME[st.chosen[0]] + ' committed'
+                                  : (st.can_choose ? 'ready' : 'recovering…');
+    $('baka-p1-meta').textContent = st.hp[1] + ' HP';
+    $('baka-round').textContent = st.round + 1;
+    $('baka-combo').textContent = st.combo[0];
+    $('baka-gold').textContent = st.gold;
+    if (st.phase === 'match_over' && bakaLive) {
+      bakaLive = false;
+      verdict($('baka-verdict'),
+        st.winner === 0
+          ? 'Stage cleared! NEXT GAME risks the pot on the next rung; PAY OUT banks it.'
+          : 'You lose the stage.', st.winner === 0 ? 'good' : 'bad');
+    }
+    if (bakaLive && st.last) {
+      const l = st.last;
+      const who = l.draw ? 'Trade' : (l.winner === 0 ? 'You hit' : 'You are hit');
+      const tags = (l.critical ? ' CRITICAL!' : '') + (l.special ? ' SPECIAL - round!' : '');
+      verdict($('baka-verdict'), `${who} for ${l.damage}${tags}`,
+              l.draw ? '' : (l.winner === 0 ? 'good' : 'bad'));
+    }
+  }
+
+  $('baka-start').addEventListener('click', bakaStart);
+  document.querySelectorAll('[data-baka]').forEach(b =>
+    b.addEventListener('click', () => bakaChoose(parseInt(b.dataset.baka, 10))));
+  /* PLAYER SELECT: a click on a fighter's third picks it; clicking the
+   * picked one confirms. (Keyboard: arrows + Enter.) */
+  $('baka-gl').addEventListener('click', (e) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    const xf = (e.clientX - r.left) / r.width;
+    const col = xf < 0.36 ? 0 : (xf > 0.64 ? 2 : 1);
+    if (bakaMode === 'cabinet') {
+      if (window.MgSpu) MgSpu.ready(api);
+      /* The lineup stands Gala left, Vahn centre, Noa right
+       * (baka_duel_scene::SELECT_LINEUP); Right steps the cursor one place
+       * right on screen (wrapping), Left one place left. */
+      const lineup = bakaCab && bakaCab.lineup;
+      if (!lineup) { bakaCabEdge |= BAKA_PACKED.Cross; return; }
+      const SCREEN_COL = [1, 2, 0];
+      const d = (col - SCREEN_COL[lineup[0]] + 3) % 3;
+      bakaCabEdge |= d === 0 ? BAKA_PACKED.Cross : (d === 1 ? BAKA_PACKED.Right : BAKA_PACKED.Left);
+      return;
+    }
+  });
+
+  /* ================= slot machine ================= */
+
+  /* ---- the machine is a 3D scene, and the engine draws it ----
+   *
+   * The retail slot machine is not a sprite collage. Every element on its face
+   * is a quad in a 3D scene, projected through the PlayStation's GTE and
+   * depth-sorted into the ordering table: the reels are textured CYLINDERS
+   * (`FUN_801d0fa8`), the paylines 3D segments (`FUN_801d3380`), the medallions,
+   * lamps, pedestals and marquee panel billboards (`FUN_801d08e4`), the marquee
+   * a 78x13 dot matrix of projected sprites (`FUN_801d0e1c`), and the cabinet
+   * body an untextured mesh (PROT 1200 descriptor 1) spawned as an ordinary
+   * actor. The projection is the GTE's own, read out of a retail save state.
+   *
+   * This page draws none of it itself: `slot_frame_rgba` is the engine's
+   * `engine-ui::slot_cabinet` primitive list - the one the native window and the play
+   * page draw - rasterised over the art pack's VRAM. See slotRender. */
+  const SLOT_START_COINS = 60;
+  const SYM_PX = 64;              /* a reel symbol cell, in texels */
+
+  let slotPayouts = [];
+  let slotArt = null;    /* null => the art did not decode; the paytable names ids */
+
+  /* ---- the bonus game ----
+   *
+   * `FUN_801d13e8` special-cases two reel symbols: a line of the BLUE "kick"
+   * (id 8) earns 1 bonus round, the RED "punch" (id 9) earns 3 - the counts and
+   * ids are pinned in the disassembly, the colours in the PROT 1200 reel art.
+   *
+   * A bonus round swaps the reels onto the machine's SECOND strip: the numerals
+   * 1..10, which are their own 64x64 artwork on art page 1 (each with its own
+   * palette column, which is why every digit on the reels is a different
+   * colour). You stop the three yourself - the bonus stop plan has depth 0 and
+   * no target, so the machine steers nothing - and the round pays the PRODUCT of
+   * the three numbers, 1 (1x1x1) to 1000 (10x10x10).
+   *
+   * Nothing here is drawn by this page. The digits are decoded off the disc
+   * (`slot_bonus_number_rgba`), and the tally strip across the top is the
+   * machine's own dot-matrix marquee running the retail glyph bank. */
+  let slotBonus = null;     /* the static bonus labels + the live round state */
+
+  /* ---- the machine's own sound ----
+   *
+   * The reel-stop click, the payout tick and the reach sting are the retail
+   * cues, decoded from your disc: the slot overlay's efect.dat descriptor block
+   * (PROT 1199) names a VAB program/tone/note per cue id, and the sample comes
+   * out of the VAB the overlay loads beside it (PROT 1198). The cue's note
+   * against the sample's own centre note IS the pitch, so the playback rate the
+   * API reports carries it.
+   *
+   * If a cue does not decode, the page stays SILENT. No substitute beeps. */
+  let slotAudio = null;   /* { ctx, buffers: {name: AudioBuffer} } */
+  let slotSfxIds = null;
+
+  function slotLoadSfx() {
+    slotSfxIds = null;
+    if (!api) return;
+    const cues = JSON.parse(api.slot_sfx_json());
+    if (!cues.length) return;              /* silent, and the note says why */
+    slotSfxIds = JSON.parse(api.slot_sfx_cue_ids());
+  }
+
+  /* The AudioContext can only start from a gesture, so build it lazily. */
+  function slotAudioReady() {
+    if (!slotSfxIds) return null;
+    if (!slotAudio) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return null;
+      const ctx = new Ctx();
+      const buffers = {};
+      const stash = (name, pcm, rate) => {
+        if (!pcm.length || !rate) return;
+        const buf = ctx.createBuffer(1, pcm.length, rate);
+        const ch = buf.getChannelData(0);
+        for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+        buffers[name] = buf;
+      };
+      for (const [name, id] of Object.entries(slotSfxIds)) {
+        stash(name, api.slot_sfx_pcm(id), api.slot_sfx_rate(id));
+      }
+      /* The reel-spin motor is not a ring cue - the reel SM keys the VAB
+       * voice directly (program 1 / tone 0 at note 0x3C) and releases it
+       * on all-reels-stop, so the page loops it for as long as reels turn. */
+      stash('spin_loop', api.slot_spin_pcm(), api.slot_spin_rate());
+      slotAudio = { ctx, buffers };
+    }
+    if (slotAudio.ctx.state === 'suspended') slotAudio.ctx.resume();
+    return slotAudio;
+  }
+
+  /* Page-level trim on every slot cue (spin motor included): the machine's
+   * effects sat well above the page's BGM, so they play at a quarter of
+   * their per-cue levels. The per-call `gain` args keep the cues' RELATIVE
+   * balance (reel_stop over reach etc.); this scales the whole machine. */
+  const SLOT_SFX_SCALE = 0.25;
+
+  /* Site master output trim (canonical value in js/layout.js; the literal is
+   * a fallback, not a second source of truth). Distinct from SLOT_SFX_SCALE
+   * above and multiplied ON TOP of it: that one is a BALANCE fix local to the
+   * slot machine (its cues sat above this page's BGM), this one is the
+   * page-wide loudness every sound on the site now carries. Collapsing them
+   * into one number would lose the slot machine's balance against the BGM the
+   * moment the site trim changes. */
+  const SLOT_MASTER_TRIM =
+    window.LEGAIA_MASTER_TRIM == null ? 0.25 : window.LEGAIA_MASTER_TRIM;
+
+  function slotPlay(name, gain = 0.5) {
+    if (window.LegaiaSound && !LegaiaSound.isSoundOn()) return;
+    const a = slotAudioReady();
+    if (!a || !a.buffers[name]) return;
+    const src = a.ctx.createBufferSource();
+    src.buffer = a.buffers[name];
+    const g = a.ctx.createGain();
+    g.gain.value = gain * SLOT_SFX_SCALE * SLOT_MASTER_TRIM;
+    src.connect(g).connect(a.ctx.destination);
+    src.start();
+  }
+
+  /* The looping spin-motor voice: keyed as the reels start, released on
+   * all-reels-stop - the retail voice lifecycle (FUN_801CF0D8, voice 0x13). */
+  let slotSpinSrc = null;
+  function slotSpinStart() {
+    if (slotSpinSrc) return;
+    if (window.LegaiaSound && !LegaiaSound.isSoundOn()) return;
+    const a = slotAudioReady();
+    if (!a || !a.buffers.spin_loop) return;
+    const src = a.ctx.createBufferSource();
+    src.buffer = a.buffers.spin_loop;
+    src.loop = true;
+    const g = a.ctx.createGain();
+    /* Retail keys it at volume 0x28 of 0x7F - noticeably under the cues. */
+    g.gain.value = 0.3 * SLOT_SFX_SCALE * SLOT_MASTER_TRIM;
+    src.connect(g).connect(a.ctx.destination);
+    src.start();
+    slotSpinSrc = src;
+  }
+  function slotSpinStop() {
+    if (!slotSpinSrc) return;
+    try { slotSpinSrc.stop(); } catch (e) { /* done */ }
+    slotSpinSrc = null;
+  }
+  if (window.LegaiaSound) LegaiaSound.onChange((on) => { if (!on) slotSpinStop(); });
+
+  /* shared helper: site/js/site-util.js */
+  const rgbaCanvas = window.LegaiaUtil.rgbaCanvas;
+
+  /* Decode the machine's textures + its 3D scene graph once, after a disc lands. */
+  function slotLoadArt() {
+    slotArt = null;
+    slotBonus = null;
+    const legend = $('slot-bonus-legend');
+    if (legend) legend.innerHTML = '';
+    if (!api || !api.slot_art_ready()) {
+      $('slot-art-note').innerHTML =
+        'The payouts are the disc’s own per-symbol table, but this disc’s <b>art pack ' +
+        '(PROT&nbsp;1200) did not decode</b>, so the reels below name the raw symbol ids. ' +
+        'No stand-in sprites are drawn.';
+      return;
+    }
+
+    const symbols = [];
+    for (let s = 0; s < 10; s++) symbols.push(rgbaCanvas(api.slot_symbol_rgba(s), SYM_PX, SYM_PX));
+    /* The ten bonus numerals, indexed by their strip value's low nibble: slot
+     * `n - 1` is the numeral `n`. Each comes off art page 1 at its own cell and
+     * its own palette column - the retail faces, not a scaled coin font. */
+    const numbers = [];
+    for (let n = 1; n <= 10; n++) {
+      numbers.push(rgbaCanvas(api.slot_bonus_number_rgba(n), SYM_PX, SYM_PX));
+    }
+    slotArt = { symbols, numbers };
+
+    const sfxN = JSON.parse(api.slot_sfx_json()).length;
+    $('slot-art-note').innerHTML =
+      'This is the retail machine’s <b>3D scene</b>, rebuilt from your own disc at runtime — ' +
+      'nothing is shipped with the page. The reels are textured <b>cylinders</b>, the paylines ' +
+      'are projected 3D segments, and the marquee is a <b>78×13 dot-matrix display</b> of 1014 ' +
+      'projected sprites; every position, cell and palette is read out of the overlay’s own ' +
+      'rodata and its art pack (PROT&nbsp;1200). In a bonus round the reels rotate onto the ' +
+      'machine’s other strip, and the marquee tally reads the same latch the payout ' +
+      'multiplies — it cannot show a line the spin did not pay. ' +
+      (sfxN
+        ? `The <b>sound</b> is the machine’s own: ${sfxN} cues out of the overlay’s ` +
+          '<code>efect.dat</code> descriptor block (PROT&nbsp;1199) and the VAB beside it ' +
+          '(PROT&nbsp;1198). '
+        : 'The machine’s <b>sound did not decode</b> from this image, so the page is silent ' +
+          'rather than beeping at you. ') +
+      'The <b>music</b> is the casino floor’s own track, mixed through the from-scratch SPU off ' +
+      'your disc and looped from the first spin. ' +
+      'The <b>cabinet</b> is the untextured mesh on your disc (PROT&nbsp;1200 descriptor&nbsp;1) ' +
+      'and the <b>projection</b> is the GTE register file read out of a retail save state; ' +
+      'the frame is the same primitive list the play page draws. <b>Triangle</b> (or Select) ' +
+      'opens the machine’s own cash-out menu. Full trace: ' +
+      '<code>docs/subsystems/minigame-slot-machine.md</code>.';
+  }
+
+  function slotDrawPaytable() {
+    const st = JSON.parse(api.slot_state_json());
+    slotPayouts = st.payouts || [];
+    if (!slotBonus && api) slotBonus = JSON.parse(api.slot_bonus_json());
+    const kick = slotBonus ? slotBonus.kick_symbol : 8;
+    const punch = slotBonus ? slotBonus.punch_symbol : 9;
+    $('slot-paytable').innerHTML = slotPayouts.map((p, id) => {
+      const bonus = (id === kick || id === punch);
+      const face = slotArt
+        ? `<canvas class="mg-glyph-sym" width="${SYM_PX}" height="${SYM_PX}" data-sym="${id}"></canvas>`
+        : `<span class="mg-glyph">#${id}</span>`;
+      return `<div class="mg-pay${bonus ? ' mg-pay-bonus' : ''}">${face}<b>${p}</b>${bonus ? ' ★' : ''}</div>`;
+    }).join('');
+    if (slotArt) {
+      $('slot-paytable').querySelectorAll('.mg-glyph-sym').forEach(c => {
+        const s = slotArt.symbols[parseInt(c.dataset.sym, 10)];
+        if (s) c.getContext('2d').drawImage(s, 0, 0);
+      });
+    }
+    slotDrawBonusLegend();
+  }
+
+  /* The bonus-game legend: a line of the blue "kick" (id 8) earns 1 bonus
+   * round, the red "punch" (id 9) earns 3, and a round pays the product of the
+   * three 1..10 numbers it stops on. Every value read off the disc. */
+  function slotDrawBonusLegend() {
+    const el = $('slot-bonus-legend');
+    if (!el || !slotBonus) return;
+    const b = slotBonus;
+    const chip = (id, label, rounds) => {
+      const face = slotArt
+        ? `<canvas class="mg-glyph-sym" width="${SYM_PX}" height="${SYM_PX}" data-sym="${id}"></canvas>`
+        : `<span class="mg-glyph">#${id}</span>`;
+      return `<span class="mg-bonus-chip">${face}<span>3 ${label} → <b>${rounds}</b> round${rounds === 1 ? '' : 's'}</span></span>`;
+    };
+    el.innerHTML =
+      '<b>Bonus game.</b> ' +
+      chip(b.kick_symbol, 'blue kicks', b.kick_rounds) +
+      chip(b.punch_symbol, 'red punches', b.punch_rounds) +
+      `<span class="mg-bonus-note">A bonus round rotates the reels onto the numeral strip ` +
+      `(<b>1–10</b>) and the marquee counts your stops. Stop all three and it pays their ` +
+      `<b>product</b> (${b.min}–${b.max} coins); nothing steers those reels.</span>` +
+      (slotArt ? `<span class="mg-bonus-nums" id="slot-bonus-nums"></span>` : '');
+    if (slotArt) {
+      el.querySelectorAll('.mg-glyph-sym').forEach(c => {
+        const s = slotArt.symbols[parseInt(c.dataset.sym, 10)];
+        if (s) c.getContext('2d').drawImage(s, 0, 0);
+      });
+      /* The ten faces themselves, off the disc - each with its own palette. */
+      const strip = $('slot-bonus-nums');
+      if (strip) {
+        for (let n = 1; n <= 10; n++) {
+          const c = document.createElement('canvas');
+          c.width = c.height = SYM_PX;
+          c.className = 'mg-glyph-num';
+          const img = slotArt.numbers[n - 1];
+          if (img) c.getContext('2d').drawImage(img, 0, 0);
+          strip.appendChild(c);
+        }
+      }
+    }
+  }
+
+  /* What a fresh machine racks. With a save loaded (the save bar's coin
+   * session), the machine IS the session wallet: it racks the save's live
+   * coin bank and every balance change syncs back (see slotFrame). An empty
+   * session still gets the free 60 so the machine stays playable - and the
+   * verdict says so, because those courtesy coins bank like any others. */
+  function slotStartBalance() {
+    const cs = window.LegaiaSaves && LegaiaSaves.coinSession();
+    if (cs && cs.coins >= 3) return Math.min(cs.coins, 9999999);
+    return SLOT_START_COINS;
+  }
+
+  function slotReset() {
+    /* The machine racks on the overlay's own literal seed (the engine's
+     * SLOT_RNG_SEED), the one the play hosts use - not a page random. */
+    const start = slotStartBalance();
+    if (!api || !api.slot_start(start)) {
+      verdict($('slot-verdict'), 'The payout table did not decode from this disc.', 'bad');
+      return;
+    }
+    const cs = window.LegaiaSaves && LegaiaSaves.coinSession();
+    verdict($('slot-verdict'),
+      cs && start !== SLOT_START_COINS
+        ? `${start} coins racked from your loaded save. Press space.`
+        : (cs
+            ? `Session under 3 coins - ${SLOT_START_COINS} courtesy coins racked (they bank into your session). Press space.`
+            : `${start} coins in the machine, 3 a spin. Press space.`),
+      '');
+    slotDrawPaytable();
+  }
+
+  /* ---------------- the machine ---------------- */
+
+  /* The retail machine, on its own 640x240 framebuffer - drawn by the ENGINE.
+   * `slot_frame_rgba` rasterises the same `engine-ui::slot_cabinet` primitive list the
+   * native window and the play page draw on their GPUs (the cabinet mesh, the
+   * reels, the glass furniture, the dot matrix, the coin readout, the paylines
+   * and the cash-out submenu), through the one projection the engine owns - the
+   * GTE registers captured at the machine. The page keeps no projection and no
+   * composition of its own, so it cannot drift from the play hosts. Without the
+   * machine's resident set there is nothing honest to draw, and it says so. */
+  let slotTick = 0;
+  function slotRender() {
+    const cv = $('slot-canvas'), g = cv.getContext('2d');
+    g.imageSmoothingEnabled = false;
+    if (api.slot_cabinet_ready()) {
+      const px = api.slot_frame_rgba(cv.width, cv.height);
+      if (px.length === cv.width * cv.height * 4) {
+        g.putImageData(new ImageData(new Uint8ClampedArray(px.buffer, px.byteOffset, px.length),
+          cv.width, cv.height), 0, 0);
+        return;
+      }
+    }
+    g.fillStyle = '#000000';
+    g.fillRect(0, 0, cv.width, cv.height);
+    g.fillStyle = '#8a8a99';
+    g.font = '12px monospace';
+    g.fillText('the art pack (PROT 1200) or the scene graph (PROT 0975) did not decode', 14, 20);
+    g.fillText('from this disc - the machine is not drawn', 14, 36);
+  }
+
+  let slotPrev = { stopped: 0, phase: '', feature: 0 };
+  /* The retail packed pad-edge bits the machine's cash-out flow reads
+   * (`_DAT_8007B874`; `SlotMachine::cash_out_input`), gathered from this
+   * frame's key presses and handed over once per frame by slotFrame. */
+  const SLOT_PAD = {
+    L2: 0x01, L1: 0x04, Triangle: 0x10, Circle: 0x20, Cross: 0x40, Square: 0x80,
+    Select: 0x100, Up: 0x1000, Down: 0x4000,
+  };
+  const SLOT_MENU_PHASES = new Set(['menu', 'no_coins', 'leaving']);
+  let slotPadEdges = 0;
+  /* A press during the spin-up ramp can't be taken (retail refuses a stop until
+   * the reels are up to speed), so hold it and take the first stop the moment
+   * the machine will accept one. Otherwise a fast triple-tap silently drops a
+   * press and you end up one reel short. */
+  let slotPendingStop = false;
+  /* The session bank changed OUTSIDE the machine (a save was loaded in the
+   * bar, a Baka pot banked): re-rack the machine from it on the next idle
+   * frame rather than mid-spin. */
+  let slotResyncPending = false;
+
+  /* The save bar's hook: a save was just loaded into the coin session. */
+  window.MgSession = {
+    onSaveLoaded() {
+      slotResyncPending = true;
+      if (api) {
+        const st = JSON.parse(api.slot_state_json());
+        if (!st.live || st.phase === 'idle') {
+          slotResyncPending = false;
+          slotReset();
+        }
+      }
+    },
+  };
+
+  /* ---- the one control ----
+   *
+   * The cabinet has a spin / collect button (Cross) and three stop buttons
+   * (Square / Cross / Circle for reels 0 / 1 / 2); every rule about them is
+   * the engine's `SlotMachine::frame`, the kernel the play hosts' world tick
+   * runs. Space is this page's one-key convenience, and it is only that: an
+   * input macro that presses the cabinet button the machine is waiting for -
+   * Cross at idle (spin), the leftmost still-open reel's stop button while
+   * the reels are stoppable, Cross on a resolved spin (it finishes the
+   * timed tally at once; left alone the win counts itself in), Cross inside
+   * the cash-out flow. The page used to bank a win whole on the frame it
+   * resolved. The page used to run
+   * its own path here, auto-collecting and stopping reels in order on one
+   * call. */
+  const SLOT_REEL_BUTTON = ['Square', 'Cross', 'Circle'];
+  function slotPress() {
+    if (!api) return;
+    const st = JSON.parse(api.slot_state_json());
+    if (!st.live) { slotReset(); return; }
+    if (st.phase === 'idle' && !st.can_spin) {   /* empty: rack a fresh machine */
+      slotReset();
+      return;
+    }
+    if (st.phase === 'spinning') {
+      /* The ramp refuses a stop: hold the press for the first open reel. */
+      slotPendingStop = true;
+      slotPadEdges |= SLOT_PAD.Cross;            /* the spin-up latch's face edge */
+      return;
+    }
+    if (st.phase === 'stopping') {
+      const r = (st.stop_open || []).indexOf(true);
+      if (r >= 0) slotPadEdges |= SLOT_PAD[SLOT_REEL_BUTTON[r]];
+      return;
+    }
+    slotPadEdges |= SLOT_PAD.Cross;
+    if (st.phase === 'idle') {
+      slotPendingStop = false;
+      verdict($('slot-verdict'), 'Spinning - press again to stop each reel.', '');
+      /* The casino floor's own track ("Sol casino", global BGM 2018 - the slot
+       * overlay starts none, so retail hears the host scene's. koin1's entry
+       * script picks it on the casino-floor arm; the Vidna cabinet's host
+       * scene plays that town's track instead). Starts with the first spin. */
+      MgBgm.start('slot');
+    }
+  }
+
+  function slotFrame() {
+    /* The machine's whole frame on this frame's packed pad edges - the
+     * engine's `SlotMachine::frame`, the play hosts' kernel. It returns the
+     * coins this frame's tally moved (one transfer, or the rest on a
+     * press), which is also the payout cue. */
+    const edges = slotPadEdges;
+    slotPadEdges = 0;
+    const credited = api.slot_step(edges);
+    slotTick++;
+    let st = JSON.parse(api.slot_state_json());
+    if (!st.live) return;
+    /* The machine committed its cash-out (the quit row, or the prompt): its
+     * balance is already synced into the session below on every frame, so
+     * leaving is racking a fresh machine. */
+    if (st.phase === 'cashed_out') {
+      if (window.LegaiaSaves) {
+        const cs = LegaiaSaves.coinSession();
+        if (cs && cs.coins !== st.balance) LegaiaSaves.updateCoinSessionCoins(st.balance);
+      }
+      const left = st.balance;
+      slotReset();
+      verdict($('slot-verdict'), `Cashed out ${left} coins. A fresh machine is racked.`, '');
+      return;
+    }
+    /* The session bank moved outside the machine: re-rack it, at idle only. */
+    if (slotResyncPending && st.phase === 'idle') {
+      slotResyncPending = false;
+      slotReset();
+      st = JSON.parse(api.slot_state_json());
+    }
+    if (slotPendingStop && st.can_stop) {
+      slotPendingStop = false;
+      slotPress();                               /* lands on the next frame */
+    }
+    /* The live bonus state, including the claimed-column tally the marquee
+     * prints. It is read off the machine's own latch, so it is the same state
+     * the payout multiplies - the strip cannot show a line the spin didn't pay. */
+    const bonus = JSON.parse(api.slot_bonus_json());
+
+    slotRender();
+
+    /* Cue the machine's own sounds off the state transitions the retail SM
+     * fires them on: the spin-motor loop while reels turn, one click per reel
+     * as its stop is taken, the "reach" sting when the second jackpot symbol
+     * lands on a live line (FUN_801D1AF4), the escalating anticipation cues
+     * when a feature mode opens, and the payout tick per coin tallied. */
+    const spinning = st.phase === 'spinning' || (st.phase === 'stopping' && st.stopped < 3);
+    if (spinning) slotSpinStart(); else slotSpinStop();
+    if (st.stopped > slotPrev.stopped) {
+      slotPlay('reel_stop', 0.55);
+      /* Two reels down: scan the five lines through them for a matching
+       * jackpot pair (symbols 8 / 9) - retail's second-symbol-sighted cue. */
+      if (st.stopped === 2 && slotPrev.stopped < 2 && st.window) {
+        const LINE = [[0, 0], [1, 1], [2, 2], [0, 1], [2, 1]]; /* rows on reels 0,1 */
+        const reach = LINE.some(([a, b]) => {
+          const s0 = st.window[0][a], s1 = st.window[1][b];
+          return s0 === s1 && s0 >= 8;
+        });
+        if (reach) slotPlay('reach', 0.5);
+      }
+    }
+    if (st.feature_mode !== slotPrev.feature && st.feature_mode > 0) {
+      slotPlay(st.feature_mode === 2 ? 'reach2' : 'reach1', 0.5);
+    }
+    if (credited > 0) {
+      /* One tally transfer is one tick (retail keys `CUE_PAYOUT_TICK` per
+       * transfer); a press that finished the count ticks once. */
+      slotPlay('payout_tick', 0.5);
+    }
+    /* The spin resolved on this frame: the last reel's stop evaluated it -
+     * into the payout state, which counts a win in, or straight back to
+     * idle on a loss. */
+    const resolved = slotPrev.phase === 'stopping'
+                     && (st.phase === 'payout' || st.phase === 'idle');
+    slotPrev = { stopped: st.stopped, phase: st.phase, feature: st.feature_mode };
+
+    /* With a save loaded, the machine is the session wallet: every balance
+     * change syncs into the coin session the save bar exports. */
+    if (window.LegaiaSaves) {
+      const cs = LegaiaSaves.coinSession();
+      if (cs && cs.coins !== st.balance) LegaiaSaves.updateCoinSessionCoins(st.balance);
+    }
+
+    $('slot-balance').textContent  = st.balance;
+    $('slot-cost').textContent     = st.cost;
+    $('slot-feature').textContent  = st.feature_mode + (st.bonus_spins > 0 ? ` (${st.bonus_spins} bonus)` : '');
+    $('slot-nettake').textContent  = st.net_take;
+
+    if (resolved && st.last) {
+      const l = st.last;
+      if (l.payout > 0) {
+        let msg;
+        if (l.bonus_spin) {
+          /* A bonus round: the three claimed columns, multiplied. The numbers
+           * come off the machine's tally latch - the same rows the payout read,
+           * so the line below the machine and the strip on it always agree. */
+          const nums = (bonus.tally && bonus.tally.length === 3)
+            ? bonus.tally.join(' × ') + ' = ' : '';
+          msg = `Bonus round: ${nums}${l.payout} coins - banked.`;
+          if (st.feature_mode === 6 && st.bonus_spins > 0) {
+            msg += ` ${st.bonus_spins} more.`;
+          }
+        } else if (l.bonus_triggered) {
+          /* The triggering line - name the symbol and the rounds it earned. */
+          const b = slotBonus;
+          const isKick = b && l.symbol === b.kick_symbol;
+          const earned = isKick ? (b ? b.kick_rounds : 1) : (b ? b.punch_rounds : 3);
+          const what = isKick ? 'blue kicks' : 'red punches';
+          msg = `Three ${what} pay ${l.payout} - and open ${earned} BONUS round${earned === 1 ? '' : 's'}!`;
+        } else {
+          msg = `A line of symbol #${l.symbol} pays ${l.payout} - banked.`;
+        }
+        verdict($('slot-verdict'), msg, 'good');
+        /* Persist the win. With a save loaded the balance sync above already
+         * banked it into the coin session; with none it joins the pending
+         * pool a future save-load absorbs. */
+        if (window.LegaiaSaves) {
+          const sm = LegaiaSaves.getMinigames().slot || {};
+          LegaiaSaves.putMinigame('slot', {
+            bestPayout: Math.max(sm.bestPayout || 0, l.payout),
+            coinsWon: (sm.coinsWon || 0) + l.payout,
+          });
+          if (!LegaiaSaves.coinSession()) LegaiaSaves.addCoinsWon(l.payout);
+        }
+      } else {
+        verdict($('slot-verdict'), 'No line. Press space to spin again.', '');
+      }
+    }
+    if (st.phase === 'no_coins') {
+      verdict($('slot-verdict'), 'Out of coins - press space to cash out and rack a fresh machine.', 'bad');
+    }
+  }
+
+  /* The machine itself is the button, so a tap works where a spacebar doesn't. */
+  $('slot-canvas').addEventListener('click', slotPress);
+
+  /* ---------------- keyboard ---------------- */
+
+  /* Space is the slot machine's only control, so it is also the one key this
+   * page takes away from the browser. Take it only while the machine is both
+   * the active tab AND actually on screen - a reader scrolled down to the Sol
+   * Tower tables still gets to page down with it. */
+  function slotOnScreen() {
+    const p = document.querySelector('.mg-panel[data-game="slot"]');
+    if (!p || !p.classList.contains('is-active')) return false;
+    const r = p.getBoundingClientRect();
+    const h = window.innerHeight || document.documentElement.clientHeight;
+    return r.bottom > 0 && r.top < h;
+  }
+
+  /* This page's controls are named PAD BUTTONS, not keys.
+   *
+   * It used to key off `e.key.toLowerCase()` against its own literals -
+   * `{a:1,s:2,d:3}` for the dance pads, `j`/`k` for the fishing reels, `t`
+   * for Triangle - while the engine binds `A`/`S`/`D` to Left / Down / Right
+   * and the face buttons to `Z`/`X`/`C`/`V`. The page's own button labels
+   * said Square = A, Circle = S, Triangle = D, so the two contradicted each
+   * other key for key on the same three buttons, and a rebind reached
+   * neither. Everything below resolves through `legaiaPadButtonOf`, which
+   * reads the engine's table (`pad_bindings_json`); the digits stay as page
+   * shortcuts, which are not pad bindings and so cannot contradict one.
+   *
+   * `legaiaPadKeysFor` closes the other half: the printed labels are derived
+   * from the same table by `relabelControls`, so a rebind relabels the page. */
+  const btnOf = (e) => e.padButton
+    || (window.legaiaPadButtonOf ? window.legaiaPadButtonOf(e.code) : '');
+  /* The three "pad" lanes the dance chart and the Baka exchange are played
+   * on, and the fourth Baka move: the face buttons, in retail's own order. */
+  const FACE_LANES = { Square: 1, Circle: 2, Triangle: 3, Cross: 4 };
+  /* The Baka duel's own map: retail's slot-0 read is Square 0x80 -> 1,
+   * Circle 0x20 -> 2, Cross 0x40 -> 3; its type 4 is an auto-finisher, so the
+   * port's chargeable Special takes the one face button the duel leaves free. */
+  const BAKA_LANES = { Square: 1, Circle: 2, Cross: 3 };
+  /* The duel's own key row (C / X / Z = throws 1 / 2 / 3, V = the cameo
+   * hold), a deliberate layout override like the dance's DANCE_KEYS. */
+  const BAKA_KEYS = { KeyC: 1, KeyX: 2, KeyZ: 3, KeyV: 0 };
+  const bakaCameoKey = (e) => BAKA_KEYS[e.code] === 0
+    || (btnOf(e) === 'Triangle' && BAKA_KEYS[e.code] === undefined);
+
+  function onPadDown(e) {
+    if (!api || e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+    const b = btnOf(e);
+    const digit = /^Digit([1-9])$/.exec(e.code);
+    const n = digit ? Number(digit[1]) : 0;
+    if (active === 'dance') {
+      /* Dance-local key row: Z / X / C are the three throws in one hand,
+       * laid out Z = Square, X = Triangle, C = Circle. This deliberately
+       * overrides the pad-binding resolution (which would put Circle on X
+       * and Triangle on C) - the row is a rhythm-game layout choice, and
+       * the printed labels on the dance buttons are static to match. */
+      const DANCE_KEYS = { KeyZ: 1, KeyX: 3, KeyC: 2 };
+      const m = DANCE_KEYS[e.code] || (FACE_LANES[b] <= 3 ? FACE_LANES[b] : undefined);
+      /* The how-to tutorial reads the same presses (any face button
+       * advances) plus Left / Right for its Yes / No prompt. */
+      if (m || (n >= 1 && n <= 3) || b === 'Cross' || b === 'Start') danceTutBits |= 1;
+      if (b === 'Left') { danceTutBits |= 2; e.preventDefault(); }
+      if (b === 'Right') { danceTutBits |= 4; e.preventDefault(); }
+      if (m) { e.preventDefault(); dancePress(m); }
+      else if (n >= 1 && n <= 3) { e.preventDefault(); dancePress(n); }
+    } else if (active === 'baka') {
+      /* Every key is the cabinet's pad (packed layout): the front end, the
+       * duel's throws (Square / Circle / Cross, `FUN_801D3F44`'s slot-0
+       * branch) and the NEXT GAME / PAY OUT sheet all read the same edge
+       * word in `BakaFight::frame`. The duel-local key row C / X / Z =
+       * throws 1 / 2 / 3 (and V = the cameo's Triangle hold) stays a layout
+       * override, like the dance's DANCE_KEYS; Enter / Space starts a run. */
+      if (bakaMode !== 'cabinet') {
+        if (b === 'Start') { e.preventDefault(); bakaStart(); }
+      } else {
+        const row = BAKA_KEYS[e.code];
+        if (bakaCameoKey(e)) bakaHeld |= 0x10;
+        const throwBtn = row ? BAKA_THROW_BUTTON[row]
+          : (n >= 1 && n <= 3 ? BAKA_THROW_BUTTON[n] : null);
+        const btn = throwBtn || (row === undefined ? b : null);
+        if (btn && BAKA_PACKED[btn] !== undefined) {
+          e.preventDefault();
+          if (window.MgSpu) MgSpu.ready(api);
+          if (!e.repeat) bakaCabEdge |= BAKA_PACKED[btn];
+        }
+      }
+    } else if (active === 'slot') {
+      /* Every pad button is the cabinet's own and lands on the machine's
+       * frame as a packed edge (`SlotMachine::frame` decides what it means:
+       * Cross spins / collects / stops reel 1, Square / Circle stop reels
+       * 0 / 2, Triangle / Select open the cash-out flow). Space - the panel's
+       * advertised key, arriving through its Start binding so a rebind
+       * follows it - is the page's macro over those buttons (`slotPress`). */
+      if (!slotOnScreen()) return;
+      if (b === 'Start') { e.preventDefault(); slotPress(); }
+      else if (SLOT_PAD[b] !== undefined) {
+        e.preventDefault();
+        if (!e.repeat) slotPadEdges |= SLOT_PAD[b];
+      }
+    } else if (active === 'fishing') {
+      /* Pad map: Circle casts (a port binding - retail casts on Cross /
+       * Square and Circle abandons the cast), Cross (reel bit 0x40) = reel A, Square
+       * (reel bit 0x80) = reel B. Every FRESH press is ORed into the packed
+       * newly-pressed word (retail _DAT_8007B874 layout: 0x8000 Left, 0x2000
+       * Right, 0x40 / 0x80 the reels); the engine's bite_pad_nudge counts the
+       * strike-credit nudge from it - three masks, the two reels as one, and
+       * never the cast press. */
+      /* The venue hub reads the same packed word: Triangle / Select open it
+       * at the shore (retail state 0x0C's `& 0x110`), Up / Down move its
+       * cursor, Cross confirms, Circle backs out. */
+      if (b === 'Circle') { e.preventDefault(); if (!e.repeat) fishPressed |= 0x20; fishingCastPress(); }
+      else if (b === 'Triangle' || b === 'Select') {
+        e.preventDefault();
+        if (!e.repeat) fishPressed |= (b === 'Triangle') ? 0x10 : 0x100;
+      }
+      else if (b === 'Up' || b === 'Down') {
+        e.preventDefault();
+        if (!e.repeat) fishPressed |= (b === 'Up') ? 0x1000 : 0x4000;
+        /* held D-pad down lifts the rod (the rod actor reads the held word) */
+        if (b === 'Down') fishHold |= 0x4000;
+      }
+      else if (b === 'Cross') { e.preventDefault(); if (!e.repeat) { fishHold |= 0x40; fishPressed |= 0x40; } }
+      else if (b === 'Square') { e.preventDefault(); if (!e.repeat) { fishHold |= 0x80; fishPressed |= 0x80; } }
+      else if (b === 'Left' || b === 'Right') {
+        e.preventDefault();
+        /* bait twitch: a fresh D-pad edge; held, the side rolls the rod */
+        if (!e.repeat) fishPressed |= (b === 'Left') ? 0x8000 : 0x2000;
+        fishHold |= (b === 'Left') ? 0x8000 : 0x2000;
+      }
+    } else if (active === 'muscle') {
+      /* Retail pad map: D-pad drives the command menu (Left=Attack,
+       * Down=Spirit), the Attack sub-menu (Left=Auto, Right=Command) and,
+       * inside Command input, commits directions; Triangle opens the retail
+       * learned-arts list; 1-4 stay as direction-slot shortcuts; Esc backs
+       * out of Attack input. */
+      const dir = { Left: 'left', Right: 'right', Up: 'up', Down: 'down' }[b];
+      if (n >= 1 && n <= 4) { e.preventDefault(); muscleCommit(n - 1); }
+      else if (dir) { e.preventDefault(); muscleKey(dir); }
+      else if (b === 'Triangle') { e.preventDefault(); muscleKey('triangle'); }
+      else if (b === 'Circle' || e.code === 'Escape' || e.code === 'Backspace') { e.preventDefault(); muscleKey('back'); }
+      else if (b === 'Cross' || b === 'Start') { e.preventDefault(); muscleConfirm(); }
+    }
+  }
+
+  function onPadUp(e) {
+    if (active === 'baka' && bakaCameoKey(e)) bakaHeld &= ~0x10;
+    if (active !== 'fishing') return;
+    const b = btnOf(e);
+    if (b === 'Cross') fishHold &= ~0x40;
+    else if (b === 'Square') fishHold &= ~0x80;
+    else if (b === 'Left') fishHold &= ~0x8000;
+    else if (b === 'Right') fishHold &= ~0x2000;
+    else if (b === 'Down') fishHold &= ~0x4000;
+  }
+
+  document.addEventListener('keydown', onPadDown);
+  document.addEventListener('keyup', onPadUp);
+
+  /* A controller drives the same two handlers a key's button does: each
+   * press / release edge of a standard-mapped gamepad (the engine's layout,
+   * `legaia_engine_system::gamepad`, through `legaiaGamepadEdges`) arrives as
+   * an event naming its pad button, so every game here reads it exactly as
+   * it reads the button's bound key. Polled once per display frame, ahead of
+   * the frame's step. */
+  const GAMEPAD_EVENT = (button) => ({
+    padButton: button, code: 'Gamepad:' + button, repeat: false,
+    target: document.body, preventDefault() {},
+  });
+  function pollMgGamepad() {
+    if (!window.legaiaGamepadEdges) return;
+    const { pressed, released } = window.legaiaGamepadEdges();
+    for (const b of released) onPadUp(GAMEPAD_EVENT(b));
+    for (const b of pressed) onPadDown(GAMEPAD_EVENT(b));
+  }
+
+  /* Rewrite every printed control hint from the engine's binding table, so
+   * the page cannot say "Square = A" while the engine binds `A` to Left.
+   * A `data-pad-key="Circle"` span is replaced by whatever key Circle is
+   * bound to; `data-pad-keys` prints them all. */
+  const PRETTY_KEY = (code) => code
+    .replace(/^Key/, '').replace(/^Digit/, '').replace(/^Arrow/, '')
+    .replace(/^Escape$/, 'Esc');
+  /* The key a named button is bound to, for a runtime message that has to say
+   * one ("X to cast again"). Falls back to the button's own name rather than
+   * to a literal, so a stale bundle prints something true. */
+  function keyLabel(button) {
+    const keys = window.legaiaPadKeysFor ? window.legaiaPadKeysFor(button) : [];
+    return keys.length ? PRETTY_KEY(keys[0]) : button;
+  }
+
+  function relabelControls() {
+    if (!window.legaiaPadKeysFor) return;
+    const pretty = PRETTY_KEY;
+    for (const el of document.querySelectorAll('[data-pad-key]')) {
+      const keys = window.legaiaPadKeysFor(el.dataset.padKey).map(pretty);
+      if (keys.length) el.textContent = keys[0];
+    }
+    for (const el of document.querySelectorAll('[data-pad-keys]')) {
+      const keys = window.legaiaPadKeysFor(el.dataset.padKeys).map(pretty);
+      if (keys.length) el.textContent = keys.join(' / ');
+    }
+  }
+
+  /* ================= fishing ================= */
+
+  /* The rules are the ported retail pond loop (engine-fishing::fishing's
+   * PondSession: cast -> band roll / cadence -> strike -> tension fight ->
+   * score) over the venue tables decoded from the visitor's disc; the 3D
+   * pond + retail HUD render through js/minigame-fishing.js (window.
+   * MgFishing). This block is glue: it ticks the session, routes input,
+   * runs the prize counter, and bridges the save bar's fishing record. */
+  let fishR = null;          /* MgFishing renderer (null = flat fallback) */
+  let fishHold = 0;          /* held packed pad: 0x40 Cross (J), 0x80 Square (K), D-pad 0x2000/0x4000/0x8000 */
+  let fishPressed = 0;       /* packed newly-pressed word since the last frame */
+  let fishCastEdge = false;  /* one-shot cast / confirm press */
+  let fishSave = null;       /* fishing record read from the loaded save */
+  let fishLive = false;
+
+  function fishingLoad() {
+    const list = JSON.parse(api.fishing_species_json());
+    $('fishing-species').innerHTML = list.map(f =>
+      `<div class="mg-pay"><b>${f.name || 'Fish #' + f.index}</b>` +
+      `<span>${f.score.toLocaleString()} pts</span></div>`).join('');
+    fishR = null;
+    if (window.MgFishing) {
+      const r = MgFishing.create(api, $('fishing-canvas'), $('fishing-gl'));
+      if (r.loadAssets()) fishR = r;
+      else fishR = r;   /* rules may be up while the 3D stage is not */
+    }
+    const note = $('fishing-note');
+    if (fishR && !fishR.sceneOk() && note && !note.dataset.flagged) {
+      note.dataset.flagged = '1';
+      const p = document.createElement('p');
+      p.innerHTML = 'This disc’s <b>venue scene did not assemble</b> in this browser, ' +
+        'so the pond below is a flat backdrop rather than the 3D map.';
+      note.prepend(p);
+    }
+    /* A save already loaded into the coin session also carries the fishing
+     * record; otherwise the pickers' defaults play. */
+    fishingReadSave().then(fishingStart);
+  }
+
+  /* Pull the persistent fishing block out of the save the coin session
+   * loaded (points / best / lure / rod / casts / one-time prize latches).
+   * Resolves with null when no card save is loaded. */
+  function fishingReadSave() {
+    fishSave = null;
+    if (!window.LegaiaSaves || !LegaiaSaves.coinSession) return Promise.resolve(null);
+    const cs = LegaiaSaves.coinSession();
+    const stored = cs && LegaiaSaves.getSession(cs.saveId);
+    if (!stored || !stored.meta || stored.meta.kind !== 'card') {
+      fishingSaveRow();
+      return Promise.resolve(null);
+    }
+    return LegaiaWasm.load().then((mod) => {
+      const j = JSON.parse(mod.card_fishing_json(stored.bytes, stored.meta.block));
+      fishSave = Object.assign(j, { id: cs.saveId, block: stored.meta.block,
+                                    name: stored.meta.name || cs.saveId });
+      /* The save's own tackle becomes the pickers' selection. */
+      $('fishing-lure').value = String(Math.min(2, j.lure >>> 0));
+      $('fishing-rod').value = String(Math.max(0, Math.min(2, j.rod | 0)));
+      fishingSaveRow();
+      return fishSave;
+    }).catch(() => { fishingSaveRow(); return null; });
+  }
+
+  function fishingSaveRow() {
+    const row = $('fishing-save-row'), note = $('fishing-save-note'),
+          btn = $('fishing-save-export');
+    if (!row) return;
+    if (fishSave) {
+      row.hidden = false;
+      btn.hidden = false;
+      note.textContent = `Record from "${fishSave.name}": ` +
+        `${(fishSave.points | 0).toLocaleString()} pts, ${fishSave.casts | 0} lifetime casts.`;
+    } else {
+      row.hidden = false;
+      btn.hidden = true;
+      note.textContent = 'No save loaded - starting from a fresh record. ' +
+        'Load one in the save bar above to fish with its rod, lures and points.';
+    }
+  }
+
+  /* Write the session's fishing record back into the loaded save's bytes
+   * (points / best / casts / tackle / one-time latches - seven dwords, in
+   * place, same shape as the coin export). */
+  function fishingExportSave() {
+    if (!api || !fishSave) return;
+    const st = JSON.parse(api.fishing_pond_state_json());
+    if (!st.live) return;
+    const stored = LegaiaSaves.getSession(fishSave.id);
+    if (!stored) return;
+    LegaiaWasm.load().then((mod) => {
+      const patched = mod.card_patch_fishing(
+        stored.bytes, fishSave.block,
+        st.points, st.lure, st.rod, st.best, st.best_fish, st.casts,
+        fishingPurchasedMask());
+      LegaiaSaves.putSession(Object.assign({}, stored.meta), patched);
+      verdict($('fishing-verdict'),
+        `Wrote ${st.points.toLocaleString()} points (+ tackle, casts, prize latches) into "${fishSave.name}" - download it from the save bar.`, 'good');
+      fishingReadSave();
+    }).catch((err) => {
+      verdict($('fishing-verdict'), 'Export failed: ' + (err && err.message || err), 'bad');
+    });
+  }
+
+  /* The session's one-time prize mask (returned inside the exchange JSON's
+   * latched flags; reconstructed here for the save write-back). */
+  function fishingPurchasedMask() {
+    let mask = 0;
+    for (const venue of [0, 1]) {
+      const ex = api.fishing_exchange_json(venue);
+      if (ex === 'null') continue;
+      for (const r of JSON.parse(ex).rows) {
+        if (r.latched) mask |= 1 << ((r.row + venue * 8) & 0x1f);
+      }
+    }
+    return mask >>> 0;
+  }
+
+  /* Start (or restart) the pond with the pickers + the loaded record. */
+  function fishingStart() {
+    if (!api || !api.fishing_pond_ready || !api.fishing_pond_ready()) {
+      verdict($('fishing-verdict'),
+        'The venue tables did not decode from this disc.', 'bad');
+      return;
+    }
+    const venue = +$('fishing-venue').value;
+    const lure = +$('fishing-lure').value;
+    const rod = +$('fishing-rod').value;
+    const s = fishSave || { points: 0, best: 0, best_fish: 0, casts: 0, purchased: 0 };
+    /* The play hosts' seed rule (salt ^ frame count), not a page random. */
+    const seed = (typeof api.minigame_seed === 'function' ? api.minigame_seed('fishing')
+      : (Date.now() ^ (Math.random() * 0x7fffffff))) >>> 0;
+    api.fishing_pond_start(venue, lure, rod, s.casts | 0, s.points | 0,
+                           s.best | 0, s.best_fish >>> 0, s.purchased >>> 0, seed);
+    fishLive = true;
+    fishHold = 0; fishPressed = 0; fishCastEdge = false;
+    fishingExchangeRender();
+    fishingPrizesRender();
+    verdict($('fishing-verdict'),
+      (venue ? 'Vidna' : 'Buma') + ` pond - ${keyLabel('Circle')} to cast.`, '');
+  }
+
+  /* Space / Cast button: a one-shot press consumed by the next tick. */
+  function fishingCastPress() {
+    if (!api || !fishLive) return;
+    fishCastEdge = true;
+  }
+
+  function fishingAnnounce(events, st) {
+    for (const e of events) {
+      if (e.e === 'splash') {
+        verdict($('fishing-verdict'), 'Good! The rhythm took - keep the reel held.', 'good');
+      } else if (e.e === 'hooked') {
+        verdict($('fishing-verdict'),
+          `Hooked ${e.name || 'a fish'}! Reel it in - ease off before the line snaps.`, 'good');
+      } else if (e.e === 'landed') {
+        verdict($('fishing-verdict'),
+          `Landed ${(st.fish && st.fish.name) || 'the fish'} for ` +
+          `${e.points.toLocaleString()} points! ${keyLabel('Circle')} to cast again.`, 'good');
+        fishingExchangeRender();
+        if (window.LegaiaSaves) {
+          const d = LegaiaSaves.getMinigames().fishing || {};
+          LegaiaSaves.putMinigame('fishing', {
+            lastCatch: e.points,
+            bestCatch: Math.max(d.bestCatch || 0, e.points),
+            plays: (d.plays || 0) + 1,
+          });
+        }
+      } else if (e.e === 'snapped') {
+        verdict($('fishing-verdict'), `The line snapped! ${keyLabel('Circle')} to cast again.`, 'bad');
+      } else if (e.e === 'hub_leave') {
+        fishLive = false;
+        verdict($('fishing-verdict'), 'You left the venue. Start again to fish.', '');
+      } else if (e.e === 'hub_exchange') {
+        const ex = $('fishing-exchange');
+        if (ex && ex.scrollIntoView) ex.scrollIntoView({ block: 'nearest' });
+        verdict($('fishing-verdict'), 'The prize exchange is the panel beside the pond.', '');
+      }
+    }
+  }
+
+  let fishClock = 0;
+  function fishingFrame(steps) {
+    if (!api || !fishLive) return;
+    /* Step the retail 60 Hz simulation by wall-clock, so a throttled rAF
+     * (background tab, slow machine, headless) still plays at game speed.
+     * `steps` is the shared stepper's answer from the page loop; a cached
+     * bundle without it (`0`) falls back to the old local clock. The
+     * one-shot cast edge and newly-pressed word ride the first step. */
+    const now = performance.now();
+    const frames = steps > 0 ? steps
+      : (fishClock ? Math.min(4, Math.max(1, Math.round((now - fishClock) / 16.6))) : 1);
+    fishClock = now;
+    let events = [];
+    for (let i = 0; i < frames; i++) {
+      const ev = JSON.parse(api.fishing_pond_tick(
+        fishHold, i === 0 && fishCastEdge, i === 0 ? fishPressed : 0));
+      if (ev.length) events = events.concat(ev);
+    }
+    fishCastEdge = false;
+    fishPressed = 0;
+    const st = JSON.parse(api.fishing_pond_state_json());
+    if (!st.live) return;
+    if (events.length) {
+      if (fishR) fishR.onEvents(events, st);
+      fishingAnnounce(events, st);
+    }
+    const hud = JSON.parse(api.fishing_pond_hud_json());
+    /* The shared effect-part pool (the strike splash's three parts). Same
+     * model, bound and fade ramp as the play page and the native window. */
+    let fx = [];
+    try { fx = JSON.parse(api.minigame_fx_json()); } catch (e) { fx = []; }
+    if (fishR) fishR.draw(st, hud, fx);
+    /* HUD spans. */
+    const PHASE_LABEL = {
+      idle: 'at the shore', windup: 'winding up', power: 'power meter',
+      flight: 'lure flying', waiting: 'lure in the water', hooked: 'FIGHTING',
+      landed: 'landed', snapped: 'line snapped',
+    };
+    $('fishing-phase').textContent = PHASE_LABEL[st.phase] || st.phase;
+    $('fishing-fish').textContent = (st.fish && st.fish.name) || '—';
+    $('fishing-points').textContent = st.points.toLocaleString();
+    $('fishing-best').textContent = st.best.toLocaleString();
+    $('fishing-casts').textContent = st.casts.toLocaleString();
+  }
+
+  /* ---- the point exchange (retail states 0x64..0x7a) ---- */
+
+  function fishingExchangeRender() {
+    const el = $('fishing-exchange');
+    if (!el || !api) return;
+    const venue = +$('fishing-venue').value;
+    const raw = api.fishing_exchange_json(venue);
+    if (raw === 'null') { el.innerHTML = ''; return; }
+    const v = JSON.parse(raw);
+    el.innerHTML = v.rows.map((r) => {
+      /* Retail hides the top prize until strictly affordable. */
+      if (r.row < v.first_visible) return '';
+      const name = r.name || ('Item 0x' + r.item_id.toString(16).toUpperCase());
+      const tail = r.latched
+        ? '<span class="fish-ex-once">claimed</span>'
+        : `<button class="mg-btn" type="button" data-exrow="${r.row}"` +
+          `${r.available ? '' : ' disabled'}>Trade</button>`;
+      return `<div class="fish-ex-row${r.available || r.latched ? '' : ' is-off'}">` +
+        `<b>${name}</b><span>${r.price.toLocaleString()} pts</span>` +
+        (r.one_time ? '<span class="fish-ex-once">one-time</span>' : '') +
+        tail + '</div>';
+    }).join('');
+    el.querySelectorAll('[data-exrow]').forEach(b =>
+      b.addEventListener('click', () => fishingBuy(+b.dataset.exrow)));
+  }
+
+  function fishingBuy(row) {
+    if (!api) return;
+    const venue = +$('fishing-venue').value;
+    const res = api.fishing_exchange_buy(venue, row, 1);
+    if (res === 'null') return;
+    const p = JSON.parse(res);
+    verdict($('fishing-verdict'),
+      `Traded ${p.cost.toLocaleString()} points for ${p.name || 'the prize'}.`, 'good');
+    fishingExchangeRender();
+    fishingPrizesRender();
+  }
+
+  function fishingPrizesRender() {
+    const el = $('fishing-prizes');
+    if (!el || !api) return;
+    const rows = JSON.parse(api.fishing_prizes_json());
+    el.textContent = rows.length
+      ? 'Prizes this session: ' + rows.map(r =>
+          `${r.name || ('item 0x' + r.item_id.toString(16))} ×${r.qty}`).join(', ')
+      : '';
+  }
+
+  /* Controls (bound once; the buttons exist in the static panel). */
+  (function bindFishing() {
+    const on = (id, fn) => { const b = $(id); if (b) b.addEventListener('click', fn); };
+    on('fishing-cast', () => { if (api) fishingCastPress(); });
+    on('fishing-start', () => { if (api) fishingStart(); });
+    on('fishing-save-export', () => { if (api) fishingExportSave(); });
+    ['fishing-venue', 'fishing-lure', 'fishing-rod'].forEach(id => {
+      const sel = $(id);
+      if (sel) sel.addEventListener('change', () => { if (api && fishLive) fishingStart(); });
+    });
+    /* Hold-to-reel buttons: the held mask + a fresh edge on press. */
+    const hold = (id, bit) => {
+      const b = $(id);
+      if (!b) return;
+      const down = (e) => { e.preventDefault(); fishHold |= bit; fishPressed |= bit; };
+      const up = () => { fishHold &= ~bit; };
+      b.addEventListener('pointerdown', down);
+      b.addEventListener('pointerup', up);
+      b.addEventListener('pointerleave', up);
+      b.addEventListener('pointercancel', up);
+    };
+    hold('fishing-reel-a', 0x40);
+    hold('fishing-reel-b', 0x80);
+    /* A freshly-loaded save re-seeds the record mid-session. */
+    window.addEventListener('legaia-coin-session-change', () => {
+      if (api && fishLive) fishingReadSave().then(() => fishingStart());
+    });
+  })();
+
+  /* ================= muscle dome ================= */
+
+  /* The rules + damage live in Rust: legaia-engine-core's muscle_dome session
+   * resolved through the ported battle formulas against disc-record fighter
+   * stats (see crates/web-minigames/src/muscle_web.rs). This block is DOM
+   * glue - the selectors, the card buttons and the HUD spans - and delegates
+   * the 3D arena, HUD canvas and round playback to js/minigame-muscle.js
+   * (window.MgMuscle). */
+  let muscleR = null;
+  let muscleLastPhase = null;
+  let muscleLastTurn = -1;
+
+  const muscleEsc = window.escapeHtml;
+
+  /* Decode the roster + build the arena once per disc (called from loadDisc).
+   * The opponent picker groups the curated Muscle Dome course line-ups
+   * (minigames.json, walkthrough ground-truth) first - matched by name onto
+   * the disc's own PROT 867 records - then the full archive. */
+  function muscleLoad() {
+    muscleR = MgMuscle.create(api, $('muscle-hud'), $('muscle-gl'));
+    const roster = muscleR.loadRoster();
+    const byName = new Map(roster.map(r => [String(r.name).toLowerCase(), r]));
+    const byId = new Map(roster.map(r => [r.id, r]));
+    const opt = (r) => `<option value="${r.id}">${muscleEsc(r.name)} — HP ${r.hp}</option>`;
+    /* The arena's line-up is disc data: PROT 0977's course descriptor table
+     * names a monster id per (course, round), and FUN_801D1510 stores that
+     * id into the ordinary battle formation cell. Use it directly; the
+     * curated name-join below is only the fallback for a disc whose ladder
+     * does not decode. */
+    const fillFromDisc = () => {
+      let ladder = [];
+      try { ladder = JSON.parse(api.muscle_course_ladder_json()); }
+      catch (e) { ladder = []; }
+      if (!ladder.length) return false;
+      const COURSE = ['Beginner', 'Expert', 'Master'];
+      let html = '<option value="0" selected>&mdash; run the course ladder &mdash;</option>';
+      for (const c of ladder) {
+        const rows = c.rounds.map((rd) => {
+          const rec = byId.get(rd.id);
+          const name = rd.name || (rec && rec.name) || ('monster ' + rd.id);
+          const hp = rd.hp != null ? rd.hp : (rec ? rec.hp : '?');
+          return `<option value="${rd.id}">${rd.round}. ${muscleEsc(String(name))}`
+            + ` — HP ${hp}</option>`;
+        });
+        html += `<optgroup label="${COURSE[c.course] || ('course ' + c.course)}`
+          + ` course (${rows.length} rounds)">${rows.join('')}</optgroup>`;
+      }
+      html += `<optgroup label="Full archive">${roster.map(opt).join('')}</optgroup>`;
+      $('muscle-foe').innerHTML = html;
+      muscleReset();
+      return true;
+    };
+    const fill = (courses) => {
+      let html = '<option value="0" selected>&mdash; run the course ladder &mdash;</option>';
+      const seen = new Set();
+      for (const c of (courses || [])) {
+        const rows = [];
+        for (const round of (c.roster || [])) {
+          const boss = c._bosses && c._bosses[round.boss_key];
+          const rec = boss && byName.get(String(boss.name || '').toLowerCase());
+          if (rec && !seen.has(rec.id)) { seen.add(rec.id); rows.push(opt(rec)); }
+        }
+        if (rows.length) {
+          html += `<optgroup label="${muscleEsc(c.name)} course">${rows.join('')}</optgroup>`;
+        }
+      }
+      html += `<optgroup label="Full archive">${roster.map(opt).join('')}</optgroup>`;
+      $('muscle-foe').innerHTML = html;
+      muscleReset();
+    };
+    if (fillFromDisc()) return;
+    fetch('minigames.json').then(r => r.json()).then(p => {
+      const courses = (p.muscle_dome || []).map(c => Object.assign({ _bosses: p.bosses }, c));
+      fill(courses);
+    }).catch(() => fill(null));
+  }
+
+  function muscleOpts() {
+    /* Picking a foe explicitly is free play against one monster; leaving it
+     * on the blank row runs the CONTEST, which stages its own foe per
+     * (course, round) the way the arena does. */
+    const monster = parseInt($('muscle-foe').value, 10) || 0;
+    return {
+      char: parseInt($('muscle-char').value, 10) || 0,
+      level: Math.max(1, Math.min(99, parseInt($('muscle-level').value, 10) || 30)),
+      course: parseInt($('muscle-course').value, 10) || 0,
+      monster,
+      pinMonster: monster > 0,
+    };
+  }
+
+  function muscleReset() {
+    if (!api || !muscleR) return;
+    muscleLastPhase = null;
+    muscleLastTurn = -1;
+    verdict($('muscle-verdict'), '', '');
+    if (!muscleR.start(muscleOpts())) {
+      verdict($('muscle-verdict'),
+        'This opponent did not decode from the image — pick another.', 'bad');
+      return;
+    }
+    muscleSync();
+  }
+
+  function muscleCommit(slot) {
+    if (!api || !muscleR) return;
+    muscleR.commit(slot);
+    muscleSync();
+  }
+
+  /* Pad-shaped input (arrows / Esc) into the battle-menu presentation. */
+  function muscleKey(name) {
+    if (!api || !muscleR) return;
+    muscleR.key(name);
+    muscleSync();
+  }
+
+  /* Space / Confirm: fight, skip the playback, leave the between-FIGHTS interval
+   * screen (a settled turn needs no press - it returns to the cluster itself),
+   * rematch. */
+  function muscleConfirm() {
+    if (!api || !muscleR) return;
+    MgBgm.start('muscle');    /* first confirm is the user gesture that lets audio play */
+    muscleR.confirm();
+    muscleSync();
+  }
+
+  function muscleFrame() {
+    if (!api || !muscleR) return;
+    muscleR.frame();
+    muscleSync();
+  }
+
+  function muscleSync() {
+    const st = muscleR.state();
+    if (!st.live) return;
+    /* The battle turn counter (ctx+0x28a) and the OPPONENT's hp * 100 / max.
+     * Retail pairs the percentage with a "Turns Left" digit only in the fight
+     * whose formation slot 0 is monster 0xB6; the dome never raises it. */
+    $('muscle-turn').textContent = st.turn;
+    $('muscle-hp-left').textContent = st.hp_left;
+    $('muscle-budget').textContent = st.budget[0];
+    $('muscle-queue').textContent = st.queue[0].length;
+    const rn = api.muscle_spell_name ? api.muscle_spell_name(st.reward_spell) : '';
+    /* The victory CAPTION's spell name. It names a string, not a prize: the
+     * table behind it is the shared battle-family cast-caption table, and
+     * the arena grants no Seru. A run's reward is coins. */
+    $('muscle-reward').textContent =
+      rn || ('spell 0x' + st.reward_spell.toString(16).toUpperCase());
+
+    /* The contest layer: where the leg sits on the ladder and what the run
+     * has banked. */
+    const run = muscleR.contest ? muscleR.contest() : null;
+    if (run) {
+      $('muscle-round').textContent = run.round + 1;
+      $('muscle-length').textContent = run.length;
+      $('muscle-tally').textContent = run.tally;
+      $('muscle-coins').textContent = run.coins;
+    }
+
+    /* Verdict per phase transition (the canvas carries the banners; this is
+     * the accessible text mirror).
+     *
+     * A settled TURN gets a line but no screen: retail goes straight back to
+     * the command cluster between turns, so the panel never stops on
+     * `turn_over` and the mirror keys off the turn counter instead of the
+     * phase. Only a settled LEG raises a screen (the INTERVAL + tally hub). */
+    if (st.turn !== muscleLastTurn && st.turn > 0 && st.phase === 'select') {
+      verdict($('muscle-verdict'),
+        `Turn ${st.turn} settled — you took ${st.last_damage[0]}, ` +
+        `${st.names ? st.names[1] : 'the opponent'} took ${st.last_damage[1]}. ` +
+        `${st.hp_left}% of the opponent is left. Enter the next turn's commands.`, '');
+      muscleLastTurn = st.turn;
+      muscleLastPhase = st.phase;
+    } else if (st.phase !== muscleLastPhase) {
+      if (st.phase === 'select') verdict($('muscle-verdict'),
+        `Left = Attack (arrows enter directions), Down = Spirit, Space begins the turn. ` +
+        `Fight until one side drops — there is no turn limit.`, '');
+      else if (st.phase === 'won') verdict($('muscle-verdict'),
+        run
+          ? `Round cleared — ${run.tally} coins banked so far. ` +
+            `Space for round ${run.round + 1} of ${run.length}.`
+          : 'You win! Space for a rematch.', 'good');
+      else if (st.phase === 'lost') verdict($('muscle-verdict'),
+        'You lost — the run banks half of what it had. Space to start again.',
+        'bad');
+      muscleLastPhase = st.phase;
+    }
+  }
+
+  (function bindMuscle() {
+    const confirm = $('muscle-confirm');
+    if (confirm) confirm.addEventListener('click', () => { if (api) muscleConfirm(); });
+    const restart = $('muscle-restart');
+    if (restart) restart.addEventListener('click', () => { if (api) muscleReset(); });
+    /* Re-rolling the matchup restarts the contest with the new picks. */
+    for (const id of ['muscle-char', 'muscle-level', 'muscle-foe', 'muscle-course']) {
+      const el = $(id);
+      if (el) el.addEventListener('change', () => { if (api && muscleR) muscleReset(); });
+    }
+  })();
+
+  /* ---------------- disc load ---------------- */
+
+  async function loadDisc(f) {
+    if (!f) { statusEl.textContent = 'No disc loaded.'; return; }
+    const prog = LoadProgress.create(statusEl);
+    try {
+      const buf = await prog.read(f, `Reading ${f.name}`);
+      prog.indeterminate('Initialising the minigame engines…');
+      const mod = await LegaiaWasm.load();
+      if (typeof mod.LegaiaMinigames !== 'function') {
+        prog.fail('This build of the viewer has no minigame support.');
+        return;
+      }
+      api = new mod.LegaiaMinigames();
+      /* Adopt the engine's keyboard layout (`Mapping::web_default` through
+       * `pad_bindings_json`) - the free function lives on the module
+       * namespace, so this needs no runtime. Every control below is named as
+       * a pad *button* and resolved through this table, so a rebind reaches
+       * this page too. */
+      if (window.legaiaAdoptPadBindings) window.legaiaAdoptPadBindings(mod);
+      relabelControls();
+      prog.indeterminate('Decoding the minigame tables…');
+      await prog.paint();
+      const status = JSON.parse(api.load_disc(buf));
+      window.__mgStatus = status;
+
+      /* A game whose overlay didn't decode is disabled, not broken. */
+      const ok = { dance: status.dance.ok, baka: status.baka.ok, slot: status.slot.ok,
+                   fishing: status.fishing.ok, muscle: status.muscle.ok };
+      tabsEl.querySelectorAll('.mg-tab').forEach(b => {
+        b.disabled = !ok[b.dataset.game];
+        if (b.disabled) b.title = (status[b.dataset.game] || {}).why || 'table did not decode';
+      });
+      const firstOk = ['slot', 'dance', 'baka', 'fishing', 'muscle'].find(g => ok[g]);
+      if (!firstOk) {
+        prog.fail('None of the minigame overlays decoded from this image.');
+        return;
+      }
+
+      if (ok.dance) danceLoadArt();
+      if (ok.baka) bakaFillRoster();
+      if (ok.slot) { slotLoadArt(); slotLoadSfx(); slotReset(); }
+      if (ok.fishing) fishingLoad();
+      if (ok.muscle) muscleLoad();
+      /* Pre-mix the on-screen game's BGM now so the first spin / first
+       * fight starts its track without a render hitch. */
+      MgBgm.prerender(active);
+      /* The save bar harvests the portrait TIMs off the freshly-loaded disc. */
+      window.dispatchEvent(new CustomEvent('mg-disc-loaded'));
+      mainEl.style.display = '';
+      setTab(firstOk);
+      if (!raf) raf = requestAnimationFrame(loop);
+
+      const games = [
+        ok.dance ? `dance (${status.dance.rows}-lane step chart)` : null,
+        ok.baka  ? `Baka Fighter (${status.baka.fighters} fighters)` : null,
+        ok.slot  ? 'slot machine (10-symbol paytable)' : null,
+        ok.fishing ? `fishing (${status.fishing.species} species)` : null,
+        ok.muscle ? 'Muscle Dome (battle-engine arena)' : null,
+      ].filter(Boolean);
+      prog.done(`Ready - ${games.join(', ')}.`);
+      /* The progress bar fades out; leave the standing status behind it. */
+      statusEl.innerHTML = `Tables decoded from your disc: ${games.join(', ')}.`;
+    } catch (err) {
+      prog.fail(`Failed to decode: ${err.message || err}`);
+      console.error(err);
+    }
+  }
+
+  /* Headless-verification hooks (see the Playwright driver). */
+  window.__mgLoad    = loadDisc;
+  window.__mgSetTab  = setTab;
+  Object.defineProperty(window, '__mgApi', { get: () => api });
+  window.__mgDance   = { start: danceStart, press: dancePress,
+                         state: () => api && JSON.parse(api.dance_state_json()),
+                         chart: () => api && JSON.parse(api.dance_chart_json()),
+                         artReady: () => api && api.dance_art_ready(),
+                         renderer: () => danceR,
+                         widgets: () => api && JSON.parse(api.dance_widgets_json()),
+                         layout: () => api && JSON.parse(api.dance_layout_json()),
+                         sfx: () => api && JSON.parse(api.dance_sfx_json()),
+                         faces: () => api && JSON.parse(api.dance_face_meta_json()) };
+  window.__mgBaka    = { start: bakaStart, choose: bakaChoose,
+                         state: () => api && JSON.parse(api.baka_state_json()),
+                         roster: () => api && JSON.parse(api.baka_roster_json()),
+                         mode: () => bakaMode,
+                         pad: (button) => { bakaCabEdge |= BAKA_PACKED[button] || 0; },
+                         view: () => bakaView,
+                         cabinet: () => bakaCab,
+                         sfxLoad: bakaSfxLoad,
+                         sfx: (e) => bakaSfx(e),
+                         sfxReady: () => !!(window.MgSpu && api && api.minigame_audio_ready()) };
+  window.__mgSlot    = { reset: slotReset,
+                         press: slotPress,
+                         state: () => api && JSON.parse(api.slot_state_json()) };
+  window.__mgFishing = { load: fishingLoad, start: fishingStart,
+                         cast: fishingCastPress,
+                         hold: (m) => { fishHold = m; },
+                         press: (m) => { fishPressed |= (m >>> 0); },
+                         buy: fishingBuy,
+                         renderer: () => fishR,
+                         state: () => api && JSON.parse(api.fishing_pond_state_json()),
+                         hud: () => api && JSON.parse(api.fishing_pond_hud_json()),
+                         spawn: (v) => api && JSON.parse(api.fishing_spawn_json(v)),
+                         exchange: (v) => api && JSON.parse(api.fishing_exchange_json(v)),
+                         sceneInfo: () => api && JSON.parse(api.fishing_scene_info_json()),
+                         species: () => api && JSON.parse(api.fishing_species_json()) };
+  window.__mgMuscle  = { reset: muscleReset, commit: muscleCommit, confirm: muscleConfirm,
+                         sceneOk: () => !!(muscleR && muscleR.sceneOk()),
+                         arenaOk: () => !!(muscleR && muscleR.arenaOk()),
+                         arenaJson: () => (api && api.muscle_arena_json
+                           ? JSON.parse(api.muscle_arena_json()) : null),
+                         sfxJson: () => (api && api.muscle_sfx_json
+                           ? JSON.parse(api.muscle_sfx_json()) : null),
+                         start: () => api && api.muscle_start(),
+                         startVs: (c, l, m, s) => api && api.muscle_start_vs(c, l, m, s),
+                         endSelection: () => api && api.muscle_end_selection(),
+                         resolve: () => api && api.muscle_resolve(),
+                         nextTurn: () => api && api.muscle_next_turn(),
+                         state: () => api && JSON.parse(api.muscle_state_json()),
+                         log: () => api && JSON.parse(api.muscle_round_log_json()),
+                         roster: () => api && JSON.parse(api.muscle_roster_json()),
+                         renderer: () => muscleR,
+                         mode: () => muscleR && muscleR.mode(),
+                         selectSub: () => muscleR && muscleR.selectSub(),
+                         key: muscleKey,
+                         artsList: () => (api && api.muscle_arts_list_json
+                           ? JSON.parse(api.muscle_arts_list_json()) : null),
+                         hud: () => (api && api.muscle_hud_json
+                           ? JSON.parse(api.muscle_hud_json()) : null),
+                         /* The contest layer (the ladder above a leg). */
+                         contest: () => muscleR && muscleR.contest(),
+                         startContest: (c) => muscleR && muscleR.startContest(c),
+                         reportLeg: (surv, out, turns, hp, u, g) =>
+                           api && api.muscle_report_leg(surv, out, turns, hp, u, g),
+                         settleContest: (u, g, p) =>
+                           api && api.muscle_contest_settle(u, g, !!p),
+                         contestJson: (u, g) => (api && api.muscle_contest_json
+                           ? JSON.parse(api.muscle_contest_json(u, g)) : null),
+                         sceneOk: () => !!(muscleR && muscleR.sceneOk()) };
+
+  RomCache.attach(fileInput, { onLoad: loadDisc });
+})();
+</script>
+
+<script>
+/* ------------------------------------------------------------------
+ * The save bar (js/minigame-saves.js + js/legaia-saves.js).
+ *
+ * Always visible above the games: the browser's stored saves as
+ * retail-style memory-card tiles (SC-block icon + disc portraits +
+ * lead/level/gold/coins/location), with Load (import the save's casino
+ * coin bank into the session), Export (write the session balance back
+ * into the stored slot's bytes - the 4-byte coin bank at RAM
+ * 0x800845A4 inside the SC block), download and delete. The WASM save
+ * tools load lazily; no disc image is needed to manage saves.
+ * ------------------------------------------------------------------ */
+(function () {
+  if (window.MgSaveBar && window.LegaiaSaves) MgSaveBar.attach('mg-save-bar');
+})();
+</script>
+
+<script>
+/* ------------------------------------------------------------------
+ * Minigames page hydration (reference tables).
+ * Loads minigames.json (see site/_gen.py:build_gamedata_json) and
+ * renders four self-contained sections.
+ * ------------------------------------------------------------------ */
+(async function () {
+  let p = null;
+  try {
+    p = await fetch('minigames.json').then(r => r.json());
+  } catch (e) {
+    document.getElementById('sol-tower-floors').innerHTML =
+      '<p style="color:var(--text-dim)">Couldn\'t load minigames.json - re-run <code>python3 site/_gen.py</code>.</p>';
+    return;
+  }
+
+
+  /* ---- Sol Tower floors ---- */
+  const $floors = document.getElementById('sol-tower-floors');
+  if ($floors && p.sol_tower && p.sol_tower.floors) {
+    $floors.innerHTML = p.sol_tower.floors.map(f => {
+      const sections = (f.sections || []).map(s => {
+        const cost = s.cost_gold ? ` <span class="tile-tag">${s.cost_gold} G</span>` : '';
+        const note = s.notes ? `<div class="floor-note">${escapeHtml(s.notes)}</div>` : '';
+        return `<li><span class="floor-section">${escapeHtml(s.name)}</span>${cost}${note}</li>`;
+      }).join('');
+      return `
+        <article class="tile tile-has-scene">
+          <header class="tile-head">
+            <h3 class="tile-title">${escapeHtml(f.name)}</h3>
+          </header>
+          <ul class="floor-sections">${sections}</ul>
+        </article>`;
+    }).join('');
+  }
+
+  /* ---- Side-quest chains ---- */
+  const $sq = document.getElementById('sol-tower-side-quests');
+  if ($sq && p.sol_tower && p.sol_tower.side_quests) {
+    $sq.innerHTML = p.sol_tower.side_quests.map(q => {
+      const steps = (q.chain || []).map((s, i) =>
+        `<li><span class="step-num">${i + 1}</span><span>${escapeHtml(s)}</span></li>`
+      ).join('');
+      const itemRow = q.reward_item && q.reward_item.name && !q.reward_item.missing
+        ? `<div class="quest-reward"><span class="tile-key">Item</span><span><code>${escapeHtml(q.reward_item.key)}</code> &middot; ${escapeHtml(q.reward_item.name)}</span></div>`
+        : '';
+      const rewardLine = q.reward
+        ? `<div class="quest-reward"><span class="tile-key">Reward</span><span>${escapeHtml(q.reward)}</span></div>`
+        : '';
+      const notes = q.notes ? `<div class="quest-notes">${escapeHtml(q.notes)}</div>` : '';
+      return `
+        <section class="quest-card">
+          <header class="quest-head">
+            <h4>${escapeHtml(q.name)}</h4>
+          </header>
+          <ol class="quest-steps">${steps}</ol>
+          ${rewardLine}
+          ${itemRow}
+          ${notes}
+        </section>`;
+    }).join('');
+  }
+
+  /* ---- Slot machines ----
+   * Target the inner tables div, NOT the enclosing slot-machines section the
+   * TOC anchors at - writing innerHTML to the section would blow away its own
+   * heading and hint. */
+  const $slots = document.getElementById('slot-machine-tables');
+  if ($slots && p.slot_machines) {
+    $slots.innerHTML = p.slot_machines.map(s => {
+      const rows = s.prizes.map(pr => {
+        const kindCls = pr.item._kind ? `ship-item-${pr.item._kind}` : '';
+        const cost = pr.cost_coins != null ? `${pr.cost_coins.toLocaleString()} coins` : '-';
+        const effect = pr.item.effect ? `<div class="ship-effect">${escapeHtml(pr.item.effect)}</div>` : '';
+        const note = pr.notes ? `<div class="ship-note">${escapeHtml(pr.notes)}</div>` : '';
+        return `
+          <li class="ship-item ${kindCls}">
+            <span class="ship-kind">${escapeHtml((pr.item._kind || 'unknown').toUpperCase())}</span>
+            <div class="ship-info">
+              <span class="ship-name">${escapeHtml(pr.item.name || pr.item.key || 'unknown')}</span>
+              ${effect}${note}
+            </div>
+            <span class="ship-price">${cost}</span>
+          </li>`;
+      }).join('');
+      /* Sol's rows aren't technically a slot machine - they're the
+       * Muscle Dome counter. Distinguish so the heading doesn't
+       * contradict the section's hint. */
+      const heading = s.location === 'Sol'
+        ? 'Sol Tower (Muscle Dome prize counter)'
+        : `${s.location} slot machine`;
+      return `
+        <section class="prize-table">
+          <header class="prize-head">
+            <h3>${escapeHtml(heading)}</h3>
+            <span class="vendor-meta">${s.prizes.length} prize${s.prizes.length === 1 ? '' : 's'}</span>
+          </header>
+          <ul class="ship-list">${rows}</ul>
+        </section>`;
+    }).join('');
+  }
+
+  /* ---- Muscle Dome courses ----
+   * Each round is a clickable row that expands an inline detail panel
+   * with the enemy's full stats (HP / MP / ATK / UDF / LDF / INT / SPD /
+   * AGL / XP / G), drops, attacks, and wiki provenance link. Seru rounds
+   * render the level-appropriate stat block from `seru_level`.
+   */
+  const bosses = (p.bosses || {});
+
+  function statRow(label, value) {
+    if (value == null) return '';
+    return `<div class="stat-cell"><span class="stat-label">${label}</span><span class="stat-value">${value.toLocaleString()}</span></div>`;
+  }
+
+  function pickStatBlock(boss, level) {
+    if (boss.kind !== 'seru') return boss;
+    const levels = boss.seru_levels || [];
+    if (!levels.length) return boss;
+    const match = levels.find(l => l.level === (level || 1));
+    return match || levels[0];
+  }
+
+  function elementChip(elem) {
+    if (!elem) return '';
+    return `<span class="enemy-elem enemy-elem-${elem.toLowerCase()}">${escapeHtml(elem)}</span>`;
+  }
+
+  function dropLine(label, name, chance) {
+    if (!name) return '';
+    const pct = chance != null ? ` <span class="drop-chance">${chance}%</span>` : '';
+    return `<div class="drop-row"><span class="drop-key">${label}</span><span class="drop-value">${escapeHtml(name)}${pct}</span></div>`;
+  }
+
+  function bossDetail(boss, level) {
+    if (!boss) return '<div class="boss-missing">No stats recorded for this slot.</div>';
+    const stats = pickStatBlock(boss, level);
+    const lvLabel = boss.kind === 'seru' && stats.level
+      ? ` <span class="enemy-lv">Lv ${stats.level}</span>` : '';
+    const elem = boss.element || (boss.kind === 'seru' ? null : null);
+    const elemChips = []
+      .concat(elem ? [`<span class="enemy-elem enemy-elem-${elem.toLowerCase()}">${escapeHtml(elem)}</span>`] : [])
+      .concat((boss.strength || []).map(e => `<span class="enemy-elem enemy-elem-${e}" title="resistant">${escapeHtml(e)} +</span>`))
+      .concat((boss.weakness || []).map(e => `<span class="enemy-elem enemy-elem-${e}" title="weak">${escapeHtml(e)} −</span>`));
+    const attacks = (stats.attacks || boss.attacks || []);
+    const immune  = (boss.immune_to || []);
+    const wiki = boss.wiki_path
+      ? `<a class="boss-wiki" href="https://legaia.fandom.com/wiki/${encodeURI(boss.wiki_path)}" target="_blank" rel="noopener">wiki source &rarr;</a>` : '';
+    return `
+      <div class="boss-detail">
+        <header class="boss-head">
+          <h4>${escapeHtml(boss.name)}${lvLabel}</h4>
+          <div class="boss-tags">${elemChips.join('')}</div>
+        </header>
+        ${boss.romaji ? `<div class="boss-romaji">${escapeHtml(boss.romaji)}${boss.script ? ` &middot; <span class="boss-script">${escapeHtml(boss.script)}</span>` : ''}</div>` : ''}
+        <div class="stat-grid">
+          ${statRow('HP', stats.hp)}
+          ${statRow('MP', stats.mp)}
+          ${statRow('ATK', stats.atk)}
+          ${statRow('UDF', stats.udf)}
+          ${statRow('LDF', stats.ldf)}
+          ${statRow('INT', stats.intelligence)}
+          ${statRow('SPD', stats.spd)}
+          ${statRow('AGL', stats.agl)}
+          ${statRow('XP',  stats.exp)}
+          ${statRow('Gold', stats.gold)}
+        </div>
+        ${attacks.length ? `<div class="boss-attacks"><span class="boss-key">Attacks</span><span>${attacks.map(a => `<span class="atk-chip">${escapeHtml(a)}</span>`).join('')}</span></div>` : ''}
+        ${immune.length  ? `<div class="boss-immune"><span class="boss-key">Immune</span><span>${immune.map(i => `<span class="atk-chip atk-immune">${escapeHtml(i)}</span>`).join('')}</span></div>` : ''}
+        ${dropLine('Steal', stats.steal || boss.steal, stats.steal_chance != null ? stats.steal_chance : boss.steal_chance)}
+        ${dropLine('Drop',  stats.drop  || boss.drop,  stats.drop_chance  != null ? stats.drop_chance  : boss.drop_chance)}
+        ${stats.location || boss.location ? `<div class="drop-row"><span class="drop-key">Found</span><span>${escapeHtml(stats.location || boss.location)}</span></div>` : ''}
+        ${wiki}
+      </div>`;
+  }
+
+  /* Target the inner courses div, NOT the enclosing section the TOC anchors
+   * at - writing innerHTML to the section would destroy its own heading and
+   * the muscle-secrets div this file populates further down. */
+  const $md = document.getElementById('muscle-dome-courses');
+  if ($md && p.muscle_dome) {
+    $md.innerHTML = p.muscle_dome.map(c => {
+      const rows = (c.roster || []).map(r => {
+        const boss = bosses[r.boss_key] || null;
+        const displayName = boss
+          ? (boss.kind === 'seru' && r.seru_level && r.seru_level > 1 ? `${boss.name} Lv${r.seru_level}` : boss.name)
+          : r.boss_key;
+        const elem = boss && boss.element;
+        const tag = elem ? ` ${elementChip(elem)}` : '';
+        const kind = boss ? boss.kind : '';
+        return `
+          <li class="enemy-row enemy-row-${kind}" data-course="${escapeHtml(c.key)}" data-round="${r.round}" data-boss="${escapeHtml(r.boss_key)}" data-level="${r.seru_level || ''}">
+            <button class="enemy-toggle" type="button" aria-expanded="false">
+              <span class="enemy-no">${r.round}</span>
+              <span class="enemy-name">${escapeHtml(displayName)}</span>
+              ${tag}
+              <span class="enemy-caret" aria-hidden="true">&rsaquo;</span>
+            </button>
+            <div class="enemy-detail" hidden></div>
+          </li>`;
+      }).join('');
+      const restrictions = (c.restrictions || []).map(r => `<span class="tile-tag tile-tag-restrict">${escapeHtml(r)}</span>`).join('');
+      const allowed      = (c.allowed || []).map(a => `<span class="tile-tag">${escapeHtml(a)}</span>`).join('');
+      const firstClear = c.reward_first_clear
+        ? `<div class="first-clear">
+             <strong>First clear:</strong>
+             <code>${escapeHtml(c.reward_first_clear)}</code>
+             ${c.reward_first_clear_item && c.reward_first_clear_item.name ? `&middot; ${escapeHtml(c.reward_first_clear_item.name)}` : ''}
+             ${c.reward_first_clear_requires ? `<div class="hint">${escapeHtml(c.reward_first_clear_requires)}</div>` : ''}
+           </div>`
+        : '';
+      return `
+        <article class="course-card course-${escapeHtml(c.key)}">
+          <header class="course-head">
+            <h3>${escapeHtml(c.name)}</h3>
+            <div class="course-meta">
+              <span class="tile-tag">${c.entry_fee} coin entry</span>
+              <span class="tile-tag tile-tag-reward">${c.reward_coins.toLocaleString()} coin reward</span>
+            </div>
+          </header>
+          <div class="course-rules">
+            ${restrictions}${allowed}
+          </div>
+          <ol class="course-enemies">${rows}</ol>
+          ${firstClear}
+        </article>`;
+    }).join('');
+
+    // Wire up click-to-expand: lazily populate the detail panel only when
+    // the row is first opened so a course with 13 rows doesn't pay the cost
+    // up front for entries the user never inspects.
+    $md.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('.enemy-toggle');
+      if (!btn) return;
+      const row = btn.parentElement;
+      const detail = row.querySelector('.enemy-detail');
+      const wasOpen = btn.getAttribute('aria-expanded') === 'true';
+      btn.setAttribute('aria-expanded', wasOpen ? 'false' : 'true');
+      if (wasOpen) {
+        detail.hidden = true;
+        return;
+      }
+      if (!detail.dataset.loaded) {
+        const boss  = bosses[row.dataset.boss] || null;
+        const level = row.dataset.level ? parseInt(row.dataset.level, 10) : null;
+        detail.innerHTML = bossDetail(boss, level);
+        detail.dataset.loaded = '1';
+      }
+      detail.hidden = false;
+    });
+  }
+
+  /* ---- Muscle Paradise secrets ---- */
+  const $secrets = document.getElementById('muscle-secrets');
+  if ($secrets && p.secrets) {
+    $secrets.innerHTML = p.secrets.map(s => {
+      const item = s.reward_item && !s.reward_item.missing
+        ? `<div class="quest-reward"><span class="tile-key">Reward</span><span>${escapeHtml(s.reward_item.name || s.reward_item.key)}</span></div>`
+        : '';
+      return `
+        <section class="quest-card">
+          <header class="quest-head"><h4>${escapeHtml(s.name)}</h4></header>
+          <div class="quest-trigger"><span class="tile-key">Trigger</span><span>${escapeHtml(s.trigger || '')}</span></div>
+          ${item}
+          ${s.notes ? `<div class="quest-notes">${escapeHtml(s.notes)}</div>` : ''}
+        </section>`;
+    }).join('');
+  }
+
+  /* ---- Baka Fighter ---- */
+  const $bm = document.getElementById('baka-fighter-meta');
+  if ($bm && p.baka_fighter && p.baka_fighter.meta && p.baka_fighter.meta.reward_coins != null) {
+    const meta = p.baka_fighter.meta;
+    $bm.innerHTML = `
+      <div class="notice-title">Full clear pays ${meta.reward_coins.toLocaleString()} coins</div>
+      <div>${escapeHtml(meta.rules || '')}</div>`;
+  }
+  const $br = document.getElementById('baka-fighter-rounds');
+  if ($br && p.baka_fighter && p.baka_fighter.rounds) {
+    // Map data tokens (Square / X / O / Triangle) to sprite symbol ids.
+    // The data uses "Square" / "X" / "O" (no triangle so far); leave room
+    // for triangle in case a future round adds it.
+    const BTN_SYMBOL = {
+      square:   'btn-square',
+      x:        'btn-cross',
+      cross:    'btn-cross',
+      o:        'btn-circle',
+      circle:   'btn-circle',
+      triangle: 'btn-triangle',
+    };
+    function buttonIcon(token) {
+      const key = token.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const sym = BTN_SYMBOL[key];
+      if (!sym) return `<span class="btn">${escapeHtml(token)}</span>`;
+      return `<svg class="btn-icon" role="img" aria-label="${escapeHtml(token)}"><use href="#${sym}"/></svg>`;
+    }
+    /* .table-wrap by hand: layout.js wraps prose tables at layout time, which
+       is before this one exists. The button-icon column has a min-content
+       width no phone can give it, and an unwrapped table widens the document
+       rather than scrolling. */
+    $br.innerHTML = `
+      <div class="table-wrap">
+      <table class="baka-table">
+        <thead><tr><th>Round</th><th>Buttons</th><th>Notes</th></tr></thead>
+        <tbody>
+          ${p.baka_fighter.rounds.map(r => `
+            <tr>
+              <td class="baka-round">${r.round}</td>
+              <td class="baka-buttons">${r.buttons.map(buttonIcon).join('')}</td>
+              <td class="baka-notes">${r.notes ? escapeHtml(r.notes) : ''}</td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+      </div>`;
+  }
+})();
+</script>

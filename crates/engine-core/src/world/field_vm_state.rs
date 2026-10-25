@@ -1,0 +1,244 @@
+//! Field-VM execution state beyond the main context: per-record channels, helper contexts, spawn requests, the op-0x49 submode block / screen, eased moves and the entry / free-roam latches.
+//!
+//! One subsystem's state, held as a unit on the composite [`World`].
+//! Fields keep their retail provenance notes.
+
+/// Field-VM execution state beyond the main context: per-record channels, helper contexts, spawn requests, the op-0x49 submode block / screen, eased moves and the entry / free-roam latches.
+pub struct FieldVmState {
+    /// `_DAT_8007B868` - the dev/retail branch discriminator. **Retail is
+    /// zero**; a non-zero value is the dev build's "not an ordinary field
+    /// frame" state. Read by [`crate::world::World::man_load_actor_reset`] through
+    /// [`legaia_engine_field::field_submode::scene_actor_initial_state`], which forces the
+    /// spawned scene actor's state word to `1` when it is set. Mirrors of the
+    /// same word live on [`legaia_engine_scene::cd_dma`] and [`legaia_engine_scene::overlay_loader`]; this
+    /// is the field-side copy.
+    pub(crate) mode_flags: u32,
+    /// The op-`0x49` submode context block (`0x801F2734..`), in the order
+    /// [`legaia_engine_field::field_submode::SUBMODE_CONTEXT_SEEDS`] lists its ten words -
+    /// that const carries the offsets. Reseeded on every MAN load by
+    /// [`crate::world::World::man_load_actor_reset`]; word `0` is the submode state
+    /// ([`legaia_engine_field::field_submode::SUBMODE_STATE_OPEN`] once opened).
+    pub(crate) submode_context: [u32; 10],
+    /// `true` only while [`crate::world::World::pre_run_field_channel_prologues`] is
+    /// executing the scene-entry spawn-prologue slices. The field-VM host
+    /// reads it to give the prologue's `4C 51` NPC-run ops their load-time
+    /// semantics (an initial SEAT written through the channel ctx) without
+    /// touching the live free-roam / cutscene behaviour of the same op.
+    pub(crate) entry_prerun: bool,
+    /// `true` while an op-`4C C3` re-seat is re-running its target's spawn
+    /// section (retail `FUN_8003CF7C` inside the `*(_DAT_801C6EA4) + 8 = 1`
+    /// bracket at `0x801E2810..0x801E282C`). Guards a section that re-seats
+    /// itself from recursing.
+    pub(crate) respawn_rerun: bool,
+    /// Live eased-move records (field-VM op `0x43` sub-9 with a non-zero
+    /// tick count, retail template `0x801F2840` / tick `FUN_801DD4C4`), each
+    /// paired with the actor whose position triple it writes.
+    pub(crate) eased_moves: Vec<crate::world::FieldEasedMove>,
+    /// The op-`0x49` sub-screen the submode driver actor is running, if any.
+    /// See [`crate::field_submode_screen`]; ticked by
+    /// [`crate::world::World::tick_handler_actors`].
+    pub submode_screen: crate::field_submode_screen::SubmodeScreen,
+    /// Concurrent spawned-record contexts: partition-2 records spawned
+    /// mid-play (field-VM op-`0x44` outside the opening chain) that execute
+    /// as independent field-VM contexts, mirroring retail's per-record spawn
+    /// (`FUN_8003BDE0` installs `ctx[+0x90]`/`ctx[+0x9E]` and lets the
+    /// per-frame context sweep run it as a sibling). Unlike
+    /// [`crate::world::CutsceneState::timeline`] these never seize the camera or lock
+    /// player locomotion ([`crate::world::World::cutscene_timeline_active`] does not cover
+    /// them); only cutscene-class records - the opening chain and gated
+    /// walk-on beat records - install as the modal timeline. Installed by
+    /// [`crate::world::World::install_spawned_helper_record`], stepped per frame by
+    /// [`crate::world::World::step_helper_contexts`], bounded by
+    /// [`crate::world::SPAWNED_CONTEXT_SLOTS`] (retail's context table is a small fixed
+    /// actor-slot pool). A completed context is dropped the frame it ends.
+    pub helper_contexts: Vec<legaia_engine_field::cutscene_timeline::CutsceneTimeline>,
+    /// Set by [`crate::world::World::seed_free_roam_story_baseline`] for scene-picker /
+    /// `--scene` entries: the world was staged for a free-roam visit with no
+    /// story behind it, so the BGM host arm drops entry-window pauses (their
+    /// authored repair - the opening records' sub-9 restarts - never runs
+    /// here). The new-game / opening chain leaves this `false`.
+    pub free_roam_staging: bool,
+    /// [`legaia_engine_vm::frame_clock::FrameClock::display_frames`] at the most recent free-roam staging / scene
+    /// entry - the base of the entry window the pause-drop measures against.
+    pub free_roam_entry_frame: u64,
+    /// Per-actor field-VM channels: one spawned context per MAN partition-1
+    /// placement record, mirroring the retail per-record spawn
+    /// (`FUN_8003A1E4`). Spawned alongside a cutscene timeline
+    /// ([`crate::world::World::install_cutscene_timeline_record`]) so the timeline's
+    /// cross-context pokes (flag writes, animate cues, moves) land on real
+    /// per-actor contexts - the opening prologue's vignette mechanism.
+    /// Their own scripts run only in the load-frame spawn pre-run
+    /// ([`crate::world::World::pre_run_field_channel_prologues`]); a touch
+    /// resumes one as the interaction timeline.
+    pub channels: Vec<legaia_engine_field::field_channels::FieldChannel>,
+    /// A copy of [`Self::channels`] taken when a stepping pass moves the live
+    /// vector out (`std::mem::take` in the channel and spawned-record
+    /// steppers), so a host hook that resolves a cross-context id while a
+    /// channel is executing - `FUN_8003C83C`'s actor-list walk, which in
+    /// retail always sees every actor - still finds the other channels.
+    /// Empty outside a stepping pass. Read it through
+    /// [`crate::world::World::channel_view`], never directly.
+    pub stepping_view: Vec<legaia_engine_field::field_channels::FieldChannel>,
+    /// The MAN payload the channels' bytecode slices from (each channel's
+    /// buffer base is its `record_offset` into this).
+    pub channels_man: Option<std::sync::Arc<Vec<u8>>>,
+    /// Placement index of the channel context currently executing (its own
+    /// spawn pre-run slice, or the target of a
+    /// cross-context poke from the cutscene timeline), so field-VM host hooks
+    /// (animate, move) can attribute the side-effect to that placement's NPC.
+    /// `None` outside a channel-targeted step.
+    pub executing_channel: Option<u8>,
+    /// The flat MAN record of the `.MAP` object-bind context currently
+    /// executing (its bind-time prologue, or the target of a cross-context
+    /// poke) - the object twin of [`Self::executing_channel`], which never
+    /// names an object bind. `None` outside such a step.
+    pub(crate) executing_object: Option<u16>,
+    /// Placement indices whose context a cross-context `CFLAG_SET` bit 8
+    /// (`B1 <id> 08`, `+0x10 |= 0x100`) engaged: retail's per-actor tick
+    /// `FUN_8003BC08` runs an engaged context through `FUN_80039B7C` from
+    /// its own parked PC on the next frame (`0x8003BD10..0x8003BD38`). The
+    /// engine plays that interaction as the touch-resumed timeline
+    /// ([`crate::world::World::drain_placement_engagements`]).
+    pub(crate) pending_engagements: Vec<usize>,
+    /// `true` while [`crate::world::World::run_spawned_record_slice`] is stepping a spawned
+    /// partition-2 record context (the modal cutscene timeline or a
+    /// concurrent helper context). Host hooks use it to distinguish a
+    /// spawned record's cross-context channel poke (seat the target exactly -
+    /// the retail run settles on the op target) from the live channel
+    /// stepper's own-script op (glide).
+    pub in_spawned_record_slice: bool,
+    /// Actors another spawned-record context holds in an in-place park
+    /// while the one being stepped runs: a walk-to-tile, rotate or player
+    /// glide leg (`None` = the player, `Some(slot)` = an NPC placement).
+    /// Retail's park leaves the target's halt bit `0x400` set until the walk
+    /// kernel lands it, and the dispatcher refuses every cross-context op
+    /// aimed at a halted target (`0x801DE90C..0x801DE944`), so the second
+    /// context waits at its op. Written by
+    /// [`crate::world::World::step_cutscene_timeline`] and
+    /// [`crate::world::World::step_helper_contexts`] before each slice.
+    pub(crate) halted_elsewhere: Vec<Option<u8>>,
+    /// Claim counter for the one shared script dialog box: each spawned
+    /// record context that reaches a text segment stamps the next value into
+    /// its [`legaia_engine_field::cutscene_timeline::CutsceneTimeline::dialog_claim`], and
+    /// the lowest stamp among the helper contexts holding text owns the box
+    /// (retail's runner claims it first come, first served).
+    pub(crate) dialog_claims: u64,
+    /// The scene's `.MAP` object script binds
+    /// (`(flat_record_index, contact_centre)`, retail `FUN_8003A55C`),
+    /// stored at scene entry so a cutscene-timeline install that has to
+    /// respawn the channel set can re-append the object-bind channels
+    /// ([`legaia_engine_field::field_channels::spawn_object_channels`]).
+    pub(crate) object_channel_binds: Vec<(usize, (i16, i16))>,
+    /// Bind-time rotation of each object-bind context, by flat record
+    /// ([`legaia_engine_field::man_field_scripts::object_script_bind_rots`]): the `.MAP`
+    /// angles `FUN_8003A55C` seeds the actor's `+0x24 / +0x26 / +0x28` with.
+    /// [`crate::world::World::object_draw_turns`] measures a script's turn
+    /// against it.
+    pub(crate) object_channel_rots: std::collections::HashMap<usize, [u16; 3]>,
+    /// Bind-time Y of each object-bind context, by flat record
+    /// ([`legaia_engine_field::man_field_scripts::object_script_bind_heights`]):
+    /// the `ladder[nibble] + y_off` `FUN_8003A55C` seats the actor's `+0x16`
+    /// at. [`crate::world::World::object_draw_displacements`] measures a
+    /// script's height write against it.
+    pub(crate) object_channel_heights: std::collections::HashMap<usize, i16>,
+    /// Live op-`4C 42` `+0x8E` ramps on object-bind actors
+    /// ([`legaia_engine_field::object_tint::ObjectSlotRamp`]), stepped by the per-actor tick.
+    pub object_slot_ramps: Vec<legaia_engine_field::object_tint::ObjectSlotRamp>,
+    /// In-flight compass walks (`37` / `41`) on object-bind actors, by the
+    /// context's script id: the leg a bind-time prologue parks on its own
+    /// actor, stepped by the per-actor tick
+    /// ([`crate::world::World::tick_object_actor_heights`]) until it lands.
+    // REF: FUN_8003BC08, FUN_8003774C (the 0x37 / 0x41 arm)
+    pub(crate) object_glide_legs:
+        std::collections::BTreeMap<u16, legaia_engine_field::object_tint::ObjectGlideLeg>,
+    /// Op-`4C 81` draw tints on the player, field NPCs and objects another
+    /// script tinted ([`legaia_engine_field::object_tint::ActorTint`]), stepped by the per-actor
+    /// tick. Scene-scoped: retail re-spawns every actor on a scene load.
+    pub actor_tints: std::collections::HashMap<
+        legaia_engine_field::object_tint::ActorTintKey,
+        legaia_engine_field::object_tint::ActorTint,
+    >,
+    /// Pending field-VM op-`0x44` SPAWN_RECORD requests: the GLOBAL record
+    /// indices whose partition-2 records should spawn as new contexts.
+    /// Recorded by the host hook (the VM borrow precludes resolving the MAN
+    /// there); drained FIFO by `SceneHost::tick`, which re-bases each into
+    /// partition 2 (`global - N0 - N1`, retail `FUN_8003BDE0`) and installs
+    /// the record - as the modal cutscene timeline during the opening chain,
+    /// as a concurrent [`crate::world::FieldVmState::helper_contexts`] entry otherwise - when its
+    /// C1/C2 story-flag gates pass. A queue (bounded by
+    /// [`crate::world::SPAWNED_CONTEXT_SLOTS`]) so a second spawn issued while another
+    /// record executes is not dropped.
+    pub pending_record_spawns: Vec<u8>,
+    /// `true` while the scene system script (ctx `0xFB`) is inside a pass:
+    /// set when a slice starts, cleared when a slice ends on an executed
+    /// `0x21`. A fresh install starts open (`FUN_8003AB2C` runs the first
+    /// pass in the load frame). The entity tick that drives the system
+    /// script, `FUN_801DA51C`, continues an open pass unconditionally
+    /// (`0x801DA78C`) but starts a new one only while the player's
+    /// `+0x10 & 0x80000` is down (`0x801DA794..0x801DA7AC`) - see
+    /// [`crate::world::World::step_field_frame_slice`].
+    // REF: FUN_801DA51C
+    pub system_pass_open: bool,
+    /// The script-counter **slot table** at `0x801C6460` (signed halfwords).
+    ///
+    /// Written by field-VM `4C CA` (set), `4C CB` (add) and `4C CC`
+    /// (subtract), the last two substituting the frame tick `_DAT_1F800393`
+    /// for a `0xFFFF` literal (`0x801E2930..0x801E29DC`); read by op `0x4E`
+    /// sub-ops `5..=8` (`0x801E0B0C`, slots `0..=3`) and by the dialog
+    /// renderer's number escape (`0x80036A7C`). Scripts build timers and
+    /// counters out of it - `tunnelc`'s hammer tremor cycles slot `1`.
+    ///
+    /// Indexed by the op's raw slot byte, so it spans all 256 values; the
+    /// shipped scripts use the low few. Nothing in retail clears it: a
+    /// reference sweep finds only the VM arms above, the number escape, a
+    /// debug print in the field overlay and the dance overlay's results
+    /// copy. It therefore survives scene loads, and the engine keeps it on
+    /// the world for the session.
+    pub slot_table: [i16; 256],
+    /// The player object's `+0x42` (the object-effect gate), which
+    /// `CC F8 C2 <b>` writes through [`super::vm_hosts`]' player routing -
+    /// the player is no placement channel, so it needs its own home.
+    /// Cleared on scene entry with the actor tints.
+    pub player_field_42: u16,
+}
+
+impl FieldVmState {
+    pub fn new() -> Self {
+        Self {
+            mode_flags: 0,
+            submode_context: [0; 10],
+            entry_prerun: false,
+            respawn_rerun: false,
+            eased_moves: Vec::new(),
+            submode_screen: crate::field_submode_screen::SubmodeScreen::default(),
+            helper_contexts: Vec::new(),
+            free_roam_staging: false,
+            free_roam_entry_frame: 0,
+            channels: Vec::new(),
+            stepping_view: Vec::new(),
+            channels_man: None,
+            executing_channel: None,
+            executing_object: None,
+            pending_engagements: Vec::new(),
+            in_spawned_record_slice: false,
+            halted_elsewhere: Vec::new(),
+            dialog_claims: 0,
+            object_channel_binds: Vec::new(),
+            object_channel_rots: Default::default(),
+            object_channel_heights: Default::default(),
+            object_slot_ramps: Vec::new(),
+            object_glide_legs: Default::default(),
+            actor_tints: std::collections::HashMap::new(),
+            pending_record_spawns: Vec::new(),
+            system_pass_open: true,
+            slot_table: [0; 256],
+            player_field_42: 0,
+        }
+    }
+}
+
+impl Default for FieldVmState {
+    fn default() -> Self {
+        Self::new()
+    }
+}

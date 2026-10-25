@@ -1,0 +1,167 @@
+//! One-off, non-randomized PS1 disc patch:
+//! Vahn enters his house in Rim Elm (town01 P0[29]), then warps to conc.
+//! Uses the original conc2 -> conc landing tuple (191, 0x1E, 0x40, 0x00).
+//! Place in crates/patcher/src/bin/conkram_door.rs of legend-of-legaia-re.
+//!
+//! Build/run from workspace root with:
+//!   cargo +stable-x86_64-pc-windows-gnu run --release -p legaia-patcher --bin conkram_door
+
+use std::{fs, path::Path};
+
+use anyhow::{Context, Result, bail, ensure};
+use legaia_disc_patch::{compress_within, disc::DiscPatcher};
+use legaia_patcher::door::SceneDoors;
+use legaia_party_swap::fieldize;
+use legaia_actor_formats::player_anm;
+use legaia_scene_formats::{man_edit::{self, Insertion}, scene_asset_table};
+
+const ORIGINAL: &str = r"D:\Emulators\Games\Legend of Legaia\LegendOfLegaia.img";
+const OUTPUT: &str = r"D:\AstraRimElmProject\Legaia_Conkram_Test.img";
+const STAGING: &str = r"D:\AstraRimElmProject\Legaia_Conkram_Test.next.img";
+const PRE_CORT_BACKUP: &str = r"D:\AstraRimElmProject\Backups\Conkram_PreCort.img";
+const CORT_SCENE_ENTRY: usize = 624;
+const CORT_MODEL: usize = 159;
+const CORT_ANM_RECORD: usize = 30;
+const VAHN_FIELD_ENTRY: usize = fieldize::PROT_ENTRY_INDEX;
+const RIM_ELM_ENTRY: usize = 4; // PROT[4]: town01 (retail NA disc)
+const HOUSE_WARP_PC: usize = 0x093B; // decoded MAN, P0[29]
+const ORIGINAL_WARP: [u8; 4] = [0xA3, 0xF8, 0x61, 0x0A];
+// Exact existing conc2 -> conc destination; don't convert into Blender coords.
+const CONKRAM_SCENE_CHANGE: [u8; 11] = [
+    0x3F, 0xBF, 0x00, // scene-change opcode, destination scene id 191 (LE i16)
+    0x04, b'c', b'o', b'n', b'c', // name length 4, scene name
+    0x1E, 0x40, 0x00, // entry X, entry Z, facing
+];
+
+fn main() -> Result<()> {
+    ensure!(Path::new(ORIGINAL).exists(), "Original image not found: {ORIGINAL}");
+    ensure!(!Path::new(STAGING).exists(),
+        "Staging output already exists: {STAGING}; move or delete it before rerunning");
+
+    let image = fs::read(ORIGINAL).with_context(|| format!("read {ORIGINAL}"))?;
+    let mut disc = DiscPatcher::open(image).context("open raw 2352-byte-sector PS1 disc")?;
+    let entry = disc.read_entry_footprint(RIM_ELM_ENTRY).context("read town01 bundle")?;
+    let scene = SceneDoors::locate(&entry, RIM_ELM_ENTRY)
+        .context("find and decompress town01 MAN")?;
+
+    // Fail closed if the user's revision differs from the inspected retail scene.
+    ensure!(
+        scene.decoded.get(HOUSE_WARP_PC..HOUSE_WARP_PC + 4) == Some(ORIGINAL_WARP.as_slice()),
+        "Unexpected bytes at town01 MAN 0x093B; refusing to patch unknown revision"
+    );
+
+    // The old MOVE_TO uses four bytes. Grow its record by seven bytes at the
+    // next instruction boundary; the repo's MAN relocation engine adjusts
+    // offsets and all crossing relative branches automatically.
+    let mut modified = man_edit::apply_insertions(&scene.decoded, &[Insertion {
+        offset: HOUSE_WARP_PC + ORIGINAL_WARP.len(),
+        bytes: CONKRAM_SCENE_CHANGE[4..].to_vec(),
+    }]).context("relocate MAN script and its jump/record offsets")?;
+    modified[HOUSE_WARP_PC..HOUSE_WARP_PC + 4]
+        .copy_from_slice(&CONKRAM_SCENE_CHANGE[..4]);
+
+    ensure!(
+        man_edit::validate(&modified, &[(HOUSE_WARP_PC, b"conc")]),
+        "Modified MAN fails scene-change validation"
+    );
+    ensure!(
+        modified.len() == scene.decoded.len() + 7,
+        "Unexpected MAN size after scripted warp insertion"
+    );
+
+    let Some(compressed) = compress_within(&modified, scene.compressed_budget) else {
+        bail!(
+            "Modified MAN does not fit its existing compressed slot (budget {} bytes). \
+             Original disc unchanged; next step is disc relayout rather than raw hex editing.",
+            scene.compressed_budget
+        );
+    };
+
+    // Maintain the scene-bundle descriptor and its total decoded-size header.
+    let table = scene_asset_table::detect(&entry).context("town01 asset descriptor table")?;
+    let old_total = u32::from_le_bytes(entry[4..8].try_into()?);
+    ensure!(
+        old_total == table.descriptor_size_sum(),
+        "Scene bundle decompressed-size header is inconsistent; refusing to patch"
+    );
+    let new_word = scene_asset_table::encode_size_word(0x03, modified.len() as u32);
+    disc.patch_prot_entry(RIM_ELM_ENTRY, scene.man_offset as u64, &compressed)
+        .context("write recompressed town01 MAN to disc copy")?;
+    disc.patch_prot_entry(RIM_ELM_ENTRY, scene.man_descriptor_off as u64, &new_word.to_le_bytes())
+        .context("update MAN decompressed-size descriptor")?;
+    disc.patch_prot_entry(RIM_ELM_ENTRY, 4, &(old_total + 7).to_le_bytes())
+        .context("update bundle total decompressed size")?;
+
+    // Verify from the edited disc representation before writing the image.
+    let check_entry = disc.read_entry_footprint(RIM_ELM_ENTRY)?;
+    let check_scene = SceneDoors::locate(&check_entry, RIM_ELM_ENTRY)
+        .context("read back patched town01 MAN")?;
+    ensure!(
+        man_edit::validate(&check_scene.decoded, &[(HOUSE_WARP_PC, b"conc")]),
+        "Patched image did not round-trip back to valid Conkram transition"
+    );
+    // Cort's original TMD is scene-pool member 159 (NOT 154).
+    // Matching 10-bone rest pose is scene ANM record 30 (anim_id 31).
+    let cort_scene = disc.read_entry_footprint(CORT_SCENE_ENTRY)
+        .context("read original conc2 scene PROT 624")?;
+    let meshes = scene_asset_table::mesh_pool(&cort_scene);
+    let tmd_bytes = &meshes.get(CORT_MODEL)
+        .context("conc2 does not contain Cort scene pool member 159")?.bytes;
+    let tmd = legaia_tmd::parse(tmd_bytes).context("parse Cort TMD")?;
+    ensure!(tmd.objects.len() == 10,
+        "Cort TMD unexpectedly has {} parts", tmd.objects.len());
+    let anm_bytes = scene_asset_table::decode_slot_by_type(
+        &cort_scene, player_anm::SCENE_ANM_TYPE_BYTE)
+        .context("conc2 has no scene ANM asset")??;
+    let anm = player_anm::parse(&anm_bytes).context("parse conc2 ANM bundle")?;
+    let clip = anm.record_to_monster_animation(CORT_ANM_RECORD)
+        .context("Cort animation record 30 is missing")?;
+    ensure!(clip.part_count == 10, "Cort ANM is not a ten-bone clip");
+    let rest = clip.frames.first().context("Cort ANM has no first frame")?;
+    let tims = scene_asset_table::decode_slot_by_type(&cort_scene, 1)
+        .context("conc2 has no type-1 TIM list; cannot extract Cort textures")??;
+
+    // Update Vahn's global field appearance only (PROT 874).
+    // Important: this FIRST build also shows Cort in Rim Elm; a later
+    // scene-aware loader hook will limit appearance by scene.
+    let field_original = disc.read_entry_footprint(VAHN_FIELD_ENTRY)
+        .context("read playable-character field container PROT 874")?;
+    let field_size = disc.read_entry(VAHN_FIELD_ENTRY)
+        .context("read PROT 874 fixed entry length")?.len();
+    let changed = fieldize::fieldize_vahn_from_scene_npc(
+        &field_original, field_size, tmd_bytes, rest, &tims)
+        .context("retarget Cort model 159 and original textures onto Vahn field slot")?;
+    ensure!(changed.entry.len() == field_size,
+        "field rebuild changed PROT 874 entry length");
+    disc.patch_prot_entry(VAHN_FIELD_ENTRY, 0, &changed.entry)
+        .context("write rebuilt Vahn field model to disc copy")?;
+    // Confirm the modified entry is still a parsable playable-character pack.
+    let patched_field = disc.read_entry_footprint(VAHN_FIELD_ENTRY)?;
+    legaia_actor_formats::character_pack::parse(&patched_field)
+        .context("round-trip parse patched playable field models")?;
+
+    // Never edit the original image. Stage a complete PS1 image first;
+    // save an independent backup before replacing the existing dev image.
+    fs::write(STAGING, disc.into_image())
+        .with_context(|| format!("write staging image {STAGING}"))?;
+    if Path::new(OUTPUT).exists() {
+        // Keep the very first verified Vahn-in-Conkram image forever; don't
+        // overwrite that backup during subsequent development rebuilds.
+        if !Path::new(PRE_CORT_BACKUP).exists() {
+            fs::copy(OUTPUT, PRE_CORT_BACKUP)
+                .with_context(|| format!("back up current development image to {PRE_CORT_BACKUP}"))?;
+        }
+        fs::remove_file(OUTPUT)
+            .context("close DuckStation; cannot replace an image it still has open")?;
+    }
+    fs::rename(STAGING, OUTPUT).context("activate staged build as development image")?;
+    println!("SUCCESS: Created updated development image: {OUTPUT}");
+    println!("Cort field model: scene conc2 / PROT 624 member 159, ANM 30; Vahn field slot modified (global).");
+    for note in &changed.warnings { println!("  NOTE: {note}"); }
+    println!("Other characters' field meshes and textures retained; battles unchanged.");
+
+    println!("town01 P0[29] 0x093B: Vahn house entrance -> conc scene (191), (0x1E, 0x40), facing 0x00");
+    println!("Test with DuckStation: load existing Rim Elm memory-card save, enter Vahn house.");
+    println!("NOTICE: Cort visual swap is experimental; verify textures and movement in DuckStation.");
+    Ok(())
+}

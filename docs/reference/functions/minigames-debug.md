@@ -1,0 +1,419 @@
+# Key functions: minigames + debug overlays
+
+Part of the [key function directory](../functions.md) - the conventions for reading these tables (bare hex = function entry, `0x`-prefixed = data / instruction, overlay-VA caveats) are on the [index page](../functions.md#how-to-use-this-page).
+
+## Minigames
+
+Each minigame's per-frame controller, with the full per-overlay function tables in its subsystem page. These overlays **VA-alias** - the four minigame-hub overlays (fishing / slot machine / Baka Fighter / dance) are distinct files that share a common library core, so the *same* address hosts a *different* function in each; always read the overlay-qualified dump (`overlay_<minigame>_<addr>.txt`), not the bare address. The "main entry" addresses some captures label per minigame (`801d63b0` / `801d2cc0` / `801d5ed0` / `801d2f38`) are the shared **textured-quad sprite/HUD emitter** the minigame reuses for every draw (hence their high caller counts), not the controller - the real per-frame drivers are below.
+
+| Address | Role |
+|---|---|
+| `801CEC94` | **Slot-machine init** (PROT 0975). Loads the cabinet bundle `FUN_8003EB98(0x4B2, *(0x8007B85C), 1)` at `0x801CEE2C`, dispatches all three PROT 1200 descriptors through `FUN_80020224(0)` at `0x801CEE44` (the second is the cabinet's untextured TMD, bound into the model bank), and spawns the cabinet actor with `FUN_80020DE0(0x801D3618, *(0x8007C34C))` at `0x801CEEA8` after writing model slot 0 into `template+4`. The cabinet is bound geometry drawn by the shared TMD renderer, which is why no slot function emits it. The session state it seeds - the LCG seed, the balance taken from the coin bank, the dev-launch fallback - is on the same routine's section in [`minigame-slot-machine.md`](../../subsystems/minigame-slot-machine.md#entry-init---fun_801cec94). |
+| `801CF3BC` | **Fishing** per-frame mode driver; `DAT_801d926c` state machine (rod-select / cast / reel / catch / exit). Case `0x14` is the cast: it seats the lure at `anchor.xz - polar(facing, 200)` (`li a1, 0xc8` at `0x801CFC50`, `subu` at `0x801CFCD4`), latches the point at `0x801D918C` and shifts it `<< 8` into the 24.8 accumulator the bite tick drifts. See [`minigame-fishing.md`](../../subsystems/minigame-fishing.md). `overlay_fishing_801cf3bc.txt`. |
+| `801CF070` | **Fishing bring-up** (PROT 0972, base + `0x858`, 844 B) - **arm 0** of the mode-24 OTHER init switch `FUN_80025980` (`jal` at SCUS `0x80025A80`). Arms audio (`FUN_80062004` with a pitch from `_DAT_8007B910`, `FUN_8005FB84` x3), streams three assets through `FUN_8001FC00`, calls `FUN_8003DE7C` six times, spawns the fishing actor from the template at `0x801D8FF4`, seeds the 16-entry floor-height LUT the terrain emitters index, and ends on a **rod-ownership scan** that rewrites the persistent rod index. [Detail](#801cf070). Port `legaia_engine_fishing::fishing::entry_rod_index`. `overlay_fishing_0972_801cf070.txt`. |
+| `801CF0D8` | **Slot machine** per-frame reel state machine (states 0..100; commits the overlay-local balance to coin bank `0x800845A4` on cash-out). The body is **3864 bytes** (`0x801CF0D8..0x801CFFF0`, frame `0x50`), not the 3060 the earlier capture dump reported - the last 804 bytes were carved off, which is what the byte worklist's `0x801CFF88` run was. See [`minigame-slot-machine.md`](../../subsystems/minigame-slot-machine.md). `overlay_slot_machine_0975_801cf0d8.txt`. |
+| `801D3380` | **Slot machine** payline draw. Emits the five paylines as `LINE_F2` prims (GP0 `0x43` - flat, semi-transparent) from the 5 x 16-byte geometry table `DAT_801d3680`, each endpoint projected on its own. Idle colour `0x808080`; the line whose index equals `DAT_801d3c8c` has only its three colour bytes overwritten with `(0xFF, 0xFF, 0x80)`, so a lit line keeps the `0x43` code. Ported as `legaia_engine_minigames::slot_machine::payline_prims`. See [`minigame-slot-machine.md`](../../subsystems/minigame-slot-machine.md#the-paylines-are-3d-lines---fun_801d3380). `overlay_slot_machine_801d3380.txt`. |
+| `801CF388` | **Baka Fighter** cabinet mode state machine - the overlay's top-level per-frame driver, a 37-way switch on `DAT_801DBF44`. See [`minigame-baka-fighter.md`](../../subsystems/minigame-baka-fighter.md#cabinet-state-machine-fun_801cf388). `overlay_baka_fighter_801cf388.txt`. |
+| `801D3468` | **Baka Fighter** round/match resolution state machine (rock-paper-scissors exchange of attack types). See [`minigame-baka-fighter.md`](../../subsystems/minigame-baka-fighter.md). `overlay_baka_fighter_801d3468.txt`. |
+| `801CF00C` | **Baka Fighter** scene-setup leaf (baka_fighter overlay occupant; VA-aliases per the note above). Runs the one-time graphics/scene init - display-env setup (`FUN_8001DAF8`), primitive-packet + OT allocation (`FUN_8001E3B8`), the streaming asset / SEQ loads (`FUN_8001FC00` / `FUN_8001E54C`), and the duel-actor spawns (`FUN_80020DE0`) - before handing to the round SM `FUN_801D3468`. See [`minigame-baka-fighter.md`](../../subsystems/minigame-baka-fighter.md). `overlay_baka_fighter_801cf00c.txt`. |
+| `801D3F44` | **Baka Fighter** combat tick. Calls the strike-keyframe lookup `FUN_801D6E5C(table, action, block[+0x90], actor[+0x68])` at `0x801D4334` unless the fighter's strike state `+0x0C` is `1`, caches a new hit at `+0x98` and sets the state to `1`; stores the cursor into `+0x90` (`0x801D47EC`) before the clip step. A special commit lowers `DAT_1F80037D` to `4` (`0x801D4568`) and spawns the afterimage. Port `engine-minigames::baka_fighter::StrikeClock`. See [`minigame-baka-fighter.md`](../../subsystems/minigame-baka-fighter.md#the-strike-clock). |
+| `801D6E5C` | **Baka Fighter** strike-keyframe lookup (`keyframe_in_range`): which sub-keyframe of the action record's `+0x26` column the cursor range covers. Callers: the combat tick at `0x801D4334` and the editor at `0x801D50D8`. Live on all three hosts through `StrikeClock`. |
+| `801D49E8` | **Baka Fighter** special-attack **afterimage** - not a mirrored sprite pass. Spawned on the special commit with `+0x74 = 0x81000000`, `+0x78 = 0x800` (`0x801D4588..0x801D4594`); `+0x78` is a depth-cue level, and it draws two ghosts three and six frames behind the thrower at cue `0x800` / `0xC00`, pushed `0x40` deeper. Port `baka_fighter_chrome::afterimage_pass`. See [`minigame-baka-fighter.md`](../../subsystems/minigame-baka-fighter.md#impact-cue-and-afterimage). |
+| `801D6310` | **Baka Fighter** round-start **cameo** (prototype record 3, `0x801D7624`): spawned only with Triangle held at round setup; scene model base `+ 3`, the PROT 1203 stage pack's fourth TMD (a ring girl), who walks in, strikes clip `0x1C` and walks out on `0x1D`, with a cell blit that winks at the pose. Port `baka_fighter_chrome::cameo_pose`, stepped by `BakaFight` as `CameoActor` on every host. See [`minigame-baka-fighter.md`](../../subsystems/minigame-baka-fighter.md#the-round-start-cameo). |
+| `801CF470` | **Dance** per-frame controller / beat-clock state machine (switch on `DAT_801d5334`). See [`minigame-dance.md`](../../subsystems/minigame-dance.md). `overlay_dance_801cf470.txt`. |
+| `801D3A2C` | **Dance** floor render cluster: per-frame draw pass `801D3A2C` (actor list + tile grid) + tile-grid blit `801D2A10` + two-layer step-marker lookup `801D3EC0`→`801D3F54`. Reuses the field scene buffer `_DAT_1f8003ec` (grid `+0x8000`, step layers `+0x10000`/`+0x12000`) + actor list `_DAT_8007c36c`. Live-pinned to the dance overlay via the resident mode-24 slot-A help text. See [`minigame-dance.md` § Dance-floor rendering](../../subsystems/minigame-dance.md#dance-floor-rendering). `overlay_dance_801d3a2c.txt`. |
+| `801D6028` | **Scene ground-height solver** - shared slot-A overlay-band code (byte-identical in the fishing / slot-machine / debug-menu images). Returns the world height under an actor off the scene floor buffer `_DAT_1F8003EC` and maintains the actor's `0x800000` off-floor flag. Bilinear corner blend, or a step-layer patch path via `801D79E0`. See [`minigame-fishing.md` § The scene floor buffer](../../subsystems/minigame-fishing.md#the-scene-floor-buffer). `overlay_fishing_801d6028.txt`. |
+| `801D6BBC` | **Scene floor pass** - the shared-band sibling of `801D3A2C`: same cell walk, same tile-actor spawn, different overlay-local globals, and it opens with a bounds debug print. Not the field-VM tile board. `overlay_fishing_801d6bbc.txt`. |
+| `801CEF54` | **Dance init entry** (PROT 0980, 1308 B) - **arm 6** of the mode-24 OTHER-game init switch `FUN_80025980` (`jal 0x801cef54` at SCUS `0x80025AE0`, jump table `0x80010AE4`, 7 arms; see [`boot.md`](../../subsystems/boot.md)). The seven arms are the seven minigame overlays' init entries, which is what pins each overlay's identity from SCUS rather than from a label. Sets the display environment, loads the venue's field file at index `0x4CC`, spawns the floor, arms audio, and calls the face-stamp rig selector `FUN_801D03C4` five times before the beat SM `FUN_801CF470` takes over. Port `legaia_engine_minigames::dance::dance_scene_entry`, the inverse of the teardown `FUN_801D414C`; live through `dance_venue`. `overlay_dance_0980_801cef54.txt`. |
+| `801D03C4` | **Dance** dancer face stamp (PROT 0980, **636 B**; the 500-byte dump was a short read, and `0x801D05B8` is not an entry at all - it is a head *interior* to this body). Bounds its rig id with `sltiu s0, 5` at `0x801D0444` over four rigged arms, each doing two `FUN_80058490` (`MoveImage`) blits - an eye cell and a mouth cell - inside that dancer's VRAM strip. Nine in-image callers, five of them from the bring-up above. Per-rig strips, frame tables and cell sizes are tabulated in [`minigame-dance.md`](../../subsystems/minigame-dance.md#the-dancer-face-stamp-fun_801d03c4). `overlay_dance_0980_801d03c4.txt`. |
+| `801D0640` | **Dance** step-marker **mesh flipbook** (PROT 0980, 272 B). `(actor)`. Counts `actor+0x54` down by the frame delta `DAT_1F800393`; on expiry it reads a `[mesh, duration]` halfword pair from the table at `0x801D44CC` - 128-byte rows selected by `actor+0x50`, cursor `actor+0x9C` - stages the mesh through `FUN_80024E08(actor, mesh + _DAT_8007B6F8)`, latches the duration into `+0x54`, steps the cursor by 2 halfwords, and wraps to 0 when the next entry's first halfword reads negative. Then advances the move buffer with `FUN_800204F8` when `+0x5C > 0` or `actor+0x10` carries flag `0x1000`. Port `legaia_engine_field::dance_marker::step_marker`. See [the flipbook detail below](#801d0640-is-a-mesh-flipbook-on-the-marker-tiles). `overlay_dance_0980_801d0640.txt`. |
+| `801D32F8` | **Dance** groove-gauge routine (PROT 0980, 1412 B): reads the gauge word `DAT_801D544C`, scales it through the `0x10624DD3` reciprocal, and draws via the shared sprite emitter `FUN_801D2F38`. Four in-image callers including the beat SM `FUN_801CF470`. **VA-aliases** the move-VM overlay-extension sub-handler `0x801D32F8` in PROT 0897 - different bytes, different routine. `overlay_dance_0980_801d32f8.txt`. |
+| `801D0750` | **Dance** setumei (how-to) tutorial script: the Disco King actor's per-frame state machine over `actor+0x9C`, a 19-slot jump table. See [`minigame-dance.md`](../../subsystems/minigame-dance.md#the-setumei-how-to-tutorial-script-fun_801d0750). `overlay_dance_801d0750.txt`. |
+| `801D0748` | The **battle-action overlay's round driver**, which is also the Muscle Dome's per-frame match controller - pad read, phase dispatch on the sub-state byte `_DAT_8007BD24[6]`, direction pick / commit / resolve. **Not a distinct overlay**: the `overlay_muscle_dome` / `overlay_magic_capture` / `overlay_magic_level_up` / `overlay_battle_action` / `overlay_0898` dumps are byte-identical across all 2781 instructions, and it owns no score loop (that is the arena hub's). See [`minigame-muscle-dome.md`](../../subsystems/minigame-muscle-dome.md) and [`battle.md`](../../subsystems/battle.md#battle-main-dispatcher-fun_801d0748). |
+| `801D56E4` | **2-D segment clipper** (fishing overlay 0972). Eight arms: all four scratchpad draw-context bounds (`0x1F800314 + 0x74 / +0x76 / +0x78 / +0x7A`) applied to both `(i16 x, i16 y)` endpoints in place. Port `engine-fishing::fishing_actors::clip_segment_2d`. `overlay_fishing_801d56e4.txt`. |
+| `801D5C2C` | **3-D segment transform + depth clip** (fishing overlay 0972). Pushes both endpoints through the GTE wrapper `FUN_8003D344` (`MVMVA`), rejects the segment when **both** transformed Z fall inside the near cutoff `_DAT_1F80037E` (zeroing both output pairs), otherwise writes the view-space coordinates back and clips against `0x1F800314 + 0x6A`. `overlay_fishing_801d5c2c.txt`. |
+| `801D26CC` | **Fishing bite tick** (fishing overlay 0972). Runs the bite ladder and two per-frame map reads of the lure's own point: the `+0x8000` cell halfword's `0x4000` water gate, which feeds the credit, and `FUN_801D7030`'s walk-grid probe, whose hit drifts the lure instead. The water class's other half, the per-cell weight, is the **modulus** of a random draw feeding the caught fish's size and render scale (`div s0, s4` at `0x801D3728`, stored at `0x801D3814`, scaled at `0x801D381C`) - it reaches neither the species roll nor the credit. Sole writer of the cast counter `_DAT_80084460`, at `0x801D296C` on the hook arm that raises cue `0x204`. See [`minigame-fishing.md`](../../subsystems/minigame-fishing.md). |
+| `801D7030` | **Walkability-grid wall probe, high nibble** (fishing overlay 0972). `(x, z) -> bool` against `*(_DAT_1F8003EC) + 0x4000` - the same per-scene grid `FUN_801CFE4C` reads (see [`field-locomotion.md`](../../subsystems/field-locomotion.md)), but taking the byte's **high** nibble, with asymmetric coordinate ladders. Leaf, no frame. Port `engine-fishing::fishing_actors::walk_grid_overhead`. Its one consumer is the bite tick `FUN_801D26CC` (`jal` at `0x801D2E10`), where a hit **drifts the lure** rather than gating water - the accumulator, the step and the sign rule are on that routine's own row below. `overlay_fishing_801d7030.txt`. |
+| `801D765C` | **Sub-cell separation of two tracked points** (fishing overlay 0972). No arguments; reads two `i16` pairs at `0x801D9184` (`+0` = x, `+4` = y) and `0x801D918C`, normalises the squared distance through `FUN_8005AF0C`, `>> 6` into 64-unit sub-cells, clamps negatives to zero. Port `engine-fishing::fishing_actors::tracked_point_separation`. `overlay_fishing_801d765c.txt`. |
+| `801D7BB8` | **Polar offset helper** - shared slot-A overlay-band code (byte-identical in the fishing / slot-machine / debug-menu images; the PROT 0897 dump at this VA is the empty-dump artifact, not a fourth copy). See [`minigame-fishing.md`](../../subsystems/minigame-fishing.md#the-shared-polar-offset-helper-fun_801d7bb8). `overlay_fishing_801d7bb8.txt`. |
+
+## Debug-menu overlay (PROT 0971, mode-0 CONFIG)
+
+The dev debug menu is the overlay mode 0 (CONFIG) loads (`FUN_80025C68`), resident at slot-A base `0x801CE818`. The generic-slot `overlay_0971_*` dumps are these same functions re-imported at `0x801C0000` (mis-based by `0xE818`) - read the `overlay_debug_menu_*` copy for correct VAs. The whole menu is retail-gated: each per-frame body early-returns unless the debug-enable flag is set.
+
+| Address | Role |
+|---|---|
+| `801CE97C` | **Debug-menu per-frame controller.** Runs a ~22-row cursor list (index `_DAT_8007B862`): pad edges move the cursor, adjust the selected row's value, or fire the row action - scene-load (`FUN_8001FC00` / `FUN_8001E54C`), SPU voice key-on/off (`FUN_80026478` / `FUN_800266E0`), sound stop-all (`FUN_80017910` + the `FUN_800653C8` voice loop). Draws labeled readouts through the debug string drawer `FUN_8001A068` and the digit drawer `FUN_8001ABC8`. `see ghidra/scripts/funcs/overlay_debug_menu_801ce97c.txt`. |
+| `801CF338` | **Debug TMD-viewer per-actor tick.** D-pad edits the viewed object's translate/rotate fields (`actor+0x14/+0x16/+0x18/+0x24/+0x26`), sums POLY/VERT counts over the object table at `actor+0x44`, prints the object readouts via `FUN_8001A068`, and cycles the TMD index `_DAT_8007B6E4`, reloading through `FUN_80024E08`. `see ghidra/scripts/funcs/overlay_debug_menu_801cf338.txt`. |
+| `801D0100` | **Sub-screen per-frame body**, and the owner of the `801D0230` bytes - see [below](#801d0100-sub-screen-body). |
+| `801D03B0` | **Sub-screen sway helper.** Leaf, no frame. Samples the shared sine table `*_DAT_8007B81C` at `angle`, `angle + 0x400` and `angle + 0x800`, scales each `>> 8` (round toward zero) and biases it by `-0xA`, writing the triple to the render scratch block `0x1F80035E/60/62` after clearing `0x1F80035C`; then advances the angle at `0x801D9118` by `DAT_1F800393 << 4`. Port `engine-fishing::fishing_chrome::sway_vector`. `see ghidra/scripts/funcs/overlay_fishing_801d03b0.txt`. |
+| `801CFE20` / `801CFE5C` | Two 15-instruction mode wrappers: `a0 == 0` runs the per-mode setup (`FUN_801D0100` / `FUN_801D0198`), otherwise they call into the `FUN_801D0100` body at `0x801D0230` and return bit 29 / bit 24 of its result. `see ghidra/scripts/funcs/overlay_debug_menu_801cfe20.txt`. |
+
+<a id="801d0100-sub-screen-body"></a>
+
+`0x801D0230` is **interior to `FUN_801D0100`**, not an entry. Disassembling PROT
+0972 at the slot-A base gives a 172-instruction body at `0x801D0100` spanning
+688 bytes - `0x801D0100..0x801D03B0` - which contains it; the dump that starts
+at `0x801D0230` opens `lw a0,-0x6F10(s0)` on a live `s0` with no prologue and
+closes by restoring `s0..s7`/`ra` from a `0x48`-byte frame it never builds.
+The body advances a fade timer by `DAT_1F800393`, emits a full-screen dim quad
+via `FUN_80024EE4`, draws sub-panels (`FUN_801D13F0` / `FUN_801D1580`), raises
+an SFX cue on a pad edge, and tails into `FUN_801D03B0`.
+
+The bytes also do not belong to the debug-menu overlay its dumps are labelled
+with: PROT 0971's own content stops at file `+0x1800`, i.e. VA `0x801D0018`,
+so everything the `overlay_debug_menu_*` dumps print above that address is
+PROT 0972 read through 0971's extraction footprint
+([`dump-corpus-integrity.md`](../../tooling/dump-corpus-integrity.md)).
+
+## Other-game minigame overlay (PROT 0977)
+
+Slot-A occupant of the mode-24 sub-id-5 door warp, true base `0x801CE818`. `other_game` is the **CDNAME block name**, not an identity: the module is the Muscle Dome **arena door/init** slot (dev module `other6`), pinned by its own monster-name roster and by the contest settlement `FUN_801D0F60`. The rows below are its HUD primitive layer. The `0x801Dxxxx`-named `overlay_0977_other_game_*` dumps are correctly based; the `0x801Cxxxx`-named ones are mis-imported at `0x801C0000` (add `0xE818` for the true VA, per the same anchor that fixes `801C2748` -> `801D0F60`).
+
+Ports: `legaia_engine_ui::muscle_dome_hud` (the two quad emitters + the decimal readout) and `legaia_engine_minigames::other_game_overlay` (the step scaler + the SFX cue). See [PROT 0977 HUD primitives](#prot-0977-hud-primitives).
+
+| Address | Role |
+|---|---|
+| `801D050C` | **Centred sprite-quad emitter** - a `POLY_GT4` packet from the scratchpad pool `0x1F800314+0x8C`, textured and Gouraud-shaded from the descriptor table at `0x801D170C` (stride `0x14`), centred on the argument point. [details](#prot-0977-hud-primitives). `see ghidra/scripts/funcs/overlay_0977_other_game_801d050c.txt`. |
+| `801D08EC` | **Corner-anchored sibling** of `801D050C`: same packet, but the argument point is the quad's top-left and the brightness argument is clamped to `0..=0xFF` first. [details](#prot-0977-hud-primitives). `see ghidra/scripts/funcs/overlay_0977_other_game_801d08ec.txt`. |
+| `801D1308` | **Decimal readout** - up to eight digits through `FUN_801D050C`, stepping the digit record's texture column per glyph. Negative values draw nothing. [details](#prot-0977-hud-primitives). `see ghidra/scripts/funcs/overlay_0977_other_game_801d1308.txt`. |
+| `801D042C` | **Course card** (PROT 0977). Six corner-anchored draws from placement records `5 + course` and `8`, the course word at `0x801D1A90` - a shadow, an under-layer and a face. The shadow and face packets are marked semi-transparent (`B - F` / `B + F`), but the GPU blends only STP texels and no hub packet subtracts: which of them blends is decided by the record's palette ([`ringside-still.md`](../../formats/ringside-still.md#which-hub-packets-blend)). Called by hub arms 4 and 5 (`0x801CFB78` / `0x801CFBBC`). Port `muscle_dome_hud::course_card_draws` ([`minigame-muscle-dome.md`](../../subsystems/minigame-muscle-dome.md)). |
+| `801D1610` | **Backdrop shade** (PROT 0977). A subtractive `POLY_G4` (draw-mode tpage `0x46`, ABR 2) whose level runs `0x64` down to `0`; one caller, `0x801D01AC`. All three hosts subtract it: the native sprite pass through an ABR-2 `OverlayBlendSpan`, the browser pages through `subtractShade`. |
+| `801D1288` | **Round-robin SFX cue** - one `FUN_80065034` voice-attr call per frame across voices `0x10..=0x13` (counter `DAT_801D1AE4 & 3`), at program `0` / tone `1` / note `0x3C`. Its last two arguments are `vol_l` / `vol_r`, halved out of the voice-volume config `_DAT_80084580`; the earlier "positioned from the party-block word" reading is falsified, see [`minigame-muscle-dome.md`](../../subsystems/minigame-muscle-dome.md#the-arenas-per-frame-voice-cue-fun_801d1288). Not a sprite emitter - `FUN_80065034` is the libsnd `SpuSetVoiceAttr` analogue. `see ghidra/scripts/funcs/overlay_0977_other_game_801d1288.txt`. |
+| `801D14B0` | **Step-size scaler** - a leaf: returns the argument unchanged while flag `DAT_801D1AB4` is set, else `arg/5` (`arg > 5`, via the `0x66666667` magic multiply), `1` (`arg < 3`), or `arg/2`. The **same routine is linked into PROT 0976 as `FUN_801D6710`** (the Baka tally drain), where only the gate global is relocated - `lui v0,0x801e; lw v0,-0x4100(v0)` reads `_DAT_801DBF00` there against this image's `_DAT_801D1AB4`, and **twenty-two of the twenty-four** instructions match one for one. A common-**prefix** byte compare reports **zero** bytes in common because the relocated `lui` is the first word, which measures where the compare starts rather than what the bodies share. `see ghidra/scripts/funcs/overlay_0977_other_game_801d14b0.txt`. |
+| `801CF074` (true VA; the `801c085c` dump is mis-based, `+0xE818`) | **Contest score-tally screen** - the six-row label + number readout, and the count-up that fills it. [details](#the-contest-score-tally-screen-fun_801cf074). Correctly based dump `overlay_arena_init_0977_801cf074.txt` (2044 B, taken from the static PROT 0977 image at `0x801CE818`); the older `see ghidra/scripts/funcs/overlay_0977_other_game_801c085c.txt` prints the same bytes at the wrong VA. |
+| `801CEA6C` | **Contest entry** - re-entered after every leg. Advances the mode-24 sub-id word `_DAT_8007BAC0` by one when it is already non-zero (`0x801CEC00`), decodes `(course, round)` out of its low byte into `DAT_801D1A90` / `DAT_801D1A94`, picks the opening course from story flags `0x536`/`0x537`/`0x538`, clamps the Master course's length against `0x378`/`0x382`/`0x471`, and routes the hub on `DAT_8007BD60 & 0x80` (the party-standing bit). [details](../../subsystems/minigame-muscle-dome.md#two-state-machines-not-one). |
+| `801D1184` | **Leg score rows** - the four count-up lanes a cleared leg is worth: `round*2`, `min(turns_taken, 8)` and `DAT_801D1A5C[min(outcome,3)]` (`= [8,12,4,2]`), each `× max_hp / 100` through the `0x51EB851F` reciprocal, plus the raw `(course, round)` score cell. The first three drain into the HP-restore accumulator `DAT_801D1AC8`, not into the tally. [details](../../subsystems/minigame-muscle-dome.md#what-a-cleared-leg-is-worth). |
+| `801D0ED8` | **Contest-start restore** - refills the fighter's HP/MP/SP to their maxima on the `0x80084140` window, and, only when `DAT_801D1A90 != 0` (`bnez` at `0x801D0EE8`), first zeroes the four equipment bytes `+0x75E`/`+0x75F`/`+0x760`/`+0x762`. So "no equipment" is an Expert/Master rule; the Beginner course keeps its gear. It runs **once per contest**, not once per leg ([details](#801d0ed8); write-up in [`minigame-muscle-dome.md`](../../subsystems/minigame-muscle-dome.md#the-contest-start-restore-fun_801d0ed8)). Port `legaia_engine_minigames::muscle_dome::apply_contest_start_restore`. |
+| `801D00F8` | **Arena backdrop**, `(brightness)` clamped into `0..=0xFF`. On `*(0x801D1AE0) == 0` it sets the OT depth `*(0x801D1AA8) = 0x3E8` and lays a 3x2 grid of record-2 quads through `FUN_801D08EC` at `(i<<7, j<<7)`, then the full-screen `POLY_G4` gradient `FUN_801D1610(0, 0, 0x140, 0xF0)`; otherwise it hand-writes two **`POLY_FT4`** packets (code `0x2C`; an earlier row said `POLY_GT4`) - the dome **panel still**, tpages `0x106` / `0x109`, `a0` broadcast into all three colour lanes as a fade, and the fork `*(0x801D1AE0)` raised by the arena init on **re-entry** only; ported as `engine-ui::ringside_backdrop` on both play hosts; geometry on [`ringside-still.md`](../../formats/ringside-still.md#what-draws-it). `overlay_0977_slotA_801d00f8.txt`. |
+| `801CF870` | **Contest hub** (and the intro / title / interval screens it draws) - dispatches the hub state `DAT_801D1A78` through the 51-entry jump table at `0x801CE990`; states `0`, `1`..`6`, `0x0A`..`0x0C`, `0x14`..`0x16` and `0x32` are real, the other 37 route to its default arm. State `0x0C` is the between-leg HP restore (`0x801CFE7C`), `0x32` settles. Every state but `0x32` tails through the `(course, round)` re-pack at `0x801D00B8`. Draws the "Welcome" strip (record 3) centred on `(160, 120)`, the course-title art (record 4) at `(160, 64)` under a shrinking scale ramp with a variant-2 shadow at `(168, 72)`, and the INTERVAL heading (record 16) at `(160, 32)`; tails into `FUN_801CF074` with its own fade counter. Extent `0x801CF870..0x801D00F8` (**2184 B**, not 1748). |
+| `801D02F0` | **ROUND banner** - record 0 centred on `(120, 120)` in both variants, then `DAT_801D1A94 + 1` as one digit at `x=240` or two at `x=240`/`x=264`, each in both variants. |
+| `801D15C8` | **ROUND digit glyph** - sets record **1**'s `u0` to `digit * 24` and delegates to `FUN_801D050C` with the index forced to 1. Not the decimal readout's record 9. |
+| `801D1510` | **Opponent installer** - indexes the course descriptor table `0x801D1A08` by `DAT_801D1A90`, its `+4` round pointer by `DAT_801D1A94`, `lbu`s the round record's `+4` monster id and `sb`s it into formation slot 0 at `0x8007BD0C` (clearing slots 1..3, and writing `0x14` to the stage word `0x8007B83C`). The arena's opponent, per (course, round). [details](../../subsystems/minigame-muscle-dome.md#course-ladder-the-opponent-per-course-round). |
+| `801D0CD4` | **Course menu** - walks all three descriptors, using each `+0x00` count as its loop bound and each round record's `+0x00` label pointer through the text drawer `0x80036888`; also clamps `DAT_801D1A94` against the count. Correctly based dump `overlay_arena_init_0977_801d0cd4.txt` (516 B). |
+
+The static PROT 0977 image also gives a correctly based dump of the corner-anchored quad emitter, `overlay_arena_init_0977_801d08ec.txt` (1000 B) - the same routine the `801D08EC` row above documents.
+
+### What the rest of PROT 0977's byte worklist turned out to be
+
+`0x801D1EF0..0x801D2018` **is** code, correcting an earlier claim on this page
+that it sits past the image's last `jr ra` and carries no function. The first
+half of that reading is true and the second does not follow: PROT 0977's extent
+is sector-granular, so the routine's body is cut at the image's last word and its
+`jr ra` is simply not in the file. It opens `lui s0, 0x8008;
+lhu v1, -0x46F0(s0)`, sets up a `0x300` / `0x1` pair on the stack and calls
+`0x8006BCB4`, `0x80026018` and `0x80024EE4` - the settlement screen's own
+bring-up, entered from the hub's `0x32` state.
+`overlay_arena_init_0977_801d1ef0.txt`.
+
+The image's other worklist runs are **interior slices of routines this page
+already documents**, not new entries, and each is now dumped at the correct base
+so the byte census stops re-proposing it:
+
+| Extent | What it is part of |
+|---|---|
+| `0x801CEAC4` | the contest entry `801CEA6C` - its audio (`FUN_80062004`) + actor-spawn (`FUN_80020DE0`) arm. The word above it is `j 0x801CEAD4`, jumping over it: it is the second arm of a two-way select, and its own second instruction reads `0x576(v1)` with `v1` set before the join |
+| `0x801CEF6C` | the bring-up ahead of the tally screen `801CF074`: three `FUN_8005FB84` audio arms, two `FUN_800266E0` / `FUN_80026520` pairs, one `FUN_8001FC00` stream. It loads `a1` for the `jal 0x8001E54C` at `0x801CEF70` whose `a0` was loaded at `0x801CEF68` - mid-argument-setup |
+| `0x801CFF44` | the contest hub `801CF870` - the arm that `j`s to the `(course, round)` re-pack at `0x801D0098` and calls `0x801D00F8`. Its two words are that `j` plus the delay-slot store of the counter incremented at `0x801CFF40` |
+| `0x801D0344` | the ROUND banner family - five `jal 0x801D15C8` digit draws bounded by `DAT_801D1A94`. The enclosing body is `FUN_801D02F0`, the ROUND banner itself; the word above `0x801D0344` is the delay slot of a `jal 0x801D050C` |
+
+No `jr ra` sits between the image head and either `0x801CEAC4` or `0x801CEF6C`, and
+the first one in the image is at `0x801CF06C` - so both are interior to the same
+body, the contest entry `FUN_801CEA6C`.
+
+### Baka Fighter's per-fighter move table (PROT 0976)
+
+| Address | Role |
+|---|---|
+| `801D553C` | **Move-table writer.** Walks the seventeen-word pointer table at `0x801DB8B8` (bound `sltiu v0,s7,0x11` at `0x801D5754`) and, per fighter, nine `0x60`-byte move records (`slti v0,s5,9` at `0x801D5710`), formatting each record's words and its `+0x1C` count of eight-byte points at `+0x20` into a text buffer handed to `FUN_8003E7F0`. Name tags at `0x801DB7A8`. One `jal`, at `0x801D1E90`. |
+| `801D57BC` | **Move-record reader.** `(fighter, move)` -> record `table[fighter] + move * 0x60`, point count `+0x1C` bounded below eight. One `jal`, at `0x801D527C`. The seventeen blocks tile `0x801D7E28..0x801DB788` exactly. |
+
+## Dev modules OTHER2 / OTHER3 (PROT 0973 / 0974)
+
+The mode-24 door-warp sub-id 1 and 2 slot-A occupants (base `0x801CE818`; see
+the sub-id table in [`script-vm.md`](../../subsystems/script-vm.md)). Both are
+primitive/clip test harnesses rather than game content - `OTHER2` heads with the
+string list `OTHER2 / CICLE1 / SPRITE1 / THERNDER1 / NORMAL / COLOR / NOT BACK
+CLIP / 3D CLIP / SPREAD / GT4 DIV16`. Neither had a dump attributable to its
+image before; both partition cleanly at their own base.
+
+| Address | Role |
+|---|---|
+| `801CE8A0` | **OTHER2 init** (PROT 0973, base + `0x88`, 76 B) - the documented sub-id-1 entry. Display env `FUN_8001DAF8(0x140)`, boot-mode init `FUN_8001DCF8(0xB)`, one actor spawn `FUN_80020DE0` from the in-image descriptor at `0x801CEFD0`, then the packet/OT allocator `FUN_8001E3B8(0x32000)`. Reached by `jal` from SCUS `0x80025A90` - **arm 1** of `FUN_80025980`, which is what pins the sub-id from SCUS rather than from the image label. The template's `+0x08` word is the tick `801CE8EC`. `overlay_other2_dev_0973_801ce8a0.txt`. |
+| `801CE8EC` | **OTHER2 per-frame tick** (620 B) - the `+0x08` tick word of the template `801CE8A0` spawns (the word at `0x801CEFD8`), also `jal`'d from SCUS `0x80025C9C`. Prints its head string through the dev-print `FUN_8001A068`, tests the pad **edge** word for `0x100` before calling `FUN_80026018`, then edits the viewed object's translate / rotate fields from the **held** pad mask `_DAT_8007B850` and hands two wrapped counters plus those fields to the worker below. [Detail](#801ce8ec). `overlay_other2_dev_0973_801ce8ec.txt`. |
+| `801CEB58` | **OTHER2 primitive/clip worker** (1144 B, frame `0xC0`) - the harness body, opening with a `FUN_80017888(0, 0x5000)` scratch allocation. The one function the OTHER2 image's own internal `jal` names. `overlay_other2_dev_0973_801ceb58.txt`. |
+| `801CE85C` | **OTHER3 bring-up** (PROT 0974, base + `0x44`, 1292 B) - the largest routine in the image: three dev prints, four `FUN_8001FC00` asset streams, three `FUN_8001E54C` SEQ arms, six `FUN_8005FB84` audio calls and five `FUN_8003DE7C` actor stages. `overlay_other3_dev_0974_801ce85c.txt`. |
+| `801CED68` | **OTHER3 roster drawer** (280 B). Takes the scratchpad draw context `0x1F800314`, bumps its `+0x8C` packet cursor by `0x18` per primitive, writes a GP0 command word built from `0x28800080`, and links through `FUN_8003D2C4`. Its loop is what identifies the image's 10,836-byte text run: `801cee00 addiu s3,v0,-0x10c0` forms the table base `0x801CEF40` and the walk steps a `0x84` stride over 81 records, so the run is a roster rather than a string pool (parser `legaia_disc_audit::other3_roster`). Not the PROT 0902 routine at the same VA. `overlay_other3_dev_0974_801ced68.txt`. |
+| `801CEE80` | **OTHER3 init** (164 B) - the sub-id-2 entry, same shape as OTHER2's: `FUN_8001DAF8(0x140)`, `FUN_8001DCF8(0xB)`, one `FUN_80020DE0` spawn from `0x801CEF24`, then the CD/streaming arms `FUN_800654D8(4)` / `FUN_800655AC`. `overlay_other3_dev_0974_801cee80.txt`. |
+
+
+### PROT 0974's tail is not PROT 0974's code
+
+The last `0x6FC` bytes of the OTHER3 image (`0x3104..0x3800`, VA
+`0x801D191C..0x801D2018`) are **byte-identical to the same file offsets of the
+fishing overlay PROT 0972**, and they are fishing code, not dev-module code.
+The operands settle it rather than the byte match: the run materialises
+`0x801D9158` and calls `0x801D63B0`, both of which lie past OTHER3's own
+`0x3800` of content (`0x801CE818 + 0x3800 = 0x801D2018`) and inside PROT 0972's
+`0xB000`. A routine cannot call an address its image does not contain.
+
+The one worklist address in that run, `0x801D1978`, is therefore a fishing
+address and an **interior** one: the enclosing body in PROT 0972 starts at
+`0x801D1870` (frame `0x40`, matching the `addiu sp,sp,0x40` epilogue at
+`0x801D1A8C`), the address itself lands mid-way through a run of `sh` packet-field
+stores whose `v0` / `v1` are set in the two words above it, and nothing in any
+image references it. The same shape holds for PROT 0979 - see the `801D2784`
+row in [`game-modes.md`](game-modes.md) - so treat a small slot-A overlay's
+trailing run as mastering residue until its operands say otherwise.
+
+This is the **slot-A** case of the rule the slot-B module band already
+established: every module image ends in a byte-identical, same-file-offset run
+of another extracted image, ending exactly at the shorter image's length
+([`re-do-not-re-walk.md`](../re-do-not-re-walk.md#the-slot-b-module-band-shares-a-library-tail)).
+Both overlays here match that description exactly - `0x3104..0x3800` for 0974
+and `0x3C68..0x4000` for 0979, each ending at its own last byte.
+
+## FIELD BACK READ overlay (PROT 0978)
+
+| Address | Role |
+|---|---|
+| `801F6B24` | **Staged background loader** - the whole of PROT 0978 (`field_back_read`, dev module `other6`), which holds exactly **one** prologue and **one** `jr ra`, so the image is this single 2100-byte routine over `0x801F6B24..0x801F7358` plus a data tail. Its two switches are **alternatives**, not phases of one walk: `sltiu 0xC` / table `0x801F6AA8` (panel stills) against `sltiu 0x13` / table `0x801F6AD8` (field restore), picked by `beqz _DAT_8007BAC0` at `0x801F6BA8`. Between them: nine `FUN_8003E8A8` resolves, nine `FUN_8003E800` reads, eight `FUN_8003E9C0` / seven `FUN_8003E964` seeks, eight `FUN_800583C8`. Slot-B occupant at base `0x801F69D8`, so it VA-aliases PROT 0900 and the summon modules - read the qualified dump `overlay_field_back_read_0978_801f6b24.txt`. |
+
+The older `overlay_0978_other_game_801f6b24.txt` prints the same span but reports
+a 328-byte body, so byte-denominated instruments credit less than a sixth of the
+routine. `0x801F7624` onward is the image's data tail, not an un-dumped run.
+
+## Function details
+
+Full write-ups for the rows above whose detail outgrew a table cell. Linked from each section table by **[details ↓]**.
+
+### `801D0640` is a mesh flipbook on the marker tiles
+
+Two facts about the halfword the tick reads settle what it is, and neither is
+about the number's magnitude. `FUN_80024E08` is the **set-model** primitive -
+it writes `actor+0x64`, clears the clip cursor `+0x5C` and re-stages the actor
+through `FUN_80020F88` - and `_DAT_8007B6F8` is the field actor **pack bias**
+(`legaia_scene_formats::field_objects::FIELD_ACTOR_PACK_BIAS`). So the table value is a
+scene-pool **mesh index**, and the tick swaps the marker's mesh every
+`duration` ticks. Nothing rotates: a yaw would not be biased by a pack base.
+
+Which actors run it is equally pinned. The dance overlay holds exactly one
+spawn descriptor whose `+0x08` handler word is `0x801D0640` - the record at
+`0x801D4314` (file `0x5AFC`) - and exactly one site materialises it,
+`0x801D2C24` inside the step-marker floor pass `FUN_801D2A10`. That arm takes
+a cell whose step record resolves to clip `6..=9` and stamps `clip - 6` into
+the new actor's `+0x50`. So `+0x50` is the marker **class** `0..=3`, not a
+dancer index, and the earlier "per-dancer facing script" reading was wrong on
+both halves.
+
+The table's shape comes from the bytes: four `0x80`-byte rows at
+`0x801D44CC..0x801D46CC` (file `0x5CB4` of `overlay_dance_0980.bin`), each 25
+`[mesh, duration]` pairs closed by a `[-1, -1]` sentinel and zero-padded.
+Durations are `12` and `6` ticks; the four rows are the same 25-step loop at
+four different phase offsets, so the marker classes flip out of step with each
+other. Row `0x200` onward is unrelated data, which is what bounds the table at
+four rows.
+
+### The contest score-tally screen (`FUN_801CF074`)
+
+`FUN_801CF074(alpha)` is one whole screen: four count-up lanes and the
+twelve quads that show them. It returns non-zero while the count-up is still
+running and `0` once it has finished, which is how its caller knows to hold
+the screen.
+
+Each lane accumulates the scratchpad frame delta (`0x1F800393`) into its own
+fade counter, clamps that counter at `0x10`, and then - if its pending value
+is non-zero - takes one step through `FUN_801D14B0`, moves it from the
+pending counter into the sink, and fires `FUN_801D1288`. A lane whose
+pending value has reached zero instead starts the next lane's fade, so the
+rows fill in sequence.
+
+| Lane | Fade counter | Pending | Sink |
+|---|---|---|---|
+| 0 | `0x801D1ABC` | `0x801D1ACC` | `0x801D1AC8` |
+| 1 | `0x801D1AC0` | `0x801D1AD0` | `0x801D1AC8` |
+| 2 | `0x801D1AC4` | `0x801D1AD4` | `0x801D1AC8` |
+| 3 | `0x801D1AB8` | `0x801D1AAC` | `_DAT_80084440` |
+
+Lane 3's sink is the running contest score tally the settlement routine
+`FUN_801D0F60` settles, which is what identifies the screen.
+
+The draw is six label strips (records `10..=15`, corner-anchored at `x=0x40`,
+`y=0x50` stepping `0x10`, scale `0x1000`) followed by six decimal values
+(`x=0xC0`, `y=0x55` stepping `0x10`), each set emitted twice - variant 1 then
+variant 2, and for the digits palette `0`/`2` then `1`/`3`, with record 9's
+`+0x0F` / `+0x13` bytes stamped between the passes.
+
+**Six rows, four lanes, three distinct sinks.** The rows are not one per lane,
+which is the reading that puts the wrong numbers on the screen. Read off the
+six value draws at `0x801CF560`..`0x801CF6B4` and the six label draws above
+them:
+
+| Row | Value cell | Brightness lane |
+|---|---|---|
+| 0 | `0x801D1ACC` - lane 0 pending | 0 (`0x801D1ABC`) |
+| 1 | `0x801D1AD0` - lane 1 pending | 1 (`0x801D1AC0`) |
+| 2 | `0x801D1AD4` - lane 2 pending | 2 (`0x801D1AC4`) |
+| 3 | `0x801D1AC8` - the shared sink lanes 0..2 drain into | 0 (`0x801D1ABC`) |
+| 4 | `0x801D1AAC` - lane 3 pending | 3 (`0x801D1AB8`) |
+| 5 | `0x80084440` (`0x80084140 + 0x300`) - the running contest tally | 3 (`0x801D1AB8`) |
+
+So the fade sequence is `[0, 1, 2, 0, 3, 3]` - **four** brightness steps across
+six rows, with rows 3 and 5 riding a lane whose own row sits elsewhere in the
+list. Every brightness is `fade * (alpha << 4) >> 7` (`sll s0, s3, 4` at
+`0x801CF298`, the `+0x7F` round before the `sra 7`), and with the fade counter
+clamped at `0x10` a full-alpha row computes `0x100`, which the emitter caps at
+`0xFF`. Port: the draw is `legaia_engine_ui::muscle_dome_hud`
+(`HUB_SCORE_TALLY_LABELS`, `score_tally_quads`), the count-up itself
+`legaia_engine_minigames::other_game_overlay::ScoreTallyRamp`.
+
+### PROT 0977 HUD primitives
+
+Three routines share the sprite descriptor table at `0x801D170C`. Each record
+is `0x14` bytes:
+
+| Offset | Field |
+|---|---|
+| `+0x00` | `i32` texel-to-world size scalar, applied before the caller's scale |
+| `+0x04` | `u16` base tpage word; the emitter adds `page * 0x20` |
+| `+0x06` | `u16` CLUT word |
+| `+0x08` / `+0x09` | `u8` texture U / V of the top-left texel |
+| `+0x0A` / `+0x0B` | `u8` texel width / height |
+| `+0x0C..0x0E` | `u8` RGB of the two **top** vertices |
+| `+0x0F` | non-zero selects the semi-transparent command (`0x3E` over `0x3C`) |
+| `+0x10..0x12` | `u8` RGB of the two **bottom** vertices |
+| `+0x13` | `u8` tpage page offset |
+
+The two colour triples make every quad a vertical two-stop gradient - the
+packet is a `POLY_GT4`, thirteen words including the tag, not a flat sprite.
+
+The `sel` argument packs a table index in its low ten bits and a **variant**
+above them (`sel / 0x400`, truncating). A non-zero variant is a *write* into
+the shared record: it sets `+0x0F` to `1` and `+0x13` to the variant, and
+those stay set for every later call on that record. Variant `2` additionally
+draws with `CLUT + 1`, which the record itself never sees.
+
+Geometry differs only between the two emitters. `FUN_801D050C` halves the
+extent (`(texels * size) >> 13`, then `* scale >> 12`) and brackets the
+argument point, `x - half ..= x + half - 1`. `FUN_801D08EC` shifts once less
+and spans `x ..= x + extent` from the argument point, and clamps brightness
+into `0..=0xFF` before scaling - the centred emitter does not, so a brightness
+above `0x100` wraps its colour bytes there.
+
+Both post through `FUN_8003D2C4` at the ordering-table depth held in
+`DAT_801D1AA8`, then reset that depth to `3`.
+
+`FUN_801D1308` renders a decimal readout through the centred emitter using
+record index `9`. Its eight digit slots start at `-1`, the units slot is
+pre-seeded with `0`, and slot `i` is overwritten with `value / 10^(7-i)` only
+when that quotient is non-zero; a slot holding a negative quotient is skipped
+at draw time. Two consequences: `0` renders as a single `0`, and a **negative
+value renders nothing at all**. The pen advances 8 px per slot including the
+skipped ones, and the digit record's CLUT is offset by the palette argument
+for the call and restored to `0x7D86` on return.
+
+### `801D0ED8`
+
+The restore is **first-entry only**. `FUN_801CEA6C` tests the mode-24 sub-id
+word `_DAT_8007BAC0` at `0x801CEB58` and, when it is already non-zero, jumps
+straight to the re-entry arm at `0x801CEC00` - past the `jal 0x801D0ED8` at
+`0x801CEBF0`. So a contest refills the fighter once, when it opens, and a leg
+boundary never does. The course byte the callee gates on is written in that
+`jal`'s own delay slot (`sw v1, 0x1A90(v0)`), which is why "no equipment" keys
+on the course and not on the round.
+
+The three restored pairs are `(max, cur)` halfwords on the live game-state
+window - `0x6CC/0x6CE`, `0x6D0/0x6D2`, `0x6D4/0x6D6` - i.e. the **lead** party
+record's `+0x104/+0x106` HP, `+0x108/+0x10A` MP and `+0x10C/+0x10E` SP
+([`save-record.md`](../../formats/save-record.md); `0x80084708 - 0x80084140 =
+`0x5C8`). There is no per-character stride in the instruction stream, so party
+slot 0 is the only record touched.
+
+The four bytes the stripped arm zeroes are `+0x75E` / `+0x75F` / `+0x760` /
+`+0x762` = record `+0x196` armour, `+0x197` head gear, `+0x198` weapon and
+`+0x19A` leg gear. It writes **neither** the Seru-lock byte `+0x199` nor the
+three accessory bytes `+0x19B..+0x19D`, so a stripped fighter keeps its
+accessories and its summon access. Retail then runs the per-character stat
+aggregator `FUN_80042558` **before** the copy, so the maxima the refill hands
+over are the ones recomputed under the stripped equipment.
+
+### `801CFE20` / `801CFE5C`
+
+**MDEC in / out DMA sync.** Both live in the slot-A STR/FMV overlay and are
+byte-identical in PROT 0970 (`cutscene_str`) and PROT 0971 (`debug_menu`) -
+the same co-residency the MDECin DMA-callback hook `FUN_801CFE98` shows (see
+[`subsystems/cutscene.md`](../../subsystems/cutscene.md)). They are **not**
+debug-menu logic; the `overlay_debug_menu_*` dumps at these VAs are that
+capture's copy of the same overlay bytes.
+
+Each takes one argument selecting between a blocking wait and a poll:
+
+| Entry | argument `0` | argument non-zero |
+|---|---|---|
+| `801CFE20` | `FUN_801D0100` - spin until MDEC-**in** idle | bit `0x1D` of the status word |
+| `801CFE5C` | `FUN_801D0198` - spin until MDEC-**out** idle | bit `0x18` of the status word |
+
+The blocking halves count down from `0x100000`, re-reading their status word
+each pass. They return `0` the moment the busy bit (`0x2000_0000` in-side,
+`0x0100_0000` out-side) clears, and `-1` after logging `"MDEC in sync"` /
+`"MDEC out sync"` if the budget runs out. Both polling halves read the *same*
+word - `FUN_801D0230`, a six-instruction leaf that dereferences the in-side
+pointer global - so the out-side poll queries the in-side register while its
+own blocking arm queries the out-side one. Port:
+`legaia_engine_system::movie::mdec_dma_sync`.
+
+### `801CE8EC`
+
+The tick is a dev object viewer, and its two input words are different words.
+The `0x100` test that guards `FUN_80026018` reads the pad **edge** mask
+`_DAT_8007B874`; every movement test below reads the **held** mask
+`_DAT_8007B850`, and `L2` held (`0x1`) suppresses the whole movement block.
+
+Movement is a fixed `0x20` units per frame per axis, applied straight to the
+viewed object's fields with no easing:
+
+| Held | Field | Step |
+|---|---|---|
+| Left `0x8000` / Right `0x2000` | `+0x14` (X) | `+0x20` / `-0x20` |
+| Up `0x1000` / Down `0x4000` | `+0x16` (Y) | `+0x20` / `-0x20` |
+| Square `0x80` / Circle `0x20` | `+0x26` | `+0x20` / `-0x20` |
+| Triangle `0x10` / Cross `0x40` | `+0x24` | `+0x20` / `-0x20` |
+
+Two counters step on the edge mask instead: `R1` (`0x8`) bumps `0x801CEFE8`
+and `R2` (`0x2`) bumps `0x801CEFEC`. Both are then reduced in place - the
+first `% 4`, the second `% 6`, the second through the `0x2AAAAAAB` reciprocal -
+and passed as the first two arguments of the prim worker `FUN_801CEB58`, whose
+other two arguments are `&object[+0x14]` and `&object[+0x24]`. So the viewer
+offers four of one variant and six of another over one object the pad moves.
+`object[+0x18]` is pinned at `0xBB8` every frame, which is the fixed viewing
+distance.
+
+Same shape as the debug TMD viewer `801CF338` in PROT 0971, which edits the
+same five fields; both are filed under `[dev_tool_overlays]` in
+`scripts/ci/port-catalog-ignore.toml`.
+
+### `801CF070`
+
+Two parts of the fishing bring-up are game state rather than transport.
+
+**The dev point grant.** Its second act, before the display env is even set,
+is `if (_DAT_8007B9B0 != 0) _DAT_8008444C += 999999` - the persistent fishing
+point counter, bumped by exactly the value the persistent HUD caps its point
+row at. `_DAT_8007B9B0` is the dev print flag the Baka Fighter overlay also
+gates its mirror remap on; retail ships it clear.
+
+**The rod scan.** The tail (`0x801CF35C..0x801CF39C`) probes the bag for item
+`0xA0 + _DAT_80084454` through the held-count helper `FUN_80042F4C`, and on a
+miss steps the persistent rod index forward, wrapping at `3`. The try counter
+advances on every miss including the wrapping one, and the loop gives up after
+six probes and stores `0` - so a player holding no rod fishes with rod `0`'s
+stat rather than with whatever the save carried. This is **not** the lure gate
+`FUN_801D712C`: that one walks items `0x9D..0x9F` and rewrites `_DAT_80084450`.
+Two indices, two item bands; `_DAT_80084454` is the one every tension divisor
+in [`minigame-fishing.md`](../../subsystems/minigame-fishing.md) scales by.
+
+The entry also fills 16 scratchpad halfwords descending from `0x1F80037A` with
+`0`, `-0x20`, ... `-0x1E0`: the floor-height LUT a map cell's low nibble
+indexes, which the per-cell terrain emitters read (`FUN_801F89B8` at
+`0x801F8A7C`). Ports: `legaia_engine_fishing::fishing::entry_rod_index`,
+`FISHING_FLOOR_LUT`, `DEV_ENTRY_POINT_BONUS`.

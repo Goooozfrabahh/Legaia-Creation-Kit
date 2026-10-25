@@ -1,0 +1,198 @@
+# legaia-engine-shell
+
+Top-level driver for the from-scratch engine reimplementation (Track 2). This
+is the crate that turns extracted-disc bytes into a running, rendered scene:
+it runs the shared game session (`legaia-engine-session`'s `BootSession`)
+over the native outputs - `legaia-engine-render` (wgpu + software PSX VRAM)
+and `legaia-engine-audio`'s cpal mixer - draws the shop-family screens
+through `legaia-engine-screens`, and ships the `legaia-engine` command-line
+tool.
+
+End-user model: ship the engine, the user supplies the disc image. The
+`--disc <bin>` flag on most subcommands reads `PROT.DAT` + `CDNAME.TXT`
+straight out of a `.bin` image; `--extracted-root <dir>` reads the output of
+`legaia-extract` instead.
+
+## Library: the wiring layer
+
+The session this host runs is `legaia-engine-session`'s, over the cpal
+output: `legaia_engine_session::native::NativeSession`
+(`BootSession<AudioOut>`) and `NativeAudioDirector`
+(`AudioDirector<AudioOut>`), opened from an extracted tree or a disc image
+([`native`](../engine-session/src/native.rs)). The crate root (`src/lib.rs`)
+holds the glue around it:
+
+- [`cutscene_av`](src/cutscene_av.rs) - STR (MDEC video + interleaved XA
+  audio) windowed playback over the shared `legaia_mdec::str_av` demux (the
+  play page's too), paced by `engine-system::movie::cutscene::MovieClock`.
+- [`replay`](src/replay.rs) - the `j-replay-v1` record/replay format
+  (pad-transition capture + deterministic playback).
+- [`scenarios`](src/scenarios.rs) - the engine integration-scenario manifest
+  runner (boot a scenario headlessly, assert the SHA-256 of its `SaveFile`).
+- [`xa_clip`](src/xa_clip.rs) - XA voice-clip dispatch arithmetic behind the
+  `xa-cue` census.
+- [`window`](src/window.rs) - the `play-window` app and the `play-str`
+  player. `window::HeadlessPlayWindow` is the same app with no window or
+  renderer, stepped one display frame at a time with a given pad word and
+  tick count: what `tests/host_frame_parity.rs` drives against the browser
+  play page.
+
+### Parity oracles
+
+The "engine vs. retail" harnesses the trace subcommands drive - the VRAM,
+mode, audio and PCM oracles, the recomp differential's `sim_trace`, and the
+retail comparison corpus - live in
+[`legaia-parity`](../parity/README.md).
+
+## Binary: `legaia-engine`
+
+The CLI is the user-facing entry point. Run `legaia-engine --help` for the
+authoritative list; the broad groups are:
+
+| Group | Subcommands | What they do |
+|---|---|---|
+| Scene inspection | `info`, `list-scenes`, `clut-trace`, `man-scripts`, `xa-cue`, `config dump-cutscene-map` | Headless reports on a scene's resolved asset chain / dropped CLUTs / MAN field-VM scripts / XA voice-cue slots, plus the CDNAME→`MV*` map as an editable TOML. |
+| Launch | *(no subcommand)* | The launcher screen: disc status and picker (native dialog, drag-and-drop, typed path), the enhancement options and controls, *Play* boots `play-window --boot-ui` in a child process. |
+| Run | `play`, `play-window`, `play-str`, `record` | Boot a scene headless (`play`) or in a wgpu window (`play-window`); play an MDEC movie (`play-str`); capture pad input to a replay (`record`). |
+| Asset export | `export-glb` | Bake a scene (or `--all-scenes`) into textured world / NPC / animated-prop `.glb`s + a placement manifest for Unity/VRChat or Blender; `--items` exports every equipment item as animated item-alone / with-limb `.glb`s, `--party` the party's field forms as villager-shaped `.glb`s ([`docs/tooling/vrchat-world-export.md`](../../docs/tooling/vrchat-world-export.md)). |
+| Save / config | `save`, `load`, `config` | Disk-save smoke round-trip + the keyboard→pad input mapping. The window's own Save writes a block of `saves/memcard1.mcr` with the loaded scene as its resume point, and Continue / Load re-enter that scene before hydrating the world, as retail does; `save` / `load` / `--resume-save` still read and write LGSF slot files. `load --card <image>` reads a block out of a real PSX memory-card image instead ([below](#memory-card-images)). |
+| Parity oracles | `vram-oracle`, `mode-trace`, `audio-trace`, `pcm-trace`, `sim-trace`, `replay`, `scenarios`, `retail-compare`, `cast-sequence-score` | The harnesses above, plus the recomp differential's engine-side emitter, deterministic replay, the scenario-hash suite, the [retail comparison corpus](../../docs/tooling/retail-compare.md) and the [cast-sequence oracle](../../docs/tooling/cast-sequence-oracle.md). |
+| Synthetic sessions | `inventory`, `equip`, `title`, `save-select`, `encounter`, `target-pick`, `chain-editor`, `seru-capture`, `gte-replay` | Drive one engine subsystem's state machine headless from a scripted input string - no disc required. |
+
+### Memory-card images
+
+The save screen's rack is retail's **two card ports**, each a memory-card
+image. Port 1 is the window's own card, `memcard1.mcr` in the save directory
+(the twin of the card the browser play page keeps in its storage), formatted
+on first use - with every LGSF `slot_NN` file an older build left in the
+directory written into it once, slot `N` into grid cell `N`. Port 2 is empty
+until `--card <image>` mounts a real PSX memory-card image in it (`.mcr` /
+`.mcd` / `.gme` / `.mcs`, whatever `legaia_save::emu::detect` recognises).
+Both ports' fifteen blocks fill the preview grid off the same
+`SaveFile::from_retail_sc_block` lift the browser rack uses; Load reads the
+block's save, resuming into its own scene when it carries one, and Save
+writes through `engine-menu-runtime::card_write::write_save_into_card` and writes the
+image back to its file.
+
+`legaia-engine load --card <image> [--block N]` is the headless half: it
+prints the same world summary the slot path prints, off a card block instead
+of an LGSF file. Without `--block` it takes the lowest block the card's
+directory files a save in.
+
+```bash
+cargo build --release
+# Boot town01 in a window, straight from a disc image:
+./target/release/legaia-engine play-window --disc "Legend of Legaia (USA).bin"
+# Headless 600-frame tick, logging scene transitions + BGM events:
+./target/release/legaia-engine play --scene town01 --disc <bin> --frames 600
+# Play a cutscene movie with synced audio:
+./target/release/legaia-engine play-str MOV/MV1.STR --disc <bin>
+# Deterministic headless-ish screenshot (offscreen readback, no scrot/xdotool):
+# open the pause menu, walk down to Status, capture at tick 140.
+./target/release/legaia-engine play-window --disc <bin> --scene town01 \
+  --screenshot status.png --screenshot-tick 140 \
+  --pad-script "40:Start,60:Down,64:Down,68:Down,72:Down,80:Cross"
+```
+
+`--screenshot PATH` renders one frame into an offscreen `COPY_SRC` texture
+(`Renderer::capture_rgba`) at `--screenshot-tick N` and writes a PNG, then exits -
+no `scrot` screen-scrape. `--pad-script "TICK:BUTTON,..."` injects one-tick pad
+edges keyed on the world-tick counter, replacing `xdotool` for menu navigation.
+A screenshot run ignores host keyboard, mouse and focus events, and opens no
+gamepad, so a window that takes focus on a shared desktop captures the same
+frame every time.
+
+An interactive `play-window` reads every connected gamepad through gilrs
+(`window::gamepad`, default `gamepad` feature; Linux links libudev), folded
+through the shared `legaia_engine_system::gamepad` layout the browser pages
+use. `--no-default-features` builds a keyboard-only window.
+Pair with `mednafen-state vram-dump --display-crop` to diff engine output against
+retail framebuffers.
+
+In `play-window`, the `F2` key toggles a master audio mute: the mixer's output
+gate zeroes the rendered frames while the sequencer / SPU / XA stream keep
+ticking, so unmuting resumes mid-track in sync. The state persists in
+`legaia-options.toml` (the engine-only `muted` knob next to the retail
+options rows) and the HUD status line reflects it. The runtime toggles are
+function keys on purpose: a letter is a pad-bindable key name, so binding one
+to a toggle costs the player that pad button (`V` is Square in the default
+table, which is what an earlier mute binding took away).
+
+`F11` or `Alt+Enter` toggles borderless fullscreen (`Enter` alone stays
+Start) and remembers it in `legaia-options.toml` beside the window size, a
+multiple of 320x240. `--fullscreen` / `--windowed` / `--window-scale N`
+override both for one session; a `--screenshot` run ignores them.
+
+In `play-window`, five minigames run as suspending scene modes driven by their
+from-scratch rules engines. Each shows its own HUD and restores the interrupted
+scene when it ends; press the same key again to quit.
+
+| Key | Minigame | Rules engine | Table source | Controls |
+|---|---|---|---|---|
+| `K` / `U` | Noa dance rhythm (`U` = the how-to dance with the Disco King tutorial) | `legaia_engine_minigames::dance` | dance overlay PROT 0980 | Square/Circle/Triangle are the three arrows (the retail pad bits) |
+| `L` | Fishing | `legaia_engine_fishing::fishing` | fishing overlay PROT 0972 | Cross casts then reels, Square is the second reel button; `P` opens the point-exchange prize list |
+| `O` | Casino slot machine | `legaia_engine_minigames::slot_machine` | slot overlay PROT 0975 | Cross spins / stops each reel / collects |
+| `B` | Baka Fighter duel | `legaia_engine_minigames::baka_fighter` | Baka Fighter overlay PROT 0976 | Square / Circle / Cross throw the three rock-paper-scissors attacks (the special is the auto-finisher, no button); Left / Right pick NEXT GAME / PAY OUT after a win |
+| `M` | Muscle Dome contest | `legaia_engine_minigames::muscle_dome` (the leg session is `legaia_engine_battle_menus::muscle_dome_session`) | hand tables from battle overlay PROT 0898; card costs from the lead's player-file swing records | Left/Right/Up/Down queue the four direction commands under the AP budget, Cross confirms/continues |
+
+Payouts and rewards land in real party state: a slot spin is the retail flat
+3-coin bet across all five paylines (1 coin during a feature) and quitting
+cashes the balance out into the casino coin bank; a best-of-3 Baka Fighter
+match win's prize runs through the retail tally into the casino coin bank
+(NEXT GAME climbs the ladder, PAY OUT or a loss ends the visit); a Muscle
+Dome win credits the reward Seru through the capture kernel.
+
+In `play-window`, when the booted disc was randomized with `--seru-trade`,
+talking to a shop merchant (the field-VM op-`0x49` trigger) shows a top-level
+**Buy / Sell / Trade / Exit** menu; the **Trade** row opens that vendor's
+seru-for-seru offers (pick an offer, confirm yes/no) - the from-scratch UI for the
+randomizer's swaps, keyed to the shop you're standing in.
+
+### Binary source layout
+
+The native window is library code: [`window`](src/window.rs) + `src/window/`
+holds the winit + wgpu drivers - the `play-window` / `record` engine viewer
+(`PlayWindowApp`, its `event_handler/` for input and the redraw passes, and
+per-screen modules such as `battle`, `hud`, `minigames`, `screens`) and
+the `play-str` movie player (`str_player`), plus their geometry / asset
+helpers - and [`host_setup`](src/host_setup.rs) the session helpers it shares
+with the headless subcommands. The binary is split into modules under
+`src/bin/legaia-engine/` (the crate root `src/bin/legaia-engine.rs` keeps only
+`main` + the clap dispatch):
+
+- `cli.rs` - the clap `Cli` / `Cmd` / `ConfigCmd` definitions (the help text
+  doubles as the user-facing per-subcommand docs).
+- `commands.rs` + `commands/` - the headless subcommand implementations
+  (`info`, `run`, `replay`, `trace`, `vram`, `sessions`, `export_glb`: scene
+  inspection, the oracle drivers, save/load, and the synthetic-session
+  drivers).
+- `launcher_window.rs` - the no-subcommand launcher screen (engine
+  text overlay + `rfd` native file dialog). Its settings / validation / option rows /
+  decision logic is the library module `launcher` (`src/launcher.rs`), unit
+  tested without a display or a disc; the user-facing description is
+  [`playing-and-viewing.md`](../../docs/guides/playing-and-viewing.md#0-the-launcher).
+  On a Wayland session the picker opens through XWayland (winit has no
+  Wayland drag-and-drop); on Windows a double-clicked engine frees the console
+  Explorer gave it.
+
+A second binary, `legaia-launch` (`src/bin/legaia-launch.rs`), is the Windows
+double-click entry: a `windows`-subsystem stub that starts `legaia-engine`
+beside it with no console window. The Windows release archive ships it as
+`Legend of Legaia.exe`; [`releases.md`](../../docs/tooling/releases.md#windows-the-console-window)
+says why it is a stub rather than a subsystem switch on the engine.
+
+## Tests
+
+Integration tests live in `tests/`. The disc-gated ones (scene-asset chains,
+VRAM / audio / PCM parity, world-map liveness) skip and pass when
+`LEGAIA_DISC_BIN` is unset; the save round-trips key on `~/.mednafen/sav/`.
+See the disc-gated-test note in the top-level `CLAUDE.md`.
+
+## See also
+
+- [`docs/subsystems/engine.md`](../../docs/subsystems/engine.md) - from-scratch
+  engine architecture and boundaries.
+- [`docs/subsystems/boot.md`](../../docs/subsystems/boot.md) - the retail
+  boot sequence this mirrors.
+- [`docs/tooling/determinism-replay.md`](../../docs/tooling/determinism-replay.md)
+  - the `j-replay-v1` format and the determinism cargo-test.

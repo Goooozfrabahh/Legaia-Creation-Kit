@@ -1,0 +1,39 @@
+[package]
+name = "legaia-engine-minigame-scenes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# tests/integration.rs gathers every tests/*.rs into one binary.
+autotests = false
+
+[lib]
+name = "legaia_engine_minigame_scenes"
+path = "src/lib.rs"
+
+[dependencies]
+legaia-engine-camera.workspace = true
+legaia-engine-battle-vm.workspace = true
+legaia-render-kernels.workspace = true
+legaia-tim.workspace = true
+legaia-tmd.workspace = true
+legaia-engine-battle.workspace = true
+legaia-engine-field.workspace = true
+legaia-engine-battle-menus.workspace = true
+legaia-engine-minigames.workspace = true
+legaia-engine-mode.workspace = true
+legaia-engine-scene.workspace = true
+legaia-engine-fishing.workspace = true
+legaia-engine-effects.workspace = true
+legaia-engine-vm.workspace = true
+legaia-prot.workspace = true
+legaia-engine-system.workspace = true
+legaia-actor-formats.workspace = true
+legaia-container-formats.workspace = true
+legaia-game-tables.workspace = true
+legaia-minigame-formats.workspace = true
+legaia-overlay-images.workspace = true
+legaia-scene-formats.workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

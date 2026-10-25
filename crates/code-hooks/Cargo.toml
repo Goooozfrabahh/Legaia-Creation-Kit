@@ -1,0 +1,14 @@
+[package]
+name = "legaia-code-hooks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "legaia_code_hooks"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+legaia-actor-formats.workspace = true
+legaia-game-tables.workspace = true

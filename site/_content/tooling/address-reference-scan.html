@@ -1,0 +1,168 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">tooling</a> &middot; address-reference scan</div>
+  <h1>Address-reference scan</h1>
+  <p class="lede">"Who calls this?" is the question that stalls a reverse-engineering thread most often, and the usual answer &mdash; "nothing does" &mdash; is usually wrong. This sweep looks for every way the game can reach an address, across every code image on the disc at once, so that answer becomes a measurement instead of a shrug.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Tool</dt><dd><code>scripts/ghidra-analysis/find-address-word-refs.py</code> - host-side, runs against <code>extracted/</code>, no Ghidra project needed</dd>
+    <dt>Corpus</dt><dd><code>SCUS_942.54</code> + all 31 recovered overlay images + (with <code>--prot</code>) the raw bytes of all 1233 archive entries</dd>
+    <dt>Forms</dt><dd>Literal word, <code>lui</code>+<code>addiu</code>/<code>ori</code> pair, <code>jal</code>, <code>j</code>, PC-relative branch - all in one pass</dd>
+    <dt>Per hit</dt><dd>Image + file offset + a triage classification (<code>dispatch-table</code> / <code>template-field</code> / <code>incidental-code</code>)</dd>
+    <dt>Outcomes</dt><dd>A table/template consumer (real work), an intra-function label (never work), or no reference anywhere (a documented negative)</dd>
+    <dt>Feeds</dt><dd>The <a href="port-catalog.html">port catalog</a>'s <code>unreferenced</code> ignore-list category</dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="why">
+  <h2>What this solves</h2>
+  <p>A call-graph tool looks for <code>jal</code>, the MIPS call instruction. Legaia reaches much of its code some other way, and each is invisible to that search:</p>
+  <ul class="bullets">
+    <li><strong>Through a table.</strong> A menu renderer, a sub-screen dispatcher, an actor template's per-frame tick - the address sits in memory as a plain 32-bit word and something loads and jumps through it. No instruction on the disc ever names it.</li>
+    <li><strong>Through an address built in two halves.</strong> A 32-bit address does not fit in one instruction, so the assembler emits a <code>lui</code> + <code>addiu</code>/<code>ori</code> pair - and Ghidra's cross-reference index does not join the pairs back together (see <a href="ghidra.html">Ghidra in Docker</a>).</li>
+    <li><strong>The mirror trap:</strong> an address with no caller of any kind might not be a function at all - a label <em>inside</em> somebody else's function, reached by a PC-relative branch. Ghidra invents a fake <code>FUN_</code> entry at each of those.</li>
+  </ul>
+  <p>Reach for this scan whenever a port-catalog row says "no caller", before you either port the routine or declare it dead. It is the instrument behind the rule that <strong>zero static callers in <code>SCUS_942.54</code> does not mean dead in retail</strong>.</p>
+  <ol class="steps">
+    <li><b>One address</b><span>a stalled worklist row, or a whole table via <code>--range</code></span></li>
+    <li><b>Sweep five forms</b><span>word / <code>lui</code>+<code>addiu</code> / <code>jal</code> / <code>j</code> / branch, over SCUS + 31 overlays (+ raw PROT) <code>find-address-word-refs.py</code></span></li>
+    <li><b>Attribute + classify</b><span>each hit named by image; word hits triaged as table / template / incidental <code>static-overlays.toml</code></span></li>
+    <li><b>Outcome</b><span>a consumer to chase, a label (never work), or "no reference exists" (documented negative)</span></li>
+  </ol>
+</section>
+
+<section class="doc-section" id="quick-start">
+  <h2>Quick start</h2>
+  <div class="cli"><code>scripts/ghidra-analysis/find-address-word-refs.py 8005126c</code></div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Command</th><th>Does</th></tr></thead>
+    <tbody>
+      <tr><td><code>find-address-word-refs.py 8005126c --prot</code></td><td>Widen to every extracted PROT entry</td></tr>
+      <tr><td><code>find-address-word-refs.py 801e58a8 --home field</code></td><td>Mark branch hits from slot siblings as aliases</td></tr>
+      <tr><td><code>find-address-word-refs.py --range 800705fc:80070760</code></td><td>Who references this table?</td></tr>
+      <tr><td><code>find-address-word-refs.py --file addrs.txt --context</code></td><td>Batch a worklist, print neighbours</td></tr>
+      <tr><td><code>find-address-word-refs.py 8004da00 --expect-scus 800767fc</code></td><td>Self-check with exit status</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <h3>The five forms it looks for</h3>
+  <table>
+    <thead><tr><th>Form</th><th>What it is</th><th>Carries its target?</th></tr></thead>
+    <tbody>
+      <tr><td>Literal word</td><td>The address stored as a 32-bit data word - a pointer-table entry or template field.</td><td>Yes</td></tr>
+      <tr><td><code>lui</code> + <code>addiu</code>/<code>ori</code></td><td>The two-instruction pair that materialises the address into a register.</td><td>Yes (in two halves)</td></tr>
+      <tr><td><code>jal</code></td><td>Ordinary call.</td><td>Yes</td></tr>
+      <tr><td><code>j</code></td><td>Absolute jump (tail calls, dispatcher exits).</td><td>Yes</td></tr>
+      <tr><td>PC-relative branch</td><td><code>beq</code>/<code>bne</code>/... - a distance, not a destination.</td><td><strong>No</strong> - only meaningful inside its own image</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="doc-section" id="reading">
+  <h2>What a hit means, and where it is</h2>
+  <p>Reporting a hit as a memory address requires knowing where its containing file loads, and the three cases are kept apart because conflating them has put an impossible address into this project's own notes:</p>
+  <table>
+    <thead><tr><th>Image</th><th>Load address comes from</th><th>A hit is reported as</th></tr></thead>
+    <tbody>
+      <tr><td><code>SCUS_942.54</code></td><td>the PS-X EXE header <code>t_addr</code></td><td>file offset and the one address it can be</td></tr>
+      <tr><td>Overlay images</td><td><code>crates/asset/data/static-overlays.toml</code> (see <a href="static-overlay-pipeline.html">static overlay pipeline</a>)</td><td>offset and address, <strong>named by image</strong></td></tr>
+      <tr><td>Other archive entries (<code>--prot</code>)</td><td>none - streamed data</td><td>file offset only</td></tr>
+    </tbody>
+  </table>
+  <p>The middle row is the one that bites: many overlays load at the same address, so the same address is a different word in each of them - the <em>image</em> is as much of the answer as the offset. The bottom row is why streamed entries carry no address: inventing one would be exactly the phantom-VA defect the first row exists to avoid.</p>
+  <h3>Classification of a word hit</h3>
+  <p>Only a word-aligned hit can be a table entry, so unaligned ones are reported as incidental. For the aligned ones, three counts over the surrounding bytes are printed alongside the verdict so it can be second-guessed:</p>
+  <table>
+    <thead><tr><th>Count</th><th>Measures</th></tr></thead>
+    <tbody>
+      <tr><td><code>code</code></td><td><code>jr ra</code> and <code>addiu sp, sp, &plusmn;N</code> words within &plusmn;<code>0x200</code> - real code carries several, a pointer table none</td></tr>
+      <tr><td><code>entry</code></td><td>Neighbouring words (&plusmn;4) that are addresses landing on a function prologue <strong>in this same image</strong></td></tr>
+      <tr><td><code>ptr</code> / <code>const</code></td><td>Neighbouring words that are RAM-band addresses, or small constants</td></tr>
+    </tbody>
+  </table>
+  <p><code>dispatch-table</code> needs two or more <code>entry</code> neighbours; <code>template-field</code> is a lone pointer among constants; <code>incidental-code</code> is a word inside an instruction stream. The verdict is triage, not a substitute for reading the disassembly at the hit.</p>
+  <details class="disclosure">
+    <summary>The template-in-code false negative, and its tell</summary>
+    <div class="disclosure-body">
+      <p>A template inside a code region reads as <code>incidental-code</code>: <code>code</code> outranks the other counts, and a static actor template is a small constant record linked <em>among the routines it seats</em>, not in a data region - so its <code>+0x8</code> tick word scores <code>code &gt; 0</code> with <code>entry = 0</code> even though a lone pointer among constants is exactly the template shape. The tell is one word back: <code>FUN_80020DE0</code> reads a template's <code>+0x4</code> model selector, which is <code>0xFFFF</code> for the transform-node helpers, so a routine's VA immediately after an <code>ffff0000</code> word is a template's tick slot. <code>801D2298</code> (0897 <code>field</code>, template <code>0x801F2294</code>) and <code>801D4098</code> (0980 <code>dance</code>, template <code>0x801D42FC</code>) are both real, ported entries with exactly that shape. A template-seated routine collects one aligned word hit; an interior label collects <em>no</em> word hit at all.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="branches">
+  <h2>A branch cannot cross images</h2>
+  <p>Four of the five forms carry a copy of the address they reach, so a hit is evidence wherever it turns up. A <strong>branch encodes a distance, not a destination</strong>, so it can only reach code in its own image - a branch hit is evidence about <em>that image's</em> copy of the address and nothing else. Since overlays share load addresses, every one of them has a byte at every address: two routines on this project's inert-code list read as referenced for exactly this reason and are not (<code>0x801CFE20</code> collects a branch from the <em>field</em> overlay, whose bytes there are an unrelated epilogue; <code>0x801E58A8</code> collects one from <em>battle_action</em>).</p>
+  <p><code>--home &lt;image&gt;</code> makes the check mechanical: name the image that holds the routine (<code>locate-entry-image.py</code> answers that from the prologue) and branch hits from any other overlay print as <code>br~</code> and tally under <code>branch_alias</code>. When a target's only hits are aliased branches, the tool says so outright; a typo'd name exits non-zero rather than quietly marking every hit an alias.</p>
+</section>
+
+<section class="doc-section" id="outcomes">
+  <h2>The three outcomes</h2>
+  <ul class="bullets">
+    <li><strong>A table or template word.</strong> The consumer is whatever dispatches through that record - the stalled thread has a next step.</li>
+    <li><strong>Branch sites but no call sites.</strong> A label inside a larger function, not an entry point. The worklist row was never work.</li>
+    <li><strong>Nothing, anywhere.</strong> The routine is real but the game never reaches it - linked in because the linker keeps whole object files. This outcome is worth naming because it looks identical to unfinished work and is the opposite of it: reimplementing a routine the original never runs cannot make anything work. Such addresses go into the <a href="port-catalog.html">port catalog</a>'s <code>unreferenced</code> ignore-list category as a documented negative.</li>
+  </ul>
+  <details class="disclosure">
+    <summary>The retail-unreachable set (closed under the sweep)</summary>
+    <div class="disclosure-body">
+      <p>Sweeping every anchor the port catalog's audit lists as <em>disclosed inert</em> answers whether a row is waiting on wiring or on nothing. Almost all are waiting on wiring; these are the ones that are not:</p>
+      <table>
+        <thead><tr><th>Address</th><th>Image</th><th>Routine</th></tr></thead>
+        <tbody>
+          <tr><td><code>8005126C</code></td><td>SCUS</td><td>battle actor on-screen test</td></tr>
+          <tr><td><code>80035274</code></td><td>SCUS</td><td>item / equipment passive-name draw</td></tr>
+          <tr><td><code>80050D40</code></td><td>SCUS</td><td>12-bit angle tween</td></tr>
+          <tr><td><code>80025054</code></td><td>SCUS</td><td>actor-template tick; unreachable through its record <code>0x80070614</code></td></tr>
+          <tr><td><code>801CFE20</code> / <code>801CFE5C</code></td><td>0970 <code>cutscene_str</code></td><td>MDEC in / out sync wrappers</td></tr>
+          <tr><td><code>801D0230</code></td><td>0970 <code>cutscene_str</code></td><td>MDEC status-word leaf; both call sites are inside the two wrappers above</td></tr>
+          <tr><td><code>801D5780</code></td><td>0897 <code>field</code></td><td>generic arc-hop spawn</td></tr>
+          <tr><td><code>801D5C2C</code></td><td>0972 <code>fishing</code></td><td>3-D segment clip + projection</td></tr>
+          <tr><td><code>801DAD6C</code></td><td>0899 <code>menu</code></td><td>five-step menu open sequence</td></tr>
+          <tr><td><code>801DBA90</code></td><td>0898 <code>battle_action</code></td><td>reward-banner composer</td></tr>
+          <tr><td><code>801E5834</code> / <code>801E58A8</code></td><td>0897 <code>field</code></td><td>pooled actor spawn + actor anim-clip pick</td></tr>
+        </tbody>
+      </table>
+      <p>Every row was checked with <code>locate-entry-image.py</code> first, so each begins where it is said to begin. The scan settles reachability, not identity: a row here still says nothing about whether the decoded behaviour is right. Per-routine write-ups live in the <a href="../reference/functions.html">function directory</a>.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="controls">
+  <h2>Controls</h2>
+  <p>A tool is only worth its negatives if its positives are checked, so it is run against known answers before a "nothing found" is believed: a known template word (<code>8004da00</code> &rarr; exactly one hit at SCUS <code>0x800767FC</code>, classified <code>template-field</code>; <code>--expect-scus</code> turns that into a pass/fail exit status), a known call target (<code>800195a8</code> &rarr; <code>jal</code> sites across SCUS and five overlays, no word hits), a known branch target (<code>80051308</code> &rarr; one <code>BR</code> site and nothing else), and a known dispatch table (<code>--range</code> over the menu overlay's sub-screen pointer array at <code>0x801E4F40</code> recovers its single materialisation site).</p>
+</section>
+
+<section class="doc-section" id="limits">
+  <h2>Limits</h2>
+  <ul class="bullets">
+    <li><strong>Compressed entries.</strong> <code>--prot</code> scans raw bytes, so a reference inside an LZS-compressed entry is invisible. Overlay <em>code</em> is stored raw, so this gap does not cover the images callers actually live in.</li>
+    <li><strong>Split materialisation.</strong> The pair scan wants one <code>lui</code> and one <code>addiu</code>/<code>ori</code> within a few instructions; the sibling gp-relative sweep's register walk covers an address assembled in more steps. <code>table_base + index</code> is covered to the extent the bytes allow: both scans carry the <code>lui</code> register through the indexing <code>addu</code> and report the array's <em>base</em> - never the element a runtime index picks - so a per-record negative over a table still needs the table base scanned before it means anything.</li>
+    <li><strong>How a register is followed.</strong> Both scans share one walk (<code>scripts/ghidra-analysis/mips_walk.py</code>, mirrored by the byte account's <code>lui_forms</code>): any other write drops the register, a copy or one runtime index carries it, a branch forks it, a call keeps only callee-saved registers past its delay slot, and <code>jr ra</code> ends the path. The earlier walk stopped only at another <code>lui</code>, and about a quarter of the pairs it formed were a high half paired with a register already rewritten; no recorded "unreferenced" verdict depended on one.</li>
+    <li><strong>A loader parameter is not an address.</strong> A <code>PROT.DAT</code> entry is reached by its index, not its address, and an index the code builds with arithmetic occurs nowhere as a constant. Two entries read as "loaded by nothing" for exactly that reason - their index is formed as <code>addiu a0,s0,0x4c7</code> with a runtime register. Sweep the base of the arithmetic, not the value it produces.</li>
+    <li><strong>The verdict is triage.</strong> A <code>dispatch-table</code> classification says the neighbours look like function entries, not that the runtime indexes them.</li>
+    <li><strong>Aliased branches.</strong> A <code>BR</code> hit in an image that does not hold the routine is not a reference to it; pass <code>--home</code> and read <code>branch_alias</code>.</li>
+  </ul>
+  <p>Three Ghidra-side scripts cover pieces of this from inside a loaded program (<code>find_lui_writers.py</code>, <code>find_addr_data.py</code> / <code>find_data_word.py</code>, <code>find_terrain_emitter_caller.py</code> - catalogued on <a href="ghidra.html">Ghidra in Docker</a>). They stay the right tool when you want the containing <em>function</em> of a hit, which they can name and this cannot; the host-side scan adds corpus and closure - every image at once, the raw PROT entries no Ghidra project holds, all five forms in one pass.</p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Tooling</span>
+    <a href="port-catalog.html">Port catalog</a>
+    <a href="static-overlay-pipeline.html">Static overlay pipeline</a>
+    <a href="ghidra.html">Ghidra in Docker</a>
+    <a href="disc-coverage.html">Disc coverage</a>
+  </div>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../reference/functions.html">Function directory</a>
+    <a href="../reference/re-settled-threads.html">Settled RE threads</a>
+    <a href="../reference/re-do-not-re-walk.html">Do not re-walk</a>
+    <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/tooling/worklist-classification.md" target="_blank" rel="noopener">Worklist classification (GitHub)</a>
+    <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/tooling/call-target-integrity.md" target="_blank" rel="noopener">Call-target integrity (GitHub)</a>
+  </div>
+</section>

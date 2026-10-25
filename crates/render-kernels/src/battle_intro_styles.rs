@@ -1,0 +1,908 @@
+//! Three of the field-to-battle transition's five per-frame style emitters:
+//! the two particle-field ticks and the screen-strip curtain.
+//!
+//! | Retail | Here | Style |
+//! |---|---|---|
+//! | `FUN_801CFDA0` | [`tick_particle_field`] with [`PARTICLE_TICK_A`] | scatter, `>> 1` velocity |
+//! | `FUN_801D0370` | [`tick_particle_field`] with [`PARTICLE_TICK_B`] | scatter with spin-up and colour decay |
+//! | `FUN_801D11D0` | [`tick_curtain`] | the screen sliced into rows and columns and stretched apart |
+//!
+//! The remaining two live in [`crate::battle_intro_tiles`] and
+//! [`crate::battle_intro_swirl`].
+//!
+//! ## The two particle ticks share a record layout, and it is not the one the
+//! seeders' field names suggest
+//!
+//! Both walk [`PARTICLE_TICK_COUNT`] records of
+//! [`crate::battle_intro_particles::PARTICLE_STRIDE`] bytes out of the entity's
+//! `+0x48` block - the block
+//! [`crate::battle_intro_particles::seed_particle_grid`] fills - and both read
+//! it the same way:
+//!
+//! | offset | the tick's use |
+//! |---|---|
+//! | `+0x04` | packed colour; bits `31..24` non-zero **skips the particle entirely** |
+//! | `+0x08` / `+0x0A` / `+0x0C` | translation vector, integrated by `+0x20` / `+0x22` / `+0x24` |
+//! | `+0x10` / `+0x12` / `+0x14` | rotation vector, integrated by `+0x18` / `+0x1A` / `+0x1C` |
+//! | `+0x1E` | spawn delay, held against the scaled entity clock |
+//! | `+0x28` | high bits pick the texture page, low six the u |
+//! | `+0x2A` | the v |
+//!
+//! That is what pins the seeder's `+0x20` / `+0x22` / `+0x24` triple as a
+//! **translation velocity** rather than as a sprite size and a flag word. See
+//! the note on [`crate::battle_intro_particles::IntroParticle`].
+//!
+//! ## `_DAT_8007B6CC` is written twice in `FUN_801D11D0` and the second wins
+//!
+//! `801d11fc`..`801d1224` computes `elapsed != 0` into the flag through a
+//! two-arm branch and then stores **zero** over it unconditionally at
+//! `801d1224`, on the merge point both arms reach. The curtain therefore always
+//! reports "first frame", unlike the other four styles. The dead pair is
+//! retail's; [`CurtainTick`] carries only the surviving write.
+//!
+//! Provenance: `see ghidra/scripts/funcs/overlay_field_battle_intro_801cfda0.txt`,
+//! `..._801d0370.txt` and `..._801d11d0.txt` - disassembly, not the C.
+//!
+//! REF: FUN_800195A8 - the sprite projector, ported as
+//! `legaia_render_kernels::billboard::project_billboard`.
+//! REF: FUN_8003D2C4 - retail `AddPrim`, whose ordering is
+//! `legaia_render_kernels::screen_prim::order_primitives`.
+//! Both are named in the wiring notes below.
+//!
+//! REF: FUN_801D0D24 - the tile-shatter tick, ported in
+//! [`crate::battle_intro_tiles`]; dispatched by [`IntroStyle::TileShatter`].
+//! REF: FUN_801D1888 - the swirl tick, ported in
+//! [`crate::battle_intro_swirl`]; dispatched by [`IntroStyle::Swirl`].
+
+use crate::battle_intro_particles::IntroParticle;
+use crate::battle_intro_transition::{
+    IntroQuad, IntroQuadAnchor, IntroQuadDesc, IntroQuadRequest, build_intro_quad,
+};
+
+// ---------------------------------------------------------------------------
+// The two switches at the tail of FUN_801CF5BC
+// ---------------------------------------------------------------------------
+
+/// Values [`IntroStyle`] covers - retail's own bound, `sltiu v0,v1,0x5` at
+/// `0x801CF974` and again at `0x801CF9F8`. A selector outside it runs no style
+/// body and no fade.
+pub const INTRO_STYLE_COUNT: i32 = 5;
+
+/// Which of the five per-frame styles the transition is running: the value of
+/// the selector global `DAT_801D2460`.
+///
+/// The two switches at the tail of `FUN_801CF5BC` both dispatch on it - the
+/// first picks the style's per-frame body, the second the style's fade ramp.
+/// Both jump tables are **data inside PROT 0979**, so the arm order below is
+/// read off the disc image rather than off Ghidra's switch recovery: the
+/// five words at `0x801CE890` are `801CF99C / 801CF9AC / 801CF9BC / 801CF9CC /
+/// 801CF9DC`, each of which is a two-instruction `jal <tick>; move a0,s1`
+/// stub, and the five at `0x801CE8A8` are the fade arms
+/// [`intro_fade`] reproduces.
+///
+/// Retail swaps `sp` onto the scratchpad at `0x1F800310` around the style
+/// call and restores it after (`0x801CF954`..`0x801CF9E8`), so a style body
+/// runs on the scratchpad stack. That is an allocation detail with no
+/// observable effect on the port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum IntroStyle {
+    /// `0` - `FUN_801CFDA0`, the scatter particle field
+    /// ([`tick_particle_field`] with [`PARTICLE_TICK_A`]).
+    ScatterParticles,
+    /// `1` - `FUN_801D0370`, the spin-up particle field
+    /// ([`tick_particle_field`] with [`PARTICLE_TICK_B`]).
+    SpinUpParticles,
+    /// `2` - `FUN_801D0D24`, the tile shatter
+    /// ([`crate::battle_intro_tiles::tick_tile_grid`]).
+    TileShatter,
+    /// `3` - `FUN_801D11D0`, the row/column curtain ([`tick_curtain`]).
+    Curtain,
+    /// `4` - `FUN_801D1888`, the counter-rotating fan
+    /// ([`crate::battle_intro_swirl::tick_swirl`]).
+    Swirl,
+}
+
+impl IntroStyle {
+    /// Decode a `DAT_801D2460` value. Out-of-range selects nothing, which is
+    /// retail's `sltiu` bound rather than a clamp - the switch is skipped and
+    /// the frame draws no transition at all.
+    pub fn from_selector(v: i32) -> Option<Self> {
+        Some(match v {
+            0 => Self::ScatterParticles,
+            1 => Self::SpinUpParticles,
+            2 => Self::TileShatter,
+            3 => Self::Curtain,
+            4 => Self::Swirl,
+            _ => return None,
+        })
+    }
+
+    /// The selector value this style is dispatched by.
+    pub fn selector(self) -> i32 {
+        self as i32
+    }
+
+    /// Address of the retail per-frame body the first switch calls. Present so
+    /// the dispatch table is checkable against the dump rather than only
+    /// described.
+    pub fn tick_address(self) -> u32 {
+        match self {
+            Self::ScatterParticles => 0x801C_FDA0,
+            Self::SpinUpParticles => 0x801D_0370,
+            Self::TileShatter => 0x801D_0D24,
+            Self::Curtain => 0x801D_11D0,
+            Self::Swirl => 0x801D_1888,
+        }
+    }
+}
+
+/// The inputs the transition's init routine picks a style from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IntroStyleInputs {
+    /// `DAT_8007BD60` - the per-battle flags byte. Only bit `0x80` is read,
+    /// the same bit
+    /// [`crate::battle_intro_transition::TransitionGlobals::battle_flags`]
+    /// names.
+    pub battle_flags: u8,
+    /// `DAT_8007BD0C` - slot 0 of the resolved formation cell, i.e. the
+    /// battle's **first monster id**. Every override keys on it.
+    pub formation_slot0: u8,
+    /// `DAT_80084540` - the current map / scene PROT base index, read with a
+    /// full `lw`. Two overrides are scene-conditional. (The memory map records
+    /// this cell as a `u16`; retail reads the word here, so the port takes the
+    /// word and the high half is expected to be zero.)
+    pub scene_index: u32,
+}
+
+/// What [`select_intro_style`] resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntroStyleChoice {
+    /// `DAT_801D2460`.
+    pub style: IntroStyle,
+    /// `DAT_801D2464` - the sub-style. Read by the tile seeder
+    /// ([`crate::battle_intro_tiles::TileSubStyle`]) and by the scatter
+    /// style's fade arm.
+    pub sub_style: i32,
+}
+
+/// Pick the transition's style, the way the intro overlay's init routine does
+/// at `0x801CE97C`..`0x801CEB38`.
+///
+/// **This is a function of the battle, not a random pick.** The default is
+/// [`IntroStyle::TileShatter`], the flags byte's top bit selects a second
+/// arm, and then a chain of independent overrides keys on the formation's
+/// first monster id - two of them additionally on the current scene. Read in
+/// retail's own order, because the overrides are sequential stores to the same
+/// two globals and a later one wins:
+///
+/// | test | style | sub |
+/// |---|---|---|
+/// | (initial) | `TileShatter` | `0` |
+/// | flags bit `0x80`, `slot0` in `0x13..=0x15` | `TileShatter` | `1` |
+/// | flags bit `0x80`, otherwise | `SpinUpParticles` | `0` |
+/// | flags bit `0x80` clear | `TileShatter` | `0` |
+/// | `slot0 == 0x4C` | `ScatterParticles` | `0` |
+/// | `slot0 == 0x88` | `ScatterParticles` | `1` |
+/// | `slot0 == 0xB3` | `ScatterParticles` | `2` |
+/// | `slot0` in `{0x4F, 0xAF, 0xA5}` | `Curtain` | unchanged |
+/// | `slot0` in `{0x3E, 0x3F}` and scene in `{3, 0xC, 0x15}` | `TileShatter` | `2` |
+/// | `slot0 == 0x80` and scene `== 0x9B` | `TileShatter` | `2` |
+/// | `slot0 == 0xB5` | `Swirl` | unchanged |
+///
+/// The two "unchanged" rows are retail's: those arms store the selector and
+/// leave `DAT_801D2464` holding whatever the arm above it left, so the sub
+/// value is carried rather than reset.
+///
+/// One arm is a delay-slot store and reads as a double write:
+/// `0x801CE9D8`'s branch carries `sw v1, 0x2460(a0)` with `v1 == 1`, so
+/// selector `1` lands on **both** paths and the fall-through then overwrites
+/// it with `2`. That is why the "flags set, not in range" row is
+/// [`IntroStyle::SpinUpParticles`] and not the default.
+///
+/// PORT: FUN_801ce8cc (the style-selection block of the transition init;
+/// the historical `FUN_801CE8C0` name was mis-rounded - `0x801CE8C0..0x801CE8C8`
+/// are three data words and the prologue is at `0x801CE8CC`, see
+/// `ghidra/scripts/funcs/overlay_field_battle_intro_801ce8cc.txt`)
+pub fn select_intro_style(inputs: &IntroStyleInputs) -> IntroStyleChoice {
+    let IntroStyleInputs {
+        battle_flags,
+        formation_slot0: slot0,
+        scene_index,
+    } = *inputs;
+
+    // The initial pair, then the flags arm. Retail stores the initial pair
+    // unconditionally and every arm below overwrites it, so the assignment is
+    // reproduced rather than folded away.
+    let mut style = IntroStyle::TileShatter;
+    let mut sub_style = 0i32;
+
+    if battle_flags & 0x80 != 0 {
+        // The delay-slot store lands first; the in-range arm overwrites it.
+        style = IntroStyle::SpinUpParticles;
+        if slot0.wrapping_sub(0x13) < 3 {
+            style = IntroStyle::TileShatter;
+            sub_style = 1;
+        }
+    }
+
+    match slot0 {
+        0x4C => (style, sub_style) = (IntroStyle::ScatterParticles, 0),
+        0x88 => (style, sub_style) = (IntroStyle::ScatterParticles, 1),
+        0xB3 => (style, sub_style) = (IntroStyle::ScatterParticles, 2),
+        _ => {}
+    }
+    if matches!(slot0, 0x4F | 0xAF | 0xA5) {
+        style = IntroStyle::Curtain;
+    }
+    if matches!(slot0, 0x3E | 0x3F) && matches!(scene_index, 3 | 0x0C | 0x15) {
+        style = IntroStyle::TileShatter;
+        sub_style = 2;
+    }
+    if slot0 == 0x80 && scene_index == 0x9B {
+        style = IntroStyle::TileShatter;
+        sub_style = 2;
+    }
+    if slot0 == 0xB5 {
+        style = IntroStyle::Swirl;
+    }
+
+    IntroStyleChoice { style, sub_style }
+}
+
+/// `DAT_801D2458` as the intro init leaves it for four of the five styles:
+/// **132 display frames**.
+///
+/// The store is unconditional and sits two instructions before the style
+/// switch itself - `addiu v0,zero,0x84` / `sw v0,0x2458(v1)` at
+/// `0x801CED14` / `0x801CED2C`, immediately followed by the
+/// `sltiu v0,a0,0x5` bound on `DAT_801D2460` (PROT 0979
+/// `overlay_field_battle_intro`, load base `0x801CE818`; read off the image's
+/// own instruction words, not the decompiler).
+///
+/// It is the denominator of everything time-shaped in the transition: the
+/// entity's `+0x1A` clock is compared against it for the BGM hand-off, and
+/// every [`INTRO_FADE_RAMPS`] entry is expressed as a *lead* before it. The
+/// tile shatter is the style that makes it observable - its spawn delays are
+/// `rand() % 5000` held against `elapsed * 60`, so the last records start
+/// around frame 83 and a window shorter than that leaves part of the grid at
+/// its rest pose for the whole transition.
+pub const INTRO_DURATION_FRAMES: i32 = 0x84;
+
+/// `DAT_801D2458` for [`IntroStyle::Swirl`]: **252 display frames**.
+///
+/// The swirl's dispatch arm (jump-table slot `4` at `0x801CE840`, body
+/// `0x801CEFEC`) re-stores the global with `addiu v0,zero,0xfc` /
+/// `sw v0,0x2458(v1)` at `0x801CEFF4` / `0x801CEFFC` - the only arm that
+/// overrides the shared value, which is why the fan transition runs so much
+/// longer than the other four.
+pub const INTRO_DURATION_FRAMES_SWIRL: i32 = 0xFC;
+
+/// The intro duration `DAT_801D2458` holds once the init has run for `style`.
+pub fn intro_duration_frames(style: IntroStyle) -> i32 {
+    match style {
+        IntroStyle::Swirl => INTRO_DURATION_FRAMES_SWIRL,
+        _ => INTRO_DURATION_FRAMES,
+    }
+}
+
+/// The per-style constants of the second switch's fade ramp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntroFadeRamp {
+    /// Frames before the end of the intro at which the ramp starts. The gate
+    /// is `total_duration - lead < elapsed`, so the ramp is inactive at and
+    /// below the threshold, not from it.
+    pub lead: i32,
+    /// Multiplier on the frames-past-threshold delta.
+    pub slope: i32,
+    /// The second argument of `FUN_80024EE4` - the quad's **GPU
+    /// semi-transparency (ABR) mode**, `1` or `2` across the five arms.
+    ///
+    /// It is not an OT depth, which is what this field used to be called.
+    /// `FUN_80024EE4` takes the OT layer in `a0` (always
+    /// [`INTRO_FADE_LAYER`]) and folds `a1` into the *draw-mode* packet it
+    /// pushes ahead of the quad:
+    ///
+    /// ```text
+    /// 80024fb0  sll  a3,s3,0x5      ; s3 = a1
+    /// 80024fbc  ori  a3,a3,0xe
+    /// 80024fcc  jal  0x80059010     ; SetDrawMode(p, dfe=0, dtd=0, tpage=a3, tw=0)
+    /// ```
+    ///
+    /// GP0 tpage bits `5..=6` are the ABR field, so `a1` lands there
+    /// verbatim: `1` = `B + F` (additive) and `2` = `B - F` (subtractive).
+    /// The quad's own command byte is `0x2B` (`lui v0,0x2b00` at
+    /// `0x80024f50`) - an untextured **semi-transparent** four-point
+    /// polygon - so the mode is always live.
+    ///
+    /// With the ramp colour being `level` smeared across all three channels,
+    /// this is what decides where a style's tail lands: an `abr == 1` style
+    /// ramps to an additive **white-out**, an `abr == 2` style to a
+    /// subtractive **fade to black**.
+    pub abr: u8,
+}
+
+/// The five ramps, indexed by [`IntroStyle::selector`]. Read off the arms at
+/// `0x801CFA20` / `0x801CFA80` / `0x801CFAA8` / `0x801CFAF0` / `0x801CFB38`.
+///
+/// Style `0` is the one with two forms: its arm branches on
+/// `DAT_801D2464 == 2` - the same tile sub-style global
+/// [`crate::battle_intro_tiles::TileSubStyle`] names - and takes ABR `1`
+/// there instead of `2`, i.e. that sub-style whites out where the plain form
+/// fades to black. See [`intro_fade`].
+pub const INTRO_FADE_RAMPS: [IntroFadeRamp; INTRO_STYLE_COUNT as usize] = [
+    IntroFadeRamp {
+        lead: 0x18,
+        slope: 12,
+        abr: 2,
+    },
+    IntroFadeRamp {
+        lead: 0x18,
+        slope: 16,
+        abr: 1,
+    },
+    IntroFadeRamp {
+        lead: 0x1C,
+        slope: 16,
+        abr: 2,
+    },
+    IntroFadeRamp {
+        lead: 0x40,
+        slope: 4,
+        abr: 2,
+    },
+    IntroFadeRamp {
+        lead: 0x20,
+        slope: 10,
+        abr: 1,
+    },
+];
+
+/// The first argument every fade call passes (`li a0,0x2` on all five arms).
+pub const INTRO_FADE_LAYER: u8 = 2;
+
+/// One `FUN_80024EE4(layer, abr, rgb)` call - the full-screen fade quad the
+/// second switch pushes after the style body has run.
+///
+/// The emitter builds a five-word (`0x05000000` tag) untextured quad with
+/// command byte `0x2B` over the whole display rect, then a `SetDrawMode`
+/// packet carrying the ABR mode; both go into OT layer `a0`. So the fade is
+/// one blended full-screen quad, and [`Self::abr`] - not the colour - is what
+/// decides whether it darkens or brightens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntroFade {
+    /// `a0`, always [`INTRO_FADE_LAYER`] - the **OT layer**, the same for
+    /// every style.
+    pub layer: u8,
+    /// `a1` - [`IntroFadeRamp::abr`], the GPU semi-transparency mode.
+    pub abr: u8,
+    /// The clamped `0..=0xFF` ramp level, before it is smeared across the
+    /// three channels.
+    pub level: u8,
+    /// `a2` - the level replicated into all three channels, which retail
+    /// computes as `level + (level << 8) + (level << 16)`.
+    pub rgb: u32,
+}
+
+/// The per-style screen fade of `FUN_801CF5BC`'s **second** switch.
+///
+/// Every arm has the same shape and differs only in two constants: a lead time
+/// before the end of the intro, and a slope. `level = (elapsed + lead -
+/// total_duration) * slope`, clamped low to `0` then high to `0xFF` - retail
+/// clamps in that order (`bgez` to zero first, then `slti 0x100` to `0xFF`),
+/// which matters because the low clamp's result is re-tested by the high one.
+///
+/// Returns `None` when the ramp has not started, which is retail branching
+/// straight to the epilogue without emitting a quad at all - not a fade of
+/// level zero.
+///
+/// `sub_style` is `DAT_801D2464`; only [`IntroStyle::ScatterParticles`] reads
+/// it, and only to choose between ABR `1` (when it is `2`) and `2`.
+///
+/// PORT: FUN_801CF5BC (the second switch)
+/// REF: FUN_80024EE4 - the fade-quad emitter this resolves the arguments of.
+pub fn intro_fade(
+    style: IntroStyle,
+    sub_style: i32,
+    elapsed: i32,
+    total_duration: i32,
+) -> Option<IntroFade> {
+    let ramp = INTRO_FADE_RAMPS[style.selector() as usize];
+    if total_duration - ramp.lead >= elapsed {
+        return None;
+    }
+    let raw = (elapsed + ramp.lead - total_duration).wrapping_mul(ramp.slope);
+    let level = raw.clamp(0, 0xFF) as u8;
+    let abr = match style {
+        IntroStyle::ScatterParticles if sub_style == 2 => 1,
+        _ => ramp.abr,
+    };
+    let l = u32::from(level);
+    Some(IntroFade {
+        layer: INTRO_FADE_LAYER,
+        abr,
+        level,
+        rgb: l | (l << 8) | (l << 16),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// FUN_801CFDA0 / FUN_801D0370 - the two particle-field ticks
+// ---------------------------------------------------------------------------
+
+/// Records both ticks walk (`slti v0,s5,0x488`).
+///
+/// It is **not** the seeders' 1280: the grid is `0x500` records and the ticks
+/// visit `0x488` of them, so the last 120 are seeded and never drawn. Both
+/// ticks agree on the bound, so it is a property of the style, not a slip.
+pub const PARTICLE_TICK_COUNT: usize = 0x488;
+
+/// Screen-space accept window applied to the projected corner `0`, exclusive at
+/// both ends (`-8 < x < 0x148`, `-8 < y < 0xF8`).
+pub const SCREEN_MIN: i16 = -8;
+
+/// See [`SCREEN_MIN`].
+pub const SCREEN_MAX_X: i16 = 0x148;
+
+/// See [`SCREEN_MIN`].
+pub const SCREEN_MAX_Y: i16 = 0xF8;
+
+/// The `+0x28` field's high bits are shifted down by six and biased by this to
+/// form the texture-page word (`sra v0,v0,0x16; addiu v0,v0,0x135`).
+pub const PARTICLE_TPAGE_BIAS: i16 = 0x135;
+
+/// The colour delta `FUN_801D0370` applies to a moving particle's `+0x04`
+/// every frame (`lui 0xfffa; ori 0xfafb`, i.e. `-0x50505`): five off each of
+/// the three channels, so a particle fades to black as it flies.
+pub const PARTICLE_COLOUR_DECAY: i32 = -0x0005_0505;
+
+/// The constants that separate the two particle ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParticleTickStyle {
+    /// Half-extent of the quad the projector is handed. `FUN_801CFDA0` builds
+    /// a `0x100` unit sprite, `FUN_801D0370` a `0x40` one.
+    pub quad_size: i16,
+    /// Multiplier on the entity clock before it is compared with a particle's
+    /// `+0x1E` delay: `0x6E` for `FUN_801CFDA0`, `0x40` for `FUN_801D0370`.
+    pub delay_scale: i32,
+    /// Right shift on the rotation integration: `1` for `FUN_801CFDA0`, `4`
+    /// for `FUN_801D0370` (whose z component uses `3` instead - see
+    /// [`ParticleTickStyle::rot_z_shift`]).
+    pub rot_shift: u32,
+    /// Right shift on the rotation vector's **z** component only.
+    pub rot_z_shift: u32,
+    /// Whether the tick pre-divides the rotation vector by 8 before handing it
+    /// to `RotMatrix`. `FUN_801D0370` does (`sra ...,0x13` on a sign-extended
+    /// halfword); `FUN_801CFDA0` passes `+0x10` straight through.
+    pub rot_prescale_shift: u32,
+    /// Whether a moving particle's spin accelerates by `+= (v >> 3) + (v >> 2)`
+    /// - a `1.375x` per frame ramp. Only `FUN_801D0370` does this.
+    pub spin_up: bool,
+    /// Whether a moving particle's colour decays by [`PARTICLE_COLOUR_DECAY`].
+    pub colour_decay: bool,
+    /// Whether the tick writes `1` into the particle's `+0x16` when it moves.
+    /// Only `FUN_801CFDA0` does.
+    pub stamp_field_16: bool,
+    /// Whether the projected depth has to fall inside `0x81..=0x3FDB`
+    /// (`FUN_801CFDA0`'s `d - 0x81 <u 0x3F5B`) or merely exceed `0x80`
+    /// (`FUN_801D0370`'s `slti 0x81`).
+    pub bounded_depth: bool,
+    /// Whether a particle that moved this frame links one OT bucket nearer
+    /// (`s6 = -1`, used as `OT + 400 + s6 * 4`). Only `FUN_801D0370` does; the
+    /// other always links at `OT + 400`.
+    pub moved_links_nearer: bool,
+}
+
+/// `FUN_801CFDA0`'s constants.
+pub const PARTICLE_TICK_A: ParticleTickStyle = ParticleTickStyle {
+    quad_size: 0x100,
+    delay_scale: 0x6E,
+    rot_shift: 1,
+    rot_z_shift: 1,
+    rot_prescale_shift: 0,
+    spin_up: false,
+    colour_decay: false,
+    stamp_field_16: true,
+    bounded_depth: true,
+    moved_links_nearer: false,
+};
+
+/// `FUN_801D0370`'s constants.
+pub const PARTICLE_TICK_B: ParticleTickStyle = ParticleTickStyle {
+    quad_size: 0x40,
+    delay_scale: 0x40,
+    rot_shift: 4,
+    rot_z_shift: 3,
+    rot_prescale_shift: 3,
+    spin_up: true,
+    colour_decay: true,
+    stamp_field_16: false,
+    bounded_depth: false,
+    moved_links_nearer: true,
+};
+
+/// One particle's outcome for a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParticleStep {
+    /// `+0x04`'s top byte was non-zero, so retail skipped the particle before
+    /// the projection. Nothing was integrated and nothing is drawn.
+    Masked,
+    /// The particle is live. `moved` is the `+0x1E < scaled_clock` gate.
+    Live {
+        /// The delay gate let the integration run.
+        moved: bool,
+        /// The rotation vector handed to `RotMatrix`, after the style's
+        /// optional pre-divide.
+        rot: (i16, i16, i16),
+        /// Texture-page word, from `+0x28`.
+        tpage: i16,
+        /// Top-left texel, `(+0x28 & 0x3F, +0x2A)`. `+0x2A` is a halfword the
+        /// packet build stores as a byte (`sb`), so only its low eight bits
+        /// reach the GPU. The quad's other three corners are this pair with
+        /// `+8` on one or both axes.
+        texel: (u8, u8),
+    },
+}
+
+/// What one [`tick_particle_field`] frame reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ParticleFieldTick {
+    /// `_DAT_8007B6CC` - `elapsed != 0` on entry.
+    pub not_first_frame: bool,
+    /// `FUN_801CFDA0` washes the screen with `0x101010` on every frame after
+    /// the first; `FUN_801D0370` never does.
+    pub late_wash: bool,
+    /// Particles the top-byte mask skipped.
+    pub masked: usize,
+    /// Particles whose delay had expired.
+    pub moved: usize,
+}
+
+fn shr_toward_zero(v: i32, bits: u32) -> i32 {
+    let bias = (1i32 << bits) - 1;
+    if v < 0 { v + bias } else { v }.wrapping_shr(bits)
+}
+
+/// One particle, one frame - the body both `FUN_801CFDA0` and `FUN_801D0370`
+/// run inside their `0x488` loop.
+///
+/// PORT: FUN_801CFDA0
+/// PORT: FUN_801D0370
+///
+/// NOT DRAWN: [`tick_particle_field`] calls this for every particle on every
+/// transition frame the native window runs, so the integration is live; what
+/// no host consumes is the per-particle packet it decides. See the tag on
+/// [`tick_particle_field`] for the emit half.
+pub fn step_particle(
+    p: &mut IntroParticle,
+    style: &ParticleTickStyle,
+    frame_step: u8,
+    scaled_clock: i32,
+) -> ParticleStep {
+    if (p.tint & 0xFF00_0000) != 0 {
+        return ParticleStep::Masked;
+    }
+    let step = i32::from(frame_step);
+    let moved = i32::from(p.delay) < scaled_clock;
+    if moved {
+        if style.colour_decay {
+            p.tint = (p.tint as i32).wrapping_add(PARTICLE_COLOUR_DECAY) as u32;
+        }
+        if style.spin_up {
+            let ramp = |v: i16| -> i16 {
+                let v32 = i32::from(v);
+                (v32 + (v32 >> 3) + (v32 >> 2)) as i16
+            };
+            p.spin = (ramp(p.spin.0), ramp(p.spin.1), ramp(p.spin.2));
+        }
+        let add = |acc: i16, v: i16, bits: u32| -> i16 {
+            (acc as u16).wrapping_add(shr_toward_zero(i32::from(v) * step, bits) as u16) as i16
+        };
+        p.rot = (
+            add(p.rot.0, p.spin.0, style.rot_shift),
+            add(p.rot.1, p.spin.1, style.rot_shift),
+            add(p.rot.2, p.spin.2, style.rot_z_shift),
+        );
+        if style.stamp_field_16 {
+            p.field_16 = 1;
+        }
+        // The translation always integrates with a `>> 1`, in both ticks.
+        p.trans = (
+            add(p.trans.0, p.trans_vel.0, 1),
+            add(p.trans.1, p.trans_vel.1, 1),
+            add(p.trans.2, p.trans_vel.2, 1),
+        );
+    }
+    let rot = if style.rot_prescale_shift == 0 {
+        p.rot
+    } else {
+        let s = style.rot_prescale_shift;
+        (p.rot.0 >> s, p.rot.1 >> s, p.rot.2 >> s)
+    };
+    ParticleStep::Live {
+        moved,
+        rot,
+        tpage: (p.texel_page >> 6).wrapping_add(PARTICLE_TPAGE_BIAS),
+        texel: ((p.texel_page as u16 & 0x3F) as u8, p.texel_v as u8),
+    }
+}
+
+/// Whether a projected particle quad survives both accept tests.
+///
+/// `depth` is `FUN_8005BAC8`'s return; `corner0` is the first projected `SXY`.
+/// `FUN_801CFDA0` bounds the depth at both ends, `FUN_801D0370` only below -
+/// so the scatter style culls far particles and the spin-up style does not.
+pub fn particle_quad_accepted(style: &ParticleTickStyle, depth: i32, corner0: (i16, i16)) -> bool {
+    let depth_ok = if style.bounded_depth {
+        (depth.wrapping_sub(0x81) as u32) < 0x3F5B
+    } else {
+        depth > 0x80
+    };
+    depth_ok
+        && corner0.0 > SCREEN_MIN
+        && corner0.0 < SCREEN_MAX_X
+        && corner0.1 > SCREEN_MIN
+        && corner0.1 < SCREEN_MAX_Y
+}
+
+/// One frame of a particle-field style. `FUN_801CFDA0` / `FUN_801D0370`.
+///
+/// The delay gate is the entity clock times [`ParticleTickStyle::delay_scale`],
+/// computed once before the loop; the clock then advances by the frame step.
+///
+/// PORT: FUN_801CFDA0
+/// PORT: FUN_801D0370
+///
+/// REPLACED-BY: `legaia_render_kernels::battle_intro::emit_particle_field`,
+/// which carries the same two PORT tags and is the live path. It does what
+/// this loop does *and* assembles the per-particle `POLY_FT4` packet in the
+/// same pass, stepping each particle through [`step_particle`] rather than
+/// calling this batch wrapper. So this entry point is superseded, not
+/// blocked: no host is owed a call to it, because the host already runs the
+/// same two retail routines through a different door.
+///
+/// Kept because it is the side-effect-free integration kernel: the emitter
+/// needs a renderer, this does not, so the frame-by-frame position/clock
+/// arithmetic stays testable on its own. Retiring it means moving those
+/// tests onto the emitter.
+pub fn tick_particle_field(
+    particles: &mut [IntroParticle],
+    style: &ParticleTickStyle,
+    elapsed: &mut i16,
+    frame_step: u8,
+) -> ParticleFieldTick {
+    let mut out = ParticleFieldTick {
+        not_first_frame: *elapsed != 0,
+        late_wash: style.stamp_field_16 && *elapsed != 0,
+        ..Default::default()
+    };
+    let scaled_clock = i32::from(*elapsed) * style.delay_scale;
+    for p in particles.iter_mut().take(PARTICLE_TICK_COUNT) {
+        match step_particle(p, style, frame_step, scaled_clock) {
+            ParticleStep::Masked => out.masked += 1,
+            ParticleStep::Live { moved, .. } => out.moved += usize::from(moved),
+        }
+    }
+    *elapsed = (*elapsed as u16).wrapping_add(u16::from(frame_step)) as i16;
+    out
+}
+
+// ---------------------------------------------------------------------------
+// FUN_801D11D0 - the curtain
+// ---------------------------------------------------------------------------
+
+/// Screen rows the curtain slices (`slti v0,s3,0xf0`).
+pub const CURTAIN_ROWS: i32 = 0xF0;
+
+/// Screen columns the curtain slices (`slti v0,s2,0x140`).
+pub const CURTAIN_COLS: i32 = 0x140;
+
+/// Vertical centre the row warp pivots about (`addiu v1,s3,-0x78`).
+pub const CURTAIN_ROW_CENTRE: i32 = 0x78;
+
+/// Horizontal centre the column warp pivots about (`addiu v0,s2,-0xa0`).
+pub const CURTAIN_COL_CENTRE: i32 = 0xA0;
+
+/// Divisor and clock bias of both warps (`addiu v1,a1,0x1c`, then `/ 0x1c`).
+pub const CURTAIN_WARP_DIVISOR: i32 = 0x1C;
+
+/// Descriptor-table index the row pass patches and draws (`param_4 == 3`).
+pub const CURTAIN_ROW_DESC: usize = 3;
+
+/// Descriptor-table index the column pass patches and draws (`param_4 == 2`).
+pub const CURTAIN_COL_DESC: usize = 2;
+
+/// Width of the row pass' left strip, and the x its right strip starts at.
+pub const CURTAIN_LEFT_W: u8 = 0xC0;
+
+/// Width of the row pass' right strip. `0xC0 + 0x80 == 0x140`, the whole
+/// screen.
+pub const CURTAIN_RIGHT_W: u8 = 0x80;
+
+/// Texture page the row pass' left strip samples (`li v0,0x105`).
+pub const CURTAIN_ROW_TPAGE_LEFT: u16 = 0x105;
+
+/// Texture page the row pass' right strip samples (`li v0,0x108`).
+pub const CURTAIN_ROW_TPAGE_RIGHT: u16 = 0x108;
+
+/// Texture page the column pass samples for columns `< 0xC0` (`li v0,0x115`).
+pub const CURTAIN_COL_TPAGE_LEFT: u16 = 0x115;
+
+/// Texture page the column pass samples for columns `>= 0xC0` (`li v0,0x118`),
+/// whose u is additionally biased by `0x40`.
+pub const CURTAIN_COL_TPAGE_RIGHT: u16 = 0x118;
+
+/// Column at which the column pass swaps page and biases u.
+pub const CURTAIN_COL_SPLIT: i32 = 0xC0;
+
+/// OT depth the row pass writes into `DAT_801D245C` before every quad.
+pub const CURTAIN_ROW_OT_DEPTH: u32 = 0x12C;
+
+/// OT depth the column pass writes.
+pub const CURTAIN_COL_OT_DEPTH: u32 = 0x1C2;
+
+/// Colour intensity both passes pass as `param_5`.
+pub const CURTAIN_INTENSITY: i32 = 0x80;
+
+/// x offset added to a column's warped position before it is drawn
+/// (`addiu a1,a1,0x1e0`), while the visibility test uses `+ 0xA0`.
+pub const CURTAIN_COL_DRAW_BIAS: i32 = 0x1E0;
+
+/// The screen wash the curtain opens with (`func_0x8004695C(0x80808)`).
+pub const CURTAIN_WASH_RGB: u32 = 0x0008_0808;
+
+/// One quad the curtain emitted, with the request that produced it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CurtainQuad {
+    /// Descriptor-table index this quad came from.
+    pub desc_index: usize,
+    /// The arguments `FUN_801CF1B0` was called with.
+    pub request: IntroQuadRequest,
+    /// The built primitive.
+    pub quad: IntroQuad,
+}
+
+/// What one curtain frame emitted.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CurtainTick {
+    /// `_DAT_8007B6CC`, which this style always clears - see the module docs.
+    pub not_first_frame: bool,
+    /// The quads, in retail emission order: `2 * `[`CURTAIN_ROWS`] row strips
+    /// first, then the visible columns.
+    pub quads: Vec<CurtainQuad>,
+    /// Columns the visibility test rejected.
+    pub culled_columns: usize,
+}
+
+/// The signed `/ 0x1C` both warps use, truncating toward zero.
+fn warp(offset: i32, elapsed: i32) -> i32 {
+    (offset * (elapsed + CURTAIN_WARP_DIVISOR)) / CURTAIN_WARP_DIVISOR
+}
+
+/// One frame of the curtain style. `FUN_801D11D0`.
+///
+/// Two passes over the descriptor table at overlay VA `0x801D1EC4`, each of
+/// which **patches the descriptor in place** before every call rather than
+/// carrying a per-strip record:
+///
+/// * **Rows.** For each of [`CURTAIN_ROWS`] scanlines, descriptor
+///   [`CURTAIN_ROW_DESC`] gets `v0 = row`, `u0 = 0`, and a `(width, tpage)`
+///   pair per half; the strip is drawn at
+///   `y = (row - 120) * (elapsed + 28) / 28 + 120`, a vertical stretch about
+///   the screen centre that opens as the clock runs.
+/// * **Columns.** For each of [`CURTAIN_COLS`], descriptor
+///   [`CURTAIN_COL_DESC`] gets `u0 = col` (`+ 0x40` past
+///   [`CURTAIN_COL_SPLIT`]) and its page; the strip is drawn only when its
+///   warped x still falls inside the screen, stretched vertically by
+///   `(|col - 160| * elapsed) >> 5` and lifted by `120/4096` of that.
+///
+/// **The two passes do not draw to the same place.** Around them retail links
+/// `SetDrawOffset` / `SetDrawArea` packets at OT buckets `0x1F4` and `0x190`,
+/// plus `FUN_801D1D9C(0x1EA, 2, 0x808080)` between them. Those are not
+/// stateless draw-list work: the pair at `0x1F4` points the draw area at VRAM
+/// `(320, 0)` with a zero offset, so the **column** pass renders an
+/// intermediate there - which is exactly the rect the **row** pass' pages
+/// [`CURTAIN_ROW_TPAGE_LEFT`] / [`CURTAIN_ROW_TPAGE_RIGHT`] decode to. Only the
+/// row pass reaches the display. That is what [`CURTAIN_COL_DRAW_BIAS`] is for:
+/// a visible column (tested about `0xA0`) lands at `x` in `320..640`, inside
+/// the installed area. See `docs/subsystems/battle.md`.
+///
+/// PORT: FUN_801D11D0
+/// REF: FUN_801CF1B0 (the quad builder), FUN_801D1D9C (the mid-pass emitter)
+///
+/// WIRED. `legaia_render_kernels::battle_intro::BattleIntro` owns the
+/// descriptor table (the `0x14`-stride table parses out of PROT 0979 via
+/// `IntroQuadTable::parse_overlay`), ticks it from the live transition clock,
+/// splits this function's output by pass, emits the row quads as screen
+/// primitives and rasterises the column quads into the intermediate.
+///
+/// The style is reached only when [`select_intro_style`] picks it, which is
+/// three formations on the disc; the ordinary encounter takes
+/// [`IntroStyle::TileShatter`], which is drawn by
+/// `legaia_render_kernels::battle_intro::emit_tile`.
+pub fn tick_curtain(table: &mut [IntroQuadDesc], elapsed: &mut i16, frame_step: u8) -> CurtainTick {
+    let mut out = CurtainTick::default();
+    let clock = i32::from(*elapsed);
+
+    for row in 0..CURTAIN_ROWS {
+        let y = warp(row - CURTAIN_ROW_CENTRE, clock) + CURTAIN_ROW_CENTRE;
+        for (x, w, tpage) in [
+            (0i32, CURTAIN_LEFT_W, CURTAIN_ROW_TPAGE_LEFT),
+            (
+                i32::from(CURTAIN_LEFT_W),
+                CURTAIN_RIGHT_W,
+                CURTAIN_ROW_TPAGE_RIGHT,
+            ),
+        ] {
+            let Some(desc) = table.get_mut(CURTAIN_ROW_DESC) else {
+                return out;
+            };
+            desc.u0 = 0;
+            desc.v0 = row as u8;
+            desc.w = w;
+            desc.tpage = tpage;
+            let request = IntroQuadRequest {
+                anchor: IntroQuadAnchor::TopLeft,
+                x: x as i16,
+                y: y as i16,
+                key: CURTAIN_ROW_DESC as i32,
+                intensity: CURTAIN_INTENSITY,
+                scale_x: 0x1000,
+                scale_y: 0x1000,
+                ot_depth: CURTAIN_ROW_OT_DEPTH,
+            };
+            if let Some(quad) = build_intro_quad(&request, table) {
+                out.quads.push(CurtainQuad {
+                    desc_index: CURTAIN_ROW_DESC,
+                    request,
+                    quad,
+                });
+            }
+        }
+    }
+
+    for col in 0..CURTAIN_COLS {
+        let right = col >= CURTAIN_COL_SPLIT;
+        let Some(desc) = table.get_mut(CURTAIN_COL_DESC) else {
+            return out;
+        };
+        desc.u0 = (if right { col + 0x40 } else { col }) as u8;
+        desc.tpage = if right {
+            CURTAIN_COL_TPAGE_RIGHT
+        } else {
+            CURTAIN_COL_TPAGE_LEFT
+        };
+
+        let off = col - CURTAIN_COL_CENTRE;
+        let warped = warp(off, clock);
+        let stretch = shr_toward_zero(off.abs() * clock, 5);
+        // The visibility test re-centres on 0xA0; the draw uses 0x1E0.
+        if ((warped + CURTAIN_COL_CENTRE) as u32) >= CURTAIN_COLS as u32 {
+            out.culled_columns += 1;
+            continue;
+        }
+        let lift = shr_toward_zero(stretch * 0x78, 12);
+        let request = IntroQuadRequest {
+            anchor: IntroQuadAnchor::TopLeft,
+            x: (warped + CURTAIN_COL_DRAW_BIAS) as i16,
+            y: (-lift) as i16,
+            key: CURTAIN_COL_DESC as i32,
+            intensity: CURTAIN_INTENSITY,
+            scale_x: 0x1000,
+            scale_y: stretch + 0x1000,
+            ot_depth: CURTAIN_COL_OT_DEPTH,
+        };
+        if let Some(quad) = build_intro_quad(&request, table) {
+            out.quads.push(CurtainQuad {
+                desc_index: CURTAIN_COL_DESC,
+                request,
+                quad,
+            });
+        }
+    }
+
+    *elapsed = (*elapsed as u16).wrapping_add(u16::from(frame_step)) as i16;
+    out
+}
+
+#[cfg(test)]
+mod tests;

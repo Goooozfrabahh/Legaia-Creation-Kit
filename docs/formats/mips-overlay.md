@@ -1,0 +1,63 @@
+# MIPS overlay code
+
+The game's executable is small; most of its code ships as **overlays** - blobs of MIPS machine code stored as ordinary PROT entries and loaded into RAM at `0x801C0000+` when a mode needs them. This page covers the detector for the simplest shape: an entry whose first bytes are a function prologue. These are the smaller specialised blobs in the `0901..=0969_xxx_dat` PROT range, as distinct from the big per-mode overlays (title / field / battle / menu).
+
+There is no container here: the entry is raw code and data linked for one load address. The "format" is the detection rule plus the load base, which the disc does not state in the entry itself.
+
+Implementation: `crates/overlay-images/src/mips_overlay.rs`.
+
+## Layout
+
+| Offset | Size | Field | Meaning | Confidence |
+|---|---|---|---|---|
+| `+0x00` | u32 | first instruction | `0x27BDFFXX` = `addiu sp, sp, -X`, a stack-frame allocation | Confirmed |
+| `+0x04` | u32 | second instruction | A prologue follow-up: `sw ra/s*` (`0xAFB?_00XX`), another `addiu`, `lui`, `sw`, or an R-type op | Confirmed |
+| `+0x08` | rest | code + data | The remainder of the overlay image | Confirmed |
+
+## Detection
+
+Three checks together produce zero false positives across the corpus:
+
+1. `u32_le[0] & 0xFFFF_FF00 == 0x27BD_FF00` - `addiu sp, sp, -X`.
+2. `(u32_le[0] & 0xFF) ∈ [0x80, 0xF8]` - only accept reasonable stack adjustments (8 to 128 bytes).
+3. `u32_le[1]`'s 6-bit MIPS opcode field is one of the common function-prologue follow-ups (`sw`, `addiu`, `lui`, `lw`, R-type, ldc/sdc).
+
+## Cluster anatomy
+
+All matches cluster in the `0901..=0969` PROT range - sized 14 KB to 37 KB (one outlier at 163 KB for `0969_xxx_dat.BIN`). The `find-overlay` heuristic ranks these as MIPS-code-shape candidates; this detector formalises that ranking into the categorize pipeline.
+
+Each entry can be Ghidra-imported via [`scripts/ghidra-analysis/bulk-import-overlays.sh`](../tooling/overlay-capture.md) once a base address is determined. The overlay window is `0x801C0000`–`0x80200000`; each blob loads at a specific offset within that range, determinable from the asset chain that pulls it in.
+
+## What the band holds
+
+The `0903..=0966` entries are the 64 slot-B cast / summon images, each one special attack's stager ([`slot-b-module-layout.md`](slot-b-module-layout.md), [`cast-module.md`](../subsystems/cast-module.md)). `0968` / `0969` are the two boss-stage modules ([`battle.md`](../subsystems/battle.md)). Entries that lead with a pointer table instead of a prologue are covered by the [sister detector](overlay-ptr-table.md).
+
+## Reading the format
+
+```rust
+use legaia_overlay_images::mips_overlay;
+
+if let Some(m) = mips_overlay::detect(buf) {
+    println!("MIPS overlay: stack frame = {} bytes; second op = {:#04x}",
+             m.stack_frame_bytes, m.second_op);
+}
+```
+
+## Address attestation in overlay dumps
+
+A dumped function's *printed* addresses are trustworthy only when the dump's link base was recovered correctly; a filename prefix is not evidence of the base. Two failure modes recur across the battle / minigame overlay dumps and disqualify most raw addresses from being documented at their printed VA. The byte-match arbiter (`scripts/ghidra-analysis/classify-worklist.py --explain <addr>`) resolves the true image per address; trust its `image=` verdict, not the dump filename.
+
+- **Mis-recovered base.** The `bat_back_dat` (PROT 0896) dump family splits across **two** imports, neither at the image's own base `0x801D4DF0`: an untagged batch at `0x801C0000`, whose prints above 0896's own `0x9000` bytes read *through* into the field (0897) and battle-action (0898) overlays, and a batch tagged `[overlay_0896 base=0x801C5818]` (the phantom jal-recovered base), printing 0896's own bytes at `printed - 0x801C5818`. The arbiter resolves most 0896 entries to field / battle bodies or interior / shared-tail fragments, never to a standalone `bat_back_dat` function at the printed VA, and no dump in this family can be cited by one. Per-program re-key law: [`overlay-va-aliases.md`](../reference/overlay-va-aliases.md#prot-0896-two-programs-one-law-each).
+
+- **Relocation-duplicate re-images.** The debug-menu (0971), minigame (0977 / 0978) and menu (0899) overlays re-image a shared render / minigame library at a different base per game-mode context - the same `0900`<->`0901` / `0965`<->`0967` re-imaging pattern noted in [`functions.md`](../reference/functions.md). Their function bodies are byte-identical modulo relocation to already-dumped bodies in debug_menu (0970) / the minigame base slot (0972) / menu (0899); the arbiter reports each such address as a `DUPLICATE` of the canonical VA.
+
+  Name these by extraction index, not by minigame. The CDNAME block `other_game` (`#define other_game 974`) opens at extraction **0972** and its names inherit forward to **0977**, so every slot in that span wears one label while the slots do different jobs - 0977 is the Muscle Dome arena's door/init slot ([`minigame-muscle-dome.md`](../subsystems/minigame-muscle-dome.md)), not a fishing overlay. Only `REAL` self-entry bodies at a recovered base attest a distinct function at their printed address.
+
+  Extraction **0978** is outside that block entirely; it opens `monster_test`, and those names run forward too. Extraction **0981** wears the label while its code is the **overworld map display** (game mode `0x0D`) at `0x801CE818`: its entry `0x801CE850` is the display tick, and its operands are the location table `DAT_80073EE0`, the kingdom filter `uRam8007b970` and the world-map camera pair `_DAT_80089118` ([`world-map.md`](../subsystems/world-map.md#the-top-view-image-on-the-disc-is-prot-0981)). A CDNAME label is a hint, not a verdict ([`cdname.md`](cdname.md#numbering-space)).
+
+## See also
+
+- [Static overlay-extraction pipeline](../tooling/static-overlay-pipeline.md) - extracts these (and the big scene overlays) from the disc at their recovered base, with identity attached from the PROT entry.
+- [Overlay pointer table](overlay-ptr-table.md) - the sister detector for overlay code with leading pointer tables.
+- [`reference/functions.md`](../reference/functions.md) - the catalogue of traced function entry points.
+- [`reference/memory-map.md`](../reference/memory-map.md) - the RAM map showing where overlays load.

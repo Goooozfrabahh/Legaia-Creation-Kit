@@ -1,0 +1,155 @@
+# Rust build output.
+/target/
+*.profraw
+
+# Disc-extracted Sony bytes. NEVER commit (see CLAUDE.md, NOTICE).
+/extracted/
+# `legaia-engine export-glb` output (Sony-derived geometry/textures for
+# local Unity/VRChat world building) - same rule.
+/glb-export/
+glb-export/
+
+# Translation language packs (`legaia-patcher translate export/init`): exported
+# packs carry the game's dialog/name strings (Sony-derived). NEVER commit.
+/translations/
+legaia_*.yaml
+
+# PCSX-Redux probe captures - full RAM dumps, register CSVs, run logs.
+# Sony-derived runtime state; regenerable from the probe + a local save.
+/captures/
+
+# Immutable save-state library: fingerprint-named backups of ephemeral
+# emulator save states (PCSX-Redux .sstate, mednafen .mcr, ...). These
+# contain Sony game RAM and are NEVER committed. The committed catalogue
+# is scripts/scenarios.toml (per-scenario `backup_fingerprint` field) -
+# metadata only, no Sony bytes. Populate via `manage-states.py backup`.
+/saves/library/
+
+# Local-only archive for retired automation. Resolved investigations live
+# here so the on-disk record survives without cluttering the active
+# tooling tree. The committed catalogue in
+# docs/tooling/pcsx-redux-automation.md is the source of truth for what
+# was learned.
+/archive/
+
+# Ghidra project DB (per-user, contains analysed Sony executable).
+/ghidra/projects/
+
+# Ghidra analysis outputs - regenerable from the project DB and contain
+# Sony-derived code/strings (decompiled C, disassembly, extracted path
+# strings, function inventories). CLAUDE.md: "no decompressed Sony bytes
+# (text strings, sample data, decompiled-C dumps with literal data) get
+# checked in". The .py / .lua / .sh tooling under ghidra/scripts/ IS
+# committed - it's the original analysis tooling, not Sony output.
+/ghidra/scripts/funcs/
+# Outputs land at the top of ghidra/scripts/ (the scripts write absolute
+# /scripts/... paths); the `**/` form also covers the bucket subdirectories.
+/ghidra/scripts/**/*.csv
+/ghidra/scripts/**/*.json
+/ghidra/scripts/**/*.txt
+/ghidra/scripts/**/*.log
+# symbols/symbols.json / symbols.lua are name -> address maps generated from the
+# funcs/*.txt headers (Ghidra default labels + addresses, no Sony bytes).
+# Committed so PCSX-Redux Lua probes can resolve names without bundling
+# the funcs/ tree. Regenerate via scripts/pcsx-redux/build-symbols.py.
+!/ghidra/scripts/symbols/symbols.json
+!/ghidra/scripts/symbols/symbols.lua
+/ghidra/import.log
+
+# Disc images, dumps, and PSX executables - defensive: extracted/ already
+# covers the canonical paths, but stop a stray drop into the repo root.
+*.bin
+*.iso
+*.img
+*.cue
+*.toc
+*.mds
+*.mdf
+/SCUS_*
+# Synthetic save-file schema fixtures (no Sony bytes; built from a
+# deterministic in-test SaveFile via crates/save/tests/schema_fixture.rs).
+# Regenerable with LEGAIA_UPDATE_FIXTURES=1.
+!/crates/save/tests/fixtures/*.bin
+# Third-party mod payloads the patcher installs verbatim (no Sony bytes; see
+# crates/patcher/data/README.md for provenance and the licence note).
+!/crates/patcher/data/*.bin
+
+# Static overlay-extraction output (Sony overlay code + generated Ghidra
+# import scripts; the as-loaded .bin already matches *.bin above, but stop
+# the generated import_*.py / driver from being committed). The committed
+# side is the map at crates/asset/data/static-overlays.toml + the docs.
+# See docs/tooling/static-overlay-pipeline.md.
+/overlays/
+/extracted/overlays/
+
+# Mednafen save states (referenced by scripts/ghidra-analysis/analyze-overlay.sh; the
+# canonical location is ~/.mednafen/mcs/, but ignore stray copies here).
+*.mc[0-9]
+*.mca
+
+# PCSX-Redux closed-loop probe outputs land under captures/<probe>/<run-ts>/
+# (the run_probe.sh wrapper defaults LEGAIA_OUT_DIR there). /captures/ above
+# already covers them. /logs/ is the legacy default for run-time logs when
+# the wrapper falls back outside captures/.
+/logs/
+# Defensive: catch repo-root probe outputs from probes that were run
+# before the captures/<stem>/<ts>/ layout landed, or when the user
+# overrides LEGAIA_OUT to land outside captures/.
+/*_probe.csv
+/*_probe.hits.txt
+/*_probe.ot_cursor.csv
+/*_probe_*.csv
+/*.detail.txt
+/*_probe_*.hits.txt
+/*_writers.csv
+/*_writers.hits.txt
+/*_writers.ot_cursor.csv
+/world_map_vm_calls.csv
+/cd_dma_probe.csv
+/cd_dma_probe.hits.txt
+/lzs_bundle_probe.csv
+/lzs_bundle_probe.hits.txt
+/deep_pool_probe*.csv
+/deep_pool_probe*.hits.txt
+
+# User-local overlay sweep spec (path/label pairs; example committed as .example).
+scripts/overlays.spec
+
+# WASM build output - tracked in the repo so the site works without a local rebuild.
+# Regenerate via scripts/ci/build-wasm.sh when crates/web-viewer or its deps change.
+# site/wasm/.gitignore allows only the specific artifacts needed by viewer.html.
+
+# Local docker compose env (UID/GID overrides). The committed
+# `.env.example` documents the available variables; users copy it to
+# `.env` and customise.
+.env
+
+# Python tooling cache (scripts/*.py).
+__pycache__/
+*.pyc
+*.pyo
+
+# Editors / IDEs.
+.idea/
+.vscode/
+*.swp
+*~
+*.bak
+*.orig
+
+# OS junk.
+.DS_Store
+Thumbs.db
+
+# Jython-compiled bytecode from running ghidra/scripts/**/*.py in the container
+*$py.class
+
+# stray mednafen-state vram-dump default output (Sony VRAM bytes)
+/vram.png
+legaia-options.toml
+
+# Recomp / sim-trace differential captures. These are Sony-derived: a retail
+# trace is a recording of the retail program's state. They belong in scratch,
+# but an `--out` pointed at the repo would otherwise be committable.
+*.jsonl
+!ghidra/scripts/**/*.jsonl

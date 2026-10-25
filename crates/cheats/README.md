@@ -1,0 +1,62 @@
+# legaia-cheats
+
+Parser + classifier for third-party GameShark / Pro-Action-Replay
+cheat code databases targeting *Legend of Legaia*. Three formats are
+supported:
+
+- **GameShark code list** (module `code_lines`): the pasted form, one
+  `AAAAAAAA VVVV` pair per line with an optional description; a
+  conditional line gates the line after it.
+- **GameShark text dump** (`legaia-ntsc-u.gs.txt`): one line per
+  effect, fields separated by whitespace
+  (`R I <width> L 0 <addr> <value> <description>`).
+- **Mednafen `.cht`** (`legaia-ntsc-u.cht`): TOML-shaped triples
+  (`cheatN_desc / cheatN_code / cheatN_enable`); multi-write codes
+  use `+` as the separator.
+
+The crate exposes:
+
+- [`CheatCode`] - a single `(addr, value, width, op)` write.
+- [`CheatEntry`] - one named effect (description + one or more
+  writes; conditional codes are first-class).
+- [`Database`] - a collection of entries plus deduplication
+  helpers.
+- [`parse_code_lines`] / [`parse_gs_text`] / [`parse_mednafen_cht`]
+  (modules `code_lines` / `gs_text` / `mednafen_cht`) - format-specific
+  parsers.
+- [`classify_address`] / `Database::classify` - assign each address a [`Category`] (per-character
+  record, inventory slot, battle actor pool, engine global,
+  mini-game scratch, …) plus a stable subtype label.
+
+The companion `cheat-tool` CLI ships with the community NTSC-U databases
+from [`data/cheats/`](../../data/cheats/) **embedded** (they are
+community-sourced, non-Sony data), so `PATH` is optional on every
+single-input subcommand - omit it to query the built-in databases, pass it
+to parse your own file. A file that parses to zero entries warns on stderr
+(the usual cause is a non-Legaia or differently-formatted cheat file):
+
+```
+cheat-tool parse [PATH]            # parse + dump as JSON
+cheat-tool list [PATH]             # one line per entry
+cheat-tool classify [PATH]         # group by category, with citations
+cheat-tool diff <A> <B>            # show entries unique to each
+cheat-tool extract-offsets [PATH]  # per-character record offsets only
+cheat-tool offset-table <PATH>     # Markdown offset table for docs/reference/cheats.md
+```
+
+The runtime cheat applier wired into `legaia-engine play-window
+--cheat-file <PATH>` lives in `legaia_engine_cheats::cheat_applier`
+and uses this crate plus the `ram_map` registry to dispatch each
+write to the appropriate engine cell.
+
+## Write taxonomy
+
+`taxonomy::classify_writes(addrs)` rolls a set of changed RAM
+addresses up into per-region buckets via `classify::classify_address`,
+flagging writes that land outside every known data region
+(`Category::Unknown`) or in the `0x8007Bxxx` script-VM / build-flag
+scratch. It is the classification half of a gameplay-driven write
+tracer; feed it the per-byte deltas from a pair of save states (see
+`mednafen-state write-taxonomy LEFT RIGHT`) to see *what* changed,
+bucketed by subsystem. Pure and capture-free - unit-tested with
+synthetic deltas.

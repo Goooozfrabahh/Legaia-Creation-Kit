@@ -1,0 +1,44 @@
+[package]
+name = "legaia-asset-viewer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "asset-viewer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+glam.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+legaia-engine-audio.workspace = true
+legaia-engine-core.workspace = true
+legaia-engine-scene.workspace = true
+legaia-engine-render.workspace = true
+legaia-engine-vm.workspace = true
+legaia-font.workspace = true
+legaia-mes.workspace = true
+legaia-prot.workspace = true
+legaia-tim.workspace = true
+legaia-tmd.workspace = true
+legaia-vab.workspace = true
+legaia-seq.workspace = true
+legaia-container-formats.workspace = true
+legaia-disc-audit.workspace = true
+legaia-engine-battle-vm.workspace = true
+legaia-engine-dialog.workspace = true
+legaia-engine-field.workspace = true
+legaia-engine-mode.workspace = true
+legaia-engine-system.workspace = true
+legaia-engine-ui.workspace = true
+legaia-scene-formats.workspace = true
+legaia-ui-formats.workspace = true
+log.workspace = true
+winit.workspace = true
+
+# SIGPIPE reset in the bin's main() so piping stdout into `head` exits
+# quietly instead of panicking on a broken pipe.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

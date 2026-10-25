@@ -1,0 +1,364 @@
+use super::*;
+use legaia_engine_mode::mode::SceneMode;
+
+#[test]
+fn world_starts_with_inactive_actors() {
+    let world = World::new();
+    assert_eq!(world.actors.len(), MAX_ACTORS);
+    assert!(world.actors.iter().all(|a| !a.active));
+}
+
+#[test]
+fn actor_vm_spawn_default_runs_through_world() {
+    let mut world = World::new();
+    // Pre-set default position for actor 7.
+    world.actors[7].default_pos = ActorVmPosition::new(100, 50);
+    // Bytecode: SpawnDefault actor 7, then End.
+    let bc = {
+        let mut v = vec![];
+        v.extend_from_slice(
+            &Insn {
+                opcode: 0x01,
+                operand_b: 7,
+                operand_w: 0,
+            }
+            .encode(),
+        );
+        v.extend_from_slice(&[0u8; 4]);
+        v
+    };
+    let pc = world.run_actor_bytecode(&bc).unwrap();
+    assert_eq!(pc, 4);
+    assert!(world.actors[7].active);
+    assert_eq!(world.actors[7].move_state.world_x, 100);
+}
+
+#[test]
+fn actor_vm_set_field_1d_writes_when_actor_exists() {
+    let mut world = World::new();
+    world.actors[3].active = true;
+    let bc = {
+        let mut v = vec![];
+        v.extend_from_slice(
+            &Insn {
+                opcode: 0x03,
+                operand_b: 3,
+                operand_w: 0xFF42,
+            }
+            .encode(),
+        );
+        v.extend_from_slice(&[0u8; 4]);
+        v
+    };
+    world.run_actor_bytecode(&bc).unwrap();
+    assert_eq!(world.actors[3].field_1d, 0x42);
+}
+
+#[test]
+fn move_vm_step_writes_world_state() {
+    let mut world = World::new();
+    world.actors[0].active = true;
+    // Bytecode: WORLD_SET (op 0x07) x=100, y=50, z=10, then HALT.
+    let bc: Vec<u16> = vec![0x0007, 100, 50, 10, 0x0008];
+    let res = world.step_move_vm(0, &bc);
+    // First step is WORLD_SET (Advance), then we'd need to call again for HALT.
+    assert!(matches!(res, vm::move_vm::StepResult::Advance));
+    assert_eq!(world.actors[0].move_state.world_x, 100);
+    assert_eq!(world.actors[0].move_state.world_y, 50);
+}
+
+#[test]
+fn world_tick_in_battle_mode_runs_state_machine() {
+    let mut world = World::new();
+    world.mode = SceneMode::Battle;
+    // Mark all actors alive so end-of-action doesn't immediately wipe.
+    for a in &mut world.actors {
+        a.battle.liveness = 1;
+    }
+    world.battle_ctx.action_state =
+        legaia_engine_battle_vm::battle_action::ActionState::Begin.as_byte();
+    world.battle_ctx.queued_action = 5;
+    let out = world.tick();
+    assert!(matches!(out, Some(StepOutcome::Transition { .. })));
+    assert_eq!(
+        world.battle_ctx.action_state,
+        legaia_engine_battle_vm::battle_action::ActionState::PreActionWait.as_byte()
+    );
+}
+
+#[test]
+fn world_tick_in_title_mode_returns_none() {
+    let mut world = World::new();
+    world.mode = SceneMode::Title;
+    let out = world.tick();
+    assert!(out.is_none());
+    assert_eq!(world.frame, 1);
+}
+
+#[test]
+fn next_rng_is_deterministic() {
+    let mut a = World::new();
+    let mut b = World::new();
+    let seq_a: Vec<_> = (0..10).map(|_| a.next_rng()).collect();
+    let seq_b: Vec<_> = (0..10).map(|_| b.next_rng()).collect();
+    assert_eq!(seq_a, seq_b);
+    // And not all zero.
+    assert!(seq_a.iter().any(|&x| x != 0));
+}
+
+#[test]
+fn next_rand_is_the_bios_shaped_draw() {
+    // `World::next_rand` is BIOS `rand()`'s shape over the world stream:
+    // the high half of the state, never above 0x7FFF, never negative as i32.
+    let mut a = World::new();
+    let mut b = World::new();
+    for _ in 0..256 {
+        let r = a.next_rand();
+        assert_eq!(r, (b.next_rng() >> 16) & 0x7FFF);
+        assert!(r <= 0x7FFF);
+    }
+    // The raw state's low bit strictly alternates (period 2); the shaped
+    // draw's low bit must not, or every `rand & 1` coin flip is a toggle.
+    let mut w = World::new();
+    let raw: Vec<u32> = (0..64).map(|_| w.next_rng() & 1).collect();
+    assert!(raw.windows(2).all(|p| p[0] != p[1]));
+    let mut w = World::new();
+    let shaped: Vec<u32> = (0..64).map(|_| w.next_rand() & 1).collect();
+    assert!(shaped.windows(2).any(|p| p[0] == p[1]));
+}
+
+#[test]
+fn battle_party_wipe_signals_end_via_world() {
+    let mut world = World::new();
+    world.mode = SceneMode::Battle;
+    // Kill all party. `max_hp > 0` marks each slot SEATED (a wipe means "a
+    // seated party with nobody standing", not "no party" - the wipe scan
+    // ignores hollow slots; see `BattleActionHost::slot_seated`).
+    for i in 0..3 {
+        world.actors[i].battle.max_hp = 1;
+        world.actors[i].battle.liveness = 0;
+    }
+    // Mark monsters alive.
+    for i in 3..8 {
+        world.actors[i].battle.liveness = 1;
+    }
+    world.battle_ctx.action_state =
+        legaia_engine_battle_vm::battle_action::ActionState::EndOfAction.as_byte();
+    let out = world.tick();
+    assert_eq!(out, Some(StepOutcome::BattleComplete));
+    // `tick` drives the battle to resolution unconditionally (see
+    // `frame_tick.rs`'s Battle arm) - but not on the signal frame. Retail's
+    // tick stops stepping the action SM once `DAT_8007BD71 == 0xFE` and runs
+    // the results sequencer `FUN_8004E568` instead; a wipe lands on its
+    // annihilated arm - the loss window, the `0x100` results hold, the
+    // exit fade with the phase halfword seeded at 2, then the `0x43` exit
+    // gate - before `finish_battle` folds the MAIN INIT game-over
+    // (`world::battle::victory`).
+    assert!(
+        world.battle_end_sequence_active(),
+        "the annihilated arm is armed on the signal frame"
+    );
+    assert!(!world.game_over, "nothing resolves before the exit gate");
+    assert_eq!(world.mode, SceneMode::Battle);
+    let mut resolved_at = None;
+    for i in 1..=(0x100 + 0x43 + 8) {
+        world.tick();
+        if world.game_over {
+            resolved_at = Some(i);
+            break;
+        }
+    }
+    assert_eq!(
+        resolved_at,
+        Some(
+            usize::from(World::VICTORY_RESULTS_HOLD_FRAMES)
+                + usize::from(World::VICTORY_EXIT_PHASE)
+                - usize::from(World::VICTORY_FADE_PHASE_SEED)
+        ),
+        "results hold + exit-fade phase walk, in vsyncs (retail: 321 from the results frame)"
+    );
+    // Then the cause is consumed by `finish_battle`: `battle_end` clears,
+    // `game_over` latches, and the wipe hold parks the world in Battle mode
+    // so hosts freeze on the final battle frame (retail holds the wipe frame
+    // while mode 22 CARD INIT streams the menu overlay). Read the *effect*
+    // of the wipe, not the transient cause byte.
+    assert_eq!(world.battle.end, None, "the cause is consumed on resolve");
+    assert!(world.game_over, "a party wipe raises game over");
+    assert!(world.game_over_hold, "the field restore is deferred");
+    assert_eq!(
+        world.mode,
+        SceneMode::Battle,
+        "the hold keeps the battle scene up for the frozen frame"
+    );
+    // The host's GameOverSession resolves -> the deferred restore runs.
+    world.resolve_game_over_hold();
+    assert!(!world.game_over_hold);
+    assert_eq!(
+        world.mode,
+        SceneMode::Field,
+        "battle mode is left once the hold resolves"
+    );
+}
+
+/// The cause byte itself, read at the step that raises it - the half the
+/// test above can no longer observe now that `tick` resolves the battle.
+#[test]
+fn battle_party_wipe_raises_party_wipe_cause_on_the_step() {
+    let mut world = World::new();
+    world.mode = SceneMode::Battle;
+    for i in 0..3 {
+        // Seated (max_hp > 0) but dead - see the sibling test above.
+        world.actors[i].battle.max_hp = 1;
+        world.actors[i].battle.liveness = 0;
+    }
+    for i in 3..8 {
+        world.actors[i].battle.liveness = 1;
+    }
+    world.battle_ctx.action_state =
+        legaia_engine_battle_vm::battle_action::ActionState::EndOfAction.as_byte();
+    assert_eq!(world.step_battle(), StepOutcome::BattleComplete);
+    assert_eq!(world.battle.end, Some(BattleEndCause::PartyWipe));
+}
+
+#[test]
+fn ensure_actor_is_idempotent_and_writes_default_pos() {
+    let mut world = World::new();
+    world.ensure_actor(2, ActorVmPosition::new(7, 11));
+    assert!(world.actors[2].active);
+    assert_eq!(world.actors[2].default_pos, ActorVmPosition::new(7, 11));
+    // Calling again with new pos updates it but doesn't reset the actor.
+    world.actors[2].field_1d = 0xAB;
+    world.ensure_actor(2, ActorVmPosition::new(13, 17));
+    assert_eq!(world.actors[2].default_pos, ActorVmPosition::new(13, 17));
+    assert_eq!(world.actors[2].field_1d, 0xAB);
+}
+
+#[test]
+fn effect_pool_follows_retail_spawn_cadence() {
+    // Catalog: effect 0 = two spawn records, each arming a 2-frame delay
+    // (2 << 3 = 16 in the 5.3 wait counter); anim batch 0 = one frame with
+    // a long hold so the seeded children persist.
+    let script = vm::effect_vm::EffectScript {
+        child_count: 2,
+        flags: 0,
+        spread: 0,
+        body: vec![],
+    };
+    let recs = vec![
+        vm::effect_vm::ChildSprite {
+            sprite_id: 0,
+            delay: 2,
+            ..Default::default()
+        };
+        2
+    ];
+    let anims = vec![vm::effect_vm::AnimBatch {
+        flags: 0,
+        frames: vec![vm::effect_vm::AnimFrame {
+            atlas_index: 0,
+            timing: [30, 0, 0, 0, 0],
+        }],
+    }];
+    let mut world = World::new();
+    world.effect_catalog =
+        vm::effect_vm::EffectCatalog::from_parts(vec![(script, recs)], vec![], anims);
+    world.try_spawn_effect(0, [0, 0, 0], 0);
+
+    // Tick 1: record 0 consumed (one child seeded), wait armed to 16.
+    world.tick_effects();
+    assert_eq!(world.effect_pool.master_slots[0].spawn_cursor, 1);
+    assert_eq!(world.effect_pool.master_slots[0].state, 16);
+    assert_eq!(world.effect_pool.active_child_count(), 1);
+    // Ticks 2-3: 5.3 countdown (16 -> 8 -> 0), no spawn.
+    world.tick_effects();
+    assert_eq!(world.effect_pool.master_slots[0].state, 8);
+    world.tick_effects();
+    assert_eq!(world.effect_pool.master_slots[0].state, 0);
+    assert_eq!(world.effect_pool.master_slots[0].spawn_cursor, 1);
+    // Tick 4: wait was zero -> final record consumed, master frees itself;
+    // the two children live on through their animation.
+    world.tick_effects();
+    assert_eq!(world.effect_pool.master_slots[0].child_count, 0);
+    assert_eq!(world.effect_pool.active_child_count(), 2);
+}
+
+#[test]
+fn world_tick_in_field_mode_steps_field_vm() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    // Bytecode: 0x37 YIELD. Should set ctx.flags |= 0x400 + advance PC
+    // past the yield.
+    world.load_field_script(vec![0x37, 0x00]);
+    let _ = world.tick();
+    assert_eq!(world.field_ctx.flags & 0x400, 0x400, "halt bit set");
+    assert!(
+        world.field_pc > 0,
+        "field_pc should advance after yield, got {}",
+        world.field_pc
+    );
+}
+
+#[test]
+fn world_tick_field_mode_no_bytecode_is_noop() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    // No bytecode loaded. Tick should not panic and should not advance
+    // field_pc.
+    let _ = world.tick();
+    assert_eq!(world.field_pc, 0);
+}
+
+/// The play clock is one law for every host (`World::tick_play_clock`): whole
+/// seconds by delta against a high-water mark, restarted by New Game. The
+/// browser page once reset only its origin on New Game, so after a second New
+/// Game the clock stood still until the wall clock passed the old mark.
+#[test]
+fn play_clock_counts_by_delta_and_restarts_on_new_game() {
+    let mut world = World::new();
+    world.tick_play_clock(1000.0);
+    assert_eq!(
+        world.clock.play_time_seconds, 0,
+        "the first reading is the origin"
+    );
+    world.tick_play_clock(1002.5);
+    assert_eq!(world.clock.play_time_seconds, 2);
+    world.tick_play_clock(1002.9);
+    assert_eq!(world.clock.play_time_seconds, 2, "whole seconds only");
+    // A loaded save's total is kept: the clock adds deltas, never assigns.
+    world.clock.play_time_seconds = 3600;
+    world.tick_play_clock(1004.0);
+    assert_eq!(world.clock.play_time_seconds, 3602);
+
+    // New Game after a long session: the next reading is a fresh origin, and
+    // the one after it counts at once rather than waiting out the old mark.
+    world.tick_play_clock(5000.0);
+    world.begin_new_game();
+    assert_eq!(world.clock.play_time_seconds, 0);
+    world.tick_play_clock(5010.0);
+    assert_eq!(world.clock.play_time_seconds, 0);
+    world.tick_play_clock(5013.0);
+    assert_eq!(world.clock.play_time_seconds, 3);
+}
+
+/// A host that stops reading - a paused or backgrounded page, a minimised
+/// window - is not playing: the gap counts nothing, and the clock picks up
+/// from where it stood.
+#[test]
+fn play_clock_does_not_count_a_stalled_host() {
+    let mut world = World::new();
+    world.tick_play_clock(100.0);
+    for i in 1..=30 {
+        world.tick_play_clock(100.0 + f64::from(i) * 0.1);
+    }
+    assert_eq!(world.clock.play_time_seconds, 3);
+    // An hour with no reading, then play resumes.
+    world.tick_play_clock(3703.0);
+    assert_eq!(
+        world.clock.play_time_seconds, 3,
+        "the stall is not play time"
+    );
+    for i in 1..=20 {
+        world.tick_play_clock(3703.0 + f64::from(i) * 0.1);
+    }
+    assert_eq!(world.clock.play_time_seconds, 5);
+}

@@ -1,0 +1,192 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">formats</a> &middot; data_field streaming format</div>
+  <h1>DATA_FIELD streaming format <span class="tag tag-done">Confirmed</span></h1>
+  <p class="lede">When the game loads a scene or a battle effect it usually needs several different things at once - a texture, a mesh, an animation - and it wants to read them off the disc in one go. DATA_FIELD is the container that does that: a stream of typed <em>chunks</em>, each a 4-byte header (what it is, how long it is) followed by raw data, read one after another until a terminator. The game hands each chunk to the <a href="asset-type.html">asset-type dispatcher</a>, which routes it to the right format handler.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Magic</dt><dd>none - the first <code>u32</code> is already a chunk header (type byte in the top 8 bits)</dd>
+    <dt>Where on disc</dt><dd>34 <code>PROT.DAT</code> entries strict-validate as class <code>data_field_streaming</code>: the <code>other5</code> character/effect run (1204..1219) and a family of scene bundles</dd>
+    <dt>Parser</dt><dd><code>crates/container-formats/src/lib.rs::parse_streaming</code>; <code>asset scan-stream</code> / <code>asset extract</code></dd>
+    <dt>Confidence</dt><dd>Confirmed - consumer <code>FUN_8002541C</code>, the <code>0x14</code> (DATA_FIELD) branch, feeding <code>FUN_8001F05C</code> with <code>copy_only=1</code></dd>
+    <dt>Used by</dt><dd><a href="../subsystems/asset-loader.html">asset loader</a>, <a href="../subsystems/battle.html">battle scene loader</a>, <a href="../characters.html">characters page</a> (battle-form meshes + atlases)</dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="overview">
+  <h2>Overview</h2>
+  <p>The walker passes every chunk through the dispatcher with <code>copy_only=1</code>, so chunks are always uncompressed - the container trades disc space for a load path with no decompression step. Implementation: <code>crates/container-formats/src/lib.rs::parse_streaming</code>.</p>
+  <aside class="notice">
+    <div class="notice-title">Scope note</div>
+    <p>This page covers the <em>typed-chunk streaming</em> shape that <code>FUN_8002541C</code> consumes - not the wider question of "what does the per-scene CDNAME block actually carry?" (a CDNAME block is the run of consecutive <code>PROT.DAT</code> entries that <a href="cdname.html"><code>CDNAME.TXT</code></a> assigns to one scene). Per-scene field bundles use multiple shapes; the slot map at the end identifies which shapes show up where.</p>
+  </aside>
+</section>
+
+<section class="doc-section" id="layout">
+  <h2>Layout</h2>
+  <p>A stream is a chain of chunks with no count up front - each header says how far to the next one:</p>
+  <div class="byte-map" role="img" aria-label="A DATA_FIELD stream: header, chunk 0 data, header, chunk 1 data, more chunks, a terminator header whose low 24 bits are zero, then the last-sector fill (the trailer)">
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+0</span><span class="bm-name">hdr</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell" style="--w:6"><span class="bm-off">+4</span><span class="bm-name">chunk 0 data (e.g. TIM)</span><span class="bm-size">size bytes</span></div>
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+4+(size&amp;~3)</span><span class="bm-name">hdr</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell" style="--w:6"><span class="bm-off">&hellip;</span><span class="bm-name">chunk 1 data (e.g. TMD2)</span><span class="bm-size">size bytes</span></div>
+    <div class="bm-cell bm-dim" style="--w:2"><span class="bm-off">&hellip;</span><span class="bm-name">more chunks</span><span class="bm-size"></span></div>
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">last</span><span class="bm-name">terminator</span><span class="bm-size">low 24 bits = 0</span></div>
+    <div class="bm-cell bm-pad" style="--w:3"><span class="bm-off">after</span><span class="bm-name">trailer</span><span class="bm-size">sector fill, unread</span></div>
+  </div>
+  <figure class="diagram">
+    <svg viewBox="0 0 720 176" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="df-fig-title">
+      <title id="df-fig-title">A DATA_FIELD stream being walked: each 4-byte header carries a type byte and a size, the dispatcher routes the data that follows by type, the walker steps over it to the next header, and a header with size zero ends the stream.</title>
+      <defs><marker id="df-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <text class="dg-edge-label" x="20" y="20">one stream, read front to back (type byte shown in each header)</text>
+      <rect class="dg-node-accent" x="20" y="30" width="60" height="44"/><text class="dg-label" x="50" y="49">hdr</text><text class="dg-sub" x="50" y="65">0x00</text>
+      <rect class="dg-node" x="80" y="30" width="130" height="44"/><text class="dg-label" x="145" y="49">TIM</text><text class="dg-sub" x="145" y="65">size bytes</text>
+      <rect class="dg-node-accent" x="210" y="30" width="60" height="44"/><text class="dg-label" x="240" y="49">hdr</text><text class="dg-sub" x="240" y="65">0x09</text>
+      <rect class="dg-node" x="270" y="30" width="130" height="44"/><text class="dg-label" x="335" y="49">TMD2</text><text class="dg-sub" x="335" y="65">size bytes</text>
+      <rect class="dg-node-accent" x="400" y="30" width="60" height="44"/><text class="dg-label" x="430" y="49">hdr</text><text class="dg-sub" x="430" y="65">0x0B</text>
+      <rect class="dg-node" x="460" y="30" width="130" height="44"/><text class="dg-label" x="525" y="49">MOVE2</text><text class="dg-sub" x="525" y="65">size bytes</text>
+      <rect class="dg-node-warn" x="590" y="30" width="110" height="44"/><text class="dg-label" x="645" y="49">hdr</text><text class="dg-sub" x="645" y="65">size = 0</text>
+      <path class="dg-edge" d="M50 74 V110" marker-end="url(#df-arrow)"/>
+      <path class="dg-edge" d="M240 74 V110" marker-end="url(#df-arrow)"/>
+      <path class="dg-edge" d="M430 74 V110" marker-end="url(#df-arrow)"/>
+      <path class="dg-edge" d="M645 74 V110" marker-end="url(#df-arrow)"/>
+      <rect class="dg-node" x="20" y="112" width="560" height="46" rx="5"/>
+      <text class="dg-label" x="300" y="132">asset-type dispatcher</text>
+      <text class="dg-sub" x="300" y="148">routes each chunk by its type byte; data is copied, never decompressed</text>
+      <rect class="dg-node" x="590" y="112" width="110" height="46" rx="5"/>
+      <text class="dg-label" x="645" y="132">stop</text>
+      <text class="dg-sub" x="645" y="148">end of stream</text>
+    </svg>
+    <figcaption>There is no count and no index: the only way to find chunk <em>n</em> is to walk the <em>n</em> headers before it. The example is the common three-chunk character stream (texture, mesh, animation).</figcaption>
+  </figure>
+  <p>Every header is the dispatcher's own packed word, stored little-endian:</p>
+  <div class="byte-map" role="img" aria-label="Chunk header: three size bytes then the type byte">
+    <div class="bm-cell" style="--w:3"><span class="bm-off">+0x00</span><span class="bm-name">size (low 24 bits)</span><span class="bm-size">u24</span></div>
+    <div class="bm-cell bm-accent" style="--w:1"><span class="bm-off">+0x03</span><span class="bm-name">type</span><span class="bm-size">u8</span></div>
+  </div>
+  <table>
+    <thead><tr><th>Offset</th><th>Size</th><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>+0x00</code></td><td>u32</td><td><code>type_size</code></td><td><code>(type_byte &lt;&lt; 24) | (size_bytes &amp; 0x00FFFFFF)</code>; <code>type_byte</code> per the <a href="asset-type.html">asset type table</a></td></tr>
+      <tr><td><code>+0x04</code></td><td><code>size_bytes</code></td><td>data</td><td>the raw asset, uncompressed</td></tr>
+      <tr><td><code>+0x04 + (size &amp; ~3)</code></td><td>u32</td><td>next <code>type_size</code></td><td>header + size truncated to a 4-byte boundary; sizes are 4-aligned in practice</td></tr>
+      <tr><td>last</td><td>u32</td><td>terminator</td><td>any header whose low 24 bits are zero</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="doc-section" id="what-s-in-the-wild">
+  <h2>What's in the wild</h2>
+  <p><code>asset scan-stream</code> strict-validates 34 PROT entries (class <code>data_field_streaming</code>), in two families.</p>
+  <h3 id="character-effect-streams">Character / effect streams</h3>
+  <p>The <code>other5</code> run, entries 1204..1219. The common shape is three single-asset chunks:</p>
+<div class="byte-map" role="img" aria-label="Typical other5 entry: a TIM chunk, a TMD2 chunk, a MOVE2 chunk, then the terminator">
+    <div class="bm-cell bm-accent" style="--w:4"><span class="bm-off">chunk 0</span><span class="bm-name">TIM - sprite atlas / texture</span><span class="bm-size">type 0x00 &middot; magic 0x10</span></div>
+    <div class="bm-cell bm-accent" style="--w:4"><span class="bm-off">chunk 1</span><span class="bm-name">TMD2 - one Legaia TMD</span><span class="bm-size">type 0x09 &middot; magic 0x80000002</span></div>
+    <div class="bm-cell bm-accent" style="--w:4"><span class="bm-off">chunk 2</span><span class="bm-name">MOVE2 - animation data</span><span class="bm-size">type 0x0B &middot; magic 0x08</span></div>
+    <div class="bm-cell bm-dim" style="--w:2"><span class="bm-off">end</span><span class="bm-name">terminator</span><span class="bm-size">u32</span></div>
+  </div>
+  <p>The two heads of the run are homogeneous instead: <code>1204</code> is five <code>TMD2</code> chunks (the battle-form party meshes used by the Baka Fighter minigame and as the default-equipment sibling pack - the in-battle player meshes themselves are assembled from the <a href="battle-data-pack.html"><code>PLAYER1..4</code> files</a>) and <code>1205</code> is eight <code>TIM</code> chunks of <code>0x8220</code> bytes each (their atlases) - which is what makes the atlas stride <code>0x8224</code>, chunk header included.</p>
+  <h3 id="scene-bundles">Scene bundles</h3>
+  <p><code>MAN / MES / MOVE / VDF</code>, four chunks (<code>dolk2</code>, <code>rikuroa</code>, <code>rikuroa2</code>, <code>rayman</code>, <code>station</code>, <code>taiku</code>, <code>taiku2</code>, <code>doman</code>, <code>nilboa2</code>, <code>edbalden</code>, <code>eddoman</code>). Shorter variants drop the trailing <code>VDF</code> (<code>balden2</code>, <code>ropeway2</code>) or lead with a bare <code>TMD</code> where a <code>MAN</code> would sit (<code>balden</code>, <code>bubu1</code>, <code>edbubu</code>). Two entries are neither family: <code>init_data</code> is <code>TIM_LIST + TMD</code>, and <code>0890_sound_data2</code> is two <code>TIM</code>s.</p>
+  <p>The chunk layouts are <strong>single assets</strong> in the <code>other5</code> family (one TIM, one TMD2, one MOVE2), not packs. Other clusters do use pack-shaped TIM_LIST / TMD chunks; the <a href="pack.html">pack format</a> handles that case.</p>
+</section>
+
+<section class="doc-section" id="trailer-data">
+  <h2>Trailer data</h2>
+  <p>Every clean stream ends inside the last 2048-byte sector of its entry, and the bytes from the terminator to the sector boundary are what <code>asset extract</code> keeps as <code>_trailer.bin</code>. The walker stops at the terminator and reads none of them. They are sector fill: across all 34 streams the trailer is shorter than a sector and zero, except in entry 1208, whose fill carries eight stray bytes (<code>78 FD 00 00 01 00 0D 00</code> at <code>0xFD70</code>) that nothing is known to read.</p>
+</section>
+
+<section class="doc-section" id="related-shapes">
+  <h2>Related shapes</h2>
+  <ul class="bullets">
+    <li>The <a href="scene-bundles.html">scene-TMD-prefixed streaming</a> shape is structurally similar but the leading chunk has no <code>[u32 type_size]</code> header and the inner content is a bare TMD instead of a TIM.</li>
+    <li>The <a href="scene-bundles.html">scene-VAB-prefixed streaming</a> shape uses the same chunk0-header trick but with VAB content.</li>
+    <li><a href="pack.html">Pack format</a> lives <em>inside</em> TIM_LIST / TMD chunks when the chunk's data is a pack rather than a single asset.</li>
+    <li>One entry (extraction <code>0892</code>) matches the <code>data_field_truncated</code> detector - three clean leading chunks, then an over-large fourth header - and the match is an artefact. The entry is an <a href="pack.html">container-formats::pack</a> (<code>count = 2</code>, word offsets <code>[3, 0x208B]</code>), and those "chunks" are the pack's own header words read as chunk headers. Mode-22 <code>CARD INIT</code> (<code>FUN_8002574C</code>) walks it as a pack and uploads each member through <code>FUN_800198E0</code>. See <a href="#card-font-pack">the card font pack</a>.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="card-font-pack">
+  <h2>Entry 0892 (<code>card_data</code>) is a pack, not a truncated stream</h2>
+  <p>Extraction entry <code>0892</code> is a two-member <a href="pack.html">container-formats::pack</a> of 4bpp TIMs, loaded once per memory-card-screen entry. The "12 MB LZS container" figure that once stood against it came from the superseded declared span (<code>toc[p+5] - toc[p+3] + 4</code> = 5977 sectors); the entry is 33 sectors, 67,584 bytes.</p>
+  <h3>What the runtime does</h3>
+  <table>
+    <thead><tr><th>Address</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x800257D0</code></td><td><code>jal 0x80017888</code>, <code>a1 = 0x19000</code> - allocate the staging buffer</td></tr>
+      <tr><td><code>0x800257DC</code></td><td><code>lh v1,-0x473e(v1)</code> - the dev/retail flag <code>_DAT_8007B8C2</code></td></tr>
+      <tr><td><code>0x800257F4</code></td><td>dev leg: <code>jal 0x8003e6bc</code>, the by-name path opener</td></tr>
+      <tr><td><code>0x8002580C</code></td><td>retail leg: <code>li a0,0x37e</code> then <code>jal 0x8003eb98</code>. Raw TOC <code>0x37E</code> is extraction <code>0892</code> under the <a href="cdname.html">+2 correction</a></td></tr>
+      <tr><td><code>0x8002581C..0x80025850</code></td><td>the pack walk: <code>count = *buf</code>, then <code>FUN_800198E0(buf + word_offsets[i] * 4)</code> per member</td></tr>
+      <tr><td><code>0x80025858</code></td><td><code>jal 0x80017b94</code> - free the buffer; the members live only in VRAM</td></tr>
+    </tbody>
+  </table>
+  <p>The entry-context selector is <code>gp+0x7E8</code> (<code>0x8007BB00</code>): <code>0</code> skips the block, <code>1</code> takes the disc load, and any other value takes a third arm that <code>MoveImage</code>s the same VRAM footprint back from a parked copy. Every writer of the slot stores <code>1</code> and the menu overlay clears it to <code>0</code>, so no retail path reaches that third arm - but its inverse is live: the menu overlay parks <code>(0,475) 256&times;1</code> to <code>(0,492)</code> and <code>(320,256) 128&times;256</code> to <code>(704,0)</code> on the way into game mode <code>0x1A</code>.</p>
+  <h3>The two members</h3>
+  <table>
+    <thead><tr><th>Member</th><th>Byte offset</th><th>CLUT rect</th><th>Image rect</th><th>Page</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td><code>0x0C</code></td><td><code>(0, 475) 16&times;16</code></td><td><code>(320, 256) 64&times;256</code></td><td>256&times;256 px</td></tr>
+      <tr><td>1</td><td><code>0x822C</code></td><td><code>(0, 475) 16&times;16</code></td><td><code>(384, 256) 64&times;256</code></td><td>256&times;256 px</td></tr>
+    </tbody>
+  </table>
+  <p>Together they tile VRAM <code>(320..447, 256..511)</code> - exactly the rect both <code>MoveImage</code> pairs move. The 948 bytes past member 1 are unreferenced tail slack.</p>
+  <h3>The content: a JIS X 0208 level-1 kanji font</h3>
+  <p>The CLUT block is identical in both members and is not an ordinary palette bank. Rows <code>0..3</code> hold the index patterns <code>0101&hellip;</code>, <code>0011&hellip;</code>, <code>00001111&hellip;</code> and <code>00000000&nbsp;11111111</code> against one ink, and rows <code>4..7</code> repeat them against a darker ink - each row selects <strong>one bit of the 4bpp index</strong>. The texture is a 1bpp bitmap packed four bit-planes deep, and a draw picks its plane by CLUT row. Rows <code>8..15</code> are ordinary 16-colour palettes for other content on those rows.</p>
+  <p>Per plane the grid is a 12-pixel pitch with an 11&times;11 ink box: columns and rows <code>11, 23, &hellip;, 239</code> carry no ink in any plane and nothing is inked past 238. That is 20&times;20 = 400 cells per plane, 4 planes per member, 8 planes in all - seven full and the last inked through cell 164, for <strong>2965 inked cells</strong>, exactly the JIS X 0208 level-1 kanji count. Plane 0 reads in level-1 ku-ten order, so a glyph's cell is <code>plane = g / 400</code>, <code>row = (g % 400) / 20</code>, <code>col = g % 20</code>.</p>
+  <p>Which routine samples the page? <strong>Nothing does</strong>: the page is loaded, parked and never drawn in this build. A GPU-FIFO watch at card-screen entry (mode <code>0x16 &rarr; 0x17</code>) sees no primitive sample it (<a href="../reference/re-settled-threads.html">settled</a>), and the static evidence agrees. A sampler would have to carry two constants, and the members' headers pin both: 4bpp pages at <code>(320, 256)</code> and <code>(384, 256)</code> give tpage ids <code>0x15</code> / <code>0x16</code>, and picking a bit-plane by CLUT row gives a CBA of <code>0x76C0 + plane &times; 0x40</code> (rows 475..482). Neither appears on the disc: sweeping <code>SCUS_942.54</code> and all 83 statically based overlay images for every one of the eight CLUT ids, as an instruction immediate <em>and</em> as a bare halfword (what a sprite-descriptor entry would be), finds only incidental instruction halves, and the only two <code>475</code> immediates disc-wide are the two <code>MoveImage</code> park/restore sites. The uploader leaves no handle behind either. The live path parks the page into the world-map texture region <code>(704, 0)</code> on the way out, and the save / load screen's own text is drawn from the <a href="dialog-font.html">dialog font</a> page at <code>(896, 0)</code>. The upload still runs on every mode-22 entry.</p>
+</section>
+
+<section class="doc-section" id="per-scene-field-bundles-what-s-still-open">
+  <h2>Per-scene field bundles</h2>
+  <p>The CDNAME block for a typical field/town scene (e.g. <code>town01</code>, <code>bubu1</code>) carries 8-12 PROT entries. Categorize (the sweep that classifies every archive entry by format) identifies several known shapes per block. In the retail block frame (see <a href="cdname.html#numbering-space">CDNAME &sect; numbering space</a>) the head of every scene block is fixed: slot 0 the scene's <a href="field-map.html"><code>.MAP</code></a>, slot 1 its <a href="scene-v12-table.html">v12 trigger sidecar</a>, slot 2 the event prescript, slot 3 the <a href="scene-bundles.html">scene asset table</a>. The table below is the categorize sweep's per-class view, whose slot columns predate that frame and are approximate.</p>
+  <table>
+    <thead><tr><th>Common slot</th><th>Class</th><th>Typical content</th></tr></thead>
+    <tbody>
+      <tr><td>0 / 1</td><td><code>SceneTmdStream</code> or <code>TmdSizePrefix</code></td><td>scene mesh (room geometry)</td></tr>
+      <tr><td>1 / 2</td><td><code>Pack</code> (TIM-pack)</td><td>scene textures / sprite atlas</td></tr>
+      <tr><td>2 / 3</td><td><code>SceneEventScripts</code></td><td>per-scene move-VM stager records (not field-VM bytecode)</td></tr>
+      <tr><td>3 / 4</td><td><code>MesContainer</code></td><td>dialog text</td></tr>
+      <tr><td>4 / 5</td><td><code>Pack</code> (ANM-pack)</td><td>per-actor animation sets</td></tr>
+      <tr><td>5..7</td><td><code>PochiFiller</code></td><td>reserved-but-unused dev fillers (one sector each)</td></tr>
+      <tr><td>6..8</td><td><code>SceneVabStream</code> (rare; only on scenes with custom audio)</td><td>per-scene VAB + SEQ</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Placed actors use their own scene's models.</strong> A placement's model byte below <code>0xF0</code> indexes the scene's TMD list, and one at or above it a global head slot (the player character pack). Across the 101 scene blocks with a MAN, every placement below <code>0xF0</code> resolves into its own block. The only exceptions are 20 placements in <code>other7</code>, an unused draft of <code>koin3</code>, whose model bytes run past its own TMD list.</p>
+  <p>The categorize sweep classifies every PROT entry to <em>something</em>; the items above are the residual edge. See <a href="../subsystems/engine.html">the engine page</a> for how scene loading consumes these shapes.</p>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <details class="disclosure">
+    <summary>Provenance: the consumer, the dispatcher hand-off, the corpus sweep</summary>
+    <div class="disclosure-body">
+  <table>
+    <thead><tr><th>Evidence</th><th>Address / test</th><th>What it proves</th></tr></thead>
+    <tbody>
+      <tr><td>Retail consumer</td><td><code>FUN_8002541C</code>, the <code>0x14</code> branch</td><td>The chunk walk: header split, <code>(size &amp; ~3) + 4</code> advance, zero-size terminator.</td></tr>
+      <tr><td>Dispatcher hand-off</td><td><code>FUN_8001F05C</code> called with <code>copy_only=1</code></td><td>Chunks are consumed uncompressed, one dispatcher call per chunk.</td></tr>
+      <tr><td>Corpus sweep</td><td><code>asset scan-stream</code> strict validation</td><td>The 34-entry census and the two family shapes above.</td></tr>
+    </tbody>
+  </table>
+    </div>
+  </details>
+  <p>Source of record: <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/formats/data-field.md" target="_blank" rel="noopener"><code>docs/formats/data-field.md</code></a>.</p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="pack.html">container-formats::pack</a>
+    <a href="asset-type.html">Asset-type dispatch</a>
+    <a href="asset-descriptor.html">Asset descriptor</a>
+    <a href="scene-bundles.html">Scene bundles</a>
+    <a href="battle-data-pack.html">Player battle files</a>
+    <a href="../subsystems/asset-loader.html">Asset loader</a>
+    <a href="../characters.html">Characters</a>
+  </div>
+</section>

@@ -1,0 +1,123 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">formats</a> &middot; pack format (inside tim_list and tmd chunks)</div>
+  <h1>Pack format (inside TIM_LIST and TMD chunks) <span class="tag tag-done">Confirmed</span></h1>
+  <p class="lede">The simplest way Legaia bundles several assets into one blob: a count, a table of offsets, then the assets packed back-to-back. When a scene needs a dozen textures or a handful of meshes at once, this is the shape they arrive in - the data payload of a TIM_LIST or TMD chunk inside a <a href="data-field.html">DATA_FIELD streaming</a> container. There is exactly one pack format on the disc; the "standalone TIM-pack" and the "field-pack" are this same pack read from behind a 4-byte chunk header, as the <a href="#distinction-from-the-standalone-tim-pack">last section</a> shows.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Magic</dt><dd>none - a bare <code>u32 count</code> opens the pack; identity comes from the enclosing chunk's type byte (<code>0x01</code> TIM_LIST or <code>0x02</code> TMD)</dd>
+    <dt>Where on disc</dt><dd>inside DATA_FIELD chunks in scene and effect entries of <code>PROT.DAT</code></dd>
+    <dt>Parser</dt><dd><code>legaia_container_formats::pack</code></dd>
+    <dt>Confidence</dt><dd>Confirmed - the type-<code>0x02</code> arm of the dispatcher <code>FUN_8001F05C</code> walks it and calls <code>FUN_80026B4C</code> per member</dd>
+    <dt>Used by</dt><dd><a href="../subsystems/asset-loader.html">asset loader</a>, <a href="../viewer.html">asset viewer</a></dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="overview">
+  <h2>Overview</h2>
+  <p>Inside a streaming chunk the bytes say nothing about what they are - the chunk header already said "a list of TIMs" or "a pack of meshes". So the pack itself is minimal: how many members, where each starts, then the members. Offsets count 4-byte words from the start of the pack data, and there is no per-pack magic.</p>
+</section>
+
+<section class="doc-section" id="layout">
+  <h2>Layout</h2>
+  <div class="byte-map">
+    <div class="bm-cell bm-accent" style="--w:4"><span class="bm-off">+0x00</span><span class="bm-name">count</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell bm-accent" style="--w:10"><span class="bm-off">+0x04</span><span class="bm-name">word_offset[count]</span><span class="bm-size">u32 &times; count</span></div>
+    <div class="bm-cell bm-dim" style="--w:14"><span class="bm-off">word_offset[0] &times; 4</span><span class="bm-name">members, back to back</span><span class="bm-size">to chunk end</span></div>
+  </div>
+  <p>Each <code>word_offset</code> counts 4-byte words from the start of <em>this pack's</em> data (not from the end of the table), and members sit on the 4-byte word grid with no other padding rule.</p>
+  <p>Sub-asset <code>i</code> lives at byte range <code>[word_offset[i] * 4 .. word_offset[i+1] * 4)</code>, with the last sub-asset ending at the chunk's end.</p>
+</section>
+
+<section class="doc-section" id="example">
+  <h2>Example</h2>
+  <p>A TIM_LIST chunk header followed by a 2-TIM pack (a TIM is the PlayStation's standard texture format):</p>
+<div class="byte-map">
+    <div class="bm-cell bm-dim" style="--w:4"><span class="bm-off">6c 02 01 01</span><span class="bm-name">chunk header: type 0x01 TIM_LIST, size 0x01026C</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell bm-accent" style="--w:4"><span class="bm-off">02 00 00 00</span><span class="bm-name">count = 2</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell bm-accent" style="--w:4"><span class="bm-off">03 00 00 00</span><span class="bm-name">offset[0] = 3 &rarr; byte 12</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell bm-accent" style="--w:4"><span class="bm-off">8b 20 00 00</span><span class="bm-name">offset[1] = 0x208B &rarr; byte 0x822C</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell" style="--w:8"><span class="bm-off">pack +12</span><span class="bm-name">TIM 0, then TIM 1</span><span class="bm-size">&hellip;</span></div>
+  </div>
+  <p>Word offset 3 is byte 12 - exactly the size of the count word plus the two-entry table, so the first member starts right after the header.</p>
+</section>
+
+<section class="doc-section" id="distinction-from-the-standalone-tim-pack">
+  <h2>One format, two readers</h2>
+  <p>A hex dump of a scene's texture entry looks like a second pack format: a marker byte <code>0x01</code> at <code>+3</code>, a count at <code>+4</code>, and member offsets that need an extra <code>+4</code>. It is not a second format. Those first four bytes are a DATA_FIELD chunk header, <code>(TIM_LIST &lt;&lt; 24) | payload_len</code>, and what follows is an ordinary pack. The older <code>prot::timpack</code> reader simply reads the pack with the header still attached, which is where both its marker test and its <code>+4</code> come from. The "field-pack" word <code>0x01059B84</code> is the same chunk header on town01's texture pack.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 720 246" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="pack-fig-title">
+      <title id="pack-fig-title">A streaming chunk holding a pack: a 4-byte chunk header, then the pack's count word, its word-offset table and its members. One reader starts at the pack, the other starts four bytes earlier at the chunk header, and both land on the same member bytes.</title>
+      <defs><marker id="pack-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <text class="dg-edge-label" x="20" y="24">one streaming chunk</text>
+      <rect class="dg-node-warn" x="20" y="34" width="120" height="50"/>
+      <text class="dg-label" x="80" y="55">chunk header</text>
+      <text class="dg-sub" x="80" y="72">type &lt;&lt; 24 | size</text>
+      <rect class="dg-node-accent" x="140" y="34" width="80" height="50"/>
+      <text class="dg-label" x="180" y="55">count</text>
+      <text class="dg-sub" x="180" y="72">u32</text>
+      <rect class="dg-node-accent" x="220" y="34" width="150" height="50"/>
+      <text class="dg-label" x="295" y="55">word_offset[ ]</text>
+      <text class="dg-sub" x="295" y="72">u32 x count</text>
+      <rect class="dg-node" x="370" y="34" width="110" height="50"/>
+      <text class="dg-label" x="425" y="63">member 0</text>
+      <rect class="dg-node" x="480" y="34" width="140" height="50"/>
+      <text class="dg-label" x="550" y="63">member 1</text>
+      <rect class="dg-node" x="620" y="34" width="80" height="50"/>
+      <text class="dg-label" x="660" y="63">...</text>
+      <path class="dg-edge" d="M250 84 V104 H372 V88" marker-end="url(#pack-arrow)"/>
+      <path class="dg-edge" d="M320 84 V114 H482 V88" marker-end="url(#pack-arrow)"/>
+      <text class="dg-edge-label" x="366" y="130" text-anchor="middle">member i starts word_offset[i] x 4 bytes after the count word</text>
+
+      <path class="dg-edge-dim" d="M140 160 V150 H700 V160"/>
+      <text class="dg-label" x="420" y="176">container-formats::pack - starts at the count word; member i at offset[i] x 4</text>
+      <path class="dg-edge-dim" d="M20 208 V198 H700 V208"/>
+      <text class="dg-label" x="360" y="224">prot::timpack - starts at the chunk header; member i at offset[i] x 4 + 4</text>
+    </svg>
+    <figcaption>One layout, two starting points. The extra <code>+4</code> in the older reader is the chunk header it did not step over; the "marker byte" it tests is that header's type.</figcaption>
+  </figure>
+  <table>
+    <thead><tr><th>Offset in the entry</th><th>Read as a chunk + pack</th><th>Read by <a href="tim-pack.html"><code>prot::timpack</code></a></th></tr></thead>
+    <tbody>
+      <tr><td><code>+0x00</code></td><td>chunk header; its high byte <code>0x01</code> is the TIM_LIST type</td><td>"magic" bytes; <code>byte[3] == 0x01</code> is the marker test</td></tr>
+      <tr><td><code>+0x04</code></td><td>pack <code>count</code></td><td><code>tim_num</code></td></tr>
+      <tr><td><code>+0x08</code></td><td>pack <code>word_offset[0]</code> &hellip;</td><td><code>word_index[0]</code> &hellip;</td></tr>
+      <tr><td>member <code>i</code></td><td><code>4 + word_offset[i] &times; 4</code></td><td><code>word_index[i] &times; 4 + 4</code> - the same byte</td></tr>
+    </tbody>
+  </table>
+  <p>Use <code>legaia_container_formats::pack</code> on a pack that starts at offset 0 (a chunk payload), and <code>prot::timpack</code> - or skip the 4-byte header first - on a whole chunk. <code>legaia_scene_formats::field_pack::scene_pack</code> locates the chunk-headered scene pack inside a CDNAME block. The former <a href="effect.html">effect bundle</a> (<code>0x02018B0C</code>) is not a different layout: it is this pack behind a type-<code>0x02</code> chunk header, carrying 29 TMDs.</p>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <p>The chunk dispatcher's type-0x02 arm walks the count and word-offset table and hands each member to the TMD handler, which consumes it at <code>word_offset[i] &times; 4</code> with no added constant.</p>
+  <details class="disclosure">
+    <summary>Provenance: the two routines</summary>
+    <div class="disclosure-body">
+  <table>
+    <thead><tr><th>Function</th><th>Address</th><th>What it proves</th><th>Dump</th></tr></thead>
+    <tbody>
+      <tr><td>Chunk dispatcher</td><td><code>FUN_8001F05C</code> (type-<code>0x02</code> arm)</td><td>Walks the count + word-offset table and hands each member to the TMD handler</td><td><code>funcs/8001f05c.txt</code></td></tr>
+      <tr><td>Per-member handler</td><td><code>FUN_80026B4C</code></td><td>Consumes one member at <code>word_offset[i] * 4</code>, no <code>+4</code> constant</td><td><code>funcs/80026b4c.txt</code></td></tr>
+    </tbody>
+  </table>
+    </div>
+  </details>
+  <p>Source of record: <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/formats/pack.md" target="_blank" rel="noopener"><code>docs/formats/pack.md</code></a>.</p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="tim-pack.html">prot::timpack</a>
+    <a href="field-pack.html">field-pack</a>
+    <a href="data-field.html">DATA_FIELD streaming</a>
+    <a href="asset-type.html">Asset-type dispatch</a>
+    <a href="tim.html">TIM</a>
+    <a href="tmd.html">TMD</a>
+    <a href="../subsystems/asset-loader.html">Asset loader</a>
+  </div>
+</section>

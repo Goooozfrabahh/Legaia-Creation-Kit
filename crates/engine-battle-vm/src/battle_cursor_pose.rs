@@ -1,0 +1,609 @@
+//! Five leaves of the battle overlay's shared "slot B" library: the
+//! living-actor cursor step, the three screen-element placement movers, and
+//! the tracked-widget pool teardown.
+//!
+//! Each routine's port tag sits on the item that implements it
+//! (`FUN_801D32BC`, `FUN_801D5718`, `FUN_801D57E8`, `FUN_801D5778`,
+//! `FUN_801D9AE8`), so each carries its own class - four wired, one
+//! replaced.
+//!
+//! REF: FUN_801D388C - the only retail caller of the three movers, and
+//! itself a further writer of the same placement table.
+//! REF: FUN_801D5854 - the inline record-41/42 move on that table.
+//!
+//! `FUN_801D32BC` is **wired**. It is the **command-input** cursor, not a
+//! turn order. Six `jal`s reach it, all in the battle overlay: the round
+//! reset `FUN_801D88CC` (`0x801D8910`, forward after seeding `ctx[+0x13]`
+//! and `ctx[+0x1F]` to `0xFF`) and the command-window controller
+//! `FUN_801D388C` - case `0x11` forward (`0x801D4128`), cases `0x10` and
+//! `0x21` backward (`0x801D4010`, `0x801D4750`), and a forward / backward
+//! pair in its shared tail (`0x801D5690`, `0x801D56A0`). The port's forward
+//! walk is retail's slot scan already (`World::next_member_owing_command`,
+//! the `FUN_801DB81C` / `FUN_801DBA04` ports); the **backward** step is
+//! this kernel, run by `World::step_back_battle_command` when the ring's
+//! cancel arm (`FUN_801D0748` `0x801D11B4`) finds a member behind the
+//! cursor - case `0x10` - and by `World::reselect_battle_commands` for case
+//! `0x21`, the commit-confirm screen's `Reselect` (`0x801D3054..0x801D30CC`),
+//! which steps back from the past-the-end index the forward walk leaves at
+//! `0x6E` onto the last member that can act.
+//!
+//! The placement-copy family is the **commit log**'s machinery
+//! (`crate::battle_commit_log`), and each routine's status sits on its own
+//! item:
+//!
+//! * `FUN_801D5718` ([`element_placement_land`]) and `FUN_801D57E8`
+//!   ([`element_placement_copy`]) are **wired**: the commit arms of
+//!   `FUN_801D388C` land every log element with the first, and the second
+//!   swaps the target plaque's content for the `All` / `All Allies` label
+//!   (`(dst 0x29, src 0x3D)` at `0x801D4414`, `(0x29, 0x3E)` at
+//!   `0x801D4434`). Both run over the scratch placement array
+//!   `battle_commit_log::commit_log_layout` stages, which the battle HUD
+//!   builder both hosts share reads each frame.
+//! * `FUN_801D5778` ([`element_placement_copy_remapped`]) is the log's
+//!   **launch**, and is **wired**: two identical loops (`0x801D50A0`,
+//!   `0x801D50F8`) over `i` in `0..3*ctx[+0x1F]` copy record `0x2B + i` into
+//!   `0x35 + i` with seat B one display width (`0x140`) left of seat A, and
+//!   open each clone as a gliding widget - the whole log sliding off the left
+//!   edge when the member leaves the ring for a sub-screen (item / magic
+//!   window, the `Auto | Command` prompt, the arts entry, the target cursor)
+//!   and back when they return. The round's Begin is **not** a launch. See
+//!   `crate::battle_commit_log::LogLaunch` for the step table.
+//!
+//! The array is the **screen-element placement table** at `0x80076C10`
+//! (`legaia_ui_formats::screen_elements`), which is disc data; the port stages
+//! only the records the log touches. This module used to call the array a
+//! per-actor animation-pose buffer - the record layout falsifies that:
+//! `FUN_801D5778` writes `dst[+0xA] = src[+0xA] - 0x140`, and `0x140` is the
+//! PSX display width, so the field it shifts is a screen X. "Pose slot" is
+//! still the right name for a *different* thing, the actor's animation-pose
+//! index (`battle_cue_group`, `charm_fix`, `docs/subsystems/battle.md`).
+//!
+//! `FUN_801D9AE8` is replaced rather than pending - it releases a `0x28`-slot
+//! tracked-widget pool, and no host is owed that call. Both of its arrays
+//! are *described* in the port - `crate::battle_value_readout` carries the
+//! same `ctx[+0x1074]` pointer table and `ctx[+0x11B4]` `0xC`-stride record
+//! as address constants - but a described offset is not a pool. No engine
+//! structure owns widget slots: the battle UI is rebuilt from world state
+//! every frame by the `engine-ui` draw-list builders, so no widget outlives
+//! the frame that drew it and nothing has a lifetime to end. That verdict
+//! rides on [`release_widget_pool`]'s own `REPLACED-BY:` marker.
+//!
+//! ## Why one module for five functions
+//!
+//! All five sit in the address band that every "slot B" overlay image carries
+//! verbatim - `overlay_battle_action`, `overlay_magic_capture`,
+//! `overlay_magic_level_up` and `overlay_muscle_dome` disassemble
+//! byte-identically at each of these VAs. (The `overlay_0897` image does
+//! **not**: at `0x801D57E8` it has a mid-function fragment with no prologue,
+//! which is a VA collision, not the same routine. Read the battle-side dumps
+//! for these, never the 0897 ones.)
+//!
+//! Provenance: `see ghidra/scripts/funcs/overlay_battle_action_801d32bc.txt`,
+//! `overlay_battle_action_801d57e8.txt`, `overlay_battle_action_801d5778.txt`,
+//! `overlay_battle_action_801d9ae8.txt`. Behaviour notes in
+//! `docs/subsystems/battle-action.md` and `docs/reference/functions.md`.
+
+// ---------------------------------------------------------------------------
+// FUN_801D32BC - living-actor cursor step
+// ---------------------------------------------------------------------------
+
+/// The status-word mask that makes an actor un-selectable: `+0x16E & 0xF84`.
+///
+/// Same mask the action-select scans use (`FUN_801DB81C` / `FUN_801DBA04`,
+/// ported in `battle_action::pool_ops`). `FUN_801D32BC` applies **only** this
+/// and the liveness halfword - unlike those two it does *not* consult the
+/// per-slot action-state byte, which is what makes it a distinct routine.
+pub const UNSELECTABLE_STATUS_MASK: u16 = 0xf84;
+
+/// Direction argument of `FUN_801D32BC`. Retail passes the raw word; any
+/// value other than `0` or `1` returns with the context untouched, which is
+/// why [`step_actor_cursor`] takes the enum and the caller decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorStep {
+    /// `FUN_801D32BC(0)` - scan upward from `cursor + 1`.
+    Forward,
+    /// `FUN_801D32BC(1)` - scan downward from `cursor - 1`.
+    Backward,
+}
+
+/// The four battle-context cursor bytes `FUN_801D32BC` rewrites.
+///
+/// | field | ctx offset | role |
+/// |---|---|---|
+/// | `active` | `+0x13` | active-actor index; also the scan's start point |
+/// | `latest` | `+0x20` | the index the last step landed on |
+/// | `previous` | `+0x21` | the index before that (`+0x21 = +0x20` on every step) |
+/// | `depth` | `+0x1F` | signed step counter, `+1` forward / `-1` backward |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ActorCursor {
+    /// ctx `+0x13`.
+    pub active: u8,
+    /// ctx `+0x20`.
+    pub latest: u8,
+    /// ctx `+0x21`.
+    pub previous: u8,
+    /// ctx `+0x1F`.
+    pub depth: u8,
+}
+
+/// One battle actor as this cursor reads it - the two halfwords the scan
+/// predicate touches and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CursorActor {
+    /// `+0x14C` liveness halfword. Zero = skip.
+    pub liveness: u16,
+    /// `+0x16E` status word. Any bit in [`UNSELECTABLE_STATUS_MASK`] = skip.
+    pub status: u16,
+}
+
+impl CursorActor {
+    /// The retail predicate: `+0x14C != 0 && (+0x16E & 0xF84) == 0`.
+    pub fn selectable(&self) -> bool {
+        self.liveness != 0 && (self.status & UNSELECTABLE_STATUS_MASK) == 0
+    }
+}
+
+/// Step the active-actor cursor to the next / previous selectable slot.
+/// `FUN_801D32BC`.
+///
+/// The scan walks the 8-slot battle actor pointer table at `DAT_801C9370`.
+/// Forward it starts at `active + 1` and stops on the first selectable slot
+/// **or** the first index `>= actor_count` (retail's `sltiu` bound is the
+/// actor count byte at ctx `+0x00`). Backward it starts at `active - 1` and
+/// stops on the first selectable slot **or** when the index wraps to `0xFF`.
+///
+/// Retail keeps the cursor in a 32-bit register and masks it to 8 bits both
+/// for the bound test and for the store, so the whole walk is exact `u8`
+/// wrapping arithmetic - reproduced here.
+///
+/// The bookkeeping writes happen on **every** call, including the exhausted
+/// case: `+0x21` takes the old `+0x20`, `+0x20` and `+0x13` take the landing
+/// index (which may be out of range), and `+0x1F` moves one step. Retail does
+/// not clamp any of them.
+///
+/// PORT: FUN_801D32BC (PROT 0898)
+///
+/// WIRED: `legaia_engine_core` `World::step_back_battle_command` (the ring's
+/// cancel arm) and `World::reselect_battle_commands` (the commit confirm's
+/// `Reselect`), both from the command session both hosts tick.
+pub fn step_actor_cursor(
+    cursor: &mut ActorCursor,
+    dir: CursorStep,
+    actor_count: u8,
+    actors: &[CursorActor],
+) {
+    let selectable = |i: u8| -> bool {
+        actors
+            .get(i as usize)
+            .map(CursorActor::selectable)
+            .unwrap_or(false)
+    };
+
+    let landing = match dir {
+        CursorStep::Forward => {
+            let mut n = cursor.active.wrapping_add(1);
+            while n < actor_count {
+                if selectable(n) {
+                    break;
+                }
+                n = n.wrapping_add(1);
+            }
+            n
+        }
+        CursorStep::Backward => {
+            let mut n = cursor.active.wrapping_sub(1);
+            if n != 0xff {
+                loop {
+                    if selectable(n) {
+                        break;
+                    }
+                    n = n.wrapping_sub(1);
+                    if n == 0xff {
+                        break;
+                    }
+                }
+            }
+            n
+        }
+    };
+
+    cursor.previous = cursor.latest;
+    cursor.latest = landing;
+    cursor.active = landing;
+    cursor.depth = match dir {
+        CursorStep::Forward => cursor.depth.wrapping_add(1),
+        CursorStep::Backward => cursor.depth.wrapping_sub(1),
+    };
+}
+
+// ---------------------------------------------------------------------------
+// FUN_801D57E8 / FUN_801D5778 - screen-element placement copy helpers
+// ---------------------------------------------------------------------------
+
+/// Byte stride of one record in the screen-element placement table at
+/// `0x80076C10`.
+pub const ELEMENT_PLACEMENT_STRIDE: usize = 0x18;
+
+/// The horizontal bias `FUN_801D5778` subtracts while re-mapping `+0x0A`.
+/// `0x140` = 320 = the PSX display width, i.e. the copy lands the clone one
+/// full screen to the left of its source.
+pub const ELEMENT_STAGING_X_BIAS: u16 = 0x140;
+
+/// One 24-byte record of the screen-element placement table at `0x80076C10`.
+///
+/// The two helpers only ever touch `+0x02`, `+0x04`, `+0x06`, `+0x0A`, `+0x0C`
+/// and `+0x14`; `+0x00`, `+0x08`, `+0x0E`, `+0x10` and `+0x12` are carried
+/// here so the record round-trips at its retail width but are deliberately
+/// left alone by both copies. `+0x14` holds the acting actor's `+0x1BC`
+/// animation-descriptor pointer, modelled here as an opaque handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ElementPlacement {
+    /// `+0x00` - never written by either helper.
+    pub f00: u16,
+    /// `+0x02`.
+    pub f02: u16,
+    /// `+0x04`.
+    pub f04: u16,
+    /// `+0x06`.
+    pub f06: u16,
+    /// `+0x08` - never written by either helper.
+    pub f08: u16,
+    /// `+0x0A`.
+    pub f0a: u16,
+    /// `+0x0C`.
+    pub f0c: u16,
+    /// `+0x0E` - never written by either helper.
+    pub f0e: u16,
+    /// `+0x10` - never written by either helper.
+    pub f10: u16,
+    /// `+0x12` - never written by either helper.
+    pub f12: u16,
+    /// `+0x14` - animation-descriptor handle.
+    pub anim: u32,
+}
+
+/// Straight partial clone of one placement record into another.
+/// `FUN_801D57E8`.
+///
+/// Copies five halfwords (`+0x02`, `+0x04`, `+0x06`, `+0x0A`, `+0x0C`) plus
+/// the word at `+0x14`. It is **not** a `memcpy`: the destination's `+0x00`,
+/// `+0x08`, `+0x0E`, `+0x10` and `+0x12` survive.
+///
+/// Out-of-range indices are a no-op here; retail would address past the array
+/// (both indices are scaled `* 0x18` with no bound check).
+///
+/// PORT: FUN_801D57E8
+///
+/// WIRED: `crate::battle_commit_log::stage_commit_row` (the all-target
+/// label swap), under the battle HUD builder both hosts draw.
+pub fn element_placement_copy(slots: &mut [ElementPlacement], dst: usize, src: usize) {
+    if dst >= slots.len() || src >= slots.len() {
+        return;
+    }
+    let s = slots[src];
+    let d = &mut slots[dst];
+    d.f02 = s.f02;
+    d.f04 = s.f04;
+    d.f06 = s.f06;
+    d.f0a = s.f0a;
+    d.f0c = s.f0c;
+    d.anim = s.anim;
+}
+
+/// Land one placement record's content at another's resting seat.
+/// `FUN_801D5718`.
+///
+/// ```text
+///   dst[+0x02] = src[+0x0A]
+///   dst[+0x04] = src[+0x0C]
+///   dst[+0x06] = src[+0x06]
+///   dst[+0x0A] = src[+0x0A]
+///   dst[+0x14] = src[+0x14]
+/// ```
+///
+/// Seat A takes the source's seat B, so the element starts where the source
+/// element rests; `+0x0C` is **not** written - the caller sets the landing
+/// row itself. Read from `0x801D5718..0x801D5774`.
+///
+/// PORT: FUN_801D5718
+///
+/// WIRED: `crate::battle_commit_log::stage_commit_row`, the commit log both
+/// hosts draw through `engine-ui`'s battle HUD builder.
+pub fn element_placement_land(slots: &mut [ElementPlacement], dst: usize, src: usize) {
+    if dst >= slots.len() || src >= slots.len() {
+        return;
+    }
+    let s = slots[src];
+    let d = &mut slots[dst];
+    d.f02 = s.f0a;
+    d.f04 = s.f0c;
+    d.f06 = s.f06;
+    d.f0a = s.f0a;
+    d.anim = s.anim;
+}
+
+/// Re-mapped clone of one placement record into another. `FUN_801D5778`.
+///
+/// Same array and stride as [`element_placement_copy`], but three of the six moves are
+/// permuted and one is biased:
+///
+/// ```text
+///   dst[+0x02] = src[+0x0A]
+///   dst[+0x04] = src[+0x0C]
+///   dst[+0x06] = src[+0x06]
+///   dst[+0x0A] = src[+0x0A] - 0x140
+///   dst[+0x0C] = src[+0x0C]
+///   dst[+0x14] = src[+0x14]
+/// ```
+///
+/// Note `dst[+0x02]` and `dst[+0x04]` take the *source's* `+0x0A` / `+0x0C`,
+/// so the pair that was the second point of the source record becomes the
+/// first point of the clone, and the clone's own second point is the same
+/// value shifted one screen width. The subtraction is `addiu`, i.e. wrapping
+/// 16-bit.
+///
+/// PORT: FUN_801D5778
+///
+/// WIRED: `crate::battle_commit_log::LogLaunch::x_offset` builds the launch
+/// clone with it - the commit log sliding off the left edge when the member
+/// leaves the ring for a sub-screen and back when they return - and the
+/// battle HUD builder both hosts share draws every row at that offset. The
+/// glide between the clone's two seats is `FUN_801D9BBC`'s linear step
+/// (`LogLaunch::step`).
+///
+/// REF: FUN_801D8DE8 (opens each clone as a gliding widget, mode `0` out / `1` in)
+pub fn element_placement_copy_remapped(slots: &mut [ElementPlacement], dst: usize, src: usize) {
+    if dst >= slots.len() || src >= slots.len() {
+        return;
+    }
+    let s = slots[src];
+    let d = &mut slots[dst];
+    d.f02 = s.f0a;
+    d.f04 = s.f0c;
+    d.f06 = s.f06;
+    d.f0a = s.f0a.wrapping_sub(ELEMENT_STAGING_X_BIAS);
+    d.f0c = s.f0c;
+    d.anim = s.anim;
+}
+
+// ---------------------------------------------------------------------------
+// FUN_801D9AE8 - tracked-widget pool teardown
+// ---------------------------------------------------------------------------
+
+/// Number of tracked-widget slots the teardown walks (`sltiu ..., 0x28`).
+pub const WIDGET_SLOTS: usize = 0x28;
+
+/// Number of words the teardown zeroes at `DAT_801C8FA0` after the walk.
+pub const WIDGET_SCRATCH_WORDS: usize = 0x10;
+
+/// One tracked-widget slot. Retail splits the record across two arrays with
+/// different strides - the `0xC`-stride record at ctx `+0x11B4` (whose `+0x00`
+/// is `tag` and `+0x03` is `live`) and the flat pointer array at ctx `+0x1074`
+/// - so the pairing by slot index is what this struct captures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WidgetSlot {
+    /// ctx `+0x11B7 + slot * 0xC`. Non-zero = this slot is tracked.
+    pub live: u8,
+    /// ctx `+0x11B4 + slot * 0xC`. Cleared alongside `live`.
+    pub tag: u8,
+    /// ctx `+0x1074 + slot * 4`. `None` models retail's null pointer.
+    pub widget: Option<WidgetHandle>,
+}
+
+/// The part of a tracked widget the teardown reads: the halfword at `+0x08`,
+/// which is the actor id handed to the shared effect trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WidgetHandle {
+    /// Widget `+0x08` - the actor id passed to `FUN_800319A8`.
+    pub actor_id: u16,
+}
+
+/// Release every tracked battle-UI widget and clear the per-battle scratch.
+/// `FUN_801D9AE8`.
+///
+/// Walks all `0x28` slots. A slot is released only when **both** its `live`
+/// flag is non-zero and its pointer is non-null - a live flag with a null
+/// pointer is left set, which is retail behaviour, not an oversight of this
+/// port. Each released slot yields its widget's `+0x08` actor id; the caller
+/// feeds those to the shared effect trigger `FUN_800319A8` (the engine's
+/// `Host::actor_effect`) in slot order. Afterwards the pointer, `live` and
+/// `tag` are all zeroed, and the 16-word scratch at `DAT_801C8FA0` is wiped
+/// unconditionally.
+///
+/// The same body is compiled into the battle overlay a second time at
+/// `0x801F02D0` (see `docs/reference/functions.md`).
+///
+/// PORT: FUN_801D9AE8
+/// REF: FUN_800319A8 (the per-widget release the returned ids feed)
+///
+/// REPLACED-BY: `engine-ui`'s per-frame battle draw-list builders. Retail
+/// tracks battle-UI widgets in a `0x28`-slot pool with explicit lifetimes; the
+/// port rebuilds every readout from `World` state each frame, so no widget
+/// outlives its draw and there is no pool to release or scratch band to wipe.
+pub fn release_widget_pool(
+    slots: &mut [WidgetSlot],
+    scratch: &mut [u32; WIDGET_SCRATCH_WORDS],
+) -> Vec<u16> {
+    let mut released = Vec::new();
+    for slot in slots.iter_mut().take(WIDGET_SLOTS) {
+        if slot.live != 0
+            && let Some(handle) = slot.widget
+        {
+            released.push(handle.actor_id);
+            slot.widget = None;
+            slot.live = 0;
+            slot.tag = 0;
+        }
+    }
+    scratch.fill(0);
+    released
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pool(spec: &[(u16, u16)]) -> Vec<CursorActor> {
+        spec.iter()
+            .map(|&(liveness, status)| CursorActor { liveness, status })
+            .collect()
+    }
+
+    #[test]
+    fn forward_skips_dead_and_afflicted() {
+        // Slot 1 dead, slot 2 afflicted (0x004 is inside the 0xF84 mask),
+        // slot 3 selectable.
+        let actors = pool(&[(1, 0), (0, 0), (1, 0x004), (1, 0), (1, 0)]);
+        let mut cursor = ActorCursor {
+            active: 0,
+            latest: 9,
+            previous: 0,
+            depth: 4,
+        };
+        step_actor_cursor(&mut cursor, CursorStep::Forward, 5, &actors);
+        assert_eq!(cursor.active, 3);
+        assert_eq!(cursor.latest, 3);
+        assert_eq!(cursor.previous, 9, "+0x21 takes the old +0x20");
+        assert_eq!(cursor.depth, 5);
+    }
+
+    #[test]
+    fn forward_exhausted_lands_past_the_bound() {
+        let actors = pool(&[(1, 0), (0, 0), (0, 0)]);
+        let mut cursor = ActorCursor {
+            active: 0,
+            ..Default::default()
+        };
+        step_actor_cursor(&mut cursor, CursorStep::Forward, 3, &actors);
+        // Retail does not clamp: the landing index is the first one that
+        // failed the bound test.
+        assert_eq!(cursor.active, 3);
+    }
+
+    #[test]
+    fn backward_stops_at_the_ff_wrap() {
+        let actors = pool(&[(0, 0), (0, 0), (1, 0)]);
+        let mut cursor = ActorCursor {
+            active: 2,
+            depth: 1,
+            ..Default::default()
+        };
+        step_actor_cursor(&mut cursor, CursorStep::Backward, 3, &actors);
+        assert_eq!(cursor.active, 0xff, "walked off the bottom");
+        assert_eq!(cursor.depth, 0);
+    }
+
+    #[test]
+    fn backward_from_zero_is_an_immediate_stop() {
+        let actors = pool(&[(1, 0), (1, 0)]);
+        let mut cursor = ActorCursor {
+            active: 0,
+            ..Default::default()
+        };
+        step_actor_cursor(&mut cursor, CursorStep::Backward, 2, &actors);
+        // `active - 1` is already 0xFF, so the scan body never runs.
+        assert_eq!(cursor.active, 0xff);
+        assert_eq!(cursor.depth, 0xff, "+0x1F still moves");
+    }
+
+    #[test]
+    fn backward_finds_the_nearest_selectable_below() {
+        let actors = pool(&[(1, 0), (1, 0x080), (1, 0)]);
+        let mut cursor = ActorCursor {
+            active: 2,
+            ..Default::default()
+        };
+        step_actor_cursor(&mut cursor, CursorStep::Backward, 3, &actors);
+        assert_eq!(cursor.active, 0, "slot 1 carries a 0xF84 bit");
+    }
+
+    #[test]
+    fn pose_copy_is_partial() {
+        let mut slots = vec![ElementPlacement::default(); 4];
+        slots[1] = ElementPlacement {
+            f00: 0x1111,
+            f02: 0x2222,
+            f04: 0x3333,
+            f06: 0x4444,
+            f08: 0x5555,
+            f0a: 0x6666,
+            f0c: 0x7777,
+            f0e: 0x8888,
+            f10: 0x9999,
+            f12: 0xaaaa,
+            anim: 0xdead_beef,
+        };
+        slots[0].f00 = 0xffff;
+        slots[0].f08 = 0xeeee;
+        slots[0].f0e = 0xdddd;
+        element_placement_copy(&mut slots, 0, 1);
+        assert_eq!(slots[0].f02, 0x2222);
+        assert_eq!(slots[0].f04, 0x3333);
+        assert_eq!(slots[0].f06, 0x4444);
+        assert_eq!(slots[0].f0a, 0x6666);
+        assert_eq!(slots[0].f0c, 0x7777);
+        assert_eq!(slots[0].anim, 0xdead_beef);
+        // Untouched by the retail store list.
+        assert_eq!(slots[0].f00, 0xffff);
+        assert_eq!(slots[0].f08, 0xeeee);
+        assert_eq!(slots[0].f0e, 0xdddd);
+        assert_eq!(slots[0].f10, 0);
+        assert_eq!(slots[0].f12, 0);
+    }
+
+    #[test]
+    fn pose_copy_remapped_permutes_and_biases() {
+        let mut slots = vec![ElementPlacement::default(); 2];
+        slots[1] = ElementPlacement {
+            f06: 0x0044,
+            f0a: 0x0100,
+            f0c: 0x0080,
+            anim: 7,
+            ..Default::default()
+        };
+        element_placement_copy_remapped(&mut slots, 0, 1);
+        assert_eq!(slots[0].f02, 0x0100, "dst+2 <- src+0xA");
+        assert_eq!(slots[0].f04, 0x0080, "dst+4 <- src+0xC");
+        assert_eq!(slots[0].f06, 0x0044);
+        assert_eq!(slots[0].f0a, 0x0100u16.wrapping_sub(0x140));
+        assert_eq!(slots[0].f0c, 0x0080);
+        assert_eq!(slots[0].anim, 7);
+    }
+
+    #[test]
+    fn widget_teardown_releases_only_flagged_and_pointed_slots() {
+        let mut slots = vec![WidgetSlot::default(); WIDGET_SLOTS];
+        slots[0] = WidgetSlot {
+            live: 1,
+            tag: 9,
+            widget: Some(WidgetHandle { actor_id: 0x21 }),
+        };
+        // Flagged but null: retail leaves the flag set.
+        slots[1] = WidgetSlot {
+            live: 1,
+            tag: 3,
+            widget: None,
+        };
+        // Pointed but not flagged: retail leaves the pointer alone.
+        slots[2] = WidgetSlot {
+            live: 0,
+            tag: 0,
+            widget: Some(WidgetHandle { actor_id: 0x22 }),
+        };
+        slots[5] = WidgetSlot {
+            live: 0x80,
+            tag: 1,
+            widget: Some(WidgetHandle { actor_id: 0x23 }),
+        };
+        let mut scratch = [0xffff_ffffu32; WIDGET_SCRATCH_WORDS];
+
+        let released = release_widget_pool(&mut slots, &mut scratch);
+
+        assert_eq!(released, vec![0x21, 0x23]);
+        assert_eq!(slots[0], WidgetSlot::default());
+        assert_eq!(slots[1].live, 1, "null pointer leaves the flag set");
+        assert!(slots[2].widget.is_some(), "unflagged pointer survives");
+        assert_eq!(slots[5], WidgetSlot::default());
+        assert!(scratch.iter().all(|&w| w == 0));
+    }
+}

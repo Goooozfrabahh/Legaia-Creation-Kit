@@ -1,0 +1,2964 @@
+# Unified save-state scenario manifest.
+#
+# Single source of truth for save-state labelled scenarios. Each
+# [[scenarios]] block maps one investigation label to per-emulator
+# save-state paths + mednafen-specific overlay/watchpoint fields used
+# by the `mednafen-state` toolkit.
+#
+# Consumers:
+#   - `mednafen-state` CLI + `scripts/mednafen/{auto-capture,state-walk}.sh`
+#     (overlay-slice + watchpoint diff workflow, mednafen mc{0..9}).
+#   - `scripts/pcsx-redux/run_probe.sh --scenario <label>` (resolves
+#     `pcsx_redux_sstate` for the probe runner).
+#   - `scripts/manage-states.py` (fingerprints / validates that each
+#     emulator's save state hasn't drifted from the committed manifest).
+#
+# Per-scenario fields (all but slot+label+description are optional):
+#   slot                       u8     mednafen .mc{0..9} slot index
+#   label                      str    short investigation handle
+#   description                str    human-readable purpose
+#   topics                     list   free-text labels
+#   diff_against               list   sister-slot indices for diff sweep
+#   pcsx_redux_sstate          path   PCSX-Redux .sstate location ($HOME / ~ expanded at use time)
+#   duckstation_sav            path   Duckstation .sav location
+#   phase                      str    boot/title/menu/field/battle/world_map/cutscene
+#   expected_game_mode         u8     _DAT_8007B83C value at scenario start
+#   expected_active_scene      str    CDNAME label (e.g. "map01")
+#   ram_fingerprint_sha256     hex    sha256 of first 64 KiB main RAM after settle
+#   backup_fingerprint         hex    sha256 of an IMMUTABLE copy stashed in
+#                                     saves/library/<emulator>/<fp>.<ext>. Live
+#                                     emulator slots (SCUS94254.sstateN, mc{N})
+#                                     get overwritten the next time you save, so
+#                                     a scenario worth keeping must be backed up.
+#                                     When set, manage-states.py + run_probe.sh
+#                                     resolve THIS copy in preference to the live
+#                                     path. The library is gitignored (Sony RAM);
+#                                     this fingerprint is the committed pointer.
+#   resident_patch             str    the backed-up state was made on a PATCHED
+#                                     disc: this names the patcher feature its
+#                                     resident SCUS carries (a state keeps the
+#                                     boot disc's executable forever). Absent =
+#                                     retail SCUS at every patcher site. Measured
+#                                     by scripts/pcsx-redux/patch_taint_audit.py
+#                                     states (and scan, the whole-executable form); see docs/tooling/
+#                                     pcsx-redux-automation.md#patched-disc-taint
+#   [scenarios.overlay_slice]  block  mednafen overlay-slice range
+#   [[scenarios.watchpoints]]  block  mednafen diff watchpoint regions
+#
+# Adding a scenario:
+#   1. Capture the state in an emulator (mednafen mc{N} / PCSX-Redux sstateN).
+#   2. Back it up so it survives a slot overwrite, and record the pointer:
+#        scripts/manage-states.py backup pcsx-redux <path> --label <label>
+#      (copies to saves/library/, sets backup_fingerprint on the scenario).
+#   3. Add/extend the [[scenarios]] block here with label / phase / scene.
+#   4. (mednafen only) `manage-states.py fingerprint <label>` for the RAM
+#      fingerprint; `manage-states.py library` lists what's backed up
+#      (`library --audit` = scenario-centric catalogue + PCSX-probe-usability).
+#   5. Commit (the manifest only - the save bytes stay local + gitignored).
+#
+# See `docs/tooling/mednafen-automation.md` for the diff-sweep workflow
+# and `docs/tooling/pcsx-redux-automation.md` for the probe workflow.
+#
+# ## Current corpus rotation
+#
+# This rotation captures the **per-STR FMV trigger corpus**: nine save
+# states taken right before each FMV begins playing, one per
+# `_DAT_8007BA78` value (`fmv_id ∈ 0..=8`). Slot mapping (debug-menu
+# driven, all from active scene `map01`):
+#
+#   mc2 → STR 0 (fmv_id 0)    mc3 → ROTATED (keikoku_chest_preload; was STR 1 / fmv_id 1)
+#   mc4 → STR 2 (fmv_id 2)    mc5 → ROTATED (title_screen_new_game)
+#   mc6 → ROTATED (v0.1 slice C+, dialogue-accept; was STR 4 / fmv_id 4)
+#   mc7 → ROTATED (v0.1 slice C; was fmv_id 5)
+#   mc8 → ROTATED (v0.1 slice E, post-battle; was fmv_id 6)
+#   mc9 → STR 7 (fmv_id 7)
+#   mc0 → ROTATED (v0.1 slice D; was fmv_id 8)
+#
+# (mc1 is unrelated to the FMV corpus in this rotation.)
+#
+# Existing slot-specific tests (encounter trigger, battle init, item-use,
+# anim, level-up triplets, FMV-overlay residency) carry slot-fingerprint
+# guards (`require_slot_scenes`) and skip-pass when the corpus has been
+# rotated to a different shape. They remain in the test suite as
+# documentation of the prior captures; the constants they reference are
+# still authoritative for the engine layer.
+
+[defaults]
+# Filename pattern for the user's mednafen saves. {slot} is replaced with
+# the slot index (0..9). The hash is mednafen's per-rom identifier - adjust
+# if you're using a different US dump.
+filename_pattern = "Legend of Legaia (USA).788de08f9c7e652c51d8d08ee374d055.mc{slot}"
+# Default mcs/ directory. Override at runtime via `LEGAIA_MEDNAFEN_DIR`.
+# (Left unset here so the manifest is portable.)
+
+# ----------------------------------------------------------------------
+# mc1 - mid-battle with full 3-character active party (Vahn/Noa/Gala) vs
+# 1 Gobu Gobu enemy, command menu open. game_mode = 0x15 (BattleMode).
+# Useful as the canonical "battle with full party" oracle because all
+# three battle-form character TMDs are simultaneously resident in
+# `DAT_8007C018[0..=2]` (different shape from the field-form pack at
+# PROT 0874 sect 0 - battle form is its own archive at PROT 1204 sect
+# `other5`, asset type 0x09 "TMD2", 5 chunks: Vahn / Noa / Gala / 2 aux).
+# ----------------------------------------------------------------------
+[[scenarios]]
+slot = 1
+label = "party_battle_gobu_gobu"
+backup_fingerprint = "a0c56d29eeeffd96aa809040bb807606545da792209b421274b9bea27c35e7f2"
+description = "Mid-battle with Vahn/Noa/Gala active party vs one Gobu Gobu (game_mode 0x15 BattleMode, command menu open); all three battle-form character TMDs resident in DAT_8007C018[0..=2]"
+topics = ["battle", "active party", "character meshes", "BattleMode", "DAT_8007C018", "battle-form TMD"]
+phase = "battle"
+expected_game_mode = 0x15
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+[[scenarios.watchpoints]]
+label = "character_tmd_pointers"
+start = 0x8007C018
+end = 0x8007C02C
+hint = "DAT_8007C018[0..=4]: 5 character TMD pointers (Vahn/Noa/Gala + 2 aux); battle-form addresses differ from field-form."
+
+# ----------------------------------------------------------------------
+# mc3 - ROTATED to the chest-randomizer pre-scene-load capture
+# `keikoku_chest_preload` (kingdom overworld map01, just outside the
+# keikoku entrance). Its [[scenarios]] block lives with the keikoku chest
+# captures further below. The slot previously held the FMV-trigger corpus
+# capture `fmv_trigger_str_1` (fmv_id=1 -> MV3.STR first segment); no test
+# references that label, so the block is superseded rather than kept.
+# ----------------------------------------------------------------------
+
+# ----------------------------------------------------------------------
+# v0.1 playthrough oracle anchor C: clean pre-battle field state.
+#
+# Vahn standing in Rim Elm (`town01`) in front of his house, free
+# movement, BEFORE talking to Tetsu and before the tutorial training
+# battle. Game mode 0x03 - this empirically confirms that 0x03 is the
+# field/town gameplay mode (corroborating the runtime pin on `map03`
+# mode 0x03 in docs/subsystems/field-locomotion.md), NOT the "options
+# menu" the dev mode-table label in engine-core::mode suggests.
+#
+# This is the clean cold-boot-reproducible town01 field anchor: the
+# engine's `enter_field_live` drives a cold boot into Field/town01,
+# which is exactly this state, so it is the convergence anchor for the
+# v0.1 playthrough oracle's Phase-1 Field leg.
+#
+# LIBRARY-ONLY: its live slot has since been refreshed to hold anchor C+
+# (the dialogue-accept frame, below). This anchor survives as its
+# immutable content-hashed copy in saves/library/ and resolves via
+# `backup_fingerprint`, so `slot` is the 255 "no live mednafen slot"
+# sentinel. The v0.1 replay's `meta.scenario` points here and resolves
+# the library copy in preference to any live slot, so the Field leg is
+# unaffected.
+# ----------------------------------------------------------------------
+[[scenarios]]
+slot = 255
+label = "v0_1_pre_battle_tetsu"
+ram_fingerprint_sha256 = "cf9fede947e0269460b41f4773011edd7490dc4d202f041bced7cecc5bfcdde7"
+backup_fingerprint = "4c650a3bb872b22029851a2a2e919fd8e3bb05eee19abaec9f5c82976424a779"
+description = "v0.1 slice anchor C: Vahn in front of his house in Rim Elm, before talking to Tetsu / before the training battle (game_mode 0x03 field, town01)"
+topics = ["v0.1 slice", "pre-battle", "field", "Tetsu tutorial", "town01"]
+phase = "field"
+expected_active_scene = "town01"
+expected_game_mode = 0x03
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+# ----------------------------------------------------------------------
+# v0.1 playthrough oracle anchor C+: the pre-fight dialogue-accept frame.
+#
+# The chronological bridge between anchor C (free movement, before
+# talking to Tetsu) and the battle anchors below: still at game mode 0x03
+# (field) on `town01`, but now parked on the sparring partner's accept
+# prompt. Advancing the dialogue one more step (the confirm press) runs
+# the field-VM dialogue-accept that arms the scripted lone-Tetsu
+# encounter and crosses into game mode 0x15 BattleMode.
+#
+# This is the mid-dialogue town01 frame the Battle-leg oracle needs to
+# drive the Field -> Battle transition from real data rather than the
+# engine's manual carrier-engage API. Because it is a field-mode state,
+# `expected_active_scene = town01` is set and the auto-discover oracles
+# can key off it (unlike the BattleMode anchors, which must skip).
+# ----------------------------------------------------------------------
+[[scenarios]]
+slot = 6
+label = "v0_1_tetsu_dialogue_accept"
+ram_fingerprint_sha256 = "a7dddfc36cf9aa2733ef04735b42e68b86ddec2a0b3215e06507bd134ed4dc1b"
+backup_fingerprint = "d3d14657aabafdeeb5ee8503091a25ef1aa1dd56974a8c89e75bbcd79bc22011"
+description = "v0.1 slice anchor C+: town01 field (game_mode 0x03), sparring-partner dialogue at the accept prompt; the confirm press arms the scripted lone-Tetsu fight and enters BattleMode"
+topics = ["v0.1 slice", "field dialogue", "dialogue accept", "Tetsu tutorial", "scripted encounter", "town01"]
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "town01"
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+# ----------------------------------------------------------------------
+# The Tetsu tutorial battle progression (anchors D0 / D / D+ / D++).
+#
+# Four save states captured in chronological order through the scripted
+# Tetsu tutorial fight, all at game mode 0x15 BattleMode on top of
+# `town01`:
+#
+#   D0  battle scene loading - screen black, battle flag already
+#       flipped (game_mode 0x15), graphics not yet drawn.
+#   D   battle graphics visible; Tetsu's pre-fight dialogue.
+#   D+  top-level command menu (Fight / Run).
+#   D++ command submenu (Spirit / Item / Attack).
+#
+# Followed by anchor E (post-victory town dialogue, back at game_mode
+# 0x03 field). Together they are the retail ground-truth sequence for
+# the v0.1 oracle's deferred Battle leg.
+#
+# LIBRARY-ONLY: these were captured in live slots mc4/mc5/mc6 but those
+# slots have since been refreshed to other content. They survive only as
+# the immutable, content-hashed copies in saves/library/ and resolve via
+# `backup_fingerprint`, so `slot` is set to 255 (the "no live mednafen
+# slot" sentinel) - re-capturing them into a live slot is not required.
+#
+# `expected_active_scene` is intentionally unset on all four: the battle
+# runs as a scene-mode overlay on the loaded field scene, and the engine
+# cannot cold-boot directly into BattleMode, so the auto-discover oracles
+# (mode_trace / vram / pcm / audio, which key off `expected_active_scene`)
+# must skip them. The overlay_slice covers the RAM-overlay region where
+# the battle action SM lives.
+# ----------------------------------------------------------------------
+
+# D0 is mc7 (still a live slot); see its block further below.
+
+# anchor D: battle graphics visible, Tetsu pre-fight dialogue.
+[[scenarios]]
+slot = 255
+label = "v0_1_battle_start_tetsu"
+ram_fingerprint_sha256 = "66bef6b52a5e1d98f7cf3b06fa4c030fa2967a143736b95e371d5fb4e8a3d23c"
+backup_fingerprint = "a4673cb5bfa57ab5135820b846cf2d227f69ce4c3dadb613cebc6df588d80cd7"
+description = "v0.1 slice anchor D: Tetsu tutorial battle, graphics visible (past loading), Tetsu pre-fight dialogue; BattleMode over town01"
+topics = ["v0.1 slice", "battle init", "Tetsu tutorial", "BattleMode", "town01"]
+phase = "battle"
+expected_game_mode = 0x15
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+# anchor D+: top-level battle command menu (Fight / Run).
+[[scenarios]]
+slot = 255
+label = "v0_1_battle_command_menu"
+ram_fingerprint_sha256 = "253a180e33ce95050095d699e4512a0b9fdc798c218947807e2d9268a6733d81"
+backup_fingerprint = "42845402539bfda659b9e17dd2d82749749cccffdb36882243bcde19d230f04e"
+description = "v0.1 slice anchor D+: Tetsu battle, top-level command menu open (Fight / Run)"
+topics = ["v0.1 slice", "battle command menu", "Tetsu tutorial", "BattleMode", "town01"]
+phase = "battle"
+expected_game_mode = 0x15
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+# anchor D++: battle command submenu (Spirit / Item / Attack).
+[[scenarios]]
+slot = 255
+label = "v0_1_battle_command_submenu"
+ram_fingerprint_sha256 = "e6d05047346bac2b8e241bb8b711fdb071419687c017b4f6d06e7b23148e4f12"
+backup_fingerprint = "281c7a3ac1497bdf5365f58d35d93b10b14d1268a2bad2e103cc1e232517e289"
+description = "v0.1 slice anchor D++: Tetsu battle, command submenu open (Spirit / Item / Attack options)"
+topics = ["v0.1 slice", "battle submenu", "Tetsu tutorial", "BattleMode", "town01"]
+phase = "battle"
+expected_game_mode = 0x15
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+# ----------------------------------------------------------------------
+# mc7 - v0.1 playthrough oracle anchor D0: battle scene loading.
+#
+# The earliest of the Tetsu-battle captures: the screen is black and
+# the battle scene is mid-load. The battle flag is already flipped -
+# `_DAT_8007B83C` (game mode) reads 0x15 BattleMode - but the battle
+# graphics are not yet drawn. Chronologically this precedes mc4 (D),
+# which is the first frame with battle graphics visible.
+#
+# `expected_active_scene` is intentionally unset (battle anchor; see the
+# Tetsu-progression header above): the engine cannot cold-boot into
+# BattleMode, so the auto-discover oracles skip it.
+#
+# Supersedes the FMV-trigger-corpus `fmv_trigger_str_5` capture that
+# previously occupied this slot.
+# ----------------------------------------------------------------------
+[[scenarios]]
+slot = 7
+label = "v0_1_battle_loading_tetsu"
+ram_fingerprint_sha256 = "5962a9313814c6ec1963fd2b495dabdd2a7ba2fa6bfc6a72310275f548bdf0a5"
+backup_fingerprint = "5649c05e0b96b87758cdfc204995efc60dda009baaa4a783b6df8c0cb1010b0a"
+description = "v0.1 slice anchor D0: Tetsu battle scene loading - screen black, battle flag set (game_mode 0x15), graphics not yet drawn"
+topics = ["v0.1 slice", "battle init", "battle loading", "Tetsu tutorial", "BattleMode", "town01"]
+phase = "battle"
+expected_game_mode = 0x15
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+# ----------------------------------------------------------------------
+# mc8 - v0.1 playthrough oracle anchor E: post-victory town dialogue.
+#
+# *After* the Tetsu tutorial battle ends: the player is back in Rim Elm
+# (`town01`) at game mode 0x03 (field / MainMode), talking to Tetsu in
+# the town. This is the post-battle field state - the tail end of the
+# v0.1 slice, after the BattleMode anchors (mc7 / mc4 / mc5 / mc6).
+#
+# Unlike the battle anchors this IS a field scene the engine can
+# cold-boot into, so it keeps `expected_active_scene = town01` and is
+# picked up by the auto-discover field oracles.
+#
+# Supersedes the FMV-trigger-corpus `fmv_trigger_str_6` capture.
+# ----------------------------------------------------------------------
+[[scenarios]]
+slot = 8
+label = "v0_1_post_battle_tetsu_town"
+ram_fingerprint_sha256 = "0b42d20e47f16c1d7e6fbf97b07b61bada3965640819a1ae03d29a5bb2f34fb7"
+backup_fingerprint = "1b1d645f8f8827c97f678d214fe16d273153313872ef8ce29b426baeffbf8f84"
+description = "v0.1 slice anchor E: post-victory, back in Rim Elm talking to Tetsu (game_mode 0x03 field, town01)"
+topics = ["v0.1 slice", "post-battle", "Tetsu tutorial", "MainMode", "town01"]
+phase = "field"
+expected_active_scene = "town01"
+expected_game_mode = 0x03
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+# ----------------------------------------------------------------------
+# Boot-to-first-town arc checkpoints (mednafen-side slot not allocated;
+# these are primarily PCSX-Redux save-state references for the
+# step-by-step launch -> first town reverse-engineering walk).
+#
+# Each scenario names a stable game state along the boot path. Capture
+# the state in PCSX-Redux (Ctrl+F<N>), then add the resulting
+# `pcsx_redux_sstate` field below. `manage-states.py list` shows "·"
+# when the manifest declares a path but the file is missing, "•" when
+# the file exists - so an unfilled checkpoint surfaces as a TODO until
+# captured.
+#
+# The slot field is set to 255 (= sentinel "no mednafen slot allocated")
+# so the existing slot-based tests don't accidentally pick these up.
+# Allocate a real mednafen mc{0..9} slot if/when a mednafen capture of
+# the same state is added.
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "publisher_logos"
+backup_fingerprint = "31fc18941d401c5758600f5be00ea47f92541b45334ce70dd28249e412d966a2"
+description = "Publisher-logo sequence, the SCEA 'Presents' card on the display; the init.pak logo TIMs (SCEA, WARNING, Prokion, Contrail) resident in VRAM beside it. Master mode 0x11 (READ MODE, the logos). Cold boot with no save state and no input (autorun_boot_continue.lua, LEGAIA_NO_SSTATE=1, LEGAIA_MASH_UNTIL=1), cal checkpoint at vsync 450; the same run enters 0x10 at 295, 0x11 at 378 and CARD INIT 0x16 at 1038."
+phase = "boot"
+expected_game_mode = 0x11
+# Re-shot: the old pointer was the live slot SCUS94254.sstate3, since
+# overwritten.
+topics = ["boot path", "init.pak", "publisher_logos"]
+
+[[scenarios]]
+slot = 255
+label = "title_attract"
+backup_fingerprint = "e40b480aff63004e02cb9d5cd75cdd529a3cfe2ba2c5367d2b642458a347216b"
+description = "Title screen idle, no input since the cold boot: logo + NEW GAME / CONTINUE drawn, attract countdown running (the attract STR, master mode 0x1A, starts about 950 vsyncs later). Master mode 0x17. Captured by autorun_boot_continue.lua on a cold boot (no save state, LEGAIA_MASH_UNTIL=1, cal checkpoint at vsync 1800; title mode 0x17 arrives at 1169)."
+phase = "title"
+expected_game_mode = 0x17
+# Re-shot: the old pointer was the live slot SCUS94254.sstate4, since
+# overwritten (it holds a battle state now), so the label opened the wrong
+# screen.
+topics = ["title overlay", "countdown trigger", "attract"]
+
+[[scenarios]]
+slot = 255
+label = "title_menu_idle"
+backup_fingerprint = "edcc11cfbbe73f50473585489a12ee449dc68a830127e3e98cc324006078afbd"
+description = "Title menu with the cursor moved: one DOWN at vsync 1800 put it on CONTINUE (interrupting the attract countdown), no Cross yet. Master mode 0x17. Same cold-boot run as save_select_idle (autorun_boot_continue.lua, LEGAIA_SEQ=1800:DOWN,2100:CROSS), cal checkpoint at vsync 2000."
+phase = "title"
+expected_game_mode = 0x17
+# Re-shot: the label had no durable state (its live slot was reused for the
+# rim_elm_queen_bee_battle capture).
+topics = ["title overlay", "title menu", "menu glyph atlas"]
+
+[[scenarios]]
+slot = 255
+label = "save_select_idle"
+backup_fingerprint = "0c98be41dcb1f21bf4c9b4cf3c18c082666829fe1959049d2a88c64e5e3fa702"
+description = "CONTINUE pressed from the title: the Load window's memory-card slot picker (SLOT 1 / SLOT 2) open over the title, cursor on SLOT 1. Still master mode 0x17. Cold boot, DOWN at vsync 1800, CROSS at 2100, cal checkpoint at 3000 (autorun_boot_continue.lua). One more Cross opens the card's save list."
+phase = "menu"
+expected_game_mode = 0x17
+# Re-shot: the old pointer was the live slot SCUS94254.sstate5, since
+# overwritten (it holds a battle state now).
+# Not captured - but no state is needed to reach this screen any more: from any
+# field state, SELECT opens the pause menu and the command list (Items / Magic /
+# Equip / Status / Options / Load / Save) puts Load 5 DOWNs away and Save 6.
+# scripts/pcsx-redux/autorun_pad_walk.lua drives it; autorun_confirm_dialog_dump.lua
+# walks it end-to-end to the confirm prompt. Capturing a state here would still
+# save ~700 vsyncs per probe run.
+topics = ["save screen", "menu overlay"]
+
+# ----------------------------------------------------------------------
+# NEW GAME flow: title menu -> intro cutscene A -> Rim Elm zoom-in ->
+# Vahn walks out of house -> name input UI -> intro cutscene B ->
+# free-roam first town. Each is a stable hold point for capture.
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "new_game_cutscene_intro_a"
+description = "First in-game (engine-rendered, NOT STR-video) cutscene after the player picks NEW GAME: low-poly actors around the Genesis tree with subtitle text (\"It was the Seru.\"). Engine-side opening narrative leading into Rim Elm."
+phase = "cutscene"
+backup_fingerprint = "1966a3c192fa0c0c3a8bfb7dff38256c2b06563ff8c5df0642a35bf6d6975c65"
+topics = ["new game", "in-engine cutscene", "intro"]
+
+[[scenarios]]
+slot = 255
+label = "rim_elm_zoom_intro"
+description = "Establishing 3D camera view of Rim Elm (town on a cliff above the sea, Vahn's house among the huts); in-engine cinematic, not a regular field scene. Distinct camera path / actor scripting from interactive Rim Elm."
+phase = "field"
+backup_fingerprint = "35927453f61bb246369fb0c991cbd76326c5afb08e56da91bbc1134d1cfca357"
+topics = ["new game", "Rim Elm intro", "cinematic camera"]
+
+[[scenarios]]
+slot = 255
+label = "vahn_walks_out"
+description = "Vahn (player model, blue hair) standing on the step outside his house at the start of the intro sequence. Actor VM driving a fixed motion path."
+phase = "field"
+backup_fingerprint = "9e9448e8a5aab75e393638340a4b22a6b327418439be3ee658672917a0c2b413"
+topics = ["new game", "scripted actor motion", "intro"]
+
+[[scenarios]]
+slot = 255
+label = "name_input_ui"
+description = "Name-entry UI open (\"Select your name.\", default 'Vahn'). Character grid: A-Z / a-z / 0-9 / symbols, with BS + Select; portrait of Vahn at left. Distinct menu overlay; text-entry SM with character grid + cursor. Fires AFTER the field opens (intro -> Rim Elm -> Vahn outside house -> THIS), not in the title front-end."
+phase = "menu"
+backup_fingerprint = "a14afa511de1abef6399abebf792e9f5b7ea669d4d60ad48e15be0b53b341a68"
+topics = ["new game", "name input", "menu overlay"]
+
+[[scenarios]]
+slot = 255
+label = "new_game_cutscene_intro_b"
+description = "Second in-game cutscene immediately after name confirmation; final lead-in to free-roam Rim Elm."
+phase = "cutscene"
+# pcsx_redux_sstate = "..."   # uncomment after capture
+topics = ["new game", "in-engine cutscene", "intro"]
+
+[[scenarios]]
+slot = 255
+label = "first_town_interactive"
+backup_fingerprint = "e9e526595d0479ce1af9619418922ca337019ba0d1078169bc65235c22d75fc8"
+description = "Rim Elm free-roam after the full NEW GAME intro completes: the SAME capture as s3_rimelm_freeroam (one library file, two labels). Master mode 0x03, player at world (4160, 11840), movement-lock bit 0x80000 of player +0x10 clear, input live. Retail SCUS (the re-shot S3 on an unpatched image)."
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "town01"
+# Relabelled: the old pointer was the live slot SCUS94254.sstate9, since
+# overwritten (it holds a battle state now).
+topics = ["field", "town01", "Rim Elm", "interactive"]
+
+# ----------------------------------------------------------------------
+# CONTINUE flow: an alternate path from save_select_idle that skips
+# the NEW GAME intros and drops the player at whatever save state they
+# loaded. field_load_first_town captures the loader frame; from there
+# the player is already inside first_town_interactive (or wherever).
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "field_load_first_town"
+backup_fingerprint = "077310ee068e9288824ff0a8dbf901683c6cc3b494997d949c48d99c2e02d7e6"
+description = "Mid-load into town01 (Rim Elm) off a memory-card CONTINUE: master mode 0x02 (MAIN INIT, the field init), scene name already town01, about 340 vsyncs before the first field-run frame. Cold boot + the one-save card staged from the town01 save (isolate_card_save.py --keep 8 --restamp 0 on the workstation's memcard1), the calibrated CONTINUE ladder, cal checkpoint at vsync 6250; mode 0x02 runs from 6142 to 6593 in that run. The field-run end of the same run is town01_field_card_boot."
+phase = "field"
+expected_game_mode = 0x02
+expected_active_scene = "town01"
+# Re-shot: the old pointer was the live slot SCUS94254.sstate6, since
+# overwritten.
+topics = ["field load", "scene asset loader", "town01"]
+
+# ----------------------------------------------------------------------
+# Walkable field scene with a fully-painted collision grid - the state
+# the field free-movement controller (FUN_801d01b0) was runtime-pinned
+# on. Captured live as PCSX-Redux SCUS94254.sstate6 and BACKED UP to the
+# immutable library (the live slot is overwritten by any later save).
+#
+# Verified via scripts/pcsx-redux/autorun_town01_script_flow.lua:
+#   - field buffer _DAT_1f8003ec = 0x80139530
+#   - collision grid (+0x4000) has 7455 / 16384 wall tiles painted
+#   - steady state runs ONE field-VM context: script_id 0xFB (system
+#     channel), bytecode at 0x8010F092, looping pc 0x0102..0x0297 - the
+#     same per-frame loop the engine's static trace settles
+#     into, and the nibble-7 paint ops fire 0 times (walls are painted
+#     at scene-load, not per frame).
+# Use this as the reference state for collision-grid / locomotion parity.
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "field_walled_collision_pin"
+backup_fingerprint = "35e640510858f62cf07db77975d0e434466fa9fa079a40a23ea8adb8c30e78ea"
+description = "Walkable field scene, game_mode 0x03, collision grid +0x4000 has 7455 painted wall tiles; system script 0xFB loops pc 0x102..0x297. Runtime-pin save for FUN_801d01b0 locomotion + collision parity."
+phase = "field"
+expected_game_mode = 0x03
+topics = ["field", "collision grid", "locomotion", "FUN_801d01b0", "nibble-7 paint"]
+
+# ----------------------------------------------------------------------
+# Pre-transition save: player stands in Drake Castle (a field scene); a
+# brief Up press walks into a scene exit that transitions to the Drake
+# Kingdom world map. Captured live as PCSX-Redux SCUS94254.sstate1 and
+# backed up immutably. Use this to capture the scene-LOAD script flow:
+# replay it driving Up so FUN_8003aeb0 / FUN_8003ab2c / the nibble-7
+# collision-paint sites fire during the transition (the load-time flow a
+# steady-state save can't show).
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "drake_castle_to_worldmap"
+backup_fingerprint = "0f659b1f3186f549a2cbac7617b4e5597c5bf4ba91e4f9c8fefe38c4e65b58a5"
+description = "Drake Castle field scene, ~half-second Up press triggers a transition to the Drake Kingdom world map. Pre-transition save for capturing scene-load script flow (FUN_8003aeb0 + nibble-7 wall paints)."
+phase = "field"
+topics = ["field", "scene transition", "world map", "Drake", "scene-load", "nibble-7 paint"]
+
+# ----------------------------------------------------------------------
+# Sebucus + Karisto kingdom-warp pre-transition saves (PCSX-Redux),
+# the second + third kingdoms to complement drake_castle_to_worldmap.
+# Each is a town field scene one held-Down press away from warping to
+# that kingdom's overworld. Used to confirm the slot-4 in-place render
+# reads (world-map renderer 0x801F78D4 + cluster-A GTE prim path)
+# generalise across kingdoms; see docs/formats/world-map-overlay.md.
+# ----------------------------------------------------------------------
+[[scenarios]]
+slot = 255
+label = "octam_to_sebucus_worldmap"
+backup_fingerprint = "f126470502fe484356fa456d691269d9fd35c3a38491b88145e9b0ac3e535e78"
+resident_patch = "starting bag + warp preset (new-game seed code)"
+description = "Octam field scene (Sebucus Islands); a ~1s Down press warps to the Sebucus world map (map02, PROT 0244). Pre-transition PCSX-Redux save for capturing the kingdom-warp scene-load + the slot-4 in-place render reads across a second kingdom."
+phase = "field"
+topics = ["field", "scene transition", "world map", "Sebucus", "map02", "slot-4", "scene-load"]
+
+[[scenarios]]
+slot = 255
+label = "sol_to_karisto_worldmap"
+backup_fingerprint = "3643191374fe98ae975d8f2b83806bf446a2693881dfeac362e76277541012ff"
+resident_patch = "starting bag + warp preset (new-game seed code)"
+description = "Sol field scene (Karisto Kingdom); a ~1s Down press warps to the Karisto world map (map03, PROT 0391). Pre-transition PCSX-Redux save for capturing the kingdom-warp scene-load + the slot-4 in-place render reads across a third kingdom."
+phase = "field"
+topics = ["field", "scene transition", "world map", "Karisto", "map03", "slot-4", "scene-load"]
+
+# ----------------------------------------------------------------------
+# Rim Elm (town01) pre-transition save: a ~1s Up press walks into the
+# south exit and warps to the Drake Kingdom overworld (map01). Ground-
+# truth for the door (scene-transition) randomizer: town01's single exit
+# is the field-VM 0x3F named-scene-change at MAN op 0x6f95 (-> map01,
+# index 85). The randomizer's runtime oracle
+# (door_randomizer_runtime_e2e) patches this exit to a different scene
+# and confirms the engine warps to the patched destination.
+# ----------------------------------------------------------------------
+[[scenarios]]
+slot = 9
+label = "door_warp_town01_to_map01"
+backup_fingerprint = "7ada4ac83d183d7cd5ed55f6c8aae96e6cae00b9016a3194a92b066f34402206"
+description = "Rim Elm (town01) field; a ~1s Up press walks into the south exit and warps to the Drake Kingdom overworld (map01). Pre-transition save pinning town01's single exit = the 0x3F named-scene-change at MAN op 0x6f95 (-> map01, index 85). Ground-truth for the door randomizer + its runtime oracle."
+phase = "field"
+topics = ["field", "scene transition", "door randomizer", "0x3F", "town01", "map01"]
+# The capture session's Rim Elm is the later-story `town0c` scene variant
+# (the save's pool slot 0 reads "town0c", same as the Mei-house captures
+# from the same session) -- not the pre-Tetsu `town01` variant the label
+# implies. The mode-trace oracle boots the scene actually in the capture.
+expected_active_scene = "town0c"
+
+# ----------------------------------------------------------------------
+# Rim Elm Mei's-house door RE set. Entering a house here is an INTRA-SCENE
+# REPOSITION, not a scene change: the active scene-name buffers
+# (0x8007050C / 0x80084548) stay "town0c" across the transition, while the
+# player struct (0x80083794) position jumps to the interior sub-area. So
+# this is a different mechanism from the 0x3F named-scene-change the door
+# randomizer handles (town0c's MAN has no 0x3E warp and one 0x3F, to map01).
+#   door_warp_rim_elm_to_mei_house  mednafen slot 0  outside (pre), town0c
+#   mei_house_inside                mednafen slot 1  inside (post), town0c
+#   mei_house_door_pcsx             pcsx sstate1     outside, earlier town01 variant (trace input)
+#   mei_house_inside_pcsx           pcsx sstate2     inside,  earlier town01 variant
+# (The PCSX pair is an earlier game stage / Rim Elm variant than the
+# mednafen pair, so positions differ; the door MECHANISM is the same.)
+# ----------------------------------------------------------------------
+[[scenarios]]
+slot = 0
+label = "door_warp_rim_elm_to_mei_house"
+backup_fingerprint = "a6e3ca59ca5849561325cb94cc660b991b75259e7495fe740e873f4a9b0a6387"
+description = "Rim Elm (town0c) field, standing directly beneath an open house door; a ~1s Up press enters Mei's house. Pre-transition save for RE'ing the intra-town (house / interior) door-warp mechanism -- an intra-scene reposition (scene stays town0c), distinct from the 0x3F named-scene-change the door randomizer handles."
+phase = "field"
+topics = ["field", "intra-town door", "house warp", "door randomizer", "town0c"]
+expected_active_scene = "town0c"
+
+[[scenarios]]
+slot = 1
+label = "mei_house_inside"
+backup_fingerprint = "8d5239ec0434644fa25e0660941dc0096b8e3857d4f9826abfdfd8ac2706d64d"
+description = "Rim Elm Mei's-house INTERIOR (mednafen), one step after entering from door_warp_rim_elm_to_mei_house. Scene is still town0c; only the player position changed -- confirms the house door is an intra-scene reposition, not a scene change."
+phase = "field"
+topics = ["field", "intra-town door", "house interior", "town0c"]
+expected_active_scene = "town0c"
+
+[[scenarios]]
+slot = 255
+label = "mei_house_door_pcsx"
+backup_fingerprint = "3c118f4a26bf0be04ab18f08b15703caa97e77c47be3ac94b8730215dc91d3f7"
+description = "Rim Elm standing beneath a house door, PCSX-Redux (earlier game stage / town01 variant than the mednafen pair). Trace input for the intra-town door mechanism: hold Up to enter and watch the field VM."
+phase = "field"
+
+[[scenarios]]
+slot = 255
+label = "mei_house_inside_pcsx"
+backup_fingerprint = "df2723f6f9ebd46f6b13e9711f636e4c47bd4fd7a96fa71de9272d53a30f56ec"
+description = "Rim Elm house interior, PCSX-Redux (earlier game stage / town01 variant), one step after entering. Pair with mei_house_door_pcsx."
+phase = "field"
+
+# ----------------------------------------------------------------------
+# Pre-transition save: player stands on a walkable area; a brief Down
+# press walks into a town entrance that loads a standalone town scene.
+# Use this to capture a town scene's MAN load: replay it driving Down so
+# the asset dispatcher FUN_8001F05C fires its MAN (type 0x03) dispatch
+# during the transition. This capture pinned the runtime MAN source
+# `_DAT_8007b898` -> the count=6 scene_asset_table variant in the town's
+# own PROT block (see autorun_man_source.lua + docs/formats/scene-bundles.md).
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "rim_elm_queen_bee_battle"
+backup_fingerprint = "3d22fa5fd53d47cd22999a7b377ec8ece057fdb5ca164357be0f96a65147ddf3"
+description = "Queen Bee boss-ambush battle in Rim Elm (town01). The fight auto-starts a few seconds after load and is lost in ~15s (no game over). Battle-init runs the monster archive loader (FUN_800542C8 -> FUN_80054CB0), so this is the capture point for the monster stat-record source + format validation. Monster ids overlap town01's encounter formations {4,7,10,61,62,63,79}."
+phase = "battle"
+topics = ["battle", "monster record", "monster stats", "FUN_80054CB0", "FUN_800542C8", "monster_data", "encounter"]
+
+[[scenarios]]
+slot = 255
+label = "rim_elm_gimard_victory"
+backup_fingerprint = "eaa8d800571dd9c144bcac7c740d1f9dcbeae4b0f7787a4b3e07acd1e82f1a73"
+description = "Rim Elm (town01) scripted Gimard fight captured mid-combo, just before Gimard's death - the fight resolves on its own (no input) into the victory-spoils path. Capture point for the battle reward path (EXP / gold / drop): write-watchpoints on the XP accumulator 0x80084440, party gold 0x8008459C, and party XP bank 0x800845A4 catch the per-monster reward summation. Gimard is a lone enemy, so the staged totals are his EXP/gold. Drives autorun_battle_reward_source.lua."
+phase = "battle"
+topics = ["battle", "reward", "exp", "gold", "drop", "spoils", "FUN_80026018", "monster record"]
+
+# ----------------------------------------------------------------------
+# Seru-capture (spell learn) before/after pair, captured during the Rim
+# Elm Gimard fight. `before` is the frame just prior to the capture; `after`
+# is during the "captured!" banner. Diffing the two pins the persistent
+# spell-learn write into the character record: ONLY 3 bytes change in the
+# whole 4-record character table, all in Vahn's record (base 0x80084708):
+#   +0x13C  00 -> 01    spell-list count 0 -> 1
+#   +0x13D  00 -> 0x81  spell-id array[0] = 0x81 (Gimard's spell)
+#   +0x161  00 -> 01    spell-level array[0] = 1
+# This validates legaia_save::CharacterRecord::spell_list (count @ +0x13C,
+# ids @ +0x13D, levels @ +0x161) against retail, and shows a story-Seru
+# capture is an IMMEDIATE grant (no capture-points accumulation in the
+# record) at spell level 1. Real spell ids (0x81) sit far above the
+# port-side SpellCatalog approximations. See
+# capture_observations::seru_capture.
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "rim_elm_gimard_seru_capture_before"
+backup_fingerprint = "3edf5fb14cd0687603febd774cc1a5e197a9f38e711d089bf5c9c02fa66dac5b"
+description = "Rim Elm (town01) Gimard fight, frame just before the Seru capture lands. Vahn's spell list at record +0x13C is still all-zero. Pair with rim_elm_gimard_seru_capture_after to diff the spell-learn write."
+phase = "battle"
+topics = ["battle", "seru", "capture", "spell learn", "spell_list", "Gimard", "character record"]
+
+[[scenarios]]
+slot = 255
+label = "rim_elm_gimard_seru_capture_after"
+backup_fingerprint = "7f91f1f0d2b3504b528a66b43fdb052a6e4f54421240b7c457a7eb34fe6a2810"
+description = "Rim Elm (town01) Gimard fight, during the 'captured!' banner. Vahn's spell list (record +0x13C) now reads count=1, id[0]=0x81, level[0]=1. Capture point for the persistent Seru spell-learn write. See capture_observations::seru_capture."
+phase = "battle"
+topics = ["battle", "seru", "capture", "spell learn", "spell_list", "Gimard", "character record"]
+
+[[scenarios]]
+slot = 255
+label = "overworld_into_town_man_load"
+backup_fingerprint = "bdbacd378093e730c0967a0c27822955f7561875c6c8e0adb2881fc1bc42f597"
+description = "Walkable area; a ~0.75s Down press walks into a town entrance, loading a standalone town scene. Pre-transition save for capturing the town MAN load via the asset dispatcher (FUN_8001F05C case 3 -> _DAT_8007b898)."
+phase = "field"
+expected_game_mode = 0x03
+topics = ["field", "scene transition", "town", "MAN", "scene_asset_table", "FUN_8001F05C", "_DAT_8007b898"]
+
+# ----------------------------------------------------------------------
+# Title screen, NEW GAME row highlighted. One Cross press short of the
+# title -> field-launch transition: confirming writes master game-mode
+# 0x02 (FUN_80025B64), whose field scene init FUN_801D6704 hands off to
+# 0x03. Pre-launch anchor for the New Game boot chain; see
+# docs/subsystems/boot.md "New Game boot chain".
+# ----------------------------------------------------------------------
+[[scenarios]]
+slot = 5
+label = "title_screen_new_game"
+ram_fingerprint_sha256 = "9efbfeacdbb7f98ab7d0f9eee62468e0ec05f540677498f771eda113c9a6776c"
+backup_fingerprint = "71094451e85eb2ecef11d2fcc975615360fb3bf58b506467fb8e1aa01f4c0334"
+description = "Title screen with the NEW GAME row highlighted; one Cross press before the title -> field master-mode transition (FUN_80025B64 -> FUN_801D6704 -> game_mode 0x03). Pre-launch anchor for the New Game boot chain."
+phase = "boot"
+topics = ["title screen", "new game", "boot", "FUN_801DD35C", "master game-mode", "FUN_80025B64", "FUN_801D6704"]
+
+# ----------------------------------------------------------------------
+# Battle 2D-billboard hit-spark + summon-flicker captures. The melee
+# hit-spark frame is the capture that resolved the long-open "what fills
+# the efect.dat atlas page (0,0)" question: walking the live GPU prim
+# pool shows NO prim samples page (0,0) / 8bpp / tpage 0x7680 anywhere -
+# the static atlas tpage is an authoring placeholder, and the runtime
+# relocates each billboard onto the loaded effect-texture pages. The
+# white melee impact draws as textured quads (POLY_FT4/GT4) sampling the
+# PROT 870 flame-atlas pages (320,0) / (448,0) with effect-band CLUTs
+# (rows 473..480) - pages that appear ONLY in the impact frame (absent
+# from a no-spark command-menu frame), confirming they are the effect.
+# See docs/formats/effect.md "2D sprite billboards".
+#
+# The two Gimard Tail-Fire frames are consecutive-ish summon-cast frames
+# for the remaining flame-flicker thread; their effect-CLUT-band VRAM
+# data (rows 473..481) is byte-identical, which points the flicker at
+# per-frame prim CBA-column cycling rather than CLUT-data re-upload.
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "battle_melee_hit_spark"
+backup_fingerprint = "2962ebbb70cc410de1050c0e4f231ce9ad66b5a509dc46d5649cff5c8b721581"
+phase = "battle"
+description = "Rim Elm (town01) battle frame on the impact of a melee attack, with the small white hit-spark effect on screen. Capture point for the efect.dat 2D-billboard texel source: the live GPU prim pool shows the spark drawn as textured quads sampling the PROT 870 flame-atlas pages (320,0)/(448,0) (effect-band CLUTs), with NO prim sampling page (0,0) / 8bpp / tpage 0x7680 - falsifying the page-(0,0) atlas reading."
+topics = ["battle", "effect", "2D billboard", "efect.dat", "hit spark", "PROT 870", "FUN_801E0088", "prim pool"]
+
+[[scenarios]]
+slot = 255
+label = "battle_gimard_tail_fire_a"
+backup_fingerprint = "c8038c2d86f84e42c0c2148fbf499eb795b645689e7260e88f7065b5c6a7c935"
+phase = "battle"
+description = "Gimard Tail Fire mid-cast in scene town0b, flame-animation frame A. Tail Fire is spell 0x27 (SCUS spell-name table DAT_800754D0), the ENEMY-Gimard move - not the player Seru cast 0x81, which the same table names Gimard and summon.dat titles Burning Attack. The state agrees: its scene word reads town0b (not town01) and the loader-B tracker 0x8007BC4C reads 0x05, i.e. extraction 900 co-resident, so no summon stager is paged in. Pair with battle_gimard_tail_fire_b for the flame-flicker thread. The effect-CLUT band (rows 473..481) is byte-identical between A and B, indicating the flicker is prim CBA-column cycling, not CLUT-data re-upload."
+topics = ["battle", "effect", "enemy cast", "Tail Fire", "Gimard", "CLUT cycling", "spell 0x27"]
+
+[[scenarios]]
+slot = 255
+label = "battle_gimard_tail_fire_b"
+backup_fingerprint = "def8234c3edec96f769a3a6e3cde0e5b93f7b68296f236ea01aba56a0f0637b1"
+phase = "battle"
+description = "Gimard Tail Fire mid-cast in scene town0b, flame-animation frame B. Pair with battle_gimard_tail_fire_a (see its note - the cast is the enemy move, spell 0x27, not the player summon 0x81) for the flame-flicker thread."
+topics = ["battle", "effect", "enemy cast", "Tail Fire", "Gimard", "CLUT cycling", "spell 0x27"]
+
+# ----------------------------------------------------------------------
+# Single-level-up capture set: a 3-party (Vahn/Noa/Gala) battle in which
+# Noa levels up exactly once, from L2 to L3. Four ordered frames isolate
+# one application of the level-up stat-growth applier FUN_801E9504 (one
+# curve byte -> one stat delta), which the multi-level corpus triplets
+# cannot do - they're the reconciliation set for the open gain-arithmetic
+# discrepancy in docs/subsystems/level-up.md (the literal
+# (max-start)*curve[row][level-1]/0x24C0 term overshoots the captured
+# 4-level deltas ~4.3..4.8x). Noa is growth slot 1; L2->L3 reads
+# curve[row][1]. All four are immutable library backups (slot 255).
+# ----------------------------------------------------------------------
+[[scenarios]]
+slot = 255
+label = "noa_levelup_field_pre"
+ram_fingerprint_sha256 = "d69feeebb9fc8c74fcdc224c5aa249a5b593292d3b03e06a3e29056133b4299c"
+backup_fingerprint = "9c09d402c52351514ab8051d82ba4ba2992a6e5f782f61c1114be02eca247ed3"
+phase = "field"
+description = "Field, just before the 3-party (Vahn/Noa/Gala) battle that levels Noa from L2 to L3. The pre-battle persistent character record (Noa's L2 stats at record +0x11C..+0x12D) - the baseline for the single-level stat-growth diff."
+topics = ["level-up", "stat growth", "Noa", "FUN_801E9504", "field", "pre-level"]
+
+[[scenarios]]
+slot = 255
+label = "noa_levelup_fight_pre"
+ram_fingerprint_sha256 = "1f9999982383f15985d97f171d3c2c3e8561a30e7fb090c953e2baff6c4a253c"
+backup_fingerprint = "ceced9566e2068009cc5b75bf0ff3689045fd75f962b9076f3295ba23967447e"
+phase = "battle"
+description = "Mid-battle (Vahn/Noa/Gala active party), before the level-up resolves. Noa still at L2. Pairs with noa_levelup_banner / noa_levelup_field_post for the single-level (L2->L3) stat-growth reconciliation."
+topics = ["level-up", "stat growth", "Noa", "FUN_801E9504", "battle", "pre-level"]
+
+[[scenarios]]
+slot = 255
+label = "noa_levelup_banner"
+ram_fingerprint_sha256 = "6652dcb2b96f1b21d88eb7e8cef8d21703d32c8c7cc8e9279585e6174984e434"
+backup_fingerprint = "f783d727ccfbe8f7341740a2a6ee5a46866adedda03d273403b06ceb2a87c625"
+phase = "battle"
+description = "End-of-battle level-up banner visible: Noa leveling from L2 to L3. The frame where FUN_801E9504 has applied the growth and the banner displays the gains."
+topics = ["level-up", "stat growth", "Noa", "FUN_801E9504", "battle", "level-up banner"]
+
+[[scenarios]]
+slot = 255
+label = "noa_levelup_field_post"
+ram_fingerprint_sha256 = "05aad8d4ebde0d35f392e4d5ea498482bfd272b28c803ce292c222f903c77132"
+backup_fingerprint = "de476a2791fba517ffddd4c23c92ce89cd03d52c69b47e602f85a3b7237e5296"
+phase = "field"
+description = "Field, after the battle and the L2->L3 level-up have settled. Noa's L3 persistent character record (+0x11C..+0x12D). Diff against noa_levelup_field_pre for the byte-exact single-level stat deltas that reconcile the FUN_801E9504 gain arithmetic."
+topics = ["level-up", "stat growth", "Noa", "FUN_801E9504", "field", "post-level"]
+
+# ----------------------------------------------------------------
+# Gimard player-summon ("Burning Attack") capture states. Vahn is the
+# solo caster. Three phases across the cast; the live summon-part mesh
+# rotation window is the Burning Attack frame. These back the
+# FUN_801F7088 rotation-source probe (autorun_summon_rotation.lua).
+# NOTE: the PLAYER Gimard move is "Burning Attack"; the ENEMY Gimard
+# boss move is "Fire Tail" - distinct moves with distinct animations.
+# ----------------------------------------------------------------
+
+[[scenarios]]
+label = "gimard_summon_start"
+slot = 255
+backup_fingerprint = "e7a26939600744e64577be4f3f5868f91a46fadbcd8d70baf90395202ac602c5"
+description = "Player Gimard Seru-magic cast, first frames of the summon (Vahn solo caster, no party). Pre-mesh-visible; the summon scene-graph spawn-stager window."
+
+[[scenarios]]
+label = "gimard_summon_visible"
+slot = 255
+backup_fingerprint = "8aa0ee1a261277bc987b57eaf283fcd074474601abbefd3d4593e5725009a0d4"
+description = "Player Gimard summon with the mesh visible on screen, pre-attack (Vahn solo caster). Steady-state summon render; resident summon overlay + per-part transform target."
+
+[[scenarios]]
+label = "gimard_burning_attack"
+slot = 255
+backup_fingerprint = "8653d14b3efae4e102e98b1e03d594d9a013baa028f4f481955d7e9a486d3050"
+description = "Player Gimard performing the Burning Attack move (move text + fire animation on screen, Vahn solo caster). The live summon-part mesh-rotation window for the FUN_801F7088 source hunt."
+
+# ----------------------------------------------------------------
+# Treasure-chest give-item capture pair (scene "keikoku" = Ravine).
+# Slot 1 = standing in front of an unopened chest; slot 2 = the open-
+# chest action just starting (chest-open SFX queued, item not yet
+# granted). The scene MAN loads verbatim at RAM 0x8012f4c8; the four
+# chest actors' interaction records carry field-VM GIVE_ITEM (0x39)
+# ops after their announcement dialogue. The actor that advances its
+# open state between the two saves is the Phoenix chest (item 0x80).
+# Ground truth for the chest-randomizer dialogue-skipping walk.
+# ----------------------------------------------------------------
+
+[[scenarios]]
+slot = 1
+label = "keikoku_chest_pre"
+ram_fingerprint_sha256 = "f88dd9fc09e13f70772030bb5bfd296b6d13815ddb8fa31c9f7880b0d1a742d1"
+backup_fingerprint = "5c450953a321496e00c7410ba49f46e2d596beb983a863f74023cb8cf8e5f26a"
+phase = "field"
+expected_active_scene = "keikoku"
+description = "Field, standing directly in front of an unopened treasure chest in keikoku (Ravine). Pre-open snapshot for the chest give-item RE."
+topics = ["chest", "give-item", "field-VM 0x39", "randomizer", "keikoku"]
+
+[[scenarios]]
+slot = 2
+label = "keikoku_chest_open"
+ram_fingerprint_sha256 = "ae775412134d561076123a8be7548a6bedd810efd2caa53c9315682a09dd53ff"
+backup_fingerprint = "c56db98557c3bae4066e8b42acda38827937d90442be53e610a4bdc74e1bf440"
+phase = "field"
+expected_active_scene = "keikoku"
+description = "Field, the open-chest action just starting (chest-open SFX 0x2d queued, item not yet added). Diff against keikoku_chest_pre: the Phoenix (0x80) chest actor advances its open-animation state; pins which give-item site the live game runs."
+topics = ["chest", "give-item", "field-VM 0x39", "randomizer", "keikoku"]
+
+# ----------------------------------------------------------------
+# Pre-scene-load capture for the keikoku chest room: standing on the
+# kingdom overworld (map01), directly outside the keikoku (Ravine)
+# entrance. Walking "up" for ~1s crosses the entrance portal, which
+# streams the keikoku scene bundle (PROT entry 112) FRESH off the disc.
+#
+# This is the state an emulator-based randomizer check needs. A mednafen
+# savestate captured INSIDE keikoku already has each chest's GIVE_ITEM
+# (0x39) bytecode resident in RAM (keikoku_chest_pre's MAN sits at
+# 0x8012f4c8), so loading it on a patched disc still grants the ORIGINAL
+# item - the chest id is read from the resident RAM copy, never re-fetched
+# from the patched disc. Captured on the overworld BEFORE the load, the
+# patched MAN is read on scene entry, so a patched chest is actually
+# observed. Companion to the deterministic engine oracle in
+# crates/parity/tests/chest_randomizer_runtime_e2e.rs (which proves
+# the same thing disc-free, by driving the patched MAN through the field VM).
+# ----------------------------------------------------------------
+
+[[scenarios]]
+slot = 3
+label = "keikoku_chest_preload"
+ram_fingerprint_sha256 = "f697ac277c14720a179e542c24d4c50a249a226b3586ef38926a3dcf4e5abab4"
+backup_fingerprint = "903185b20b9ada6fb6f18cc5abe5814caa090b7d8430635afdc92301d9dc8149"
+phase = "field"
+expected_active_scene = "map01"
+description = "Kingdom overworld (map01), standing just outside the keikoku (Ravine) entrance. Walking up ~1s crosses the portal and streams the keikoku scene bundle fresh from disc - the pre-scene-load state for validating a patched-disc chest in an emulator without the savestate RAM-cache trap."
+topics = ["chest", "randomizer", "keikoku", "scene-load", "preload", "map01"]
+
+# ----------------------------------------------------------------
+# PCSX-Redux trace state: standing directly in front of an early
+# treasure chest (normally a Healing Leaf). Used to trace the field-VM
+# GIVE_ITEM (op 0x39) path at runtime - capturing the RAM address the
+# game reads the item-id operand from (s6 at 0x801E0450) and the granted
+# id (FUN_800421D4 a0) - to verify whether a randomizer chest patch
+# reaches the running game. Probe: autorun_chest_give_trace.lua.
+# ----------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "chest_open_trace_pcsx"
+backup_fingerprint = "083275b4ab53021546759c3a0d36534d43ffcce40c6dd7b1c0629414d84a07f4"
+phase = "field"
+description = "PCSX-Redux: standing in front of an early treasure chest (normally a Healing Leaf), for the field-VM GIVE_ITEM (0x39) runtime trace - operand RAM address + granted item id."
+topics = ["chest", "give-item", "field-VM 0x39", "randomizer", "trace", "pcsx-redux"]
+
+# ----------------------------------------------------------------
+# Player-steal RAM capture (Evil God Icon equipped). The per-monster
+# steal item is NOT a raw id in the PROT 867 monster record (exhaustive
+# offset scan, docs/reference/open-rev-eng-threads.md), so closing where
+# the steal item is read needs a live capture. Pair: Vahn attacks a
+# skeleton and steals an "Incense"; `_pre` is the frame before the
+# attack resolves, `_banner` is the "Stole the 'Incense'." message frame.
+# Diff the pair to localize the RAM address carrying the stolen item id,
+# then trace its source (a separate table/asset or a non-raw index).
+# ----------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "player_steal_skeleton_pre"
+ram_fingerprint_sha256 = "aca366d22fd9fca9127b1ce3a452e043c7a319dfea3b4d2de33668e9a4124dfc"
+backup_fingerprint = "4dda3e8b2b9099024785896db03425a53c98bb9204ee910400802d4063612b8d"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Player-steal capture (Evil God Icon equipped): in battle, at the start of Vahn's attack that kills a skeleton and steals an 'Incense' - the frame before the steal resolves. Pairs with player_steal_skeleton_banner."
+topics = ["steal", "Evil God Icon", "battle", "skeleton", "incense", "randomizer", "RE"]
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+[[scenarios]]
+slot = 255
+label = "player_steal_skeleton_banner"
+ram_fingerprint_sha256 = "f3225f2b7c9120e433f80a3a7852f56e00890983aa5ca587cba3515b9e656651"
+backup_fingerprint = "1acdd38d71671c6d3eaa5e68999dd558d8d58ce61e8876526f010aeed6e7ed00"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Player-steal capture (Evil God Icon equipped): the 'Stole the `Incense`.' banner frame, after the steal from the skeleton resolved. Diff vs player_steal_skeleton_pre to localize the stolen-item-id RAM address."
+topics = ["steal", "Evil God Icon", "battle", "skeleton", "incense", "randomizer", "RE"]
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+# ----------------------------------------------------------------
+# Overworld battle-background capture set (4 camera angles). Vahn
+# (solo, LV 1) vs a Gobu Gobu on the OVERWORLD continent, paused on
+# the Begin/Run turn menu while the battle camera idly orbits the
+# scene. The four slots are the SAME battle at four orbit angles, so
+# diffing them isolates what is camera-dependent (the 3D stage:
+# ground + mountains) from what is fixed (the sky backdrop).
+#
+# These pin the overworld battle backdrop = the map's scene_tmd_stream
+# DOME (PROT 88 for map01): sky + mountain ring + grass ground,
+# resident at RAM 0x800A8B34, registered as DAT_80076810. The ~738
+# background prims (619 POLY_GT4 + 116 POLY_GT3) are the dome's
+# gouraud-textured geometry. (NOT the world-map continent heightfield:
+# the old "3715 hits in 0x80190000" was a prim-trace false positive
+# from 3 degenerate clut=0 FT4 prims; the real-CLUT clusters match 0
+# bytes in the continent windows.) Diffing the four angles isolates
+# the orbit yaw `_DAT_8007b792` (the only camera global that changes:
+# 224/3808/3136/2632) from the fixed rig (pitch 32, TR (0,1280,7680),
+# H 256). Randomizer disc (mechanism is disc-independent). See
+# docs/subsystems/battle.md "Battle background".
+
+[[scenarios]]
+slot = 2
+label = "overworld_battle_bg_angle_a"
+backup_fingerprint = "7269ae2b694a6a276037ad437eee9c331479c20d1eefb4f9c9a57ca982d46019"
+resident_patch = "starting bag + warp preset (new-game seed code) + arts randomizer (SCUS arts-name glyph strings)"
+phase = "battle"
+expected_game_mode = 0x15
+diff_against = [3, 4, 5]
+description = "Overworld Vahn vs Gobu Gobu, Begin/Run turn menu, battle camera orbit angle A. Backdrop = the map01 scene_tmd_stream dome (PROT 88, resident at 0x800A8B34): sky + mountain ring + grass. Randomizer disc."
+topics = ["battle", "battle background", "world map", "terrain", "camera orbit", "Gobu Gobu", "randomizer", "RE"]
+
+[[scenarios]]
+slot = 3
+label = "overworld_battle_bg_angle_b"
+backup_fingerprint = "32257e93ca63ebea0907c504b3d3e864fd13b97a430faa16010ff339ebadcde9"
+resident_patch = "starting bag + warp preset (new-game seed code) + arts randomizer (SCUS arts-name glyph strings)"
+phase = "battle"
+expected_game_mode = 0x15
+diff_against = [2, 4, 5]
+description = "Overworld Vahn vs Gobu Gobu, Begin/Run turn menu, battle camera orbit angle B. Sister of overworld_battle_bg_angle_a at a different orbit angle. Randomizer disc."
+topics = ["battle", "battle background", "world map", "terrain", "camera orbit", "Gobu Gobu", "randomizer", "RE"]
+
+[[scenarios]]
+slot = 4
+label = "overworld_battle_bg_angle_c"
+backup_fingerprint = "d0e4abc503bc0a914ae7989d8bb4c7ca28abbd95c95fe5114dc75bc732c74bf7"
+resident_patch = "starting bag + warp preset (new-game seed code) + arts randomizer (SCUS arts-name glyph strings)"
+phase = "battle"
+expected_game_mode = 0x15
+diff_against = [2, 3, 5]
+description = "Overworld Vahn vs Gobu Gobu, Begin/Run turn menu, battle camera orbit angle C. Sister angle. Randomizer disc."
+topics = ["battle", "battle background", "world map", "terrain", "camera orbit", "Gobu Gobu", "randomizer", "RE"]
+
+[[scenarios]]
+slot = 5
+label = "overworld_battle_bg_angle_d"
+backup_fingerprint = "af7a80a0d203fe57d904fdb1de559714b418100a08a38def0c5d09644357ebb9"
+resident_patch = "starting bag + warp preset (new-game seed code) + arts randomizer (SCUS arts-name glyph strings)"
+phase = "battle"
+expected_game_mode = 0x15
+diff_against = [2, 3, 4]
+description = "Overworld Vahn vs Gobu Gobu, Begin/Run turn menu, battle camera orbit angle D. Sister angle. Randomizer disc."
+topics = ["battle", "battle background", "world map", "terrain", "camera orbit", "Gobu Gobu", "randomizer", "RE"]
+
+# ----------------------------------------------------------------------
+# Minigame captures. Five of the game's side-activities, each parked in
+# its playable state. Library-only (slot = 255): these were saved to
+# ephemeral live mednafen slots, then content-hashed into saves/library/
+# so they resolve durably via `backup_fingerprint` (the live slots get
+# reused). The exact game_mode / scene per minigame is not yet pinned, so
+# those optional fields are left off rather than asserted.
+# ----------------------------------------------------------------------
+[[scenarios]]
+slot = 255
+label = "minigame_muscle_dome"
+ram_fingerprint_sha256 = "e43e4df0d352417601d3b913665e5a711ca347886a60fe72d92bf535374932cc"
+backup_fingerprint = "6917e1a452fc38f89016c876123950b7d0bbd2d98105e386a5d19a109170ad82"
+phase = "minigame"
+description = "Muscle Dome minigame (the rapid-button arm-wrestling / dome contest), parked in its playable state"
+topics = ["minigame", "muscle dome", "RE"]
+
+[[scenarios]]
+slot = 255
+label = "minigame_baka_fighter"
+ram_fingerprint_sha256 = "d661866d1bd91a3e18593b30101952d2eb6c17c9f8be0096a63cbd010590d1a5"
+backup_fingerprint = "c7a37c39178b2b1fa80b2fc8e150c83c97fddd98a897fe98d52172607e1bcf00"
+phase = "minigame"
+description = "Baka Fighter minigame (play as a battle-form party member; reuses the PROT 1204 battle character pack, see project_battle_char_pack_is_prot1204)"
+topics = ["minigame", "baka fighter", "PROT 1204", "battle char pack", "RE"]
+
+[[scenarios]]
+slot = 255
+label = "minigame_dance_noa"
+ram_fingerprint_sha256 = "68994559d2663e3829bf06d5ccf6a41dde538c82944ddf16af28d386d1d830ee"
+backup_fingerprint = "5214a97ff7cac6d12cfffcf2ba6474fd159639442eacea07ec6ada5c375948c1"
+phase = "minigame"
+description = "Noa dance-rhythm minigame, parked in its playable state"
+topics = ["minigame", "dance", "rhythm", "Noa", "RE"]
+
+[[scenarios]]
+slot = 255
+label = "minigame_fishing"
+ram_fingerprint_sha256 = "14a5afcf9d040b64b3697468f2ba6dda4073ec0e5dc3db5de4b1a8ab2164c979"
+backup_fingerprint = "9afc1f1cf6d26746765bc9a8dc46a0af7130deea9f1c68f9373a81ac10f97bf7"
+phase = "minigame"
+description = "Fishing minigame, parked in its playable state"
+topics = ["minigame", "fishing", "RE"]
+
+[[scenarios]]
+slot = 255
+label = "minigame_slot_machine"
+ram_fingerprint_sha256 = "af9d9266c7712ddb5854a225237d153aaa170122446367557572e516a8df8b1f"
+backup_fingerprint = "9dda14702d18b7d80ffcf1f7b4d6daefbbc6490d0ed60ee8c4aaae250351d3b8"
+phase = "minigame"
+description = "Casino slot-machine minigame, parked in its playable state (the coin economy the casino prize-exchange randomizer feeds)"
+topics = ["minigame", "slot machine", "casino", "RE"]
+
+# ----------------------------------------------------------------------
+# Minigame captures - PCSX-Redux. Breakpoint-probable twins of the five
+# mednafen minigame states above (mednafen's debugger is GUI-only, so those
+# can only be read offline). Each is a LOAD-TRANSITION capture: parked at the
+# earliest reachable frame of the minigame loading (the mode-24 OTHER-INIT
+# entry window), NO button presses needed. To probe: load the save and run
+# FORWARD a few frames - the overlay finishes loading (its score/payout/deck/
+# step-chart DATA tables become resident in RAM, readable even without play)
+# and the gameplay SM begins ticking (the exec-bp dispatchers fire). Gameplay
+# EVENTS that need input (a payout-on-win, a judged beat) require playing
+# forward / pad injection - a later mid-game save is the cleaner source for
+# those. Probes: scripts/pcsx-redux/autorun_minigame_*.lua. Deep-RE ROI order
+# (lowest port-catalog coverage first): fishing, dance, slot, baka, muscle.
+# ----------------------------------------------------------------------
+[[scenarios]]
+slot = 255
+label = "minigame_dance_pcsx"
+backup_fingerprint = "e9ae63ed4cecc05b96722bfe4ed5bb586a5b90341c7174ab2b740f85da9ffdb2"
+resident_patch = "shiny-seru + enemy-ally charm (PROT 0867/0898/0899 + SCUS)"
+resident_disc = "old/legaia_shiny_charm_100.bin"
+phase = "minigame"
+description = "Noa dance rhythm minigame, load-transition capture (earliest reachable, no input). Run forward to resident-load the overlay + start the SM. Overlay: beat-clock SM FUN_801cf470, timing-window judge FUN_801d1960, step chart 0x801d509c, groove gauge DAT_801d544c (per-tier rating multipliers unpinned)."
+topics = ["minigame", "dance", "RE", "pcsx-redux", "load-transition", "breakpoint-probe"]
+
+[[scenarios]]
+slot = 255
+label = "minigame_baka_pcsx"
+backup_fingerprint = "2126e54f99600b31377eaaea97bab695145b702df90d3e9819ecc093d88b3185"
+resident_patch = "shiny-seru + enemy-ally charm (PROT 0867/0898/0899 + SCUS)"
+resident_disc = "old/legaia_shiny_charm_100.bin"
+phase = "minigame"
+description = "Baka Fighter duel minigame, load-transition capture (earliest reachable, no input). Run forward to resident-load the overlay + start the SM. Overlay: round SM FUN_801d3468, rock-paper-scissors exchange resolver FUN_801d3a14, stat/combo damage (best-of-N + gold-payout constants unpinned). Reuses the PROT 1204 battle-form party meshes."
+topics = ["minigame", "baka fighter", "RE", "pcsx-redux", "load-transition", "breakpoint-probe"]
+
+[[scenarios]]
+slot = 255
+label = "minigame_slot_machine_pcsx"
+backup_fingerprint = "d96c9a9dabb08742b38407b0792cea25da30c0e72501060ed836084169d6ffc1"
+resident_patch = "shiny-seru + enemy-ally charm (PROT 0867/0898/0899 + SCUS)"
+resident_disc = "old/legaia_shiny_charm_100.bin"
+phase = "minigame"
+description = "Casino slot-machine minigame, load-transition capture (earliest reachable, no input). Run forward to resident-load the overlay + start the SM. Overlay: reel SM FUN_801cf0d8, dual RNG (LCG FUN_801d30cc + BIOS-rand feature rolls), payout/jackpot eval FUN_801d13e8; cash-out commits into coin bank 0x800845A4."
+topics = ["minigame", "slot machine", "casino", "RE", "pcsx-redux", "load-transition", "breakpoint-probe"]
+
+[[scenarios]]
+slot = 255
+label = "minigame_muscle_dome_pcsx"
+backup_fingerprint = "ed174405c2685db529b0e9bd6a4deb5024db916b963588f43c44cefa3a8905cb"
+resident_patch = "shiny-seru + enemy-ally charm (PROT 0867/0898/0899 + SCUS)"
+resident_disc = "old/legaia_shiny_charm_100.bin"
+phase = "minigame"
+description = "Muscle Dome arena minigame, load-transition capture (earliest reachable, no input). Run forward to resident-load the overlay + start the SM. Overlay: match SM FUN_801d0748 (phase byte ctx+6), four direction commands 0xC..0xF committed under an AP budget into the actor +0x1df action queue, resolution via the shared battle-action path. Not a card battle - nothing is drawn, discarded or reshuffled."
+topics = ["minigame", "muscle dome", "RE", "pcsx-redux", "load-transition", "breakpoint-probe"]
+
+[[scenarios]]
+slot = 255
+label = "minigame_fishing_pcsx"
+backup_fingerprint = "1592a3b1ab7522a336e24da7ce9b8bd6b554e46044d1890e0071c12b59caba64"
+resident_patch = "shiny-seru + enemy-ally charm (PROT 0867/0898/0899 + SCUS)"
+resident_disc = "old/legaia_shiny_charm_100.bin"
+phase = "minigame"
+description = "Fishing minigame, load-transition capture (earliest reachable, no input). Run forward to resident-load the overlay + start the SM. Overlay: state machine FUN_801cf3bc, tension gauge 0x801d9168 (fish-AI/tension tick FUN_801d4004), catch scoring into 0x8008444c (FUN_801d5298). Lowest-ported overlay = highest RE ROI."
+topics = ["minigame", "fishing", "RE", "pcsx-redux", "load-transition", "breakpoint-probe"]
+
+[[scenarios]]
+slot = 255
+label = "party_basic_attack_vs_gobu_gobu"
+backup_fingerprint = "658af41bc58b055801090f4fc91f7b4311b87aa9d505f49b94342e21bb0543f6"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Battle paused at the Begin/Reselect confirm with Vahn's queued basic Attack on a lone Gobu Gobu; pressing X (Begin) runs the turn (Gobu Gobu acts first, then Vahn's basic attack lands). Captures a party-member basic-Attack resolution for tracing the attack damage path (actor+0x1df move id, ctx+0x1014 held move-power record, damage dealt)."
+topics = ["battle", "basic attack", "party damage", "move-power", "BattleMode", "RE"]
+
+# ----------------------------------------------------------------------
+# Pause-menu overlay captures (PROT 0899 resident at slot-A base
+# 0x801CE818). Used to RAM-byte-match the menu overlay for the static
+# overlay-extraction pipeline (docs/tooling/static-overlay-pipeline.md):
+# the menu overlay replaces the field overlay (PROT 0897) in slot A, so
+# the field VM at 0x801DE840 is NOT a prologue in these states while the
+# equipment aggregator FUN_801CF650 at 0x801CF650 IS. Party = Vahn only.
+#
+# Two scene contexts (the menu overlay is identical in both): the field
+# world-map scene `map01` (Drake Kingdom approach) and the town `town01`
+# (Rim Elm). backup_fingerprint resolves the immutable library copy.
+# ----------------------------------------------------------------------
+[[scenarios]]
+slot = 1
+label = "menu_equipment_field"
+backup_fingerprint = "9b0e7a6a4498c06e618d05fb1a1f9fa1d9d7d9101c5ed1e65d6175a6bcf24d98"
+phase = "menu"
+expected_active_scene = "map01"
+# The menu-open captures all hold game_mode 0x17 (23, the CARD/menu-overlay
+# per-frame mode): the in-field pause menu runs under the CARD mode pair,
+# not field mode 3 (read directly off the six library saves at 0x8007B83C).
+expected_game_mode = 0x17
+description = "Equipment menu open from the field (map01, Drake Kingdom approach), party = Vahn. Menu overlay PROT 0899 resident at 0x801CE818 (field overlay 0897 swapped out). Source for the menu-overlay clean-copy RAM byte-match."
+topics = ["menu", "equipment", "overlay PROT 0899", "static overlay", "map01"]
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+[[scenarios]]
+slot = 2
+label = "menu_status_field"
+backup_fingerprint = "904f3ae91fc5601f46403e93c88cea818db5d7e64345efbfa47e50c1096dab67"
+phase = "menu"
+expected_active_scene = "map01"
+# The menu-open captures all hold game_mode 0x17 (23, the CARD/menu-overlay
+# per-frame mode): the in-field pause menu runs under the CARD mode pair,
+# not field mode 3 (read directly off the six library saves at 0x8007B83C).
+expected_game_mode = 0x17
+description = "Status menu open from the field (map01), party = Vahn. Menu overlay PROT 0899 resident at 0x801CE818."
+topics = ["menu", "status", "overlay PROT 0899", "static overlay", "map01"]
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+[[scenarios]]
+slot = 3
+label = "menu_options_field"
+backup_fingerprint = "169eade7dfe4e646a39f99d855fa99da73f427747520a8572ddda57fcbb83378"
+phase = "menu"
+expected_active_scene = "map01"
+# The menu-open captures all hold game_mode 0x17 (23, the CARD/menu-overlay
+# per-frame mode): the in-field pause menu runs under the CARD mode pair,
+# not field mode 3 (read directly off the six library saves at 0x8007B83C).
+expected_game_mode = 0x17
+description = "Options/config menu open from the field (map01), party = Vahn. Menu overlay PROT 0899 resident at 0x801CE818 (the options-menu config bundle boot.md attributes to PROT 0899)."
+topics = ["menu", "options", "config", "overlay PROT 0899", "static overlay", "map01"]
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+[[scenarios]]
+slot = 6
+label = "menu_equipment_town"
+backup_fingerprint = "016b9175ec42d85514e0a7ad5fb0414c81a152d0f6701934713f08b869ed92c9"
+phase = "menu"
+expected_active_scene = "town01"
+# The menu-open captures all hold game_mode 0x17 (23, the CARD/menu-overlay
+# per-frame mode): the in-field pause menu runs under the CARD mode pair,
+# not field mode 3 (read directly off the six library saves at 0x8007B83C).
+expected_game_mode = 0x17
+description = "Equipment menu open in town (town01, Rim Elm), party = Vahn. Menu overlay PROT 0899 resident at 0x801CE818. Town sibling of menu_equipment_field (the overlay is identical in town and field)."
+topics = ["menu", "equipment", "overlay PROT 0899", "static overlay", "town01"]
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+[[scenarios]]
+slot = 7
+label = "menu_status_town"
+backup_fingerprint = "fd818b998623f3733ead6aa8337606efd25747c4fd4433cba0e427982c6f0784"
+phase = "menu"
+expected_active_scene = "town01"
+# The menu-open captures all hold game_mode 0x17 (23, the CARD/menu-overlay
+# per-frame mode): the in-field pause menu runs under the CARD mode pair,
+# not field mode 3 (read directly off the six library saves at 0x8007B83C).
+expected_game_mode = 0x17
+description = "Status menu open in town (town01, Rim Elm), party = Vahn. Menu overlay PROT 0899 resident at 0x801CE818."
+topics = ["menu", "status", "overlay PROT 0899", "static overlay", "town01"]
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+[[scenarios]]
+slot = 8
+label = "menu_options_town"
+backup_fingerprint = "e79b212a6284b03a3471a6cd4e69c0f39ac47d67b85452c764835ff6601c6eb3"
+phase = "menu"
+expected_active_scene = "town01"
+# The menu-open captures all hold game_mode 0x17 (23, the CARD/menu-overlay
+# per-frame mode): the in-field pause menu runs under the CARD mode pair,
+# not field mode 3 (read directly off the six library saves at 0x8007B83C).
+expected_game_mode = 0x17
+description = "Options/config menu open in town (town01, Rim Elm), party = Vahn. Menu overlay PROT 0899 resident at 0x801CE818."
+topics = ["menu", "options", "config", "overlay PROT 0899", "static overlay", "town01"]
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+[[scenarios]]
+slot = 255
+label = "battle_noa_miracle_art_combo"
+backup_fingerprint = "3cb1376abaf61f060c82c45aa1418cd82785ca8681d4586cbd4c52dd842a5d09"
+resident_patch = "starting bag + warp preset (new-game seed code)"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Battle, Noa auto-executes a Miracle Art against an enemy on load (no input needed); she runs through the component arts over a few seconds before the find/replace finisher triggers. Capture point for the Super/Miracle Art action-queue builder (F-SUPER): the runtime emits the combo's interleaved queue + combo-specific connector bytes into the battle-action context at ctx[+0x274] (ctx = *(0x8007BD24)). Drives autorun_super_art_queue_builder.lua, which watches ctx+0x274/+0x276 for writes to pin the builder PC + the literal queue bytes."
+topics = ["battle", "RE", "miracle art", "super art", "arts", "Noa", "ctx queue", "FUN_801E295C"]
+
+[[scenarios]]
+slot = 255
+label = "battle_vahn_tri_somersault_super"
+backup_fingerprint = "c2831f77f52da05ae709740853147f7ef49e8cd0e824b4650a98c3d1bf08b76c"
+resident_patch = "starting bag + warp preset (new-game seed code)"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Vahn auto-executes the Tri-Somersault Super Art during a counterattack ~2s after load (no input). The byte-exact Super action queue is resident at actor[+0x1DF]: 0F 0E 19 27 0F 19 1F 0E 1A 2B 2B 2B = [Up Down][Starter Somersault 0x27 -> Up][Starter Cyclone 0x1F -> Down][SpecialStarter 0x1A][Tri-Somersault finisher 0x2B x3]. The tail matches super_art.rs's Tri-Somersault `replace` byte-exact, validating the combo-specific connectors (0x27->0F, 0x1F->0E). The dequeue site is pc 0x801D89D8 (consumes the queue head-first). Drives autorun_super_art_action_queue.lua."
+topics = ["battle", "RE", "super art", "arts", "Vahn", "Tri-Somersault", "ctx queue", "FUN_801E295C"]
+
+[[scenarios]]
+slot = 255
+label = "rimelm_wall_press_left"
+ram_fingerprint_sha256 = "1f5dfa67b5baff5b2b903859529c364f90626aedf76ad48e94768d59d407d24a"
+backup_fingerprint = "57657d067b1cbe91121f0f131683312d39d77070a0e86f1582f94a9ab2441050"
+phase = "field"
+expected_active_scene = "town0c"
+description = "Rim Elm (town0c variant session holding the town01 field buffer), player holding LEFT (screen-left = world X-) pressed against a wall, resting at (1838,2526) against the full-height wall column at grid col 13. Cheat-free re-capture (an earlier take had a walk-through-walls GameShark code active). RESULT: validates the retail derivation + 47-unit leading edge at step granularity (probe 1791 = the column's last wall sub-cell; one 2-unit step shallower reads clear). Consumed by parity/tests/field_collision_discriminator.rs."
+topics = ["field", "collision", "locomotion", "walkability grid", "FUN_801cfe4c", "RE"]
+
+[[scenarios]]
+slot = 255
+label = "casino_ticket_counter"
+backup_fingerprint = "68df0a5ca04ac334d07025fab777af85d95e0d9d8b3c5c62ed8dd2a9407cad2f"
+resident_patch = "starting bag + warp preset (new-game seed code)"
+phase = "field"
+expected_game_mode = 0x03
+description = "Casino floor, Vahn standing at the prize-exchange ticket counter (pre-interaction). Brackets the prize-exchange flow entry; pairs with casino_ticket_counter_dialog and casino_prize_shop for the prize-exchange game-mode + 0x3E sub-id hunt. Measured: game_mode 0x03 (field), field overlay PROT 0897 resident in slot A (clean prefix 1.0000)."
+topics = ["casino", "prize exchange", "game mode", "RE"]
+
+[[scenarios]]
+slot = 255
+label = "casino_ticket_counter_dialog"
+backup_fingerprint = "9e4fdec5c2e4ec77c92c5b87948c1ac3f8a9ac4f86cedad9518223ff31c8c318"
+resident_patch = "starting bag + warp preset (new-game seed code)"
+phase = "field"
+expected_game_mode = 0x03
+description = "Casino floor, mid-dialog with the prize-exchange ticket-counter attendant. Middle of the prize-exchange flow bracket (see casino_ticket_counter). Measured: still game_mode 0x03 (field) - the dialog runs under the field overlay, not a menu session."
+topics = ["casino", "prize exchange", "dialog", "game mode", "RE"]
+
+[[scenarios]]
+slot = 255
+label = "casino_prize_shop"
+backup_fingerprint = "231209cd8a981bf9b1d60d5410f2535546ba7546e240b28863be049376f70da4"
+resident_patch = "starting bag + warp preset (new-game seed code)"
+phase = "menu"
+expected_game_mode = 0x17
+description = "Inside the casino ticket-counter prize-exchange shop UI (the PROT 0899 @0x15D00 prize table's consumer). FINDING: the prize shop runs at game_mode 0x17 (the CARD/menu pair, same as the pause menu) with the MENU overlay PROT 0899 resident in slot A (clean prefix 1.0000) and the field overlay swapped out - the prize exchange is a menu-overlay session, consistent with its table + debit kernel living in PROT 0899."
+topics = ["casino", "prize exchange", "shop", "PROT 0899", "game mode", "RE"]
+
+[[scenarios]]
+slot = 255
+label = "baka_fighter_entry_pretransition"
+backup_fingerprint = "1ac2c3d37e24ff428fa89db0dff01b2e402b21b1a29fba765f0d505ee36e0965"
+resident_patch = "starting bag + warp preset (new-game seed code)"
+phase = "field"
+expected_game_mode = 0x03
+description = "Starting the Baka Fighter minigame: pre-transition, Vahn taking a seat at the chair (game_mode still 0x03, 0x3E sub-id 0). Drives autorun_minigame_overlay_capture.lua: the sit animation rolls into the mode-24 transition hands-free (~vsync 138 after load). RESULT of the live entry window: sub-id 0x8007BA34 = 4 (live-confirms the 0x3E operand-100 model), the SCUS-resident OTHER INIT ('other init end') streams the per-minigame overlay directly into slot A, and PROT 0896's bytes appear NOWHERE in RAM across the window or any parked library state - the '0896 = mode-24 OTHER overlay' hypothesis is refuted (its 0x801C5818 base was an over-read artifact of the field-overlay tail; see open-rev-eng-threads.md)."
+topics = ["minigame", "baka fighter", "overlay PROT 0896", "game mode", "0x3E", "RE"]
+
+[[scenarios]]
+slot = 255
+label = "rimelm_wall_press_down"
+ram_fingerprint_sha256 = "37218ba4fa31810f9115a68fd740138fdf3ccf077334883d8f24531660203327"
+backup_fingerprint = "5461e7a0f28d55f805b298f5c97185fdf25d7b9fc1cc6571f5d50bee97065813"
+phase = "field"
+expected_active_scene = "town0c"
+description = "Rim Elm (town0c variant session holding the town01 field buffer), player holding DOWN (screen-down = world Z-, toward the camera) pressed against a lower wall, resting at (3386,2606). THE DECISIVE Z-row discriminator, cheat-free: the plain floor-indexed standing cell (26,20) is an all-quads wall byte (the position would be unreachable under floor indexing) while the retail biased derivation reads it clear and blocks at the z-47 leading-edge probes with a step-exact standoff. PROVED the +2 Z bias is authored into the wall bits; World::field_tile_is_wall realigned on this evidence. Consumed by parity/tests/field_collision_discriminator.rs."
+topics = ["field", "collision", "locomotion", "walkability grid", "FUN_801cfe4c", "RE"]
+
+[[scenarios]]
+slot = 255
+label = "rimelm_npc_press_tetsu"
+ram_fingerprint_sha256 = "aa2711168c6af4466b9894dedd80f53212d85c7c0a742d88adad30d955a7d250"
+backup_fingerprint = "05f218afdec9dd4d0c400f51ef3d1730219b1a7baf2c706f52b6d1f65f19d793"
+phase = "field"
+description = "Rim Elm tutorial area, player holding the d-pad pressed INTO the sparring partner Tetsu (player 0x80083794 at (2762,1782) facing 0x800, Tetsu actor 0x80083284 at (2752,1856)). The MUTUAL +0x98 collision link is LIVE in-frame both ways (player+0x98 = 0x80083284, actor+0x98 = 0x80083794) - direct evidence of FUN_801cfc40's hit path. Tetsu's flags+0x10 = 0x08020884 carry the 0x20000 class bit: the village NPC takes the MOVING-actor arm (result bit 1, +/-40-unit box around live position, caller extents 0), NOT the static record-anchor arm - the ground truth that re-classed the engine's NPC box. Active-actor table _DAT_8007b6b8 = 1 (Tetsu alone). Consumed by parity/tests/field_collision_discriminator.rs (npc-press leg)."
+topics = ["field", "collision", "NPC", "FUN_801cfc40", "actor probe", "Tetsu", "RE"]
+
+# ----------------------------------------------------------------
+# Per-spell summon mid-cast corpus: one battle state per player
+# Seru-magic spell, captured mid-cast (summon creature on screen,
+# pre-attack). Each pins the battle overlay loader-B current-id
+# 0x8007BC4C for its spell id (the id is a last-load tracker, so
+# only mid-cast states are evidential). Verified linear arithmetic:
+# extraction = loader_id + 895, loader_id = spell_id - 0x79.
+# Notably Nighto (0x85) holds id 12 -> extraction 0907 even though
+# 0907 was content-pinned as the Disco King dance song - the stager
+# attribution and that content pin now need reconciling.
+
+[[scenarios]]
+slot = 4
+label = "theeder_summon_mid_cast"
+ram_fingerprint_sha256 = "5cf235e8a581aa965572762bb132c876ec63d5e01fa873210a85e6b49129fc3a"
+backup_fingerprint = "696ec5e27394d7fee7de65f5875db88f757888a1f60a873a8036cfbaf4ab258a"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Vahn casting Theeder (spell 0x82) mid-summon. Loader-B current-id 0x8007BC4C = 9 -> stager extraction 0904."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x82"]
+
+[[scenarios]]
+slot = 3
+label = "vera_summon_mid_cast"
+ram_fingerprint_sha256 = "7efe17be4b742c67bb7ac8704f23c04d6268c657d247472b4bb7186d287b6654"
+backup_fingerprint = "6a640a54d1573134e21cc224e0ca5f07d567596db443e06806fb05db17633a53"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Gala casting Vera (spell 0x83) mid-summon. Loader-B current-id 0x8007BC4C = 10 -> stager extraction 0905."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x83"]
+
+[[scenarios]]
+slot = 2
+label = "gizam_summon_mid_cast"
+ram_fingerprint_sha256 = "da21ab0b1c14afa1dd5205fd57a0778a69d16ae17b10fe7158d0f21361999240"
+backup_fingerprint = "f7917d0f784c58760806d7fc52ff8f7b0a761a6f3b01a262e1398061ec337a66"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Noa casting Gizam (spell 0x84) mid-summon. Loader-B current-id 0x8007BC4C = 11 -> stager extraction 0906."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x84"]
+
+[[scenarios]]
+slot = 7
+label = "nighto_summon_mid_cast"
+ram_fingerprint_sha256 = "47436f3945a7b87c94b53a51e7f1c9ba3d850fc96b8fbc193be08f5279f82117"
+backup_fingerprint = "3b43a70e0eaebe65bceb86d50168dde80225815ade000bae5456cd1edb7aa820"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Vahn casting Nighto (spell 0x85) mid-summon. Loader-B current-id 0x8007BC4C = 12 -> stager extraction 0907 - the linear arithmetic HOLDS despite 0907's dance-song content pin; reconcile the two attributions."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x85", "extraction 0907"]
+
+[[scenarios]]
+slot = 5
+label = "zenoir_summon_mid_cast"
+ram_fingerprint_sha256 = "b9e2bbd8312f06652ba0251304ba89705079e3a81689a4673a41d1d70fd26671"
+backup_fingerprint = "529a43d0320d655ec7689438dae9703ded35ea667409586f6c786a3843c0c2ad"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Noa casting Zenoir (spell 0x86) mid-summon. Loader-B current-id 0x8007BC4C = 13 -> stager extraction 0908."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x86"]
+
+[[scenarios]]
+slot = 6
+label = "viguro_summon_mid_cast"
+ram_fingerprint_sha256 = "bb9dc1a909fb684f795408da38dacb2488e99708c51e5e03ba38c365f7a7b50e"
+backup_fingerprint = "8905ddd367835da6d7a22c59201c44efbeecc16d9401e6777f0b2345b91d4b6a"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Gala casting Viguro (spell 0x87) mid-summon. Loader-B current-id 0x8007BC4C = 14 -> stager extraction 0909."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x87"]
+
+[[scenarios]]
+slot = 2
+label = "swordie_summon_mid_cast"
+ram_fingerprint_sha256 = "0dcd865e05e60a4875bd119bced7abe25ddaae22a7b23e169eb917d8652bc175"
+backup_fingerprint = "6d877c409b1b82138f3200fbd0db1527f533635ffdf58e6031d81a1bcbd665c0"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Noa casting Swordie (spell 0x88) mid-summon. Loader-B current-id 0x8007BC4C = 15 -> stager extraction 0910."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x88"]
+
+[[scenarios]]
+slot = 4
+label = "orb_summon_mid_cast"
+ram_fingerprint_sha256 = "56011a5847a8fe007f9d4a3b226b1160c5bb46fa93ca1bcfa80012e845bb576d"
+backup_fingerprint = "b60d9e367758c05dfc15ab0220b60ae8454bb1262f9805b7499bd2d5d16d6f16"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Vahn casting Orb (spell 0x89) mid-summon. Loader-B current-id 0x8007BC4C = 16 -> stager extraction 0911."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x89"]
+
+[[scenarios]]
+slot = 3
+label = "freed_summon_mid_cast"
+ram_fingerprint_sha256 = "26e3375d44a3794569fc84dc78721ac21a820d4dd1f244bafdf78475ae0d7089"
+backup_fingerprint = "677e2b12242689966f4f5a1f21682b9de8c1f8bb5094ecdfe9f7437ce6981e5b"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Gala casting Freed (spell 0x8A) mid-summon. Loader-B current-id 0x8007BC4C = 17 -> stager extraction 0912."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x8A"]
+
+[[scenarios]]
+slot = 5
+label = "nova_summon_mid_cast"
+ram_fingerprint_sha256 = "a458136e6863f7bf95adb8143453053afcd0554218c000ddaa7f72c71c45354a"
+backup_fingerprint = "c2c46b5f0a23b6f6737d6d6be499e0f11dc0be10b8a4ef10c75a2e0f9ee548ab"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Noa casting Nova (spell 0x8B) mid-summon. Loader-B current-id 0x8007BC4C = 18 -> stager extraction 0913. Completes the capture-pinned player Seru-magic block: 0x81..0x8B -> 903..913, every leg on the linear arithmetic."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x8B"]
+
+# Evolved-Seru summon mid-cast corpus: the player evolved-Seru casts
+# (spell ids 0x8C..) that continue the base block on the same linear
+# arithmetic (extraction = loader_id + 895, loader_id = spell_id - 0x79).
+# Each was previously only statically predicted (the entries parse as
+# stagers, but no mid-cast state pinned the per-id binding); these three
+# byte-pin it - loader-B current-id read mid-cast + the predicted stager
+# 100% byte-resident at slot-B 0x801F69D8.
+
+[[scenarios]]
+slot = 2
+label = "gola_gola_summon_mid_cast"
+ram_fingerprint_sha256 = "53c9d0345c2cee22fe32c5bb584cce3adc355ce8e5f32c61a87b16a07ef93056"
+backup_fingerprint = "de6b61e58bfa84404133cc74b0e582a2793260f182d334dc6c5dfa8bf626aab5"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Vahn casting Gola Gola (evolved-Seru, fire, attack 'Spinning Flare', spell 0x8C) mid-summon. Loader-B current-id 0x8007BC4C = 19 (0x13) -> stager extraction 0914; the stager is 100% byte-resident at slot-B 0x801F69D8. Byte-pins the predicted evolved-Seru leg 0x8C -> 914."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x8C", "evolved-Seru"]
+
+[[scenarios]]
+slot = 3
+label = "mushura_summon_mid_cast"
+ram_fingerprint_sha256 = "0a4412f8a879c39e9866dfb9ff515b2eb7a279d1f65031cb01d2d82db4868a3c"
+backup_fingerprint = "2a73b0a95f14853e1059cd9271c9f5bb0121db362d1468d6b1703d472b6f6e88"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Noa casting Mushura (evolved-Seru, earth, attack 'Crazy Driver', spell 0x8D) mid-summon. Loader-B current-id 0x8007BC4C = 20 (0x14) -> stager extraction 0915; the stager is 100% byte-resident at slot-B 0x801F69D8. Byte-pins the predicted evolved-Seru leg 0x8D -> 915."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x8D", "evolved-Seru"]
+
+[[scenarios]]
+slot = 4
+label = "barra_summon_mid_cast"
+ram_fingerprint_sha256 = "c8d607dbd2f34700378ad928a1c67482088addd9f437421092dd7717b8ed9f60"
+backup_fingerprint = "fbe3179a7668dbe094c526756a2eaf12d197c21252b03da2168f6dbb1a910979"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Gala casting Barra (evolved-Seru, wind, attack 'Hell Dive', spell 0x8F) mid-summon. Loader-B current-id 0x8007BC4C = 22 (0x16) -> stager extraction 0917; the stager is 100% byte-resident at slot-B 0x801F69D8. Byte-pins the predicted evolved-Seru leg 0x8F -> 917."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x8F", "evolved-Seru"]
+
+[[scenarios]]
+slot = 8
+label = "aluru_summon_mid_cast"
+ram_fingerprint_sha256 = "dfb57b1bddc8b233beb5dad3a8b8b64c3efa04662d0edce6759ba5825a7cffcb"
+backup_fingerprint = "164d2174566d7613889f3363ab7964b7dfb311d1c4210933fb3440c18a03983c"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Vahn casting Aluru (evolved-Seru, light, attack 'Final Blast', spell 0x8E) mid-summon. Loader-B current-id 0x8007BC4C = 21 (0x15) -> stager extraction 0916; the stager is 100% byte-resident at slot-B 0x801F69D8. Byte-pins leg 0x8E -> 916 - one of the two evolved-block stagers carrying 0x4000 render-mode-node records - confirming that carrier is a player cast."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x8E", "evolved-Seru", "render-mode"]
+
+[[scenarios]]
+slot = 5
+label = "slippery_summon_mid_cast"
+ram_fingerprint_sha256 = "ec87790af7570ce6837e4ce1728af43fd5436a83dc7a5f848f68c81a10e53693"
+backup_fingerprint = "ba29ffa030958fb38acb82948707dde451ae052bea04ce2a587daa7ee765ca4c"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Vahn casting Slippery (evolved-Seru, water, attack 'Deadly Rain', spell 0x92) mid-summon. Loader-B current-id 0x8007BC4C = 25 (0x19) -> stager extraction 0920; the stager is byte-resident at slot-B 0x801F69D8. Byte-pins leg 0x92 -> 920."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x92", "evolved-Seru"]
+
+[[scenarios]]
+slot = 7
+label = "iota_summon_mid_cast"
+ram_fingerprint_sha256 = "f8fd73be47c7b8e5debb9354edbe2e4fa43eb9ffe5d53648f7611f5e3c4118bd"
+backup_fingerprint = "7779cd109943b4489d879adc9b8d200b44df83131d4ee851e4b8e98336d4a547"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Vahn casting Iota (evolved-Seru, earth, attack 'Odd Dimension', spell 0x93) mid-summon. Loader-B current-id 0x8007BC4C = 26 (0x1a) -> stager extraction 0921; the stager is 100% byte-resident at slot-B 0x801F69D8. Byte-pins leg 0x93 -> 921 - the second evolved-block stager carrying 0x4000 render-mode-node records (6 of them) - confirming that carrier is a player cast."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x93", "evolved-Seru", "render-mode"]
+
+[[scenarios]]
+slot = 6
+label = "puera_summon_mid_cast"
+ram_fingerprint_sha256 = "7673a799ee29f77bd3a972742378a8e0edc493ec17cb02fb7be865dc7f0d2261"
+backup_fingerprint = "f09357904e2ad50a966c8213fdf116cb1157db343f30f23574b06830a04b1940"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Noa casting Puera (evolved-Seru, dark, attack 'Dream Illusion', spell 0x94) mid-summon. Loader-B current-id 0x8007BC4C = 27 (0x1b) -> stager extraction 0922; the stager is 100% byte-resident at slot-B 0x801F69D8. Byte-pins leg 0x94 -> 922."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x94", "evolved-Seru"]
+
+[[scenarios]]
+slot = 9
+label = "gilium_summon_mid_cast"
+ram_fingerprint_sha256 = "01a398e1d798fb45d7f753b1abf42102e47a80d442e01b6f968db0e3f630e9c8"
+backup_fingerprint = "4010d82fbff48cc13840984ccc3cfc1061e33dfa9d364638145b9463da157049"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Noa casting Gilium (evolved-Seru, thunder, attack 'Space Cannon', spell 0x95) mid-summon. Loader-B current-id 0x8007BC4C = 28 (0x1c) -> stager extraction 0923; the stager is 100% byte-resident at slot-B 0x801F69D8. Byte-pins leg 0x95 -> 923, the last entry of the evolved-Seru block. With these the only unpinned legs are 0x90 -> 918 and 0x91 -> 919."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x95", "evolved-Seru"]
+
+# High-id summon mid-cast corpus (endgame card): the Ra-Seru summons
+# (Meta / Terra / Ozma, spell ids 0x9E..0xA0) and an Evil Seru Magic
+# cast (spell id 0x99, creature Juggernaut). Same evidential shape as
+# the base block above: loader-B current-id 0x8007BC4C read mid-cast +
+# the predicted stager byte-resident at slot-B 0x801F69D8. These four
+# extend the verified linear arithmetic (extraction = loader_id + 895,
+# loader_id = spell_id - 0x79) across the high block: 0x99 -> 0927
+# ("Dark Eclipse" = the ATTACK display name, parallel to Nighto's
+# "Hell's Music"), 0x9E..0xA0 -> 0932..0934.
+
+[[scenarios]]
+slot = 2
+label = "juggernaut_summon_mid_cast"
+ram_fingerprint_sha256 = "08a9ef833879c39c4eeef4a4bcfff8e83a92e75fc4bb6d59e562f98eee1143e9"
+backup_fingerprint = "c9bb599b6b44f21290896a93ce31ac54d70567b9fbc195a81e4f05a1349f0293"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Vahn casting Evil Seru Magic (spell 0x99) mid-summon, creature Juggernaut. Loader-B current-id 0x8007BC4C = 0x20 -> stager extraction 0927 (the 'Dark Eclipse'-titled stager; the title is the attack's display name). Resolves the 0927 'loads computed' question."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x99", "Evil Seru Magic", "Juggernaut", "extraction 0927"]
+
+[[scenarios]]
+slot = 3
+label = "meta_summon_mid_cast"
+ram_fingerprint_sha256 = "8df6166dea3110b2e4bb535423a539f4f3216e9a3b28713b7368f2f0e95d3209"
+backup_fingerprint = "6ce344812e0fb47119d6a9f3fdeb48a9b72e569d671dcdf9ffd99c7a559b356e"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Vahn casting Meta (spell 0x9E, the Ra-Seru summon) mid-summon. Loader-B current-id 0x8007BC4C = 0x25 -> stager extraction 0932 (slot-B pointer-table head, byte-resident at 0x801F69D8)."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x9E", "Ra-Seru", "Meta"]
+
+[[scenarios]]
+slot = 4
+label = "terra_summon_mid_cast"
+ram_fingerprint_sha256 = "daf0a829198bd9f9899cdd826137e116edafcfa2096877e01fd78b9298381d15"
+backup_fingerprint = "4bddedf7ee28d1481bbad30bc53feac74414602764b22f3779401cf3daf5732a"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Noa casting Terra (spell 0x9F, the Ra-Seru summon) mid-summon. Loader-B current-id 0x8007BC4C = 0x26 -> stager extraction 0933."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x9F", "Ra-Seru", "Terra"]
+
+[[scenarios]]
+slot = 5
+label = "ozma_summon_mid_cast"
+ram_fingerprint_sha256 = "b1cf96853826e56ffaf76e21340f6a74e8597b6babfec6a27046fe0521611a1c"
+backup_fingerprint = "4ecc936179600e06be2b7cb6b8d8237aaf829afd7bc8667870573de81d265963"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Gala casting Ozma (spell 0xA0, the Ra-Seru summon) mid-summon. Loader-B current-id 0x8007BC4C = 0x27 -> stager extraction 0934. With Meta/Terra this completes the Ra-Seru block 0x9E..0xA0 -> 0932..0934 on the same linear arithmetic as the base summons."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0xA0", "Ra-Seru", "Ozma"]
+
+# Sim-Seru summon mid-cast corpus (all Vahn casts): Palma / Mule / Horn /
+# Jedo (spell ids 0x9A..0x9D, mp 200). Same evidential shape; these fill
+# the gap between Evil Seru Magic (0x99 -> 0927) and the Ra-Seru trio
+# (0x9E..0xA0 -> 0932..0934), making the whole 0x99..0xA0 -> 927..934
+# stager block linear with zero exceptions.
+
+[[scenarios]]
+slot = 4
+label = "palma_summon_mid_cast"
+ram_fingerprint_sha256 = "c30b1dbcaa4dac5abb1139e8242d6fc01b2d376eb411a24e944ba8d505356b37"
+backup_fingerprint = "dfd540db7aa336bdbe84fb561527da8719b8abf170b386a8d52d39efb131da6f"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Vahn casting Palma (spell 0x9A, Sim-Seru summon) mid-summon. Loader-B current-id 0x8007BC4C = 0x21 -> stager extraction 0928 (byte-resident at slot B 0x801F69D8)."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x9A", "Sim-Seru", "Palma"]
+
+[[scenarios]]
+slot = 6
+label = "mule_summon_mid_cast"
+ram_fingerprint_sha256 = "3905d7903655e76dbc8c002ad49edcec811a6c6bf5f59bbf4747f0c6d0e4fa7d"
+backup_fingerprint = "40b2fe215e52c1fc954031ae4b182ce7ec7f9a5a44402b61e7057dc5c9e4b5b9"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Vahn casting Mule (spell 0x9B, Sim-Seru summon) mid-summon. Loader-B current-id 0x8007BC4C = 0x22 -> stager extraction 0929."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x9B", "Sim-Seru", "Mule"]
+
+[[scenarios]]
+slot = 3
+label = "horn_summon_mid_cast"
+ram_fingerprint_sha256 = "0fdb85fd129f8f1f83fa55bc7399d4a4d29f9f2fbd71d49ecacc92687098903d"
+backup_fingerprint = "0df8c64dfd89d34653c24da20fad289dbd463eaf8fa69413f9f611a05cd1d492"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Vahn casting Horn (spell 0x9C, Sim-Seru summon) mid-summon. Loader-B current-id 0x8007BC4C = 0x23 -> stager extraction 0930."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x9C", "Sim-Seru", "Horn"]
+
+[[scenarios]]
+slot = 2
+label = "jedo_summon_mid_cast"
+ram_fingerprint_sha256 = "202977b8ab0adc3664c36053b6e27c269551139c586b528aaed8cfa25963bd6d"
+backup_fingerprint = "b035a46da481f1af7852a3f4edf37c815cc92f43948764737b447aa59d435bfc"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Vahn casting Jedo (spell 0x9D, Sim-Seru summon) mid-summon. Loader-B current-id 0x8007BC4C = 0x24 -> stager extraction 0931. Completes the high summon block: 0x99..0xA0 -> 927..934, every leg capture-pinned on the linear arithmetic."
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x9D", "Sim-Seru", "Jedo"]
+
+[[scenarios]]
+slot = 2
+label = "terra_party_battle"
+ram_fingerprint_sha256 = "511ff91d2fc31b791b255b4702900275457bb0eb58b1a9d6848d0edec616224f"
+backup_fingerprint = "21a55afe042ca93a245ab201fd4d683ed9e358c7368c72cdb2d5229241379c68"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Noa + Terra in the active battle party vs a Theeder + mushroom-type enemy formation. The Terra-in-party capture: pins the 4th playable character's runtime texture band / CLUT row (the band selector is the member's present-party ordinal, not the character id) and live-validates her player-file record[0] idle stream."
+topics = ["battle", "Terra", "party", "texture band", "CLUT row", "record[0]", "battle_char_assembly"]
+
+[[scenarios]]
+slot = 4
+label = "evil_medallion_rage_battle"
+ram_fingerprint_sha256 = "bdac6719c35274edf4ef6623ff7f5b6e00cbcd5f163b34119f29566775041591"
+backup_fingerprint = "1bc733225aae105a430cbefab2ee472ff51520ec69f0a9dfdbe21d81a299bc06"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Vahn wearing the Evil Medallion, about to attack an enemy Gimard variant (full trio party). The AI-delegation marker is the battle-actor +0x16E & 0x380 bits, set ONLY on the delegated slot 0 (the other party slots read +0x16E = 0); the battle-actor +0xF8 bit 0x2000 is set on all three party slots so it does NOT discriminate the delegated actor. The delegated pick is RESOLVED in the actor: +0x1DE category = 3 (Attack), +0x1DF action stream = 22 26 25 22 21 (a 5-element multi-strike), ctx action_state = 0x0A pre-action. The stream is FUN_801F0450's delegated arm (learned arts, id + 0x1B, written at 0x801F068C / 0x801F06B8 - pinned by autorun_rage_delegated_pick.lua on a poked battle_gaza2_prompt); it never picks magic. Pinned by rage_delegated_pick."
+topics = ["battle", "status", "Evil Medallion", "Rage", "delegated action", "actor +0x1DE", "RE"]
+
+[[scenarios]]
+slot = 4
+label = "sebucus_overworld_resident"
+ram_fingerprint_sha256 = "4530537ebfa4d573a31c929c80f47effa52bcbd63b9591d7d4dedcde4fa41c68"
+backup_fingerprint = "690167160fcb7f83311a286467e04d9c488b6c34898d43be6daec786cb33ed20"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "map02"
+description = "Standing resident on the Sebucus Islands overworld outside Jeremi (scene-bundle pool slot 0 = 244 = map02 kingdom bundle). The Sebucus leg of the world-map CLUT-cycle verification: the ocean-head CLUT row and cycle strips live in VRAM on a kingdom other than Drake."
+topics = ["world map", "map02", "Sebucus", "CLUT cycle", "ocean", "VRAM"]
+
+[[scenarios]]
+slot = 5
+label = "karisto_overworld_resident"
+ram_fingerprint_sha256 = "9a34e30d321db69d4ce6ef066b31bbbfd56ddb3334f8360d082fd43f2ceb85c0"
+backup_fingerprint = "7039bd6626c5cfd7305d726b933e22aa8b7b592be841fdc8c980c14e621ce289"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "map03"
+description = "Standing resident on the Karisto Kingdom overworld outside Sol (scene-bundle pool slot 0 = 391 = map03 kingdom bundle). The Karisto leg of the world-map CLUT-cycle verification."
+topics = ["world map", "map03", "Karisto", "CLUT cycle", "ocean", "VRAM"]
+
+[[scenarios]]
+slot = 1
+label = "karisto_sol_pre_encounter"
+backup_fingerprint = "f6d09947d68848330fdb5ccbcd8091a7473265f7cc5809443a28606e5e79c28e"
+resident_patch = "starting bag + warp preset (new-game seed code)"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "map03"
+description = "Karisto Kingdom overworld outside Sol (PCSX-Redux), parked one step from a random encounter: holding RIGHT for ~1 second of walking rolls a battle. The battle-ENTRY probe state - arm exec breakpoints (e.g. the MoveImage wrapper for the face-stamp hunt) and walk right to capture the field-to-battle init window live."
+topics = ["world map", "map03", "Karisto", "encounter", "battle entry", "probe state"]
+
+# ----------------------------------------------------------------
+# Ending-sequence screen-widget corpus: six states through the end
+# credits, the only retail consumer of the PROT-0900 widget family
+# (field-VM op 0x43 sub-ops). Each holds live widget actors on the
+# effect-actor list (_DAT_8007C34C family; handler at node+0xC in
+# {801F7A9C sprite, 801F811C mask, 801F849C panel, 801F8A34
+# letterbox}) whose field values byte-match the disc operand census
+# + the screen_fx model (masks at the census rects; panel at the
+# move-record position with base sizes x 0x700/4096 applied).
+
+[[scenarios]]
+slot = 3
+label = "ending_vignette_rimelm_walkaway"
+ram_fingerprint_sha256 = "1e9925bd6440746e83e388ac085eacdc20c2183c4fb2520773b7b74df0600e32"
+backup_fingerprint = "103c0d4c31da5773fd42f0a13bb6e8d54ae0ee1f99fba1182c8f8b978487430f"
+phase = "field"
+expected_game_mode = 0x03
+description = "End credits: Vahn walking away from Rim Elm (scene pool slot0 = 85). No widget actors live in this moment."
+topics = ["ending", "cutscene", "screen widgets"]
+
+[[scenarios]]
+slot = 4
+label = "ending_banner_mask_closed"
+ram_fingerprint_sha256 = "b26ab2feb1551eaa52d4d8783845f9463c81acba899c41241caa8d5d655a3d4b"
+backup_fingerprint = "17552e64acb105d8c9f732f1144a5dd02b88bdadf13702cd23dd34b097b928a1"
+phase = "field"
+expected_game_mode = 0x03
+description = "End credits: title banner over black (scene pool slot0 = 780). Live mask widget parked at the degenerate mask-to-black rect (32,32,32,32) + two banner sprite widgets at (92,80)/(133,112)."
+topics = ["ending", "screen widgets", "mask", "sprite"]
+
+[[scenarios]]
+slot = 5
+label = "ending_vignette_fullscreen"
+ram_fingerprint_sha256 = "4435c6cc81a95c2ff3cee192f0b27f80c46782ed77d8b00953a9113aafb7a04b"
+backup_fingerprint = "5c45bfd7578eb8654272313e04d93b5490d85eb11aae768071e09659b7d4a44b"
+phase = "field"
+expected_game_mode = 0x03
+description = "End credits: fullscreen location vignette (scene pool slot0 = 780). Live mask widget at the top/bottom-border rect (0,16,320,204) - the census record [0,0x10,0x140,0xCC]."
+topics = ["ending", "screen widgets", "mask"]
+
+[[scenarios]]
+slot = 6
+label = "ending_panel_corner"
+ram_fingerprint_sha256 = "cdc829b952298d6f349a13a20de258cfbc346bf15a4b0b300bc7a05f2c48bf3d"
+backup_fingerprint = "9915fc3d7746d4386aadcd4530fc32a739874de7354183a72aeec2759ab50571"
+phase = "field"
+expected_game_mode = 0x03
+description = "End credits: vignette photo panel shrunk to the corner with credit names (scene pool slot0 = 780). Live panel widget at (16,112) sized 140x98 = base (320,224) x scale 0x700 (4.12 fixed), base sizes intact at +0xb8; mask-to-black + two credit sprites at x=184."
+topics = ["ending", "screen widgets", "panel", "scale 0x700", "sprite"]
+
+[[scenarios]]
+slot = 7
+label = "ending_scene_load_gap"
+ram_fingerprint_sha256 = "f421c0a52a637cf46aeb3b7ad405d9fa129c6528801e5d62f510fad165f97aa0"
+backup_fingerprint = "2286e018049076f693e1710ab2594d4e4eb635b339ddd7eaa84f67d3639c1d0c"
+phase = "field"
+expected_game_mode = 0x02
+description = "End credits: black screen between vignettes (mode 0x02 scene init, scene pool slot0 = 785). Widget list empty - clean per-scene teardown."
+topics = ["ending", "screen widgets", "scene transition"]
+
+[[scenarios]]
+slot = 8
+label = "ending_vignette_biron"
+ram_fingerprint_sha256 = "a96c041e6ef0308b53ddd23aebc1cc722d4826ac5e7f145d2035c0065743b4c8"
+backup_fingerprint = "885a10acf52b8792e4c3e47155d8435a87e9c58e579cf4aba2a3a8d8a45c0b68"
+phase = "field"
+expected_game_mode = 0x03
+description = "End credits: Biron Monastery vignette (scene pool slot0 = 785). Live mask widget at the border rect (0,16,320,204) on a second vignette scene."
+topics = ["ending", "screen widgets", "mask"]
+
+[[scenarios]]
+slot = 8
+label = "zora_glare_petrify_pre"
+ram_fingerprint_sha256 = "f7d9913a34c8005cc5c8426126ae5a362973bf2284dcd504791421f2d2d36be8"
+backup_fingerprint = "201feab882893d03effd6abe4c5660d1acb9599d96d9a15998234454cd3b9ca1"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Enemy Zora about to cast Glare on Vahn (full trio party). The BEFORE leg of the petrify pair: Vahn's +0x16E status halfword = 0, action category 4 queued at +0x1DE."
+topics = ["battle", "status", "Stone", "petrify", "Glare", "capture pair"]
+
+[[scenarios]]
+slot = 9
+label = "zora_glare_petrify_post"
+ram_fingerprint_sha256 = "23f4a658aa6d6c3ee40a93691eaef4f7c1663a4dbb8c0242a02bffadddbed13f"
+backup_fingerprint = "accace3d146cdc230ed56859c35b8404bacfbf9c26996bfdc0284cf7847c9450"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Right after Zora's Glare petrified Vahn. The AFTER leg: +0x16E = 0x04 (Stone's runtime bit, the previously-unassigned hole in the applier byte map), HP untouched, queued action category cleared, +0x220 visual flag dropped. Diff vs zora_glare_petrify_pre pins Stone's representation."
+topics = ["battle", "status", "Stone", "petrify", "Glare", "capture pair", "+0x16E bit 0x04"]
+
+# ----------------------------------------------------------------
+# Delilas-brothers enemy special-attack mid-cast corpus: a NON-final-boss
+# enemy block on the same loader-B stager mechanism (extraction = 895 +
+# loader-B id at 0x8007BC4C), confirming the enemy-cast stager path
+# generalizes beyond Cort. Ids 0x3F/0x40/0x41 -> extraction 0958/0959/0960
+# (a contiguous block just below Cort's evolved-form 0x42/0x43 -> 0961/0962).
+# Each stager is 100% byte-resident at slot B and parses as a move-VM
+# stager. At the captured instants the part-actor pool DAT_801C90F0 is
+# empty (no live pooled part-actor; the few RAM word-matches into the
+# record table are the overlay's own internal pointers, not actor +0x48).
+# None of the three carries a 0x4000 render-mode node, so even a live part
+# here would not seat the render-mode draw.
+
+[[scenarios]]
+slot = 2
+label = "gi_delilas_blazing_slash_mid_cast"
+ram_fingerprint_sha256 = "7a97cf28e8abb9fdc97b4b87658972d9c6ed6399b98bb9c946afc5a473c4068e"
+backup_fingerprint = "94769738cb0eb2d460171c0a2ef30b00afc1f6998dfdc784eaa3b798ef389394"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Enemy Gi Delilas casting Blazing Slash mid-cast. Loader-B current-id 0x8007BC4C = 0x3F (63) -> stager extraction 0958 (100% byte-resident at slot B 0x801F69D8). Enemy-cast stager leg; no 0x4000 render-mode record; part pool empty at this instant."
+topics = ["battle", "Delilas", "boss", "stager", "loader-B", "Blazing Slash", "enemy cast"]
+
+[[scenarios]]
+slot = 3
+label = "che_delilas_megaton_press_mid_cast"
+ram_fingerprint_sha256 = "7340a85e78e1d4f361c81c17b65f07322586739d0e7558e467765f01cd800a41"
+backup_fingerprint = "760cb4604254c4ab55043381db5284e66ec5a65b843a8fc6e460683cf2e06c97"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Enemy Che Delilas casting Megaton Press mid-cast. Loader-B current-id 0x8007BC4C = 0x40 (64) -> stager extraction 0959 (100% byte-resident at slot B 0x801F69D8). Enemy-cast stager leg; no 0x4000 render-mode record; part pool empty at this instant."
+topics = ["battle", "Delilas", "boss", "stager", "loader-B", "Megaton Press", "enemy cast"]
+
+[[scenarios]]
+slot = 4
+label = "lu_delilas_plasma_strike_mid_cast"
+ram_fingerprint_sha256 = "1f37b93502c424aa36ac20d51d9de798c5d74b51c7762903109f0d9fe1f60438"
+backup_fingerprint = "ba7756bfb31f592f5a06db7363caafa9f8031796d7f81a11161022660616dc31"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Enemy Lu Delilas casting Plasma Strike mid-cast. Loader-B current-id 0x8007BC4C = 0x41 (65) -> stager extraction 0960 (100% byte-resident at slot B 0x801F69D8). Enemy-cast stager leg; no 0x4000 render-mode record; part pool empty at this instant."
+topics = ["battle", "Delilas", "boss", "stager", "loader-B", "Plasma Strike", "enemy cast"]
+
+# Zeto enemy special-attack mid-casts. Call Wave and Big Wave are one logical
+# attack over two turns (Call Wave summons the wave; Big Wave unleashes it the
+# next turn), so both read loader-B id 0x33 -> the SAME stager extraction 0946,
+# byte-resident at slot B in both states - the shared id is the move's
+# identity, not a stale tracker. No 0x4000 record; part pool empty at both
+# instants.
+
+[[scenarios]]
+slot = 5
+label = "zeto_call_wave_mid_cast"
+ram_fingerprint_sha256 = "507e00081b48816d3f476e1788dbf1a815b1f14cd86c37d216705603bf4211cb"
+backup_fingerprint = "81b5850d8373aba6d30fe8b6804863e462aa7c25eb61a861ba2cd7caa75f3772"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Enemy Zeto casting Call Wave mid-cast. Loader-B current-id 0x8007BC4C = 0x33 (51) -> stager extraction 0946 (100% byte-resident at slot B 0x801F69D8). Enemy-cast stager leg; no 0x4000 render-mode record; part pool empty at this instant. Shares stager 0946 with zeto_big_wave_mid_cast."
+topics = ["battle", "Zeto", "boss", "stager", "loader-B", "Call Wave", "enemy cast"]
+
+[[scenarios]]
+slot = 6
+label = "zeto_big_wave_mid_cast"
+ram_fingerprint_sha256 = "29499bcbb7c4a264ba2090d2ebd49cc0ffbd77f8d5c8cf0ebb8effe250055c24"
+backup_fingerprint = "b44ff5645f5094c0313b2c1781096b12264fcb8d74d3adc21539fda84a47064f"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Enemy Zeto casting Big Wave mid-cast. Loader-B current-id 0x8007BC4C = 0x33 (51) -> stager extraction 0946 (byte-resident at slot B 0x801F69D8) - the same stager as zeto_call_wave_mid_cast. Enemy-cast stager leg; no 0x4000 render-mode record; part pool empty at this instant."
+topics = ["battle", "Zeto", "boss", "stager", "loader-B", "Big Wave", "enemy cast"]
+
+# Final-boss (Cort) special-attack mid-cast corpus: the first ENEMY-cast
+# legs of the loader-B stager mechanism. Every leg lands on the same
+# linear arithmetic as the player summons (stager extraction = 895 +
+# loader-B current-id at 0x8007BC4C) and is byte-resident at slot B
+# 0x801F69D8 - enemy boss specials stream their own stager overlays,
+# answering the "enemy cast = stager or move-FX module?" question for
+# Cort. NOTE Cort's Evil Seru Magic resolves loader id 0x47 -> stager
+# extraction 0966, DISTINCT from the player-side Juggernaut stager 0927:
+# the player and enemy arms of the same spell ship separate stagers.
+
+[[scenarios]]
+slot = 2
+label = "cort_mystic_shield_mid_cast"
+ram_fingerprint_sha256 = "9a06b7e988a4a5e215eac2ab0af395c9f931026950a1add7fb77f23258f91d8e"
+backup_fingerprint = "5e24762bd6926e85609f1b2d8971ade83066c93192f09068908740caedf2efa1"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Enemy boss Cort casting Mystic Shield mid-cast, in a forced encounter (scene town01, ctx[+0x287] = 0, random-encounter stat profile) - not the chitei2 final-boss battle. Loader-B current-id 0x8007BC4C = 0x2D -> stager extraction 0940 (byte-resident at slot B 0x801F69D8). Enemy-cast stager leg."
+topics = ["battle", "Cort", "boss", "stager", "loader-B", "Mystic Shield", "enemy cast"]
+
+[[scenarios]]
+slot = 3
+label = "cort_guilty_cross_mid_cast"
+ram_fingerprint_sha256 = "8fa77f7e47171f8ef9fc6f0069241bcda3c93dd030947fc9e880ac7c839ad4f8"
+backup_fingerprint = "b54a2a425aba832769dc1b32f14f20a044a8f29bca28c910df9193bbc7be77c1"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Enemy boss Cort casting Guilty Cross mid-cast. Loader-B current-id 0x8007BC4C = 0x31 -> stager extraction 0944 (byte-resident at slot B 0x801F69D8)."
+topics = ["battle", "Cort", "boss", "stager", "loader-B", "Guilty Cross", "enemy cast"]
+
+[[scenarios]]
+slot = 4
+label = "cort_mystic_circle_mid_cast"
+ram_fingerprint_sha256 = "6577ccaeb74a85ef029544224de5afe4010879eefd9d358edfca36720d748269"
+backup_fingerprint = "0ba3c2ba495e25703bf8c2380c9d98156a22ddc411460c3810b28a687be8c16e"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Enemy boss Cort casting Mystic Circle mid-cast. Loader-B current-id 0x8007BC4C = 0x2B -> stager extraction 0938 (byte-resident at slot B 0x801F69D8)."
+topics = ["battle", "Cort", "boss", "stager", "loader-B", "Mystic Circle", "enemy cast"]
+
+[[scenarios]]
+slot = 5
+label = "cort_evolved_ultra_charge_mid_cast"
+ram_fingerprint_sha256 = "aa46ab10e5842f303e3dc8f5eed3a1c69615232d08773cb0d06dce49a26d3fe2"
+backup_fingerprint = "baf51cc2d6063dd27e459c5445327470e329a50150c73d3c2c3cb634263e0f51"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Evolved (second-form) Cort casting Ultra Charge mid-cast. Loader-B current-id 0x8007BC4C = 0x43 -> stager extraction 0962 (byte-resident at slot B 0x801F69D8)."
+topics = ["battle", "Cort", "evolved Cort", "boss", "stager", "loader-B", "Ultra Charge", "enemy cast"]
+
+[[scenarios]]
+slot = 6
+label = "cort_evolved_final_crisis_mid_cast"
+ram_fingerprint_sha256 = "7a1a2e231d86649383ac6149824d077b9020a9222884c9339880f3d5cde8ce3d"
+backup_fingerprint = "f96f2d3cc30ef3c3c82a57799728b990bc702007857e224f00da4622ffe45ea5"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Evolved (second-form) Cort casting Final Crisis mid-cast. Loader-B current-id 0x8007BC4C = 0x42 -> stager extraction 0961 (byte-resident at slot B 0x801F69D8)."
+topics = ["battle", "Cort", "evolved Cort", "boss", "stager", "loader-B", "Final Crisis", "enemy cast"]
+
+[[scenarios]]
+slot = 7
+label = "cort_evil_seru_magic_mid_cast"
+ram_fingerprint_sha256 = "812a21ef3fb82cb107dcfac3f873306bd6b06928b17c2454abdd4c3637bbc273"
+backup_fingerprint = "ccf3e11956ce940f269adf93abc50e172b3a1c18ad66ff301a9708a5660d0f23"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Enemy boss Cort casting Evil Seru Magic (Juggernaut) mid-cast. Loader-B current-id 0x8007BC4C = 0x47 -> stager extraction 0966 (byte-resident at slot B 0x801F69D8) - DISTINCT from the player-side Juggernaut stager 0927 (loader id 0x20): the enemy arm of the same spell ships its own stager."
+topics = ["battle", "Cort", "boss", "stager", "loader-B", "Evil Seru Magic", "Juggernaut", "enemy cast"]
+
+# ----------------------------------------------------------------------
+# Evolved-Cort battle-entry ladder. Three PCSX-Redux states walking into
+# the final fight, captured to close the PROT 0968 residency thread: the
+# mid-cast corpus above proved a cast stager always evicts the stage
+# overlay, so the closing observation needed the first command menu,
+# before any cast. Slot-3 is that observation (tracker 0x49 + 0968
+# byte-resident); slots 1-2 are the field-side contrast (0900, the
+# general slot-B co-resident, holds the buffer until battle load).
+
+[[scenarios]]
+slot = 255
+label = "cort_evolved_approach_cutscene"
+backup_fingerprint = "e7042fc438e784c0c64367af7203ffc13e6ec42bfe529b7005314f782666ca28"
+resident_patch = "location rename (quick-travel names)"
+phase = "field"
+expected_game_mode = 0x03
+description = "Mid-cutscene on the approach to the final fight (scene jouind, field engine). Slot B still holds the 0900 co-resident library (100% byte match), loader-B tracker 0x8007BC4C = 0x05. Staging point: cinematics separate this from the pre-battle and in-battle sibling states."
+topics = ["field", "Cort", "boss", "cutscene", "loader-B", "jouind"]
+
+[[scenarios]]
+slot = 255
+label = "cort_evolved_pre_battle"
+backup_fingerprint = "7a8266530955d4442f32b0e1f6a4b4d1e1f7c61f22683b2c2e0dafcf519b8598"
+resident_patch = "location rename (quick-travel names)"
+phase = "field"
+expected_game_mode = 0x03
+description = "Scene jouine about half a second before the evolved-Cort battle kicks off (field engine, pre-load). Slot B: 0900 co-resident at 100%, tracker 0x05 - the stage overlay is NOT yet paged; contrast with cort_evolved_battle_first_menu taken across the battle load."
+topics = ["field", "Cort", "boss", "pre-battle", "loader-B", "jouine"]
+
+[[scenarios]]
+slot = 255
+label = "cort_evolved_battle_first_menu"
+backup_fingerprint = "ef0b72d6dc6901185d08255846d763dba46f09f0a6c2028aa710337629820058"
+resident_patch = "location rename (quick-travel names)"
+phase = "battle"
+expected_game_mode = 0x15
+description = "Evolved-Cort battle (scene jouine) at the first command-input screen, before any special attack or summon. THE PROT 0968 residency capture: loader-B tracker 0x8007BC4C = 0x49, formation head 0x8007BD0C = 0xB5, entry 0968 100% byte-resident at slot B 0x801F69D8 over its own 0xA28 extent (check-0968-residency.py). Closed the last Title/boot/overlays RE thread."
+topics = ["battle", "Cort", "boss", "stage overlay", "loader-B", "PROT 0968", "jouine"]
+
+# ----------------------------------------------------------------------
+# Weapon-specialty / arts-bar arm-width corpus. Three PCSX-Redux states,
+# all at the in-battle arts command-input screen (game_mode 0x15), each
+# with a different character holding a weapon whose favored-class status
+# differs - the contrast needed to locate the table + consumer that sets
+# the "Arms" input width on the action-queue bar (off-class / Astral =
+# double width; favored = single). See the weapon-specialty RE thread.
+#   - astral  : Vahn + Astral Sword  -> always-double arms (the exception)
+#   - offclass: Gala + Nail Gloves   -> off-class (claw on a club user) = double
+#   - ideal   : Noa  + Ra-Seru Fangs -> favored class = single (baseline)
+# Diff astral/offclass against ideal to find the differing bar-width field,
+# then read-watch the weapon slot (char+0x196) to pin the builder + table.
+# ----------------------------------------------------------------------
+[[scenarios]]
+slot = 1
+label = "arts_bar_astral_sword_vahn"
+backup_fingerprint = "4a42dbc15d3be77b6b81d8b03262f1410a5b9c2ebc0ec64bd0bd11717a69e1d6"
+description = "In-battle arts command-input screen, Vahn equipped with the Astral Sword (always double-width Arms input - the can't-be-favored exception); game_mode 0x15"
+topics = ["weapon specialty", "arts bar", "arm width", "astral sword", "battle", "BattleMode"]
+phase = "battle"
+expected_game_mode = 0x15
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+[[scenarios]]
+slot = 2
+label = "arts_bar_offclass_gala_nail"
+backup_fingerprint = "7867ed3ea46b19183970c3b0b4723fc7fea94e8aeb622c51888c55adc2fa72b9"
+description = "In-battle arts command-input screen, Gala equipped with Nail Gloves (off-class - a claw on a club user, so double-width Arms input); game_mode 0x15"
+topics = ["weapon specialty", "arts bar", "arm width", "off-class weapon", "battle", "BattleMode"]
+phase = "battle"
+expected_game_mode = 0x15
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+[[scenarios]]
+slot = 3
+label = "arts_bar_ideal_noa_fangs"
+backup_fingerprint = "da710f5a5a5ddc5c9b83a298e9ff4dc8034b0f77016f20f143c6079b4d4501b1"
+description = "In-battle arts command-input screen, Noa equipped with Ra-Seru Fangs (favored class - single-width Arms input, the baseline); game_mode 0x15"
+topics = ["weapon specialty", "arts bar", "arm width", "favored weapon", "battle", "BattleMode"]
+phase = "battle"
+expected_game_mode = 0x15
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+# Same-character favored pair for arts_bar_offclass_gala_nail: Gala holding the
+# Ra-Seru Club (a club = his favored class -> single-width Arms input). Diffed
+# against the off-class Gala+Nail-Glove state (same character, same battle) this
+# isolates the cached arm-width field with no character confound.
+[[scenarios]]
+slot = 4
+label = "arts_bar_ideal_gala_club"
+backup_fingerprint = "b97a031eec3b0be650acd3828b456c5d51435ea495eeaa1500d8e7d3165e0b62"
+description = "In-battle arts command-input screen, Gala equipped with the Ra-Seru Club (favored club class - single-width Arms input); pairs with arts_bar_offclass_gala_nail for a same-character diff; game_mode 0x15"
+topics = ["weapon specialty", "arts bar", "arm width", "favored weapon", "gala", "battle", "BattleMode"]
+phase = "battle"
+expected_game_mode = 0x15
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+# Equip-UI before/after-class pair for the weapon-specialty mechanic: Vahn in the
+# equipment menu holding the Astral Sword (id 0xBA, not-favored / always-double
+# Arms) vs the Ra-Seru Blade (favored sword, single Arms). Same character + same
+# menu, and the two weapons' ATK is near-identical (97 vs 98), so a char-record
+# diff isolates exactly what equipping each writes - revealing any equip-time
+# "favored" flag beyond the slot byte + ATK bonus.
+[[scenarios]]
+slot = 5
+label = "equip_ui_vahn_astral"
+backup_fingerprint = "93dcb7b46d552d11f01a25af2806a9cac036a0ad53487638f1d271f01238a929"
+description = "Equipment UI, Vahn holding the Astral Sword (id 0xBA, not-favored / always-double-width Arms exception)"
+topics = ["weapon specialty", "equip menu", "arm width", "astral sword", "vahn"]
+phase = "menu"
+
+[[scenarios]]
+slot = 6
+label = "equip_ui_vahn_raseru_blade"
+backup_fingerprint = "8d656e67367c7de3ba8d443053b5698032bed3578bcacdc96c0e64d007abc5cd"
+description = "Equipment UI, Vahn holding the Ra-Seru Blade (favored sword - single-width Arms); pairs with equip_ui_vahn_astral"
+topics = ["weapon specialty", "equip menu", "arm width", "favored weapon", "vahn"]
+phase = "menu"
+
+# The pre-build arts-input state: saved the instant the player presses the button
+# to BEGIN inputting an arts command for Gala holding the off-class Nail Glove
+# (a claw on a club user). Run a few frames forward and the gauge draws; that
+# build window is when the weapon class is consulted to set the arm width. Unlike
+# the other arts_bar states (all captured mid-input, past the build), this one is
+# armed BEFORE the gauge is built - the one window a read-watch on the weapon byte
+# can catch the arm-width consumer + its per-weapon-class data source.
+[[scenarios]]
+slot = 1
+label = "arts_input_start_gala_nail"
+backup_fingerprint = "0c58c4d4ca6e17496c3aa578ed6b8c27f59aa5d076d3c96b6cd1e2e31053de51"
+description = "In-battle, the instant arts command-input BEGINS (button just pressed, gauge not yet drawn) for Gala equipped with the off-class Nail Glove (claw on a club user); stepping forward builds the double-width Arms gauge; game_mode 0x15"
+topics = ["weapon specialty", "arts bar", "arm width", "off-class weapon", "bar build", "gala", "battle", "BattleMode"]
+phase = "battle"
+expected_game_mode = 0x15
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+# ----------------------------------------------------------------------
+# Multi-enemy active battle with the enemy-ally "charm" randomizer on a
+# disc patched at --enemy-ally-pct 100: a Gobu Gobu (charmed: +0x16E has
+# the AI-delegated bits 0x380, so it fights the player's side) alongside a
+# normal Slime. The one clean *multi-enemy* battle anchor in the corpus -
+# the only other live battle state, party_battle_gobu_gobu, is solo, so it
+# can't show a charmed enemy striking a packmate. game_mode 0x15.
+# LIBRARY-ONLY (slot 255): resolves via backup_fingerprint; the bytes are
+# from a charm-patched image and stay local + gitignored.
+# ----------------------------------------------------------------------
+[[scenarios]]
+slot = 255
+label = "enemy_ally_charm_gobu_slime"
+ram_fingerprint_sha256 = "436da14abfeb3dff03854e90ae55fa0260b7d355c142d8cac0d99de943eeee96"
+backup_fingerprint = "be8e1ef7a6073b255ee3114d78935561dc12791ac2f950f7d489940649653afc"
+resident_patch = "enemy-ally charm"
+resident_disc = "old/legaia_enemy_ally_100.bin"
+description = "Multi-enemy battle (Gobu Gobu charmed via the enemy-ally 0x380 bits + a normal Slime) on an --enemy-ally-pct 100 patched disc; the charmed Gobu attacks the Slime. game_mode 0x15 BattleMode."
+topics = ["enemy ally", "charm", "0x380", "AI-delegated", "multi-enemy", "battle", "BattleMode", "randomizer"]
+phase = "battle"
+expected_game_mode = 0x15
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+# ----------------------------------------------------------------------
+# Post-REFACTOR validation captures (shiny flag moved out of the spell-level
+# byte into the parallel +0x1C0 shiny-byte array). A FRESHLY captured shiny
+# Gimard on legaia_shiny_100 - confirms the new encoding works end to end:
+# partial summon transparency, "+35% DMG!" text, correct level (no Lv 129),
+# and a correctly-rendering "grew to level" message. These supersede the
+# old-encoding captures above for regression-checking the refactor.
+# LIBRARY-ONLY (slot 255): resolves via backup_fingerprint; shiny-patched
+# image bytes stay local + gitignored.
+# ----------------------------------------------------------------------
+[[scenarios]]
+slot = 255
+label = "shiny_refactor_gimard_precast"
+backup_fingerprint = "4642e41b3dfcd5f397c9bd9c973f8b429ceea58c0026500eb0ec5e03dd9d02dc"
+resident_patch = "shiny-seru (earlier SCUS layout)"
+resident_disc = "old/legaia_shiny_100.bin"
+description = "Fresh-captured shiny Gimard (new +0x1C0 shiny-byte encoding), frame just before its first Burning Attack cast. Validates the post-refactor storage (clean level byte, shiny byte set). game_mode 0x15."
+topics = ["shiny seru", "refactor", "Gimard", "shiny byte", "battle", "randomizer"]
+phase = "battle"
+expected_game_mode = 0x15
+
+[[scenarios]]
+slot = 255
+label = "shiny_refactor_gimard_plus35"
+backup_fingerprint = "3fdb3fcd08da20222ae42d9605cce88673262e1660265cabdb542ae9842457b8"
+resident_patch = "shiny-seru (earlier SCUS layout)"
+resident_disc = "old/legaia_shiny_100.bin"
+description = "Fresh-captured shiny Gimard mid-cast with the '+35% DMG!' text on screen + partial summon transparency, post-refactor. game_mode 0x15."
+topics = ["shiny seru", "refactor", "Gimard", "+35%", "transparency", "battle", "randomizer"]
+phase = "battle"
+expected_game_mode = 0x15
+
+[[scenarios]]
+slot = 255
+label = "shiny_refactor_gimard_levelup"
+backup_fingerprint = "e291b758439059bdc5bf6d14ea73c88b3201bd0b7b141f2bc582e02d380e6411"
+resident_patch = "shiny-seru (earlier SCUS layout)"
+resident_disc = "old/legaia_shiny_100.bin"
+description = "Fresh-captured shiny Gimard Seru level-up, post-refactor - the 'grew to level' message renders correctly (the pre-refactor blank-box bug is fixed; level is correct, not Lv 129). game_mode 0x15."
+topics = ["shiny seru", "refactor", "Gimard", "level up", "battle", "randomizer"]
+phase = "battle"
+expected_game_mode = 0x15
+
+# ----------------------------------------------------------------------
+# Trace-driven playthrough segment anchors (docs/tooling/playthrough-coverage.md).
+# Each Sn checkpoint is captured by autorun_play_from_boot.lua and chained: Sn's
+# end state is the start anchor for Sn+1. Built from boot (no ephemeral slots).
+# ----------------------------------------------------------------------
+[[scenarios]]
+slot = 255
+label = "s1_newgame_field"
+backup_fingerprint = "e3d6b6f329cdcf23e28ac3a4f4e0bd6ef6b5abee99a354de48f9ce207e49f7e0"
+phase = "field"
+expected_game_mode = 3
+expected_active_scene = "opdeene"
+description = "S1 of the trace-driven playthrough: a fresh NEW GAME driven cold from boot on a staged, unpatched image (autorun_play_from_boot.lua, LEGAIA_NO_SSTATE=1 LEGAIA_FASTBOOT=1: title-tick exec-bp FUN_801DD35C navigates PRESS-START + NEW GAME; field-tick exec-bp FUN_8001698C drives + checkpoints past the XA-streaming vsync-blind window). Captured at the opening prologue scene 'opdeene' at field-run (game_mode 0x03, 20-tick settle), player (5824, 1984) - the same moment as the capture it replaces (01ea5175..., made on a shiny-seru + enemy-ally charm image, whose resident SCUS carried that build). Retail SCUS at every patcher site (patch_taint_audit.py states). The start anchor for chaining S2 (Rim Elm)."
+topics = ["playthrough", "trace-coverage", "S1", "cold-boot", "new-game", "pcsx-redux"]
+
+[[scenarios]]
+slot = 255
+label = "s2_rimelm_town01"
+backup_fingerprint = "72d0201ab5224af86a8370256b2fb9386654355aa9d8301f3c3ebe02e4286ec5"
+phase = "field"
+expected_game_mode = 3
+expected_active_scene = "town01"
+description = "S2 of the trace-driven playthrough: Rim Elm (town01) reached by chaining forward from the S1 checkpoint on a staged, unpatched image (autorun_chain_fast.lua under --fast, CROSS every 20 vsyncs through opdeene -> opstati -> opurud -> map01 -> town01, ~10200 vsyncs, 40-vsync settle). Player (12352, 2368), as in the patched-image capture it replaces (71937100...). Retail SCUS at every patcher site. The start anchor for S3."
+topics = ["playthrough", "trace-coverage", "S2", "rim-elm", "town01", "segment-chaining", "pcsx-redux"]
+
+[[scenarios]]
+slot = 255
+label = "s3_rimelm_freeroam"
+backup_fingerprint = "e9e526595d0479ce1af9619418922ca337019ba0d1078169bc65235c22d75fc8"
+phase = "field"
+expected_game_mode = 3
+expected_active_scene = "town01"
+description = "S3 of the trace-driven playthrough: first free walk in Rim Elm (town01), reached by completing the opening name-entry screen from S2 with pad input only (autorun_s3_fast.lua: CROSS on End, UP to Yes and CROSS while the name-entry actor's +0x54 sub-state is the confirm, then CROSS through the opening's remaining dialogue until the player engaged flag 0x80000 clears), 60-vsync settle. Player (4160, 11840), name 'Vahn' (record +0x2A7), as in the patched-image capture it replaces (2fba9adf...). Retail SCUS at every patcher site. The start anchor for S4."
+topics = ["playthrough", "trace-coverage", "S3", "rim-elm", "town01", "name-entry", "free-roam", "pcsx-redux"]
+
+[[scenarios]]
+slot = 255
+label = "s4_rimelm_door_transition"
+backup_fingerprint = "820f1418028a3a26f6acc39d63ab6fa070c9d21be3dd7f8ef4d17f8e05dc80af"
+phase = "field"
+expected_game_mode = 3
+expected_active_scene = "town01"
+description = "S4 of the trace-driven playthrough: first door transition - the player walks out of Vahn's house into Rim Elm proper. Reached from S3 by holding DOWN (autorun_chain_fast.lua LEGAIA_HOLD_BTN=DOWN LEGAIA_CKPT_WARP=1): the front-door walk-touch warp jumps the player (4160,10574) -> (3264,3520) = tile (32,82) -> (25,27), an intra-town01 warp into the open exterior, and the state is taken 200 vsyncs after the jump (a checkpoint 50 vsyncs after it does not resume - the emulator reboots). player+0x14/+0x18 are 16-bit signed; +0x16 between them is the footing (field-locomotion.md). Replaces the patched-image capture a89f131f..., which reached the same warp by grid-BFS door-nav. Retail SCUS at every patcher site. D-pad only, no pokes."
+topics = ["playthrough", "trace-coverage", "S4", "rim-elm", "town01", "door", "grid-bfs", "scene-transition", "pcsx-redux"]
+
+[[scenarios]]
+slot = 255
+label = "s5_tetsu_battle"
+backup_fingerprint = "4fcfff14628ececbc46dd5d122852b1e8f12bd7352e93fca1e374f72c8eb23dd"
+phase = "battle"
+expected_game_mode = 21
+expected_active_scene = "town01"
+description = "S5 of the trace-driven playthrough: first battle - the scripted Tetsu sparring tutorial (formation_id 4), entered from the S4 exterior anchor. Rim Elm has no random encounters at this story point (story-gated), so the first fight is the spar, started by talking to the sparring partner and picking the 3rd 'training fight' list option. Reached by replaying a human's recorded route (autorun_record_inputs.lua; the S4 -> Tetsu walk at world (2752,1856), the story beat at (2368,3392) on the way, his dialogue, 3rd option, start) with autorun_replay_inputs.lua, which drives the pad through pad.force from the recorded 0x8007B850 mask on the field-tick clock. The recording was made from the patched-image S4 (a89f131f...) and replays unchanged from the re-shot one: BattleMode 0x15, battle_ctx 0x8007BD24 = 0x800EB654, over town01, as in the capture it replaces (4e9c1e5f..., whose resident 0898 differed from the disc at six hook clusters). Resident SCUS and 0898 retail. Real D-pad + interact inputs, no pokes."
+topics = ["playthrough", "trace-coverage", "S5", "rim-elm", "town01", "tetsu", "battle", "record-replay", "pcsx-redux"]
+
+# ----------------------------------------------------------------------
+# Chapter-1 rikuroa / Drake-castle story-beat brackets (operator-captured
+# during the flag-firehose playthrough). These close the runbook's
+# "no catalogued state brackets the spine writes" hole: flag 0x142 is
+# UNSET in rikuroa_pre_caruban and SET in rikuroa_post_caruban (the
+# firehose caught the write live: field-VM script op `51 42`, writer
+# ra 0x801E3598, set in-scene during the post-Caruban sequence - the
+# rikuroa streaming-carrier MAN's P2[50] self-latching one-shot). Flag
+# 0x1BE is geremi's Jeremi-arrival one-shot (chapter 2), so it reads 0
+# in all four chapter-1 states - it is NOT a Zeto gate; Zeto's trigger
+# scene is `jou` (battle-state scene buffer + DAT_8007B7FC = 0x4B).
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "rikuroa_pre_caruban"
+backup_fingerprint = "b22d6844b05042e7e5440928dd08dd62815a4eb75ae951beef097d6d0d8395b2"
+resident_patch = "shiny-seru + enemy-ally charm (PROT 0867/0898/0899 + SCUS)"
+resident_disc = "old/legaia_shiny_charm_100.bin"
+phase = "field"
+expected_game_mode = 3
+expected_active_scene = "rikuroa"
+description = "Mt. Rikuroa, standing right before the Caruban boss trigger (party: Vahn + Noa). Spine bracket: story flag 0x142 UNSET here, SET in rikuroa_post_caruban - load this to re-drive the Caruban fight and the 0x142 script write (field-VM op bytes 51 42, PROT 0157 rikuroa carrier)."
+topics = ["chapter-1", "rikuroa", "caruban", "boss", "spine-flags", "flag-0x142", "pcsx-redux"]
+
+[[scenarios]]
+slot = 255
+label = "rikuroa_post_caruban"
+backup_fingerprint = "1adb5c862902908041b3a43350ebed266a23c80619d4bd333a4a19a9a568d2f5"
+resident_patch = "shiny-seru + enemy-ally charm (PROT 0867/0898/0899 + SCUS)"
+resident_disc = "old/legaia_shiny_charm_100.bin"
+phase = "field"
+expected_game_mode = 3
+expected_active_scene = "rikuroa"
+description = "Mt. Rikuroa immediately after the Caruban boss fight, during the post-fight dialogue. Story flag 0x142 now SET (the write happens in the post-fight rikuroa script, NOT in the dolk dungeon - firehose-pinned). Pair with rikuroa_pre_caruban for the tightest 0x142 bracket."
+topics = ["chapter-1", "rikuroa", "caruban", "post-boss", "spine-flags", "flag-0x142", "pcsx-redux"]
+
+[[scenarios]]
+slot = 255
+label = "rikuroa_post_genesis_tree"
+backup_fingerprint = "685397e7dfce0e5c381b87c9c766f0bd58e68dbbcb1ee700b19f7fa72861b118"
+resident_patch = "shiny-seru + enemy-ally charm (PROT 0867/0898/0899 + SCUS)"
+resident_disc = "old/legaia_shiny_charm_100.bin"
+phase = "field"
+expected_game_mode = 3
+expected_active_scene = "rikuroa"
+description = "Mt. Rikuroa summit after the Genesis Tree revival scene (Noa recruited). Flags 0x142 set / 0x1BE still unset - the state to play FORWARD from toward the Zeto beat (0x1BE + the battle-id staging write, both still uncaptured)."
+topics = ["chapter-1", "rikuroa", "genesis-tree", "noa", "spine-flags", "pcsx-redux"]
+
+[[scenarios]]
+slot = 255
+label = "dolk2_market_noa"
+backup_fingerprint = "72c8fcfc1340720dcee78de5f5e1e562431fce08c09feee0b87bbc254a4f9e24"
+resident_patch = "shiny-seru + enemy-ally charm (PROT 0867/0898/0899 + SCUS)"
+resident_disc = "old/legaia_shiny_charm_100.bin"
+phase = "field"
+expected_game_mode = 3
+expected_active_scene = "dolk2"
+description = "Drake Castle interior (dolk2) entering the market with Noa - story scene where she talks to each vendor. Useful shop/dialogue-heavy beat inside the dolk2 conditional-entrance scene (the 0x142-gated variant)."
+topics = ["chapter-1", "dolk2", "drake-castle", "market", "noa", "shop-dialogue", "pcsx-redux"]
+
+[[scenarios]]
+slot = 255
+label = "chapter2_garmel_pre_songi"
+backup_fingerprint = "e40d1ef52d405eba0e0412a7ea9688a67a3abd72ea843be3fcbd7cce7a2fde90"
+phase = "field"
+expected_game_mode = 3
+expected_active_scene = "garmel"
+description = "Second-kingdom run, standing just before the Songi fight. Scene garmel, field mode. Formation table DAT_8007BD0C=[1D,31,..] (the Songi encounter pair). Clean disc (no PPF). Companion to the pre-Zeto / post-Zeto brackets from the same capture session."
+topics = ["chapter-2", "garmel", "songi", "boss", "capture-bracket", "pcsx-redux"]
+
+[[scenarios]]
+slot = 255
+label = "chapter2_garmel_pre_zeto"
+backup_fingerprint = "3a0247170816254f5e50e5fe34d328c027441ae00f21d3f93ce9a8ee1ee5fc01"
+phase = "field"
+expected_game_mode = 3
+expected_active_scene = "garmel"
+description = "Second-kingdom run, standing just before the Zeto fight. Scene garmel, field mode, battle-id staging DAT_8007B7FC still 0 (staged AT the trigger, between here and the fight) - the ideal FORWARD-play save for the open Zeto battle-id-staging RE thread. Formation DAT_8007BD0C=[37,37,..]. Clean disc."
+topics = ["chapter-2", "garmel", "zeto", "boss", "battle-id-staging", "capture-bracket", "pcsx-redux"]
+
+[[scenarios]]
+slot = 255
+label = "chapter2_garmel_post_zeto"
+backup_fingerprint = "9c1842050b814263a8ddc7be106872b397a2286ff93e7977ef2e777993eb44e4"
+phase = "battle"
+expected_game_mode = 2
+expected_active_scene = "garmel"
+description = "Second-kingdom run, immediately after the boss fight resolves. Scene garmel, mode 0x02 (post-battle transition). Formation DAT_8007BD0C=[4B,00,00,00] - lone-boss id 0x4B (labelled Zeto by the capture, but the id->name lookup + the garmel-vs-jou scene scoping are unverified; see the open reconcile thread). Clean disc. Closes the pre/post bracket."
+topics = ["chapter-2", "garmel", "zeto", "boss", "capture-bracket", "pcsx-redux"]
+
+[[scenarios]]
+label = "flute_lippian_midcast"
+slot = 255
+backup_fingerprint = "da0da66d0ee4ca2fbab82120c36ecfcf850d7dfabab983aa5f109ce04e220765"
+description = "Mid-cast Lippian Flute summon (spell 0x96) vs Gobu Gobu; loader-B id 0x1D, slot-B resident = extraction 0924 (head title 'Ultimate Rave' = the failed-kill banner; the landed kill shows 'Ultimate Death'). Pinned the 0924 binding."
+
+[[scenarios]]
+label = "flute_spikefish_midcast"
+slot = 255
+backup_fingerprint = "506c35707fc97431dffe8e4483ed687e6a9dbb60c3e805f3a8f4d1be721dd27f"
+description = "Mid-cast Spikefish Flute summon (spell 0x97, attack 'Blowfish') vs Gobu Gobu; loader-B id 0x1E, slot-B resident = extraction 0925 (untitled pre-linked head). Pinned the 0925 binding."
+
+[[scenarios]]
+label = "evolved_0x90_midcast"
+slot = 255
+backup_fingerprint = "ba2a2321a7d687b9115eb015bfdc5ee66a8f049c7106816603b51ff4542f6c3d"
+description = "Mid-cast Kemaro summon (evolved-Seru spell 0x90, attack 'Canine Fangs') vs Gobu Gobu, cast injected into Vahn's record spell list (autorun_evolved_cast.lua); loader-B id 0x17, slot-B resident = extraction 0918 (pre-linked pointer-table head), 100% byte-match over the 6-sector LBA footprint. Pinned the 0918 binding - closed one of the two arithmetic-predicted evolved legs."
+# autorun_evolved_cast.lua grants 999 MP into the record (+0x108 / +0x10A /
+# +0x11E) after battle init copied max MP 27 into the actor (+0x152).
+ram_injected = ["p0.mp_max"]
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x90", "evolved-Seru", "pcsx-redux"]
+
+[[scenarios]]
+label = "evolved_0x91_midcast"
+slot = 255
+backup_fingerprint = "59eb763bbbf748d46f585d8b4ef94f9a7df559e1782f7003deee5cbad603e794"
+description = "Mid-cast Spoon summon (evolved-Seru spell 0x91, attack 'Holy Eyes') vs Gobu Gobu, cast injected into Vahn's record spell list (autorun_evolved_cast.lua); loader-B id 0x18, slot-B resident = extraction 0919 (MIPS-prologue head), 100% byte-match over the 5-sector LBA footprint. Pinned the 0919 binding - closed the last arithmetic-predicted evolved leg."
+# autorun_evolved_cast.lua grants 999 MP into the record (+0x108 / +0x10A /
+# +0x11E) after battle init copied max MP 27 into the actor (+0x152).
+ram_injected = ["p0.mp_max"]
+topics = ["battle", "summon", "stager", "overlay", "loader-B", "spell 0x91", "evolved-Seru", "pcsx-redux"]
+
+# ----------------------------------------------------------------------
+# Super-Art queue tail-replace captures (probe
+# autorun_super_art_queue_inject.lua; runbook
+# docs/tooling/super-art-queue-capture.md). Each state is
+# party_basic_attack_vs_gobu_gobu one vsync after the retail Super
+# applier FUN_801EF9E4 ran over an injected queue: the acting slot-0
+# actor's queue at actor[+0x1DF] holds the Super's byte-exact `replace`
+# string (find injected at the applier entry breakpoint, register a1
+# retargeted to the owning character's table index). One state per
+# character, each a previously-unexecuted Super; the full 15/15 sweep's
+# CSV lives with the capture run. Checked by
+# crates/parity/tests/super_art_queue_replace.rs.
+# ----------------------------------------------------------------------
+[[scenarios]]
+label = "super_queue_replace_vahn_rolling_combo"
+backup_fingerprint = "bfe53a9fafdfde84374050f72618bec765cc6c7dc0b49b5537e0d84e2cda3db8"
+slot = 255
+phase = "battle"
+expected_game_mode = 0x15
+description = "Post-applier battle state: slot-0 actor queue at +0x1DF = Vahn's Rolling Combo replace string 19 22 0C 19 25 0F 0F 1A 2F 30 (two-part finisher), written live by FUN_801EF9E4 over the injected find; zero fill to +0x1EE."
+topics = ["battle", "super art", "arts", "Vahn", "Rolling Combo", "action queue", "FUN_801EF9E4", "pcsx-redux"]
+
+[[scenarios]]
+label = "super_queue_replace_noa_triple_lizard"
+backup_fingerprint = "cc470e28b1a44d60cfafcf85b7f77b8e8afa5b4117ada34481a26eb601f2f1d0"
+slot = 255
+phase = "battle"
+expected_game_mode = 0x15
+description = "Post-applier battle state: slot-0 actor queue at +0x1DF = Noa's Triple Lizard replace string 19 25 0F 19 24 0E 1A 2E 2E 2E (x3 finisher), written live by FUN_801EF9E4 with a1 retargeted to char index 1; zero fill to +0x1EE."
+topics = ["battle", "super art", "arts", "Noa", "Triple Lizard", "action queue", "FUN_801EF9E4", "pcsx-redux"]
+
+[[scenarios]]
+label = "super_queue_replace_gala_back_punch"
+backup_fingerprint = "01c8b1f893a4c8a38016852afad6e7281fc146436d5fe5ee1bdadbba9f9dbce6"
+slot = 255
+phase = "battle"
+expected_game_mode = 0x15
+description = "Post-applier battle state: slot-0 actor queue at +0x1DF = Gala's Back Punch x3 replace string 19 27 0F 19 29 0D 1A 2B 2B 2B (x3 finisher), written live by FUN_801EF9E4 with a1 retargeted to char index 2; zero fill to +0x1EE."
+topics = ["battle", "super art", "arts", "Gala", "Back Punch x3", "action queue", "FUN_801EF9E4", "pcsx-redux"]
+
+# ----------------------------------------------------------------------
+# Gaza 2 (Sim-Seru Gaza, monster id 166) - the boss fight the community
+# endless-camera-orbit softlock is reported in, and the anchor every
+# HP-readout probe under scripts/pcsx-redux/autorun_gaza2_*.lua runs
+# against. Identify it by its contents, never by a slot number: the live
+# PCSX-Redux slot is overwritten the next time anyone saves, which is why
+# this block carries a backup_fingerprint.
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "battle_gaza2_prompt"
+description = "Gaza 2 boss fight parked at the top-level Begin/Run prompt (battle-action ctx+7 = 0). Enemy seat 3 is monster id 166 Sim-Seru Gaza, HP 15000 / MP 1200; party is Vahn/Noa/Gala at LV23 with max HP 1289/1199/1382. The fight the HP-readout desync work is anchored on: state 0x51 parks forever when a party slot's live HP +0x14C and displayed HP +0x172 disagree while the pending-delta accumulator +0x10 reads zero."
+phase = "battle"
+expected_game_mode = 0x15
+expected_active_scene = "korb3"
+pcsx_redux_sstate = "$HOME/.config/pcsx-redux/SCUS94254.sstate9"
+backup_fingerprint = "6ae194385d1e7c9ef8e2f968a065a906a0ab38ca683f1b50b7b02d677f56d986"
+resident_patch = "arts AP override (SCUS arena 1 routines)"
+topics = ["battle", "boss", "Gaza", "softlock", "HP readout", "state 0x51", "BattleMode", "korb3"]
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+[[scenarios.watchpoints]]
+label = "party_hp_readout_triple"
+start = 0x800EC9E8
+end = 0x800ED0E0
+
+# ----------------------------------------------------------------------
+# The 0x19 attack-approach park, caught LIVE by a human playing the Gaza 2
+# fight at dynarec speed under autorun_gaza2_park_hunter.lua. A second,
+# distinct park class from the 0x51 HP-settle gate above: Gaza (acting seat
+# 3, category 3 physical attack, 871/15000 HP) targets Gala (seat 2) from a
+# ~556-unit gap, the walk phase never engaged (0x0C -> 0x14 -> 0x19 within
+# ~3 vsyncs), and state 0x19 re-polls FUN_8004E2F0 forever - its
+# not-in-range path only bumps the stall counter ctx+0x6D4. The whole round
+# queue is wedged in approach states (Vahn -> Gaza at 458; Noa and Gala
+# hold target 8, which FUN_8004E2F0 rejects by construction).
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "battle_gaza2_park_0x19"
+description = "Gaza 2 fight parked in battle-action state 0x19 (attack approach) - the endless-camera-orbit softlock caught from ordinary play. ctx+0x13 acting = 3 (Gaza, category 3 attack, 871/15000 HP) targeting +0x1DD = 2 (Gala); Gaza at (433,291) vs Gala at (0,0), range metric ~556 vs reach ~416, no walking, stall counter ctx+0x6D4 climbing. Party Vahn/Noa/Gala LV23 full HP, all HP triples synced (the 0x51 HP-readout invariant is NOT involved)."
+phase = "battle"
+expected_game_mode = 0x15
+expected_active_scene = "korb3"
+pcsx_redux_sstate = "saves/library/pcsx-redux/814dce6b90da114a8d8d37386a90623c4f871f7e380e14c010889ab4414c9dd8.sstate"
+backup_fingerprint = "814dce6b90da114a8d8d37386a90623c4f871f7e380e14c010889ab4414c9dd8"
+resident_patch = "arts AP override (SCUS arena 1 routines)"
+topics = ["battle", "boss", "Gaza", "softlock", "state 0x19", "attack approach", "FUN_8004E2F0", "korb3", "endless orbit"]
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+[[scenarios]]
+slot = 255
+label = "battle_gaza2_park_0x19_summon_melee"
+description = "Second live-caught 0x19 park, REPRODUCED on the first directed attempt of the summon-then-melee recipe, with the onset ON RECORD (capture gaza2_summon_displacement 2026-07-24T17-07-05Z): summon ends v26867 (Gaza staged to (0,-2048), damage-reaction clip 2/2 during staging), his melee starts directly next v26873 targeting seat 1 (Noa) at ~1022 units; the fallback Move clip ENGAGES (anim pair 1/1, ~19 units/vsync) and DIES ~12 vsyncs later (pair 0/0, frozen at ~786 from the target, beyond reach ~416). Party state at park: Vahn dead 0/1289, Noa 79/1199, Gala 378/1382, Gaza 5700/15000 targeting +0x1DD = 1. Healthy contrast in the same capture: summon -> other action -> melee ran the Move clip 64 vsyncs / 1260 units. Open: which anim-driver field the summon staging leaves stale."
+phase = "battle"
+expected_game_mode = 0x15
+expected_active_scene = "korb3"
+pcsx_redux_sstate = "saves/library/pcsx-redux/98022a6d3a4db2a2753b5b29214fcf75de9279e8a8b1ee8a7d91bdf180acead1.sstate"
+backup_fingerprint = "98022a6d3a4db2a2753b5b29214fcf75de9279e8a8b1ee8a7d91bdf180acead1"
+resident_patch = "arts AP override (SCUS arena 1 routines)"
+topics = ["battle", "boss", "Gaza", "softlock", "state 0x19", "attack approach", "summon staging", "Move clip", "korb3", "endless orbit"]
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+[[scenarios]]
+slot = 255
+label = "battle_gaza2_park_0x19_target_vahn"
+description = "Third live-caught 0x19 park, again from ordinary play in the Gaza 2 fight. Gaza (seat 3, 10386/15000 HP) wedged targeting seat 0 (Vahn) with the dead-clip signature (anim pair +0x1DA/+0x1D9 = 0/0); party seats 0-2 alive and full HP, all holding target 3. Confirms the park is target-independent (previous catches targeted Gala and Noa) - the discriminator is the dead Move clip, not distance or seat."
+phase = "battle"
+expected_game_mode = 0x15
+expected_active_scene = "korb3"
+pcsx_redux_sstate = "saves/library/pcsx-redux/a8ade5cd5c21fc6bebbb91d8f17c74ed4061c53dc097cd42b27f3331b39ab234.sstate"
+backup_fingerprint = "a8ade5cd5c21fc6bebbb91d8f17c74ed4061c53dc097cd42b27f3331b39ab234"
+resident_patch = "arts AP override (SCUS arena 1 routines)"
+topics = ["battle", "boss", "Gaza", "softlock", "state 0x19", "attack approach", "Move clip", "korb3", "endless orbit"]
+
+[scenarios.overlay_slice]
+start = 0x801C0000
+end = 0x80200000
+
+[[scenarios]]
+slot = 1
+label = "nivora_cutscene_delilas_intro"
+backup_fingerprint = "542107a89004977b35d47057ed5695c20b47061bd48b7f004b5d6d705a8f89af"
+description = "RETAIL disc: start of the Nivora ravine cutscene with the Delilas siblings (nilboa field-run, x=14400 z=14656) - the walk-in before the duels"
+topics = ["nivora", "nilboa", "Delilas", "cutscene", "retail reference"]
+phase = "field"
+expected_active_scene = "nilboa"
+
+[[scenarios]]
+slot = 2
+label = "nivora_duel_che_vs_gala_start"
+backup_fingerprint = "41471a9dc196ea13b0d909be3a06ee80f32d2511d8e370fb615098d65c234a12"
+description = "RETAIL disc: start of the Che vs Gala Nivora duel battle (nilboa battle mode) - the retail boss-cast reference fight"
+topics = ["nivora", "nilboa", "Delilas", "Che", "duel", "battle", "retail reference"]
+phase = "battle"
+expected_game_mode = 0x15
+expected_active_scene = "nilboa"
+
+[[scenarios]]
+slot = 3
+label = "nivora_duel_pre_megaton_press"
+backup_fingerprint = "87dd9568e167bdb96ad94cc9a7bc4504073eef2979e87e616d755905bb80ce02"
+description = "RETAIL disc: mid Che vs Gala duel, ~1 second before Che performs Megaton Press unprompted - THE retail reference for the capture-cast module 959 finale (camera pan to caster + face cut-in). Load and wait; the cast fires on its own"
+topics = ["nivora", "Delilas", "Che", "Megaton Press", "cast module 959", "finale", "camera", "face cut-in", "retail reference"]
+phase = "battle"
+expected_game_mode = 0x15
+expected_active_scene = "nilboa"
+
+[[scenarios]]
+label = "nivora_duel_pre_plasma_strike"
+backup_fingerprint = "9f7afd18519ad43c44b764a64c2e25902a9c97756c8886002a9055cd496795a9"
+description = "RETAIL disc: mid Lu vs Noa duel (formation 0xA4, party Noa), captured at phase 0x51 with Lu's queued action already cat=2 spell=0x7B (Plasma Strike) and the cast module NOT yet loaded (slot-B empty) - the retail before-cast reference for porting the capture-cast route to Lu's module. Load and wait; the cast fires on its own"
+topics = ["nivora", "Delilas", "Lu", "Plasma Strike", "spell 0x7B", "cast module", "retail reference"]
+phase = "battle"
+expected_game_mode = 0x15
+expected_active_scene = "nilboa"
+
+[[scenarios]]
+label = "nivora_duel_mid_blazing_slash"
+backup_fingerprint = "7c7a8d2034ec3e5a164145910cf55a8b34629861209683fc922066b87d1837ff"
+description = "RETAIL disc: mid Gi vs Vahn duel (formation 0xA2, party Vahn), captured INSIDE the cast band (phase 0x6E) with Gi's action cat=2 spell=0x79 (Blazing Slash) and the cast module resident at slot-B 0x801F6E9C - the module bytes are dumpable straight from this state's RAM. Load and the spectacle plays out"
+topics = ["nivora", "Delilas", "Gi", "Blazing Slash", "spell 0x79", "cast module", "slot-B resident", "retail reference"]
+phase = "battle"
+expected_game_mode = 0x15
+expected_active_scene = "nilboa"
+
+[[scenarios]]
+slot = 7
+label = "delilas_gi_move_input_hand_gap"
+backup_fingerprint = "cf06081fa6e864ca2e6c0c2455317a850142fad31d78760d4f732db0c1495a73"
+resident_patch = "delilas party swap + cast"
+resident_disc = "Legend of Legaia (USA).legaia-patcher-1787410245104.bin"
+description = "DELILAS PARTY SWAP MOD savestate - disc patched with --delilas-party lu,gi,che (rom 'Legend of Legaia (USA).legaia-patcher-1787410245104.bin'): battle, Gi (Noa slot) waiting for move input with his hand visibly DISCONNECTED from the arm - a live repro of the playerize hand/variant seam on the current build. Patched-disc state: RAM carries the patched player files, so the defect is dumpable straight from this state"
+topics = ["delilas party", "Gi", "playerize", "hand gap", "mesh seam", "patched disc", "bug repro"]
+phase = "battle"
+expected_game_mode = 0x15
+
+[[scenarios]]
+slot = 8
+label = "delilas_che_move_input_mesh_gaps"
+backup_fingerprint = "7b5060df8c86fea91faaa3095e8cf64a553eef388cac5f49b87c5a85a7b25204"
+resident_patch = "delilas party swap + cast"
+resident_disc = "Legend of Legaia (USA).legaia-patcher-1787410245104.bin"
+description = "DELILAS PARTY SWAP MOD savestate - same lu,gi,che-patched rom as delilas_gi_move_input_hand_gap: battle, Che (Gala slot) waiting for move input with gaps in his mesh (the hammer among them) - live repro of missing/cropped geometry in the playerized battle form on the current build"
+topics = ["delilas party", "Che", "playerize", "mesh gaps", "hammer", "patched disc", "bug repro"]
+phase = "battle"
+expected_game_mode = 0x15
+
+[[scenarios]]
+slot = 9
+label = "delilas_gi_spirit_artifact"
+backup_fingerprint = "75e9f97dd640bfb27a17201b7c28728713898b00b4cdb53d66cf71114e15e61d"
+resident_patch = "delilas party swap + cast"
+resident_disc = "Legend of Legaia (USA).legaia-patcher-1787410245104.bin"
+description = "DELILAS PARTY SWAP MOD savestate - same lu,gi,che-patched rom as delilas_gi_move_input_hand_gap: battle, Gi mid-SPIRIT - load and the stretched-mesh visual artifact shows about one second later. THE repro state for the Spirit stretch (task-60 class): patched RAM, natural battle context, artifact on a timer from load"
+topics = ["delilas party", "Gi", "Spirit", "mesh stretch", "equipment variant window", "patched disc", "bug repro"]
+phase = "battle"
+expected_game_mode = 0x15
+
+[[scenarios]]
+slot = 1
+label = "delilas_gi_move_hand_gap_v2"
+backup_fingerprint = "baa3330b8b4575828c8c01fc3b766f365c866fb488029256ee6de9b951eaa51a"
+resident_patch = "delilas party swap + cast"
+resident_disc = "Legend of Legaia (USA).legaia-patcher-1787422713325.bin"
+description = "DELILAS PARTY SWAP MOD savestate - disc patched with --delilas-party lu,gi,che (rom 'Legend of Legaia (USA).legaia-patcher-1787422713325.bin', CONTAINS the hand centroid-seat + winding-twin fixes and the VDF-tail restore, all byte-verified): battle, Gi (Noa slot) waiting for move input with a visible gap between hand and arm - the residual after the seat + twins"
+topics = ["delilas party", "Gi", "hand gap", "residual", "patched disc", "bug repro"]
+phase = "battle"
+expected_game_mode = 0x15
+
+[[scenarios]]
+slot = 2
+label = "delilas_che_move_hammer_gaps_v2"
+backup_fingerprint = "9ecca345b035241ef5a5145a05f95ab627e5edad161a9d328c1d6e823d13817b"
+resident_patch = "delilas party swap + cast"
+resident_disc = "Legend of Legaia (USA).legaia-patcher-1787422713325.bin"
+description = "DELILAS PARTY SWAP MOD savestate - same fixed rom as delilas_gi_move_hand_gap_v2: battle, Che (Gala slot) waiting for move input with visible gaps in the hammer - residual after the hammer's full winding twins (129->258 prims)"
+topics = ["delilas party", "Che", "hammer gaps", "residual", "patched disc", "bug repro"]
+phase = "battle"
+expected_game_mode = 0x15
+
+[[scenarios]]
+slot = 3
+label = "delilas_gi_spirit_streaks_v2"
+backup_fingerprint = "445f85f3afab797761e98784f919dbeee4613c5281cfc24ae64a74bcbf279eb1"
+resident_patch = "delilas party swap + cast"
+resident_disc = "Legend of Legaia (USA).legaia-patcher-1787422713325.bin"
+description = "DELILAS PARTY SWAP MOD savestate - same fixed rom as delilas_gi_move_hand_gap_v2: mid-battle during Gi's SPIRIT with mesh pieces stretching across the screen. The VDF tail is byte-intact on this rom, so the streak source is NOT the zero-filled effect tail - THE attribution state for the reopened streak hunt (task 60): patched RAM, fixed disc, artifact live"
+topics = ["delilas party", "Gi", "Spirit", "streaks", "residual", "patched disc", "bug repro"]
+phase = "battle"
+expected_game_mode = 0x15
+
+[[scenarios]]
+slot = 1
+label = "delilas_gi_hand_gap_v3"
+backup_fingerprint = "ed830c9db304d50115948fa2b02b7124fcf7fb74f7e7fe0de15a5ea31ebf423d"
+resident_patch = "delilas party swap + cast"
+resident_disc = "Legend of Legaia (USA).legaia-patcher-1787575238766.bin"
+phase = "battle"
+expected_game_mode = 0x15
+expected_active_scene = "vozz"
+description = "DELILAS PARTY SWAP MOD savestate - rom 1787575238766 (delilas-verify PASS, all static invariants hold). Gi (Noa slot) at the command ring in a vozz random encounter with his fist visibly DETACHED from the forearm. Decoded runtime assembly is byte-identical to a clean boot-anchored battle (digest e92dfddc..., 18 objects, no 0xFE) - the defect is POSE-TIME, not bake-time: certain idle-cycle frames pose the hand channel where the seated geometry does not follow."
+topics = ["delilas", "battle", "pose-time", "hand gap", "probe state"]
+
+[[scenarios]]
+slot = 2
+label = "delilas_che_hammer_gaps_v3"
+backup_fingerprint = "675336d7d2d3f7ff66671ddce60be30fce0518579fb066d0779dad69616cbf86"
+resident_patch = "delilas party swap + cast"
+resident_disc = "Legend of Legaia (USA).legaia-patcher-1787575238766.bin"
+phase = "battle"
+expected_game_mode = 0x15
+expected_active_scene = "vozz"
+description = "DELILAS PARTY SWAP MOD savestate - same rom/session as delilas_gi_hand_gap_v3. Che (Gala slot) at his ring with a separated hammer chunk floating right of the body and gaps in the hammer head. Same pose-time class: assembly bytes match the clean battle."
+topics = ["delilas", "battle", "pose-time", "hammer gap", "probe state"]
+
+[[scenarios]]
+slot = 3
+label = "delilas_gi_spirit_distortion_v3"
+backup_fingerprint = "ccc316d8494386e49ad02b0b38da70e07b06522c7e907972026bada97016ddd4"
+resident_patch = "delilas party swap + cast"
+resident_disc = "Legend of Legaia (USA).legaia-patcher-1787575238766.bin"
+phase = "battle"
+expected_game_mode = 0x15
+expected_active_scene = "vozz"
+description = "DELILAS PARTY SWAP MOD savestate - same rom/session. Gi mid-Spirit with distorted/stretched torso mesh on a disc that has NO 0xFE extras (the ordinal-overrun fix is on this rom and the runtime assembly confirms it) - a SECOND streak mechanism, pose-time like the hand/hammer gaps. Streaks flash within ~1s of loading."
+topics = ["delilas", "battle", "pose-time", "spirit streaks", "probe state"]
+
+# ----------------------------------------------------------------------
+# Uru Mais exit capture. The four Uru Mais rooms and `jouine` carry their
+# exits in partition-2 records that only the scene's `.PCH` walk-on trigger
+# sidecar names (the second table, staged past the `.MAP` and searched when
+# the map's own misses), so a sweep of the `.MAP` table reads them as sealed.
+# `uru_field_run` parks the player on uru's arrival tile, four tiles south
+# of the gate-1 band that spawns the MAP03 exit record.
+# Probe: scripts/pcsx-redux/autorun_uru_exit_probe.lua.
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "uru_field_run"
+backup_fingerprint = "6889b1c9d1ecf990b30a8cc24c6a2aefef2835ee6baffb0fc77c5329284f4719"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "uru"
+description = "Free field run inside Uru Mais (scene uru), player parked at world (4864, 880) = tile (38, 6) - the arrival tile the map03 entrance record writes. The gate-1 walk-on band at tiles (36..39, 5) is four tiles north; it spawns partition-2 record 42, whose 41-byte body ends in the 0x3F named scene change back to MAP03 at entry (0x24, 0x46)."
+topics = ["field", "uru", "Uru Mais", "walk-on trigger", "scene exit", "probe state"]
+
+# ----------------------------------------------------------------------
+# Cold-boot title front end. A NO-SAVE phase marker: the capture starts the
+# emulator with no state at all (`LEGAIA_NO_SSTATE=1`), because the two
+# questions it answers are properties of the boot itself and a save state
+# would replay a RAM image that has already passed them. It carries the pad
+# ladder because the title front end needs one: sub-mode 0x10 is the two-row
+# NEW GAME / CONTINUE menu, row 0 confirms through sub-mode 0x16 into 0x06
+# (init_game -> master mode 2), and row 1 confirms through 0x18 into 0x14,
+# the memory-card screen. Idle instead and the attract countdown underflows
+# into master mode 0x1A (the opening FMV) around 1500 vsyncs after the title
+# appears. Probe: scripts/pcsx-redux/autorun_boot_warning_screen.lua.
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "cold_boot_title_front_end"
+phase = "boot"
+expected_game_mode = 0x17
+description = "Cold boot with no save state, driven through the title front end by the probe's own pad ladder (LEGAIA_PAD_SCRIPT). Reference timings from the USA disc under PCSX-Redux with FastBoot: master mode 0x10 at ~235 vsyncs, 0x11 at 318, CARD INIT 0x16 at 978, title 0x17 at 1109; title sub-mode 0x11 at 1110 and 0x10 at 1185. Answers what draws the init.pak WARNING screen (nothing does), which title sub-mode a cold boot shows (0x10, because the boot init.pak raises _DAT_8007BB00 at 0x801CEB84), and whether anything samples the card-screen kanji page (nothing does)."
+topics = ["boot", "title", "cold boot", "init.pak", "WARNING screen", "kanji page", "no-save", "probe state"]
+
+# ----------------------------------------------------------------------
+# Teien (Sebucus garden) free field run - the state the object-grid ground
+# thread was blocked on. Produced by playing the corpus's teien field-init
+# state forward past its transition fade under
+# scripts/pcsx-redux/autorun_field_ground_cells.lua, which also writes the
+# live object-grid census and the per-cell emit census for the frame.
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "teien_field_run"
+backup_fingerprint = "0f0f5384290739532d20a93d2759d36aa16fc551051ebc071f671b443ae6dbb8"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "teien"
+description = "Free field run inside the Sebucus garden (scene teien), player at world (6180, 3994): a cold boot of a staged, unpatched image + a memory-card load of the teien save (playthrough-ladder-pro00-14.mcr block 3, restamped to -00; autorun_boot_continue.lua under --fast, 400-vsync settle). It replaces a capture of the same save made on a location-rename image (811098af...); the object-grid counts below and the 0900 residency are identical in both. The frame's live object grid at *(0x1F8003EC)+0x8000 holds 451 non-zero cells - 400 with the ground-draw bit 0x1000, 53 with 0x2000, 45 with 0x0800 and no 0x1000 - and PROT 0900 is byte-resident at slot B, so the ground pass FUN_801F6D48 can be breakpointed straight from the load."
+topics = ["field", "teien", "object grid", "ground pass", "FUN_801F6D48", "PROT 0900", "probe state"]
+
+# ----------------------------------------------------------------------
+# Memory-card cold-boot field anchors (the "card tier" states).
+#
+# These four are not save-state derivatives: each was produced by booting
+# the disc from power-on, driving the title front end through CONTINUE
+# into the memory-card load screen, loading one save off a progression
+# card and checkpointing on the first field-run frame
+# (scripts/pcsx-redux/autorun_boot_continue.lua). Everything the loader
+# builds at load time therefore comes off the disc under test, which a
+# state-derived anchor cannot promise.
+#
+# The card is staged down to a single save first, AND that save's
+# product-code suffix is re-stamped to `-00`. The load grid places a save
+# by its own slot number - the suffix - not by the card block it occupies,
+# so without the re-stamp only a `...PRO-00` save lands under the cursor
+# and the calibrated input ladder misses every other one.
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "vozz_field_card_boot"
+backup_fingerprint = "d57b7ca197ecc34e23c6cfccff36b3e6d0942f362ea1bcce338fdbb8040e8ec5"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "vozz"
+description = "Voz Forest free field run, reached by a cold boot + memory-card load rather than from another state. Player at world (13606, 8760). The scene is one of the six that issue the field-VM actor clone (`4C 14`), and its sixteen sites are the disc's only ones at rate 0x0199."
+topics = ["field", "vozz", "card boot", "actor clone", "4C 14", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "conc_field_card_boot"
+backup_fingerprint = "085ec69470c8ef854acf5876f8132351a9fa97ab37fe113465b71dd39d309704"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "conc"
+description = "Conkram town free field run at the late-game save, reached by a cold boot + memory-card load. Player at world (2274, 12506). The nearest catalogued state to the `conc2` -> `juui1` door, which is the one op-0x3F crossing into the Juggernaut interior."
+topics = ["field", "conc", "Conkram", "card boot", "juui1", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "chitei2_field_card_boot"
+backup_fingerprint = "5ea350dfb89735177c628ab1a30f2424fc5ddfc0556e1a853f02a0dfeedcf5c0"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "chitei2"
+description = "Underground Octam free field run, reached by a cold boot + memory-card load. Player at world (6272, 4826). One of the Karisto spokes no capture had ever entered, so the region story-flag families it latches were unobserved."
+topics = ["field", "chitei2", "Karisto", "story flags", "card boot", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "retona_field_card_boot"
+backup_fingerprint = "cb69ed5a9435041e9dabc83d29627aa7b7111446896305e9494178ffa63fcca3"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "retona"
+description = "Mt. Letona free field run, reached by a cold boot + memory-card load. Player at world (8536, 12638). The save one step before the `retock` beats, so a play-forward from here fires that region's entry family organically instead of finding it pre-latched."
+topics = ["field", "retona", "retock", "story flags", "card boot", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "town01_field_card_boot"
+backup_fingerprint = "6acd2d93d83e0f24a03d794f99485bea11820083ad07c8598923d4f9f03a3b34"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "town01"
+description = "Rim Elm (town01) free field run, reached by a cold boot + memory-card load (the town01 save, restamped to suffix -00 so the calibrated ladder lands on it). Player at world (9690, 8512), which the frame shows as a cave chamber around a glowing tree (the save point the card was written at), with a second character standing beside Vahn - not the village square. Checkpointed 40 field-run vsyncs after the load; its load-screen sibling is field_load_first_town."
+topics = ["field", "town01", "Rim Elm", "card boot", "probe state"]
+
+# ----------------------------------------------------------------------
+# Pre-entry card-boot anchor.
+#
+# The card-tier anchors above are checkpointed on the first FIELD frame,
+# which is already past everything the scene entry did. A question about
+# what the entry itself writes needs an anchor BEFORE it, so this one is
+# checkpointed on the memory-card load screen with the CONTINUE ladder's
+# confirm already pressed: loading it replays the save block's restore,
+# the scene load and the entry script under whatever watches a probe arms
+# first.
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "conc_pre_entry_card_boot"
+backup_fingerprint = "b0eef610f26d37763fdf8c375137969e28733a8b1eee11d4fa3a7ab8ea21dfe5"
+phase = "menu"
+expected_game_mode = 0x17
+expected_active_scene = "opdeene"
+description = "Memory-card load screen with the `conc` save's confirm already taken, ~450 vsyncs before the scene settles into field mode. The pre-entry sibling of `conc_field_card_boot`: a watch armed on this state sees the save-block restore, both of conc's entry-time story-flag clears and the entry script's first re-arm passes."
+topics = ["field", "conc", "card boot", "story flags", "scene entry", "probe state"]
+
+# ----------------------------------------------------------------------
+# Story-ladder card-boot anchors (playthrough-ladder-pro00-14.mcr blocks
+# 8 / 10 / 11 / 12 / 13, endgame-7saves block 2). Same cold boot +
+# memory-card CONTINUE as the anchors above, one per save, so each
+# chapter-2 spoke has a state standing just before its own story beats:
+# `retock` (block 8), `kor5` (block 10 - the 0x43A -> 0x436 -> 0x6C4
+# chain is still all clear here), `korb2` (block 11 - 0x3FB still clear,
+# the save before `doman` sets it), `doman` (block 12) and the late-game
+# `rugi` (endgame block 2). The three `_pre_entry` rows are the
+# load-screen siblings (checkpointed with the CONTINUE confirm taken), for
+# watches that must see the scene entry itself.
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "retock_field_card_boot"
+backup_fingerprint = "ec0b6122f9b1ea9173ed288562eaf40afa72cff6d12afb3fd46c92a06df331e2"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "retock"
+description = "Retock free field run from the story-ladder card (block 8), cold boot + memory-card load. Player at world (15280, 10960). The spoke whose entry script latches 0x493 / 0x01F / 0x52A and clears 0x19B..0x1AA."
+topics = ["field", "retock", "story flags", "card boot", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "kor5_field_card_boot"
+backup_fingerprint = "1f81d55a7fe5f8ae9bf4a85a8ad95be1f3b270572780a6883d4499e93e36ca5b"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "kor5"
+description = "Biron Monastery (kor5) free field run from the story-ladder card (block 10), cold boot + memory-card load. Player at world (3674, 4214). Flags 0x43A / 0x436 / 0x464 / 0x6C4 all clear: the whole partition-2 chain P2[3] -> P2[4] -> P2[5] -> P2[8] is still ahead."
+topics = ["field", "kor5", "story flags", "card boot", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "korb2_field_card_boot"
+backup_fingerprint = "a598c9057396248355089ec287132f3bc39b912e801de4efd7dbe548ff455ba4"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "korb2"
+description = "korb2 free field run from the story-ladder card (block 11), cold boot + memory-card load. Player at world (9536, 13146). kor5's chain is complete here (0x6C4 set) and doman's 0x3FB is still clear - the save before doman P2[4] sets it."
+topics = ["field", "korb2", "doman", "story flags", "card boot", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "doman_field_card_boot"
+backup_fingerprint = "0ef4316a9350a4300ff142ef94143cb574746283378f0ea6b523c9dcb03962a2"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "doman"
+description = "Doman free field run from the story-ladder card (block 12), cold boot + memory-card load. Player at world (9818, 14846). 0x3FB is already set, so doman P2[4] (walk-on tiles (67, 108..110), C1 {0x3FB}) no longer spawns without a flag poke."
+topics = ["field", "doman", "story flags", "card boot", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "rugi_field_card_boot"
+backup_fingerprint = "081f939ef49276ce28eeb752d7ca81be94795f2f70522b2e4ee9f37c161fbdab"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "rugi"
+description = "Rugi free field run from the endgame card (playthrough-endgame-7saves block 2), cold boot + memory-card load. Player at world (10918, 8416). The organic route to juui1 from here passes the Rogue boss (rugi P2[39])."
+topics = ["field", "rugi", "juui1", "card boot", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "retock_pre_entry_card_boot"
+backup_fingerprint = "eb14d449287e8a73f2ea13c87c489e60c6b8fce6e98c891b84a2d56532d9716c"
+phase = "field"
+expected_game_mode = 0x02
+expected_active_scene = "opdeene"
+description = "Memory-card load with the story-ladder block-8 save's CONTINUE confirm taken; the scene settles into `retock` about 40 vsyncs after load. Pre-entry sibling of retock_field_card_boot."
+topics = ["field", "retock", "card boot", "story flags", "scene entry", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "doman_pre_entry_card_boot"
+backup_fingerprint = "319f004170bca04dba9ce7f6f81b281a6810810d0ae1aa21d515e3a7d272406e"
+phase = "field"
+expected_game_mode = 0x02
+expected_active_scene = "opdeene"
+description = "Memory-card load with the story-ladder block-12 save's CONTINUE confirm taken; the scene settles into `doman` about 40 vsyncs after load. Pre-entry sibling of doman_field_card_boot."
+topics = ["field", "doman", "card boot", "story flags", "scene entry", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "nilboa_pre_entry_card_boot"
+backup_fingerprint = "3fe32661b85a44aa044586d410089f2047357de52bf0799918fbb8fd7d47d5c5"
+phase = "field"
+expected_game_mode = 0x02
+expected_active_scene = "opdeene"
+description = "Memory-card load with the story-ladder block-13 save's CONTINUE confirm taken; the scene settles into `nilboa` about 40 vsyncs after load."
+topics = ["field", "nilboa", "card boot", "story flags", "scene entry", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "kor5_post_43a_checkpoint"
+backup_fingerprint = "073eab966cabfa6f7e547bf107088152e854b3f767ab118585e6cac1c42a9dbf"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "kor5"
+description = "kor5 300 vsyncs after P2[3] latches 0x43A, reached from kor5_field_card_boot by tile pokes (captures/w7c-0921/kor5_k2). P2[3] is parked and the player, still under the movement lock (+0x10 bit 0x80000) for about 120 more vsyncs, was poked onto P2[4]'s tile (32, 41) during the lock - so the last-tile pair already reads (32, 41) and standing there fires nothing; after the lock clears, crossing (32, 40) then (32, 41) dispatches P2[4]. 0x436 / 0x464 / 0x6C4 still clear."
+topics = ["field", "kor5", "story flags", "walk-on trigger", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "doman_arrival_from_korb2"
+backup_fingerprint = "dba64ecf1f6aa55b2270360d92cf4d19ca2b1e3e4d9de113c031cfcd45279a66"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "doman"
+description = "The map03 -> doman crossing, caught about 60 vsyncs before doman loads, on a route walked by tile pokes from korb2_field_card_boot (korb2 -> kor -> korout -> map03 -> doman; captures/w7c-0921/doman_org). The scene label already reads doman while the player still stands on map03's doman portal tile (63, 69). 0x3FB is clear, so doman P2[4] (walk-on (67, 108..110), C1 {0x3FB}) is still live - the organic pre-entry state card block 12 lacks."
+topics = ["field", "doman", "map03", "story flags", "scene entry", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "son_arrival_from_doman"
+backup_fingerprint = "7a80d3229a1ebaf5225e080ee2144c95ce5e5b04949927e84b4ebe16bb3baa52"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "son"
+description = "The map03 -> son crossing, caught just before son loads, on a route walked by tile pokes from doman_field_card_boot (doman -> map03 -> son; captures/w7c-0921/son_org). The scene label already reads son while the player is still on map03, at world (6272, 11520) where the portal record P2[13] (tile (45, 84)) left it. Loading it replays son's entry: the entry script clears 0x3A6 / 0x3A7 / 0x3A8 and the arrival seat (8, 9) fires P2[5], which sets 0x60D."
+topics = ["field", "son", "map03", "story flags", "scene entry", "probe state"]
+
+# ----------------------------------------------------------------------
+# Mist-forest fog reference. `vell` is reached from the map01 hub state
+# `overworld_into_town_man_load` by one door-tile poke
+# (`autorun_w5a_poke_walk.lua`, LEGAIA_ROUTE="map01@77,97",
+# LEGAIA_CKPT_SCENE=vell, LEGAIA_CKPT_AFTER=700), then checkpointed 700
+# field vsyncs after arrival so the fog pool is populated. It is the retail
+# reference for the field fog sheets: VRAM through
+# `extract_vram_from_sstate.py`, the pool through
+# `autorun_w1a_fog_pool_poll.lua`.
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "vell_fog_field"
+backup_fingerprint = "bd407707f5aa6f437bc3c9a075416da1ac26fad3d7ea6a54cf1fd6450965775e"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "vell"
+description = "Mist forest (vell) free field run at the map01 entrance, player at world (11584, 1088), fog gate _DAT_8007B854 raised, 14 live fog records at the checkpoint (cap 0x18). Reached from overworld_into_town_man_load by a door-tile poke, not a walk. Retail frame + VRAM reference for the field fog sheets (texture page 0x0027 = VRAM (448, 0), CLUT (0, 473))."
+topics = ["field", "vell", "fog", "fog pool", "VRAM", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "kor5_post_436_organic"
+backup_fingerprint = "4f40281a85b01b4e8d6b9c84115228bd03aa0a94066e762f87a9899851335fcc"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "kor5"
+description = "kor5 on the vsync P2[5] sets 0x436 itself (record +0xD0D, FUN_8003CE08 from ra 0x801E3598) - no flag poke. Reached from kor5_post_43a_checkpoint by tile pokes onto P2[4]'s (32,40) -> (32,41), a Cross mash, and the Gaza fight passed by holding the enemy HP at 1 (synthetic: the loss is a game over, mode 0x16); P1[0] spawns P2[5] on the reload and it runs to +0xD0D about 3,300 vsyncs later. 0x6C4 still clear: crossing (32,85) -> (32,86) dispatches P2[8], which sets it at +0x75."
+topics = ["field", "kor5", "story flags", "walk-on trigger", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "koru_strip_forced"
+backup_fingerprint = "7f4a53493c884f768ac087672bc74317cabaf5b24a89ac212a1a52b53f07dbbc"
+phase = "battle"
+expected_game_mode = 0x15
+expected_active_scene = "nilboa"
+description = "Koru (monster 0xB6) battle at the first round's Begin / Run prompt, with the Turns Left / HP Left strip drawn (turns left 4, HP 100). SYNTHETIC formation: autorun_w1a_koru_strip.lua installed cells 0x8007BD0C..0F = [0xB6,0,0,0] + master mode 8 from nivora_cutscene_delilas_intro, so the party is that state's (Gala alone) and the arena is the nilboa battle stage, not Koru's scripted fight. The strip's gate reads only the formation cell."
+topics = ["battle", "Koru", "timed fight", "battle HUD", "synthetic", "probe state"]
+
+# ----------------------------------------------------------------------
+# Retail dialogue reference: town01 P1[16]'s first page.
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "town01_npc16_dialogue_first_page"
+backup_fingerprint = "7d9fb8c0b64ab43ce2f85d27601921f2ca144f05481b5ab1fa5b341e710d04fe"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "town01"
+description = "Rim Elm (town01) with placement P1[16]'s conversation open on its first page, fully typed and waiting on the page cursor: two lines, the first opening on the lead-name escape (1F C1 00). Retail frame-pair for the engine's first-box render of the same record. Made from s4_rimelm_door_transition (retail SCUS) by autorun_talk_to_npc.lua with LEGAIA_NPC_P90=0x800E6702 (MAN base 0x800E4008 + record offset 0x26FA) and a position poke to (3456, 3072) - the path from the house door crosses a story trigger and a fenced lane - then a DOWN tap and CROSS. The poke moves only the player; nothing the conversation reads."
+topics = ["field", "town01", "dialogue", "P1[16]", "name escape", "frame pair", "probe state"]
+
+# ----------------------------------------------------------------------
+# Retail field references reached by tile pokes / a talk probe.
+# ----------------------------------------------------------------------
+
+[[scenarios]]
+slot = 255
+label = "cave01_attached_light"
+backup_fingerprint = "bfbf2a94618ba8bf7d75640245577c7ba7e97025b9804798b1989b3199001481"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "cave01"
+description = "cave01 free field run with the op 0x34 sub-1 darkness mask live on the player: one FUN_801E4470 actor, extents (0xC00, 0xC00), +0x74 0, +0x88 0x808020, +0x5A 2, offset (0, -0x60, 0). Retail SCUS: reached from s3_rimelm_freeroam by autorun_w5a_poke_walk.lua (LEGAIA_ROUTE town01@25,46;map01@37,110), checkpointed 240 field vsyncs after the arrival at world (11968, 12480). The frame's rim packets put the ring at 180 px round (155, 116) with H 512 and vz 8710. Consumed by engine-core attached_light_cave01_retail_capture_disc."
+topics = ["field", "cave01", "attached light", "darkness mask", "op 0x34", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "retock_innkeeper_talk_open"
+backup_fingerprint = "7e62fec0bdd6153953a685d01eb113c55c3631253e01652cdbfcdbb803518c32"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "retock"
+description = "retock inn interior with the innkeeper's (P1[26], actor +0x90 0x800E9688, MAN base 0x800E7494) conversation open, 5 vsyncs after the box appears. Retail SCUS: from retock_field_card_boot, a tile poke onto the kind-0 door (54,71) warps into the inn at (15168, 1280); autorun_talk_to_npc.lua with LEGAIA_POKE_POS=14816,1728 opens the talk (approached from the west - from the south the adjacent P1[29] answers instead). A Cross cadence runs one full stay (240 G) and parks the record's cursor on its 26 loop-back at +0x18A; the next talk executes the loop-back and the CC F8 85 acquire at +0x30 (arm 0x801E2148, s7 = 5)."
+topics = ["field", "retock", "inn", "dialogue", "halt-acquire", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "retock_inn_stay_prompt"
+backup_fingerprint = "a4ac1ccbeddb32f399a58d2f9b73c55b1b1e81541e93a4005ff4f135a510ea6d"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "retock"
+description = "retock inn, the innkeeper's stay offer on screen and waiting: the pager (FUN_801D84D0) has just entered page wait 0x19 on the page that ends on the 0x2A picker open byte, so one confirm press opens the Yes / No menu. Retail SCUS: from retock_innkeeper_talk_open, autorun_dialog_picker_open.lua (LEGAIA_PICKER_WAIT=20, LEGAIA_PICKER_RETALK=400, LEGAIA_PICKER_CKPT=1) runs the first talk's two pages, talks again after the stay, and checkpoints the 0x19 entry that precedes state 0x11. The press drives 0x11 -> 0x12: the 88 x 26 box slides in from x 336 to 216 at y 74 over twelve pager calls (frame step 2)."
+topics = ["field", "retock", "inn", "dialogue", "picker", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "town01_tetsu_topic_prompt"
+backup_fingerprint = "652584a3b64ffbefc196965e4a5adcea975c5851e879152ad3cc3eefe75b7478"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "town01"
+description = "Rim Elm (town01), the sparring partner Tetsu's topic prompt on screen and waiting: the pager (FUN_801D84D0) is in page wait 0x19 on the page that ends on the 0x29 picker open byte, so one confirm press opens his 4-option list. Retail SCUS: from s4_rimelm_door_transition, autorun_replay_inputs.lua replays the recorded human route to Tetsu (captures/record_inputs inputs.csv) with LEGAIA_CKPT_FRAME=1290, then autorun_dialog_picker_open.lua (LEGAIA_PICKER_WAIT=20, LEGAIA_PICKER_CKPT=1) checkpoints the 0x19 entry that precedes state 0x17. The press drives 0x17 -> 0x18: the 244 x 56 box rises from y 240 to 148 at x 38 over twelve pager calls (frame step 2)."
+topics = ["field", "town01", "Tetsu", "dialogue", "picker", "probe state"]
+
+[[scenarios]]
+slot = 255
+label = "tunnelb_field_card_boot"
+backup_fingerprint = "91070cb51112e90b4a17d4fb9e9c0383cbc1976a0d6cd7ae9c914bca84b9aed9"
+phase = "field"
+expected_game_mode = 0x03
+expected_active_scene = "tunnelb"
+description = "tunnelb free field run from the story-ladder card (playthrough-ladder-pro00-14 block 4, restamped to -00 by isolate_card_save.py), cold boot + memory-card load (autorun_boot_continue.lua, the calibrated CONTINUE ladder, LEGAIA_SETTLE=200). Player at world (5286, 11830). The nearest card block to rayman: tunnelb P2[35] (tile (12, 105)) and P2[38] (tile (17, 71)) are its doors into rayman, rayman2 once flag 0x1D5 is set."
+topics = ["field", "tunnelb", "rayman", "story flags", "card boot", "probe state"]

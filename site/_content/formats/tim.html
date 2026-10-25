@@ -1,0 +1,198 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">formats</a> &middot; psx tim (texture)</div>
+  <h1>PSX TIM (texture) <span class="tag tag-done">Confirmed</span></h1>
+  <p class="lede">Every surface you see in Legend of Legaia - Vahn's jacket, the cobbles of Rim Elm, the gold border round a menu, the letters of the dialog font - is painted from a texture, and every one of those textures is a TIM. TIM is the standard PlayStation texture-image format: a small header, an optional palette, and a block of pixels stamped straight into video memory. This page covers how <em>Legaia</em> uses it, the two habits that break naive tools, and the write side that lets a modder swap a texture on the disc.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>In the game</dt><dd>Every texture: character skins, floors and walls, the world map, UI panels and cursors, menu glyphs and the dialog font.</dd>
+    <dt>Magic</dt><dd><code>0x00000010</code> as the first u32</dd>
+    <dt>Lives in</dt><dd>Inside <a href="prot.html">PROT.DAT</a> entries (usually behind <a href="lzs.html">LZS</a>), inside <a href="pack.html">packs</a> - bare, or behind the <a href="field-pack.html">chunk header</a> the <a href="tim-pack.html">TIM-pack reader</a> steps past - and two in the unindexed head gap of <code>PROT.DAT</code> before the first entry (<code>0x018E0</code>, <code>0x11218</code>)</dd>
+    <dt>Parser</dt><dd><code>crates/tim</code> (<code>parse</code>, <code>parse_strict</code>, PNG export, <code>encode</code> PNG-to-TIM); catalogs <code>legaia_disc_audit::tim_catalog</code> / <code>tim_deep_catalog</code> / <code>tim_labels</code></dd>
+    <dt>Confidence</dt><dd>Confirmed - public format; Legaia's upload habits byte-checked against retail VRAM dumps.</dd>
+    <dt>Used by</dt><dd><a href="../subsystems/renderer.html">Renderer</a>, <a href="../viewer.html">Asset viewer</a>, <a href="../tooling/rom-patcher.html">ROM patcher</a></dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="overview">
+  <h2>What a TIM is</h2>
+  <p>The PSX has 1&nbsp;MB of video memory (VRAM), one 1024&times;512 grid of 16-bit pixels. A TIM is a &ldquo;VRAM-ready&rdquo; image: a rectangle of pixel data plus the VRAM coordinates it uploads to. Most textures are palettised - 4-bit (16 colours) or 8-bit (256 colours) indices - and the palette, the <strong>CLUT</strong> (colour look-up table), is itself just another small rectangle of VRAM pixels, usually one row of 16 or 256 entries.</p>
+
+  <h3 id="tim-header">File header</h3>
+  <div class="byte-map">
+    <div class="bm-cell bm-accent" style="--w:4"><span class="bm-off">+0x00</span><span class="bm-name">id = 0x10</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell" style="--w:4"><span class="bm-off">+0x04</span><span class="bm-name">flags</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell bm-dim" style="--w:8"><span class="bm-off">+0x08</span><span class="bm-name">CLUT block (if flags bit 3)</span><span class="bm-size">12 + w&middot;h&middot;2</span></div>
+    <div class="bm-cell" style="--w:10"><span class="bm-off">after CLUT</span><span class="bm-name">image block</span><span class="bm-size">12 + pixels</span></div>
+  </div>
+  <p><code>flags</code> bits 0..2 are the pixel mode (0 = 4bpp, 1 = 8bpp, 2 = 16bpp, 3 = 24bpp), bit 3 says a CLUT block follows, and bits 4+ are zero on a real TIM.</p>
+  <h3 id="tim-block">Block header (CLUT and image alike)</h3>
+  <div class="byte-map">
+    <div class="bm-cell bm-accent" style="--w:4"><span class="bm-off">+0x00</span><span class="bm-name">size</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell" style="--w:2"><span class="bm-off">+0x04</span><span class="bm-name">dx</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell" style="--w:2"><span class="bm-off">+0x06</span><span class="bm-name">dy</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell" style="--w:2"><span class="bm-off">+0x08</span><span class="bm-name">w</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell" style="--w:2"><span class="bm-off">+0x0A</span><span class="bm-name">h</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell bm-dim" style="--w:8"><span class="bm-off">+0x0C</span><span class="bm-name">data</span><span class="bm-size">w&middot;h halfwords</span></div>
+  </div>
+  <p><code>(dx, dy)</code> is the VRAM position the rectangle uploads to; <code>size = 12 + w*h*2</code>. <code>w</code> counts 16-bit VRAM halfwords, not texels - a 4bpp image 256 texels wide has <code>w = 64</code>. A CLUT block with <code>h &gt; 1</code> holds several palette rows.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 720 340" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="tim-fig-title">
+      <title id="tim-fig-title">A TIM's two blocks upload to two rectangles of the 1024 by 512 VRAM grid: the image block to a tall rectangle at (960, 256), the CLUT block to a strip of 256 colours on row 510. A primitive then names a 16-colour slice of that strip.</title>
+      <defs><marker id="tim-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <text class="dg-edge-label" x="110" y="30" text-anchor="middle">one TIM file</text>
+      <rect class="dg-node" x="20" y="44" width="180" height="40" rx="5"/>
+      <text class="dg-label" x="110" y="61">header</text>
+      <text class="dg-sub" x="110" y="76">id 0x10, flags</text>
+      <rect class="dg-node-accent" x="20" y="96" width="180" height="54" rx="5"/>
+      <text class="dg-label" x="110" y="119">CLUT block</text>
+      <text class="dg-sub" x="110" y="137">dx, dy, w, h + colours</text>
+      <rect class="dg-node" x="20" y="162" width="180" height="54" rx="5"/>
+      <text class="dg-label" x="110" y="185">image block</text>
+      <text class="dg-sub" x="110" y="203">dx, dy, w, h + indices</text>
+
+      <text class="dg-edge-label" x="470" y="30" text-anchor="middle">VRAM: 1024 x 512 cells, 16 bits each</text>
+      <rect class="dg-group" x="250" y="44" width="440" height="220"/>
+      <text class="dg-edge-label" x="256" y="58">(0, 0)</text>
+      <rect class="dg-node" x="662.5" y="154" width="27.5" height="110"/>
+      <text class="dg-edge-label" x="652" y="176" text-anchor="end">image at (960, 256)</text>
+      <text class="dg-edge-label" x="652" y="208" text-anchor="end">64 x 256 cells = 256 x 256 texels</text>
+      <path class="dg-edge" d="M200 189 H660" marker-end="url(#tim-arrow)"/>
+      <rect class="dg-node-accent" x="250" y="261" width="110" height="4"/>
+      <path class="dg-edge" d="M200 123 H226 V246 H262 V259" marker-end="url(#tim-arrow)"/>
+      <text class="dg-edge-label" x="272" y="250">CLUT on row 510: 256 colours</text>
+
+      <path class="dg-edge-dim" d="M277.5 266 L360 292 M284.4 266 L387.5 292"/>
+      <rect class="dg-node" x="250" y="292" width="110" height="22"/>
+      <text class="dg-sub" x="305" y="307">0..63</text>
+      <rect class="dg-node-accent" x="360" y="292" width="27.5" height="22"/>
+      <rect class="dg-node" x="387.5" y="292" width="302.5" height="22"/>
+      <text class="dg-sub" x="539" y="307">80..255</text>
+      <text class="dg-edge-label" x="250" y="332">row 510 zoomed: palette selector (64, 510) reads colours 64..79</text>
+    </svg>
+    <figcaption>The shared interior page as an example (image block at <code>(960, 256)</code>, palette strip on row 510). The image holds only 4-bit indices; a texel gets its colour at draw time, from whichever 16-cell slice of VRAM the primitive names. The file's own CLUT is just the pixels that happened to be uploaded there - see <a href="#exported-palette">why an exported palette can look wrong</a>.</figcaption>
+  </figure>
+  <p>Every TIM in the streaming files is 4bpp with a CLUT. Most sit inside <code>PROT.DAT</code> entries behind <a href="lzs.html">LZS compression</a>; two UI sheets sit in the unindexed gap before the first entry, where no per-entry walker reaches them.</p>
+</section>
+
+<section class="doc-section" id="multi-row-clut">
+  <h2>One image, many palettes</h2>
+  <p>A 4bpp CLUT block may hold several 16-entry rows, so one sheet of indexed shapes is recoloured per use by picking a row. Legaia's system-UI sheets work this way.</p>
+  <table>
+    <thead><tr><th>Sheet</th><th>Where</th><th>Rows</th></tr></thead>
+    <tbody>
+      <tr><td>System-UI sprite sheet (4bpp, 256&times;192, 16&times;16 CLUT)</td><td><code>PROT.DAT[0x018E0]</code>, head gap; constants <code>legaia_ui_formats::title_pak::OVERLAY_SYSTEM_UI_TIM_*</code></td><td>Row 2 = load-screen panel chrome; row 7 = pointing-finger cursor; others = HP/MP/money panels, battle chrome, equipment frames</td></tr>
+      <tr><td>Menu-glyph / interior atlas (4bpp, 256&times;256, multi-row CLUT)</td><td><code>PROT.DAT[0x11218]</code>, head gap; <code>legaia_ui_formats::menu_glyph_atlas</code></td><td>Rows render NEW GAME / CONTINUE / OPTIONS and smaller menu labels; also the shared interior page (below)</td></tr>
+    </tbody>
+  </table>
+  <div class="cli"><code>asset-viewer tim extracted/PROT.DAT --offset 0x018E0 --clut 2</code></div>
+  <p class="hint">Any row 0..15 works; row 2 shows the panel chrome, row 7 the cursor.</p>
+</section>
+
+<section class="doc-section" id="flat-strip-cluts">
+  <h2>Flat-strip CLUT uploads: when the header lies</h2>
+  <p>This is the trap that makes textures &ldquo;disappear&rdquo; in a straightforward renderer. Two TIM families declare a multi-row CLUT rectangle that would run off the bottom of VRAM. The game does not upload that rectangle - it uploads the palette as one flat horizontal strip of <code>w &times; h</code> entries at the block's origin.</p>
+  <table>
+    <thead><tr><th>Family</th><th>Declared</th><th>Uploaded as</th><th>Uploader</th></tr></thead>
+    <tbody>
+      <tr><td>Field-character atlas palettes (PROT 0874 &sect;2, entries 1..3)</td><td>multi-row block</td><td>one strip on row 478</td><td><code>legaia_actor_formats::field_char_textures::upload_to_vram</code></td></tr>
+      <tr><td>Shared interior page (256&times;256 4bpp, image at <code>(960, 256)</code>)</td><td>16&times;16 block at <code>(0, 510)</code></td><td>256-entry strip on row 510</td><td><code>legaia_ui_formats::interior_page</code></td></tr>
+    </tbody>
+  </table>
+  <p>Town meshes address cells mid-strip (town01 uses <code>(64, 510)</code> = strip entry 64) with texture pages inside the <code>(960, 256)</code> image. A renderer that honours the declared rectangle clips the rows past <code>y = 512</code>, leaves the strip empty, and the meshes sampling it render black or drop - even though every byte is on the disc. Row 510 in every captured field save is byte-identical to the strip upload.</p>
+</section>
+
+<section class="doc-section" id="catalog">
+  <h2>Cataloging every TIM on the disc</h2>
+  <p>Scanning <code>PROT.DAT</code> as one flat stream (rather than per entry) catches every raw TIM whichever addressing layer hosts it, including the head-gap sheets. Two tiers, one label table:</p>
+  <table>
+    <thead><tr><th>Tier</th><th>Module</th><th>Finds</th><th>Command</th></tr></thead>
+    <tbody>
+      <tr><td>Flat</td><td><code>legaia_disc_audit::tim_catalog</code></td><td>Raw TIMs, mapped back to owning entry + offset (or the gap); item-for-item identical to an independent reference decoder</td><td><code>asset tim-catalog extracted/PROT.DAT --out catalog.tsv</code></td></tr>
+      <tr><td>Deep</td><td><code>legaia_disc_audit::tim_deep_catalog</code></td><td>TIMs inside LZS-compressed sections (most character and scene textures), keyed by <code>(entry, section, offset)</code></td><td><code>asset tim-deep-catalog extracted/PROT.DAT --out deep.tsv</code></td></tr>
+      <tr><td>Labels</td><td><code>legaia_disc_audit::tim_labels</code></td><td>Content-fingerprint (FNV-1a-64) keyed names - a coarse category or a pinned role - shared by both tiers and shown in the viewer</td><td><code>--rollup</code> on either command for count + digest</td></tr>
+    </tbody>
+  </table>
+  <p>Both tiers admit a hit only through <code>parse_strict</code>: no reserved flag bits, pixel mode 0..3, block sizes exactly <code>12 + w*h*2</code>, non-zero dimensions, image rectangle inside VRAM. The CLUT rectangle is deliberately <em>not</em> bounds-checked - the <a href="npc-palette.html">row-479 palette band</a> parks legitimate blocks at rows 510..511 with heights up to 16. The deep tier additionally requires the decoded bytes to render to RGBA, because <a href="lzs.html">LZS decompresses anything without error</a>. The <a href="../viewer.html#tim-catalog">asset viewer</a> builds both catalogs live from a user-supplied disc.</p>
+  <details class="disclosure">
+    <summary>Details: how labels are assigned</summary>
+    <div class="disclosure-body">
+      <p>A label is either a coarse visual category from reviewing decoded thumbnails (<code>environment</code>, <code>terrain</code>, <code>foliage</code>, <code>character</code>, <code>ui-text</code>, <code>effect</code>, <code>other</code>) or a precise role for a texture whose loader site is pinned (menu-glyph atlas, main-title sprite sheet, the four <code>init.pak</code> publisher / warning logos, the load-screen UI sheet, party portraits, empty-slot frame). <code>asset tim-render-distinct</code> decodes each distinct fingerprint to a local PNG and <code>scripts/asset-investigation/montage_tims.py</code> lays them into contact sheets; the PNGs stay local, only the fingerprint-to-label table is committed. The flat tier has an external reference decoder as its oracle; the deep tier has none.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="encoding">
+  <h2>Encoding: PNG to TIM (texture replacement)</h2>
+  <p>A replacement texture only works if it is the <em>same size</em> as the original, so it drops into the same slot on the disc. <code>legaia_tim::encode</code> copies the original's structure verbatim - pixel mode, block dimensions, every VRAM placement field - and takes pixels from caller-supplied RGBA. It backs <code>legaia-patcher tim-replace</code> and the <a href="../tooling/rom-patcher.html">ROM patcher</a>'s texture panel.</p>
+  <h3 id="alpha-stp">Alpha to STP mapping</h3>
+  <p>PSX texels carry a 1-bit semi-transparency flag (STP), not an alpha channel:</p>
+  <table class="layout">
+    <thead><tr><th>Alpha</th><th>Encoded texel</th></tr></thead>
+    <tbody>
+      <tr><td><code>0</code></td><td><code>0x0000</code> - transparent (the GPU skips it)</td></tr>
+      <tr><td><code>1..=254</code></td><td>STP set + RGB truncated to 5 bits per channel</td></tr>
+      <tr><td><code>255</code></td><td>STP clear + RGB truncated - except opaque pure black, which becomes <code>0x8000</code> (plain <code>0x0000</code> would read back transparent)</td></tr>
+    </tbody>
+  </table>
+  <h3 id="original-colour-reuse">Palette fitting</h3>
+  <ul class="bullets">
+    <li>A pixel whose position held the same colour keeps its original index verbatim; other matches reuse the first palette entry that decodes to the colour. Untouched regions keep their STP choices, so <code>encode(decode(tim))</code> reproduces the original byte-for-byte across the whole raw catalog.</li>
+    <li>Indexed modes must fit 16 / 256 distinct 15-bit colours. New colours overwrite slots the new image no longer references; overflow is a hard error listing the offending pixels, or, behind an explicit quantize opt-in, the least-frequent extras fold to their nearest palette colour.</li>
+    <li>Only the palette the image was drawn through is rewritten; every other palette of a multi-palette CLUT stays byte-identical, because the game picks a palette per sprite and copying one over the rest would recolour every region drawn through them. Editing several palettes at once goes through the <a href="../tooling/randomizer.html#multi-palette-textures">multi-palette downloads</a>.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="exported-palette">
+  <h2>Why an exported palette can look wrong</h2>
+  <p>A TIM export decodes the image through one of the file's own CLUT rows. That matches the screen only when three things hold, and on Legaia they often don't:</p>
+  <ul class="bullets">
+    <li><strong>Each palette recolours the whole image.</strong> A multi-palette sheet is one grid of indices that each sprite reads through its own palette, so any single palette shows most of the sheet in colours it is never drawn with.</li>
+    <li><strong>The draw names a VRAM cell, not a file.</strong> A sprite can take a palette another TIM uploaded (the system-UI sheet's status badges use the CLUT-only TIM at <code>PROT.DAT[0x1858]</code>), and a later upload can overwrite a TIM's own palette before anything draws it (the battle font's <code>(0, 510)</code> strip is covered by the menu-glyph atlas at boot).</li>
+    <li><strong>The screen multiplies the texel.</strong> The primitive's colour word (<code>texel * colour / 128</code>) and the depth cue sit on top of the palette.</li>
+  </ul>
+  <p><code>legaia_ui_formats::tim_palette_context</code> resolves the first two from the disc - boot-time CLUT state, a per-rectangle palette map of the system-UI page, and an &ldquo;as drawn&rdquo; composite - and the viewer and ROM patcher read it. The whole colour chain is on <a href="../subsystems/shading.html">shading</a>.</p>
+</section>
+
+<section class="doc-section" id="vram-emulation-in-the-engine-port">
+  <h2>In the port</h2>
+  <p><code>crates/tim</code> parses and encodes; <code>crates/engine-render</code> keeps a 1024&times;512 R16Uint VRAM page so the per-primitive palette and texture-page selectors (CBA / TSB) and 4/8/15bpp CLUT decoding run in a fragment shader, with every sibling TIM uploaded so multi-page meshes bind the right CLUT.</p>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <details class="disclosure"><summary>Evidence behind each claim</summary>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Claim</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td>Head-gap sheets at <code>0x018E0</code> / <code>0x11218</code>, row usage</td><td>Retail VRAM dumps byte-matched; the 32-byte panel CLUT signature occurs once on the disc - <a href="../subsystems/save-screen.html#sprite-sources">save screen, sprite sources</a></td></tr>
+      <tr><td>Flat-strip upload on rows 478 / 510</td><td>VRAM row 510 byte-identical across every captured field save; town01 env CBA <code>(64, 510)</code> resolves only under the strip reading</td></tr>
+      <tr><td>Flat catalog completeness</td><td>Item-for-item match with an independent reference decoder (offsets, dimensions, bit depths, palette counts)</td></tr>
+      <tr><td>Encoder round trip</td><td><code>encode(decode(tim))</code> is byte-identical for every raw-catalog TIM</td></tr>
+    </tbody>
+  </table></div>
+  </details>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../subsystems/shading.html">Shading and palettes</a>
+    <a href="tmd.html">Legaia TMD</a>
+    <a href="tim-pack.html">TIM-pack</a>
+    <a href="npc-palette.html">NPC palettes</a>
+    <a href="field-pack.html">Field-pack bundles</a>
+    <a href="../subsystems/renderer.html">Renderer</a>
+    <a href="../subsystems/save-screen.html">Save screen (sprite sources)</a>
+  </div>
+  <div class="see-also">
+    <span class="see-also-label">Demo / tooling</span>
+    <a href="../viewer.html">Asset viewer (TIM catalog)</a>
+    <a href="../tooling/rom-patcher.html">ROM patcher (texture replacement)</a>
+    <a href="../tooling/randomizer.html">Randomizer / disc patcher</a>
+    <a href="../tooling/extraction.html">Extraction pipeline</a>
+  </div>
+</section>

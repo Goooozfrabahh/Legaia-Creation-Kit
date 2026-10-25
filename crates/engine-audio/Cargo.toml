@@ -1,0 +1,73 @@
+[package]
+name = "legaia-engine-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# tests/integration.rs gathers every tests/*.rs into one binary.
+autotests = false
+
+[lib]
+name = "legaia_engine_audio"
+path = "src/lib.rs"
+
+[features]
+default = ["cli"]
+# The command-line binary and its argument parser. On by default so
+# `cargo build` still builds every binary; library dependents take this
+# crate through [workspace.dependencies] with default features off, which
+# keeps clap out of library-only builds (the wasm bundle among them).
+cli = ["dep:clap"]
+# Activates the WebAudio backend for wasm32 targets. Enables a
+# `WebAudioOut` struct (ScriptProcessorNode-based) that mirrors the
+# `AudioOut` cpal API. Must be initialised from a user-gesture handler.
+audio-webaudio = []
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+legaia-xa.workspace = true
+legaia-vab.workspace = true
+legaia-seq.workspace = true
+legaia-prot.workspace = true
+clap = { workspace = true, optional = true }
+
+# The native output stream (`AudioOut`). The browser host plays through
+# `WebAudioOut` instead, so wasm32 builds never link cpal.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+cpal.workspace = true
+
+# WebAudio deps - pulled in on all wasm32 builds; only wired up when
+# audio-webaudio feature is enabled (gates the webaudio module).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen.workspace = true
+js-sys.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+workspace = true
+features = [
+    "AudioContext",
+    "ScriptProcessorNode",
+    "AudioProcessingEvent",
+    "AudioBuffer",
+    "AudioNode",
+    "AudioDestinationNode",
+    "AudioParam",
+    "GainNode",
+]
+
+[[bin]]
+name = "note-trace"
+path = "src/bin/note-trace.rs"
+required-features = ["cli"]
+
+[dev-dependencies]
+legaia-prot.workspace = true
+# Disc-gated session ladder only: the SFX descriptor table (`DAT_8006F198`)
+# and its cue -> VAB-slot routing live in `legaia-game-tables`, and the ladder
+# drives the same decode the hosts do. That crate sits below every engine
+# crate, so this dev-only edge is acyclic.
+legaia-game-tables.workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

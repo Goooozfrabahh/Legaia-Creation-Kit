@@ -1,0 +1,667 @@
+# Key functions: PSX runtime + standard libraries
+
+Part of the [key function directory](../functions.md) - the conventions for reading these tables (bare hex = function entry, `0x`-prefixed = data / instruction, overlay-VA caveats) are on the [index page](../functions.md#how-to-use-this-page).
+
+**A row here can be right about the address while the dump file named for it is
+wrong about the body.** The overlay routines this page cites from the field
+overlay - `FUN_801CFC40` (the actor-collision box probe) and `FUN_801D5780`
+(the arc-hop spawner) - are both genuine entries in PROT 0897 read at its own
+base `0x801CE818`. The bare-named corpus files `801cfc40.txt` and
+`801d5780.txt` were taken from differently-based programs and open at
+`0x801CF88C` and `0x801D56FC`, neither of which begins a function in 0897 at
+all. Read those two from `overlay_0897_<addr>.txt`, and see
+[dump-corpus-integrity.md](../../tooling/dump-corpus-integrity.md) for why a
+filename is not evidence about its contents.
+
+## PSX runtime / standard libraries
+
+Statically-linked PsyQ glue. Trivial to stub in a from-scratch port.
+
+| Address | Role |
+|---|---|
+| `80056678` | `EnterCriticalSection` - `syscall(0)` with `$a0=1`. |
+| `80056688` | `ExitCriticalSection` - `syscall(0)` with `$a0=2`. |
+| `80056738` / `80056748` / `80056758` / `80056768` / `80057014` / `8005ACE8` / `8005ACD8` / `8005BBE8` / `8005FD68` / `8005FD78` | `jr 0xA0/0xB0/0xC0` - PSX BIOS table dispatchers (libapi). Identified targets: `80056728` = `strcat` (A0 0x15); `80056738` = `strcmp` (A0 0x17); `80056748` = `strncmp` (A0 0x18); `80056758` = `strcpy` (A0 0x19, `li t2,0xA0; jr t2; li t1,0x19`) - the name-copy thunk used by `FUN_800560B4` (party-name seed) and `FUN_8001D7F8` (scene-name sync); `80056768` = `strlen` (A0 0x1B); `80057014` = A0 `0x2E` = `memchr` (**not** `rand` - `rand` is A0 `0x2F`, the veneer at `80056798`); `8005ACD8` = `GPU_cw` (A0 0x49); `8005BBE8` = `FlushCache` (A0 0x44); `8005FD68` = B0 0x5B (card init); `8005FD78` = `ChangeClearRCnt` (C0 0x0A). |
+| `80056658` | `TestEvent` BIOS thunk - `jr 0xB0` with `t1=0x0B`. Polls a kernel event handle. |
+| `80056798` | **BIOS `rand`** - `li t2,0xA0; jr t2; li t1,0x2F`, the `A(2Fh)` vector. Returns `(seed >> 16) & 0x7FFF`, the **high** half of the kernel LCG, which is why callers may test its low bits (`rand & 0xF`, `& 7`, `& 0x7F`). A port that hands those tests a raw 32-bit LCG state gets a low nibble of period 16; the fog spawner did. `SCUS_942.54` has no `A(30h)` (`srand`) thunk, so every caller shares one kernel stream; the port's `World::next_rand` is that stream through `bios_rand_shape`, drawn by the field side, while the battle-side ports still draw the raw state. About sixteen hundred `jal` sites in the dump corpus. |
+| `8006B844` | `WaitEvent` BIOS thunk - `jr 0xB0` with `t1=0x0A`. Blocks on a kernel event handle. |
+| `80056698` / `800566A8` / `800566B8` / `800566C8` / `800566D8` / `800566E8` / `800566F8` / `80056708` / `80056718` | BIOS B-vector thunks, `li t2,0xB0; jr t2; li t1,N`. Each sets its own routine number in the delay slot: B `0x32`..`0x36` (`open` / `lseek` / `read` / `write` / `close`), `0x41` (`firstfile`), `0x42` (`nextfile`), `0x43` (`rename`), `0x45` (`erase`), in address order. Same pattern at `8006EE14` / `8006EE24` / `8006EE34` (B0-vector cluster cited from menu/text helpers). |
+| `8006D7A4` | BIOS C0 thunk - `li t2,0xC0; jr t2; li t1,0x3`. Dispatches to C0 vector 0x03 (`ChangeThreadSubFunction`). Called from `FUN_8006D2AC` (audio subsystem init). |
+| `8006EF18` (caller) + `8006EF68` / `8006F088` / `8006F118` (trio) | **Card teardown + BIOS kernel un-patch**, not an SPU init - [details below](#the-bios-kernel-patch-cluster-8006ee8c--8006ef18). |
+| `8006EE8C` / `8006EEE0` / `8006EFD0` | The install half of the same cluster - [details below](#the-bios-kernel-patch-cluster-8006ee8c--8006ef18). |
+| `800567A8` | BIOS `printf`, A0 `0x3F` (`li t2,0xA0; jr t2; li t1,0x3F`). Output goes to the BIOS TTY, which a retail console does not display. Called by 95 `jal` sites in SCUS and 117 in the overlays (none in the battle image 0898), and also reached through the libgpu print hook at `0x80078D50`, which holds this address. No call site reads the return value. |
+| `800567B8` | `sprintf` (handles `%d %x %o %s %f`); the destination buffer is the caller's `a0`. Body spans `0x800567B8..0x8005700F`, so the `0x80056B18` this row used to list beside it is **interior** to it, not a second entry - the dump named `80056b18.txt` holds this same routine from its real start. |
+| `80057024` | `memmove` - overlap-safe direction-aware copy. |
+| `8005ACAC` | `memset`. |
+| `8005E540` | `memcpy` - forward-only byte copy. |
+| `8005FF04` | `irq_mask_swap16` - atomic-swap on `_DAT_8007A868` (16-bit IRQ mask). `FUN_8005A78C` calls it twice to bracket the `ResetGraph` register pokes. |
+| `8005FCCC` | VSync wait spin (frame-budget gated). |
+| `80060A04` | `BREAK 0x105` - debug trap. |
+| `800608E0` / `8006xxxx` | libapi `fopen` / `fseek` / `fread` / `fclose` cluster. |
+| `8005FD88` | libapi device-vtable trampoline (slot `+0xC` of `PTR_PTR_8007A860`). |
+| `8005FE18` / `8005FE7C` / `8005FEAC` | libapi device-vtable trampolines - call slot `+0x14` (`(4, a0)`) / `+0x10` / `+0x18` of `*0x800857A0`; siblings of the `+0xC` trampoline `FUN_8005FD88`. |
+| `80056638` / `80056668` / `80056778` / `80056618` | More `li t2,vec; jr t2; li t1,routine` BIOS-vector thunks with identified targets: `80056638` = `OpenEvent` (B0 0x08), `80056668` = `EnableEvent` (B0 0x0C), `80056778` = `bzero` (A0 0x28), `80056618` = A0 0x70. The audio-init `FUN_8001D230` opens then enables its 8 SPU/DMA events through the first two. |
+| `8005F994` | `memcpy` (word-granular) - copies `a2` words `a1` -> `a0`. |
+| `80056608` / `80056628` | Two more `li t2,0xA0; jr t2; li t1,N` BIOS A-vector veneers in the same bank as the identified thunks above: `80056608` = A0 `0x51`, `80056628` = A0 `0x71`. Sandwiched between them is `80056618` = A0 `0x70`, already listed. The bank is one veneer per distinct routine number, emitted by the linker. `see ghidra/scripts/funcs/80056608.txt`, `80056628.txt`. |
+| `8002B584` | `free` - the standard 12-byte-header free-list insert with forward and backward coalescing. Block header is `[next, prev, size]`; the list head is gp-relative at `gp+0x840`; a block is merged when `block + size + 0xC` equals its neighbour's stored `next`. No branch in it touches game state. `see ghidra/scripts/funcs/8002b584.txt`. |
+| `80058170` | libgpu debug rectangle validator. Reads the library debug-level byte `_DAT_80078D56`; at level 1 it bounds-checks the four `RECT` halfwords at `a1+0x0/2/4/6` against the framebuffer limits `_DAT_80078D58` / `_DAT_80078D5A` and rejects non-positive extents, at level 2 it reports unconditionally, and either way it reports through the installed printf hook `*_DAT_80078D50` with a caller-name argument. Pure diagnostics - the retail path leaves the level byte at 0 and the whole body falls through. `see ghidra/scripts/funcs/80058170.txt`. |
+| `8005860C` | Sibling of the validator above on the primitive-submission path: same `_DAT_80078D56` debug gate and `*_DAT_80078D50` hook, then dispatch through slot `+0x2C` of the GPU module function table `*_DAT_80078D4C`, then a 24-bit-masked pointer store into the primitive's first word - the OT/tag link every libgpu submit ends with. `see ghidra/scripts/funcs/8005860c.txt`. |
+| `8005F9C8` | Raw DMA-channel start - spins for the channel idle, enables it in DPCR, programs MADR/BCR/CHCR at `0x1F801080 + chan*0x10` and the DICR bit; the low-level transfer kick under libgpu/libspu. `see ghidra/scripts/funcs/8005f9c8.txt`. |
+| `8002035C` | Kernel-event teardown - closes the 8 event handles at `gp+0x6D8..0x6F8` (via the `CloseEvent`-class thunk `FUN_80056648`) inside a critical section, then runs the card-teardown / un-patch trio `FUN_8006EF18`. Inverse of the audio-event setup `FUN_8001D230`. `see ghidra/scripts/funcs/8002035c.txt`. |
+| `80026C28` | **The PS-X EXE entry stub** - the address the header's `pc0` field carries, so this is `crt0` and nothing calls it. Word-zeroes `0x8007B6C0..0x801CE818`, loads `sp` from the table at `0x80026CD4` OR'd with `0x80000000`, sets `gp = 0x8007B318`, calls `InitHeap` (`FUN_800565F8`) over the region from `0x801CE81C` up toward the stack, then calls `main` (`FUN_80015E90`) and traps on `break 0, 1` if it ever returns. [Details below](#the-entry-stub-80026c28). `see ghidra/scripts/funcs/80026c28.txt`. |
+| `800565F8` | `InitHeap` BIOS A-vector veneer (`li t2,0xA0; jr t2; li t1,0x39`). Its one caller is the entry stub above. `see ghidra/scripts/funcs/800565f8.txt`. |
+| `8002A880` | Heap bucket drain with coalescing. For bucket index `a0` (bounds-checked against the count at `heap[+0x4]`) it walks the 12-byte-header list at `heap[0] - a0*12` and, per block, unlinks it from its bucket, re-inserts it into the address-ordered free list at `heap[0][+0xC]`, and merges it with whichever neighbour begins at `block + size + 0xC` in either direction. Same `[next, prev, size]` header and same `gp+0x840` descriptor as the allocator `FUN_8002B468` and the free `FUN_8002B584`. `see ghidra/scripts/funcs/8002a880.txt`. |
+| `8002B6C4` | Heap dump diagnostic - three dev-string prints through the on-screen formatter `FUN_8001A068` (headers at `0x80010BE0` / `0x80010C00`, per-block row at `0x80010BEC`) reporting `[start, end-1, size]` for every block on the `gp+0x840` heap's bucket chain (`+0xC`) and then on its address-ordered chain (`+0x0`). Reads the same headers as the three routines above and writes nothing. `see ghidra/scripts/funcs/8002b6c4.txt`. |
+| `80025344` | Actor-flag clear leaf - five instructions clearing bit `0x2` of the actor flags word at `actor[+0x10]`. Called from the actor-template tick `FUN_80025054`. `see ghidra/scripts/funcs/80025344.txt`. |
+| `8005B4B8` | `TransMatrix` - copies a caller-supplied `VECTOR`'s three **32-bit** words into `matrix+0x14/+0x18/+0x1C`, the `long t[3]` tail `FUN_8005B6A8` later uploads as `TR`. It is the step that puts the field camera's live eye trio into the view matrix unscaled and unnarrowed, which is why the trio is in GTE units rather than in the base matrix's units. |
+
+### The entry stub (`80026C28`)
+
+The `PS-X EXE` header's `pc0` field is literally `0x80026C28`, so this body is
+the program's first instruction and has no caller anywhere. Reading it settles
+two things the rest of the docs depend on.
+
+- **`gp` is set here**, by `lui gp, 0x8008; addiu gp, gp, -0x4CE8` = `0x8007B318`.
+  The header's own `gp0` field is `0`, so the stub is the only place the value
+  comes from. Any sweep that wants to see gp-relative accesses has to resolve it
+  from here first - see [`ghidra.md`](../../tooling/ghidra.md#decompiler-artifacts-that-have-produced-false-claims).
+- **The BSS clear is the stub's, not the BIOS's.** The header carries
+  `b_size = 0`, so the loader zeroes nothing; the stub word-zeroes
+  `0x8007B6C0..0x801CE818` itself before anything else runs. Both statements are
+  true at once, and only the second one licenses assuming a global in that range
+  starts at zero.
+
+The remainder is ordinary `crt0`: `sp = 0x00200000 | 0x80000000` = `0x80200000`,
+read from the word at `0x80026CD8` (the table at `0x80026CD4` holds the same
+value in each of its slots); `ra` is parked at `0x8007BB40`; `fp = sp`; and
+`InitHeap` (`FUN_800565F8`, BIOS A0 `0x39`) is handed base `0x801CE81C` - four
+bytes past the end of the clear - with size `sp - *0x8007A8C8 - 0x1CE818`. Then
+`jal FUN_80015E90` - `main` - and a `break 0, 1` that only executes if it
+returns.
+
+### The BIOS kernel-patch cluster (`8006EE8C` / `8006EF18`)
+
+Six functions in one address bank patch **kernel code**, bracketed by
+`EnterCriticalSection` and `FlushCache`. Nothing in them touches an SPU
+register, a voice block or a libspu global; the "SPU voice-state init sequence"
+label the trio used to carry was read off vector numbers alone.
+
+| Address | What the disassembly does |
+|---|---|
+| `8006EF48` / `8006EF58` / `8006EF68` | Bare BIOS stubs (`li t2,0xb0; jr t2; li t1,N`): B0 `0x4A` `InitCARD`, `0x4B` `StartCARD`, `0x4C` `StopCARD`. |
+| `8006EFD0` | B0 `0x56` `GetC0Table`, reads `C0table[6]` (`ExceptionHandler`), rebuilds a kernel address from the `lui`/`ori`-style immediate pair at `+0x70` / `+0x74`, and copies a 5-word block from `0x8006EF78` to that address `+0x28`. The block is `lui/addiu` + `jr` to `0x8006EF8C` - a jump out into SCUS code. |
+| `8006F088` | B0 `0x57` `GetB0Table`, takes `B0table[0x5B]` (the `ChangeClearPAD` entry - an anchor whose *relative* offsets are BIOS-version-stable) and **swaps** 5 words between `+0x9C8` there and the static block at `0x8006F058`. The shipped block is a `jalr` trampoline to `0x8006F058` itself, so after the swap the kernel calls a buffer holding its own displaced instructions, which fall through into a `0xC8`-iteration busy-wait at `0x8006F070` and `jr ra`. A swap is its own inverse, which is why install and teardown both call it. |
+| `8006F118` | B0 `0x56` again, then copies 3 words from `0x8006F180` (zero in the shipped image) over `ExceptionHandler + 0x70..+0x78` - blanking the immediate pair `8006EFD0` reads. |
+
+`FUN_8006EE8C(pad_enable)` is the install veneer (`ChangeClearPAD(0)`,
+`InitCARD`, then `_EFD0` + `_F088`), `FUN_8006EEE0` the `StartCARD` sibling, and
+`FUN_8006EF18` the teardown trio (`StopCARD`, `_F088` swapping the delay back
+out, `_F118` clearing the address pair).
+`see ghidra/scripts/funcs/8006ee8c.txt`, `8006ef18.txt`, `8006efd0.txt`,
+`8006f088.txt`, `8006f118.txt`.
+
+#### The payload blocks are code that is never a function
+
+`0x8006EF78` and `0x8006F058` are the blocks the two patchers copy, and they are
+worth naming separately because of how they read to any instrument that measures
+code by function bodies. Each is real MIPS - it executes, in kernel RAM, after
+the copy - and nothing calls it at its link address, so no function is ever
+created there. The only reference either has in any image is the `lui`/`addiu`
+pair inside its own copier, which is the copier taking the block's **address**,
+not calling it.
+
+That is what kept them out of
+[disc-denominated code coverage](../../tooling/disc-coverage.md) for as long as
+it did: bytes that decode as plausible code and sit inside no dumped function,
+because auto-analysis had them as `undefined4` data words and `createFunction`
+declines an address it cannot first disassemble. Clearing the window and
+disassembling it word by word before creating the function is what closes them;
+each now has a dump of its own (`8006ef78.txt`, `8006ef8c.txt`, `8006f058.txt`,
+`8005bbb8.txt`). The residue is genuinely structural: `0x8006F0F4`, the
+`0x320000`-iteration settle loop the cluster uses, whose body Ghidra keeps but
+whose surrounding alignment does not close.
+
+`0x8006EF8C` is the hook the first trampoline lands on, and the one block of the
+four that is a plain routine rather than a template. It returns immediately when
+`I_MASK` (`v1+0x1074`, with `v1` = `0x1F800000`) bit 7 - the SIO0
+controller-and-memory-card interrupt line - is clear; otherwise it spins while
+`JOY_STAT` (`v1+0x1044`) bit 7 is set and tail-jumps through the resume pointer
+`FUN_8006EFD0` stored at `0x8007BE04`, back into the kernel body just past the
+patched words. A transfer-settle wait wrapped around the BIOS's own handler.
+
+`0x8005BBB8` is the third block of this shape, and the reference sweep's answer
+for it needs reading carefully. It is the stock PSX exception-handler prologue -
+load the ExCB chain head from `0x100`, follow it, save `at`/`v0`/`v1`/`ra` into
+the saved-register area at `+8`, read `CAUSE` via `mfc0`. A five-form sweep
+([address-reference-scan.md](../../tooling/address-reference-scan.md)) finds
+**no word, no `jal`, no `j`, no branch and no `lui` pair** for
+`0x8005BBB8` itself. That is not the same as the block being unused: `InitGeom`
+(`FUN_8005BB48`) copies it over `C0table[6]` on every boot, and its copy loop
+names the extent exactly - `t2` = `0x8005BBB0`, `t1` = `0x8005BBE8`, so the two
+leading `nop`s are payload and the address the sweep can see is `0x8005BBB0`,
+eight bytes below the prologue proper. The block is installed; only its interior
+is unreferenced, which is what an entered-by-exception routine looks like.
+
+#### What is left of the `SCUS_942.54` code gap is not code
+
+With the payload blocks dumped, the executable's byte-denominated
+[code gap](../../tooling/disc-coverage.md) leaves four windows totalling 40
+bytes that fall under the gap classifier's tiny-gap rule (a gap of fewer than
+eight words counts as code without a statistical test), and none of them is an
+un-analysed routine. The classifier recognises both shapes by their bytes and
+reports them as `constant_table` / `psyq_lib_stamp` rather than `code`, which
+is what empties the bytes-derived dump worklist for this image.
+
+These four are what is left of the **code-classified** gap specifically. The
+image's inter-function alignment - 62 gaps, 344 bytes, every word `nop` - is a
+separate matter: it is reported in the shape census as `padding` and is not in
+the code denominator at all, because a zero word decodes to `nop` and would
+otherwise score as perfect code (see
+[`disc-coverage.md`](../../tooling/disc-coverage.md#the-two-shapes-that-exist-because-the-opcode-statistic-is-blind-to-them)).
+Alignment persists however much is dumped, and so do these four windows; the
+difference is that the four ride the tiny-gap fiat into the denominator and the
+alignment does not.
+
+| Window | What the words are |
+|---|---|
+| `0x80026CD4`..`0x80026CE4` | Four identical `0x00200000` words (the 2 MB RAM size) - the `crt0` stack-pointer table [described above](#the-entry-stub-80026c28). The stub reads `0x80026CD8` and ORs in `0x80000000`. Shape `constant_table`. |
+| `0x8005AFA8`, `0x8005DB94`, `0x80060498` | **PSY-Q librarian version stamps**: 8-byte records opening with ASCII `Ps`, then two id bytes (module index + a byte shared per library), then one word shared per library - `50 73 09 0C  DA AE 37 00` at `0x8005AFA8`. Read as instructions, word 0 decodes as a `jal` outside the 2 MB RAM window or a branch past the image and word 1 as an invalid `SPECIAL` encoding, which is how they surfaced as a fake "code" gap. Ten word-aligned instances exist in the image: these three between link modules' function bodies, seven more inside the data segment interleaved with the hardware-register address tables at `0x80078D04`..`0x8007B310`. Shape `psyq_lib_stamp`. |
+
+Nothing closes these by dumping. Creating a function over either shape would
+assert an entry point the bytes do not support, which is the failure the
+`worklist_*` ignore categories exist to prevent.
+
+### libgte primitives
+
+| Address | Role |
+|---|---|
+| `8005B7C0` | `SetRotMatrix`-shaped - `setCopControlWord(2, 0xD800, x)`. |
+| `8005B7CC` | `SetTransMatrix`-shaped - `setCopControlWord(2, 0xE000, x)`. |
+| `8005B6A8` | `SetTransMatrix` proper - loads three words from `matrix+0x14/+0x18/+0x1C` (the `long t[3]` tail of a PsyQ `MATRIX`, past the `short m[3][3]` head) into the GTE translation control registers TRX / TRY / TRZ. Eight instructions, no branches. `see ghidra/scripts/funcs/8005b6a8.txt`. |
+| `8005B7D8` | `SetFarColor` - shifts each of the three colour arguments left by 4 and writes them to the GTE far-colour control registers RFC / GFC / BFC. The `<< 4` is the PsyQ API's own 8-bit → 12-bit-fraction promotion, so a caller passes plain 0..255 components. The overworld ground's far colour is a literal call of it, `SetFarColor(0x100, 0x100, 0x100)` from `FUN_801F69D8` at `0x801F729C`. `see ghidra/scripts/funcs/8005b7d8.txt`. |
+| `8005BA38` | **`RotTransPers`** - the single-vertex perspective transform, and the one-point sibling of `8005BA68` below. Loads `VXY0`/`VZ0` from the argument vector, issues GTE `RTPS` (`cop2 0x0180001`), then stores `SXY2`, `IR0` and the GTE `FLAG` control word (`cfc2 $31`) through the second, third and fourth arguments, returning `SZ3 >> 2` - PsyQ's `otz`. Eleven instructions, complete, closing on `jr ra` with the shift in the delay slot. This row previously read "**Not a function**", on a dump statistic that has since changed under it - see [`re-do-not-re-walk.md` § Measurement readings](../re-do-not-re-walk.md#measurement-readings). `see ghidra/scripts/funcs/8005ba38.txt`. |
+| `8001CF50` | **Per-node camera-relative rotation.** Reached from `FUN_8001ADA4` (`0x8001B3A0`) and `FUN_8001B964` (`0x8001BA24`) only when `node+0x52 & 0x780`, plus once from fishing 0972. Rebuilds the camera rotation from `0x8007B790/92/94`, dropping the axes flagged `0x80` / `0x100` / `0x200`, scales the node matrix x6 and multiplies; bit `0x400` places the node in view space. The camera build itself is `FUN_800172C0` -> `FUN_80026988`. Port `render-kernels::gte::camera_view_rotation`, reached by both hosts' part passes through `camera_relative_model_prefix` (draw records carry `+0x52` as `flags_52`). [details](../../subsystems/renderer.md#camera-relative-nodes-fun_8001cf50) |
+| `800461A4` / `8004629C` / `8004638C` | GTE `RotMatrixX` / `RotMatrixY` / `RotMatrixZ`. `(angle12)`: masks the angle to 12 bits (`4096 = 360°`), indexes the shared sin/cos LUT at `0x80070A2C` (`+0x800` = the quarter-wave cosine offset), and multiplies the current matrix by the per-axis rotation via GTE `mvmva`. Used by the camera build `FUN_8001CF50` and other per-object transforms. |
+| `8005BA1C` | GTE square-root / normalize - `mtc2 0xF000 / mfc2 0xF800`. |
+| `8005BA68` | GTE 3-point transform helper. Loads 3 vertex pairs into COP2 registers, calls `copFunction(2, 0x280030)` (RTPT), reads back SXY0/1/2 and OTZ. Cited from the cutscene/world-map sprite batcher (`FUN_801CFC40`). |
+| `8005BB48` | `InitGeom` - saves return addr to `_DAT_8007BDF0`, `EnterCriticalSection`, copies exception-handler table from `DAT_8005BBB0`, `FlushCache`. |
+| `8005AF0C` | `isqrt`-style normalise - uses `FUN_8005BA1C` (GTE normalize) then dispatches to `FUN_8005ADB8` with shift correction. |
+| `8005ADB8` | Fixed-point bit-rotation / arc helper - consumed by `FUN_8005AF0C`. 85-instr ladder of conditional shifts. |
+
+#### Statically-linked per-op wrappers (`0x8005B158..0x8005BA1C`)
+
+The rest of the libgte link unit is a family of single-COP2-op wrappers. None has
+a static caller in `SCUS_942.54` or a hit in any runtime hot profile - the TMD
+renderer (`FUN_8002735C`) and the cluster-A path (`FUN_80043390`) issue their COP2
+ops inline, so these are link residue carried in by the `.a` member. Catalogued so
+gap sweeps stop re-flagging them; all are dumped under `ghidra/scripts/funcs/<addr>.txt`.
+
+| Address | COP2 cmd | Role |
+|---|---|---|
+| `8005B158` | `MVMVA` ×3 (`0x0486012`, RT·V0) | `MulMatrix0`-shaped 3×3 matrix·matrix multiply: installs m0 into the RT control regs, streams m1's columns through V0, reads each product column from IR1..3 (clobbers RT). |
+| `8005B7B4` | none (`mtc2` LZCS) | LZCS load: three instructions writing the argument to GTE data register 30, which the hardware answers on LZCR (register 31). The seed half of the `8005BA1C` / `8005B0B8` count-leading-zeros pair; `8005B0B8` inlines its own `mtc2` rather than calling this. |
+| `8005B6F8` | none | Vertex staging: loads V0/V1/V2 from three packed-SVECTOR pointers (`lwc2` data regs 0..5) - the load half of an RTPT sequence. |
+| `8005B760` | none | SZ-FIFO staging: `mtc2` SZ0..SZ3 from the four args - the load half of an AVSZ4 sequence. |
+| `8005B828` | `MVMVA` (`0x04DA412`, LCM·IR+BK, lm=1) | Colour-matrix transform: vec3 from `a0` through the light-colour matrix + background colour, result to `a1` - the lighting second stage as a standalone op. |
+| `8005B850` | `DCPL` (`0x0680029`) | `DpqColorLight`-shaped: IR vec + RGB-in + IR0 depth factor → depth-cued lit RGB2 out. |
+| `8005B878` | `DPCT` (`0x0F8002A`) | `DpqColor3`-shaped: RGB0..2 + IR0 → three depth-cued colours. |
+| `8005B8B4` | `INTPL` (`0x0980011`) | `Intpl`-shaped far-colour interpolate: IR vec + IR0 → RGB2. |
+| `8005B8D8` / `8005B900` | `SQR` sf=1 / sf=0 | `Square12` / `Square0`: component-wise square of IR1..3 into MAC1..3. |
+| `8005B928` / `8005B948` | `AVSZ3` / `AVSZ4` | `AverageZ3` / `AverageZ4`: SZ values in via `mtc2`, averaged OTZ returned. |
+| `8005B96C` / `8005B9C4` | `OP` sf=1 / sf=0 | `OuterProduct12` / `OuterProduct0`: saves the RT control regs, installs the operand vector as the D1/D2/D3 diagonal, cross-products against IR, restores RT. |
+| `8003D300` / `8003D320` | `AVSZ3` / `AVSZ4` | Second link copy of the AVSZ pair in the billboard/OT module band (`0x8003Dxxx`); the `8003D320` AVSZ4 variant additionally takes the `ZSF4` scale factor as a fifth argument (`ctc2` cr30). |
+| `8003D368` | `RTPS` (`0x0180001`) | Single-vertex projector: `(vec3*, sxy_out*) -> IR3`. Loads V0, projects, stores packed SXY2, returns the depth. The projector the dev line emitters (`FUN_8001CE34`) call. |
+| `8003D388` | `RTPT` (`0x0280030`) | `RotTransPers3`-shaped triangle projector: three SVECTOR pointers in, three packed-SXY out-pointers, returns IR3 (last vertex depth). Ghidra's auto-analysis splits this entry as `8003d388`/`8003d38c`; the body is one function at `0x8003D388`. |
+| `8003D1A4` / `8003D20C` | none (`ctc2` / `cfc2` cr0..cr7) | **GTE control-word save / restore pair.** `8003D20C` reads control registers 0..7 - the rotation matrix plus the translation vector `TR` - into a 32-byte block at `a0`; `8003D1A4` writes the same eight words back. Every routine that installs its own matrix brackets itself with the pair, which is why a scratchpad block address next to one of them is a saved GTE state rather than a transform. |
+| `8003D1EC` | none (`ctc2` cr5..cr7) | Loads the translation vector `TR` alone, from three words at `a0`. The `TR`-only half of the pair above. |
+| `8003D254` | none (`ctc2` cr26) | Sets the GTE projection distance `H`: `ctc2 a0,0xd000`, then `jr ra` - three instructions, no frame. The camera snap and the world-map top view both commit `_DAT_8007B6F4` through it. |
+| `80046190` | none | Far-colour read-back: `cfc2` cr21 (RFC) returned. Sits just before the `RotMatrixX` trio. |
+| `8003FABC` | none | Not a standalone primitive: the out-of-line tail of the `FUN_8003F86C` fog-sheet emitter module - restores `s0..s7` from the scratchpad save slots (`0x1F800000..0x1C`, the same convention `FUN_8003F86C`'s prologue writes), installs a `diag(0x6000)` RT and stages a vector into data regs 5..7. Reached only from the hand-scheduled emitter code. |
+
+### libapi interrupt-callback core (`0x8005FF20..0x800608E0`)
+
+The tier under every `InterruptCallback` / `DMACallback` registration in the
+binary. Its state block starts at `0x800797D8` (`+0x0` system-enabled halfword,
+`+0x2` in-handler re-entrancy latch, `+0x4..` eleven per-IRQ handler slots,
+`+0x30` the enable shadow at `0x80079808`, `+0x38` the `setjmp` buffer at
+`0x80079810`). Four pointers hold the hardware registers the tier touches:
+`0x8007A864` → I_STAT, `0x8007A868` → I_MASK, `0x8007A86C` → DPCR,
+`0x8007A89C` → DICR, with the DMA channel-register base at `0x8007A8C0`.
+Nothing here is game logic - a from-scratch port replaces the whole band with its
+host's frame and audio callbacks.
+
+The base address is worth stating twice, because every routine below rebuilds it
+with the same `lui 0x8008; addiu -0x6828` pair and a reader who mis-reads one
+digit lands 0x200 bytes into the handler-slot array. `0x800797D8`, not
+`0x800799D8`.
+
+The tier publishes itself through the pointer at `0x8007A860`: the two
+installers below are called for their **return values**, which land in that
+record at `+0x14` (the VBlank tier's entry, `0x800605C8`) and `+0x4` (the
+`DMACallback` core `FUN_800607F4`). The trampolines `FUN_8005FDB8` (slot `+0x8`,
+`InterruptCallback`), `FUN_8005FDE8` (slot `+0x4`, `DMACallback`) and
+`FUN_8005FD88` (slot `+0xC`) are how the rest of the binary reaches them.
+
+| Address | Role |
+|---|---|
+| `8005FF20` | **`ResetCallback`-shaped init.** No-ops when the enabled halfword is already set. Zero-fills the `0x41A`-word state block from `0x800797D8`, runs `setjmp` (A0 `0x13`) on the buffer at `0x80079810` and enters `FUN_8005FFFC` on the non-zero return - the `longjmp` the exception entry performs. Seeds the buffer's stack slot `0x80079814 = 0x8007A7F0`, installs the hook via `HookEntryInt` (B0 `0x19`), raises the enabled halfword, runs both fan-out installers and publishes their results, calls the A0 `0x72` veneer, then `ExitCriticalSection`. Returns `0x800797D8`. `see ghidra/scripts/funcs/8005ff20.txt`. |
+| `8005FFFC` | **Root IRQ handler**, entered by `longjmp` from the kernel exception hook. When the enabled halfword is clear it prints a diagnostic (format `0x80015CD0`) and calls `ReturnFromException` (B0 `0x17`). Raises the in-handler flag `0x800797DA`, then repeatedly recomputes `pending = I_STAT & shadow & I_MASK` and, for each of the eleven slots at `0x800797DC`, acks the bit in I_STAT and `jalr`s the installed handler. A watchdog at `0x8007A870` counts consecutive rounds that leave IRQs pending and past `0x800` prints a diagnostic and force-clears I_STAT. Clears the flag and calls `ReturnFromException` before its own `jr ra`. `see ghidra/scripts/funcs/8005fffc.txt`. |
+| `800601E4` | **`InterruptCallback` core.** `(irq, handler) -> previous`. Returns early when the handler is unchanged or the system is not initialised. Otherwise masks I_MASK, writes the slot at `0x800797DC + irq*4`, sets or clears the matching enable bit in both I_MASK and the shadow at `0x80079808`, and re-arms the kernel side. The second argument each kernel call passes is `handler == 0` - the *removal* flag, not an enable: IRQ `0` calls `FUN_8005FD68(handler == 0)` then `FUN_8005FD78(3, handler == 0)`, and IRQs `4`/`5`/`6` call `FUN_8005FD78(0..2, handler == 0)` (the root-counter clear-mode toggles). `see ghidra/scripts/funcs/800601e4.txt`. |
+| `80060338` / `800603E4` | **Stop / restart pair.** `_338` enters a critical section, saves I_MASK to `0x8007980A` and DPCR to `0x8007980C`, zeroes I_MASK, clears every DMA enable bit in DPCR (`& 0x77777777`), calls `ResetEntryInt` (B0 `0x18`) and clears the enabled halfword. `_3E4` re-hooks with `HookEntryInt`, restores both saved registers, sets the halfword to `1` and exits the critical section. `see ghidra/scripts/funcs/80060338.txt`, `800603e4.txt`. |
+| `800604F8` + `80060550` | **VBlank fan-out** - installer + dispatcher. The installer zeroes the eight-slot table at `0x8007A874`, seeds `0x107` through the pointer at `0x8007A898`, clears the tick counter `0x8007A894`, registers `FUN_80060550` on IRQ `0` through the trampoline `FUN_8005FDB8`, and returns the code pointer `0x800605C8` its caller publishes at `+0x14`. The dispatcher bumps the counter and `jalr`s each non-null slot. `see ghidra/scripts/funcs/800604f8.txt`, `80060550.txt`. |
+| `80060620` + `80060670` | **DMA fan-out** - installer + dispatcher, registered on IRQ `3`. The installer zeroes the eight-word table at `0x8007A8A0`, clears DICR, and returns `FUN_800607F4`. The dispatcher reads DICR, takes `(dicr >> 24) & 0x7F` as the per-channel flag set, and for each set bit among the **seven** it walks acks it (writing back with only that channel's flag preserved) and `jalr`s the matching table slot; it re-reads DICR until the set is empty. A bus-error tail (`dicr & 0xFF000000 == 0x80000000`, or `dicr & 0x8000`) prints the DICR word plus seven channel register triples through the printf hook. `see ghidra/scripts/funcs/80060620.txt`, `80060670.txt`. |
+| `800607F4` | **`DMACallback` core.** `(channel, handler) -> previous`, a leaf with no stack frame. The DMA-side twin of `FUN_800601E4` on the `0x8007A8A0` table: installs the slot, then rewrites DICR as `(dicr & 0x00FFFFFF) \| 0x00800000` with bit `channel + 0x10` set or cleared - the `& 0x00FFFFFF` drops every pending channel-IRQ flag from the written value, so the update never acks one, and `0x00800000` re-asserts the master enable each time. `see ghidra/scripts/funcs/800607f4.txt`. |
+| `8006046C` / `800605F4` / `8006089C` | Three byte-identical **word-fill-with-zero** loops, `(ptr, n_words)`, one emitted per calling link unit - the state-block, VBlank-table and DMA-table clears respectively. Nothing distinguishes the bodies. `see ghidra/scripts/funcs/8006046c.txt`. |
+| `800604A0` / `800604B8` / `800604C8` / `800604D8` / `800604E8` | More `li t2,vec; jr t2; li t1,routine` BIOS veneers in this band: A0 `0x72` (`_96_remove`), B0 `0x17` (`ReturnFromException`), B0 `0x18` (`ResetEntryInt`), B0 `0x19` (`HookEntryInt`), A0 `0x13` (`setjmp`). `see ghidra/scripts/funcs/800604a0.txt`. |
+
+### libgpu texture-page + primitive macros (`0x80057358..0x80057914`)
+
+The out-of-line copies of libgpu's primitive-setup macros, plus the `TPAGE` /
+`CLUT` packers. Several arms branch on the cached GPU type - `FUN_80057FEC` is a
+four-instruction accessor returning the byte at `0x80078D54`, which the probe
+`FUN_8005ABD0` produces and the public `ResetGraph` `FUN_80057C44` stores -
+because the older part (type `1` / `2`) encodes the draw-mode word two bits
+higher. Link residue in the main: no dumped body in the corpus calls any address
+in this band, and the packing the ones that matter describe is re-derived inline
+by the port.
+
+That byte is one field of the libgpu module state block, whose members every
+routine on this page reaches by `lui 0x8008` plus a negative displacement:
+
+| Address | Field |
+|---|---|
+| `0x80078D4C` | GPU module function-table pointer (`FUN_8005860C` dispatches slot `+0x2C`). |
+| `0x80078D50` | Installed printf hook - every diagnostic on this page calls through it. |
+| `0x80078D54` | Cached GPU **type** - `FUN_80057FEC` returns it, so that leaf is `GetGraphType`, not `GetGraphDebug`. |
+| `0x80078D56` | Debug level, `0` in retail; gates `FUN_80058170` / `FUN_8005860C`. |
+| `0x80078D58` / `0x80078D5A` | Framebuffer width / height limits, as halfwords. |
+
+The public `ResetGraph` `FUN_80057C44` is what fills all three: it `memset`s
+`0x80078D54..+0x80`, stores `FUN_8005A78C`'s return byte as the type, and indexes
+the two per-type tables at `0x80078DD4` and `0x80078DE8` by `type * 4` to seed
+the width and height limits every clamp on this page reads.
+
+| Address | Role |
+|---|---|
+| `80057358` | `GetTPage`-shaped tpage packer. `(tp, abr, x, y)`. GPU version `1`/`2`: `(tp & 3) << 9 \| (abr & 3) << 7 \| (y & 0x300) >> 3 \| (x & 0x3FF) >> 6`. Otherwise the fields shift down two bits and `y` bit `0x200` moves to bit `11`. `see ghidra/scripts/funcs/80057358.txt`. |
+| `80057428` | `GetClut`-shaped CLUT packer. `(x, y) -> (y << 6) \| ((x >> 4) & 0x3F)`, truncated to 16 bits. Six instructions. `see ghidra/scripts/funcs/80057428.txt`. |
+| `80057440` / `80057510` / `80057B98` | Diagnostic dumpers - a tpage word, a CLUT word and a whole **`DISPENV`** (not a bare `RECT`: `80057B98` reports `disp` and `screen` as two four-halfword rects, then the `isinter` and `isrgb24` bytes at `+0x10` / `+0x11`, one printf call each). All report through the installed hook `*_DAT_80078D50` with format strings at `0x800154D0` / `0x800154E8` / `0x80015550`..`0x80015594`. Retail leaves the hook path unused. `see ghidra/scripts/funcs/80057440.txt`, `80057510.txt`, `80057b98.txt`. |
+| `80057588` | `addPrim(ot, prim)` OT insert. Copies the tag's 24-bit address field into the prim's, then points the tag at the prim - each store preserving the other byte of the word. `see ghidra/scripts/funcs/80057588.txt`. |
+| `80057600` / `80057550` / `8005756C` / `80057624` | The 24-bit address-field family on a primitive's first word, one out-of-line copy per PsyQ macro: `_600` = `setaddr(p, addr)`, `_550` = `nextPrim(p)` (the field with the top byte replaced by `0x80`), `_56C` = `isendprim(p)` (field all-ones), `_624` = `termPrim(p)` (ORs the field to all-ones in place). `see ghidra/scripts/funcs/80057600.txt`, `80057550.txt`, `8005756c.txt`, `80057624.txt`. |
+| `8005763C` / `80057664` | `SetSemiTrans(p, abe)` and `SetShadeTex(p, tge)`: each branches on its second argument to set or clear bit `0x2` / bit `0x1` of the code byte at `prim+0x7` - the semi-transparency and raw-texture flags. `see ghidra/scripts/funcs/8005763c.txt`, `80057664.txt`. |
+| `8005768C..80057840` (21 leaves) | The per-primitive-type initialisers - seventeen 20-byte leaves at a `0x14` stride from `8005768C` to `800577CC`, then four 32-byte ones at `800577E0` / `80057800` / `80057820` / `80057840`. Each stores the packet word length at `prim+0x3` and the GP0 code at `prim+0x7`; the longer forms add a `0x55555555` terminator in the packet's tail word (`+0x14` at `800577E0`, `+0x24` at `80057840`). One leaf per `(length, code)` pair the library ships. `see ghidra/scripts/funcs/8005768c.txt` and siblings. |
+| `80057860` | `SetDrawMode(p, dfe, dtd, tpage)` GP0 `0xE1` word builder. Writes length `1` at `prim+0x3` and the command word at `prim+0x4`: on the newer GPU `0xE1000000 \| (tpage & 0x9FF)` with **`dtd`** → bit `0x200` and **`dfe`** → bit `0x400`; on version `1`/`2` the same fields sit two bits higher (`dtd` → `0x800`, `dfe` → `0x1000`, mask `0x27FF`). Bit `0x200` is the hardware dither the port's `set_psx_mode` gates - it is the *third* argument that carries it. `see ghidra/scripts/funcs/80057860.txt`. |
+| `80057090` | `LoadTPage(pix, tp, abr, x, y, w, h)` - builds a `RECT` from the four coordinates with the width divided by 4 / 2 / 1 for `tp` 0 / 1 / 2 (4bpp / 8bpp / 16bpp), calls `LoadImage` (`FUN_800583C8`) and returns the tpage word from `FUN_80057358`. `see ghidra/scripts/funcs/80057090.txt`. |
+| `8005717C` / `800571E4` | `LoadClut` / `LoadClut2` - the 256-entry and 16-entry forms of the flat-strip CLUT upload. Identical bodies apart from the `RECT` width immediate (`0x100` vs `0x10`): height `1`, `LoadImage` (`FUN_800583C8`), then the CBA word from `GetClut` (`FUN_80057428`). The flat-strip shape is what [`tim-pack.md`](../../formats/tim-pack.md) describes for the boot upload. `see ghidra/scripts/funcs/8005717c.txt`, `800571e4.txt`. |
+| `80057DC8` | `SetVideoMode(mode)` - latches the new mode byte at `0x80078D57`, takes the default display word from module-table slot `+0x28`, issues GP1 `0x08` with bit `0x80` set for the PAL value through slot `+0x10`, and on `0x80078D54 == 2` follows with GP1 `0x20000504` / `0x20000501`. Returns the previous mode. `see ghidra/scripts/funcs/80057dc8.txt`. |
+
+### libgpu GP0 / GP1 register layer (`0x80059878..0x8005A1C0`)
+
+Below the primitive macros sits the register poke layer, reaching the GPU
+through indirections rather than absolute addresses. Two DMA channels are wired
+up, not one, and mistaking the second set for "the DPCR-side pair" is what hid
+`ClearOTagR` on this page:
+
+| Pointer at | Register |
+|---|---|
+| `0x80078E24` | GP0 (`0x1F801810`) - written for commands, read for GPUREAD. |
+| `0x80078E28` | GP1 (`0x1F801814`) - written for commands, read for GPUSTAT. |
+| `0x80078E2C` / `0x80078E30` / `0x80078E34` | DMA channel 2 (GPU): MADR / BCR / CHCR. |
+| `0x80078E38` / `0x80078E3C` / `0x80078E40` | DMA channel 6 (OTC): MADR / BCR / CHCR. |
+| `0x80078E44` | DPCR - bit `0x800` enables channel 2, bit `0x08000000` channel 6. |
+
+| Address | Role |
+|---|---|
+| `80059878` | Reads the GP1 port back - one `lw` through the pointer, `jr ra`. The GPUSTAT read every spin in this layer polls. `see ghidra/scripts/funcs/80059878.txt`. |
+| `8005A094` | Issues one GP1 command and caches its low byte in the per-command shadow table at `0x801C948C + (cmd >> 24)`, so a later query can answer without re-reading the port. `see ghidra/scripts/funcs/8005a094.txt`. |
+| `8005A0D0` | Direct FIFO write: sets GP1 `0x04` (DMA direction off), then writes `count` words from the caller's list straight to GP0. `see ghidra/scripts/funcs/8005a0d0.txt`. |
+| `8005A120` | Linked-list DMA kick: GP1 `0x04000002` (direction CPU→GP0), MADR from the argument, BCR cleared, then CHCR `0x01000401` on channel 2 - sync mode 2, from RAM, start. `see ghidra/scripts/funcs/8005a120.txt`. |
+| `8005A16C` | GPU-info read: issues GP1 `0x10 \| selector` and returns `GPUREAD & 0x00FFFFFF`. `see ghidra/scripts/funcs/8005a16c.txt`. |
+| `8005A78C` | **`ResetGraph` worker**, not a pad or SIO routine - the body the public `FUN_80057C44` calls for the GPU type it caches. Brackets itself in `FUN_8005FF04` (IRQ-mask swap) and dispatches on `mode & 7`. Mode `0` resets the GPU outright (GP1 `0x00`) and clears both scratch areas - `0x100` bytes at `0x801C948C` (the GP1 command shadow `FUN_8005A094` writes) and `0x1800` at `0x801C9590` (the command ring `FUN_8005A1C0` fills); modes `1` / `3` / `5` only re-arm channel 2 (CHCR `0x401`, DPCR `\|= 0x800`) and issue GP1 `0x02` + GP1 `0x01`. Every arm ends by returning the probe below. `see ghidra/scripts/funcs/8005a78c.txt`. |
+| `8005ABD0` | **GPU type probe** - the value `FUN_8005A78C` returns and `FUN_80057C44` caches at `0x80078D54`. Issues GP1 `0x10000007` (GPU info, selector 7) and reads `GPUREAD & 0xFFFFFF`. Reading `2` yields type `3`, or `4` after writing GP1 `0x09000001` when the caller's bit `0x8` is set. Otherwise it writes GP0 `0xE1001000` - a draw-mode bit only the older part latches - and re-reads GPUSTAT: bit `0x1000` clear yields `0`, set yields `1`, or `2` after writing GP1 `0x20000504` under the same caller bit. Every register it touches is GP0 / GP1; there is no SIO here. `see ghidra/scripts/funcs/8005abd0.txt`. |
+| `80059890` | **`ClearOTagR` proper** - the OTC-DMA half behind the public entry `FUN_8005860C`. `(ot, n)`: enables DMA channel 6 in DPCR (`\|= 0x08000000`), zeroes its CHCR, points MADR at the *last* word `ot + n*4 - 4` and BCR at `n`, then starts `0x11000002` - decrementing address, immediate sync - so the hardware walks the ordering table backwards writing each entry's link. Spins on CHCR bit `0x01000000` under the `FUN_8005AA64` timeout, returning `n` on completion and `-1` on timeout. `see ghidra/scripts/funcs/80059890.txt`. |
+| `80059978` | **`ClearImage`** - a VRAM rectangle fill, *not* a CPU↔VRAM transfer. Clamps the `RECT` extents `+0x4` / `+0x6` against the framebuffer limits `0x80078D58` / `0x80078D5A` (negative extent → zero), then assembles a GP0 packet at `0x801C9448` and kicks it through the linked-list DMA `FUN_8005A120`. When `rect.x` and `rect.w` are both 64-aligned it emits the five-word fast form (GP0 `0x02` VRAM fill plus `0xE6`, `0xE1`); otherwise the eight-word form (GP0 `0x60` monochrome rectangle wrapped in `0xE1`, `0xE3`, `0xE4FFFFFF`, `0xE5`, `0xE6`). The second argument carries the fill colour in its low 24 bits and `dfe` in bit 31. `see ghidra/scripts/funcs/80059978.txt`. |
+| `80059E10` | **`StoreImage`** - VRAM → CPU. Arms the timeout (`FUN_8005AA30`), clamps the same two extents against the same two limits, converts `w*h` pixels to `(w*h + 1) / 2` words split into 16-word blocks plus a remainder, issues GP0 `0x01` then GP0 `0xC0` with the two rect words, drains the remainder word-by-word from GPUREAD, and moves the blocks by DMA channel 2 (GP1 `0x04000003`, `BCR = blocks<<16 \| 0x10`, `CHCR = 0x01000200`). Returns `-1` on a zero-word rect or a timeout. The `LoadImage` twin is `80059BD4` (GP0 `0xA0`), with `80059C00` / `80059DE4` interior to it. `see ghidra/scripts/funcs/80059e10.txt`. |
+| `8005A19C` | Three-argument shim: forwards `(a0, a1, 0, a2)` to `FUN_8005A1C0`. `see ghidra/scripts/funcs/8005a19c.txt`. |
+| `80059068` | **`SetDrawEnv` packet builder** - reads a `DRAWENV` (clip rect `+0x0..+0x6`, offset `+0x8` / `+0xA`, texture window `+0xC`, tpage fields `+0x14` / `+0x16` / `+0x17`, `isbg` `+0x18`, background RGB `+0x19..+0x1B`) and fills a GP0 word list through the composers `FUN_80059568` (`0xE3`), `FUN_80059634` (`0xE4`), `FUN_80059700` (`0xE5`), `FUN_80059510` (`0xE1`) and `FUN_80059744` (`0xE2`), then `0xE6000000`. With `isbg` set it appends a GP0 `0x60` fill-rect whose extents are clamped against `0x80078D58` / `0x80078D5A`. The packet's word count lands in the tag byte at `+0x3`. `see ghidra/scripts/funcs/80059068.txt`. |
+| `80058554` | **`ClearOTag`** - the forward-linking OT clear, the twin of `ClearOTagR` (`FUN_80059890`). Zeroes each entry's length byte at `+0x3` and writes the 24-bit address of the following word into it, terminating the last entry with the masked sentinel address `0x80078E10`. Same debug-level gate and printf hook as its neighbours. `see ghidra/scripts/funcs/80058554.txt`. |
+| `8005A8E8` | **`DrawSync(mode)`** - with `mode == 0` it arms the timeout `FUN_8005AA30` and spins, draining the command queue through `FUN_8005A4A0` whenever the head / tail pair `0x80078E58` / `0x80078E5C` differ, until channel-2 CHCR bit `0x01000000` clears and GPUSTAT bit `0x04000000` is set; `-1` on timeout. Any other mode returns the pending-entry count `(head - tail) & 0x3F` without waiting. `see ghidra/scripts/funcs/8005a8e8.txt`. |
+
+### libcd primitives
+
+| Address | Role |
+|---|---|
+| `8005CCB4` | `CdSync` - 179-instr poll loop, spins on `FUN_8005C4AC` using timeout in `_DAT_801CADF8` (~16 ms). Strings: `"CD ready"`, `"CD timeout"`. |
+| `8005D9A0` | `CdControl_raw` - writes CD MMIO regs at `_DAT_80079670/67C/6A4/680/6A8/6AC/6B0/6B4` with command bytes. Spins waiting bit `0x40` then `0x1000000`. |
+| `8005C2C4` | `CdDiskReady` - wraps `FUN_8005D9A0`, returns `rc == 0`. |
+| `8005BC28` | libcd init / reset with 4-retry - probes via `FUN_8005BD80(1)`, on success installs the three CD event callbacks `FUN_8005BCB8` / `FUN_8005BCE0` / `FUN_8005BD08` through `FUN_8005BECC` / `FUN_8005BEE4` / `FUN_8005EB50`; after 4 failures prints a diagnostic and returns 0. `see ghidra/scripts/funcs/8005bc28.txt`. |
+| `8005BCB8` / `8005BCE0` / `8005BD08` | The three callbacks that install names. Each is a 10-instruction wrapper calling the `DeliverEvent` BIOS thunk `FUN_8005BD30` (B-vector `0x07`) with event class `0xF0000003` and spec `0x20` (`8005BCB8`) or `0x40` (the other two) - i.e. they raise the kernel CD-ROM event so a `TestEvent` / `WaitEvent` poller elsewhere unblocks. Not game logic; do not port. `see ghidra/scripts/funcs/8005bcb8.txt`, `8005bce0.txt`, `8005bd08.txt`. |
+| `8005BD80` | CD state-probe dispatcher - `(mode)`: mode 2 -> `FUN_8005D5F8`, else `FUN_8005D648` (and mode 1 also `FUN_8005D504`); returns a readiness bool. Called by the init/reset `FUN_8005BC28`. `see ghidra/scripts/funcs/8005bd80.txt`. |
+| `8005D424` | Low-level CDROM controller poke (thunked through `FUN_8005BDEC`) - writes index/command bytes to the CD MMIO register pointers `_DAT_80079670/9678/967C/9680`, spins on status bit `0x7`, commits `0x1325`. `see ghidra/scripts/funcs/8005d424.txt`. |
+| `8005D834` | CD transfer-completion wait with watchdog, the body under `CdDiskReady` (`FUN_8005C2C4`). Clocks off `VSync(-1)` (`FUN_8005FB84`), gives up `0x3C0` vsync ticks after entry and `0x3C0000` poll rounds after that, and on expiry prints the last command / result / status names out of the three name-pointer tables `0x800793D0` / `0x80079450` / `0x80079688` before re-resetting the registers through `FUN_8005D424`. Otherwise it spins on DMA channel-3 CHCR (`*0x800796B4`) bit `0x01000000` while its argument is zero. `see ghidra/scripts/funcs/8005d834.txt`. |
+
+## CD / file-system (libcd-style)
+
+Used by the sound subsystem's dev branch and elsewhere when retail-async CD reads aren't appropriate. Stack ordering: SCUS path-opener (`0x8003E6BC`) → libcd file-system (`0x8005DEA0`) → libcd primitives (`0x8005CCB4 / D9A0 / E4D4`) → libapi device-vtable (`0x8005FD88`) → BIOS A0 / B0 / C0 traps.
+
+| Address | Role |
+|---|---|
+| `8005DEA0` | Directory parser - reads the active sector, caches up to 128 entries into `0x801CB408` (`lui at,0x801d` + `sw ...,-0x4bf8(at)`; stride `0x2C`, fields `+0x00` 1-based index, `+0x04` the source byte at `+6`, `+0x08` the four bytes at source `+2`, `+0x0C` the name the copier `FUN_8005E540` writes). The cap is the two `slti a3,0x80` tests at `0x8005E0E0` / `0x8005E100`. The long-standing `0x801C4BEC` was the *offset* half of that `lui`/`sw` pair pasted into the high half of an address; the routine forms no address in `0x801C4***` at all. `see ghidra/scripts/funcs/8005dea0.txt`. |
+| `8005E180` | Directory-entry lookup by ID; returns slot index or `-1`. |
+| `8005E228` | File loader - reads sectors from a directory entry into a cache buffer. |
+| `8005E4D4` | Synchronous LBA read: `(sector_count, lba, dest_buffer)` → `bool`. `a1` alone reaches `FUN_8005C328` (LBA → `CdlLOC`), so it is an LBA and not a directory record; `a0` and `a2` are forwarded unchanged as `FUN_8005E9A4(a0, a2, 0x80)`, where `a0` lands in `0x800796C4` and `a2` in `0x800796C8`. `FUN_8005E228` calls it `(1, entry_lba, 0x801CCA08)`. `FUN_8005BEFC(2,…)` issues the `CdlSetloc` between the two; the `0x80` mode selects the 2048-byte sector size. The `(buf, dir_entry, size)` reading of this row was argument order reversed. |
+| `8005E574` | CD sector-reader state machine - handles block reads, timeout, completion callback at `_DAT_800796C0`. |
+| `8005C42C` | BCD-MSF → LBA: `((m*60 + s)*75 + f) - 150`. |
+| `8005ED64` | CD set-read-location - converts the stored MSF at `0x801CD210` to LBA (`FUN_8005C42C`) and builds the CdlLOC via `FUN_8005C328`; returns -1 when the drive is busy (`0x801CD208 != 0`). `see ghidra/scripts/funcs/8005ed64.txt`. |
+| `8005DE80` | 12-byte filename equality test - `strncmp(a, b, 12) == 0` (BIOS A0 0x18 via `FUN_80056748`); the directory-lookup name match. `see ghidra/scripts/funcs/8005de80.txt`. |
+| `8005EC1C` | libcd FS state reset - zeroes the file-system state globals at `0x801DAD..` and clears the entry table via `FUN_8005EF04(0)`. `see ghidra/scripts/funcs/8005ec1c.txt`. |
+| `8005EC7C` | libcd stop / teardown - critical-section-guarded `FUN_8005C2E4(0)` + `FUN_8005BEE4(0)`, then clears the CD busy flags at `_DAT_80079700` / `_DAT_800796F4`. `see ghidra/scripts/funcs/8005ec7c.txt`. |
+| `8005EF04` | FS entry-table clear - zeroes the `+0x0` word of `a1` records (0x20-byte stride) starting at index `a0` in the libcd FS entry table `*0x801CADD8`. `see ghidra/scripts/funcs/8005ef04.txt`. |
+
+## Helpers
+
+| Address | Role |
+|---|---|
+| `80017888` | **Logging malloc wrapper** over the real allocator - `(heap_index, size)`. Forwards to `FUN_8002B468`; its failure arm prints `malloc err size %d` and bumps a byte counter at `gp+0x510`. Every retail allocation this repo has traced goes through the wrapper, not the allocator: the tile-board cell buffer (`DAT_801F35C0 = FUN_80017888(0, width * height)` at `0x801EF3E8`) and the two `0x8000`-byte render scratch buffers `0x8007BB04` / `0x8007BB08` among them. |
+| `8002B468` | **The allocator itself** - a best-fit walk of a doubly-linked free list with `(size + 3) & ~3` alignment and the heap index in `a0`. Nothing in the traced corpus calls it except `FUN_80017888`. |
+| `8003540C` | **Menu entry-context park release** (leaf). Zeroes `gp+0x148` and `gp+0x138` - the whole of the release; the `-1` park it clears is what a sub-screen leaves behind on exit. Sibling of `FUN_800353E0` ([`asset-loading.md`](asset-loading.md)). Port `World::release_menu_entry_context_park`. |
+| `801D8450` | **Side-band stream teardown** - the body of field-VM op `0x36` sub `3`. `FUN_800653C8(0x17)` then `(0x16)`, `FUN_8001FF58(6)` to close VAB slot 6 (the field bank PROT 0876, or a side-band bank streamed over it), then `_DAT_8007BA88 = 0` and the field-bank latch `_DAT_8007BAFC = 0`, so the next field init reloads PROT 0876 ([`sfx-table.md`](../../formats/sfx-table.md#one-region-per-mode-slot-2-and-slot-6)). Ungated, and it *yields the frame* rather than falling through - the one arm of that sub-switch the request/acknowledge pair does not gate. See [`script-vm.md`](../../subsystems/script-vm.md#overlay-0897-command--submenu-support-functions). |
+| `80019788` | Global-buffer base accessor. `() -> ptr`. Two-instruction `lui v0,0x8009` + `jr ra` thunk returning the fixed address `0x80088758` (a game-side char/data buffer). Callers (the world-map-walk, fishing, slot-machine, debug-menu and cutscene overlays, plus `FUN_801EE328`) store the result at `actor[+0x94]` and walk it as a `char*`, scanning for `'_'` separators. A pointer getter, not transform or floor math (its address proximity to the floor sampler `FUN_80019278` is incidental). `see ghidra/scripts/funcs/80019788.txt`. |
+| `800196A4` | World-map-entry **fade-up tick**. Re-derives the kingdom index `gp+0x658` from the scene PROT base `_DAT_80084540` (`0x55`/`0xF4`/`0x187` → `0..=2`, else `-1`), then, while the ramp global `0x8007BAF4` is non-zero, advances it by `DAT_1F800393 << 5`, draws the full-screen grey quad via `FUN_80024EE4(1, 2, grey*0x010101)` (grey clamps at `0xFF`; the stored value does not), and on reaching `0x100` parks the ramp at `0xFF` + stores mode `_DAT_8007B83C = 0xC` (12 = MAPDSIP INIT). Port: `engine-field::world_map::WorldMapEntryFade`. `see ghidra/scripts/funcs/800196a4.txt`. |
+| `80019898` | Field-BGM re-attach + volume re-apply - the body of field-VM op `0x35` sub-op `8`. Re-attaches the BGM slot's sound source (`FUN_80026478(0x8007057C)`), then applies level `(DAT_8007B6EC << 15) >> 16` to both channels of the slot's voice (`lh 0xA(0x8007057C)`) via the `SsSeqSetVol`-shaped `FUN_80064890`. Port: `engine-scene-host::scene_host::bgm_reattach_volume` + `BgmDirector::reattach_volume`. `see ghidra/scripts/funcs/80019898.txt`. |
+| `8001FFA4` | Game-state cold-reset. Zero-fills the `0x1A18`-byte live game-state block at `0x80084140`, seeds boot defaults (`_DAT_80084574 = 1`, configured audio level `_DAT_8008457C = 0xD7`, voice volume `_DAT_80084580 = 200`, its live copy `_DAT_8007B910 = 0xD7`, BGM volume `DAT_8007B6EC = -1`, `DAT_8007B750 = _DAT_8007BAD0 = 0`), then chains `FUN_80034A6C` (new-game data-init) + `FUN_8002614C(0)` - the audio-context volume re-apply, which is one of the reasons the `0x8007B910` pair reads as audio rather than brightness ([battle-action.md](../../subsystems/battle-action.md#the-_dat_8007b910-ramps-are-an-audio-duck)). Port: `engine-menus::new_game::GAME_STATE_COLD_RESET`. `see ghidra/scripts/funcs/8001ffa4.txt`. |
+| `8003C5F0` | Generic ramp scheduler. 64-slot pool at `0x801C66A0` (stride 0x20). Used for sound + render-bank ramps. |
+| `80036D80` | **Ramp-scheduler tick** - the per-frame walk of the `0x801C66A0` pool `8003C5F0` installs. Full record layout and the lerp law are on [`motion-vm.md`](../../subsystems/motion-vm.md#the-generic-ramp-scheduler). |
+| `0x80036DE8` (instruction) | Interior of `FUN_80036D80`: the `blez` that takes the "remaining `<= 0`" arm after the frame delta `DAT_1F800393` is subtracted from the slot's countdown at `+0x14`. Not an entry - it has no prologue and consumes `$t1`/`$t2` from the enclosing loop. |
+| `0x8003F000` (instruction) | Interior of `FUN_8003EFE8`: the `addiu a0,a0,0x1104` in the **delay slot** of that function's `jal 0x800567A8`. Not an entry; `FUN_8003EFE8` is a 15-instruction routine spanning `0x8003EFE8..0x8003F020`. |
+| `0x8003F0F4` (instruction) | Interior of `FUN_8003F08C` (35 instructions, `0x8003F08C..0x8003F114`). Its dump resolves `entry=8003f08c`; the bare address is a citation stub, not a second function. |
+| `0x80056B18` (instruction) | Interior of `sprintf` (`FUN_800567B8`), whose body runs `0x800567B8..0x8005700F`. Long listed as a second entry beside it; Ghidra has no function here. |
+| `8001FA00` | **Identity index-list init.** `(count_out: *i16, list: *u16, n: i16)`. Writes `list[i] = i` for `i` in `0..n` (nothing when `n <= 0`), then stores `n - 1` into `*count_out` - i.e. it seeds a list in the same **1-based top index** convention the stack pop/push pair `8001FA34` / `8001FA68` consumes. Its one caller is MAIN INIT's `jal` at `0x801D7384` (PROT 0897), passing `(pool, pool + 4, 0x50)` - the **fog-particle pool's** free stack, not a cutscene sprite list. `see ghidra/scripts/funcs/8001fa00.txt`; the dump carries decompiled C only, so this row is read from `extracted/SCUS_942.54` at file offset `0x10200`. |
+| `8001A78C` | RGB→HSV decompose: `(r, g, b, hue*, sat*, val*)`. Max/min channel select, `sat = (max-min)<<8 / max`, hue = sextant·`0x100` + minor/major ratio (range `0..0x600`). Overlay colour-cycling / tint effects call it (the menu overlay 0899 and field 0897, whose dialog / cutscene modes reach it through the `FUN_801D362C` sub-ops `0x1F`/`0x20`). `see ghidra/scripts/funcs/8001a78c.txt`. |
+| `8001A8DC` | HSV→RGB compose - the inverse of `FUN_8001A78C`. Clamps sat/val to `0..0x100`, reduces hue mod `0x600`, then a six-arm jump table (`jr` at `0x8001A9FC`, arms `0x8001AA14..0x8001AA54`) writes the `(val, ramp, base)` triple in the sextant's channel order. `see ghidra/scripts/funcs/8001a8dc.txt`. |
+| `8003D038` | **Touch post.** `lbu` the byte at `DAT_801C6470 + param*4`; unless it is `0x8C`, write `DAT_80073F1C = param`. The caller is the **actor-collision box probe** `FUN_801CFC40` (not a sprite batcher), passing the touched actor's bind-record index `other[+0x50]`; the motion-VM wait-for-touch opcode at `0x8003882C` consumes and resets the post. See [`subsystems/motion-vm.md` § The touch post](../../subsystems/motion-vm.md#the-touch-post---fun_8003d038) and [`field-locomotion.md`](../../subsystems/field-locomotion.md). `see ghidra/scripts/funcs/8003d038.txt`. |
+| `8001FA34` | **Sprite-list stack pop.** `(count_ptr, table)`. The count is a signed halfword holding the **1-based top index**, body at `table + 2`, so the effective read is `table[count]` - the load carries a `+2` displacement (`lh v0,2(v0)` at `0x8001FA54`) *on top of* an index scaled from `count - 1`, which an `addr + 2*(count-1)` reading drops. Decrements the count, returns the value. The paired **push** is the next routine, `FUN_8001FA68` (`count++`, then `sh a3,(table + count*2)` - the same halfword). Underflow (`bltz` on the *pre*-decrement count) branches past this function's own `jr ra` into a separate `jr ra; li v0,-1` tail, so `count == 0` still pops the header halfword and only the next call returns `-1`. Port: `legaia_engine_system::movie::cutscene::sprite_stack_pop`. |
+| `8003C83C` | Script-context resolver. `id == 0xF8` returns `_DAT_8007C364` (the player / camera-anchor actor); `id == 0xFB` is the system channel; any other id first-matches an actor by script id `node[+0x50]` (u16; the decompile's `piVar1[0x14]` int index) in the `_DAT_8007C354` list. Two id families live in that slot: `N0 + placement_index` (placement contexts, `FUN_8003A1E4`) and the **flat** MAN record index (`.MAP` object binds, `FUN_8003A55C` `actor+0x50 = trigger[2]` - how the town01 Mei beat's `0x01` pokes reach the Vahn's-house door object). Resolves the field VM's cross-context (`0x80`-bit) target byte. Engine `field_channels::resolve_target`. |
+| `801D1EC4` | **Timed kind-0 warp + tile-crossing trigger handler** (field overlay, `0x801D1EC4..0x801D2294`): the warp timer `_DAT_8007B6B0` only counts, the landing seats the player once, and the idle half compares against the last crossed tile `(_DAT_8007BDC8, _DAT_8007BDCC)` - [details ↓](#801d1ec4); the trigger half is written up in [`field-locomotion.md`](../../subsystems/field-locomotion.md#the-walk-on-dispatcher-fun_801d1ec4) |
+| `801D58F0` | **Screen-fade wrapper** (field overlay) - the **fade spawner** of [`script-vms.md`](script-vms.md), one routine under two names. `(kind, from_rgb, to_rgb, delay, duration, hold)` - packs a stack descriptor (`+0` kind, `+2` duration, `+6/+8/+0xA` the three `from` channels, `+0xE/+0x10/+0x12` the `to` channels, `+0x14` delay, `+0x16` hold) and hands it to `FUN_80024E80(desc, 0)` (`0x801D58F0..0x801D5968`). The kind-0 warp arm of `FUN_801D1EC4` calls it twice - the fade out and the delayed fade back - and `FUN_801D1344`'s intro skip once ([`field-locomotion.md`](../../subsystems/field-locomotion.md#the-timed-kind-0-warp)). |
+| `8003BDE0` | **Partition-record → VM-context dispatcher.** `(x, z, record, gate)`. Resolves a scene-MAN partition-2 record (an op-`0x44` GLOBAL index is re-based `- N0 - N1`), walks its named-record header (name + C0/C1/C2 lists; layout in `cutscene.md`), and spawns a field-VM context (`ctx[+0x90]` = base, `ctx[+0x9e]` = entry PC, `ctx[+0x10] \|= 0x100`). C1/C2 gate on the story-flag bitmap `DAT_80085758`: C1 blocks if ANY set (one-shot; `town01`'s opening record lists `0x225`), C2 requires ALL set. Two caller families, live-probe-pinned on the New-Game opening (exactly 5 hits): op `0x44` SPAWN_RECORD (ra `0x801DF098`) and the walk-on tile trigger (`FUN_801D1EC4` → `FUN_801D5630`, ra `0x801D218C`; `gate = 0` = scene-init object-binds). Engine: `World::install_gated_p2_record`. |
+| `80039B7C` | Per-context field-script runner. Loops `FUN_801DE840(ctx[+0x90], ctx[+0x9e], ctx)` until a yield/halt, gated on `ctx[+0x10] & 0x100`. The per-frame tick of a context `FUN_8003BDE0` spawned. Also hosts the **interaction-end teardown** (the inverse of `FUN_801d5b5c`'s post): on dialog end it restores the actor's facing `+0x26` from the `+0x5A` save (moving-class partners), subtracts the actor's touch counter `+0x2A` out of the field-control global `+0xA`, and when the global reaches zero clears the player's `0x80000` locomotion-suppress flag and the `ctrl+0x60` interact flag - the counter pair keeps the player engaged until every overlapping touch is dismissed. |
+| `8003CF7C` | **Field-script fast-forward to next text/low opcode.** `(ctx_ptr)`. Drives the field VM over a context (`ctx[+0x90]` bytecode base, `ctx[+0x9e]` PC), single-stepping `FUN_801DE840(base, pc, ctx)` and writing back the advanced PC, until the PC lands on a byte with `(byte & 0x7F) < 0x20` (the printable/text range), hits opcode `0x21`, or stops advancing; returns the opcode byte it stopped on. The run-to-text sibling of the run-to-yield runner `FUN_80039B7C`. `see ghidra/scripts/funcs/8003cf7c.txt`. |
+| `80038050` | **Inline-script control-byte handler** (script base `actor[+0x90]`, PC `actor[+0x9e]`). Distinct from the pager `FUN_801D84D0`. Switches on the control byte the script PC sits on. Picker-confirm case: reads the chosen index from the cursor `*(DAT_801C6EA4+0xc)` and sets `actor[+0x9e] = (pc0 + 1 + index*2) + i16_LE(option_entry[index])` - i.e. each option's 2-byte entry is a **signed relative jump** taken from the start of that option's own entry. `case 0x4C` advances the PC by 2 / 3 by sub-byte. Consumer of the picker jump table `legaia_mes::picker` parses ([`mes.md`](../../formats/mes.md#picker-control-region-layout)). Also the dialog SM's post-box classifier that ends a talk - [details ↓](#80038050); ported live as `inline_dialogue::talk_dispatch`. |
+| `8003C764` | On-screen text-**balloon** spawner (the `4C E1` single-caption op; handler `FUN_801DA7F0`, whose own first lines kill the predecessor balloon). Allocates a text context from the pool, sets bytecode = the page bytes, seeds the per-page display timer `actor[+0x9c] = 0x78` (120 frames), centers the line `X = (320 − width)/2` (width via `FUN_80035F04`) and fixes `Y = 180`. Stores the parent ctx at `+0x94` (the handler's engaged-flag handshake latch). **Not the opening narration crawl** - that is the `[CC F8 80 N]` op routed to the roller `FUN_80037174` (below). Port: `engine-dialog::text_balloon::TextBalloon::spawn`. |
+| `801DA7F0` | `4C E1` balloon **handler** (field overlay, per-tick body of the `FUN_8003C764` actor). Kills any live sibling balloon (`FUN_8003CF04` find + `+0x10 \|= 8`); parent-link handshake against the player-engaged flag (`_DAT_8007C364 +0x10 & 0x80000`: link set + flag clear → clear link; link clear + flag set → jump timer `+0x54` to total `+0x9C`, ending the balloon early); timer bands `<1` (startup, +1), `< 0x78` (draw: text via `FUN_80036888` at `(+0x14, +0x16)` over widget frame `FUN_80034B6C(3)` + `FUN_8002C69C(0x58, y, 0x90, 0xB)`, timer += `DAT_1F800393`), else self-kill. Port: `engine-dialog::text_balloon::TextBalloon::tick`. `see ghidra/scripts/funcs/801da7f0.txt`. |
+| `80037174` | **Narration crawl roller** - the on-screen-text actor behind the opening narration op `[CC F8 80 N]`, spawned as a **child context** that owns a block's `N` pages while the parent timeline keeps running, so camera cuts play under the scroll. Draws each line centered, bottom-up in a clipped window. Geometry is the config block `*0x801C6EA4` (`+0x4C` top, `+0x4E` slots, `+0x50` divisor, `+0x52` release), reset by `FUN_8003A024` and seeded by `CC F8 E8` before each block; pitch is a fixed 16 and the clock the frame step `DAT_1F800393` (the capture-fitted per-scene table with 18 px for `opdeene` is retired). Port `cutscene_narration::CutsceneNarration`. See [`cutscene.md`](../../subsystems/cutscene.md#narration-playback---the-crawl-roller-fun_80037174). |
+| `80036044` | **Typewriter glyph count**, not a width and not a wrap. Returns one per glyph byte, `0x7C` or `0xCE` escape, zero per `0xCF`, and for a substitution token (`0xC1..0xC5`, `0xC7`; gate `(byte + 0x40) < 8`) the byte length of the spliced string - `0xC1` a party name at record `+0x2A7` (`0x800849AF + idx*0x414`, arg `0x63` = `DAT_80084597`), `0xC2`/`0xC4` `PTR_DAT_8007436C[idx*3]`, `0xC3` `0x800754D0 + idx*0xC`, `0xC5` the arts table `0x80075EC4`, `0xC7` `DAT_80073F24 + idx*8` - plus any party name a nested `0xC1` adds. The count a typewriter reveal steps through. Overruns the `NUL` by a byte per two-byte unit ([`mes.md`](../../formats/mes.md#fun_80036044---glyph-count)). See [`dialog-font.md`](../../formats/dialog-font.md#line-width-and-wrapping). |
+| `8003CC98` | Draw one string and count it: `FUN_80036044(buf)` for the glyph count, `FUN_80036888(buf, 0, 0, x, y)` to draw, returns the count. |
+| `8003CD00` | Draws a string through `FUN_80036888` and returns the largest glyph count it reports (not a pixel width). A string led by a byte below `0x20` draws nothing, so it is stepped over by its `FUN_80036044` count and retried `0x0D` px lower. |
+| `80034358` | **Arts-list panel renderer** (SCUS-resident). Draws a scrollable list of the active character's (`gp+0x874`) learned Arts: for each visible slot (list at block `0x80084140 + char*0x414 + 0x74E`, count `+0x74D`, scroll top `gp+0x140`) it matches the arts-name table `DAT_80075EC4` (stride `0x14`) on `[character, art-id]`, then draws the name via `FUN_80036888`, the AP cost via `FUN_8003C11C` (halved when block `+0x6C0` bit `0x800` set), and the input command as arrow sprites via `FUN_8003C310`. SCUS sibling of the overlay "Moves" submenu. See [`renderer.md`](../../subsystems/renderer.md#arts-list-panel-renderer). `see ghidra/scripts/funcs/80034358.txt`. |
+| `8003CE08` / `CE34` / `CE64` | SET / CLEAR / TEST against the **fourth flag bank** (256-bit bitfield at `DAT_80085758`). Wired by field-VM opcodes 0x50 / 0x60 / 0x70. |
+| `8003CE9C` | Signed-16-bit operand decoder (sign-extended `s16` from two bytes). |
+| `8003CEB8` | 24-bit LE decoder. Reads 3 bytes as a u24. |
+| `8003CED8` | 32-bit LE decoder. Reads 4 bytes as a u32. |
+| `8003D064` | **Packed 3-vector unpack.** `(src: *u8, *x, *y, *z)`. Reads three consecutive little-endian `s16` values from `src[0..6]` and sign-extends each into `*x` / `*y` / `*z`. The 3-component sibling of the `8003CE9C` single-`s16` decoder. The field-VM op-`0x44` SPAWN_RECORD handler reads a packed triple this way (`func_0x8003d064(_DAT_8007B898 + 0x22, …)` in `FUN_801DE840` before its `FUN_8003BDE0` call); the same leaf is reused as a generic packed-XYZ reader across the cutscene / dialog / world-map overlays. `see ghidra/scripts/funcs/8003d064.txt`. |
+| `80032434` | **Live-window upsert.** Lazily allocates the 0x34-byte sentinel-circular list head at `gp[0x148]` (`prev = next = self`, `+8 = 0xFFFF`). `param_1` is a window id, `param_2` a 14-halfword config record - copied into the **upserted node**, not the head: the walk at `0x80032528..` inserts (or reuses) a node sorted ascending by the `u16` id at `+0x8`, sums the length-prefixed record string into the glyph count `+0x14`, rebuilds content via `FUN_80030628`, and allocates the slide record at `+0x24` (current = target = the rect, motion flag `+0x20` = 1). `gp[0x148]` is the menu live-window list the kind-4 kernel iterates; the dialog overlay init (`FUN_801ECD0C` case 0) uses it too. Ported: `engine-menus::menu_list_rows::LiveWindowSet`. `see ghidra/scripts/funcs/80032434.txt`. |
+| `8001D058` | **Guarded per-frame sub-dispatch.** Conditionally calls `FUN_80026CE4` only when bit 3 of the scratchpad state word at `0x1F800394` is set; a per-frame gate the default mode handler's tick runs each field frame (surfaced by the playthrough gap-set trace). `see ghidra/scripts/funcs/8001d058.txt`. |
+| `8001A6A4` | **Byte-fill (`memset`).** `(dst, byte, count)`. Stores `byte` into `dst[0..count]`; `count == 0` writes nothing. Nine instructions. `see ghidra/scripts/funcs/8001a6a4.txt`. |
+| `8002B790` | **Linked-list maximum.** `() -> max`. Walks the sentinel-terminated list whose head is `*(gp+0x840)` (node `+0x0` = next, terminator = `head+0xC`) and returns the maximum `node[+0x8]` value across the nodes (`0` for an empty list). `see ghidra/scripts/funcs/8002b790.txt`. |
+| `8003E9C0` | **Named-resource open helper.** `(name, ...)`. Copies the name string (`FUN_80056758`) into a scratch record, resolves it via `FUN_800608F0` (returns `-1` on miss, bumping the fail counter `_DAT_8007B86E` and re-copying the name for the diagnostic), and proceeds with the resolved handle on success. `see ghidra/scripts/funcs/8003e9c0.txt`. |
+| `8003053C` | **Spell-record dispatch keyed on spell id.** `(spell_id)`. Indexes the SCUS spell-stats table `DAT_800754C8` (12-byte stride; [`formats/spell-table.md`](../../formats/spell-table.md)) and branches on the record's flag byte `+0x2` bit `0x20`: set → `FUN_8003FB10(record[0], record[1], 0)`; clear → iterates the live party/state block at `0x80084140 + 0x454`. `see ghidra/scripts/funcs/8003053c.txt`. |
+| `80019098` | List-file loader + parser - opens a named text file via the SCUS path-opener `FUN_8003E6BC` into a 2 KB buffer, splits it on `0x0D` newlines (terminator `0xFF`), and copies each name into a 16-byte-stride table it allocates and returns. `see ghidra/scripts/funcs/80019098.txt`. |
+| `8001C93C` | Debug watch-list renderer - `(count, records)`. Draws `count` 0x28-byte watch records via the dev monospaced writers `FUN_8001AA68` / `FUN_8001ABC8`, dispatching on the record type `+0x0` (string / indexed name / signed number with auto digit count); rows are `+0x00` kind, `+0x02` x, `+0x04` y, `+0x08` value pointer, `+0x0E` label, `+0x24` name table. Consumers: PROT 0976 hands it an eleven-row array; PROT 0971's DEBUG MODE walks the same row layout inline over twenty-two rows rather than calling it ([`byte-accounting.md`](../../tooling/byte-accounting.md#a-table-its-consumers-pin)). `see ghidra/scripts/funcs/8001c93c.txt`. |
+| `8003CB54` | Append a 2-byte control code to a MES/dialog string - walks to the terminator (skipping `0xC0`-family two-byte escapes) and writes `[a1][a2][0x00]`; sibling of the glyph-stride walker `FUN_8003CA38`. Its three callers on the disc are all in `FUN_8004AD80` (`0x8004B2F8` / `0x8004B338` / `0x8004B60C`), appending the `0xC2` pair to the steal-result caption templates `0x80077A38` / `0x80077A4C` / `0x80077A64`. `see ghidra/scripts/funcs/8003cb54.txt`. |
+| `80037044` | **Zone-gated linear value interpolator.** Reads a reference point from `a0[+0x14]` / `a0[+0x18]` (X / Y). When the object flag bit `0x400` is clear (flags word supplied in `v0`, = `a2[+0x10]`) and the point lies inside the window `a2[+0x88..+0xC8]` (X) x `a2[+0x8A..+0xCA]` (Y), it interpolates `a2[+0x80] + (a2[+0x84] - a2[+0x80]) * (Y - ymin) / (ymax - ymin)` and stores it through the pointer `*(a2+0x94)` as u8 / u16 / u32 per the width selector `a2[+0x8C]`; an out-of-window point sets done-bit `8` in `a2[+0x10]`. Per-object evaluator of a position-driven parameter channel - sibling of the countdown-driven interpolation loop near `0x80036DB0`. `see ghidra/scripts/funcs/80037044.txt`. |
+| `800265E8` | **Boot-time table seeder** (SCUS). Sets three enable flags (`0x80070520` / `0x80070580` / `0x800705B0` = 1) and fills the twelve-word struct at `0x800917B0` with a fixed set of ascending 32-bit offset constants (base word `0x1010`, remaining fields at `+0x4..+0x2C`). The consumer is `FUN_8002630C`, which indexes the table by VAB slot for `SsVabOpenHead`: the twelve words are the per-slot SPU transfer bases, ported as `legaia_game_tables::sfx_table::spu_base_for_slot` and written up in [`audio.md`](../../subsystems/audio.md) and [`sfx-table.md`](../../formats/sfx-table.md). `see ghidra/scripts/funcs/800265e8.txt`. |
+| `80026BE0` | **Sin/cos LUT pointer install** (SCUS). Calls `FUN_8005B818(0xA0)`, then points `DAT_8007B81C` at the static sine table `0x80070A2C` and `DAT_8007B7F8` at `+0x800` bytes (= `+0x400` entries, the quarter-revolution **cosine** view). The table is 5120 `i16` of `trunc(sin(i*2pi/4096)*4096)`, its last 1024 entries repeating the first so the offset read never wraps (disc-verified byte-exact). The earlier "double-buffer banks, consumer unidentified" reading is superseded: consumers dereference the pair as trig - the battle effect-script walker `FUN_801DEA50`, the actor push-apart `FUN_80050BB8`. Engine mirror `engine-system::rotation_lut::RetailRotationLut`. `see ghidra/scripts/funcs/80026be0.txt`. |
+| `801CFE98` | **MDECin DMA-callback wrapper.** Nine instructions: forwards its single argument to the PsyQ `DMACallback` entry `FUN_8005FDE8` with the channel hard-coded to `0` (MDECin), via `move a1,a0; clear a0`. Byte-identical at the same VA in the `debug_menu` and `str_fmv` overlay captures. Sibling of the SPU registration `FUN_8006A0E0` (channel 4). |
+| `801D5780` | **Arc-hop actor spawner** (field overlay 0897) - a complete routine that **retail never reaches**. The four-argument standalone spawn half of `FUN_801D25EC`: allocates from template `0x801F227C` through `FUN_80020DE0(template, _DAT_8007C34C)`, copies the source position with an `lwl`/`lwr` pair from `src+0x14..0x1B`, stores the target at `+0x24`/`+0x26`/`+0x28`, and writes the quadratic-Bezier control point `+0x3E = 2*apex - mid` where `apex = min(start.y, target.y) - arc_height`. Per-frame step `+0x9E = 0x1000 / duration`. See [the unreachability note](#801d5780-is-shipped-dead-code) below before treating its port's inertness as an engine gap. |
+| `801D7518` | **Scene-load actor re-hydration pass** (field overlay 0897). Called seven times from the per-scene field init `FUN_801D6704`. Walks an actor list allocating the runtime side buffers a freshly loaded record lacks - a `0x9C`-byte block into `+0x44` (plus `FUN_80024D78`), the `+0xA8` staging buffer via `StoreImage`, and a `0x18`-stride two-key interpolation table into `+0x4C` - and retires three handler classes by setting `+0x10 \| 8`. Dispatches on the handler pointer `actor[+0xC]`. |
+| `801D9C3C` | **Field-overlay MAN-load reset hook** (field overlay 0897). Called from the SCUS MAN decoder `FUN_8003AEB0` at `0x8003B444`. Reseeds the `0x801F2734..0x801F275C` and `0x801F3530..0x801F3538` globals (`0x801F2734 = 1`, `0x801F2740 = 3`, the rest zeroed), zeroes sixteen words ending at `0x801F357C`, then find-or-spawns a root actor (`FUN_8003CF04`, then `FUN_80020DE0` on template `0x801F2760`), clearing its `+0x50` / `+0x54`. |
+| `801DA390` | **Offset ease-toward-target** (field/world overlay). Skipped entirely when `_DAT_1f800394 & 0x1000000`. Eases the **vertical offset** `_DAT_8007bcac` toward `cam[+0x4a] - player[+0x16]` (camera `DAT_801c6ea4`, player `_DAT_8007c364`) - `lhu v0,0x4a(v0)` at `0x801DA3B4` and `lhu v1,0x16(a1)` at `0x801DA3B8`, and `+0x16` is the actor's Y, so this is not a yaw by a per-frame step: `0xc` when a d-pad direction is held (`_DAT_8007b850 & 0xf000`) under mode bit `0x20000`, otherwise `1`, and frozen while the player is stationary (`+0x16==+0x1e && +0x18==+0x20`); the step is also clamped to the remaining distance in `[1,0xc]`. Port `engine-field::camera_ease::ease_camera_offset`. `see ghidra/scripts/funcs/801da390.txt`. |
+
+### `801D1EC4`
+
+While the warp timer `_DAT_8007B6B0 > 0` it only counts: it tags the first live
+actor whose handler is `0x801DA7F0` for tear-down and subtracts `DAT_1F800393` -
+nothing walks toward the destination. The frame it reaches zero is the landing:
+`_DAT_8007B6B4 = 0x28`, the encounter counter re-rolled through `FUN_801DDF48`
+if it is `<= 0` (`0x801D1F6C`), `_DAT_8007B6B0 = -1000` (cleared to `0` the same tick by `FUN_801DA51C`'s tail, `0x801DA7D8`), the player seated at
+`(dest_x * 64 + 64, (dest_z + 1) * 64)` from `(_DAT_8007BDD0, _DAT_8007BDD4)`,
+the camera re-pinned and the landing tile's kind-1 record run. When idle,
+compares the actor tile against the last crossed tile `(_DAT_8007BDC8,
+_DAT_8007BDCC)` - not `0x8007BDD8`, the field clip base, which it sets to `2`
+after a trigger when `0x8007B6A8` is set (`0x801D21AC`) - runs the `cell &
+0x600` filter, posts `FUN_8003BDE0` and, on a kind-0 tile, arms a `0x26`-frame
+warp with two fades through `FUN_801D58F0`. An older reading printed at the
+phantom VA `0x801C36AC` had the timer half walking the actor and the crossing
+tile at `0x8007BDD8`; neither is in the bytes. See
+[`field-locomotion.md`](../../subsystems/field-locomotion.md#trigger-block-0x10000---four-kind-sub-tables).
+
+### `80038050`
+
+The dialog SM `FUN_80039B7C` calls it on the byte after a scanned box (`jal
+0x80038050` at `0x80039C84`) and ends the talk when it returns `0` (`bne
+v0,zero,0x80039D64` at `0x80039C8C`). Its jump table `0x80010F38` (guard
+`sltiu 0x2C` over `byte - 0x21`) has one default arm, `0x80038150`, and four
+live ones: `0x24` / `0x25` / `0x48` step the cursor by one and continue; the
+option bytes `0x27..0x2A` apply the picker jump and continue; `0x4C` continues
+past `FF` / `FE` sub-bytes; and `0x21` steps past itself and ends. Every other
+byte - a `0x26` jump, any opcode - takes the default and ends with the cursor
+left on it, which is how an NPC talk parks: the next talk starts on that byte
+([`script-vm.md`](../../subsystems/script-vm.md)).
+
+The port is `legaia_engine_field::inline_dialogue::talk_dispatch`, called from
+the world's inline dialogue runner on every dismissed box; the parked cursor
+becomes the placement's next interaction entry. A talk that ends on a raw
+`0x21` keeps its entry, where retail's cursor moves past it.
+`see ghidra/scripts/funcs/80038050.txt`.
+
+## Static actor templates
+
+Most of the engine's per-frame work is done by **pool actors**, and an actor's
+behaviour is not chosen by a call - it is copied out of a static 24-byte
+**template** record by the allocator `FUN_80020DE0(template, pool)`. The
+template's tick pointer becomes `actor[+0x0C]`, which the actor-list walk then
+invokes every frame. So a routine that is only ever a tick has **no caller** in
+the call-graph sense; its one reference on the whole disc is the pointer word
+inside its template.
+
+The layout is fixed by the allocator's own field copies
+(`see ghidra/scripts/funcs/80020de0.txt`, `0x80020E34..0x80020EE0`):
+
+| off | type | field | lands at |
+|---|---|---|---|
+| `+0x00` | u16 | actor kind / seed word | consumed by the allocator's tail |
+| `+0x02` | u16 | secondary id | `actor[+0x62]` |
+| `+0x04` | u16 | mesh / bank index - **written at spawn time** by several sites before the call | `actor[+0x60]` and `actor[+0x64]` |
+| `+0x06` | u16 | `0xFFFF` on every record | - |
+| `+0x08` | ptr | **tick** - the per-frame handler | `actor[+0x0C]` |
+| `+0x0C` | u32 | flags, OR'd with `2` | `actor[+0x10]` |
+| `+0x10` | u32 | zero on every record | - |
+| `+0x14` | u16 | initial state word | `actor[+0x56]` |
+
+Records sit on a `0x18` grid. Known table heads: `0x800705FC` and
+`0x8007671C` in SCUS (the second one's leading eight records differ only in
+`+0x00`, and are reached by an index rather than individually), a third at
+`0x80073E60`, and per-overlay tables such as the field overlay's
+`0x801F2704..` band.
+
+**Each spawn site names its own record with a `lui`+`addiu` pair** - there is
+no dispatcher walking the table - so a record that nothing materialises is a
+record nothing spawns from, and its tick never runs. That is a checkable
+property rather than an inference: the
+[address-reference scan](../../tooling/address-reference-scan.md) resolves the
+materialisation sites of a whole table with `--range`.
+
+### The ledge-hop templates (`0x801F227C` / `0x801F2294` / `0x801F22AC`)
+
+Three consecutive records in the field overlay's own table, and reading their
+`+0x08` words is what settles which routine drives which half of a
+[ledge hop](../../subsystems/field-locomotion.md#the-scripted-hop-arc-controller):
+
+| Template | File offset (base `0x801CE818`) | Tick |
+|---|---|---|
+| `0x801F227C` | `0x23A64` | `FUN_801D5C08` - the **arc** helper: steps the clip cursor, evaluates the seeded quadratic Bezier through `FUN_801E45BC`, writes the result into the parent actor's `+0x14 / +0x16 / +0x18`. |
+| `0x801F2294` | `0x23A7C` | `FUN_801D2298` - the **paired** helper: phase / SFX / movement-lock state machine only, no position write. |
+| `0x801F22AC` | `0x23A94` | `FUN_801D5D60` - the emitter `FUN_801D25EC` chains behind a non-player arc. |
+
+The setup `FUN_801D2404` allocates the first two together, so a hop is two
+pool actors, not one. Reading `FUN_801D2298` alone leaves the position write
+unaccounted for, which is exactly what happened while `FUN_801D5C08` was
+missing from this page.
+
+### Three timer-driven templates (`0x801F27EC` / `0x801F2840` / `0x801F2858`)
+
+Further up the same field-overlay band sit three more records of the plain
+shape - `+0x06 = 0xFFFF`, a tick at `+0x08`, every other word zero. Each is
+materialised exactly once, and each of the three sites is the same five
+instructions: `lui a0, 0x801f` / `lui v0, 0x8008` / `lw a1, -0x3cb4(v0)` /
+`sw ra` / `jal 0x80020de0` with the `addiu a0, a0, <low>` in the delay slot -
+an allocator call against the actor pool `_DAT_8007C34C`. So all three run.
+All three are per-frame timers driven by the frame delta `_DAT_1F800393`, and
+each spends its timer on something different:
+
+| Template | Tick | Spawner | Field-VM op | What the tick drives |
+|---|---|---|---|---|
+| `0x801F27EC` | `FUN_801DA930` | `FUN_801DDE34` | `4C 90` (9 bytes) | One rung of the scene floor-height ladder at `0x1F80035C` |
+| `0x801F2840` | `FUN_801DD4C4` | `FUN_801DE698` | `43 09` with ticks (10 bytes) | A three-axis eased move of **another** actor |
+| `0x801F2858` | `FUN_801DD784` | `FUN_801DE754` | `43 0C` (5 bytes) | Two black screen quads - a shutter blackout |
+
+All three are ported in
+[`legaia_engine_field::field_actor_timers`](../../../crates/engine-vm/README.md),
+spawned from the field host and stepped by
+`World::tick_field_timer_actors`.
+
+`FUN_801CFF3C` is **not** a fourth entry point. Its dump is byte-for-byte
+`FUN_801DE754` - the same 26 instructions with the same `addiu a0, a0,
+0x2858` - and `0x801DE754 - 0x801CFF3C = 0xE818` is exactly the re-key delta
+[`phantom-print-index.md`](../../tooling/phantom-print-index.md) records for
+the `overlay_0897_xxx_dat` dump program.
+
+#### `FUN_801DA930` - floor-height-ladder oscillator
+
+The destination settles what this is. The tick stores its high halfword into
+`0x1F800314 + 0x48 + actor[+0x50] * 2` = `0x1F80035C + rung * 2`, and that
+array is the scene's **16-entry `i16` floor-elevation ladder**: `FUN_8003AEB0`
+fills it from the MAN header at scene entry, `FUN_80019278` bilinearly
+interpolates it for ground height, `FUN_8003A55C` adds `LUT[cell & 0xF]` to
+every placed object's Y, and the field VM's own `4C 9E` writes all sixteen
+entries at once. So this tick **animates one elevation rung**, and every tile
+whose collision nibble selects that rung rises and falls with it. See
+[`field-locomotion.md`](../../subsystems/field-locomotion.md#where-the-collision-grid-comes-from)
+for the ladder's other consumers.
+
+The motion: per frame-delta iteration it adds `actor[+0x88]` into the velocity
+`actor[+0x84]` in whichever direction points at the rest height `actor[+0x8C]`,
+adds that to `actor[+0x80]`, and publishes `+0x80 >> 16`. There is no damping
+term and the rest height is never rewritten, so the rung overshoots and swings
+back - the ping-pong. `actor[+0x9E]` with bit `0x8000` set is a **burst**: run
+`+0x9E & 0x7FFF` single-tick iterations now and clear the word, which is how a
+script phase-offsets one rung against its neighbours.
+
+Only phase `actor[+0x54] == 1` runs; phase `0` seeds the phase from
+`actor[+0x6C] + 1`. The spawner writes the field VM's sub-op there, so
+sub-`0` gives phase 1 and sub-`1`/`2` give phases 2 and 3 - and those two
+**never decrement the tick's outer counter** (`0x801DAA3C` is inside the
+phase-1 arm), so the loop at `0x801DAA40` has no exit. That arm is
+unreachable in shipped content: `4C 91` and `4C 92` do not occur as a byte
+pair anywhere in any of the 101 extractable scene MANs.
+
+#### `FUN_801DD4C4` - three-axis eased move
+
+`actor[+0x90]` holds a pointer to a **second** actor, and this tick writes that
+actor's position triple `+0x14 / +0x16 / +0x18`. The timer `actor[+0x50]`
+advances by the frame delta toward the duration `actor[+0x9E]`, latching flag
+`0x8` into `actor[+0x10]` on arrival. Each axis then eases from its start
+(`actor[+0x14 + axis*2]`) to its end (`actor[+0x24 + axis*2]`) by `t^2 / d^2` -
+two successive `mult`/`div` pairs, not one - so the motion is quadratic rather
+than linear, and it is an ease-**in**: it accelerates the whole way and arrives
+at full speed. An end value of `-1` disables that axis. The Y axis has a rider:
+when the target's `+0x10` carries bit `0x2000_0000` (`lui at, 0x2000` at
+`0x801DD6A8` - a full word, not `0x2000`), the negated Y also lands in
+`target[+0x8E]`; that is the same bit op `4C 42` tests for the inverted-Y
+mirror.
+
+The spawner's one field-VM caller is op `43 09`'s non-zero-`ticks` branch at
+`0x801DF874`, and it passes `&target[+0x14]` as the start block - so the ease
+begins at the target's **live** position, never a scripted one.
+
+#### `FUN_801DD784` - the shutter blackout
+
+The output is not a stored number at all: the tick emits **two flat quads**
+(GP0 `0x28`, tag `0x05000000`, colour bytes zeroed to black) into the
+scratchpad prim cursor `0x1F8003A0`, linked into the OT at
+`*(0x1F8003F4) + 8`. The
+top bar spans `x 0..0x140`, `y -4 .. bar-4`; the bottom spans
+`y 0xE0-bar .. 0xE0`.
+
+`bar` comes from a four-phase envelope: `actor[+0x9E]` steps by the frame delta
+against a per-phase duration at `actor[+0xB8 + phase*2]`, bumping the phase
+`actor[+0x54]` and resetting the timer at each overflow. Phase 0 **closes**
+(`bar = 115 * t / duration[0]`), phase 1 holds at the constant `0x73` = 115,
+phase 2 **opens** (`bar = 115 - 115 * t / duration[2]`), and phase 3 ramps
+nothing at all - it sets flag `0x8` in `actor[+0x10]` and draws a zero-height
+bar. `duration[1]` is read only by the phase-1 boundary test, which is why the
+spawner's three operands are `[close, hold, open]`.
+
+**The peak is a blackout, not a letterbox.** Two bars of `0x73` = 115 lines in
+a 224-line screen cover it twice over (they overlap by two scanlines), so the
+beat is a shutter that closes to full black, holds, and opens - the
+intermediate frames are what read as a cinematic crop.
+
+The on-disc sites say the same thing, and they come in exactly two flavours.
+Across the 101 extractable scene MANs, 31 `43 0C` instructions land at real
+opcode boundaries (39 raw byte pairs; the other 8 are dialogue text):
+
+| Operand triple | Sites | Where |
+|---|---|---|
+| `10 08 10` -> close 16, hold 8, open 16 | 29 | `balden` P1[4/5/6/38/49/56/61] (11), `balden2` (11), `town0c` P1[24] (7) - each in a photographer's dialogue beat, i.e. the camera shutter |
+| `18 08 A0` -> close 24, hold 8, open 160 | 2 | `deroa` P2[9], `station3` P2[0] - cutscene-timeline records, a blackout with a slow reveal |
+
+### `801D5780` is shipped dead code
+
+The section above is the reason a bare "no caller" proves nothing here - a
+tick's only disc reference is its template word. `FUN_801D5780` clears that
+bar too: it has **no reference of any form** - no `jal`, no `j`, no literal
+address word - in `SCUS_942.54`, in any base-mapped overlay image, or in any
+extracted PROT entry, and it is not the `+0x08` word of any template. Its
+three siblings are the positive controls that make the zero a real one rather
+than a scan artifact: `FUN_801D2404` and `FUN_801D25EC` are each found by
+`jal`, and `FUN_801D2298` as a template word at `0x801F229C`.
+
+The bytes are nonetheless a complete routine - field overlay `0897_xxx_dat` at
+file `0x6F68` opens `addiu sp, sp, -0x28`, and the null-`a0` bail sits at
+`0x801D57A4` - so this is a routine the linker kept, not a mis-read address.
+
+Two traps sit on any re-check, and between them they will talk a reader out of
+the right answer. `ghidra/scripts/funcs/801d5780.txt` is a **wrong-image
+import** whose header resolves `entry=801d56fc`, so it presents the address as
+interior to a menu-family function; and the VA is **aliased** - in the cutscene
+images `0x801D5780` really is an entry, of a different 92-instruction routine.
+Neither observation is about PROT 0897. Read the field-overlay bytes.
+
+### The `+0x0C` framing error
+
+Several older rows describe the tick as the template's `+0x0C` word and quote
+a base 4 bytes below the real one (`0x800767F0` for `0x800767F4`, `0x80070670`
+for `0x80070674`). The allocator reads `lw v0, 0x8(s1)`, and the spawn sites
+pass the grid address itself - `addiu a0, a0, 0x67f4` at `0x80051D40`,
+`addiu s0, s0, 0x680c` at `0x80051A70` - so the tick is at **`+0x08`** and the
+record boundary is the grid address. The skewed frame names the same
+absolute pointer word, so nothing downstream of it was wrong; it is the
+record's *base* that the frame gets wrong, which matters the moment a doc
+quotes the neighbouring fields. Same shape as the `0x801E473C` menu-table skew
+in [`field-menu.md`](../../subsystems/field-menu.md#window-descriptor-table).
+
+## Stub helpers
+-
+These are 2-instruction `jr ra` / nop bodies - likely retail-disabled debug hooks where the dev gate lives in the caller. Listed for completeness so a from-scratch port can implement them as no-ops without further investigation.
+
+| Address | Role |
+|---|---|
+| `80024C80` | Move-VM op `0x16` body. The opcode is a no-op. |
+| `80024DFC` | Actor-cleanup hook (called from `FUN_8002519C` while freeing an actor). |
+| `8002B93C` / `8002B944` / `8002B94C` / `8002B954` / `8002B974` | Cluster of debug-disabled helpers (each a 2-instruction `jr ra; nop`). `8002B974` is a genuine empty leaf, not a Ghidra phantom. |
+| `8002B934` / `8002B96C` / `8002B984` / `8002B98C` | Four more members of that same `0x8002B9xx` cluster, each an identical 2-instruction `jr ra; nop`. They interleave with the five above at 8-byte spacing, which is what a run of separately-emitted empty library leaves looks like. `see ghidra/scripts/funcs/8002b934.txt`, `8002b96c.txt`, `8002b984.txt`, `8002b98c.txt`. |
+| `80026C18` / `80026C20` | Adjacent 2-instruction `jr ra; nop` leaves in the renderer band. Nothing dispatches through them conditionally - a port implements both as no-ops. `see ghidra/scripts/funcs/80026c18.txt`, `80026c20.txt`. |
+| `8003CC88` | `jr ra; li v0,0` - the "returns zero" variant of the empty leaf, so a caller that tests the result always takes the false branch. `see ghidra/scripts/funcs/8003cc88.txt`. |
+| `8003E7F0` | Reserved sound-path stub (called from `FUN_80017AAC`). |

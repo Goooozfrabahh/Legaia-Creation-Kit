@@ -1,0 +1,1564 @@
+//! Battle **action effect script**: the 8-byte record stream a battle action
+//! walks to place its visual effects, and the move-power install + homing seed
+//! it does when the stream terminates.
+//!
+//! PORT: FUN_801DEA50
+//!
+//! One call per frame for the acting actor. The actor carries a cursor byte at
+//! `+0x1F5`; each call consumes records from that cursor until it hits a
+//! terminator or runs the cursor to `8`. Every record is an offset in the
+//! actor's own local frame, which the stepper **rotates by the actor's facing**
+//! (`actor[+0x46]`) before spawning anything, so an art authored facing "north"
+//! plays correctly whichever way the actor is turned.
+//!
+//! Three things happen per record, and only the first is effect-specific:
+//!
+//! 1. the record's offset is rotated into world space and an effect is spawned
+//!    at it (`FUN_80050ED4` for the table-driven forms, `FUN_801DFDF0` for the
+//!    `0x80`-flagged direct form);
+//! 2. on the terminator, the acting actor's **move-power record** is installed
+//!    at the battle context's `+0x1014` and its `+0x04` word mirrored to
+//!    `+0x6C6`;
+//! 3. every target slot gets its homing state seeded - phase `+0x24E`, launch
+//!    position `+0x1144`, bearing `+0x1166` and target index `+0x252`.
+//!
+//! The kernels here are the deterministic ones: the record layout, the facing
+//! rotation, the move-power index chain, the effect-id classification, and the
+//! target **band** the homing seed sweeps. The spawns themselves come back as a
+//! list of requests rather than calls, so a host can route them at whatever
+//! layer owns effects.
+//!
+//! `see ghidra/scripts/funcs/overlay_battle_action_801dea50.txt` and
+//! [`docs/formats/move-power.md`](../../../docs/formats/move-power.md) for the
+//! record the terminator installs.
+//!
+//! ## Retail wiring (all three former input gaps are closed)
+//!
+//! **The caller is not the battle-action SM.** A five-form reference scan
+//! ([`docs/tooling/address-reference-scan.md`](../../../docs/tooling/address-reference-scan.md))
+//! over `SCUS_942.54`, the based overlay images and the raw PROT entries finds
+//! no reference of any form to `0x801DEA50` inside the battle-action overlay
+//! image: the only two `jal` sites in the corpus are `0x800478B8` and
+//! `0x80047C08`, both inside **`FUN_80047430`**, the battle per-frame
+//! anim-node tick. Both are gated on `DAT_8007BD71 == 0xFF`, the effect-VM
+//! ready flag, and both are preceded by the paired call to `FUN_801EC3E4` with
+//! the same three arguments. So this runs once per frame off the render tick
+//! for the acting actor, not once per action off the SM - and that tick is
+//! itself reached by function pointer from the actor-list iterator
+//! `FUN_8002519C`, which is live-pinned mid-battle.
+//!
+//! The three inputs, each pinned:
+//!
+//! 1. **The script block is the action's anim record itself.** The stepper's
+//!    second argument is `node[+0x4C]` (`FUN_80047430` passes `s3 =
+//!    *(node+0x4C)` at both `jal` sites), and `node[+0x4C]` is installed from
+//!    `actor[+0x234 + i*4]` (`FUN_80049348`, `0x800494C8..D0`) - the committed
+//!    per-action entry the anim commit `FUN_8004AD80` selects. On disc that
+//!    entry is a monster-archive action entry / a player record[0] action
+//!    entry, and its `+0x14..+0x53` region is exactly this record stream -
+//!    carried by `legaia_actor_formats::monster_archive::MonsterAnimation::effect_script`.
+//! 2. **The cursor is per-actor state** (`+0x1F5`), zeroed when a new anim
+//!    record commits (`FUN_8004AD80`, `0x8004B060`) - the engine mirror is
+//!    `world::Actor::battle_effect_cursor`, reset by the anim commit.
+//! 3. **The [`RotationLut`] pair is one SCUS-resident sine table.**
+//!    `FUN_80026BE0` sets `_DAT_8007B81C = 0x80070A2C` and `_DAT_8007B7F8 =
+//!    0x80070A2C + 0x800`. The table at `0x80070A2C` is 5120 `i16` entries of
+//!    `trunc(sin(i * 2pi / 4096) * 4096)` (disc-verified byte-exact, zero
+//!    mismatches, truncation toward zero; the final 1024 entries repeat the
+//!    first 1024 so the `+0x400`-entry cos read never wraps). So `b()` = sin
+//!    and `a()` = cos of the 12-bit angle -
+//!    [`legaia_engine_system::rotation_lut::RetailRotationLut`] generates
+//!    the same table from the formula.
+//!
+//! Engine wiring: `World::tick_battle_animations` steps each battle actor's
+//! committed clip through [`step_effect_script`] and queues the resulting
+//! [`EffectSpawn`]s as `world::BattleEffectSpawn`s (drained via
+//! `World::drain_battle_effect_spawns`, consumed by the native window's
+//! battle FX layer).
+//!
+//! The terminator's context writes now have a sink: [`MoveFxStreak`] models
+//! the `ctx[+0x1014]` / `+0x6C6` / `+0x24E` / `+0x1144` block, the live tick
+//! installs it (`World::step_actor_effect_script` →
+//! `World::casting.move_fx_streak`), and the render layer projects the streak
+//! billboard from it (`legaia_render_kernels::afterimage`, drawn by the native
+//! window's screen-FX pass). What is still **not** modelled is the stepper's
+//! function-head sibling, retail's `0x801DEA50..0x801DEBEC` prologue - whose
+//! semantics are now pinned from the disassembly even though the port carries
+//! no seat for them:
+//!
+//! * `ctx[+0x1028]` is a **single tracked part handle**, installed by the
+//!   table arm for codes `0xA` / `0x2D` / `0x2E` (`0x801df1b8..0x801df1e8`),
+//!   which also stash the record's *raw, unrotated* XYZ at
+//!   `ctx[+0x1184/+0x1186/+0x1188]`.
+//! * The prologue is **not** target-seeking integration. Each call it first
+//!   drops the handle when the part's `+0x10` flags carry bit `3`
+//!   (`0x801dea88..0x801deaac` - the part retired), then, only while the
+//!   stepped actor is the context's active actor (`ctx[+0x13]`,
+//!   `0x801deabc`), it **re-seats** the part at the actor: position
+//!   `+0x14/+0x16/+0x18` = actor `+0x34..+0x3B`, `y -= ctx[+0x1186]`, and
+//!   x/z offset by the stashed legs rotated through the sin/cos LUTs at the
+//!   **current** facing `+ 0x800` (`0x801deae0..0x801debe4`). So the
+//!   spawned effect *follows the acting actor* frame by frame (a dash drags
+//!   its projectile along); the per-target `+0x1144` quads feed the separate
+//!   `+0x0E`-list spawns, not this handle.
+//! * The engine's table-form spawns are seated once at spawn position and
+//!   never re-seated: `BattleEffectSpawn` carries no raw-offset channel and
+//!   the spawned `SummonScene` is not identified back to its record, so the
+//!   follow-the-actor motion has no carrier yet. The streak block reads
+//!   `+0x1144` only as a projection input.
+//!
+//! A second prologue lane: `ctx[+0x263]` non-zero consumes the whole call -
+//! it clears the flag and bumps the actor's `+0x1F5` **and** `+0x1F6`
+//! cursors without spawning (`0x801dec08..0x801dec48`), the "skip one
+//! record" strobe the melee kernel's limb-vs-height miss raises. The engine
+//! seat is `World::consume_effect_skip_strobe`, not this stepper.
+//!
+//! REF: FUN_80050ED4, FUN_801DFDF0 - the two effect-spawn entry points.
+//! REF: FUN_80047430 - the sole retail caller, the battle anim-node tick.
+//! REF: FUN_801EC3E4 - the sibling call the caller pairs this with.
+//! REF: FUN_8002519C - the actor-list iterator that dispatches the tick.
+//! REF: FUN_80049348 - shadows `actor[+0x234+i*4]` into `node[+0x4C]`.
+//! REF: FUN_8004AD80 - the anim commit that installs the entry + zeroes `+0x1F5`.
+//! REF: FUN_801E295C - the action SM that stages the move. It is *not* a
+//! caller of this routine: a five-form reference sweep finds no `jal`, `j`,
+//! literal word or `lui`+`addiu` pair for `FUN_801DEA50` anywhere inside the
+//! battle-action overlay image.
+//! REF: FUN_80019B28 - the bearing helper.
+
+use legaia_engine_system::rotation_lut::RotationLut;
+
+/// Bytes per effect-script record.
+pub const RECORD_STRIDE: usize = 8;
+
+/// Byte offset of record 0 inside the script block (`0x801deca8`: the cursor
+/// scales by `8` then adds `0x14`).
+pub const RECORD_BASE: usize = 0x14;
+
+/// Cursor values `>= this` end the walk (`0x801dec6c`: `sltiu v0,v0,0x8`).
+pub const MAX_CURSOR: u8 = 8;
+
+/// Record `+0x01` low-7-bit value that marks the stream's end. The two spawn
+/// branches test it differently - the direct branch compares the whole byte
+/// against `0xFF` (`0x801dee88`) and the table branch compares against `0x7F`
+/// (`0x801df0d4`) - and since the branch is selected by bit `0x80`, the two
+/// tests together are exactly "`effect & 0x7F == 0x7F`".
+pub const TERMINATOR_EFFECT_MASKED: u8 = 0x7F;
+
+/// Slots the terminator's unconditional homing pre-seed sweeps
+/// (`0x801df294..0x801df2e0`: `ctx[+0x24E + i] = 1` and the launch position
+/// into `ctx[+0x1144 + i*8]`, for `i` in `0..4`).
+pub const HOMING_SLOT_COUNT: usize = 4;
+
+/// Record `+0x01` bit that selects the **direct** spawn form (`FUN_801DFDF0`)
+/// over the table form.
+pub const EFFECT_DIRECT_BIT: u8 = 0x80;
+
+/// The battle-overlay prototype the direct arm seats beside the pool spawn
+/// for codes `0x81..=0x83` (`lui a2,0x801f` / `addiu a2,a2,0x5eb0`, then
+/// `jal 0x80050ED4` at `0x801DEF08`): a floor ring on the actor's body pair.
+pub const FLOOR_PART_RECORD: u32 = 0x801F_5EB0;
+
+/// Whether a direct record's whole `+0x01` byte (bit 7 included) also seats
+/// [`FLOOR_PART_RECORD`]: `addiu v0,v0,0x7f` / `andi 0xff` / `sltiu v0,v0,3`
+/// at `0x801DEEAC..0x801DEEB4` holds for `0x81`, `0x82` and `0x83`.
+///
+/// PORT: FUN_801DEA50 (`0x801DEEA4..0x801DEEB8`, the floor-part test)
+pub const fn seats_floor_part(code: u8) -> bool {
+    code.wrapping_add(0x7F) < 3
+}
+
+/// The two direct-form effect bytes whose Z offset is clamped into the
+/// attacker-target separation before rotation (`0x801DEDAC..0x801DEDB8`:
+/// `li v0,0x93` / `li v0,0x84` compared against the **whole** `+0x01` byte).
+/// See [`EffectScriptActor::approach`].
+pub const APPROACH_CLAMPED_EFFECTS: [u8; 2] = [0x93, 0x84];
+
+/// Exclusive upper bound of the table-form codes that consult the per-effect
+/// **CLUT map** (`0x801F6418`): the table arm's gate is `sltiu v0,v1,0x32`
+/// (`0x801df0d8`), so only plain codes `0x00..=0x31` can stage a palette row,
+/// and a code at or above this (e.g. the spreadsheet's `0x4C` "hit effect"
+/// constant) copies nothing by construction. Contrast the cue-group expander
+/// `FUN_801E22C8`, whose arm has **no** such bound - the two gate
+/// differently. Consumed by `World::drain_battle_effect_spawns`, the engine
+/// seat of the arm.
+///
+/// The map is not a sound table: the byte becomes `rect.x` of a `RECT` handed
+/// to `MoveImage` (`FUN_80058490`), a 16x1 VRAM copy onto `(224, 476)`. See
+/// [`crate::battle_effect_clut`] for the whole arm and the reading it
+/// replaces.
+///
+/// PORT: FUN_801DEA50 (`0x801df0d4..0x801df134`, the CLUT gate + `RECT` build)
+/// REF: FUN_80058490 (`MoveImage` - the blit the `RECT` reaches)
+pub const TABLE_CLUT_GATE: u8 = 0x32;
+
+/// PSX angle units in a full revolution.
+const ANGLE_MASK: i32 = 0xFFF;
+
+/// Half a revolution - the bias the stepper adds to the facing before indexing
+/// the LUTs.
+const ANGLE_HALF: i32 = 0x800;
+
+/// Fixed-point shift of the rotation products.
+const ROT_SHIFT: u32 = 12;
+
+/// Move-power table stride (`0x801df264..0x801df27c` builds `id * 0x1A` out of
+/// shifts and adds).
+pub const MOVE_POWER_STRIDE: usize = 0x1A;
+
+/// Target-slot band the homing seed sweeps, derived from the acting actor's
+/// `+0x1DD` scope byte.
+///
+/// PORT: FUN_801DEA50 (`0x801df2e4..0x801df338`).
+///
+/// The byte is a scope selector, not a slot index:
+///
+/// - `0..=7`: a single slot - `first == last == scope`, so the sweep touches
+///   exactly that actor.
+/// - `9`: the **monster** row - slots `3..=6`.
+/// - `8`: the **party** row - slots `0..=2`.
+/// - anything else: the registers keep whatever the `0..=7` arm left, which for
+///   a fresh call is the raw byte in both, i.e. the single-slot form.
+///
+/// Retail's loop is `for (i = 0; first + i <= last; i++)`, so an empty band is
+/// impossible - the single-slot form always runs once.
+///
+/// The scope byte is `+0x1DD` =
+/// `legaia_engine_battle_vm::battle_action::BattleActor::active_target`, written and
+/// read across the live action SM (the attack band, the spirit band, the
+/// target cursor, `battle_round`); its group codes `8` / `9` are exactly the
+/// ones `battle_action::magic`'s cast-begin retarget pass and
+/// `battle_target_group` deal in. The band is computed on every terminator
+/// [`step_effect_script`] reaches from the live tick, but its **consumer** is
+/// still missing: the engine models no per-target `+0x1144` homing block for
+/// the seed to write into (see the module note).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetBand {
+    /// First slot index the sweep visits.
+    pub first: u8,
+    /// Last slot index (inclusive).
+    pub last: u8,
+}
+
+impl TargetBand {
+    /// Classify the acting actor's `+0x1DD` scope byte.
+    pub fn from_scope(scope: u8) -> Self {
+        match scope {
+            9 => Self { first: 3, last: 6 },
+            8 => Self { first: 0, last: 2 },
+            s => Self { first: s, last: s },
+        }
+    }
+
+    /// The slots the sweep visits, in order.
+    pub fn slots(self) -> impl Iterator<Item = u8> {
+        (0u8..).map_while(move |i| {
+            let s = self.first.checked_add(i)?;
+            (s <= self.last).then_some(s)
+        })
+    }
+}
+
+/// One decoded effect-script record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectRecord {
+    /// `+0x00` - the frame gate. The stepper skips the whole record while the
+    /// action's frame counter plus one is below this.
+    pub frame: u8,
+    /// `+0x01` - the effect selector. [`TERMINATOR_EFFECT_MASKED`] in the low
+    /// seven bits ends the stream; [`EFFECT_DIRECT_BIT`] picks the direct spawn
+    /// form.
+    pub effect: u8,
+    /// `+0x02` (`i16`) - local-frame X offset.
+    pub off_x: i16,
+    /// `+0x04` (`i16`) - local-frame Y offset. Subtracted from the actor's Y,
+    /// not added, and scaled by the actor's mesh scale.
+    pub off_y: i16,
+    /// `+0x06` (`i16`) - local-frame Z offset.
+    pub off_z: i16,
+}
+
+impl EffectRecord {
+    /// Decode the record at `cursor` from a script block. The block is the
+    /// action's anim-record head
+    /// (`legaia_actor_formats::monster_archive::MonsterAnimation::effect_script`),
+    /// whose records sit at [`RECORD_BASE`]` + cursor * `[`RECORD_STRIDE`].
+    ///
+    /// PORT: FUN_801DEA50 (`0x801dec84..0x801ded48`).
+    pub fn at(block: &[u8], cursor: u8) -> Option<Self> {
+        let o = RECORD_BASE + usize::from(cursor) * RECORD_STRIDE;
+        let r = block.get(o..o + RECORD_STRIDE)?;
+        Some(Self {
+            frame: r[0],
+            effect: r[1],
+            off_x: i16::from_le_bytes([r[2], r[3]]),
+            off_y: i16::from_le_bytes([r[4], r[5]]),
+            off_z: i16::from_le_bytes([r[6], r[7]]),
+        })
+    }
+
+    /// `true` when this record ends the stream (`0x7F` or `0xFF`).
+    pub fn is_terminator(self) -> bool {
+        self.effect & 0x7F == TERMINATOR_EFFECT_MASKED
+    }
+
+    /// `true` when the record spawns through the direct form.
+    pub fn is_direct(self) -> bool {
+        self.effect & EFFECT_DIRECT_BIT != 0
+    }
+}
+
+/// Rotate a local-frame `(x, z)` offset into world space by an actor facing.
+///
+/// PORT: FUN_801DEA50 (`0x801dedd4..0x801dee7c` and the sibling block at
+/// `0x801defa0..0x801df050`).
+///
+/// Four LUT reads, not two - the pair and its **complement** `0xFFF - a`:
+///
+/// ```text
+/// dx = (b[a]    * z) >> 12  +  (a[~a] * x) >> 12
+/// dz = (b[~a]   * x) >> 12  +  (a[a]  * z) >> 12
+/// ```
+///
+/// Each product narrows on its own with a plain arithmetic `>> 12`, so the two
+/// halves round independently - summing first and shifting once is *not*
+/// equivalent.
+///
+/// The two blocks that use this differ only in the angle: the direct-spawn
+/// branch takes `facing & 0xFFF` ([`FacingBias::None`]) and the table branch
+/// takes `(facing + 0x800) & 0xFFF` ([`FacingBias::Half`]).
+///
+/// The retail LUT pair behind `_DAT_8007B7F8` / `_DAT_8007B81C` is pinned as
+/// one SCUS sine table (see
+/// [`legaia_engine_system::rotation_lut::RetailRotationLut`]), which is what the live
+/// battle tick supplies.
+pub fn rotate_offset<L: RotationLut>(
+    lut: &L,
+    facing: u16,
+    bias: FacingBias,
+    x: i32,
+    z: i32,
+) -> (i32, i32) {
+    let a = (i32::from(facing) + bias.units()) & ANGLE_MASK;
+    let comp = ANGLE_MASK - a;
+    let dx = ((lut.b(a) * z) >> ROT_SHIFT) + ((lut.a(comp) * x) >> ROT_SHIFT);
+    let dz = ((lut.b(comp) * x) >> ROT_SHIFT) + ((lut.a(a) * z) >> ROT_SHIFT);
+    (dx, dz)
+}
+
+/// Which of the stepper's two facing conventions a rotation uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FacingBias {
+    /// `facing & 0xFFF` - the direct-spawn branch (`0x801ded7c`).
+    None,
+    /// `(facing + 0x800) & 0xFFF` - the table-spawn branch (`0x801defb0`).
+    Half,
+}
+
+impl FacingBias {
+    /// The angle units added before masking.
+    pub fn units(self) -> i32 {
+        match self {
+            Self::None => 0,
+            Self::Half => ANGLE_HALF,
+        }
+    }
+
+    /// The bias a record's effect byte selects.
+    pub fn for_effect(effect: u8) -> Self {
+        if effect & EFFECT_DIRECT_BIT != 0 {
+            Self::None
+        } else {
+            Self::Half
+        }
+    }
+}
+
+/// Scale a record's local offset by the actor's mesh scale.
+///
+/// PORT: FUN_801DEA50 (`0x801ded0c..0x801ded38` and siblings).
+///
+/// `scale` is the `u16` at the actor's mesh header `+0x72`. The product is
+/// biased by `0xFFF` when negative before the `>> 12`, i.e. it truncates
+/// toward zero rather than flooring.
+///
+/// Input caveat (narrower than a missing caller): engine battle actors carry
+/// a typed pose and no mesh-header pointer, so the live tick substitutes the
+/// q12 unit (`0x1000`) for the retail `actor[+0x22C][+0x72]` word - offsets
+/// are unscaled until the per-actor render-node scale is modeled.
+pub fn scale_offset(off: i16, scale: u16) -> i32 {
+    let p = i32::from(off) * i32::from(scale);
+    let p = if p < 0 { p + 0xFFF } else { p };
+    p >> ROT_SHIFT
+}
+
+/// Resolve the move-power table index for an acting actor.
+///
+/// PORT: FUN_801DEA50 (`0x801df248..0x801df284`).
+///
+/// The actor's queued action byte `+0x1DF` indexes the **map** at
+/// `0x801F4E64` - and retail reads `map[action - 1]`, not `map[action]`
+/// (`0x801df25c`: `lbu v1,-0x1(v1)` after the add). The resulting id scales by
+/// [`MOVE_POWER_STRIDE`] into the record table at `0x801F4F5C`.
+///
+/// Returns `None` for action `0` (no queued action - the read would run off the
+/// front of the map).
+///
+/// The map is `legaia_game_tables::move_power::parse_id_index_map`'s table (runtime
+/// VA `0x801F4E64`), which the live tick passes when a
+/// `crate::move_power::MovePowerCatalog` is installed. Note the off-by-one:
+/// `map[action - 1]`, not `map[action]` (`0x801df25c`). The resulting record
+/// offset is surfaced on [`EffectScriptStep`] but has no consumer yet - the
+/// engine has no `ctx[+0x1014]` staged-record slot (see the module note).
+pub fn move_power_record_offset(map: &[u8], action: u8) -> Option<usize> {
+    let idx = usize::from(action).checked_sub(1)?;
+    let id = usize::from(*map.get(idx)?);
+    Some(id * MOVE_POWER_STRIDE)
+}
+
+/// One effect the stepper wants spawned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectSpawn {
+    /// Cursor the record sat at.
+    pub cursor: u8,
+    /// The record's effect selector, with [`EFFECT_DIRECT_BIT`] still set when
+    /// the direct form applies.
+    pub effect: u8,
+    /// `true` when this goes through `FUN_801DFDF0` rather than
+    /// `FUN_80050ED4`.
+    pub direct: bool,
+    /// World-space position the effect is spawned at.
+    pub at: (i32, i32, i32),
+}
+
+/// What one call of the stepper decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectScriptStep {
+    /// Cursor value the actor's `+0x1F5` should be left at.
+    pub cursor: u8,
+    /// Effects to spawn, in record order.
+    pub spawns: Vec<EffectSpawn>,
+    /// `Some(offset)` when the stream terminated this call - the byte offset of
+    /// the move-power record to install at the battle context's `+0x1014`.
+    pub move_power_offset: Option<usize>,
+    /// `Some(band)` when the stream terminated - the target slots whose homing
+    /// state the terminator seeds.
+    pub homing_band: Option<TargetBand>,
+    /// `Some(point)` when the stream terminated - the world-space **launch
+    /// position** the terminator writes into every `ctx[+0x1144 + i*8]` slot.
+    ///
+    /// It is the terminator record's own rotated offset, not the bare actor
+    /// position: retail re-seeds the stack pair from `actor[+0x34..+0x3B]` at
+    /// the top of *every* record iteration (`0x801DECE4`) and then runs the
+    /// scale + facing rotation on it (`0x801DED30` for Y, `0x801DEE40` /
+    /// `0x801DEE7C` or `0x801DF014` / `0x801DF050` for X / Z) **before** the
+    /// terminator test, so the quad the seed loop copies out at `0x801DF2B4`
+    /// carries the terminator record's placement. That point is what the
+    /// afterimage streak later projects
+    /// ([`legaia_render_kernels::afterimage`]).
+    pub launch: Option<(i32, i32, i32)>,
+}
+
+/// The battle-context block the terminator installs, and the consumer the
+/// move-FX streak reads it back through.
+///
+/// PORT: FUN_801DEA50 (`0x801df248..0x801df2e0` - the install + seed loop)
+///
+/// This is the sink for the two context writes the stepper used to compute
+/// and drop. Retail's block spans four context words:
+///
+/// | context | written by | read by |
+/// |---|---|---|
+/// | `+0x1014` | `sw` of the move-power record pointer (`0x801DF284`) | the action SM's per-move behaviour reads |
+/// | `+0x6C6` | `sh` of that record's `+0x04` (`0x801DF290`) | the afterimage streak's billboard **half-width**, as `word - 0x200` (`0x801E1B44`) |
+/// | `+0x24E + i` | `sb 1` per slot `i in 0..4` (`0x801DF2A4`) | the homing phase gate |
+/// | `+0x1144 + i*8` | the launch position, same loop (`0x801DF2B4`) | the streak's billboard **centre** (`0x801E1AF8`) |
+///
+/// The engine keeps the record as an id rather than a pointer (its damage
+/// path resolves move power by id through [`crate::move_power`]), and models
+/// the four homing slots as one shared launch point - retail's pre-seed
+/// loop writes the *same* quad into all four, and only the band loop that
+/// follows differentiates them, which is per-target homing state the streak
+/// never reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MoveFxStreak {
+    /// `ctx[+0x1014]`, as a table index rather than a pointer: the move id
+    /// whose record the terminator staged. `None` before any terminator.
+    pub move_id: Option<u8>,
+    /// `ctx[+0x6C6]` - the staged record's `+0x04` word.
+    pub counter_word: u16,
+    /// `ctx[+0x1144]` - the launch position every homing slot is seeded with.
+    pub launch: Option<(i32, i32, i32)>,
+    /// `ctx[+0x24E + i]` - the homing phase byte, `1` once seeded. Retail
+    /// writes four identical bytes; the engine keeps the one value.
+    pub phase: u8,
+    /// The band the seed loop swept, for hosts that want to know which
+    /// targets the move homes on.
+    pub band: Option<TargetBand>,
+}
+
+impl MoveFxStreak {
+    /// Apply one terminator's writes. No-op for a step that did not
+    /// terminate, so a host can call it unconditionally per frame.
+    ///
+    /// `counter_word` is the staged move-power record's `+0x04`
+    /// (`legaia_game_tables::move_power::MoveRecord::counter_init`); pass `None`
+    /// when no catalog is installed and the block keeps its previous word,
+    /// exactly as retail's `sh` would be skipped.
+    pub fn install(&mut self, step: &EffectScriptStep, counter_word: Option<u16>) -> bool {
+        let Some(band) = step.homing_band else {
+            return false;
+        };
+        self.move_id = step
+            .move_power_offset
+            .map(|off| (off / MOVE_POWER_STRIDE) as u8);
+        if let Some(w) = counter_word {
+            self.counter_word = w;
+        }
+        self.launch = step.launch;
+        self.phase = 1;
+        self.band = Some(band);
+        true
+    }
+
+    /// The streak billboard's half-width: `ctx[+0x6C6] - 0x200`, the value
+    /// `FUN_801E1AB0` hands the GTE projector at `0x801E1B44`. Mirrors
+    /// `legaia_render_kernels::afterimage::streak_half_width`, which is the
+    /// canonical port - repeated here so `engine-core` (which cannot depend
+    /// on the wgpu-linked render crate) can answer the same question.
+    pub fn half_width(&self) -> i16 {
+        (self.counter_word as i16).wrapping_sub(0x200)
+    }
+
+    /// `true` once a terminator has staged a launch point - i.e. the frame's
+    /// streak has something to project.
+    pub fn is_armed(&self) -> bool {
+        self.phase != 0 && self.launch.is_some()
+    }
+
+    /// The per-frame counter walk: retail's phase-1 arm decrements
+    /// `ctx[+0x6C6]` by `DAT_1F800393 << 2` per game frame and floors it at
+    /// zero (`FUN_801E09F8`, `0x801E0C1C..0x801E0C40`) - per 1-vsync engine
+    /// tick, 4. The word is what schedules the trail's two emitters: the
+    /// single-quad afterimage draws while it is `>= 0x281`, the chained
+    /// ribbon once it falls below `0x201` (`0x801E0C84..0x801E0CD4`), and
+    /// its `- 0x200` is the afterimage's shrinking half-width. Call once
+    /// per battle frame; no-op while unarmed.
+    // REF: FUN_801E09F8 (the move-FX phase driver's counter walk)
+    pub fn tick_counter(&mut self) {
+        self.tick_counter_by(1);
+    }
+
+    /// [`Self::tick_counter`] over one battle frame of `step` vsyncs, as
+    /// retail's pass makes it: `4 * step` off the word at once, floored at
+    /// zero (`lbu 0x393; sll 2; subu; bgez` at `0x801E0C1C..0x801E0C40`).
+    pub fn tick_counter_by(&mut self, step: u8) {
+        if self.phase != 0 {
+            self.counter_word = self.counter_word.saturating_sub(4 * u16::from(step));
+        }
+    }
+
+    /// Drop the block (the move finished / the actor's clip changed).
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// The number of homing slots the terminator seeds (`ctx[+0x24E..=+0x251]`).
+pub const HOMING_SLOTS: usize = 4;
+
+/// The flight arm's arrival radius: a slot within `|dx| + |dz| <= 0x100` of
+/// its target lands (`slti v0,v0,0x101` at `0x801E1334`).
+pub const HOMING_ARRIVAL: i32 = 0x100;
+
+/// One homing slot: `ctx[+0x24E + i]` (phase), `ctx[+0x252 + i]` (the target
+/// seat plus one, `0` = none), `ctx[+0x1144 + i*8]` (position),
+/// `ctx[+0x1166 + i*8]` (heading) and the per-slot counter
+/// `ctx[+0x6C6 + i*2]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HomingSlot {
+    /// `0` idle, `1` streaking, `2` in flight, `3` landed.
+    pub phase: u8,
+    /// The target's engine actor index plus one; `0` for no target.
+    pub child: u8,
+    pub pos: [i32; 3],
+    pub heading: u16,
+    pub counter: i16,
+}
+
+/// One effect-list spawn the flight made: the list byte (bit 7 = the 2D pool
+/// form, `0xFF` = a ribbon the port does not stage), where, and the heading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HomingSpawn {
+    pub effect: u8,
+    pub at: [i32; 3],
+    pub heading: u16,
+    /// The homing slot that made the spawn. A table-form spawn's actor is
+    /// that slot's handle `ctx[+0x1018 + slot * 4]` (`sw v0,0x1018(v1)` at
+    /// `0x801E1238` / `0x801E14DC`), the one [`HomingSlots::follows`] drags.
+    pub slot: u8,
+}
+
+/// The four homing slots a move's projectile flies on - the per-slot half of
+/// `FUN_801E09F8`'s effect-child driver, from the terminator's seed through
+/// the flight to the landing.
+///
+/// The terminator (`FUN_801DEA50`, `0x801DF298..0x801DF3DC`) seeds every
+/// slot at the launch point in phase `1`, and gives slot `i` of the target
+/// band the band's `i`-th seat as its child when that seat is alive and not
+/// the caster. Phase `1` waits out the streak counter (slot `0`'s word, the
+/// [`MoveFxStreak`] walk); then every slot takes phase `2` when the record's
+/// `+0x12` list is non-empty, else `3` (`0x801E0CF8..0x801E0D34`). Phase `2`
+/// turns onto the target, advances `record[+0x08]` units a frame along that
+/// heading (`0x801E0FE8..0x801E10B0`), spawns the `+0x12` list every time its
+/// counter runs out and re-arms it to `0x40 - record[+0x08]`
+/// (`0x801E1144..0x801E1280`), and lands inside [`HOMING_ARRIVAL`] of the
+/// target: phase `3`, counter `record[+0x06]`, the position snapped onto the
+/// target raised by `record[+0x02]`, and the `+0x16` list spawned there
+/// (`0x801E1334..0x801E1430`). Phase `3` counts down and then hits and frees
+/// the slot (`0x801E178C..0x801E1A68`).
+///
+/// The hit's arithmetic stays with the engine's cast fold; this carries the
+/// flight - the position the camera's projectile shot (`FUN_801DC0A0` case
+/// `8`) frames, the child count its case `7` hands on at, the spawns - and
+/// says **when** the hit lands: the pass a landed slot's counter has run out
+/// on is the one that rolls `FUN_801DD0AC` and writes the victim
+/// (`0x801E1844..0x801E1A68`), reported in [`HomingSlots::hits`].
+///
+/// PORT: FUN_801E09F8 (the per-slot phases 1..3: seed, flight, landing, free)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HomingSlots {
+    pub slots: [HomingSlot; HOMING_SLOTS],
+    /// The staged move-power record's table index (`ctx[+0x1014]`).
+    pub record: Option<usize>,
+    /// Whether the world routes this flight's list spawns. See
+    /// `World::seed_homing_slots`.
+    pub emits: bool,
+    /// The child bytes (target actor index plus one) of the slots the last
+    /// [`Self::step`] hit and freed, `0` for none. Slot-indexed.
+    pub hits: [u8; HOMING_SLOTS],
+    /// Where the last [`Self::step`] dragged each slot's handle actor: on a
+    /// record whose `+0x09` byte is set, a phase-`2` slot between two list
+    /// spawns copies its fresh position into the actor its last table-form
+    /// spawn returned (`0x801E10CC..0x801E1108`: `lbu v0,0x9(v0)`, then the
+    /// `+0x1144..+0x114B` octet into handle `+0x14..+0x1B`). So the node the
+    /// flight last seated rides the flight's head until the next spawn; a
+    /// slot that spawned this step, or does not track, reads `None`.
+    pub follows: [Option<[i32; 3]>; HOMING_SLOTS],
+}
+
+impl HomingSlots {
+    /// The terminator's seed: every slot at `launch` in phase `1`, and slot
+    /// `i` aimed at `seats[i]` when the closure finds it alive and not the
+    /// caster.
+    pub fn seed(
+        &mut self,
+        record: Option<usize>,
+        launch: (i32, i32, i32),
+        seats: &[Option<[i32; 3]>],
+        child_of: impl Fn(usize) -> u8,
+    ) {
+        self.record = record;
+        self.hits = [0; HOMING_SLOTS];
+        for (i, s) in self.slots.iter_mut().enumerate() {
+            *s = HomingSlot {
+                phase: 1,
+                child: 0,
+                pos: [launch.0, launch.1, launch.2],
+                heading: 0,
+                counter: 0,
+            };
+            if let Some(Some(t)) = seats.get(i) {
+                s.child = child_of(i);
+                s.heading = heading_to(s.pos, *t);
+            }
+        }
+    }
+
+    /// The census's child count `ctx[+0x24D]`: children of a seeded block.
+    pub fn children(&self) -> u8 {
+        if self.slots.iter().all(|s| s.phase == 0) {
+            return 0;
+        }
+        self.slots.iter().filter(|s| s.child != 0).count() as u8
+    }
+
+    /// Slot `0`'s position, the point case `8` frames, once seeded.
+    pub fn lead(&self) -> Option<[i32; 3]> {
+        self.record.map(|_| self.slots[0].pos)
+    }
+
+    /// One frame. `record` is the staged move-power record's raw bytes,
+    /// `streak_counter` slot `0`'s phase-`1` word, `target` the live position
+    /// of a child's actor (by child byte). Returns the list spawns made.
+    pub fn step(
+        &mut self,
+        record: &[u8],
+        streak_counter: u16,
+        target: impl Fn(u8) -> Option<[i32; 3]>,
+    ) -> Vec<HomingSpawn> {
+        self.run(record, streak_counter, 1, false, target)
+    }
+
+    /// One battle **pass** of `step` vsyncs, as retail's `FUN_801E09F8`
+    /// makes it once a battle frame: the flight advances
+    /// `(lut * speed * step) << 3 >> 15` (`mult` by the frame step byte
+    /// `0x1F800393` at `0x801E103C` / `0x801E1098`), every counter falls by
+    /// `4 * step` and floors at zero (`0x801E1110..0x801E1140`,
+    /// `0x801E17A8..0x801E17CC`), and a slot that lands in phase `2` falls
+    /// through to the phase-`3` arm on the same pass (`0x801E1338` to
+    /// `0x801E1560`), so its first countdown is that pass's.
+    /// `streak_counter` is slot `0`'s phase-`1` word as the pass found it,
+    /// before that pass's own walk ([`MoveFxStreak::tick_counter_by`]): the
+    /// arm takes the hand-over only on a pass that opens on zero
+    /// (`beq v0,zero,0x801E0CF8` at `0x801E0C14`).
+    ///
+    /// PORT: FUN_801E09F8 (the per-slot phases on retail's battle-frame cadence)
+    pub fn step_pass(
+        &mut self,
+        record: &[u8],
+        streak_counter: u16,
+        step: u8,
+        target: impl Fn(u8) -> Option<[i32; 3]>,
+    ) -> Vec<HomingSpawn> {
+        self.run(record, streak_counter, i32::from(step.max(1)), true, target)
+    }
+
+    fn run(
+        &mut self,
+        record: &[u8],
+        streak_counter: u16,
+        delta: i32,
+        landing_counts: bool,
+        target: impl Fn(u8) -> Option<[i32; 3]>,
+    ) -> Vec<HomingSpawn> {
+        let mut out = Vec::new();
+        let fall = 4 * delta as i16;
+        self.hits = [0; HOMING_SLOTS];
+        self.follows = [None; HOMING_SLOTS];
+        let tracks = record.get(0x09).copied().unwrap_or(0) != 0;
+        let byte = |o: usize| record.get(o).copied().unwrap_or(0);
+        let speed = i32::from(byte(0x08));
+        let list = |base: usize| -> Vec<u8> {
+            (0..4)
+                .map(|k| byte(base + k))
+                .take_while(|&b| b != 0)
+                .collect()
+        };
+        if self.slots[0].phase == 1 {
+            if streak_counter != 0 {
+                return out;
+            }
+            let next = if byte(0x12) != 0 { 2 } else { 3 };
+            for (i, s) in self.slots.iter_mut().enumerate() {
+                s.phase = next;
+                if next == 3
+                    && s.child != 0
+                    && let Some(t) = target(s.child)
+                {
+                    land(s, i as u8, t, record, &list, &mut out);
+                }
+            }
+        }
+        for (i, s) in self.slots.iter_mut().enumerate() {
+            if s.child == 0 {
+                continue;
+            }
+            let Some(t) = target(s.child) else {
+                // A child whose actor is gone has nothing to fly onto or
+                // hit: the slot frees, so the recovery gate that counts it
+                // (`ctx[+0x24D]`) cannot hold the band open on it.
+                if s.phase >= 2 {
+                    s.phase = 0;
+                    s.child = 0;
+                }
+                continue;
+            };
+            match s.phase {
+                2 => {
+                    s.heading = heading_to(s.pos, t);
+                    let (sin, cos) = legaia_engine_system::trig::trig12(s.heading);
+                    // `(lut * speed * delta) << 3 >> 15`.
+                    s.pos[2] += (i32::from(cos) * speed * delta * 8) >> 15;
+                    s.pos[0] += (i32::from(sin) * speed * delta * 8) >> 15;
+                    if s.counter != 0 {
+                        if tracks {
+                            self.follows[i] = Some(s.pos);
+                        }
+                        s.counter = (s.counter - fall).max(0);
+                    } else {
+                        for e in list(0x12) {
+                            if e != 0xFF {
+                                out.push(HomingSpawn {
+                                    effect: e,
+                                    at: s.pos,
+                                    heading: s.heading,
+                                    slot: i as u8,
+                                });
+                            }
+                        }
+                        s.counter = (0x40 - speed) as i16;
+                    }
+                    if (s.pos[0] - t[0]).abs() + (s.pos[2] - t[2]).abs() <= HOMING_ARRIVAL {
+                        land(s, i as u8, t, record, &list, &mut out);
+                        // The landing falls into the phase-3 arm on the
+                        // same pass (`0x801E13D8` / `0x801E1558` to
+                        // `0x801E1560`): a counter the landing armed
+                        // non-zero takes the pass's drain, and a zero one
+                        // hits and frees the slot there and then
+                        // (`beq v0,zero,0x801E1844` at `0x801E17A0`).
+                        if landing_counts {
+                            if s.counter != 0 {
+                                s.counter = (s.counter - fall).max(0);
+                            } else {
+                                self.hits[i] = s.child;
+                                s.phase = 0;
+                                s.child = 0;
+                            }
+                        }
+                    }
+                }
+                3 => {
+                    if s.counter != 0 {
+                        s.counter = (s.counter - fall).max(0);
+                    } else {
+                        // `0x801E1844..0x801E1A68`: the hit, then the free.
+                        self.hits[i] = s.child;
+                        s.phase = 0;
+                        s.child = 0;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+/// `FUN_80019B28(a.z, a.x, b.z, b.x)`.
+fn heading_to(a: [i32; 3], b: [i32; 3]) -> u16 {
+    legaia_engine_battle_vm::battle_action::bearing_12bit_approx(
+        a[2] as i16,
+        a[0] as i16,
+        b[2] as i16,
+        b[0] as i16,
+    )
+}
+
+/// The landing (`0x801E1340..0x801E1430`): phase `3`, counter
+/// `record[+0x06]`, the slot on its target raised by `record[+0x02]`, and the
+/// `+0x16` list spawned there.
+fn land(
+    s: &mut HomingSlot,
+    slot: u8,
+    t: [i32; 3],
+    record: &[u8],
+    list: &impl Fn(usize) -> Vec<u8>,
+    out: &mut Vec<HomingSpawn>,
+) {
+    let half = |o: usize| {
+        i16::from_le_bytes([
+            record.get(o).copied().unwrap_or(0),
+            record.get(o + 1).copied().unwrap_or(0),
+        ])
+    };
+    s.phase = 3;
+    s.counter = half(0x06);
+    s.pos = [t[0], t[1] - i32::from(half(0x02)), t[2]];
+    for e in list(0x16) {
+        if e != 0xFF {
+            out.push(HomingSpawn {
+                effect: e,
+                at: s.pos,
+                heading: s.heading,
+                slot,
+            });
+        }
+    }
+}
+
+/// Actor state the stepper reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectScriptActor {
+    /// `+0x1F5` - the record cursor.
+    pub cursor: u8,
+    /// `+0x46` - facing, in PSX angle units.
+    pub facing: u16,
+    /// `+0x34`/`+0x38`/`+0x3C` - the actor's world position the offsets are
+    /// applied to.
+    pub world: (i32, i32, i32),
+    /// The actor's mesh scale (`actor[+0x22C][+0x72]`).
+    pub scale: u16,
+    /// `+0x1DD` - the target-scope byte.
+    pub scope: u8,
+    /// `+0x1DF` - the queued action byte.
+    pub action: u8,
+    /// `+0x1DC` bit `0x8` - "this actor's effects are suppressed", which makes
+    /// the whole call a no-op.
+    pub suppressed: bool,
+    /// The attacker's live pair (`+0x34` / `+0x38`) with its target's **seat**
+    /// pair (`+0x3C` / `+0x40` of `pool[+0x1DD]`) - what `FUN_801DF570`
+    /// measures the separation over. `None` when the scope byte names no
+    /// single actor; the [`APPROACH_CLAMPED_EFFECTS`] records then keep their
+    /// authored offset.
+    pub approach: Option<legaia_engine_battle_vm::battle_approach::ApproachPose>,
+}
+
+/// The direct branch's approach clamp (`0x801DEDC0..0x801DEDD0`): the scaled
+/// Z offset, sign-extended to a halfword, goes through `FUN_801DF570` and the
+/// result replaces it before the facing rotation - so a `0x93` / `0x84`
+/// effect lands inside `[3d/4, d]` of the attacker-target separation `d`
+/// rather than at its authored distance.
+///
+/// The separation reads the same LUT pair the rotation does, at the bearing
+/// from the target's seat back to the attacker plus a half-turn:
+/// `_DAT_8007B81C` ([`RotationLut::b`]) scales the X delta and `_DAT_8007B7F8`
+/// ([`RotationLut::a`]) the Z delta (`0x801DF5D8..0x801DF60C`).
+fn approach_clamped_z<L: RotationLut>(
+    lut: &L,
+    pose: legaia_engine_battle_vm::battle_approach::ApproachPose,
+    requested: i16,
+) -> i16 {
+    use legaia_engine_battle_vm::battle_approach::{approach_angle, approach_distance};
+    let bearing = legaia_engine_battle_vm::battle_action::bearing_12bit_approx(
+        pose.ref_z, pose.ref_x, pose.z, pose.x,
+    );
+    let a = approach_angle(bearing);
+    approach_distance(pose, requested, lut.b(a) as i16, lut.a(a) as i16)
+}
+
+/// Walk the effect script for one frame.
+///
+/// PORT: FUN_801DEA50 (`0x801dec4c..0x801df53c`).
+///
+/// `frame` is the action's frame counter (the stepper's third argument); a
+/// record whose `+0x00` gate is above `frame + 1` stops the walk for this call
+/// without advancing the cursor, and a gate of `0` also stops it. Otherwise the
+/// record spawns, the cursor advances, and the walk continues while the cursor
+/// is below [`MAX_CURSOR`].
+///
+/// **A terminator does not break the loop.** Retail's terminator arm only sets
+/// the local flag that enables the move-power install; the cursor still
+/// advances and the walk still continues (`0x801df50c..0x801df538` is the sole
+/// loop back-edge). What actually stops it one record later is the `+0x00 == 0`
+/// gate on the zero-filled tail. The port keeps that structure, so a script
+/// with two terminators installs twice - which is what the bytes do.
+///
+/// Wired: `World::tick_battle_animations` drives this once per battle frame
+/// per actor with a committed clip, mirroring the retail cadence (the two
+/// `jal` sites `0x800478B8` / `0x80047C08` inside `FUN_80047430`, the
+/// per-frame anim-node tick dispatched from `FUN_8002519C`). The block is the
+/// committed clip's disc entry head, the cursor persists on
+/// `world::Actor::battle_effect_cursor`, and the spawns queue as
+/// `world::BattleEffectSpawn`s for the host FX layer. Still open: the retail
+/// call sites' `_DAT_8007BD71 == 0xFF` effect-VM-ready gate has no checked
+/// engine model (the engine steps whenever a clip is committed), and the
+/// terminator's two context installs surface without a consumer (module
+/// note).
+pub fn step_effect_script<L: RotationLut>(
+    lut: &L,
+    block: &[u8],
+    actor: EffectScriptActor,
+    frame: u8,
+    move_power_map: &[u8],
+) -> EffectScriptStep {
+    let mut out = EffectScriptStep {
+        cursor: actor.cursor,
+        spawns: Vec::new(),
+        move_power_offset: None,
+        homing_band: None,
+        launch: None,
+    };
+    if actor.suppressed || actor.cursor >= MAX_CURSOR {
+        return out;
+    }
+    while out.cursor < MAX_CURSOR {
+        let Some(rec) = EffectRecord::at(block, out.cursor) else {
+            break;
+        };
+        // Frame gate: `frame + 1 < rec.frame` defers, `rec.frame == 0` ends.
+        if i32::from(frame) + 1 < i32::from(rec.frame) || rec.frame == 0 {
+            break;
+        }
+        // The offset math runs for EVERY record, terminator included: retail
+        // re-seeds the stack pair from the actor position and rotates it
+        // before the terminator test, so the terminator's own placement is
+        // what the homing seed copies out as the launch position.
+        let sx = scale_offset(rec.off_x, actor.scale);
+        let sy = scale_offset(rec.off_y, actor.scale);
+        let mut sz = scale_offset(rec.off_z, actor.scale);
+        if APPROACH_CLAMPED_EFFECTS.contains(&rec.effect)
+            && let Some(pose) = actor.approach
+        {
+            sz = i32::from(approach_clamped_z(lut, pose, sz as i16));
+        }
+        let (dx, dz) = rotate_offset(
+            lut,
+            actor.facing,
+            FacingBias::for_effect(rec.effect),
+            sx,
+            sz,
+        );
+        // Y is subtracted (`0x801ded38`: `subu v0,v0,v1`).
+        let at = (actor.world.0 + dx, actor.world.1 - sy, actor.world.2 + dz);
+        if rec.is_terminator() {
+            out.move_power_offset = move_power_record_offset(move_power_map, actor.action);
+            out.homing_band = Some(TargetBand::from_scope(actor.scope));
+            out.launch = Some(at);
+        } else {
+            out.spawns.push(EffectSpawn {
+                cursor: out.cursor,
+                effect: rec.effect,
+                direct: rec.is_direct(),
+                at,
+            });
+        }
+        out.cursor += 1;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use legaia_engine_system::rotation_lut::retail_rotation_lut;
+
+    /// A rotation LUT in the retail fixed point. Generated, not lifted.
+    struct Lut {
+        t: Vec<i16>,
+    }
+
+    impl Lut {
+        fn new() -> Self {
+            let one = f64::from(1 << ROT_SHIFT);
+            Self {
+                t: (0..4096)
+                    .map(|i| {
+                        let a = f64::from(i) * std::f64::consts::TAU / 4096.0;
+                        (a.sin() * one).round() as i16
+                    })
+                    .collect(),
+            }
+        }
+    }
+
+    impl RotationLut for Lut {
+        fn a(&self, angle: i32) -> i32 {
+            i32::from(self.t[(angle & ANGLE_MASK) as usize])
+        }
+        fn b(&self, angle: i32) -> i32 {
+            i32::from(self.t[((angle + 1024) & ANGLE_MASK) as usize])
+        }
+    }
+
+    fn actor() -> EffectScriptActor {
+        EffectScriptActor {
+            cursor: 0,
+            facing: 0,
+            world: (1000, 200, 3000),
+            scale: 1 << ROT_SHIFT,
+            scope: 9,
+            action: 5,
+            suppressed: false,
+            approach: None,
+        }
+    }
+
+    /// `[frame, effect, x, y, z]` per record, laid out at `RECORD_BASE`.
+    fn block(records: &[(u8, u8, i16, i16, i16)]) -> Vec<u8> {
+        let mut b = vec![0u8; RECORD_BASE + records.len() * RECORD_STRIDE];
+        for (i, &(f, e, x, y, z)) in records.iter().enumerate() {
+            let o = RECORD_BASE + i * RECORD_STRIDE;
+            b[o] = f;
+            b[o + 1] = e;
+            b[o + 2..o + 4].copy_from_slice(&x.to_le_bytes());
+            b[o + 4..o + 6].copy_from_slice(&y.to_le_bytes());
+            b[o + 6..o + 8].copy_from_slice(&z.to_le_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn retail_lut_is_the_truncated_sine_pair() {
+        let lut = retail_rotation_lut();
+        // Cardinal points of the 12-bit angle space.
+        assert_eq!(lut.b(0), 0);
+        assert_eq!(lut.b(1024), 4096); // sin(90 deg) at 1<<12 fixed point
+        assert_eq!(lut.b(2048), 0);
+        assert_eq!(lut.b(3072), -4096);
+        // `a` is `b` advanced a quarter revolution (the retail +0x800-byte
+        // pointer offset): cosine.
+        assert_eq!(lut.a(0), 4096);
+        assert_eq!(lut.a(1024), 0);
+        assert_eq!(lut.a(2048), -4096);
+        for angle in [1, 7, 100, 2047, 4095] {
+            assert_eq!(lut.a(angle), lut.b((angle + 1024) & 0xFFF), "{angle}");
+        }
+        // Truncation toward zero, not rounding: entry 1 is
+        // trunc(sin(2pi/4096)*4096) = trunc(6.283) = 6 (rounding would give
+        // the same here, but entry 3 separates them: trunc(18.849) = 18).
+        assert_eq!(lut.b(1), 6);
+        assert_eq!(lut.b(3), 18);
+        // A retail-LUT rotation preserves length like the synthetic one.
+        let r = rotate_offset(lut, 300, FacingBias::Half, 1000, 250);
+        let len = ((r.0 * r.0 + r.1 * r.1) as f64).sqrt();
+        let src = ((1000.0f64 * 1000.0) + (250.0 * 250.0)).sqrt();
+        assert!((len - src).abs() <= 4.0, "{r:?}");
+    }
+
+    #[test]
+    fn scope_bytes_pick_a_row_or_a_single_slot() {
+        assert_eq!(
+            TargetBand::from_scope(9).slots().collect::<Vec<_>>(),
+            vec![3, 4, 5, 6]
+        );
+        assert_eq!(
+            TargetBand::from_scope(8).slots().collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        // The `0..=7` arm is a single slot, and it always runs once.
+        for s in 0..8u8 {
+            assert_eq!(
+                TargetBand::from_scope(s).slots().collect::<Vec<_>>(),
+                vec![s]
+            );
+        }
+        // Out-of-range bytes fall through to the single-slot form.
+        assert_eq!(
+            TargetBand::from_scope(20).slots().collect::<Vec<_>>(),
+            vec![20]
+        );
+    }
+
+    #[test]
+    fn a_unit_scale_passes_the_offset_through_and_truncates_toward_zero() {
+        assert_eq!(scale_offset(100, 1 << ROT_SHIFT), 100);
+        assert_eq!(scale_offset(-100, 1 << ROT_SHIFT), -100);
+        // Half scale: 100 -> 50, -100 -> -50 (truncate, not floor).
+        assert_eq!(scale_offset(100, 1 << (ROT_SHIFT - 1)), 50);
+        assert_eq!(scale_offset(-100, 1 << (ROT_SHIFT - 1)), -50);
+        // A fractional negative rounds toward zero, so a small offset vanishes
+        // rather than becoming -1.
+        assert_eq!(scale_offset(-1, 1), 0);
+    }
+
+    #[test]
+    fn the_rotation_is_facing_dependent_and_preserves_length() {
+        let lut = Lut::new();
+        let len = |(x, z): (i32, i32)| (((x * x + z * z) as f64).sqrt()) as i32;
+        let base = rotate_offset(&lut, 0, FacingBias::None, 1000, 0);
+        let quarter = rotate_offset(&lut, 1024, FacingBias::None, 1000, 0);
+        assert_ne!(base, quarter, "a quarter turn must move the offset");
+        // The four-read pair is a rotation, so the magnitude survives (within
+        // the fixed point's rounding).
+        assert!(
+            (len(base) - len(quarter)).abs() <= 4,
+            "{base:?} {quarter:?}"
+        );
+        assert!((len(base) - 1000).abs() <= 4, "{base:?}");
+    }
+
+    #[test]
+    fn the_half_bias_is_the_opposite_facing() {
+        let lut = Lut::new();
+        let none = rotate_offset(&lut, 0, FacingBias::None, 1000, 500);
+        let half = rotate_offset(&lut, 0, FacingBias::Half, 1000, 500);
+        // A half-revolution bias negates the rotated offset (to within the
+        // fixed point's independent per-product rounding).
+        assert!((none.0 + half.0).abs() <= 4, "{none:?} {half:?}");
+        assert!((none.1 + half.1).abs() <= 4, "{none:?} {half:?}");
+        // And the bias a record picks follows its direct bit.
+        assert_eq!(FacingBias::for_effect(0x10), FacingBias::Half);
+        assert_eq!(
+            FacingBias::for_effect(EFFECT_DIRECT_BIT | 0x10),
+            FacingBias::None
+        );
+    }
+
+    #[test]
+    fn move_power_index_reads_one_before_the_action() {
+        let map = [7u8, 9, 11, 13];
+        // action 1 -> map[0] = 7.
+        assert_eq!(
+            move_power_record_offset(&map, 1),
+            Some(7 * MOVE_POWER_STRIDE)
+        );
+        // action 4 -> map[3] = 13.
+        assert_eq!(
+            move_power_record_offset(&map, 4),
+            Some(13 * MOVE_POWER_STRIDE)
+        );
+        // action 0 has no record.
+        assert_eq!(move_power_record_offset(&map, 0), None);
+        // past the map end.
+        assert_eq!(move_power_record_offset(&map, 9), None);
+    }
+
+    #[test]
+    fn the_walk_spawns_then_terminates_and_installs_the_move_power() {
+        let lut = Lut::new();
+        let b = block(&[
+            (1, 0x10, 100, 0, 0),
+            (1, 0x11, 0, 0, 100),
+            (1, 0xFF, 0, 0, 0),
+        ]);
+        let map = [0u8, 0, 0, 0, 3];
+        let s = step_effect_script(&lut, &b, actor(), 4, &map);
+        assert_eq!(s.spawns.len(), 2);
+        // The terminator advances the cursor too, then the zero-filled tail's
+        // `+0x00 == 0` gate stops the walk.
+        assert_eq!(s.cursor, 3);
+        assert_eq!(s.move_power_offset, Some(3 * MOVE_POWER_STRIDE));
+        assert_eq!(s.homing_band, Some(TargetBand { first: 3, last: 6 }));
+        assert!(!s.spawns[0].direct);
+    }
+
+    #[test]
+    fn the_terminator_carries_its_own_placement_as_the_launch_point() {
+        let lut = Lut::new();
+        // A terminator with a non-zero offset: retail rotates it like any
+        // other record before it notices the record ends the stream, so the
+        // launch point is NOT the bare actor position.
+        let b = block(&[(1, 0xFF, 100, 40, 0)]);
+        let s = step_effect_script(&lut, &b, actor(), 4, &[0u8; 8]);
+        let launch = s.launch.expect("terminator seeds a launch point");
+        assert_ne!(launch, actor().world, "the offset is applied");
+        // Y is subtracted, unrotated.
+        assert_eq!(launch.1, actor().world.1 - 40);
+        // A zero-offset terminator does land on the actor.
+        let b0 = block(&[(1, 0xFF, 0, 0, 0)]);
+        let s0 = step_effect_script(&lut, &b0, actor(), 4, &[0u8; 8]);
+        assert_eq!(s0.launch, Some(actor().world));
+    }
+
+    #[test]
+    fn a_step_that_does_not_terminate_seeds_nothing() {
+        let lut = Lut::new();
+        let b = block(&[(1, 0x10, 0, 0, 0)]);
+        let s = step_effect_script(&lut, &b, actor(), 4, &[0u8; 8]);
+        assert_eq!(s.launch, None);
+        let mut blk = MoveFxStreak::default();
+        assert!(!blk.install(&s, Some(0x300)));
+        assert!(!blk.is_armed());
+        assert_eq!(blk, MoveFxStreak::default());
+    }
+
+    #[test]
+    fn the_terminator_installs_the_streak_block() {
+        let lut = Lut::new();
+        let b = block(&[(1, 0x10, 0, 0, 0), (1, 0xFF, 0, 0, 0)]);
+        let map = [0u8, 0, 0, 0, 3];
+        let s = step_effect_script(&lut, &b, actor(), 4, &map);
+
+        let mut blk = MoveFxStreak::default();
+        assert!(blk.install(&s, Some(0x300)));
+        // `ctx[+0x1014]` as an id: the offset the terminator resolved, back
+        // through the table stride.
+        assert_eq!(blk.move_id, Some(3));
+        // `ctx[+0x6C6]` verbatim, and the projector's half-width from it.
+        assert_eq!(blk.counter_word, 0x300);
+        assert_eq!(blk.half_width(), 0x100);
+        assert_eq!(blk.launch, s.launch);
+        assert_eq!(blk.phase, 1);
+        assert_eq!(blk.band, s.homing_band);
+        assert!(blk.is_armed());
+
+        // No catalog: the `sh` is skipped and the previous word stands.
+        let mut again = blk;
+        assert!(again.install(&s, None));
+        assert_eq!(again.counter_word, 0x300);
+
+        blk.clear();
+        assert!(!blk.is_armed());
+    }
+
+    #[test]
+    fn half_width_is_the_context_word_minus_0x200_and_wraps() {
+        // The projector argument is a signed 16-bit subtract, so a small
+        // counter yields a negative half-width - retail passes it through.
+        let mut blk = MoveFxStreak {
+            counter_word: 0x100,
+            ..Default::default()
+        };
+        assert_eq!(blk.half_width(), -0x100);
+        blk.counter_word = 0x200;
+        assert_eq!(blk.half_width(), 0);
+    }
+
+    #[test]
+    fn both_terminator_encodings_end_the_stream() {
+        // The direct branch's `0xFF` and the table branch's `0x7F` are the
+        // same marker seen through the bit-0x80 branch split.
+        for e in [0x7Fu8, 0xFF] {
+            let lut = Lut::new();
+            let b = block(&[(1, e, 0, 0, 0)]);
+            let s = step_effect_script(&lut, &b, actor(), 4, &[0u8, 0, 0, 0, 1]);
+            assert!(s.spawns.is_empty(), "effect {e:#x} should not spawn");
+            assert!(s.move_power_offset.is_some(), "effect {e:#x}");
+        }
+        // A neighbouring id is an ordinary effect.
+        let lut = Lut::new();
+        let b = block(&[(1, 0x7E, 0, 0, 0)]);
+        let s = step_effect_script(&lut, &b, actor(), 4, &[]);
+        assert_eq!(s.spawns.len(), 1);
+        assert!(s.move_power_offset.is_none());
+    }
+
+    #[test]
+    fn the_direct_bit_routes_to_the_other_spawn_form() {
+        let lut = Lut::new();
+        let b = block(&[(1, EFFECT_DIRECT_BIT | 0x13, 0, 0, 0)]);
+        let s = step_effect_script(&lut, &b, actor(), 1, &[]);
+        assert_eq!(s.spawns.len(), 1);
+        assert!(s.spawns[0].direct);
+        assert_eq!(s.spawns[0].effect, EFFECT_DIRECT_BIT | 0x13);
+    }
+
+    #[test]
+    fn a_future_frame_gate_defers_without_advancing_the_cursor() {
+        let lut = Lut::new();
+        let b = block(&[(1, 0x10, 0, 0, 0), (9, 0x11, 0, 0, 0)]);
+        let s = step_effect_script(&lut, &b, actor(), 0, &[]);
+        // frame 0 + 1 == 1 clears the first gate but not the second.
+        assert_eq!(s.spawns.len(), 1);
+        assert_eq!(s.cursor, 1);
+        assert_eq!(s.move_power_offset, None);
+    }
+
+    #[test]
+    fn a_suppressed_actor_does_nothing() {
+        let lut = Lut::new();
+        let b = block(&[(1, 0x10, 0, 0, 0)]);
+        let mut a = actor();
+        a.suppressed = true;
+        let s = step_effect_script(&lut, &b, a, 4, &[]);
+        assert!(s.spawns.is_empty());
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn an_exhausted_cursor_does_nothing() {
+        let lut = Lut::new();
+        let b = block(&[(1, 0x10, 0, 0, 0)]);
+        let mut a = actor();
+        a.cursor = MAX_CURSOR;
+        let s = step_effect_script(&lut, &b, a, 4, &[]);
+        assert!(s.spawns.is_empty());
+        assert_eq!(s.cursor, MAX_CURSOR);
+    }
+
+    #[test]
+    fn the_y_offset_is_subtracted_not_added() {
+        let lut = Lut::new();
+        let b = block(&[(1, 0x10, 0, 300, 0)]);
+        let a = actor();
+        let s = step_effect_script(&lut, &b, a, 1, &[]);
+        assert_eq!(s.spawns[0].at.1, a.world.1 - 300);
+    }
+
+    /// The direct `0x93` / `0x84` records clamp their Z offset into the
+    /// attacker-target separation before rotating it (`FUN_801DF570` at
+    /// `0x801DEDC8`); every other record - and a `0x93` with no single
+    /// target - keeps its authored offset.
+    #[test]
+    fn the_approach_effects_clamp_their_z_offset_into_the_separation() {
+        use legaia_engine_battle_vm::battle_approach::ApproachPose;
+        let lut = retail_rotation_lut();
+        // Attacker 400 units down +Z from its target's seat, facing it.
+        let pose = ApproachPose {
+            x: 0,
+            z: 400,
+            ref_x: 0,
+            ref_z: 0,
+        };
+        let mut a = actor();
+        a.world = (0, 0, 400);
+        a.approach = Some(pose);
+        // A 1000-unit authored reach overshoots the 400-unit gap: clamped to d.
+        let far = step_effect_script(lut, &block(&[(1, 0x93, 0, 0, 1000)]), a, 0, &[]);
+        let near = approach_clamped_z(lut, pose, 1000);
+        assert_eq!(near, 400, "min(requested, d)");
+        let expect = rotate_offset(lut, a.facing, FacingBias::None, 0, i32::from(near));
+        assert_eq!(
+            far.spawns[0].at,
+            (a.world.0 + expect.0, a.world.1, a.world.2 + expect.1)
+        );
+        // A 10-unit reach is floored at three quarters of the gap.
+        assert_eq!(approach_clamped_z(lut, pose, 10), 300);
+        // A plain direct record is untouched.
+        let plain = step_effect_script(lut, &block(&[(1, 0x92, 0, 0, 1000)]), a, 0, &[]);
+        let raw = rotate_offset(lut, a.facing, FacingBias::None, 0, 1000);
+        assert_eq!(plain.spawns[0].at, (raw.0, 0, 400 + raw.1));
+        // No single target: the authored offset stands.
+        a.approach = None;
+        let open = step_effect_script(lut, &block(&[(1, 0x84, 0, 0, 1000)]), a, 0, &[]);
+        assert_eq!(open.spawns[0].at, (raw.0, 0, 400 + raw.1));
+    }
+
+    /// A move-power record shaped like Tail Fire's (table index 18): speed
+    /// `0x20`, a lift, a landing counter, one `0x1B` on each list.
+    fn tail_fire_like(lift: i16, land_counter: i16) -> [u8; 26] {
+        let mut r = [0u8; 26];
+        r[0x02..0x04].copy_from_slice(&lift.to_le_bytes());
+        r[0x06..0x08].copy_from_slice(&land_counter.to_le_bytes());
+        r[0x08] = 0x20;
+        r[0x12] = 0x1B;
+        r[0x16] = 0x1B;
+        r
+    }
+
+    #[test]
+    fn a_seeded_slot_flies_lands_raised_and_frees() {
+        let rec = tail_fire_like(300, 8);
+        let target = [0, 0, -2000];
+        let mut h = HomingSlots::default();
+        h.seed(Some(18), (0, -300, 0), &[Some(target)], |_| 1);
+        assert_eq!(h.children(), 1);
+        assert_eq!(h.lead(), Some([0, -300, 0]));
+        // Phase 1 holds while the streak word runs.
+        assert!(h.step(&rec, 4, |_| Some(target)).is_empty());
+        assert_eq!(h.slots[0].phase, 1);
+        // Then the flight: one `+0x12` spawn on its first pass, re-armed to
+        // `0x40 - speed` and fired again once that has drained by 4 a frame.
+        let first = h.step(&rec, 0, |_| Some(target));
+        assert_eq!(first.len(), 1);
+        assert_eq!(h.slots[0].phase, 2);
+        assert_eq!(h.slots[0].pos[2], -0x20, "speed 0x20 straight down -z");
+        let mut spawns = first.len();
+        let mut frames = 1;
+        while h.slots[0].phase == 2 {
+            spawns += h.step(&rec, 0, |_| Some(target)).len();
+            frames += 1;
+            assert!(frames < 200, "the slot arrives");
+        }
+        // Landed inside the radius: on the target, raised by the record's
+        // lift, the `+0x16` list fired there.
+        assert_eq!(h.slots[0].phase, 3);
+        assert_eq!(h.slots[0].pos, [0, -300, -2000]);
+        assert!(spawns >= 2);
+        // The landing counter drains, then the slot frees.
+        for _ in 0..2 {
+            h.step(&rec, 0, |_| Some(target));
+        }
+        assert_eq!(h.slots[0].phase, 3);
+        assert_eq!(h.hits, [0; 4], "no hit while the landing counter runs");
+        h.step(&rec, 0, |_| Some(target));
+        assert_eq!(h.slots[0].phase, 0);
+        assert_eq!(h.hits, [1, 0, 0, 0], "the hit lands on the freeing pass");
+        assert_eq!(h.children(), 0);
+        h.step(&rec, 0, |_| Some(target));
+        assert_eq!(h.hits, [0; 4], "and is reported once");
+        assert_eq!(
+            h.lead(),
+            Some([0, -300, -2000]),
+            "the point stays for case 8"
+        );
+    }
+
+    #[test]
+    fn an_empty_flight_list_lands_straight_from_the_streak() {
+        let mut rec = tail_fire_like(0, 0);
+        rec[0x12] = 0;
+        let mut h = HomingSlots::default();
+        h.seed(Some(1), (0, 0, 0), &[Some([500, 0, 500])], |_| 1);
+        let out = h.step(&rec, 0, |_| Some([500, 0, 500]));
+        // The transition falls straight into the per-slot pass in the same
+        // call (`0x801E0F70` -> `0x801E0F78`), so a zero landing counter
+        // frees the slot on the frame it lands.
+        assert_eq!(h.slots[0].phase, 0);
+        assert_eq!(h.slots[0].pos, [500, 0, 500]);
+        assert_eq!(out.len(), 1, "the `+0x16` list only");
+        assert_eq!(h.hits[0], 1);
+    }
+
+    /// On retail's cadence a pass moves `step` vsyncs' worth and drains
+    /// every counter `4 * step` at once: the flight's re-arm (`0x40 - 0x20`
+    /// = `32`) fires again after four step-`2` passes and one more to read
+    /// zero, not after nine one-vsync calls; the landing pass counts its
+    /// counter down once (`0x801E1338` falls into the phase-3 arm).
+    #[test]
+    fn a_pass_drains_and_moves_a_whole_frame_step() {
+        let rec = tail_fire_like(300, 8);
+        let target = [0, 0, -2000];
+        let mut h = HomingSlots::default();
+        h.seed(Some(18), (0, -300, 0), &[Some(target)], |_| 1);
+        let first = h.step_pass(&rec, 0, 2, |_| Some(target));
+        assert_eq!(first.len(), 1);
+        assert_eq!(h.slots[0].pos[2], -0x40, "two vsyncs of speed 0x20");
+        assert_eq!(h.slots[0].counter, 0x20);
+        let mut passes = 0;
+        while h.step_pass(&rec, 0, 2, |_| Some(target)).is_empty() {
+            passes += 1;
+        }
+        assert_eq!(passes, 4, "32 drains in four passes of 8, then fires");
+        // Land: the landing pass already takes 8 off the landing counter.
+        while h.slots[0].phase == 2 {
+            h.step_pass(&rec, 0, 2, |_| Some(target));
+        }
+        assert_eq!(h.slots[0].counter, 0);
+        h.step_pass(&rec, 0, 2, |_| Some(target));
+        assert_eq!(h.hits, [1, 0, 0, 0]);
+    }
+
+    /// Tail Fire's record arms no landing counter (`+0x06 == 0`): the pass
+    /// that lands runs the phase-3 arm on a zero counter and hits there
+    /// (`0x801E1560` -> `0x801E17A0` -> `0x801E1844`), not a pass later.
+    #[test]
+    fn a_zero_counter_landing_hits_on_its_pass() {
+        let rec = tail_fire_like(0, 0);
+        let target = [100, 0, 100];
+        let mut h = HomingSlots::default();
+        h.seed(Some(18), (0, 0, 0), &[Some(target)], |_| 1);
+        h.step_pass(&rec, 0, 2, |_| Some(target));
+        assert_eq!(h.hits, [1, 0, 0, 0]);
+        assert_eq!(h.slots[0].phase, 0);
+    }
+
+    /// A record with `+0x09` set drags its handle between spawns: the pass
+    /// that spawns reports no follow, every pass after it until the counter
+    /// next runs out reports the slot's fresh position
+    /// (`0x801E10CC..0x801E1108`). A record without it never does.
+    #[test]
+    fn a_tracking_record_drags_the_handle_between_spawns() {
+        let mut rec = tail_fire_like(300, 8);
+        rec[0x09] = 1;
+        let target = [0, 0, -2000];
+        let mut h = HomingSlots::default();
+        h.seed(Some(18), (0, -300, 0), &[Some(target)], |_| 1);
+        let spawns = h.step(&rec, 0, |_| Some(target));
+        assert_eq!(spawns.len(), 1);
+        assert_eq!(spawns[0].slot, 0);
+        assert_eq!(h.follows, [None; 4], "the spawning pass drags nothing");
+        h.step(&rec, 0, |_| Some(target));
+        assert_eq!(h.follows[0], Some(h.slots[0].pos));
+        assert_eq!(h.follows[0].map(|p| p[2]), Some(-0x40));
+        rec[0x09] = 0;
+        h.step(&rec, 0, |_| Some(target));
+        assert_eq!(h.follows, [None; 4], "an untracked record never drags");
+    }
+
+    #[test]
+    fn a_slot_whose_target_is_gone_frees_without_a_hit() {
+        let rec = tail_fire_like(300, 8);
+        let target = [0, 0, -2000];
+        let mut h = HomingSlots::default();
+        h.seed(Some(18), (0, -300, 0), &[Some(target)], |_| 1);
+        h.step(&rec, 0, |_| Some(target));
+        assert_eq!(h.slots[0].phase, 2);
+        h.step(&rec, 0, |_| None);
+        assert_eq!(h.slots[0].phase, 0);
+        assert_eq!(h.children(), 0);
+        assert_eq!(h.hits, [0; 4]);
+    }
+}
+
+#[cfg(test)]
+mod floor_part_tests {
+    use super::*;
+
+    /// Only the direct codes `0x81..=0x83` seat the floor part.
+    #[test]
+    fn the_floor_part_follows_codes_0x81_to_0x83() {
+        let hits: Vec<u8> = (0..=0xFFu8).filter(|&c| seats_floor_part(c)).collect();
+        assert_eq!(hits, vec![0x81, 0x82, 0x83]);
+    }
+}

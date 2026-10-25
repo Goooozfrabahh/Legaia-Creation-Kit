@@ -1,0 +1,365 @@
+<!-- Arrow symbol defs lifted from site/img/legaia-arts arrow style.
+     Hidden; referenced via <use href="#ar-*"> in the per-art SVG cards.
+     Yellow = trigger / finisher input; Purple = setup / lead-in input.
+     Per Legaia UI convention: regulars highlight only the last (trigger)
+     input in yellow; Hyper / Super / Miracle arts light up every input. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" style="display:none" aria-hidden="true">
+  <defs>
+    <linearGradient id="artsBgGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"   stop-color="#1B1E75"/>
+      <stop offset="50%"  stop-color="#121558"/>
+      <stop offset="100%" stop-color="#0C0E45"/>
+    </linearGradient>
+    <symbol id="ar-up-y" viewBox="0 0 20 20">
+      <path d="M 8,0 L 16,8 L 11,8 L 11,16 L 5,16 L 5,8 L 0,8 Z" fill="#111111" transform="translate(2,2)"/>
+      <path d="M 8,0 L 16,8 L 11,8 L 11,16 L 5,16 L 5,8 L 0,8 Z" fill="#F4B41A"/>
+    </symbol>
+    <symbol id="ar-up-p" viewBox="0 0 20 20">
+      <path d="M 8,0 L 16,8 L 11,8 L 11,16 L 5,16 L 5,8 L 0,8 Z" fill="#111111" transform="translate(2,2)"/>
+      <path d="M 8,0 L 16,8 L 11,8 L 11,16 L 5,16 L 5,8 L 0,8 Z" fill="#8C88EC"/>
+    </symbol>
+    <symbol id="ar-dn-y" viewBox="0 0 20 20">
+      <path d="M 8,16 L 0,8 L 5,8 L 5,0 L 11,0 L 11,8 L 16,8 Z" fill="#111111" transform="translate(2,2)"/>
+      <path d="M 8,16 L 0,8 L 5,8 L 5,0 L 11,0 L 11,8 L 16,8 Z" fill="#F4B41A"/>
+    </symbol>
+    <symbol id="ar-dn-p" viewBox="0 0 20 20">
+      <path d="M 8,16 L 0,8 L 5,8 L 5,0 L 11,0 L 11,8 L 16,8 Z" fill="#111111" transform="translate(2,2)"/>
+      <path d="M 8,16 L 0,8 L 5,8 L 5,0 L 11,0 L 11,8 L 16,8 Z" fill="#8C88EC"/>
+    </symbol>
+    <symbol id="ar-lt-y" viewBox="0 0 20 20">
+      <path d="M 0,8 L 8,16 L 8,11 L 16,11 L 16,5 L 8,5 L 8,0 Z" fill="#111111" transform="translate(2,2)"/>
+      <path d="M 0,8 L 8,16 L 8,11 L 16,11 L 16,5 L 8,5 L 8,0 Z" fill="#F4B41A"/>
+    </symbol>
+    <symbol id="ar-lt-p" viewBox="0 0 20 20">
+      <path d="M 0,8 L 8,16 L 8,11 L 16,11 L 16,5 L 8,5 L 8,0 Z" fill="#111111" transform="translate(2,2)"/>
+      <path d="M 0,8 L 8,16 L 8,11 L 16,11 L 16,5 L 8,5 L 8,0 Z" fill="#8C88EC"/>
+    </symbol>
+    <symbol id="ar-rt-y" viewBox="0 0 20 20">
+      <path d="M 16,8 L 8,0 L 8,5 L 0,5 L 0,11 L 8,11 L 8,16 Z" fill="#111111" transform="translate(2,2)"/>
+      <path d="M 16,8 L 8,0 L 8,5 L 0,5 L 0,11 L 8,11 L 8,16 Z" fill="#F4B41A"/>
+    </symbol>
+    <symbol id="ar-rt-p" viewBox="0 0 20 20">
+      <path d="M 16,8 L 8,0 L 8,5 L 0,5 L 0,11 L 8,11 L 8,16 Z" fill="#111111" transform="translate(2,2)"/>
+      <path d="M 16,8 L 8,0 L 8,5 L 0,5 L 0,11 L 8,11 L 8,16 Z" fill="#8C88EC"/>
+    </symbol>
+  </defs>
+</svg>
+
+<script src="js/rom-cache.js"></script>
+<script src="js/disc-info.js"></script>
+<script src="js/load-progress.js"></script>
+<script src="js/webgl-math.js"></script>
+<script src="js/webgl-shaders.js"></script>
+<script src="js/webgl-tmd.js"></script>
+<script src="js/webgl-tmd-frame-state.js"></script>
+<script src="js/webgl-tmd-assembled-scene.js"></script>
+<script src="js/mesh-view.js"></script>
+<script src="js/audio-toggle.js"></script>
+<script src="js/legaia-sfx.js"></script>
+<script src="js/arts-viewer.js"></script>
+
+<style>
+.file-input-group {
+  display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
+  margin: 0.75rem 0;
+}
+.file-input-group input[type="file"] { color: var(--text-muted); font-family: var(--font-mono); font-size: 0.85rem; }
+.arts-status { color: var(--text-dim); font-family: var(--font-mono); font-size: 0.82rem; }
+.arts-stage { margin-top: 0.75rem; }
+canvas.arts-canvas {
+  width: 100%; max-width: 720px; height: 420px; display: block;
+  background: radial-gradient(ellipse at 50% 40%, #10132e 0%, #06071a 75%);
+  border: 1px solid var(--border, #2a2d55); border-radius: 8px;
+  cursor: grab; touch-action: none;
+}
+canvas.arts-canvas:active { cursor: grabbing; }
+.arts-actions { margin-top: 0.5rem; display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.arts-actions:empty { display: none; }
+.arts-action-btn {
+  font: inherit; font-size: 0.78rem; padding: 0.15rem 0.55rem;
+  border: 1px solid var(--border, #444); border-radius: 999px;
+  background: transparent; color: inherit; cursor: pointer;
+}
+.arts-action-btn:hover { border-color: var(--accent, #8ab); }
+.arts-action-btn.arts-action-playing { border-color: var(--accent, #8ab); font-weight: 600; }
+.arts-now { margin-top: 0.5rem; font-weight: 600; }
+.arts-note { color: var(--text-dim); font-family: var(--font-mono); font-size: 0.8rem; min-height: 1.2em; }
+.arts-controls {
+  display: flex; align-items: center; gap: 0.9rem; flex-wrap: wrap;
+  margin: 0.6rem 0 0;
+}
+.arts-controls label.arts-trail-label {
+  display: inline-flex; align-items: center; gap: 0.4rem; cursor: pointer;
+  color: var(--text-muted); font-family: var(--font-mono); font-size: 0.82rem;
+}
+.arts-controls button {
+  padding: 0.3rem 0.7rem; cursor: pointer; font: inherit; font-size: 0.82rem;
+  border-radius: 4px; border: 1px solid var(--border, #4a4668);
+  background: transparent; color: var(--text-muted, #9a96b8);
+}
+.arts-controls button:hover:not(:disabled) { border-color: var(--accent); color: var(--text); }
+.arts-controls button:disabled { opacity: 0.45; cursor: default; }
+/* Cards become interactive once a disc is loaded. */
+body.arts-live .art-card[data-art] { cursor: pointer; }
+body.arts-live .art-card[data-art]:hover { outline: 1px solid #8C88EC; }
+.art-card-playing { outline: 2px solid #F4B41A !important; }
+</style>
+
+<header class="page-header">
+  <div class="breadcrumb"><a href="index.html">home</a> &middot; tactical arts</div>
+  <h1>Tactical Arts</h1>
+  <p class="lede">
+    Arts are the direction-input combos Vahn, Noa and Gala throw in battle: each turn you get a bar of inputs, and the right sequence turns a string of punches into a named move. This page lists every art with its inputs and AP cost, and - with your own disc image loaded - plays each one on the character's real battle model, in your browser.
+  </p>
+</header>
+
+<div class="disc-bar">
+  <label for="arts-file">Disc:</label>
+  <input type="file" id="arts-file" accept=".bin,.DAT,.dat">
+  <span class="arts-status" id="arts-status">No disc loaded - the cards below stay a static reference until you provide a <code>.bin</code> Mode2/2352 image (or a raw <code>PROT.DAT</code>).</span>
+</div>
+
+<section class="doc-section" id="arts-motion">
+  <h2>Watch the arts</h2>
+  <p>Pick a character below, then click any art card to play it here. The chip row under the model plays the character's other battle clips - idle, walk, flinches, knockdown, block and the four weapon swings. Drag to orbit.</p>
+  <div class="arts-controls">
+    <label class="arts-trail-label" title="The tinted delayed after-image drawn behind the character during an art (retail-faithful). Untick to draw the animation clean.">
+      <input type="checkbox" id="arts-trail-toggle"> after-image trail
+    </label>
+    <button id="arts-glb-btn" class="btn-accent" type="button" disabled
+            title="Download the selected character's assembled battle model with every battle animation (the labeled action bank: idle, walk, flinches, knockdown, block + the four weapon swings + all arts) baked in as named glTF animations. Needs a loaded disc.">Download .glb with all battle animations</button>
+  </div>
+  <p class="arts-legend-note arts-legend-note-dim">The model here wears the default gear. To watch the same clips on a character you have dressed - weapon in hand, every action and art in one strip - use the <a href="characters.html">characters page</a>.</p>
+  <div class="arts-stage" id="arts-stage" hidden>
+    <canvas id="arts-canvas" class="arts-canvas" width="720" height="420"></canvas>
+    <div class="arts-actions" id="arts-actions"
+         title="The character's battle action bank + the four direction-command weapon swings - the non-art clips the .glb download also carries. Retail has no separate run clip; Walk / Approach is the locomotion the battle engine plays."></div>
+    <div class="arts-now" id="arts-now"></div>
+    <div class="arts-note" id="arts-note"></div>
+  </div>
+</section>
+
+<section class="doc-section" id="characters">
+  <div class="arts-tabs" role="tablist" aria-label="Character">
+    <button class="arts-tab" data-character="Vahn" aria-selected="true" role="tab">Vahn</button>
+    <button class="arts-tab" data-character="Noa"  aria-selected="false" role="tab">Noa</button>
+    <button class="arts-tab" data-character="Gala" aria-selected="false" role="tab">Gala</button>
+  </div>
+  <div id="arts-panels" role="tabpanel" aria-live="polite">
+    <p class="arts-loading">Loading arts.json - re-run <code>python3 site/_gen.py</code> if this persists.</p>
+  </div>
+</section>
+
+<section class="doc-section" id="overview">
+  <h2>How to read the cards</h2>
+  <div class="arts-legend">
+    <div class="arts-legend-block">
+      <div class="arts-legend-row">
+        <svg class="ar-icon"><use href="#ar-up-y"/></svg>
+        <svg class="ar-icon"><use href="#ar-dn-y"/></svg>
+        <svg class="ar-icon"><use href="#ar-lt-y"/></svg>
+        <svg class="ar-icon"><use href="#ar-rt-y"/></svg>
+        <span><strong>Yellow</strong> = trigger input (the finisher that lands the art)</span>
+      </div>
+      <div class="arts-legend-row">
+        <svg class="ar-icon"><use href="#ar-up-p"/></svg>
+        <svg class="ar-icon"><use href="#ar-dn-p"/></svg>
+        <svg class="ar-icon"><use href="#ar-lt-p"/></svg>
+        <svg class="ar-icon"><use href="#ar-rt-p"/></svg>
+        <span><strong>Purple</strong> = setup input (queued combo step)</span>
+      </div>
+    </div>
+  </div>
+  <ul>
+    <li><strong>Arrows</strong> are the inputs, left to right. Up and Down are the high and low attacks, Left and Right are the two arm attacks. Regular arts light only the trigger yellow; Hyper, Super and Miracle arts light every input, the way the game's own arts list does.</li>
+    <li><strong>AP</strong> is what the art costs from the arts gauge. A Super Art has no cost of its own - the number shown is what the chain of arts that triggers it pays. The Miracle Art is always 99.</li>
+    <li><strong>Noa is left-handed</strong>, so her arm inputs mirror Vahn's and Gala's: same move, mirrored direction.</li>
+    <li>Arts can overlap inside one input bar: the game matches the longest art whose inputs fit, then keeps going from its trigger - so a long bar can land two or three arts in a row.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="kinds">
+  <h2>The four kinds of art</h2>
+  <table>
+    <thead><tr><th>Kind</th><th>How you get it</th><th>What it is</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Regular</strong></td><td>Learned by trying inputs in battle</td><td>Short combos; the AP cost grows with the number of inputs</td></tr>
+      <tr><td><strong>Hyper</strong></td><td>Unlocked as the character levels up</td><td>Longer pre-set combos, entered as one chain; they play a fanfare instead of a voice shout</td></tr>
+      <tr><td><strong>Super</strong></td><td>Story unlock (Vahn: Cyclone Trigger, Noa: Music Box Trigger, Gala: Wind Cave and the Mystery Tree)</td><td>Fires automatically when the right chain of arts is entered in one bar; the chain pays the AP</td></tr>
+      <tr><td><strong>Miracle</strong></td><td>One per character, from the Ra-Seru</td><td>The most powerful unique animation, at a fixed 99 AP</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<details class="about-data">
+  <summary>About this data &mdash; where the animations and voices come from, the .glb export</summary>
+  <div class="about-body">
+  <h3>Playback</h3>
+  <p>
+    With a disc loaded, every art card plays that art on the character's battle model, posed from the on-disc keyframes. The voice shout rides along as in retail: each shout is a CD-XA channel from the character's own voice bank (Vahn <code>XA2.XA</code>, Noa <code>XA4.XA</code>, Gala <code>XA6.XA</code>). Retail rolls a random channel from the art's candidate pool each time; this page plays the channel a live instrumented battle was captured firing for that art where one is pinned, else a fixed member of the same pool.
+  </p>
+  <p>
+    <strong>Hyper Arts play no shout in retail</strong> - each fires a stereo fanfare from the character's fanfare bank (Vahn <code>XA1.XA</code>, Noa <code>XA3.XA</code>, Gala <code>XA5.XA</code>), coin-flipped between the art's own pair of channels; Super and Miracle Arts open with the same bank's generic fanfare. Every per-art channel was verified against a live instrumented battle.
+  </p>
+  <p>
+    Retail also draws a tinted after-image trail behind the character (Vahn <span style="color:#e0524a">red</span>, Noa <span style="color:#4ac05a">green</span>, Gala <span style="color:#5a7ae8">blue</span>). It starts off here for a clean view; tick the box to switch it on.
+  </p>
+  <h3>The .glb export</h3>
+  <p>
+    The <strong>.glb</strong> button bakes the selected character's assembled battle model with its <em>entire</em> battle-animation set as named glTF animations - the action bank (Idle, Walk / Approach, the flinches, Knockdown, Get Up, Ready / Recover / Defeat, Block), the four direction-command weapon swings, and every art - ready for Blender or three.js. Retail has no separate <em>run</em> clip: Walk / Approach is the battle locomotion. Nothing is uploaded; the disc never leaves your machine.
+  </p>
+
+<section class="doc-section" id="related">
+  <h3>Under the hood</h3>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="formats/art-data.html">Art-data format</a>
+    <a href="subsystems/arts-command-gauge.html">Arts gauge &amp; AP</a>
+    <a href="subsystems/battle-formulas.html">Damage formulas</a>
+    <a href="formats/character-mesh.html">Character mesh</a>
+    <a href="formats/battle-data-pack.html">Player battle files</a>
+    <a href="formats/summon-readef.html">Animation side-band</a>
+    <a href="formats/xa.html">XA audio (shouts)</a>
+    <a href="subsystems/battle-action.html">Battle action</a>
+    <a href="reference/gamedata.html">Arts gamedata</a>
+    <a href="tooling/rom-patcher.html">ROM patcher (arts randomizer)</a>
+  </div>
+</section>
+  </div>
+</details>
+
+<script>
+/* arts.html - per-character art list, driven by arts.json.
+ * The Python side groups by character and kind; this script lays out one
+ * SVG card per art with the arrow inputs colored by trigger-vs-setup rule. */
+(async function(){
+  const $panels = document.getElementById('arts-panels');
+  const $tabs = document.querySelectorAll('.arts-tab');
+  let payload;
+  try {
+    payload = await fetch('arts.json').then(r => r.json());
+  } catch (e) {
+    $panels.innerHTML =
+      '<p style="color:var(--text-dim)">Couldn\'t load arts.json - re-run <code>python3 site/_gen.py</code>.</p>';
+    return;
+  }
+  const byChar = {};
+  for (const c of payload.characters) byChar[c.name] = c;
+
+  // 1=L, 2=R, 3=D, 4=U -> arrow symbol id base
+  const DIR_ID = { 1: 'ar-lt', 2: 'ar-rt', 3: 'ar-dn', 4: 'ar-up' };
+  const KIND_LABEL = {
+    regular: 'Regular Arts',
+    hyper:   'Hyper Arts',
+    super:   'Super Arts',
+    miracle: 'Miracle Art',
+  };
+  const KIND_NOTE = {
+    regular: 'Learned by use during normal play. AP cost rises with chain length.',
+    hyper:   'Pre-set multi-art combos. Trigger by entering the full input as a single chain.',
+    super:   'Story-gated. Cyclone Trigger (Vahn), Music Box Trigger (Noa), Wind Cave + Mystery Tree (Gala).',
+    miracle: 'One per character. Fixed 99 AP cost; unlocks the most powerful unique animation.',
+  };
+
+  function arrowSvg(dir, color) {
+    const base = DIR_ID[dir];
+    if (!base) return '';
+    const suf = color === 'y' ? '-y' : '-p';
+    return `<svg class="ar-icon"><use href="#${base}${suf}"/></svg>`;
+  }
+
+  function renderArt(art, kind) {
+    const dirs = art.directions || [];
+    const lastIdx = dirs.length - 1;
+    const arrows = dirs.map((d, i) => {
+      // Regulars: only the trigger (last) input is yellow.
+      // Hyper / Super / Miracle: every input lights up yellow.
+      const color = (kind === 'regular' && i !== lastIdx) ? 'p' : 'y';
+      return arrowSvg(d, color);
+    }).join('');
+    const cmd = (art.command || []).join(' · ');
+    const ac = art.action_constant != null;
+    // The card carries its resolution payload for the animation viewer
+    // (js/arts-viewer.js): once a disc is loaded, clicking plays the art.
+    const payload = escapeHtml(JSON.stringify({
+      name: art.name,
+      directions: dirs,
+      action_constant: art.action_constant ?? null,
+    }));
+    return `
+      <article class="art-card art-card-${kind}" data-art="${payload}"
+               tabindex="0" role="button"
+               aria-label="Play ${escapeHtml(art.name)} animation (needs a loaded disc)">
+        <header class="art-card-row">
+          <h4 class="art-name">${escapeHtml(art.name)}</h4>
+          <span class="art-ap" aria-label="AP cost">${art.ap}<span class="art-ap-unit"> AP</span></span>
+        </header>
+        <div class="art-card-row art-card-row-sec">
+          <div class="art-arrows" aria-label="Input sequence" title="${escapeHtml(cmd)}">${arrows}</div>
+          ${ac ? `<span class="art-ac" title="action_constant">0x${art.action_constant.toString(16).toUpperCase().padStart(2,'0')}</span>` : ''}
+        </div>
+      </article>`;
+  }
+
+  function renderCharacter(name) {
+    const ch = byChar[name];
+    if (!ch) {
+      $panels.innerHTML = `<p style="color:var(--text-dim)">No arts for ${escapeHtml(name)}.</p>`;
+      return;
+    }
+    const sections = ['regular', 'hyper', 'super', 'miracle']
+      .map(kind => {
+        const arts = ch.arts_by_kind[kind] || [];
+        if (!arts.length) return '';
+        return `
+          <section class="art-kind-section" id="arts-${name.toLowerCase()}-${kind}">
+            <header class="art-kind-head">
+              <h3>${KIND_LABEL[kind]} <span class="art-kind-count">${arts.length}</span></h3>
+              <p class="art-kind-note">${KIND_NOTE[kind]}</p>
+            </header>
+            <div class="art-card-grid">
+              ${arts.map(a => renderArt(a, kind)).join('')}
+            </div>
+          </section>`;
+      })
+      .join('');
+    $panels.innerHTML = `
+      <div class="arts-char-header">
+        <h2>${escapeHtml(name)}'s Arts</h2>
+        <span class="arts-char-total">${ch.total} arts</span>
+      </div>
+      ${sections}`;
+  }
+
+  // The animation viewer (js/arts-viewer.js): disc input + canvas + the
+  // art-card click delegation. Purely additive - without a loaded disc the
+  // page stays the static reference it always was.
+  const artsApp = window.ArtsViewerApp
+    ? window.ArtsViewerApp.mount({
+        file: 'arts-file', status: 'arts-status', stage: 'arts-stage',
+        now: 'arts-now', note: 'arts-note', panels: 'arts-panels', canvas: 'arts-canvas',
+        trail: 'arts-trail-toggle', glb: 'arts-glb-btn', actions: 'arts-actions',
+      })
+    : null;
+
+  $tabs.forEach(btn => {
+    btn.addEventListener('click', () => {
+      const name = btn.dataset.character;
+      $tabs.forEach(b => b.setAttribute('aria-selected', b === btn ? 'true' : 'false'));
+      renderCharacter(name);
+      if (artsApp) artsApp.setCharacter(name);
+      history.replaceState(null, '', `#${name.toLowerCase()}`);
+    });
+  });
+
+  // Initial render: honour URL hash if it names a character; else Vahn.
+  const initialHash = (location.hash || '').replace('#', '').toLowerCase();
+  const initialName = ['vahn','noa','gala'].includes(initialHash)
+    ? initialHash.charAt(0).toUpperCase() + initialHash.slice(1)
+    : 'Vahn';
+  $tabs.forEach(b => b.setAttribute('aria-selected',
+    b.dataset.character === initialName ? 'true' : 'false'));
+  renderCharacter(initialName);
+  if (artsApp) artsApp.charName = initialName;
+})();
+</script>

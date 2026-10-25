@@ -1,0 +1,210 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">tooling</a> &middot; asset extraction</div>
+  <h1>Asset extraction</h1>
+  <p class="lede">Point one command at your own Legend of Legaia disc image and get back every texture as a PNG, every 3D model as an OBJ, every sound bank and voice line as a WAV - the game's whole asset library as ordinary files. The project ships no game data, so the tools always run against a disc you supply.</p>
+</header>
+
+<section class="doc-section" id="when">
+  <h2>What this solves</h2>
+  <p>Almost everything on the disc lives inside <code>PROT.DAT</code>, one archive of 1233 numbered entries, and most entries are containers within containers: compressed streams, texture packs, mesh bundles, sound banks. Nothing on the disc is a file you can open directly. The extraction tools walk that whole chain so you never have to. Use them to browse the art, models and audio; to feed the engine, the asset viewer and the site's 3D pages (all read the <code>extracted/</code> tree); or to drive one stage while reverse-engineering.</p>
+</section>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Input</dt><dd>A raw Mode2/2352 <code>.bin</code> dump, or a <code>.cue</code> resolved to its BINARY track.</dd>
+    <dt>Output</dt><dd><code>./extracted/</code> (gitignored): PROT entries, streaming sub-assets, PNG / OBJ / WAV exports, TIM catalogs, dialog font.</dd>
+    <dt>Driver</dt><dd><code>legaia-extract</code> (<code>crates/extract</code>) runs every stage; each stage is also its own binary.</dd>
+    <dt>Stages</dt><dd>verify &rarr; disc &rarr; PROT &rarr; categorize &rarr; streaming extract &rarr; PNG &rarr; CD-XA demux &rarr; TIM catalogs &rarr; dialog font.</dd>
+    <dt>Consumers</dt><dd><code>legaia-engine</code>, <code>asset-viewer</code>, the <a href="../viewer.html">web viewer</a>, Ghidra (mounts <code>extracted/</code> read-only).</dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="top-level-pipeline">
+  <h2>Quick start: the one-command pipeline</h2>
+  <div class="cli"><code>./legaia-extract "/path/to/Legend of Legaia (USA).bin" --out extracted</code></div>
+  <ol class="steps">
+    <li><b>Disc image</b><span>ISO9660 walk, fingerprint check. <code>disc-extract</code></span></li>
+    <li><b>PROT.DAT</b><span>1233 entries, named via <code>CDNAME.TXT</code>. <code>prot-extract</code></span></li>
+    <li><b>Classify</b><span>Each entry's format class, by magic bytes. <code>asset categorize</code></span></li>
+    <li><b>Decompress</b><span>LZS sections, output magic-checked. <code>lzs-decode</code></span></li>
+    <li><b>Sub-assets</b><span>DATA_FIELD chunks split out. <code>asset extract</code></span></li>
+    <li><b>Exports</b><span>PNG, OBJ, WAV, TIM catalogs, dialog font. <code>tim tmd vab xa</code></span></li>
+  </ol>
+  <figure class="diagram">
+    <svg viewBox="0 0 966 212" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The extraction pipeline. The disc image is verified, walked as ISO 9660, PROT.DAT is split into its 1233 entries, each entry is categorized, DATA_FIELD streaming sub-assets are extracted and their TIMs converted to PNG. Two branches leave the main line: CD-XA audio is demuxed from the raw disc sectors into per-channel WAVs, and the split PROT entries feed the two TIM catalogs and the dialog-font artifacts.">
+      <defs><marker id="ex-ah" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect x="10" y="20" width="146" height="44" rx="4" class="dg-node-accent"/><text x="83" y="39" class="dg-label">disc .bin</text><text x="83" y="55" class="dg-sub">verify SHA-256</text>
+      <rect x="170" y="20" width="146" height="44" rx="4" class="dg-node"/><text x="243" y="39" class="dg-label">ISO 9660 walk</text><text x="243" y="55" class="dg-sub">copy every file</text>
+      <rect x="330" y="20" width="146" height="44" rx="4" class="dg-node"/><text x="403" y="39" class="dg-label">split PROT.DAT</text><text x="403" y="55" class="dg-sub">1233 entries</text>
+      <rect x="490" y="20" width="146" height="44" rx="4" class="dg-node"/><text x="563" y="39" class="dg-label">categorize</text><text x="563" y="55" class="dg-sub">class per entry</text>
+      <rect x="650" y="20" width="146" height="44" rx="4" class="dg-node"/><text x="723" y="39" class="dg-label">streaming</text><text x="723" y="55" class="dg-sub">DATA_FIELD chunks</text>
+      <rect x="810" y="20" width="146" height="44" rx="4" class="dg-node-ok"/><text x="883" y="39" class="dg-label">TIM to PNG</text><text x="883" y="55" class="dg-sub">--skip-png</text>
+      <path d="M156 42 L168 42" class="dg-edge" marker-end="url(#ex-ah)"/>
+      <path d="M316 42 L328 42" class="dg-edge" marker-end="url(#ex-ah)"/>
+      <path d="M476 42 L488 42" class="dg-edge" marker-end="url(#ex-ah)"/>
+      <path d="M636 42 L648 42" class="dg-edge" marker-end="url(#ex-ah)"/>
+      <path d="M796 42 L808 42" class="dg-edge" marker-end="url(#ex-ah)"/>
+      <path d="M83 64 L83 122 L168 122" class="dg-edge" marker-end="url(#ex-ah)"/>
+      <rect x="170" y="100" width="146" height="44" rx="4" class="dg-node"/><text x="243" y="119" class="dg-label">CD-XA demux</text><text x="243" y="135" class="dg-sub">raw 2352-byte sectors</text>
+      <path d="M243 144 L243 154" class="dg-edge" marker-end="url(#ex-ah)"/>
+      <rect x="170" y="156" width="146" height="44" rx="4" class="dg-node-ok"/><text x="243" y="175" class="dg-label">XA_WAV/</text><text x="243" y="191" class="dg-sub">per (file, channel)</text>
+      <path d="M413 64 L413 122 L488 122" class="dg-edge" marker-end="url(#ex-ah)"/>
+      <rect x="490" y="100" width="146" height="44" rx="4" class="dg-node-ok"/><text x="563" y="119" class="dg-label">TIM catalogs</text><text x="563" y="135" class="dg-sub">two .tsv inventories</text>
+      <path d="M393 64 L393 178 L488 178" class="dg-edge" marker-end="url(#ex-ah)"/>
+      <rect x="490" y="156" width="146" height="44" rx="4" class="dg-node-ok"/><text x="563" y="175" class="dg-label">dialog font</text><text x="563" y="191" class="dg-sub">atlas + width table</text>
+    </svg>
+    <figcaption>What <code>legaia-extract</code> runs. Each later stage reads what an earlier one wrote; the CD-XA branch reads the raw image, because the ISO walk's Form-1 copy truncates every audio sector. Green nodes are outputs, each behind its own <code>--skip-*</code> flag.</figcaption>
+  </figure>
+  <p class="hint">Each stage is a standalone binary; <code>legaia-extract</code> chains them. CD-XA audio skips the walk entirely and is demuxed straight from the raw disc (see below).</p>
+  <table>
+    <thead><tr><th>Flag</th><th>Skips</th></tr></thead>
+    <tbody>
+      <tr><td><code>--skip-verify</code></td><td>SHA verification of the disc's key files.</td></tr>
+      <tr><td><code>--skip-png</code></td><td>Streaming-container TIM &rarr; PNG (a handful of files; the bulk inventory is the catalogs).</td></tr>
+      <tr><td><code>--skip-xa</code></td><td>The CD-XA audio demux (voice lines, streamed audio).</td></tr>
+      <tr><td><code>--skip-catalog</code></td><td><code>prot_tim_catalog.tsv</code> + <code>prot_tim_deep_catalog.tsv</code>.</td></tr>
+      <tr><td><code>--skip-font</code></td><td>The <code>font/</code> dialog-font artifacts.</td></tr>
+    </tbody>
+  </table>
+  <p><code>--verbose</code> prints one line per file written. <code>--all-textures</code> adds one stage: every TIM in every PROT entry, raw or LZS-compressed, written as <code>.tim</code> + <code>.png</code> under <code>tim_scan/</code> (<code>asset tim-scan</code> and <code>tim convert-dir</code> in one step).</p>
+  <h3>What lands in <code>extracted/</code></h3>
+  <table class="layout">
+    <thead><tr><th>Path</th><th>Contents</th></tr></thead>
+    <tbody>
+      <tr><td><code>PROT.DAT</code> <code>CDNAME.TXT</code> <code>SCUS_942.54</code></td><td>raw archive, entry name map, executable</td></tr>
+      <tr><td><code>PROT/####_&lt;name&gt;.BIN</code></td><td>one file per entry - its whole sector footprint - plus <code>categorize.json</code></td></tr>
+      <tr><td><code>streaming/####_&lt;name&gt;/chunk##_&lt;TYPE&gt;/</code></td><td>TMD chunks split into numbered meshes, TIM lists (+ PNG), opaque blobs (MAN, MES, MOVE, VDF)</td></tr>
+      <tr><td><code>prot_tim_catalog.tsv</code> <code>prot_tim_deep_catalog.tsv</code></td><td>flat TIM inventory; TIMs inside LZS-compressed sections</td></tr>
+      <tr><td><code>font/</code></td><td>dialog-font atlas, width table, metadata</td></tr>
+      <tr><td><code>XA/</code></td><td>raw Form-1 dumps - truncated, not listenable</td></tr>
+      <tr><td><code>XA_WAV/XAn_fileN_chM.wav</code></td><td>correctly paced per-channel voice / streamed audio</td></tr>
+    </tbody>
+  </table>
+  <h3>Getting <em>all</em> the textures</h3>
+  <p>The PNG step covers only the few TIMs the streaming containers carry. For the full set, export the catalogued hits and convert them - the two commands the pipeline's summary prints:</p>
+  <div class="cli"><code>asset tim-scan extracted/PROT --out extracted/tim_scan</code></div>
+  <div class="cli"><code>tim convert-dir extracted/tim_scan</code></div>
+  <details class="disclosure">
+    <summary>Details: why voice audio is demuxed from the raw disc</summary>
+    <div class="disclosure-body">
+      <p>The ISO walk writes <code>*.XA</code> as Form-1 files, which truncates every Form-2 audio sector (2324 &rarr; 2048 bytes) and collapses a file's multiplexed channels into one shuffled stream. The CD-XA step instead reads raw 2352-byte sectors and writes one WAV per <code>(file_no, ch_no)</code>, at the rate and stereo mode each sector's subheader declares. The NA corpus is 34 files / 316 channels, all 4-bit 37.8 kHz; the decoder is bit-exact.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="per-stage-tools">
+  <h2>Per-stage tools</h2>
+  <table>
+    <thead><tr><th>Binary</th><th>Stage</th><th>Key commands</th><th>Format</th></tr></thead>
+    <tbody>
+      <tr><td><code>disc-extract</code></td><td>disc &rarr; files</td><td><code>extract DISC.bin extracted/</code></td><td><a href="../formats/disc.html">disc</a></td></tr>
+      <tr><td><code>prot-extract</code></td><td>PROT.DAT &rarr; entries</td><td><code>extract</code>, <code>list</code>, <code>locate</code>, <code>retail-names</code></td><td><a href="../formats/prot.html">PROT</a>, <a href="../formats/cdname.html">CDNAME</a></td></tr>
+      <tr><td><code>lzs-decode</code></td><td>decompress</td><td><code>probe</code>, <code>container</code>, <code>raw --size N</code></td><td><a href="../formats/lzs.html">LZS</a></td></tr>
+      <tr><td><code>asset</code></td><td>classify + sub-assets</td><td><code>categorize</code>, <code>extract</code>, <code>stream</code>, <code>describe</code>, <code>tim-scan</code>, <code>tmd-scan</code>, <code>tim-catalog</code>, <code>tim-deep-catalog</code></td><td><a href="../formats/asset-type.html">asset type</a></td></tr>
+      <tr><td><code>tim</code></td><td>texture &rarr; PNG</td><td><code>info</code>, <code>convert [--clut N | --all-cluts]</code>, <code>convert-dir</code></td><td><a href="../formats/tim.html">TIM</a></td></tr>
+      <tr><td><code>tmd</code></td><td>mesh &rarr; OBJ</td><td><code>info</code>, <code>dump-obj</code>, <code>validate-prims</code></td><td><a href="../formats/tmd.html">TMD</a></td></tr>
+      <tr><td><code>vab</code></td><td>sound bank &rarr; WAV</td><td><code>list</code>, <code>extract [--wav]</code></td><td><a href="../formats/vab.html">VAB</a></td></tr>
+      <tr><td><code>xa</code></td><td>streamed audio &rarr; WAV</td><td><code>demux-disc-all</code>, <code>demux-disc --lba --size</code>, <code>info</code>, <code>convert</code></td><td><a href="../formats/xa.html">XA</a></td></tr>
+      <tr><td><code>mes</code></td><td>dialog containers</td><td><code>info</code>, <code>disasm</code>, <code>json</code></td><td><a href="../formats/mes.html">MES</a></td></tr>
+      <tr><td><code>mdt</code></td><td>move tables</td><td><code>classify</code>, <code>records</code>, <code>slots</code></td><td><a href="../formats/mdt.html">MDT</a></td></tr>
+      <tr><td><code>font-extract</code></td><td>dialog font</td><td><code>--disc &lt;bin-or-PROT.DAT&gt;</code></td><td><a href="../formats/dialog-font.html">dialog font</a></td></tr>
+    </tbody>
+  </table>
+  <ul class="bullets">
+    <li><strong>Entry size is the sector gap.</strong> Each <code>PROT/*.BIN</code> holds exactly its entry's sectors, so the files tile the archive with no gaps or overlaps. <code>prot-extract locate</code> maps any offset to the entry that owns it.</li>
+    <li><strong>LZS "decodes without error" proves nothing.</strong> The ring buffer starts zeroed, so random input decodes to plausible bytes. Magic-check the output.</li>
+    <li><strong>Prefer <code>xa demux-disc-all</code></strong> over <code>convert</code>: it takes rate and channel mode from each sector instead of guessing.</li>
+    <li><strong>Legaia TMDs are a custom variant</strong> (magic <code>0x80000002</code>); a stock PSX TMD tool will not read them.</li>
+  </ul>
+  <details class="disclosure">
+    <summary>Details: <code>prot-extract</code> subcommands and the two TIM catalogs</summary>
+    <div class="disclosure-body">
+      <div class="cli"><code>prot-extract extract extracted/PROT.DAT extracted/PROT/ --cdname extracted/CDNAME.TXT</code></div>
+      <div class="cli"><code>prot-extract list extracted/PROT.DAT --cdname extracted/CDNAME.TXT</code></div>
+      <div class="cli"><code>prot-extract locate extracted/PROT.DAT 0x17855 --in-entry 866 --cdname extracted/CDNAME.TXT</code></div>
+      <div class="cli"><code>prot-extract retail-names extracted/CDNAME.TXT</code></div>
+      <ul class="bullets">
+        <li><code>extract</code> also writes <code>manifest.json</code> and an unpacked <code>tim/&lt;entry&gt;/</code> dir per TIM-pack entry.</li>
+        <li><code>list</code> prints each size next to <code>decl_span</code>, the superseded over-reading expression, flagging <code>ovr</code> where it overshoots; <code>locate</code> re-keys coordinates measured under it - such a coordinate may name the wrong owning entry.</li>
+        <li><code>retail-names</code> shows what the retail loader reads out of <code>CDNAME.TXT</code>. Its <code>#define</code> numbers are raw TOC indices, shifted +2 from the extraction filenames.</li>
+        <li><code>--clamp-footprint</code> is a deprecated no-op.</li>
+      </ul>
+      <p><code>asset tim-catalog</code> scans the whole <code>PROT.DAT</code> image, strict-validates each TIM and maps it to its owning entry + offset (or the unindexed system-UI gap); it recovers the same set an independent reference decoder reports, and <code>--rollup</code> prints the count + digest a disc-gated test pins. <code>asset tim-deep-catalog</code> decompresses every entry and catalogs the TIMs inside each section, keyed <code>(entry, section, offset)</code>; a hit is admitted only when it strict-parses <strong>and</strong> decodes to RGBA.</p>
+    </div>
+  </details>
+  <details class="disclosure">
+    <summary>Details: full <code>asset</code> and <code>xa</code> command lists</summary>
+    <div class="disclosure-body">
+<pre><code>asset categorize     &lt;DIR&gt; [--out categorize.json]    # per-class breakdown
+asset extract        &lt;file&gt; --out &lt;out_dir&gt;           # streaming chunks -&gt; files
+asset stream         &lt;file&gt;                           # walk DATA_FIELD chunks, no extraction
+asset describe       &lt;file&gt;                           # container TOC
+asset effect-bundle  &lt;file&gt;
+asset tmd-scan       &lt;DIR&gt;                            # byte-search for TMD magic
+asset tim-scan       &lt;DIR&gt;                            # byte-search for TIM magic (lenient)
+asset tim-catalog    &lt;PROT.DAT&gt; [--out f.tsv|f.json]  # strict flat catalog
+asset tim-deep-catalog &lt;PROT.DAT&gt; [--out f.tsv|f.json] # TIMs inside LZS sections
+
+xa demux-disc-all &lt;disc.bin&gt; --out extracted/XA_WAV   # every .XA -&gt; per-channel WAV
+xa demux-disc &lt;disc.bin&gt; --lba L --size S --out &lt;dir&gt;  # one .XA by LBA/size
+xa info    &lt;file.xa&gt; [--channels stereo] [--sample-rate 37800]
+xa convert &lt;file.xa&gt; [-o out.wav]                       # single Form-1 dump (guesses rate)</code></pre>
+      <p>Beyond these, <code>asset</code> carries the analysis subcommands documented on their own pages: <code>asset account</code> (<a href="byte-accounting.html">byte accounting</a>), <code>asset overlay</code> (<a href="static-overlay-pipeline.html">static overlay pipeline</a>) and <code>asset field-op-census</code> (<a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/tooling/field-op-census.md">field-op census, GitHub</a>).</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="asset-viewer">
+  <h2>Browsing the result</h2>
+  <p>Once extracted, browse interactively with the native <code>asset-viewer</code> (the browser equivalent is the <a href="../viewer.html">web viewer</a>).</p>
+  <table>
+    <thead><tr><th>Command</th><th>Shows</th></tr></thead>
+    <tbody>
+      <tr><td><code>asset-viewer prot extracted/PROT.DAT --cdname extracted/CDNAME.TXT</code></td><td>PROT entry browser, format auto-detected per entry</td></tr>
+      <tr><td><code>asset-viewer tim &lt;file.tim&gt;</code></td><td>one texture; <code>--offset 0x… --clut N</code> reaches TIMs in the unindexed gap of <code>PROT.DAT</code></td></tr>
+      <tr><td><code>asset-viewer tmd &lt;file.tmd | dir&gt;</code></td><td>a mesh, or a directory to cycle (N / P / PgDn / PgUp); <code>--bundle battle</code> pairs the TIMs for correct CLUTs</td></tr>
+      <tr><td><code>asset-viewer vab &lt;entry.BIN&gt; --offset 0xN --sample N</code></td><td>one sound-bank sample</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="doc-section" id="disc-gated-tests">
+  <h2>How we know</h2>
+  <p>The pipeline is pinned by tests that run only when <code>LEGAIA_DISC_BIN</code> points at a valid <code>.bin</code>; without it every one skips and passes, so CI needs no Sony data. Do not change that gating.</p>
+  <div class="cli"><code>LEGAIA_DISC_BIN="/path/to/Legend of Legaia (USA).bin" cargo test --workspace</code></div>
+  <ul class="bullets">
+    <li><strong>The disc walk</strong> - file count and the key files' SHA-256s.</li>
+    <li><strong>Sector write-back</strong> - re-encoded sectors keep valid EDC/ECC.</li>
+    <li><strong>Archive tiling</strong> - entry footprints tile <code>PROT.DAT</code> exactly, and the sector-gap size matches retail's own span routine (<code>FUN_8003E68C</code>).</li>
+    <li><strong>The full pipeline</strong> - entry count, sub-asset totals, TIM round-trip, catalog digests.</li>
+  </ul>
+  <p>Find every disc-gated test with <code>grep -rl LEGAIA_DISC_BIN crates/*/tests</code>.</p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Guides</span>
+    <a href="../guides/extracting-assets.html">Extracting assets (guide)</a>
+    <a href="../guides/playing-and-viewing.html">Playing and viewing</a>
+    <a href="../viewer.html">Web asset viewer</a>
+  </div>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../formats/disc.html">Disc layout</a>
+    <a href="../formats/prot.html">PROT.DAT TOC</a>
+    <a href="../formats/cdname.html">CDNAME name map</a>
+    <a href="../formats/lzs.html">LZS compression</a>
+    <a href="../formats/asset-type.html">Asset-type dispatch</a>
+    <a href="../formats/tim.html">TIM</a>
+    <a href="../formats/tmd.html">TMD</a>
+    <a href="../formats/xa.html">XA audio</a>
+  </div>
+  <div class="see-also">
+    <span class="see-also-label">Tooling</span>
+    <a href="ghidra.html">Ghidra in Docker</a>
+    <a href="disc-coverage.html">Disc coverage</a>
+    <a href="randomizer.html">Randomizer / disc patcher</a>
+  </div>
+</section>

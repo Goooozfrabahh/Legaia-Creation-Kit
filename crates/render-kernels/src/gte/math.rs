@@ -1,0 +1,531 @@
+/// Fixed-point bit count for rotation-matrix coefficients (q3.12).
+pub const ROT_FRAC_BITS: i32 = 12;
+
+/// Fixed-point scale factor for rotation coefficients (`1 << 12 = 4096`).
+/// A retail GTE rotation matrix is encoded with element values in
+/// `[-32768, 32767]`; an identity rotation has diagonal = `4096`.
+pub const ROT_ONE: i32 = 1 << ROT_FRAC_BITS;
+
+/// Default GTE focal length in pixels (the value the retail TMD renderer
+/// loads into `H` for the standard 320×240 PSX frame: `H = 320`).
+pub const DEFAULT_H: i32 = 320;
+
+/// Saturated 16-bit signed clamp for the perspective-divide *numerator* -
+/// the hardware IR1/IR2 the projection multiplies by the reciprocal. IR
+/// registers are 16-bit signed, so the numerator is clamped to `[-32768,
+/// 32767]`. NB this is the IR clamp, NOT the final screen-coordinate clamp -
+/// the GTE saturates the *stored* SXY FIFO entry much more tightly (see
+/// [`SX_MIN`]/[`SX_MAX`]).
+pub const SXY_MIN: i32 = i16::MIN as i32;
+pub const SXY_MAX: i32 = i16::MAX as i32;
+
+/// Final SXY-FIFO screen-coordinate saturation bound. The GTE clamps the
+/// projected screen X/Y to signed 11 bits, `[-0x400, 0x3FF]`, and raises
+/// `SX2_SATURATED` / `SY2_SATURATED` when it does - matching the PSX GPU's
+/// 11-bit-signed drawing coordinate range. Cross-validated bit-exact against
+/// a real-COP2 RTPT ring capture (see the `rtpt_matches_recomp_cop2_capture`
+/// oracle in `tests.rs`); the earlier i16 bound here was a latent divergence
+/// that a self-consistent in-repo sweep could not surface.
+pub const SX_MIN: i32 = -0x400;
+pub const SX_MAX: i32 = 0x3FF;
+
+/// 3-vector of i32. Matches the GTE's MAC0/MAC1/MAC2/MAC3 accumulator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GteVec3 {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+}
+
+impl GteVec3 {
+    pub const fn new(x: i32, y: i32, z: i32) -> Self {
+        Self { x, y, z }
+    }
+
+    /// Convert from f32 world coordinates assuming q19.12 fixed-point.
+    /// Saturates at i32 bounds to avoid panics on rare overflow.
+    pub fn from_f32_q12(x: f32, y: f32, z: f32) -> Self {
+        Self {
+            x: clamp_i32_from_f32(x * ROT_ONE as f32),
+            y: clamp_i32_from_f32(y * ROT_ONE as f32),
+            z: clamp_i32_from_f32(z * ROT_ONE as f32),
+        }
+    }
+
+    /// Convert back to f32 world coordinates.
+    pub fn to_f32_q12(&self) -> (f32, f32, f32) {
+        let inv = 1.0 / ROT_ONE as f32;
+        (
+            self.x as f32 * inv,
+            self.y as f32 * inv,
+            self.z as f32 * inv,
+        )
+    }
+}
+
+/// Row-major 3×3 rotation matrix in q3.12 fixed-point.
+///
+/// Identity:
+/// ```text
+/// [4096, 0, 0]
+/// [0, 4096, 0]
+/// [0, 0, 4096]
+/// ```
+/// Each element is in `[-32768, 32767]`. The retail GTE stores these as
+/// `i16`; we widen to `i32` to keep the multiply-add path overflow-free
+/// without saturation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GteMat3 {
+    pub m: [[i16; 3]; 3],
+}
+
+impl GteMat3 {
+    pub const IDENTITY: Self = Self {
+        m: [
+            [ROT_ONE as i16, 0, 0],
+            [0, ROT_ONE as i16, 0],
+            [0, 0, ROT_ONE as i16],
+        ],
+    };
+
+    /// Build a rotation matrix about the +Y axis by `angle` radians, with
+    /// elements quantized to q3.12 (matches the GTE precision).
+    ///
+    // PORT: FUN_8004629C - retail RotMatrixY: indexes the cos/sin LUT pair
+    // (&DAT_80070A2C / &DAT_8007122C) by a 12-bit angle (4096 = 2*PI) and
+    // composes via the GTE; this builds the same +Y rotation in q3.12 with a
+    // radian input (ROT_ONE = 0x1000 matches the LUT's 1.0).
+    //
+    // Live through its one q3.12 consumer, `camera_view_rotation` (the
+    // `FUN_8001CF50` port), which composes the camera-relative rotation a
+    // `+0x52 & 0x780` part is drawn under on both play hosts - the same job
+    // retail's `jal 0x8004629c` at `0x8001CFC0` does. The full camera and
+    // the hosts' model matrices use f32 axis factors instead
+    // (`legaia_engine_camera::psx_camera::camera_rotation`, `Mat4::from_rotation_y`).
+    // The radian argument is a deviation: retail takes a 12-bit angle and
+    // reads the LUT, which `billboard::rot_z_psx` models for Z and
+    // `battle_intro::euler_rot_psx` (the `FUN_80026988` port) for all three.
+    pub fn rot_y(angle: f32) -> Self {
+        let c = (angle.cos() * ROT_ONE as f32).round() as i16;
+        let s = (angle.sin() * ROT_ONE as f32).round() as i16;
+        Self {
+            m: [[c, 0, s], [0, ROT_ONE as i16, 0], [-s, 0, c]],
+        }
+    }
+
+    /// Build a rotation about the +X axis (pitch).
+    ///
+    // PORT: FUN_800461A4 - retail RotMatrixX (same cos/sin LUT + 12-bit angle
+    // as FUN_8004629C, about the +X axis).
+    // Live through `camera_view_rotation` (retail's `jal 0x800461a4` at
+    // `0x8001CF9C`) - see `rot_y`.
+    pub fn rot_x(angle: f32) -> Self {
+        let c = (angle.cos() * ROT_ONE as f32).round() as i16;
+        let s = (angle.sin() * ROT_ONE as f32).round() as i16;
+        Self {
+            m: [[ROT_ONE as i16, 0, 0], [0, c, -s], [0, s, c]],
+        }
+    }
+
+    /// Build a rotation about the +Z axis (roll).
+    ///
+    // PORT: FUN_8004638C - retail RotMatrixZ (same cos/sin LUT + 12-bit angle
+    // as FUN_8004629C, about the +Z axis).
+    // Live through `camera_view_rotation` (retail's `jal 0x8004638c` at
+    // `0x8001CFE4`) - see `rot_y`. This
+    // address has a second, more faithful port in `billboard::rot_z_psx`, which takes
+    // the retail 12-bit angle and reads the LUT rather than f32 trig; the two
+    // are pinned to agree at the cardinals by a unit test there. That one is
+    // inert, for the reason recorded on that module.
+    pub fn rot_z(angle: f32) -> Self {
+        let c = (angle.cos() * ROT_ONE as f32).round() as i16;
+        let s = (angle.sin() * ROT_ONE as f32).round() as i16;
+        Self {
+            m: [[c, -s, 0], [s, c, 0], [0, 0, ROT_ONE as i16]],
+        }
+    }
+
+    /// Compose two q3.12 rotation matrices: `out = a * b`. Same i64-widened
+    /// accumulator shape as [`Self::mul_vec`]; result is renormalised back
+    /// to q3.12 with i16 saturation on each element.
+    pub fn mul(&self, other: &Self) -> Self {
+        let mut out = [[0i16; 3]; 3];
+        for (r, row_out) in out.iter_mut().enumerate() {
+            for (c, slot) in row_out.iter_mut().enumerate() {
+                let acc = (self.m[r][0] as i64) * (other.m[0][c] as i64)
+                    + (self.m[r][1] as i64) * (other.m[1][c] as i64)
+                    + (self.m[r][2] as i64) * (other.m[2][c] as i64);
+                let scaled = acc >> ROT_FRAC_BITS;
+                *slot = scaled.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+            }
+        }
+        Self { m: out }
+    }
+
+    /// Apply this rotation matrix to `v` and return the result in q19.12.
+    /// The accumulator is widened to i64 internally to prevent overflow on
+    /// cumulative multiply-adds.
+    pub fn mul_vec(&self, v: GteVec3) -> GteVec3 {
+        let row = |r: usize| -> i32 {
+            let a = (self.m[r][0] as i64) * (v.x as i64);
+            let b = (self.m[r][1] as i64) * (v.y as i64);
+            let c = (self.m[r][2] as i64) * (v.z as i64);
+            // Sum of three i32×i16 products fits in i64; shift by ROT_FRAC_BITS
+            // to drop the q12 fractional. Clamp on conversion to i32 so an
+            // overflow surfaces as saturation, not a panic.
+            ((a + b + c) >> ROT_FRAC_BITS).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+        };
+        GteVec3 {
+            x: row(0),
+            y: row(1),
+            z: row(2),
+        }
+    }
+}
+
+impl Default for GteMat3 {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+/// Per-object suppression bits in the render-node flag halfword at `+0x52`,
+/// read by the retail view-rotation build [`camera_view_rotation`].
+///
+/// Each bit **skips** its axis - the retail branch is `andi` + `bnez` to the
+/// next stage, so a *set* bit means "leave this axis out of the composition",
+/// not "apply it".
+pub mod view_rot_flags {
+    /// Skip the pitch factor (`RotMatrixX`, `FUN_800461A4`).
+    pub const SKIP_PITCH: u16 = 0x0080;
+    /// Skip the yaw factor (`RotMatrixY`, `FUN_8004629C`).
+    pub const SKIP_YAW: u16 = 0x0100;
+    /// Skip the roll factor (`RotMatrixZ`, `FUN_8004638C`).
+    pub const SKIP_ROLL: u16 = 0x0200;
+    /// Bypass the whole build and reuse the saved GTE control block.
+    pub const USE_SAVED_MATRIX: u16 = 0x0400;
+}
+
+/// Retail's **camera-relative** rotation for one render node: the partial
+/// camera rotation a node whose `+0x52` carries a skip bit is drawn under,
+/// in place of the full camera matrix.
+///
+/// PORT: FUN_8001CF50
+///
+/// Both play hosts reach it through [`super::camera_relative_model_prefix`]
+/// at their move-VM part draw sites - the summon / move-FX parts, the field
+/// stager parts (`World::active_field_fx_part_draws`) and the draw-kind-4
+/// list (`World::active_effect_kind4_draws`) - which carry the part's `+0x52`
+/// word as `flags_52`. A part with no `0x780` bit keeps the host's
+/// full-camera composition unchanged. The Baka Fighter cameo's `0x400` arm
+/// (`baka_duel_scene`) is its own placement over the same shape.
+///
+/// **This is not the camera build.** It was long documented as the
+/// cutscene / field view-rotation build and tagged as replaced by the hosts'
+/// camera; the disassembly says otherwise. Its three callers are the
+/// per-node renderers - the render dispatcher `FUN_8001ADA4` (`jal` at
+/// `0x8001B3A0`) and the animated mesh renderer `FUN_8001B964`
+/// (`0x8001BA24`) - plus one in the fishing overlay, and both SCUS callers
+/// reach it only when `node+0x52 & 0x780` is non-zero (`andi v0,v0,0x780` at
+/// `0x8001B374` / `0x8001BA0C`); otherwise they fold
+/// the object matrix into the camera matrix at scratch `0x1F8003C8`. That
+/// camera matrix is built by `FUN_800172C0` through `FUN_80026988` over the
+/// same angle globals - ported retail-exact as
+/// `crate::battle_intro::euler_rot_psx` - and the hosts' f32 rendition of it
+/// is `legaia_engine_camera::psx_camera::camera_rotation`.
+///
+/// Across the 98 catalogued mednafen states, 334 of the 3956 nodes on the
+/// actor lists `0x8007C34C..` carry a bit of `0x780`, all but four of them
+/// ticked by the part tick `FUN_80021DF4` (the four by `0x801D4098`, in the
+/// dance state): `0x380` (every axis skipped - a screen-aligned billboard) on
+/// 118 battle-effect parts, `0x100` / `0x180` on 46 field and overworld
+/// parts, and the `0x400` arm on 170, mostly summon casts. Fifteen states
+/// hold an axis-skipping node whose skipped angle is non-zero, so the port's
+/// full-camera draw of those parts differs from retail on screen. Six of the
+/// seven map01 states are the exception: their camera yaw is `0`, so the
+/// `0x100` nodes there (the kind-4 column) draw the same either way; the
+/// seventh is an ending-vignette shot at yaw `75`. Those are the draws the
+/// host prefix turns.
+///
+/// Returns the composed rotation, or `None` when the node asks for the saved
+/// camera matrix instead ([`view_rot_flags::USE_SAVED_MATRIX`]).
+///
+/// The shape, read off `0x8001CF50..0x8001D038`:
+///
+/// 1. `FUN_8003D178` resets the GTE rotation to identity **and clears
+///    TRX/TRY/TRZ**, so the build starts from a pure rotation.
+/// 2. Each of `FUN_800461A4` / `FUN_8004629C` / `FUN_8004638C` **post**-multiplies
+///    the current GTE rotation by its axis factor, so the composition order is
+///    `Rx * Ry * Rz`, pitch outermost - the camera's own order, minus the
+///    skipped factors.
+/// 3. Each factor is skipped when its `node+0x52` bit is set (see
+///    [`view_rot_flags`]); the angles are the camera globals
+///    `_DAT_8007B790` (pitch) / `_DAT_8007B792` (yaw) / `_DAT_8007B794` (roll).
+/// 4. The rotation is read back (`FUN_8003D20C`), the node's own matrix is
+///    scaled by `0x6000` on each axis (`FUN_8005B4E8`, the six-fold world
+///    scale the camera matrix otherwise carries from `_DAT_8007BF10`), and
+///    the two are multiplied (`FUN_8005B3A8`).
+/// 5. Bit `0x400` short-circuits the rotation: retail restores the base
+///    matrix block `0x8007BF10` (`FUN_8003D1A4`), reads it back, and MVMVAs the
+///    node's position `+0x14` through it into `+0x2C` (`FUN_8003D344`) - a
+///    camera-locked placement, which is what `None` stands for here.
+///
+/// The scale stage is not part of the rotation and is left to the caller.
+pub fn camera_view_rotation(flags: u16, pitch: f32, yaw: f32, roll: f32) -> Option<GteMat3> {
+    if flags & view_rot_flags::USE_SAVED_MATRIX != 0 {
+        return None;
+    }
+    let mut m = GteMat3::IDENTITY;
+    if flags & view_rot_flags::SKIP_PITCH == 0 {
+        m = m.mul(&GteMat3::rot_x(pitch));
+    }
+    if flags & view_rot_flags::SKIP_YAW == 0 {
+        m = m.mul(&GteMat3::rot_y(yaw));
+    }
+    if flags & view_rot_flags::SKIP_ROLL == 0 {
+        m = m.mul(&GteMat3::rot_z(roll));
+    }
+    Some(m)
+}
+
+/// Equivalent of `RTPT` (rotate, translate, perspective transform): apply
+/// `rot * v + trans`. Result is in q19.12.
+pub fn rot_trans(rot: &GteMat3, v: GteVec3, trans: GteVec3) -> GteVec3 {
+    let r = rot.mul_vec(v);
+    GteVec3::new(
+        r.x.saturating_add(trans.x),
+        r.y.saturating_add(trans.y),
+        r.z.saturating_add(trans.z),
+    )
+}
+
+fn clamp_i32_from_f32(f: f32) -> i32 {
+    if !f.is_finite() {
+        return 0;
+    }
+    f.round().clamp(i32::MIN as f32, i32::MAX as f32) as i32
+}
+
+/// 2D screen-space coordinate, GTE-style q.0 in pixels (signed i16-clamped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScreenXY {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl ScreenXY {
+    pub const fn new(x: i32, y: i32) -> Self {
+        Self { x, y }
+    }
+
+    /// Saturate to the GTE's signed-11-bit SXY-FIFO range `[-0x400, 0x3FF]`.
+    /// The retail GTE pushes projected coordinates through this clamp before
+    /// the OT writer reads them, raising SX2/SY2 on saturation; reproduce that
+    /// so out-of-bounds verts behave the same as on hardware. Bound confirmed
+    /// against a real-COP2 capture (see [`SX_MIN`]/[`SX_MAX`]).
+    pub fn saturate_sxy(self) -> Self {
+        Self {
+            x: self.x.clamp(SX_MIN, SX_MAX),
+            y: self.y.clamp(SX_MIN, SX_MAX),
+        }
+    }
+}
+
+/// Per-vertex GTE clip status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clip {
+    /// Vertex is in front of the near plane and projection is well-defined.
+    SafeFront,
+    /// Vertex is behind or on the camera plane (`view.z <= 0`). The retail
+    /// GTE saturates SXY in this case; the OT entry is usually skipped.
+    Behind,
+}
+
+/// Output of a single GTE projection (one `RTPT` slot).
+#[derive(Debug, Clone, Copy)]
+pub struct ProjectedVertex {
+    pub screen_xy: ScreenXY,
+    pub view_z: i32,
+    pub clip: Clip,
+}
+
+// ---- Perspective divide: Unsigned Newton-Raphson (UNR) reciprocal. --------
+//
+// The divide itself lives in `crate::gte::divide`, the leaf the
+// simulation links too, so a screen point `engine-core` needs and one this
+// crate draws divide identically. See docs/subsystems/renderer.md.
+#[cfg(test)]
+use crate::gte::divide::GTE_DIV_TABLE;
+pub use crate::gte::divide::gte_divide;
+
+/// Apply a `gte_divide` quotient to one screen axis: multiply by the
+/// i16-saturated numerator (IR1 for X, IR2 for Y) and drop the 16 fractional
+/// bits the reciprocal carries. Caller adds `OFX`/`OFY` and clamps.
+/// `pub` (not crate-local): the billboard projector in `engine-render` runs
+/// the same hardware term.
+pub fn gte_persp_term(numerator_i16: i32, recip: i64) -> i64 {
+    (numerator_i16 as i64 * recip) >> 16
+}
+
+/// `NCLIP`: signed 2× area of the screen-space triangle (a, b, c), used by
+/// the GTE for back-face rejection. The retail TMD renderer reads `MAC0`
+/// after `NCLIP` and drops primitives where the result is non-negative
+/// (i.e. zero area or back-facing under PSX winding).
+///
+/// Returns the cross product `(b - a) × (c - a)` widened to i64 so a
+/// quadrant-spanning triangle doesn't overflow.
+pub fn nclip(a: ScreenXY, b: ScreenXY, c: ScreenXY) -> i64 {
+    let ab_x = (b.x - a.x) as i64;
+    let ab_y = (b.y - a.y) as i64;
+    let ac_x = (c.x - a.x) as i64;
+    let ac_y = (c.y - a.y) as i64;
+    ab_x * ac_y - ab_y * ac_x
+}
+
+/// `AVSZ3`: average of three SZ values (post-RTPT view-space Z). Returns
+/// the OT-bucket index `(z0 + z1 + z2) * ZSF3 / 4096`, but with `ZSF3 = 1`
+/// the formula simplifies to `(z0 + z1 + z2) >> ROT_FRAC_BITS`. Caller can
+/// supply a custom scale via [`avsz3_with_scale`] when reproducing a
+/// retail-captured GTE state.
+pub fn avsz3(z0: i32, z1: i32, z2: i32) -> i32 {
+    avsz3_with_scale(z0, z1, z2, ROT_ONE)
+}
+
+/// Same as [`avsz3`] but with an explicit `zsf3` (q3.12). The retail GTE
+/// uses `ZSF3 = 1024` for an "average" bucket and `ZSF3 = 4096` for a
+/// "sum" bucket.
+pub fn avsz3_with_scale(z0: i32, z1: i32, z2: i32, zsf3: i32) -> i32 {
+    let sum = z0 as i64 + z1 as i64 + z2 as i64;
+    let scaled = (sum * zsf3 as i64) >> ROT_FRAC_BITS;
+    scaled.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+/// `AVSZ4`: same as [`avsz3`] for quads.
+pub fn avsz4(z0: i32, z1: i32, z2: i32, z3: i32) -> i32 {
+    avsz4_with_scale(z0, z1, z2, z3, ROT_ONE)
+}
+
+/// Same as [`avsz4`] but with an explicit `zsf4` (q3.12).
+pub fn avsz4_with_scale(z0: i32, z1: i32, z2: i32, z3: i32, zsf4: i32) -> i32 {
+    let sum = z0 as i64 + z1 as i64 + z2 as i64 + z3 as i64;
+    let scaled = (sum * zsf4 as i64) >> ROT_FRAC_BITS;
+    scaled.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+/// Convert a GTE-projected `ScreenXY` (q.0 pixel coord, possibly outside
+/// the viewport) into integer pixel coordinates clamped to a render
+/// target. Useful for offline rasterizers that don't want to handle
+/// off-screen vertices specially.
+pub fn screen_to_pixel(screen: ScreenXY, w: i32, h: i32) -> (i32, i32) {
+    (screen.x.clamp(0, w - 1), screen.y.clamp(0, h - 1))
+}
+
+// ---- Free functions used by the register-transfer layer. -----------------
+
+/// Sign-extend the low 16 bits of `v` to a u32. The cop2 register file
+/// returns IR / matrix elements as sign-extended 32-bit values when read
+/// through MFC2 / CFC2.
+pub(crate) fn sign_extend_i16(v: i16) -> u32 {
+    v as i32 as u32
+}
+
+/// Pack two i16 values into one u32: low half = `lo`, high half = `hi`.
+/// Matches the cop2 register layout for matrix rows + SXY entries.
+pub(crate) fn pack_i16_lo_hi(lo: i16, hi: i16) -> u32 {
+    ((lo as u16) as u32) | (((hi as u16) as u32) << 16)
+}
+
+pub(crate) fn unpack_i16_lo_hi(v: u32) -> (i16, i16) {
+    let lo = (v & 0xFFFF) as i16;
+    let hi = ((v >> 16) & 0xFFFF) as i16;
+    (lo, hi)
+}
+
+pub(crate) fn clamp_i32_from_i64(v: i64) -> i32 {
+    v.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+/// Pack IR1/IR2/IR3 into the BGR555 form the cop2cr28 (IRGB) read returns.
+/// Hardware clamps each IR to `0..=0x1F` (i.e. `IR >> 7`).
+pub(crate) fn packed_irgb(ir1: i32, ir2: i32, ir3: i32) -> u32 {
+    let r = ((ir1 >> 7).clamp(0, 0x1F)) as u32;
+    let g = ((ir2 >> 7).clamp(0, 0x1F)) as u32;
+    let b = ((ir3 >> 7).clamp(0, 0x1F)) as u32;
+    r | (g << 5) | (b << 10)
+}
+
+/// LZCR semantics: count leading bits that match the sign bit of `lzcs`.
+/// For a non-negative `lzcs` the count of leading zeros; for a negative
+/// `lzcs` the count of leading ones (0..=32).
+pub(crate) fn count_leading_same(v: i32) -> u32 {
+    if v < 0 {
+        (!v as u32).leading_zeros()
+    } else {
+        (v as u32).leading_zeros()
+    }
+}
+
+#[cfg(test)]
+mod unr_tests {
+    use super::*;
+
+    #[test]
+    fn unr_table_matches_published_seed_values() {
+        // The generated table must reproduce the published PSX GTE UNR seed
+        // table (no$psx / Beetle). Pin the head, the two trailing entries, and
+        // the duplicated 0x100 slot - a mismatch means the formula drifted.
+        let expected_head = [0xFFu8, 0xFD, 0xFB, 0xF9, 0xF7, 0xF5, 0xF3, 0xF1];
+        assert_eq!(&GTE_DIV_TABLE[..8], &expected_head);
+        assert_eq!(GTE_DIV_TABLE[0xFE], 0x00);
+        assert_eq!(GTE_DIV_TABLE[0xFF], 0x00);
+        assert_eq!(GTE_DIV_TABLE[0x100], GTE_DIV_TABLE[0xFF]);
+    }
+
+    #[test]
+    fn gte_divide_near_camera_overflow_saturates_and_flags() {
+        // Audit case: H=256, SZ3=100. 2*100 <= 256 ⇒ overflow, quotient
+        // saturates to 0x1FFFF. With IR1=50 the projected offset is 99 (the
+        // retail value), where an exact H*IR1/SZ3 would give 128.
+        let (recip, overflow) = gte_divide(256, 100);
+        assert!(overflow);
+        assert_eq!(recip, 0x1FFFF);
+        assert_eq!(gte_persp_term(50, recip), 99);
+    }
+
+    #[test]
+    fn gte_divide_overflow_boundary_is_2sz3_le_h() {
+        // Exactly 2*SZ3 == H still overflows (<=), one above does not.
+        let (r_ovf, ovf) = gte_divide(320, 160);
+        assert!(ovf);
+        assert_eq!(r_ovf, 0x1FFFF);
+        let (_r, no_ovf) = gte_divide(320, 161);
+        assert!(!no_ovf);
+        // SZ3 == 0 (behind / on the near plane) always overflows.
+        assert_eq!(gte_divide(320, 0), (0x1FFFF, true));
+    }
+
+    #[test]
+    fn gte_divide_matches_exact_within_documented_error_for_large_sz3() {
+        // For SZ3 > H/2 (no overflow) the UNR reciprocal tracks the exact
+        // divide to within the documented bound (±1, up to 2 at the boundary /
+        // for extreme numerators), across the full i16 numerator range.
+        for &h in &[256u16, 320] {
+            let mut sz3 = (h / 2) + 1;
+            while sz3 <= 8192 {
+                let (recip, overflow) = gte_divide(h, sz3);
+                assert!(!overflow, "sz3={sz3} above H/2 must not overflow");
+                let mut ir = -32768i64;
+                while ir <= 32767 {
+                    let approx = gte_persp_term(ir as i32, recip);
+                    let exact = (ir * h as i64) / sz3 as i64;
+                    assert!(
+                        (approx - exact).abs() <= 2,
+                        "h={h} sz3={sz3} ir={ir}: approx={approx} exact={exact}"
+                    );
+                    ir += 97;
+                }
+                sz3 += 1;
+            }
+        }
+    }
+}

@@ -1,0 +1,645 @@
+//! Top-level engine driver. The "single command" that turns extracted-disc
+//! bytes into a runtime view of any CDNAME scene.
+//!
+//! With no subcommand it runs the first-run launcher (`launcher_window`):
+//! ask for the disc image once, remember it, then boot `play-window`.
+//!
+//! Subcommands:
+//!
+//! - `info` - headless one-line summary of a scene's resolved asset chain.
+//! - `list-scenes` - every CDNAME scene name with its PROT range.
+//! - `play` - headless engine tick: world + camera + audio, no window.
+//! - `play-window` - windowed engine: opens a wgpu surface, renders scene
+//!   TMDs against the software PSX VRAM each frame. Input: arrows = D-pad,
+//!   Z = Cross, Esc = quit.
+
+#[path = "legaia-engine/cli.rs"]
+mod cli;
+#[path = "legaia-engine/commands.rs"]
+mod commands;
+#[path = "legaia-engine/launcher_window.rs"]
+mod launcher_window;
+
+use anyhow::Result;
+use clap::Parser;
+use cli::{Cli, Cmd};
+use commands::{
+    cmd_audio_trace, cmd_chain_editor, cmd_clut_trace, cmd_config, cmd_encounter, cmd_equip,
+    cmd_export_glb, cmd_gte_replay, cmd_info, cmd_inventory, cmd_list_scenes, cmd_load,
+    cmd_man_scripts, cmd_mode_trace, cmd_pcm_trace, cmd_play, cmd_replay, cmd_save,
+    cmd_save_select, cmd_scenarios, cmd_seru_capture, cmd_sim_trace, cmd_target_pick, cmd_title,
+    cmd_vram_oracle,
+};
+use legaia_engine_shell::window::{self, cmd_play_str, cmd_play_window, cmd_record};
+use std::path::Path;
+
+/// Restore the default SIGPIPE disposition so piping stdout (JSONL traces,
+/// scene listings) into `head` terminates quietly instead of panicking with
+/// "failed printing to stdout: Broken pipe".
+fn reset_sigpipe() {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+fn main() -> Result<()> {
+    reset_sigpipe();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let cli = Cli::parse();
+    // No subcommand (a double-click): the first-run launcher picks the disc,
+    // then boots `play-window` on it - in this process when no picker window
+    // was needed, otherwise in a child it already ran.
+    let cmd = match cli.cmd {
+        Some(cmd) => cmd,
+        None => match launcher_window::run()? {
+            Some(args) => Cli::parse_from(args)
+                .cmd
+                .expect("launcher play args name a subcommand"),
+            None => return Ok(()),
+        },
+    };
+    match cmd {
+        Cmd::RetailCompare(args) => legaia_parity::retail_compare_cli::run(args),
+        Cmd::CastSequenceScore(args) => legaia_parity::cast_sequence::run(args),
+        Cmd::Info {
+            scene,
+            extracted_root,
+            disc,
+            vram_png,
+            vram_bin,
+            runtime_vram,
+            vram_diff_png,
+            tmd_stats,
+            no_targeted,
+        } => cmd_info(
+            &scene,
+            &extracted_root,
+            disc.as_deref(),
+            vram_png.as_deref(),
+            vram_bin.as_deref(),
+            runtime_vram.as_deref(),
+            vram_diff_png.as_deref(),
+            tmd_stats,
+            !no_targeted,
+        ),
+        Cmd::ListScenes {
+            extracted_root,
+            disc,
+        } => cmd_list_scenes(&extracted_root, disc.as_deref()),
+        Cmd::ExportGlb {
+            scene,
+            all_scenes,
+            out,
+            scale,
+            include_sky,
+            no_npcs,
+            no_props,
+            items,
+            party,
+            extracted_root,
+            disc,
+        } => cmd_export_glb(
+            &scene,
+            all_scenes,
+            &out,
+            scale,
+            include_sky,
+            no_npcs,
+            no_props,
+            items,
+            party,
+            &extracted_root,
+            disc.as_deref(),
+        ),
+        Cmd::ClutTrace {
+            scene,
+            extracted_root,
+            disc,
+            runtime_vram,
+            max_sources,
+        } => cmd_clut_trace(
+            &scene,
+            &extracted_root,
+            disc.as_deref(),
+            runtime_vram.as_deref(),
+            max_sources,
+        ),
+        Cmd::ManScripts {
+            scene,
+            extracted_root,
+            disc,
+            all,
+            disasm_record,
+            disasm_partition,
+            dump_man,
+            variant,
+            gflag_partition,
+            narration,
+            system_flag_census,
+            motion_flag_census,
+            op49_window_census,
+            p2_gates,
+        } => cmd_man_scripts(
+            &scene,
+            &extracted_root,
+            disc.as_deref(),
+            all,
+            disasm_record,
+            disasm_partition,
+            dump_man.as_deref(),
+            variant,
+            gflag_partition,
+            narration,
+            system_flag_census,
+            motion_flag_census,
+            op49_window_census,
+            p2_gates,
+        ),
+        Cmd::VramOracle {
+            scene,
+            extracted_root,
+            disc,
+            runtime_vram,
+            scenario,
+            manifest,
+            frames,
+            strict,
+            diff_png,
+            tiles,
+            rows_csv,
+            clut_regions,
+        } => cmd_vram_oracle(VramOracleArgs {
+            scene: scene.as_deref(),
+            extracted_root: &extracted_root,
+            disc: disc.as_deref(),
+            runtime_vram: runtime_vram.as_deref(),
+            scenario: scenario.as_deref(),
+            manifest: &manifest,
+            frames,
+            strict,
+            diff_png: diff_png.as_deref(),
+            tiles,
+            rows_csv: rows_csv.as_deref(),
+            clut_regions,
+        }),
+        Cmd::ModeTrace {
+            scene,
+            extracted_root,
+            disc,
+            scenario,
+            manifest,
+            frames,
+            out,
+            strict,
+        } => cmd_mode_trace(ModeTraceArgs {
+            scene: scene.as_deref(),
+            extracted_root: &extracted_root,
+            disc: disc.as_deref(),
+            scenario: scenario.as_deref(),
+            manifest: &manifest,
+            frames,
+            out: &out,
+            strict,
+        }),
+        Cmd::SimTrace {
+            scene,
+            extracted_root,
+            disc,
+            frames,
+            no_field_live,
+            out,
+        } => cmd_sim_trace(
+            &scene,
+            &extracted_root,
+            disc.as_deref(),
+            frames,
+            !no_field_live,
+            &out,
+        ),
+        Cmd::AudioTrace {
+            scene,
+            extracted_root,
+            disc,
+            scenario,
+            manifest,
+            frames,
+            bgm_id,
+            out,
+            retail_jsonl,
+            strict,
+            per_voice,
+            retail_keyon_csv,
+            pin_bgm,
+            retail_keyon_owner,
+        } => cmd_audio_trace(AudioTraceArgs {
+            scene: scene.as_deref(),
+            extracted_root: &extracted_root,
+            disc: disc.as_deref(),
+            scenario: scenario.as_deref(),
+            manifest: &manifest,
+            frames,
+            bgm_id,
+            out: &out,
+            retail_jsonl: retail_jsonl.as_deref(),
+            strict,
+            per_voice,
+            retail_keyon_csv: retail_keyon_csv.as_deref(),
+            pin_bgm,
+            retail_keyon_owner,
+        }),
+        Cmd::PcmTrace {
+            scene,
+            extracted_root,
+            disc,
+            scenario,
+            manifest,
+            frames,
+            bgm_id,
+            retail_save,
+            engine_wav,
+            retail_wav,
+            strict,
+        } => cmd_pcm_trace(PcmTraceArgs {
+            scene: scene.as_deref(),
+            extracted_root: &extracted_root,
+            disc: disc.as_deref(),
+            scenario: scenario.as_deref(),
+            manifest: &manifest,
+            frames,
+            bgm_id,
+            retail_save: retail_save.as_deref(),
+            engine_wav: engine_wav.as_deref(),
+            retail_wav: retail_wav.as_deref(),
+            strict,
+        }),
+        Cmd::Replay { input, out, strict } => cmd_replay(&input, &out, strict),
+        Cmd::Record {
+            out,
+            scene,
+            extracted_root,
+            disc,
+            no_audio,
+            world_map,
+            save_dir,
+            scenario,
+            rng_seed,
+        } => cmd_record(
+            &out,
+            &scene,
+            &extracted_root,
+            disc.as_deref(),
+            !no_audio,
+            world_map,
+            &save_dir,
+            scenario.as_deref(),
+            rng_seed,
+        ),
+        Cmd::Play {
+            scene,
+            extracted_root,
+            disc,
+            frames,
+            no_audio,
+            frame_ms,
+            str_file,
+            cutscene_map,
+        } => cmd_play(
+            &scene,
+            &extracted_root,
+            disc.as_deref(),
+            frames,
+            !no_audio,
+            frame_ms,
+            str_file.as_deref(),
+            cutscene_map.as_deref(),
+        ),
+        Cmd::PlayWindow {
+            scene,
+            extracted_root,
+            disc,
+            no_audio,
+            world_map,
+            str_file,
+            boot_ui,
+            save_dir,
+            card,
+            cutscene_map,
+            cheat_file,
+            cheat_strict,
+            no_live_loop,
+            no_player_battle,
+            party,
+            simple_dialogue,
+            flat_y,
+            no_edge_collision,
+            no_solid_npcs,
+            no_live_npcs,
+            no_damage_finish,
+            battle_bgm,
+            screenshot,
+            screenshot_tick,
+            screenshot_chrome,
+            screenshot_every,
+            screenshot_dir,
+            screenshot_last_tick,
+            pad_script,
+            key_script,
+            seed_party,
+            battle,
+            dynamic_lighting,
+            no_dynamic_lighting,
+            no_dyn_shadows,
+            no_entry_pulse,
+            smart_monsters,
+            no_shiny_seru,
+            flee_exp,
+            exp_rate,
+            no_fortress_encounter_fix,
+            jewel_fix,
+            no_hp_readout_guard,
+            spirit_ap,
+            damage_ap,
+            seru_catch_rate,
+            enemy_attack_count,
+            enemy_stat_scale,
+            equipment_drops,
+            no_occlusion_fade,
+            no_volumetric_fog,
+            psx_render,
+            fullscreen,
+            windowed,
+            window_scale,
+            retail,
+            learn_spell,
+            set_flag,
+            resume_save,
+            cheat_level,
+            cheat_gold,
+            cheat_coins,
+            cheat_item,
+            cheat_max_ap,
+            cheat_restore,
+            cheat_seru,
+            cheat_arts,
+            cheat_max_items,
+            cheat_noclip,
+        } => cmd_play_window(
+            &scene,
+            &extracted_root,
+            disc.as_deref(),
+            !no_audio,
+            world_map,
+            str_file.as_deref(),
+            boot_ui,
+            &save_dir,
+            card.as_deref(),
+            cutscene_map.as_deref(),
+            cheat_file.as_deref(),
+            cheat_strict,
+            !no_live_loop,
+            !no_player_battle,
+            party.as_deref(),
+            !simple_dialogue,
+            !flat_y,
+            !no_edge_collision,
+            !no_solid_npcs,
+            !no_live_npcs,
+            !no_damage_finish,
+            battle_bgm,
+            window::ScreenshotConfig::from_args(
+                screenshot,
+                screenshot_tick,
+                screenshot_every,
+                screenshot_dir,
+                screenshot_last_tick,
+                pad_script.as_deref(),
+                key_script.as_deref(),
+            )?
+            .map(|s| s.with_chrome(screenshot_chrome)),
+            seed_party,
+            battle.as_deref(),
+            if retail {
+                window::LaunchFidelity {
+                    psx_render,
+                    window: window::WindowLaunch::from_flags(fullscreen, windowed, window_scale),
+                    ..window::LaunchFidelity::retail()
+                }
+            } else {
+                window::LaunchFidelity {
+                    dynamic_lighting: if no_dynamic_lighting {
+                        Some(false)
+                    } else if dynamic_lighting {
+                        Some(true)
+                    } else {
+                        None
+                    },
+                    dyn_shadows: !no_dyn_shadows,
+                    entry_pulse: !no_entry_pulse,
+                    smart_monsters,
+                    tweaks: legaia_engine_session::session_switches::GameplayTweaks {
+                        shiny_seru: !no_shiny_seru,
+                        flee_exp,
+                        exp_rate_permille: exp_rate.unwrap_or(
+                            legaia_engine_session::session_switches::GameplayTweaks::default()
+                                .exp_rate_permille,
+                        ),
+                        fortress_encounter_fix: !no_fortress_encounter_fix,
+                        jewel_fix,
+                        hp_readout_guard: !no_hp_readout_guard,
+                        spirit_ap: spirit_ap.unwrap_or(legaia_engine_core::world::SPIRIT_AP_RETAIL),
+                        damage_ap: damage_ap.unwrap_or(legaia_engine_core::world::DAMAGE_AP_RETAIL),
+                        seru_catch_pct: seru_catch_rate,
+                        enemy_attack_permille: enemy_attack_count
+                            .unwrap_or(legaia_engine_core::world::SCALE_RETAIL),
+                        enemy_stat_permille: enemy_stat_scale
+                            .unwrap_or(legaia_engine_core::world::SCALE_RETAIL),
+                        bonus_drop: equipment_drops,
+                    },
+                    occlusion_fade: !no_occlusion_fade,
+                    volumetric_fog: !no_volumetric_fog,
+                    retail: false,
+                    psx_render,
+                    window: window::WindowLaunch::from_flags(fullscreen, windowed, window_scale),
+                }
+            },
+            window::DebugSeeds::from_args(&learn_spell, &set_flag, resume_save)?.with_cheats(
+                window::PlayCheats {
+                    level: cheat_level,
+                    gold: cheat_gold,
+                    coins: cheat_coins,
+                    items: cheat_item,
+                    max_ap: cheat_max_ap,
+                    restore: cheat_restore,
+                    seru_level: cheat_seru,
+                    arts: cheat_arts,
+                    max_items: cheat_max_items,
+                    noclip: cheat_noclip,
+                },
+            ),
+        ),
+        Cmd::Save {
+            extracted_root,
+            disc,
+            save_dir,
+            slot,
+            party_size,
+        } => cmd_save(
+            &extracted_root,
+            disc.as_deref(),
+            &save_dir,
+            slot,
+            party_size,
+        ),
+        Cmd::Load {
+            save_dir,
+            slot,
+            card,
+            block,
+        } => cmd_load(&save_dir, slot, card.as_deref(), block),
+        Cmd::XaCue { ids, len, xa_dir } => {
+            let parse = |t: &String| -> u32 {
+                let t = t.trim();
+                t.strip_prefix("0x")
+                    .or_else(|| t.strip_prefix("0X"))
+                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+                    .or_else(|| t.parse().ok())
+                    .unwrap_or(0)
+            };
+            let ids: Vec<u32> = if ids.is_empty() {
+                (0..8)
+                    .map(|i| legaia_engine_shell::xa_clip::XA_CUE_BASE + i)
+                    .collect()
+            } else {
+                ids.iter().map(parse).collect()
+            };
+            print!(
+                "{}",
+                legaia_engine_shell::xa_clip::report_cues(&ids, len, xa_dir.as_deref())
+            );
+            Ok(())
+        }
+        Cmd::PlayStr {
+            str_file,
+            disc,
+            width,
+            height,
+        } => cmd_play_str(&str_file, disc.as_deref(), width, height),
+        Cmd::Config { cmd } => cmd_config(cmd),
+        Cmd::Inventory {
+            item,
+            party_size,
+            script,
+        } => cmd_inventory(item, party_size, &script),
+        Cmd::Equip { slot, item } => cmd_equip(slot, item),
+        Cmd::GteReplay { trace, verbose } => cmd_gte_replay(&trace, verbose),
+        Cmd::Title {
+            script,
+            no_save,
+            fade_frames,
+        } => cmd_title(&script, no_save, fade_frames),
+        Cmd::SaveSelect {
+            mode,
+            slots,
+            script,
+        } => cmd_save_select(&mode, &slots, &script),
+        Cmd::Encounter { rate, steps, seed } => cmd_encounter(rate, steps, seed),
+        Cmd::TargetPick {
+            kind,
+            actor,
+            script,
+        } => cmd_target_pick(&kind, actor, &script),
+        Cmd::ChainEditor { char_slot, script } => cmd_chain_editor(char_slot, &script),
+        Cmd::SeruCapture { seru, count, party } => cmd_seru_capture(seru, count, &party),
+        Cmd::Scenarios {
+            manifest,
+            extracted_root,
+            bless,
+        } => cmd_scenarios(manifest.as_deref(), &extracted_root, bless),
+    }
+}
+
+/// Side-by-side compare of engine VRAM (built via the scene's targeted
+/// upload) against a runtime VRAM blob from a save state. Reports the
+/// per-band overlap and per-tile (64x64) diff if `tiles` is set; writes
+/// the colour-coded diff PNG when `diff_png` is provided.
+#[allow(clippy::too_many_arguments)]
+struct VramOracleArgs<'a> {
+    scene: Option<&'a str>,
+    extracted_root: &'a Path,
+    disc: Option<&'a Path>,
+    runtime_vram: Option<&'a Path>,
+    scenario: Option<&'a str>,
+    manifest: &'a Path,
+    frames: u64,
+    strict: bool,
+    diff_png: Option<&'a Path>,
+    tiles: bool,
+    rows_csv: Option<&'a Path>,
+    clut_regions: bool,
+}
+
+/// Phase-E3 mode-trace oracle - args struct for `cmd_mode_trace`.
+struct ModeTraceArgs<'a> {
+    scene: Option<&'a str>,
+    extracted_root: &'a Path,
+    disc: Option<&'a Path>,
+    scenario: Option<&'a str>,
+    manifest: &'a Path,
+    frames: u64,
+    out: &'a Path,
+    strict: bool,
+}
+
+/// Audio-trace oracle - args struct for `cmd_audio_trace`.
+struct AudioTraceArgs<'a> {
+    scene: Option<&'a str>,
+    extracted_root: &'a Path,
+    disc: Option<&'a Path>,
+    scenario: Option<&'a str>,
+    manifest: &'a Path,
+    frames: u64,
+    bgm_id: Option<u16>,
+    out: &'a Path,
+    retail_jsonl: Option<&'a Path>,
+    strict: bool,
+    per_voice: bool,
+    retail_keyon_csv: Option<&'a Path>,
+    pin_bgm: bool,
+    retail_keyon_owner: Option<u16>,
+}
+
+struct PcmTraceArgs<'a> {
+    scene: Option<&'a str>,
+    extracted_root: &'a Path,
+    disc: Option<&'a Path>,
+    scenario: Option<&'a str>,
+    manifest: &'a Path,
+    frames: u64,
+    bgm_id: Option<u16>,
+    retail_save: Option<&'a Path>,
+    engine_wav: Option<&'a Path>,
+    retail_wav: Option<&'a Path>,
+    strict: bool,
+}
+
+/// Decode a raw PSX STR file (2048-byte sectors) headlessly and return the
+/// number of MDEC video frames that decode cleanly. Shared by the `play`
+/// pre-decode pass and the in-flow cutscene driver.
+fn decode_str_frame_count(str_path: &Path) -> Result<usize> {
+    use legaia_mdec::{MdecDecoder, str_sector::StrFrameAssembler};
+    let data = std::fs::read(str_path)?;
+    let n_sectors = data.len() / 2048;
+    let mut asm = StrFrameAssembler::new();
+    let mut decoded = 0usize;
+    for i in 0..n_sectors {
+        let sector = &data[i * 2048..(i + 1) * 2048];
+        if let Some((hdr, bs)) = asm.push_sector(sector)? {
+            let dec = MdecDecoder::new(hdr.width as u32, hdr.height as u32);
+            if dec.decode_frame(&bs).is_ok() {
+                decoded += 1;
+            }
+        }
+    }
+    Ok(decoded)
+}

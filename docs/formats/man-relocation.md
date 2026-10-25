@@ -1,0 +1,219 @@
+# MAN relocation (variable-length destination editing)
+
+How to **resize** a field-VM `0x3F` named-scene-change ("door / exit")
+destination in a decompressed scene **MAN** and rebuild the buffer so every
+internal offset stays valid. This is what lets the [randomizer](../tooling/randomizer.md)
+re-point a door at a scene with a differently-sized name. Engine: `legaia_scene_formats::man_edit`.
+
+## The destination table is the partition-2 record-offset table
+
+A `0x3F` op carries its destination inline:
+
+```text
+0x3F [i16 index][u8 name_len][name_len name bytes][entry_x][entry_z][dir]
+```
+
+The ops are **partition-2 MAN records** (the named cutscene-timeline-style
+records - see [encounter.md](encounter.md) for the MAN layout, including the
+`[u8 name_len][name*2 SJIS][cond-blocks]` partition-2 header). They are reached
+at runtime through the **partition-2 record-offset table**: on a transition the
+field controller sets the VM bytecode base to
+`man_base + data_region + partition2[slot]` and runs that record's small script
+by fall-through (`SysFlag.Set; CFlag.Set; EFFECT; yield; 0x3F; entry-trailer;
+JmpRel-1 self-loop`), whose `0x3F` op warps by the inline name. Selection is by
+stable **slot index**, so the op's `index` field is only the destination-scene id
+passed to the warp packet (`FUN_8001FD44`), not a record selector.
+
+This was pinned by a live PCSX-Redux dispatch trace (`autorun_door_dispatch_trace.lua`
+on the `drake_castle_to_worldmap` capture): the executing op's bytecode base
+minus the MAN base equalled `data_region + partition2[0]` exactly. Corpus census
+(clean partition walk, disc-wide): 160 destination ops across 48 scenes, 153 in
+partition 2.
+
+The practical consequence: the destination "index" *is* a structural offset
+table the MAN parser already exposes, so resizing a record is safe - fix the
+table, and every door stays addressable.
+
+Note the table is **flat** across the three partitions (`[P0..P1..P2]`), and it
+is indexed that way by the runtime resolver `FUN_8003C8F0` - but each partition
+prefixes its record with a *different* header, so a record's script start is not
+a function of the index alone. The per-partition header table is in
+[`script-vm.md`](../subsystems/script-vm.md#record-headers-are-per-partition-the-record-index-space-is-flat).
+
+## Relocation surface
+
+A mid-buffer insert/delete of `delta` bytes at a destination op needs these
+fixups (all offsets per [`man_section`](../../crates/scene-formats/src/man_section.rs)):
+
+1. **Partition record-offset tables** (`MAN[0x2B..]`, u24LE entries relative to
+   `data_region_offset`): bump every entry whose record starts after the edit by
+   `delta`. This table *is* the door dispatch index.
+2. **`u24_at_28`** (header `MAN[0x28..0x2B]`, u24LE section-0 offset relative to
+   `data_region`): the section chain sits after the records, so it shifts by the
+   total delta.
+3. **Intra-record relative jumps** in the edited record whose source/target
+   straddle the edit: `field_disasm` `0x26 JMP_REL`, `0x42 COND_JMP`,
+   `0x4D BBOX_TEST`, `0x4E` conditional sub-ops, `0x70` SystemFlag-test. The
+   stored u16 delta is recomputed; a jump wholly on one side is unaffected (its
+   endpoints shift together). The delta field sits exactly at the jump's relative
+   base (`target - delta`), so the rewrite is op-agnostic. (37 of 160 corpus ops
+   have such a jump.)
+4. **External descriptor** (`scene_asset_table`): the MAN's *decompressed* size
+   is stored only in the scene-bundle descriptor word `(type<<24)|size`. Rewrite
+   it with `scene_asset_table::encode_size_word` after recompressing.
+   Deltas are 16-bit two's-complement: retail keeps the script PC in a 16-bit
+   field, so a high-bit delta is a **backward** jump - the `[21] [26 FE FF]`
+   park loop (`script-vm.md`). The fixup inverts the target with the
+   sign-extended delta; reading it unsigned placed the loop's target past the
+   buffer, where every later splice shifted it while its base stayed put, so
+   the rewrite turned the loop into a forward jump that the preservation
+   check could not see (an unresolvable target on both sides compares equal).
+
+`data_region_offset` is derived (`0x2B + 3*total_records`) and does not move.
+
+## Safety
+
+- **The field VM stores no absolute PC anywhere**, so a same-record shift
+  preserves every control-flow field it has. `0x45 0xC0` camera-apply is **not**
+  an exception: its trailing halfword is not a record-relative PC. The APPLY arm
+  at `0x801DF254..0x801DF288` hands the halfword to
+  `FUN_801DE084(0x801C6EA8, trigger, mode)`, the same call the CONFIGURE arm
+  makes with its own apply trigger, and exits `j 0x801E3624` /
+  `addiu s8,s8,0x4` - a 4-byte fall-through, never a jump
+  (`see ghidra/scripts/funcs/overlay_0897_801de840.txt`). It is a camera
+  parameter, and relocating it would corrupt the camera, so the editor leaves
+  it alone and edits records that contain one. The decoder names the field
+  `apply_trigger`.
+- **Validate-or-skip**: `man_edit::validate` re-parses + re-walks the rebuilt MAN
+  and confirms each edited op decodes as a `0x3F` carrying the intended name.
+- **Footprint**: the recompressed MAN must fit the original asset's on-disc
+  footprint (the gap to the next descriptor). A scene that can't grow in place -
+  the big overworld hubs, whose next asset is flush after the MAN - is skipped
+  and reported rather than relocating the whole bundle.
+- **Identify the carrier, not the scene name.** An edit is keyed to the PROT
+  entry the MAN actually lives in. A scene may have no MAN of its own, one
+  bundle MAN, or a bundle MAN plus a streaming variant carrier
+  (`legaia_scene_formats::man_section` parses all of them identically); the enumerator
+  is `legaia_engine_scene::man_census::scene_man_carriers`. Every carrier
+  on the disc is byte-unique, so a name that appears to resolve the *same* MAN
+  as another scene is a framing bug, not a shared asset - a CDNAME block whose
+  window is a subset of its neighbour's (the two head defines keep unshifted
+  legacy windows, see [cdname.md](cdname.md)) can reach the neighbour's bundle
+  if entry sizes over-read, and an edit made under that name would rewrite the
+  neighbour's sectors.
+
+## Generalized interior-text growth
+
+The same relocation machinery generalizes from a door's destination *name* to an
+arbitrary interior byte run - the dialog-segment text a localization grows or
+shrinks. `man_edit::apply_text_edits` takes a set of `TextEdit { offset, old_len,
+new_bytes }` (replace the `old_len` bytes at `offset` with `new_bytes` of any
+length) and rebuilds the MAN through the identical `rebuild_man` path: partition
+record-offset tables, `u24_at_28`, and straddling intra-record relative jumps are
+all fixed, and the external descriptor decompressed-size word is the caller's to
+rewrite after recompressing.
+
+A dialog segment is a `0x1F <text> 0x00` run in the script stream - most often
+a bare segment the actor-dialog SM parks on, otherwise the inline MES of a
+`0x49 0x00` state-resume or a `0x4C E1` balloon. The decoder treats the bare
+segment and the `0x27..0x2A` picker jump table as strides of the stream
+([`script-vm.md`](../subsystems/script-vm.md#text-segments-and-pickers-are-strides-of-the-stream)),
+so a record's clean walk crosses its dialogue instead of ending at the first
+line, a grown run keeps the fall-through decode in sync, and every reference
+behind it is still found + relocated: the relative-jump family, and a picker's
+`i16` entries, each relative to its own offset with its handler past the option
+labels - the case a label edit straddles every time. The walk starts at each
+partition's own `pc0` (partition 0 `[n][2n][attr]`, partition 1 `[N][2N][4]`,
+partition 2 parsed); the partition-1 formula applied to a partition-0 record
+starts mid-op and never reaches the record's text.
+
+Three invariants keep this safe:
+
+1. **Record-region gate.** Every edit must lie strictly before section 0 (the
+   record region), inside a partition record. Dialog is field-VM script =
+   partition records, never a data section, so an edit that would touch the
+   section chain (whose length prefixes this pass does not fix) is refused.
+2. **Round-trip backstop.** `man_edit::text_edits_preserve_scripts(original,
+   rebuilt)` re-walks every record in both buffers and requires an identical
+   instruction stream - same opcodes in order, every control-flow target
+   resolving to the same instruction ordinal. A mis-relocated jump diverges the
+   ordinal and is caught; the caller drops the growth and falls back to same-size
+   abbreviation for that scene.
+3. **Text-site gate.** `man_edit::text_site` classifies a run by where it sits
+   on its record's clean walk: `Segment` (the lead is the text an instruction
+   carries - dialog), `Operand` (an instruction spans it - `CC 1F 50 4B 00`
+   reads `1F "PK" 00` but is a cross-context MENU_CTRL), or `Unreached` (the
+   walk ended first). `apply_text_edits` refuses an `Operand` run outright and
+   refuses to *shift* an `Unreached` one; the importer skips the former on
+   every path and writes the latter same-size only.
+
+**Budget = the MAN's on-disc footprint.** The recompressed grown MAN must still
+fit the gap from its compressed stream to the next asset descriptor (same LBA, no
+disc relayout). Across the retail USA disc the scene-bundle PROT entries are
+**sector-aligned with zero padding**, and each compressed MAN already fills its
+footprint, so in-place growth fits a wordier localization only when the rewritten
+MAN recompresses no larger than the original - a small fraction of scenes. The
+rest are residual sector-crossers whose deficit is under one 2048-byte sector;
+supplying that sector is a disc-level relayout (what the PAL discs did at
+mastering - see [pal-localizations.md](../tooling/pal-localizations.md)).
+
+## The same question for a `container-formats::pack`: growing a mesh member
+
+A scene's TMD [pack](pack.md) poses the relocation question in its simplest
+form, and the answer is the opposite of the MAN's: **nothing outside the pack
+holds a byte offset into it**, so growing a member costs a rebuild of the pack
+entry and nothing else.
+
+The worked case is the Nivora Ravine duel scene's NPC mesh pack, PROT entry
+`0639` - the entry a `Flag(0x0A)` descriptor streams from the block's `+4` slot
+([scene-bundles.md](scene-bundles.md#a-flag-descriptor-streams-an-extra-file)).
+Its layout is a DATA_FIELD chunk header over a bare pack: `[u32 (0x02 << 24) |
+347476][u32 count = 112][u32 word_offsets[112]]`, and the 112 members tile the
+declared length exactly - member 0 begins at byte `452` (the header's own size,
+`4 + 4 * 112`) and the last member's end is the declared length, with no member
+zero-sized and no slack between any pair. Members `106` / `107` / `108` are the
+Delilas siblings' field rigs (Gi / Che / Lu; byte offsets `0x49690`, `0x4B880`,
+`0x4E8B4`, sizes `8688` / `12340` / `9248`).
+
+**The external references are all by index, never by offset.** Each is a
+different structure and each was checked:
+
+| Structure | What it names | Byte offset into the pack? |
+|---|---|---|
+| The pack's own `word_offsets[i]` | member start `/ 4` | yes - **internal** |
+| Mesh pool `DAT_8007C018` | one slot per member, in pack order (`FUN_8001F05C` loops `i in 0..count` calling `FUN_80026B4C(buf + offsets[i] * 4)`) | no - a runtime pointer rebuilt on every scene load |
+| Placement records (`legaia_scene_formats::field_objects`) | pool slot = member index + `FIELD_ACTOR_PACK_BIAS` | no |
+| Scene ANM records | an ANM **record number**, paired to a member by the placement's anim byte | no |
+| The bundle's `scene_asset_table` descriptors | `data_offset` / `size` inside the **bundle entry** (`0638`) | no - the pack is a separate PROT entry |
+| The bundle header's `+0x04` word | `Σ descriptor.size`, and never read | no |
+
+A byte scan agrees with the structural reading and sharpens it: across all 1233
+PROT entries, each of members `106` / `107` / `108`'s word offsets occurs
+**exactly once** - in `0639`'s own offset array - the byte-offset form occurs
+**zero** times anywhere, and the declared length `347476` occurs zero times
+outside the chunk header that encodes it. The twelve entries of the `nilboa`
+block (`0634..0645`, the 352 KB bundle `0638` included) carry no word equal to
+any of the 112 members' byte offsets.
+
+So the cost of growing a member is: rewrite `word_offsets[i..]` for every member
+at or after the grown one, rewrite the chunk header's declared length, and keep
+the result inside the entry's sector footprint. That is exactly what
+`legaia_party_swap::nivora_field` does when it re-emits members
+`106/107/108` (disc oracle `nivora_field_real`), and it is why the swap budgets
+the *contiguous span of the three retail members* rather than patching in place.
+
+Two qualifications. First, the same pack **inside a bundle** (the `Tmd`
+descriptor form, `town01`'s 114-mesh environment pack) adds two words to the
+list, both in the carrying entry: that descriptor's `size` - its decompressed
+byte count - and the header's `+0x04` sum, plus the requirement that the
+recompressed LZS stream still fits its span. Second, the budget is the same one
+the MAN faces above: the retail scene entries are sector-aligned with no
+padding, so a member that grows has to be paid for by another member shrinking.
+
+## See also
+
+- [Randomizer](../tooling/randomizer.md) - the door feature this enables.
+- [PAL localizations](../tooling/pal-localizations.md) - the dialog-growth consumer + fit rate.
+- [encounter.md](encounter.md) - the MAN multi-section layout.
+- [`field_disasm`](../subsystems/script-vm.md) - the field-VM opcode decoder the
+  jump fixup uses.

@@ -1,0 +1,1047 @@
+use super::*;
+use legaia_engine_field::world_map_markers::WorldMapEntityKind;
+use legaia_engine_mode::mode::SceneMode;
+
+/// The raw ([`legaia_engine_system::input::PadButton`]) word that reaches the world-map
+/// controller as the retail **packed** word `packed`. `FUN_801E76D4`'s
+/// literals are all packed bits; `WorldMapController::tick` converts, so a
+/// test that wants a named retail chord has to convert too.
+fn raw_pad(packed: u16) -> u16 {
+    packed.swap_bytes()
+}
+
+/// Retail's top-view chord as raw bits: `R1 | R2 | Cross` held, `Cross` the
+/// new press (packed `0x4A` / `0x40`, compared for word equality).
+const TOP_VIEW_CHORD: u16 = 0x4A00;
+/// The two shoulders alone - the frame that has to precede the chord so
+/// Cross is the *only* bit in the newly-pressed word.
+const TOP_VIEW_SHOULDERS: u16 = 0x0A00;
+
+/// Drive the top-view toggle the way a pad does: shoulders down for a frame,
+/// then Cross added on the next.
+fn press_top_view_chord(world: &mut World) {
+    world.set_pad(TOP_VIEW_SHOULDERS);
+    let _ = world.tick();
+    world.set_pad(TOP_VIEW_CHORD);
+    let _ = world.tick();
+}
+
+#[test]
+fn enter_world_map_installs_controller() {
+    let mut world = World::default();
+    assert!(world.world_map.ctrl.is_none());
+    world.enter_world_map();
+    assert_eq!(world.mode, SceneMode::WorldMap);
+    assert!(world.world_map.ctrl.is_some());
+    // Idempotent: re-entry keeps the existing controller + state.
+    world.world_map.ctrl.as_mut().unwrap().camera_x = 42;
+    world.enter_world_map();
+    assert_eq!(world.world_map.ctrl.as_ref().unwrap().camera_x, 42);
+}
+
+/// The top-view screen-dim pass (`FUN_801E75DC`) must be produced by the
+/// world-map *tick*, not by a host-side call: retail runs it from inside the
+/// controller `FUN_801E76D4`, immediately after the toggle/camera block.
+///
+/// This test fails if `World::tick_world_map` stops calling
+/// `WorldMapController::run_screen_dim` - the field stays `None` through a
+/// tick that retail would have dimmed.
+#[test]
+fn world_tick_emits_top_view_screen_dim() {
+    let mut world = World::default();
+    world.enter_world_map();
+    world.world_map.ctrl.as_mut().unwrap().debug_enabled = true;
+
+    // Walk mode (view_mode == 0): retail's first branch skips the whole
+    // top-view block, so no dim regardless of the anim flags.
+    world.world_map.ctrl.as_mut().unwrap().anim_flags = 1;
+    world.set_pad(0);
+    let _ = world.tick();
+    assert!(
+        world.world_map.ctrl.as_ref().unwrap().screen_dim.is_none(),
+        "walk mode must not dim"
+    );
+
+    // Flip into top view with the debug combo, keeping anim bit 0 set.
+    press_top_view_chord(&mut world);
+    assert!(world.world_map.ctrl.as_ref().unwrap().is_top_view());
+    // The chord itself carries R1|R2 held, and the anim toggles stand down
+    // while a shoulder is held, so bit 0 survives the toggle frame.
+    world.world_map.ctrl.as_mut().unwrap().anim_flags = 1;
+
+    world.set_pad(0);
+    let _ = world.tick();
+    let dim = world
+        .world_map
+        .ctrl
+        .as_ref()
+        .unwrap()
+        .screen_dim
+        .expect("top view with anim bit 0 set must emit the dim pass");
+    // The retail packet: black semi-transparent flat quad over the whole
+    // 320x224 draw area, dither bracketed off then on.
+    assert_eq!(dim.quad.cmd, 0x2A);
+    assert_eq!(dim.quad.color, (0, 0, 0));
+    assert_eq!(dim.quad.verts, [(0, -4), (320, -4), (0, 224), (320, 224)]);
+    assert!(!dim.mode_before.dither);
+    assert!(dim.mode_after.dither);
+
+    // Clearing anim bit 0 stops the pass on the very next tick - retail's
+    // second branch - and the stale pass must not linger.
+    world.world_map.ctrl.as_mut().unwrap().anim_flags = 0;
+    let _ = world.tick();
+    assert!(
+        world.world_map.ctrl.as_ref().unwrap().screen_dim.is_none(),
+        "anim bit 0 clear must stop the dim and clear the stale pass"
+    );
+}
+
+#[test]
+fn world_tick_drives_world_map_from_pad() {
+    // A pad installed via set_pad() before tick() flows into the
+    // world-map controller through World::tick's WorldMap arm. This is
+    // the A1 keystone: input changes per-frame World state through the
+    // tick path, not via a host-side controller.
+    let mut world = World::default();
+    world.enter_world_map();
+    world.world_map.ctrl.as_mut().unwrap().debug_enabled = true;
+
+    // Frames 1-2: the toggle chord (packed 0x4A held / 0x40 pressed) flips
+    // the view into top-view.
+    press_top_view_chord(&mut world);
+    assert!(world.world_map.ctrl.as_ref().unwrap().is_top_view());
+
+    // Next: in top-view, the camera bank needs the L1 modifier held
+    // alongside the direction (packed 0x4 | 0x1000). Releasing the toggle
+    // bits first so this frame is a clean scroll, not another toggle.
+    world.set_pad(0);
+    let _ = world.tick();
+    world.set_pad(raw_pad(0x0004 | 0x1000));
+    let _ = world.tick();
+    assert_eq!(world.world_map.ctrl.as_ref().unwrap().camera_x, -8);
+}
+
+#[test]
+fn world_map_tick_is_deterministic_across_identical_pad_streams() {
+    let pad_stream = [
+        TOP_VIEW_SHOULDERS,
+        TOP_VIEW_CHORD,
+        0x0000,
+        raw_pad(0x0004 | 0x1000),
+        raw_pad(0x0004 | 0x0020),
+        raw_pad(0x0004 | 0x0002),
+    ];
+    let drive = |stream: &[u16]| {
+        let mut world = World::default();
+        world.enter_world_map();
+        world.world_map.ctrl.as_mut().unwrap().debug_enabled = true;
+        for &pad in stream {
+            world.set_pad(pad);
+            let _ = world.tick();
+        }
+        let c = world.world_map.ctrl.unwrap();
+        (c.view_mode, c.camera_x, c.camera_z, c.azimuth, c.zoom)
+    };
+    assert_eq!(drive(&pad_stream), drive(&pad_stream));
+}
+
+/// With no overworld entities installed, the world-map tick is camera-only:
+/// the encounter state never advances even when encounters are enabled.
+#[test]
+fn world_map_without_entities_never_encounters() {
+    let mut world = World::default();
+    world.enter_world_map();
+    world.set_world_map_encounter(true, 0, 7, 64);
+    // No install_world_map_entities call.
+    for _ in 0..10 {
+        let _ = world.tick();
+    }
+    assert_eq!(world.mode, SceneMode::WorldMap);
+    assert!(world.world_map.pending_encounter.is_none());
+}
+
+/// Walking the overworld player across tiles rolls the region-keyed encounter
+/// (the `FUN_801D9E1C` port) and flips Field-less straight into a battle that
+/// returns to the world map.
+#[test]
+fn world_map_region_walk_triggers_battle() {
+    use legaia_engine_battle::monster_catalog::{
+        FormationDef, FormationSlot, MonsterCatalog, MonsterDef,
+    };
+    use legaia_engine_battle::region_encounter::{EncounterRegion, RegionEncounterTable};
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.toggles.live_gameplay_loop = true;
+    world.enter_world_map();
+    // Frame the camera at a quarter turn (azimuth 1024) so the camera-relative
+    // remap maps a held Right cleanly to world +X (keeps this test's "walk +X
+    // across tiles" intent readable; at the default azimuth 0 Right maps to -Z).
+    if let Some(ctrl) = world.world_map.ctrl.as_mut() {
+        ctrl.azimuth = 1024;
+    }
+    world.install_field_player(0); // player_actor_slot = 0, actor active
+    world.actors[0].battle.hp = 400;
+    world.actors[0].battle.max_hp = 400;
+    world.actors[0].battle.liveness = 1;
+    world.set_battle_attack(0, 80);
+
+    // Formation 5 spawns one weak monster (id 100).
+    world
+        .tables
+        .formation_table
+        .insert(FormationDef::new(5, vec![FormationSlot::new(100)]));
+    let mut cat = MonsterCatalog::new();
+    cat.insert(MonsterDef::new(100, "Test Slug", 20, 4));
+    world.set_monster_catalog(cat);
+
+    // One region covering tiles (0,0)..(20,20), high rate, rolling formation 5.
+    let mut table = RegionEncounterTable::new("test");
+    table.regions.push(EncounterRegion {
+        tile_x_min: 0,
+        tile_z_min: 0,
+        tile_x_max: 20,
+        tile_z_max: 20,
+        rate_increment: 255,
+        formation_base: 5,
+        formation_count: 1,
+        setup: Default::default(),
+    });
+    world.set_world_map_regions(table);
+
+    // Hold Right; the player walks +X, crossing 128-unit tiles. Each crossing
+    // rolls the region; the high rate triggers within a couple of tiles.
+    world.set_pad(input::PadButton::Right.mask());
+    let mut entered_battle = false;
+    for _ in 0..200 {
+        let _ = world.tick();
+        if world.mode == SceneMode::Battle {
+            entered_battle = true;
+            break;
+        }
+    }
+    assert!(
+        entered_battle,
+        "walking the overworld triggers a region encounter"
+    );
+    assert_eq!(world.battle.return_mode, SceneMode::WorldMap);
+}
+
+/// The overworld player is bounded by the scene's walkability grid, exactly
+/// like the field: the retail world-map-walk overlay's locomotion is the same
+/// `FUN_801d01b0` + `FUN_801cfe4c` against the same `_DAT_1f8003ec + 0x4000`
+/// grid. With every tile walled the player cannot move in any direction.
+#[test]
+fn world_map_locomotion_blocked_by_full_wall_grid() {
+    let mut world = World::default();
+    world.enter_world_map();
+    world.install_field_player(0);
+    // Wall every tile (sub=1 sets all four sub-cell bits across the grid).
+    world.paint_field_collision(1, (0, 0x80), (0, 0x80), 0);
+    world.actors[0].move_state.world_x = 400;
+    world.actors[0].move_state.world_z = 400;
+    world.set_pad(input::PadButton::Up.mask());
+    let _ = world.tick();
+    assert_eq!(
+        world.actors[0].move_state.world_x, 400,
+        "walled in: no X move"
+    );
+    assert_eq!(
+        world.actors[0].move_state.world_z, 400,
+        "walled in: no Z move"
+    );
+}
+
+/// With no walls, the overworld player walks freely. At the default walk-mode
+/// camera azimuth (`0`) the walk-view camera is retail's identity frame, so
+/// "screen up" walks the player `+Z` - the retail compass ring with zero
+/// octant offset.
+#[test]
+fn world_map_locomotion_walks_when_clear() {
+    let mut world = World::default();
+    world.enter_world_map();
+    world.install_field_player(0);
+    world.reset_field_collision_grid(); // present but all-walkable
+    world.actors[0].move_state.world_x = 200;
+    world.actors[0].move_state.world_z = 250;
+    world.set_pad(input::PadButton::Up.mask());
+    let _ = world.tick();
+    // speed 8 -> four 2-unit steps, all clear: at azimuth 0 "screen up" walks
+    // +Z (retail identity); z: 250 -> 258, x unchanged.
+    assert_eq!(world.actors[0].move_state.world_x, 200);
+    assert_eq!(world.actors[0].move_state.world_z, 258);
+}
+
+/// The camera-relative remap rotates the held d-pad through the overworld
+/// camera azimuth. Spot-check the cardinal framings against the **walk-view**
+/// camera - the retail GTE composition locomotion actually renders under -
+/// whose azimuth-0 frame is retail's identity: Up walks `Z+`, Right walks
+/// `X+` (the retail compass ring with zero octant offset).
+#[test]
+fn world_map_camera_relative_bits_rotates_with_azimuth() {
+    use crate::world::world_map_camera_relative_bits;
+    // Expectations are the walk-camera screen axes (screen-up -> world
+    // (-sinθ, cosθ), screen-right -> world (cosθ, sinθ)); the engine-shell
+    // projection test confirms these move the right way on screen.
+    // No input -> no bits.
+    assert_eq!(world_map_camera_relative_bits(0, 0, 0), 0);
+    // Azimuth 0: retail identity - Up -> Z+ (0x1000), Right -> X+ (0x2000).
+    assert_eq!(world_map_camera_relative_bits(0, 0, 1), 0x1000);
+    assert_eq!(world_map_camera_relative_bits(0, 1, 0), 0x2000);
+    // Azimuth 1024 (quarter turn): Up -> X- (0x8000).
+    assert_eq!(world_map_camera_relative_bits(1024, 0, 1), 0x8000);
+    // Azimuth 2048 (half turn): Up -> Z- (0x4000).
+    assert_eq!(world_map_camera_relative_bits(2048, 0, 1), 0x4000);
+    // Azimuth 3072 (3/4 turn): Up -> X+ (0x2000), Right -> Z- (0x4000).
+    assert_eq!(world_map_camera_relative_bits(3072, 0, 1), 0x2000);
+    assert_eq!(world_map_camera_relative_bits(3072, 1, 0), 0x4000);
+    // A diagonal framing (1/8 turn) maps a single screen press to two world
+    // axes (the player walks diagonally).
+    let diag = world_map_camera_relative_bits(512, 0, 1);
+    assert_eq!(
+        diag.count_ones(),
+        2,
+        "rotated framing -> diagonal world move"
+    );
+}
+
+/// A camera-only world map (no entities, no region tracker) never encounters,
+/// even while the player walks.
+#[test]
+fn world_map_without_regions_or_entities_never_encounters() {
+    let mut world = World::default();
+    world.enter_world_map();
+    world.install_field_player(0);
+    world.set_pad(input::PadButton::Right.mask());
+    for _ in 0..500 {
+        let _ = world.tick();
+    }
+    assert_eq!(world.mode, SceneMode::WorldMap);
+    assert!(world.world_map.pending_encounter.is_none());
+}
+
+/// An installed overworld entity whose shared countdown reaches zero (with
+/// encounters enabled) fires an encounter that resolves into a battle, and
+/// the battle is tagged to return to the overworld - not the field.
+#[test]
+fn world_map_encounter_flips_to_battle_returning_to_world_map() {
+    use legaia_engine_battle::monster_catalog::{
+        FormationDef, FormationSlot, MonsterCatalog, MonsterDef,
+    };
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.toggles.live_gameplay_loop = true;
+    world.enter_world_map();
+    // A capable lone party member.
+    world.actors[0].active = true;
+    world.actors[0].battle.hp = 400;
+    world.actors[0].battle.max_hp = 400;
+    world.actors[0].battle.liveness = 1;
+    world.set_battle_attack(0, 80);
+    // Formation 7 spawns one weak monster (id 100); register its stats.
+    world
+        .tables
+        .formation_table
+        .insert(FormationDef::new(7, vec![FormationSlot::new(100)]));
+    let mut cat = MonsterCatalog::new();
+    cat.insert(MonsterDef::new(100, "Test Slug", 20, 4));
+    world.set_monster_catalog(cat);
+    // One entity; encounters enabled with the countdown already at zero so
+    // the first Idle step fires immediately.
+    world.install_world_map_entities(1);
+    world.set_world_map_encounter(true, 0, 7, 64);
+
+    // The entity SM fires the encounter, the field-to-battle intro
+    // transition clocks its 132 display frames, and the world flips into
+    // battle, tagged to return to the overworld.
+    for _ in 0..200 {
+        if world.mode == SceneMode::Battle {
+            break;
+        }
+        let _ = world.tick();
+    }
+    assert_eq!(world.mode, SceneMode::Battle);
+    assert_eq!(world.battle.return_mode, SceneMode::WorldMap);
+    assert!(world.field_return.is_some());
+
+    // Drive the fight to completion; it must return to the world map, not
+    // the field.
+    let mut returned = false;
+    for _ in 0..8000 {
+        world.tick();
+        if world.mode != SceneMode::Battle {
+            returned = true;
+            break;
+        }
+    }
+    assert!(returned, "the overworld battle must resolve");
+    assert_eq!(
+        world.mode,
+        SceneMode::WorldMap,
+        "an overworld encounter returns to the world map"
+    );
+}
+
+/// A stationary player next to an idle overworld entity triggers an
+/// interaction (surfaced as a `FieldInteract` event), and a moving player
+/// does not.
+#[test]
+fn world_map_idle_entity_interacts_only_when_player_stationary() {
+    let mut world = World::default();
+    world.enter_world_map();
+    world.install_world_map_entities(1);
+    // Encounters disabled so only the interaction path can fire.
+    world.set_world_map_encounter(false, 50, 0, 64);
+
+    // Player moving (d-pad direction held): no interaction.
+    world.set_pad(legaia_engine_system::input::PadButton::Up.mask());
+    let _ = world.tick();
+    assert!(
+        !world
+            .pending_field_events
+            .iter()
+            .any(|e| matches!(e, FieldEvent::FieldInteract { .. })),
+        "a walking player does not interact"
+    );
+
+    // Player stationary: the idle entity interacts.
+    world.set_pad(0);
+    let _ = world.tick();
+    let interacted = world
+        .drain_field_events()
+        .iter()
+        .any(|e| matches!(e, FieldEvent::FieldInteract { interact_id: 0, .. }));
+    assert!(interacted, "a stationary player interacts with the entity");
+}
+
+/// An encounter-zone entity spawns its OWN formation, not the map-wide
+/// shared one.
+#[test]
+fn world_map_encounter_zone_uses_its_own_formation() {
+    use legaia_engine_battle::monster_catalog::{
+        FormationDef, FormationSlot, MonsterCatalog, MonsterDef,
+    };
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.toggles.live_gameplay_loop = true;
+    world.enter_world_map();
+    world.actors[0].active = true;
+    world.actors[0].battle.hp = 400;
+    world.actors[0].battle.max_hp = 400;
+    world.actors[0].battle.liveness = 1;
+    world.set_battle_attack(0, 80);
+    // Register both the zone's formation (9) and a decoy shared one (7).
+    world
+        .tables
+        .formation_table
+        .insert(FormationDef::new(9, vec![FormationSlot::new(100)]));
+    world
+        .tables
+        .formation_table
+        .insert(FormationDef::new(7, vec![FormationSlot::new(101)]));
+    let mut cat = MonsterCatalog::new();
+    cat.insert(MonsterDef::new(100, "Zone Slug", 20, 4));
+    cat.insert(MonsterDef::new(101, "Decoy", 20, 4));
+    world.set_monster_catalog(cat);
+    // Entity 0 is an encounter zone for formation 9; shared formation is 7.
+    world.install_world_map_entities_with_configs(vec![WorldMapEntityConfig::EncounterZone {
+        formation_id: 9,
+    }]);
+    world.set_world_map_encounter(true, 0, 7, 64);
+
+    // The contact arms the intro transition; the flip lands once its 132
+    // display frames elapse.
+    for _ in 0..200 {
+        if world.mode == SceneMode::Battle {
+            break;
+        }
+        let _ = world.tick();
+    }
+    assert_eq!(world.mode, SceneMode::Battle);
+    assert_eq!(
+        world
+            .battle
+            .active_formation
+            .as_ref()
+            .map(|f| f.formation_id),
+        Some(9),
+        "the zone's own formation spawns, not the shared one"
+    );
+}
+
+/// Engaging a minigame-door entity arms the **mode-24 door warp** with the
+/// placement's sub-id.
+///
+/// This used to assert a `WorldMapTransition { target_map: 5 }`, which was the
+/// defect: the payload of an overworld door entity is `op0 - 100` off the
+/// field-VM `0x3E` arm - a code-overlay selector - so surfacing it as a map id
+/// handed a minigame sub-id to the CDNAME-ordinal resolver.
+#[test]
+fn world_map_minigame_door_engage_arms_the_door_warp() {
+    let mut world = World::default();
+    world.enter_world_map();
+    world.install_world_map_entities_with_configs(vec![WorldMapEntityConfig::MinigameDoor {
+        sub_id: 5,
+        slot: 0,
+    }]);
+    // Encounters off so only the transition path can fire.
+    world.set_world_map_encounter(false, 50, 0, 64);
+
+    world.engage_world_map_entity(0);
+    let _ = world.tick();
+    assert_eq!(
+        world.minigames.pending_warp,
+        Some(5),
+        "the door arms its minigame sub-id"
+    );
+    assert!(
+        world.minigames.scene_backup.is_some(),
+        "the departure scene is backed up for the return trip"
+    );
+    assert!(
+        !world
+            .drain_field_events()
+            .iter()
+            .any(|e| matches!(e, FieldEvent::WorldMapTransition { .. })),
+        "a minigame door is not a scene transition"
+    );
+}
+
+/// Walking the overworld player onto a minigame-door entity's tile
+/// auto-engages it (no host `engage_world_map_entity` call) and arms the door
+/// warp with its sub-id.
+#[test]
+fn world_map_walking_onto_minigame_door_auto_engages() {
+    let mut world = World::default();
+    world.enter_world_map();
+    world.install_field_player(0);
+    // Encounters off so only the transition path can fire.
+    world.set_world_map_encounter(false, 50, 0, 64);
+    // A door at tile (3,3) -> world (3*128 + 64 = 448, 448).
+    world.install_world_map_entities_at(vec![(
+        WorldMapEntityConfig::MinigameDoor { sub_id: 3, slot: 0 },
+        (448, 448),
+    )]);
+
+    // Player starts two tiles to the -X side, on the same row as the door.
+    world.actors[0].move_state.world_x = 448 - 256;
+    world.actors[0].move_state.world_z = 448;
+
+    // Hold the d-pad direction that walks +X at the default azimuth (0): the
+    // walk frame is retail's identity, so "screen right" walks +X toward the
+    // door (see the camera-relative remap).
+    world.set_pad(input::PadButton::Right.mask());
+    let mut armed = false;
+    for _ in 0..200 {
+        let _ = world.tick();
+        if world.minigames.pending_warp == Some(3) {
+            armed = true;
+            break;
+        }
+    }
+    assert!(
+        armed,
+        "walking onto the door tile auto-arms its minigame warp"
+    );
+}
+
+/// An object entrance (a `.MAP` object whose bind record runs to a `0x3F` -
+/// `map01` P0[10], the Drake castle door) is solid, so the player never
+/// stands on its tile: it engages on contact, from the leading probes that
+/// stop the step. A walk-on portal behind the same wall stays unreached.
+#[test]
+fn world_map_pressing_into_an_object_entrance_engages_it() {
+    let run = |object: bool| {
+        let mut world = World::default();
+        world.enter_world_map();
+        world.install_field_player(0);
+        world.set_world_map_encounter(false, 50, 0, 64);
+        // Wall off tile column 4 so the entrance tile (4, 3) cannot be
+        // entered from the -X side; the retail leading-edge probes stop the
+        // player a probe's length short of it, on tile 3.
+        world.locomotion.leading_edge_wall_probes = true;
+        world.paint_field_collision(1, (4, 5), (0, 0x80), 0);
+        world.install_world_map_entities_at(vec![(
+            WorldMapEntityConfig::OverworldPortal {
+                scene_name: "dolk".to_string(),
+                index: 0,
+                entry_x: 0,
+                entry_z: 0,
+                dir: 0,
+                record: 0,
+                object,
+            },
+            (560, 448),
+        )]);
+        world.actors[0].move_state.world_x = 256;
+        world.actors[0].move_state.world_z = 448;
+        world.set_pad(input::PadButton::Right.mask());
+        for _ in 0..200 {
+            let _ = world.tick();
+            if world
+                .drain_field_events()
+                .into_iter()
+                .any(|e| matches!(e, FieldEvent::WorldMapTransition { .. }))
+            {
+                return true;
+            }
+        }
+        assert!(
+            world.actors[0].move_state.world_x < 512,
+            "the wall holds the player off the entrance tile"
+        );
+        false
+    };
+    assert!(run(true), "pressing into an object entrance engages it");
+    assert!(!run(false), "a walk-on portal needs its tile");
+}
+
+/// Auto-engage is walk-onto-only: walking onto an NPC entity's tile fires
+/// neither a transition nor a door warp (NPCs are talk-to).
+#[test]
+fn world_map_walking_onto_npc_does_not_transition() {
+    let mut world = World::default();
+    world.enter_world_map();
+    world.install_field_player(0);
+    world.set_world_map_encounter(false, 50, 0, 64);
+    world.install_world_map_entities_at(vec![(
+        WorldMapEntityConfig::Npc {
+            interact_id: 4,
+            text_id: None,
+            inline: Vec::new(),
+        },
+        (448, 448),
+    )]);
+    world.actors[0].move_state.world_x = 448;
+    world.actors[0].move_state.world_z = 448; // standing on the NPC tile
+    world.set_pad(0);
+    let _ = world.tick();
+    let transitioned = world
+        .drain_field_events()
+        .into_iter()
+        .any(|e| matches!(e, FieldEvent::WorldMapTransition { .. }));
+    assert!(
+        !transitioned,
+        "an NPC is not auto-engaged by walking onto its tile"
+    );
+    assert_eq!(
+        world.minigames.pending_warp, None,
+        "nor does it arm a door warp"
+    );
+}
+
+/// Placed overworld entities surface as render markers: one per installed
+/// position, paired with its kind, at the player's walking plane.
+#[test]
+fn world_map_entity_markers_pair_position_and_kind() {
+    let mut world = World::default();
+    world.enter_world_map();
+    world.install_field_player(0);
+    // Put the player on a known plane so the marker `y` is deterministic.
+    world.actors[0].move_state.world_y = -200;
+    world.install_world_map_entities_at(vec![
+        (
+            WorldMapEntityConfig::MinigameDoor { sub_id: 3, slot: 0 },
+            (448, 320),
+        ),
+        (
+            WorldMapEntityConfig::Npc {
+                interact_id: 4,
+                text_id: None,
+                inline: Vec::new(),
+            },
+            (640, 128),
+        ),
+        (
+            WorldMapEntityConfig::EncounterZone { formation_id: 2 },
+            (-64, 512),
+        ),
+    ]);
+
+    let markers = world.world_map_entity_markers();
+    assert_eq!(markers.len(), 3);
+    // Position x/z come straight from the placement; y is the player plane.
+    assert_eq!(markers[0].world_pos, [448.0, -200.0, 320.0]);
+    assert_eq!(markers[0].kind, WorldMapEntityKind::Portal);
+    assert_eq!(markers[1].world_pos, [640.0, -200.0, 128.0]);
+    assert_eq!(markers[1].kind, WorldMapEntityKind::Npc);
+    assert_eq!(markers[2].world_pos, [-64.0, -200.0, 512.0]);
+    assert_eq!(markers[2].kind, WorldMapEntityKind::EncounterZone);
+}
+
+/// The player surfaces as an overworld marker at its actor position; with no
+/// player actor installed there is no marker.
+#[test]
+fn world_map_player_marker_tracks_player_actor() {
+    let mut world = World::default();
+    world.enter_world_map();
+    assert!(
+        world.world_map_player_marker().is_none(),
+        "no player actor -> no marker"
+    );
+    world.install_field_player(0);
+    world.actors[0].move_state.world_x = 320;
+    world.actors[0].move_state.world_y = -64;
+    world.actors[0].move_state.world_z = 256;
+    let m = world
+        .world_map_player_marker()
+        .expect("player marker present");
+    assert_eq!(m.world_pos, [320.0, -64.0, 256.0]);
+}
+
+/// Walking on the overworld records a heading the player marker exposes (the
+/// world-map walk sets `render_26` itself, since it uses the camera-relative
+/// bits rather than the field heading decoder).
+#[test]
+fn world_map_walking_sets_player_marker_facing() {
+    let mut world = World::default();
+    world.enter_world_map();
+    world.install_field_player(0);
+    world.set_world_map_encounter(false, 50, 0, 64);
+    world.reset_field_collision_grid(); // all-walkable so the step commits
+    world.actors[0].move_state.world_z = 200; // away from the -Z boundary
+    let start_z = world.actors[0].move_state.world_z;
+    // At the default azimuth the walk frame is retail's identity, so "screen
+    // up" walks +Z (dx=0, dz=1) -> atan2(0, 1) = 0 -> heading 0.
+    world.set_pad(input::PadButton::Up.mask());
+    let _ = world.tick();
+    let m = world
+        .world_map_player_marker()
+        .expect("player marker present");
+    assert_eq!(m.facing, 0, "walking +Z faces heading 0");
+    assert!(
+        world.actors[0].move_state.world_z > start_z,
+        "the player advanced +Z (start {start_z} -> {})",
+        world.actors[0].move_state.world_z
+    );
+}
+
+/// Config-only installs (no disc placements) produce no markers, so a
+/// camera-only or synthetic world map draws nothing.
+#[test]
+fn world_map_entity_markers_empty_without_positions() {
+    let mut world = World::default();
+    world.enter_world_map();
+    world.install_world_map_entities_with_configs(vec![WorldMapEntityConfig::Npc {
+        interact_id: 1,
+        text_id: None,
+        inline: Vec::new(),
+    }]);
+    assert!(world.world_map_entity_markers().is_empty());
+}
+
+/// An NPC-config entity surfaces its configured interaction id.
+#[test]
+fn world_map_npc_config_surfaces_interact_id() {
+    let mut world = World::default();
+    world.enter_world_map();
+    world.install_world_map_entities_with_configs(vec![WorldMapEntityConfig::Npc {
+        interact_id: 7,
+        text_id: None,
+        inline: Vec::new(),
+    }]);
+    world.set_world_map_encounter(false, 50, 0, 64);
+    // Stationary player: the idle entity interacts.
+    world.set_pad(0);
+    let _ = world.tick();
+    let interacted = world
+        .drain_field_events()
+        .into_iter()
+        .any(|e| matches!(e, FieldEvent::FieldInteract { interact_id: 7, .. }));
+    assert!(interacted, "the NPC surfaces its configured interact id");
+}
+
+/// Talking to an adjacent NPC that carries inline dialog text opens its MES
+/// message on a confirm press (sets `current_dialog` + emits `OpenDialog`); a
+/// later confirm/cancel press dismisses it (emits `DialogDismissed`).
+#[test]
+fn world_map_npc_talk_to_opens_and_dismisses_dialogue() {
+    let cross = legaia_engine_system::input::PadButton::Cross.mask();
+    let mut world = World::default();
+    world.enter_world_map();
+    world.install_field_player(0);
+    world.set_world_map_encounter(false, 50, 0, 64);
+    // Inline dialog bytes in the field-VM box format: a one-byte prologue
+    // then a `0x1F`-lead text segment ("Hi").
+    let inline = vec![0x00u8, 0x1F, b'H', b'i', 0x00];
+    world.install_world_map_entities_at(vec![(
+        WorldMapEntityConfig::Npc {
+            interact_id: 4,
+            text_id: Some(0x12),
+            inline: inline.clone(),
+        },
+        (576, 448), // one tile east of the player (448 >> 7 == 3, 576 >> 7 == 4)
+    )]);
+    world.actors[0].move_state.world_x = 448;
+    world.actors[0].move_state.world_z = 448;
+
+    // Settle a frame with no input so the next Cross press is a clean edge.
+    world.set_pad(0);
+    let _ = world.tick();
+    assert!(world.dialog.current.is_none(), "no box before talking");
+
+    // Confirm press next to the NPC opens its dialogue, carrying the inline
+    // text through (the host renders it via `OwnedDialogPanel::from_inline_dialog`).
+    world.set_pad(cross);
+    let _ = world.tick();
+    assert_eq!(
+        world.dialog.current.as_ref().map(|d| d.inline.clone()),
+        Some(inline.clone()),
+        "talk-to opens the NPC's inline dialogue text"
+    );
+    assert!(
+        world
+            .drain_field_events()
+            .into_iter()
+            .any(|e| matches!(e, FieldEvent::OpenDialog { ref inline, .. } if !inline.is_empty())),
+        "talk-to emits OpenDialog carrying the inline text for the host to render"
+    );
+
+    // Cross held across the frame boundary is not a fresh edge (edges advance
+    // on `set_pad`): the box stays up.
+    world.set_pad(cross);
+    let _ = world.tick();
+    assert!(
+        world.dialog.current.is_some(),
+        "no dismiss without a new edge"
+    );
+
+    // Release then press again to dismiss.
+    world.set_pad(0);
+    let _ = world.tick();
+    world.set_pad(cross);
+    let _ = world.tick();
+    assert!(world.dialog.current.is_none(), "confirm dismisses the box");
+    assert!(
+        world
+            .drain_field_events()
+            .into_iter()
+            .any(|e| matches!(e, FieldEvent::DialogDismissed)),
+        "dismiss emits DialogDismissed"
+    );
+}
+
+/// The overworld runs the field overlay's walk tick (`FUN_801D1344` calls
+/// `FUN_801D0B90` at `0x801D16EC`), so an open Incense window drains while
+/// the party walks the continent and the region roll (`FUN_801D9E1C`,
+/// `0x801DA174`) skips while it is open. The contrast is
+/// [`world_map_region_walk_triggers_battle`], the same walk with no window.
+#[test]
+fn an_open_incense_window_drains_and_suppresses_overworld_rolls() {
+    use legaia_engine_battle::region_encounter::{EncounterRegion, RegionEncounterTable};
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.toggles.live_gameplay_loop = true;
+    world.enter_world_map();
+    if let Some(ctrl) = world.world_map.ctrl.as_mut() {
+        ctrl.azimuth = 1024;
+    }
+    world.install_field_player(0);
+    let mut table = RegionEncounterTable::new("test");
+    table.regions.push(EncounterRegion {
+        tile_x_min: 0,
+        tile_z_min: 0,
+        tile_x_max: 60,
+        tile_z_max: 60,
+        rate_increment: 255,
+        formation_base: 5,
+        formation_count: 1,
+        setup: Default::default(),
+    });
+    world.set_world_map_regions(table);
+    world.locomotion.walk_regen_window = 0x40;
+
+    world.set_pad(input::PadButton::Right.mask());
+    let p0 = (
+        i32::from(world.actors[0].move_state.world_x),
+        i32::from(world.actors[0].move_state.world_z),
+    );
+    for _ in 0..200 {
+        let _ = world.tick();
+        assert!(
+            world.world_map.pending_encounter.is_none() && world.mode == SceneMode::WorldMap,
+            "no overworld roll while the Incense window is open"
+        );
+    }
+    let moved = (i32::from(world.actors[0].move_state.world_x) - p0.0).abs()
+        + (i32::from(world.actors[0].move_state.world_z) - p0.1).abs();
+    assert!(moved > 256, "the player crossed tiles (moved {moved})");
+    assert!(
+        world.locomotion.walk_regen_window < 0x40,
+        "walking the overworld drains the window"
+    );
+}
+
+/// The wear-off edge fires on the overworld too, and the notice holds the
+/// player until it is confirmed.
+#[test]
+fn the_incense_wear_off_notice_raises_on_the_overworld() {
+    let mut world = World::default();
+    world.enter_world_map();
+    if let Some(ctrl) = world.world_map.ctrl.as_mut() {
+        ctrl.azimuth = 1024;
+    }
+    world.install_field_player(0);
+    world.locomotion.walk_regen_window = 1;
+    world.set_pad(input::PadButton::Right.mask());
+    let mut raised = false;
+    for _ in 0..200 {
+        let _ = world.tick();
+        if world.incense_notice_shown() {
+            raised = true;
+            break;
+        }
+    }
+    assert!(raised, "walking the last Incense tick off shows the notice");
+    let at = (
+        world.actors[0].move_state.world_x,
+        world.actors[0].move_state.world_z,
+    );
+    for _ in 0..10 {
+        let _ = world.tick();
+    }
+    let now = (
+        world.actors[0].move_state.world_x,
+        world.actors[0].move_state.world_z,
+    );
+    assert_eq!(now, at, "the notice locks the walk");
+}
+
+/// The region reader samples the player's tile once per **game tick**
+/// (`FUN_801DA51C` state 0 calls `FUN_801D9E1C` at `0x801DA5B0`, one pass in
+/// every `frame_step` vsyncs - three on the overworld), so a diagonal whose X
+/// and Z tile boundaries fall on different vsyncs of one game tick is one
+/// step, the same as a straight one. Sampling per vsync made it two.
+#[test]
+fn a_diagonal_split_across_one_game_tick_drains_one_step() {
+    use legaia_engine_battle::region_encounter::{EncounterRegion, RegionEncounterTable};
+
+    let mut world = World::default();
+    world.toggles.live_gameplay_loop = true;
+    world.enter_world_map();
+    world.install_field_player(0);
+    let mut table = RegionEncounterTable::new("test");
+    table.regions.push(EncounterRegion {
+        tile_x_min: 0,
+        tile_z_min: 0,
+        tile_x_max: 60,
+        tile_z_max: 60,
+        rate_increment: 1,
+        formation_base: 5,
+        formation_count: 1,
+        setup: Default::default(),
+    });
+    world.set_world_map_regions(table);
+    world.set_encounter_step_counter(100_000);
+    // The overworld's cadence, which scene entry pins on a real `mapNN`.
+    world.clock.frame_step = 3;
+
+    let seat = |w: &mut World, tx: i16, tz: i16| {
+        w.actors[0].move_state.world_x = tx * 0x80 + 0x40;
+        w.actors[0].move_state.world_z = tz * 0x80 + 0x40;
+    };
+    // Run to a game-tick boundary with the player parked on (10, 10), so
+    // the reader's cache holds that tile.
+    seat(&mut world, 10, 10);
+    let mut guard = 0;
+    loop {
+        let _ = world.tick();
+        guard += 1;
+        if world.clock.game_tick_fired && guard > 3 {
+            break;
+        }
+    }
+    let c0 = world.encounter_step_counter();
+    // One straight step, held across a whole game tick.
+    seat(&mut world, 11, 10);
+    for _ in 0..3 {
+        let _ = world.tick();
+    }
+    let straight = c0 - world.encounter_step_counter();
+    assert!(straight > 0, "a straight step drains the counter");
+    // A diagonal: X on the first vsync of the next game tick, Z on the
+    // second, the reader running on the third.
+    let c1 = world.encounter_step_counter();
+    seat(&mut world, 12, 10);
+    let _ = world.tick();
+    seat(&mut world, 12, 11);
+    let _ = world.tick();
+    let _ = world.tick();
+    assert_eq!(
+        c1 - world.encounter_step_counter(),
+        straight,
+        "the split diagonal is one step"
+    );
+}
+
+/// The overworld action button does not open a talk while a script context
+/// engages the player. A scripted overworld beat parks the player in the
+/// off-map hide box, the same box the parked talk placements spawn in, so an
+/// ungated probe found one of them on the pad presses that advance the beat:
+/// `map01` `P1[2]` is a flag-setting picker, and the presses picked rows on
+/// it (`0x19A` among them, which shuts the Garmel entrance).
+#[test]
+fn world_map_talk_probe_waits_out_an_engaging_script() {
+    let mut world = World::default();
+    world.enter_world_map();
+    world.install_field_player(0);
+    world.toggles.use_vm_dialogue = true;
+    world.npcs.dialog_prologue.insert(
+        2,
+        legaia_engine_field::man_field_scripts::InlineDialogPrologue {
+            body: vec![0x25, 0x21, 0x1F, b'A', 0x00, 0x21],
+            entry_pc: 2,
+            first_segment: 2,
+        },
+    );
+    let p = world.player_actor_slot.expect("player") as usize;
+    let mut hit = false;
+    'seat: for (dx, dz) in [(0i16, -96i16), (0, 96), (-96, 0), (96, 0)] {
+        for heading in [0i16, 0x400, 0x800, 0xC00] {
+            world.npcs.positions.insert(2, (1000 + dx, 1000 + dz));
+            world.actors[p].move_state.world_x = 1000;
+            world.actors[p].move_state.world_z = 1000;
+            world.actors[p].move_state.render_26 = heading;
+            if world.world_map_record_talk_slot() == Some(2) {
+                hit = true;
+                break 'seat;
+            }
+        }
+    }
+    assert!(hit, "an idle player's probe finds the placement");
+    world.cutscene.timeline = Some(
+        legaia_engine_field::cutscene_timeline::CutsceneTimeline::new(
+            vec![0x25, 0x26, 0xFE, 0xFF],
+            0,
+        ),
+    );
+    assert!(world.cutscene_timeline_active());
+    assert_eq!(
+        world.world_map_record_talk_slot(),
+        None,
+        "a running beat engages the player: no talk opens under it"
+    );
+}

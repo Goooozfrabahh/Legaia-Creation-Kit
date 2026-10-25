@@ -1,0 +1,248 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">subsystems</a> &middot; pause menu</div>
+  <h1>Field Menu - Windows + Status Panel</h1>
+  <p class="lede">How the pause menu is built - the screen you open in the field to check Status, change Equipment, or flip Options. It is data-driven: a 52-entry <strong>window-descriptor table</strong> on the disc places every screen's bordered windows and names each one's content-renderer, and the renderers draw window <em>contents</em> only - the gold 9-slice frame is emitted by the caller. This page pins the table, every screen's layout, and the from-scratch port that redraws it all.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Window table</dt><dd>52 records at menu-overlay VA <code>0x801E4738</code> (PROT 0899 file <code>0x15F20</code>); parser <code>legaia_game_tables::menu_windows</code></dd>
+    <dt>Record</dt><dd>0x10 bytes: content id, park edge, window class (2 tab / 3 standard / 4 list), content rect <code>x,y,w,h</code>, renderer VA</dd>
+    <dt>Choreography</dt><dd>Windows slide in / out via the <a href="actor-vm.html">window-widget VM</a>; a closed window parks offscreen at its park edge</dd>
+    <dt>Data read</dt><dd>The live <code>0x414</code>-byte character records at <code>0x80084708</code> - the same block the save file copies</dd>
+    <dt>In the port</dt><dd><code>engine-ui</code> draw builders (wgpu-free, shared by native window and browser) over <code>engine-world-views::pause_screens</code></dd>
+    <dt>Confidence</dt><dd>Confirmed - table byte-matched disc-vs-RAM; layouts pinned by GPU-prim scans of menu captures (<a href="#how-we-know">how we know</a>)</dd>
+  </dl>
+  <table class="data-table">
+    <thead><tr><th>Question</th><th>Short answer</th><th>Section</th></tr></thead>
+    <tbody>
+      <tr><td>Where do the windows come from?</td><td>One table row per window: rect + content renderer.</td><td><a href="#window-table">Window table</a></td></tr>
+      <tr><td>How does a screen get picked?</td><td>A submenu index through the same sub-screen pointer table the save screen uses.</td><td><a href="#submenu-dispatch">Dispatch</a></td></tr>
+      <tr><td>How does "Best Equipment" choose?</td><td>A bag scan with two surprising ranking laws.</td><td><a href="#equip-screen">Equip</a></td></tr>
+      <tr><td>Where are the options stored?</td><td>Straight into the live config words the audio and pad code read.</td><td><a href="#options-screen">Options</a></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="doc-section" id="screen-tree">
+  <h2>The screen tree</h2>
+  <p>Press Start in the field and the root command list slides in beside a money / play-time box and a party panel. Its seven rows are the whole menu; each opens one screen, and every screen is assembled from the same window table described below.</p>
+  <figure class="diagram fm-tree">
+    <svg viewBox="0 0 860 420" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The pause menu's screen tree. Start in the field opens the root command list with seven rows in retail order: Items, Magic, Equip, Status, Options, Load and Save. Each row opens its own screen: Items leads to Use, Throw Out and Arrange; Magic to the spell list and a target; Equip to slot rows, candidates and Best Equipment; Status to the status, skills, magic and moves pages; Options to eight settings with value popups; Load and Save to the memory-card flow, Save only on the overworld.">
+      <defs><marker id="fm-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="dg-node-accent" x="20" y="180" width="150" height="60" rx="5"/>
+      <text class="dg-label" x="95" y="206">Pause menu</text><text class="dg-sub" x="95" y="224">Start in the field</text>
+      <path class="dg-edge" d="M170 210 L200 210 M200 39 L200 381"/>
+      <path class="dg-edge" d="M200 39 L228 39" marker-end="url(#fm-arrow)"/>
+      <a href="#items-use-flows"><rect class="dg-node" x="230" y="16" width="150" height="46" rx="5"/><text class="dg-label" x="305" y="43">Items</text></a>
+      <path class="dg-edge-dim" d="M380 39 L418 39" marker-end="url(#fm-arrow)"/>
+      <rect class="dg-node" x="420" y="16" width="420" height="46" rx="5"/><text class="dg-sub" x="630" y="43">Use on a target, Throw Out, Arrange</text>
+      <path class="dg-edge" d="M200 97 L228 97" marker-end="url(#fm-arrow)"/>
+      <a href="#list-kernel"><rect class="dg-node" x="230" y="74" width="150" height="46" rx="5"/><text class="dg-label" x="305" y="101">Magic</text></a>
+      <path class="dg-edge-dim" d="M380 97 L418 97" marker-end="url(#fm-arrow)"/>
+      <rect class="dg-node" x="420" y="74" width="420" height="46" rx="5"/><text class="dg-sub" x="630" y="101">spell list; cast on a party target</text>
+      <path class="dg-edge" d="M200 155 L228 155" marker-end="url(#fm-arrow)"/>
+      <a href="#equip-screen"><rect class="dg-node" x="230" y="132" width="150" height="46" rx="5"/><text class="dg-label" x="305" y="159">Equip</text></a>
+      <path class="dg-edge-dim" d="M380 155 L418 155" marker-end="url(#fm-arrow)"/>
+      <rect class="dg-node" x="420" y="132" width="420" height="46" rx="5"/><text class="dg-sub" x="630" y="159">slot rows, candidate list, Best Equipment, stat compare</text>
+      <path class="dg-edge" d="M200 213 L228 213" marker-end="url(#fm-arrow)"/>
+      <a href="#submenu-dispatch"><rect class="dg-node" x="230" y="190" width="150" height="46" rx="5"/><text class="dg-label" x="305" y="217">Status</text></a>
+      <path class="dg-edge-dim" d="M380 213 L418 213" marker-end="url(#fm-arrow)"/>
+      <rect class="dg-node" x="420" y="190" width="420" height="46" rx="5"/><text class="dg-sub" x="630" y="217">status page, Skills, Magic and Moves pages via the pager</text>
+      <path class="dg-edge" d="M200 271 L228 271" marker-end="url(#fm-arrow)"/>
+      <a href="#options-screen"><rect class="dg-node" x="230" y="248" width="150" height="46" rx="5"/><text class="dg-label" x="305" y="275">Options</text></a>
+      <path class="dg-edge-dim" d="M380 271 L418 271" marker-end="url(#fm-arrow)"/>
+      <rect class="dg-node" x="420" y="248" width="420" height="46" rx="5"/><text class="dg-sub" x="630" y="275">settings rows, each with a value popup</text>
+      <path class="dg-edge" d="M200 329 L228 329" marker-end="url(#fm-arrow)"/>
+      <a href="save-screen.html"><rect class="dg-node" x="230" y="306" width="150" height="46" rx="5"/><text class="dg-label" x="305" y="333">Load</text></a>
+      <path class="dg-edge-dim" d="M380 329 L418 329" marker-end="url(#fm-arrow)"/>
+      <rect class="dg-node" x="420" y="306" width="420" height="46" rx="5"/><text class="dg-sub" x="630" y="333">the card load flow; greyed in one script context</text>
+      <path class="dg-edge" d="M200 387 L228 387" marker-end="url(#fm-arrow)"/>
+      <a href="save-screen.html"><rect class="dg-node-warn" x="230" y="364" width="150" height="46" rx="5"/><text class="dg-label" x="305" y="391">Save</text></a>
+      <path class="dg-edge-dim" d="M380 387 L418 387" marker-end="url(#fm-arrow)"/>
+      <rect class="dg-node" x="420" y="364" width="420" height="46" rx="5"/><text class="dg-sub" x="630" y="391">the card save flow; greyed off the overworld</text>
+    </svg>
+    <figcaption>Two levels: confirming a row suspends the root list and the routed screen owns the pad until it finishes, then the root list resumes. A blocked row still takes the cursor; it draws grey and buzzes on confirm. Click a row for its section.</figcaption>
+  </figure>
+
+  <p>The menu opens in any scene the field walk controller runs - which includes the three kingdom overworlds, ordinary field scenes as far as the game is concerned - but not while a dialogue is up. While it is open the game is in the <code>CARD</code> mode, whose handler runs no frame driver, so nothing in the world moves (<a href="boot.html#game-mode">game modes</a>).</p>
+</section>
+
+<section class="doc-section" id="window-table">
+  <h2>Window descriptor table</h2>
+  <p>Press the menu button and a set of bordered gold windows slides in from the screen edges. None is hand-placed in code: each screen is a <em>list of window ids</em>, each id a row in the table giving the window's home rectangle and content renderer. The renderers only ever draw <em>inside</em>; the frame - which extends 8 px past the content rect on every side - is drawn by whoever opened the window.</p>
+  <figure class="overlay-strip">
+    <svg viewBox="0 0 640 500" width="100%" style="max-width: 640px; font-family: var(--font-mono); font-size: 11px;" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The Status screen's four descriptor-table windows placed on the 320 by 240 stage: party list, condition pager and summary down the left, the main status panel filling the right">
+      <rect x="10" y="10" width="608" height="456" fill="var(--bg-raised)" stroke="var(--border)"/>
+      <text x="18" y="30" fill="var(--text-muted)">320 x 240 stage - Status screen</text>
+      <g fill="none" stroke="var(--accent)" stroke-width="1.4">
+        <rect x="37" y="82" width="114" height="72"/>
+        <rect x="37" y="185" width="114" height="19"/>
+        <rect x="37" y="265" width="114" height="133"/>
+        <rect x="181" y="40" width="414" height="357"/>
+      </g>
+      <g fill="currentColor" text-anchor="middle">
+        <text x="94" y="112">id 26</text>
+        <text x="94" y="128" fill="var(--text-muted)">party list</text>
+        <text x="94" y="199">id 27 pager</text>
+        <text x="94" y="322">id 30</text>
+        <text x="94" y="338" fill="var(--text-muted)">summary</text>
+        <text x="388" y="205">id 28 - main panel</text>
+        <text x="388" y="223" fill="var(--text-muted)">FUN_801D33D8</text>
+        <text x="388" y="241" fill="var(--text-muted)">rect (90,16,218,188)</text>
+      </g>
+    </svg>
+    <figcaption>One screen = one window-id list. Each id resolves through the 52-record table to a content rect and a renderer; the gold frame is drawn 8 px outside the rect by the caller.</figcaption>
+  </figure>
+  <table class="data-table">
+    <thead><tr><th>Screen</th><th>Windows (draw order)</th></tr></thead>
+    <tbody>
+      <tr><td>Top-level pause menu</td><td>50 command list <code>(24,24,104,94)</code>; 49 money / play-time box <code>(24,178,104,24)</code>; 51 right party panel <code>(144,24,152,180)</code></td></tr>
+      <tr><td>Status</td><td>tab 3; 26 party list <code>(14,38,60,38)</code>; 27 "Condition" pager <code>(14,92,60,10)</code>; 30 summary <code>(14,134,60,70)</code>; 28 <strong>main panel</strong> <code>(90,16,218,188)</code></td></tr>
+      <tr><td>Equip</td><td>tab 2; 21 party <code>(14,42,80,38)</code>; 23 item list <code>(174,22,132,182)</code> (renderer-less); 22 main <code>(14,96,292,108)</code></td></tr>
+      <tr><td>Options</td><td>tab 4; 48 settings <code>(24,40,256,148)</code>; 47 value popup <code>(170, *, 128, *)</code> - y/h stamped per open</td></tr>
+    </tbody>
+  </table>
+  <p>Live windows are doubly-linked structs carrying the descriptor id and an <em>animated</em> copy of the rect: on screen exit a window slides to its park edge and sits offscreen. The top-level windows stay parked in every sub-screen capture - which is how the top-level set was pinned without a top-level capture.</p>
+</section>
+
+<section class="doc-section" id="submenu-dispatch">
+  <h2>Submenu dispatch and the status pages</h2>
+  <p>The main panel's page is a submenu index (raw ids 6..10 alias onto 1..5):</p>
+  <table class="data-table">
+    <thead><tr><th>Id</th><th>Page</th></tr></thead>
+    <tbody>
+      <tr><td>0 or 5</td><td>Full status: name + LV + HP/MP + AP gauge + 6 stats + 7 equip slots + XP / Next Level</td></tr>
+      <tr><td>1</td><td>Skills / accessory-passive list</td></tr>
+      <tr><td>2</td><td>Magic list</td></tr>
+      <tr><td>3</td><td>Moves / arts list</td></tr>
+      <tr><td>4</td><td>Header only</td></tr>
+    </tbody>
+  </table>
+  <p>Everything the pages print comes from the live character record and the executable's static name tables - item names, spell names, equipment stats, accessory passives, arts (<a href="#record-fields">record fields</a>).</p>
+  <details class="disclosure">
+    <summary>Deep dive: pixel layout of the status page, tab plaque and satellites</summary>
+    <div class="disclosure-body">
+      <p><strong>Status page</strong> (offsets from the window origin <code>(WX, WY)</code>): header row - name <code>+8</code>, "LV" <code>+0x50</code>, level <code>+0x60</code> (record <code>+0x130</code>). HP row at <code>Y+0x13</code>, MP at <code>Y+0x20</code>, each placing current / max / base at <code>X+0x30 / +0x58 / +0x84</code>. AP gauge at <code>(X+0x40, Y+0x2D)</code>: four sprites from the system-UI sheet (CLUT row 4) plus a meter fill of <strong>two untextured gouraud quads</strong> spanning <code>x+0x1B .. +value/2</code> (dark-red &rarr; gold &rarr; dark-red gradient) and 6x6 digit records, with a dedicated "100" glyph at full charge. Six growth stats in a 3x2 grid at rows <code>Y+0x42/+0x4F/+0x5C</code>; seven equipment slots from <code>Y+0x6D</code> (icon <code>X+0</code>, name <code>X+0x10</code>; slots 4..6 in a right column); Experience at <code>Y+0xA5</code>, Next Level at <code>Y+0xB2</code>.</p>
+      <p><strong>Tab plaque.</strong> The class-2 title tabs draw no gold frame: their chrome is the carved brown plaque - left cap <code>(208,64,8,20)</code>, 16x20 body tile repeated across the width, right cap <code>(216,64,8,20)</code>, all CLUT row 12 of the system-UI sheet. The tab renderer draws only the label.</p>
+      <p><strong>Satellites.</strong> Party list (<code>FUN_801D2094</code>): names at <code>WX+6</code> on <code>0xE</code> pitch, pointing-hand cursor sprite (UV <code>(152,64)</code>, CLUT 7) at <code>WX-0xC</code>. Pager (<code>FUN_801D30A4</code>): label flanked by solid triangles at <code>WX-0x10</code> / <code>WX+0x3A</code>. Summary (<code>FUN_801D31EC</code>): name, LV icon + 2-digit level, and "ATR:" with the per-character element icon - a <code>0xCE</code>-token string resolving through the aux table to 28x12 sprites in the system-UI extension strip TIM at <code>PROT.DAT[0x10178]</code>, palettes from the sibling TIM at <code>PROT.DAT[0x10028]</code>.</p>
+      <p><strong>Selection plumbing.</strong> Highlighted member index = <code>*(u8*)(0x80084598 + (DAT_801E46C4 &amp; 0xFFF))</code>; its record = <code>0x80084708 + idx*0x414</code>. The renderer walks a running Y cursor down the page block by block.</p>
+      <p><strong>Top-level windows.</strong> Command list (<code>FUN_801CFD68</code>): seven rows at <code>0xE</code> pitch in the retail order Items, Magic, Equip, Status, Options, Load, Save; blocked rows gray to CLUT 0 (Load under a dialog-context lock, Save when the save-enable flag is clear). Money box (<code>FUN_801D0148</code>): money pictogram + 8-digit amount, optional casino-coin row, clock from the 60 Hz tick counter <code>0x80084570</code>. Party panel (<code>FUN_801D030C</code>): one block per member at stride <code>0x3E</code> - name, LV, HP / MP with 4-digit fields, and the AP gauge fed from the persistent record <code>+0x10E</code>; HP / MP ink runs through the health-tier colour functions.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="equip-screen">
+  <h2>Equip screen and "Best Equipment"</h2>
+  <p>Four windows; the main window draws "Best Equipment" plus seven slot rows (pictogram, equipped name), a stat-compare block when previewing, and the item's description panel when a slot row is focused. The interesting part is the candidate scan behind "Best Equipment": it seeds with what the character wears, walks the bag keeping one winner per armament slot, and obeys two ranking laws the screen never reveals:</p>
+  <ul class="bullets">
+    <li><strong>Armour ranks on UDF + LDF only.</strong> The INT and SPD bonuses are never read - a pure-INT head accessory or a pure-SPD boot can never displace an incumbent.</li>
+    <li><strong>A weapon's category check dominates its attack.</strong> The score is <code>attack + (favored ? 1000 : 0)</code>, and an attack byte cannot reach 1000 - so a category-favoured weapon outranks every unfavoured one regardless of raw attack.</li>
+    <li>An empty slot is filled by the <em>first</em> eligible entry; ties keep the incumbent. The whole scan is a trial equip the routine undoes before returning.</li>
+  </ul>
+  <p>An item competes only when its record marks it equipment and its equip-character mask matches the character; the slot it competes for comes from the equipment record's slot bits, permuted weapon-first. Engine port: <code>equip_session::best_equipment_candidates</code>.</p>
+</section>
+
+<section class="doc-section" id="options-screen">
+  <h2>Options screen</h2>
+  <p>The settings rows are data-driven too: a display-layout table joined to 8-byte row descriptors, each naming the <em>live config word</em> the row edits. Confirm opens a value popup positioned under the row; a choice commits <strong>directly into the config word</strong> - edits are already live, backing out reverts nothing.</p>
+  <table class="data-table">
+    <thead><tr><th>Row</th><th>Choices</th><th>Config word</th></tr></thead>
+    <tbody>
+      <tr><td>Battle Camera</td><td>Close / Normal / Far</td><td><code>0x800846C0</code></td></tr>
+      <tr><td>Battle Select Attack</td><td>Select / Automatic / Command</td><td><code>0x800846C4</code></td></tr>
+      <tr><td>Battle Command</td><td>Directional Buttons / button glyph</td><td><code>0x800846C8</code></td></tr>
+      <tr><td>Field Move</td><td>Walk / Run</td><td><code>0x800846CC</code></td></tr>
+      <tr><td>Field HP Display</td><td>Immediate / Gradual / Display Off</td><td><code>0x800845C4</code></td></tr>
+      <tr><td>Sound</td><td>Stereo / Monaural</td><td><code>0x800846BC</code></td></tr>
+      <tr><td>Dual Shock: Battles / Events / Encounters</td><td>Vibration On / Off</td><td><code>0x800845C8 / 0x800845A8 / 0x800845CC</code></td></tr>
+    </tbody>
+  </table>
+  <p>A hidden "Battle Voices" row (<code>0x800845AC</code>) exists in the descriptor list but not in the layout table. Engine port: <code>engine-menus::options</code> + <code>engine-ui::options_draws_for</code>; the Sound row drives libsnd's per-voice monaural fold (movie and voice audio stay stereo, as on the original); the full downmix is the separate Mono output setting.</p>
+  <details class="disclosure">
+    <summary>Deep dive: popup geometry and the debug flag editor</summary>
+    <div class="disclosure-body">
+      <p>Popup (window 47): x/w static <code>(170,128)</code>; <code>y = settings-window y + 0x16 + &Sigma; advances above the cursor row</code>, <code>h = choices &times; 13 - 4</code>, flipped up when the bottom would pass <code>0xB0</code>. Rows advance 14 px, 20 px across the two group separators; labels ink 7 white (ink 5 teal on the indented Dual Shock sub-rows), values ink 6 gold at <code>x+140</code>. Committing Events to Off also zeroes the live rumble state.</p>
+      <p>The retail <em>debug</em> build's developer menu (overlay 0897) carries a raw EVENT FLAG index/value poke tool - not part of the retail pause menu. Two kernels are ported for completeness: the value step (Up/Down &plusmn;<code>0x8</code>, &plusmn;<code>0x80</code> with Triangle, Left/Right &plusmn;1, clamped <code>[0, 0xFFF]</code>) and the wrapping list cursor. Engine: <code>engine-dev-menu::dev_menu_flags</code>.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="list-kernel">
+  <h2>List pages: one kernel</h2>
+  <p>Every class-4 <strong>list page</strong> - the Items and Magic lists, the Equip candidates, shop rows - is paged by one executable-resident kernel. What a player feels as "fixed 12-row pages" is its navigation law:</p>
+  <ul class="bullets">
+    <li>Up / Down move the selection <em>within</em> the page, wrapping at the edges - they never scroll.</li>
+    <li>Left / Right are the only scroll, one whole page at a time.</li>
+    <li>Confirming a disabled (grey) row buzzes; a list parked behind the command window draws every row white.</li>
+  </ul>
+  <p>The menu overlay builds each row as a packed u16 - class nibble, disabled bit, alt-ink bit, 12-bit payload - and the kernel only reads them; a small global protocol carries mode, selection and scroll between the two. The per-row draw switches on the class nibble: bag rows with counts, equip candidates with slot pictograms, shop rows with prices, plain names. Engine port: <code>engine-menus::pause_screens::list_kernel_navigate</code> + <code>engine-ui::menu::screens</code>.</p>
+</section>
+
+<section class="doc-section" id="items-use-flows">
+  <h2>Items screen: Use / Throw Out / Arrange</h2>
+  <ul class="bullets">
+    <li><strong>Use</strong> dispatches on the item's effect class from the <a href="../formats/item-effect-table.html">item-effect table</a>: three class items get their own routes - <strong>Door of Light</strong> (confirm, defaulting Yes; consumes one and exits the menu with the dungeon-escape code), <strong>Door of Wind</strong> (a destination list over the 6-byte quick-travel records; exits with the world-map warp), <strong>Incense</strong> (confirm, applies encounter suppression, stays on the screen). Everything else opens the party target panel - all-party when the effect's flag says so, single-target otherwise - and applies through the executable's item-effect applier, consuming one bag copy per use.</li>
+    <li><strong>Throw Out</strong> re-points the list and confirms (Yes/No seeded to <strong>No</strong>); Yes zeroes both bytes of the bag-slot pair - <em>the whole stack is discarded</em>, with no compaction.</li>
+    <li><strong>Arrange</strong> inverts the overlay's display-order table into an id &rarr; rank map and selection-sorts the bag pairs; emptied slots sink behind the occupied run.</li>
+  </ul>
+  <p>The target panel (window 14) draws one block per member; for the permanent-stat Waters it previews the changed maxima or stat rows rather than plain cur / max pairs. Engine: <code>PauseItemsSession</code>, <code>SpecialUseSession</code>, <code>target_panel_model</code> + their <code>engine-ui</code> draw builders.</p>
+  <details class="disclosure">
+    <summary>History: the mode-1 target panel</summary>
+    <div class="disclosure-body"><p>An earlier reading called the target panel's mode 1 an "HP-restore preview". Restore items use the plain mode-0 panel; the non-zero modes belong to the permanent-stat Waters (Life / Magic / Power / Swift / Wisdom / Guardian).</p></div>
+  </details>
+</section>
+
+<section class="doc-section" id="record-fields">
+  <h2>Record fields consumed</h2>
+  <p>Into the <code>0x414</code>-stride live record: experience <code>+0x0</code>, next-level threshold <code>+0x4</code>, HP <code>+0x104/+0x106/+0x11C</code>, MP <code>+0x108/+0x10A/+0x11E</code>, persistent AP <code>+0x10E</code>, growth stats <code>+0x122..+0x12C</code>, displayed level <code>+0x130</code>, spells <code>+0x13C/+0x13D/+0x161</code>, equipped ids <code>+0x196..</code>, name <code>+0x2A7</code>. External tables: item names <code>0x8007436C</code>, spell names <code>0x800754D0</code>, equipment stats <code>0x80074F68</code>, accessory passives <code>0x8007625C</code>, arts <code>0x80075EC4</code>.</p>
+</section>
+
+<section class="doc-section" id="engine-port">
+  <h2>In the port</h2>
+  <p>The engine parses the window table off the player's disc at boot and frames each screen with the same 9-slice chrome. The menu's two-level stack lives on the session (<code>engine-menus::field_menu</code>, <code>pause_screens</code>), so both hosts walk identical screens; every draw builder lives in <code>engine-ui</code>, the wgpu-free leaf, which is what lets the browser play page draw the same menus without linking wgpu. Panels are drawn at the byte-pinned offsets and checked against menu captures pixel by pixel.</p>
+  <p>Opening and closing are one rule too. A Start press goes through the same engine call on the native window, the browser page and a headless run, so a press that retail refuses (during a conversation, say) is refused everywhere. Retail does not cut straight to the menu: the field fades toward black for a few frames and the first window appears only once the fade is deep enough, and on the way out the fade lifts with the field running again. Both hosts keep drawing the field until the menu exists, send it no input before then, and draw the fade as the same subtractive quad the shop's opening uses.</p>
+  <details class="disclosure">
+    <summary>Deep dive: shared draw primitives and CLUT staging</summary>
+    <div class="disclosure-body"><p>Three primitives render everything: the proportional string (<code>FUN_80036888</code>, MES control tokens <code>0x7C/0xCE/0xCF</code>), the UI-icon sprite (<code>FUN_8002C488</code>, UV/CLUT from the 12-byte-stride table at <code>0x800732A4</code>), and decimal digits (<code>FUN_80034B78</code>). The palette-staging global <code>DAT_8007B454</code> is read <strong>only</strong> by the string primitive - icons and numbers carry their own CLUT, so a write before an icon draw is really staging the <em>next string's</em> palette. Staged index N selects the 16-colour CLUT at VRAM <code>(16&times;(6+N), 510)</code>; main ink is entry 15 - 7 white <code>(206,206,206)</code>, 5 teal <code>(66,222,222)</code>, 6 gold <code>(231,173,0)</code>, 9 orange, 2 red.</p></div>
+  </details>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <table class="data-table">
+    <thead><tr><th>Function / data</th><th>Address</th><th>What it proves</th></tr></thead>
+    <tbody>
+      <tr><td>Window table</td><td><code>0x801E4738</code> (PROT 0899 <code>0x15F20</code>)</td><td>52 records, byte-matched disc-vs-resident across six catalogued menu-open save states; only two fields differ at runtime.</td></tr>
+      <tr><td>Status panel renderer</td><td><code>FUN_801D33D8</code></td><td>Every position an offset from the caller-supplied window origin; the submenu fold.</td></tr>
+      <tr><td>Satellites</td><td><code>FUN_801D2094</code> / <code>FUN_801D30A4</code> / <code>FUN_801D31EC</code></td><td>Party list, pager, summary layouts and sprites.</td></tr>
+      <tr><td>Top-level windows</td><td><code>FUN_801CFD68</code> / <code>FUN_801D0148</code> / <code>FUN_801D030C</code></td><td>Command rows, money / clock box, party panel.</td></tr>
+      <tr><td>Equip screen</td><td><code>FUN_801D21C0</code> / <code>FUN_801CF88C</code></td><td>Slot rows, stat compare; the Best Equipment scan and both ranking laws.</td></tr>
+      <tr><td>Options</td><td><code>FUN_801DCEF0</code> / <code>FUN_801D2910</code> / <code>FUN_801DA9F8</code></td><td>Layout + row-descriptor tables at <code>0x801E4404</code> / <code>0x801E44B8</code>; live config-word commits.</td></tr>
+      <tr><td>List kernel</td><td><code>FUN_80032A44</code></td><td>Page-local navigation, packed row entries, the parked-white rule.</td></tr>
+      <tr><td>Items flows</td><td><code>FUN_801D7C00</code> / <code>FUN_801D7E50</code> / <code>FUN_801D8734</code> / <code>FUN_801D64A8</code></td><td>Use routing, Throw Out stack discard, Arrange sort.</td></tr>
+      <tr><td>Pixel pins</td><td>GPU-prim scans</td><td>Frame = content &minus; 8 px; plaque tiles; cursor sprites; AP-gauge quads - from the <code>menu_status_town</code> capture family.</td></tr>
+    </tbody>
+  </table>
+  <p class="hint">The full doc also pins the live window structs, every submenu's state machine, the Items / Magic screens in full, the prize-exchange screen, the equip stat-compare panels and the overlay-identity notes: <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/subsystems/field-menu.md" target="_blank" rel="noopener"><code>docs/subsystems/field-menu.md</code></a>. There is <strong>no inn screen</strong> in this overlay - an inn stay is field-VM script, see <a href="inn.html">inn</a>.</p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="save-screen.html">Save screen</a>
+    <a href="actor-vm.html">Actor / sprite VM</a>
+    <a href="inventory.html">Inventory</a>
+    <a href="shop.html">Shop</a>
+    <a href="level-up.html">Level-up</a>
+    <a href="../formats/window-script.html">Window scripts</a>
+    <a href="../formats/save-record.html">Save record</a>
+    <a href="../formats/new-game-table.html">New-game table</a>
+    <a href="../formats/spell-table.html">Spell table</a>
+    <a href="../formats/item-table.html">Item table</a>
+    <a href="../formats/equipment-table.html">Equipment table</a>
+    <a href="../formats/accessory-passive-table.html">Accessory passives</a>
+  </div>
+</section>

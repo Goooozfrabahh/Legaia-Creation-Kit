@@ -1,0 +1,75 @@
+//! Field VM result / parameter value types surfaced by the [`FieldHost`]
+//! trait methods.
+
+/// Camera parameter for op 0x45 CONFIGURE. The bit index in the mask
+/// determines the parameter slot (0..=9, MSB-first per the original); the
+/// value is a `u16` read from the operand stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CameraParam {
+    pub slot: u8,
+    pub value: u16,
+}
+
+/// Story-flag-driven dispatch path for op 0x4C outer-nibble-4 sub-9.
+///
+/// The original VM branches on two bits of `_DAT_1F800394`. See
+/// [`FieldCameraMotionHost::camera_offset_mode`] for the bit table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sub9State {
+    /// Bits `0x02000000` clear, `0x01000000` clear - default path. Write or
+    /// ramp `_DAT_801C6EA4 + 0x4A` only.
+    #[default]
+    Default,
+    /// Bits `0x02000000` clear, `0x01000000` set - player-relative write.
+    /// The target slot receives `value + player_anchor[+0x16]` (the
+    /// cutscene-dialogue overlay's `case 9` arm; live-probe-pinned across
+    /// the New-Game opening - `4C 49` never jumps there). A `4C 49` decoded
+    /// against the field-overlay-0897 dump was previously read as an
+    /// absolute jump; the live retail run through `opurud` (`44 32` reached
+    /// at `+0x7A` with bit 24 set) falsifies that for the opening path.
+    PlayerRelative,
+    /// Bit `0x02000000` set - delta path. The host writes/ramps both the
+    /// target slot AND a delta-accumulator at `_DAT_8007BCAC`.
+    Delta,
+}
+
+/// Outcome of [`FieldScreenHost::scene_fade`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SceneFadeResult {
+    /// Fade started or completed - VM advances past the instruction.
+    Done,
+    /// Scene is busy with a previous transition - hold at current PC, the
+    /// runtime will retry next tick.
+    Busy,
+}
+
+/// Tristate for op 0x49 STATE_RESUME. Mirrors `_DAT_8007B450` in the
+/// original (idle = 0, done = 1, anything else = currently armed). Hosts
+/// World coordinates copied onto a script context by Op 0x4C sub-3 sub-7
+/// ([`FieldPlayerHost::fetch_player_coords`]). All values are at-rest player ctx
+/// fields - the VM doesn't transform them before assigning.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlayerCoords {
+    /// `+0x14` on the player ctx.
+    pub world_x: u16,
+    /// `+0x16` on the player ctx.
+    pub world_y: u16,
+    /// `+0x18` on the player ctx.
+    pub world_z: u16,
+    /// `+0x26` on the player ctx.
+    pub field_26: u16,
+}
+
+/// implement [`FieldDialogMenuHost::op49_state`] to surface their internal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Op49State {
+    /// `_DAT_8007B450 == 0`. The script can arm a fresh resume.
+    #[default]
+    Idle,
+    /// `_DAT_8007B450` holds a PC pointer. The VM halts at the same PC and
+    /// the host advances the underlying state machine.
+    Armed,
+    /// `_DAT_8007B450 == 1`. The previous arm completed; the script's
+    /// 0x49 sub-op fires and the slot is cleared.
+    Done,
+}

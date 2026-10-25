@@ -1,0 +1,315 @@
+//! The scene floor-height ladder is **animated**, and the drawn ground has to
+//! follow it.
+//!
+//! Field-VM op `0x4C` outer-nibble 9 owns the sixteen-rung elevation ladder at
+//! `0x1F80035C`: sub-`0xE` rewrites all sixteen rungs and sub-`0..2` sets one
+//! rung oscillating every frame (`FUN_801DDE34` allocates `0x801F27EC`, tick
+//! `FUN_801DA930` stores `pos >> 16` into `0x1F800314 + 0x48 + slot*2`). Retail's
+//! per-cell terrain emitters re-read that array every frame, so the floor of
+//! `jou`'s organic Seru interior undulates; `4C 90` occurs 180 times across 19
+//! scenes.
+//!
+//! The port resolves its environment draws and its walk-ground heightfield
+//! once per scene, against the scene's MAN-header ladder, so the wave was
+//! invisible: only the floor sampler (`World::sample_field_floor_height`, which
+//! reads the live array) moved. These tests pin the two kernels that close that
+//! gap - [`legaia_engine_scene::field_env::FloorWave`] for the translated env
+//! draws and [`legaia_engine_scene::field_ground::live_render_positions`] for the
+//! per-vertex ground (PROT 0900's ground pass `FUN_801F6D48`) - end to end
+//! through the real field VM.
+//!
+//! The **sign** is the trap. `Scene::field_floor_height_lut` returns the MAN
+//! header's sixteen shorts; `FUN_8003AEB0` installs their **negation** into the
+//! scratchpad, which is what `World::terrain.floor_height_lut` holds and what
+//! `FUN_801DA930` writes. `Placement::world_y` consumes the MAN frame (its every
+//! term is `-lut[nibble]`). Handing the world's copy straight to a draw resolver
+//! therefore inverts the wave. `FloorWave::from_scene_and_world` is where that
+//! conversion lives so no host has to pick a sign.
+
+use legaia_engine_core::world::World;
+use legaia_engine_mode::mode::SceneMode;
+use legaia_engine_scene::field_env::{self, EnvDraw, FloorWave};
+use legaia_scene_formats::field_objects::Placement;
+
+/// A placement standing on floor tier `nibble`, at pack slot 0.
+fn placed(nibble: u8) -> Placement {
+    Placement {
+        obj_idx: 1,
+        col: 4,
+        row: 4,
+        anchor_col: 4,
+        anchor_row: 4,
+        anchor_cell: 0,
+        world_x: 0,
+        world_z: 0,
+        y_off: 0,
+        floor_nibble: Some(nibble),
+        floor_corner_nibbles: None,
+        pack_index: Some(0),
+        flags: 0,
+        rot_x: 0,
+        rot_y: 0,
+        rot_z: 0,
+        collider_x: 0,
+        collider_z: 0,
+        cull_radius: 0,
+    }
+}
+
+/// A terrain / decoration cell whose 2x2 corner block sits on `corners`.
+fn terrain(corners: [u8; 4]) -> Placement {
+    Placement {
+        floor_nibble: None,
+        floor_corner_nibbles: Some(corners),
+        ..placed(0)
+    }
+}
+
+/// `4C 90 <rung> 50 00 16 00 00 80` - the operand triple `jou`'s entry script
+/// carries at `P1[0] +0x0190`: period `0x50`, amplitude `0x16`, burst-arm word
+/// `0x8000`.
+fn arm_rung(rung: u8) -> Vec<u8> {
+    vec![0x4C, 0x90, rung, 0x50, 0x00, 0x16, 0x00, 0x00, 0x80]
+}
+
+/// Seed a field world at a scene's MAN ladder, exactly as
+/// `SceneHost::enter_field_scene` does (the runtime copy is NEGATED).
+fn world_on_ladder(man_lut: [i16; 16], script: Vec<u8>) -> World {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.clock.display_frame_step = 1;
+    world.terrain.floor_height_lut = man_lut.map(i16::wrapping_neg);
+    world.load_field_script(script);
+    world
+}
+
+fn draws(placements: &[Placement], man_lut: [i16; 16]) -> Vec<EnvDraw> {
+    let (draws, _) = field_env::resolve_env_draws(&[0usize], placements, Some(man_lut));
+    assert_eq!(
+        draws.len(),
+        placements.len(),
+        "every placement must resolve"
+    );
+    draws
+}
+
+/// A ladder nobody has moved yields no wave at all - the short-circuit both
+/// hosts skip the whole pass on.
+#[test]
+fn a_still_ladder_is_no_wave() {
+    let man = [0x40i16; 16];
+    let scratch = man.map(i16::wrapping_neg);
+    assert!(FloorWave::from_scene_and_world(Some(man), &scratch).is_none());
+    // ... and the inverse pairing IS a wave, which is what makes the assertion
+    // above a statement about the sign convention and not about equality.
+    assert!(FloorWave::from_scene_and_world(Some(man), &man).is_some());
+}
+
+/// End to end through the field VM: `4C 90` on one rung moves every anchor
+/// standing on that rung through the [`FloorWave`] kernel, in both the
+/// corner-average and the single-nibble flavours, and leaves every other
+/// rung's anchors alone. (Which layer a host folds the live wave into is a
+/// separate rule: a placed object stands on its spawn ladder instead - see
+/// `a_placed_object_keeps_its_spawn_ladder`.)
+#[test]
+fn op_4c_90_moves_the_drawn_ground_under_the_rung_it_arms() {
+    let mut man = [0i16; 16];
+    man[4] = 0x40;
+    man[5] = 0x80;
+    let list = [terrain([4, 4, 4, 4]), placed(4), terrain([5, 5, 5, 5])];
+    let d = draws(&list, man);
+    let baked: Vec<i32> = d.iter().map(|d| d.world_y).collect();
+    assert_eq!(baked[0], -0x40, "corner-average of one tier is that tier");
+    assert_eq!(baked[1], -0x40);
+    assert_eq!(baked[2], -0x80);
+
+    let mut world = world_on_ladder(man, arm_rung(4));
+    let mut span = [(i32::MAX, i32::MIN); 3];
+    let mut untouched_moved = false;
+    for _ in 0..128 {
+        let _ = world.tick();
+        let Some(wave) =
+            FloorWave::from_scene_and_world(Some(man), &world.terrain.floor_height_lut)
+        else {
+            continue;
+        };
+        for (i, draw) in d.iter().enumerate() {
+            let off = wave.offset(&draw.floor);
+            span[i].0 = span[i].0.min(off);
+            span[i].1 = span[i].1.max(off);
+            if i == 2 && off != 0 {
+                untouched_moved = true;
+            }
+        }
+    }
+    assert_eq!(
+        world.terrain.floor_tier_bobs.len(),
+        1,
+        "the rung must be armed"
+    );
+    assert!(
+        span[0].1 > span[0].0,
+        "the terrain cell on rung 4 must swing: {:?}",
+        span[0]
+    );
+    assert!(
+        span[1].1 > span[1].0,
+        "so must the single-nibble anchor on rung 4: {:?}",
+        span[1]
+    );
+    assert_eq!(
+        span[0], span[1],
+        "the corner-average of a uniform block is the single-nibble height, \
+         so the two flavours must move identically"
+    );
+    assert!(
+        !untouched_moved,
+        "a draw on rung 5 must not move - the wave is per-rung, not global"
+    );
+}
+
+/// The sign the brief warns about, asserted rather than assumed: routing the
+/// world's copy in **unconverted** inverts the wave.
+#[test]
+fn the_worlds_copy_is_the_scratchpad_frame_not_the_man_frame() {
+    let mut man = [0i16; 16];
+    man[3] = 0x100;
+    let d = draws(&[placed(3)], man);
+    let mut world = world_on_ladder(man, arm_rung(3));
+    for _ in 0..40 {
+        let _ = world.tick();
+    }
+    let live_scratch = world.terrain.floor_height_lut;
+    let right = FloorWave::from_scene_and_world(Some(man), &live_scratch)
+        .expect("the rung has moved")
+        .offset(&d[0].floor);
+    // The un-converted pairing - the mistake the conversion exists to prevent.
+    let wrong = FloorWave::between(man, live_scratch)
+        .expect("still a difference")
+        .offset(&d[0].floor);
+    assert_ne!(right, 0);
+    // `height(lut) = -lut[n]`, so the converted form is
+    // `live_scratch[3] + man[3]` and the unconverted one is
+    // `-live_scratch[3] + man[3]`: they differ by twice the live rung, i.e. the
+    // unconverted pairing reflects the wave about the baked height instead of
+    // following it.
+    assert_eq!(wrong - right, -2 * i32::from(live_scratch[3]));
+    assert!(
+        (wrong - right).abs() > 0,
+        "the rung is off zero, so the two readings must actually differ"
+    );
+}
+
+/// `4C 9E` re-installs all sixteen rungs mid-scene. That is a floor move too,
+/// and the draw list must follow it rather than staying on the MAN ladder.
+#[test]
+fn op_4c_9e_reinstalls_the_ladder_and_the_draws_follow() {
+    let man = [0i16; 16];
+    let d = draws(&[terrain([2, 2, 2, 2])], man);
+    assert_eq!(d[0].world_y, 0);
+    let mut script = vec![0x4C, 0x9E];
+    for i in 0..16u16 {
+        script.extend_from_slice(&(i * 0x20).to_le_bytes());
+    }
+    let mut world = world_on_ladder(man, script);
+    let _ = world.tick();
+    let wave = FloorWave::from_scene_and_world(Some(man), &world.terrain.floor_height_lut)
+        .expect("the install moved the ladder");
+    // The install writes `-words[i]` into the scratchpad, i.e. `words[i]` in
+    // the MAN frame, so rung 2's draw height goes from `0` to `-(2 * 0x20)`.
+    assert_eq!(wave.offset(&d[0].floor), -(2 * 0x20));
+}
+
+/// The ground surface follows the wave **per vertex**: a cell whose corners
+/// sit on the armed rung lifts and drops, its neighbour on another rung stays,
+/// and a cell straddling both tilts - the drawn ground the floor sampler walks.
+#[test]
+fn op_4c_90_deforms_the_ground_heightfield_per_vertex() {
+    use legaia_scene_formats::field_objects::{GROUND_PRIM_COLOR, WalkHeightfield};
+    let mut man = [0i16; 16];
+    man[4] = 0x40;
+    man[5] = 0x80;
+    // Two cells side by side: corners on tiers 4 | 4/5 straddle | 5.
+    let tiers = [4u8, 4, 4, 4, 4, 5, 4, 5];
+    let hf = WalkHeightfield {
+        positions: tiers
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| [(i % 2) as f32 * 128.0, -f32::from(man[t as usize]), 0.0])
+            .collect(),
+        tile_ids: vec![0; 8],
+        uvs: vec![[0, 0]; 8],
+        cba_tsb: vec![[0, 0]; 8],
+        colors: vec![GROUND_PRIM_COLOR; 8],
+        indices: vec![0, 1, 2, 1, 3, 2, 4, 5, 6, 5, 7, 6],
+        corner_tiers: tiers.to_vec(),
+        far_bucket: Vec::new(),
+    };
+    let baked = legaia_engine_scene::field_ground::render_positions(&hf);
+    let mut world = world_on_ladder(man, arm_rung(4));
+    assert_eq!(
+        legaia_engine_scene::field_ground::live_render_positions(
+            &hf,
+            &world.terrain.floor_height_lut
+        ),
+        baked,
+        "the live ladder at entry reproduces the baked ground"
+    );
+    let mut moved = [false; 8];
+    for _ in 0..128 {
+        let _ = world.tick();
+        let live = legaia_engine_scene::field_ground::live_render_positions(
+            &hf,
+            &world.terrain.floor_height_lut,
+        );
+        for (i, (l, b)) in live.iter().zip(&baked).enumerate() {
+            assert_eq!((l[0], l[2]), (b[0], b[2]), "only Y moves");
+            moved[i] |= l[1] != b[1];
+        }
+    }
+    for (i, &t) in tiers.iter().enumerate() {
+        assert_eq!(moved[i], t == 4, "vertex {i} on tier {t}");
+    }
+}
+
+/// A placed object is an actor whose Y `FUN_8003A55C` (or the window sweep
+/// `FUN_801D7B50`) stores once at spawn, from the ladder live at that moment,
+/// and nothing re-samples it: the per-cell decoration sweep that re-reads the
+/// ladder every frame skips `flags & 4` records. So under a moving rung the
+/// terrain cell swings and the placed object on the same rung does not -
+/// until a window re-plan re-spawns a window-owned one on the new rungs.
+#[test]
+fn a_placed_object_keeps_its_spawn_ladder() {
+    let mut man = [0i16; 16];
+    man[4] = 0x40;
+    let d = draws(&[terrain([4, 4, 4, 4]), placed(4)], man);
+    let mut world = world_on_ladder(man, arm_rung(4));
+    world.terrain.placed_spawn_lut = world.terrain.floor_height_lut;
+    let key = legaia_engine_scene::field_env::PlacedWindowKey::of_draw(&d[1]);
+    let (mut terrain_moved, mut bound_moved, mut windowed_moved) = (false, false, false);
+    for _ in 0..64 {
+        let _ = world.tick();
+        let wave = FloorWave::from_scene_and_world(Some(man), &world.terrain.floor_height_lut);
+        terrain_moved |= wave.is_some_and(|w| w.offset(&d[0].floor) != 0);
+        let off =
+            world.placed_floor_offsets(Some(man), [&d[1].floor, &d[1].floor], &[None, Some(key)]);
+        bound_moved |= off[0] != 0;
+        windowed_moved |= off[1] != 0;
+    }
+    assert!(terrain_moved, "the terrain cell rides the rung");
+    assert!(!bound_moved, "the bound object stays on its spawn ladder");
+    assert!(
+        !windowed_moved,
+        "and so does a window-owned one until a re-plan"
+    );
+    // A re-plan spawns the window-owned object on the rungs live at that moment.
+    world.rebuild_static_object_window([0, 0, 1, 1]);
+    let live = FloorWave::from_scene_and_world(Some(man), &world.terrain.floor_height_lut)
+        .map_or(0, |w| w.offset(&d[1].floor));
+    let off = world.placed_floor_offsets(Some(man), [&d[1].floor, &d[1].floor], &[None, Some(key)]);
+    assert_eq!(
+        off,
+        vec![0, live],
+        "the re-plan's ladder, the bound one's unchanged"
+    );
+}

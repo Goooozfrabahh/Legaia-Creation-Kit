@@ -1,0 +1,639 @@
+# Playing and viewing
+
+`legaia-engine` is the port: point it at your disc and you are playing Legend
+of Legaia - title screen, New Game or a save, towns, the world map, battles,
+menus, minigames, cutscenes. `asset-viewer` is its museum-mode sibling for
+browsing individual assets. Both ship in the release archive; commands use the
+bare `./tool` form (source builds live at `target/release/`).
+
+There are two ways to play, and they run the same engine:
+
+| Host | Start it | Input | Notes |
+|---|---|---|---|
+| Native window | `./legaia-engine` ([the launcher](#0-the-launcher)), or `play-window` | Keyboard or gamepad | wgpu renderer; every flag on this page |
+| Browser play page | The project site's play page, or [a local build](#10-run-the-browser-version-locally) | Keyboard or gamepad | Nothing to install; also runs in VR over WebXR |
+
+On this page:
+
+- Play: [the launcher](#0-the-launcher), [booting a scene](#1-boot-the-engine),
+  [picking a scene, and cheats](#2-pick-a-scene), [FMVs](#3-play-the-fmvs),
+  [minigames](#4-start-a-minigame-from-a-live-scene), [audio](#5-what-you-hear),
+  [saves and config](#6-saves-and-config-live-next-to-you).
+- Tools: [record and replay](#7-record-and-replay-a-session),
+  [the asset viewer](#8-browse-assets-interactively),
+  [script disassembly](#9-read-the-games-scripts),
+  [the browser build](#10-run-the-browser-version-locally).
+
+Every subcommand accepts the disc directly via `--disc` - no extraction step
+required to play. Without `--disc`, tools read an `extracted/` tree
+(`--extracted-root`, default `extracted`, resolved against the current
+directory) produced by `legaia-extract`
+([getting-started.md](getting-started.md)).
+
+## 0. The launcher
+
+The project site's [desktop apps guide](https://andrewaltimit.github.io/legend-of-legaia-re/guides/desktop-apps.html) covers the download, the
+first start past SmartScreen or Gatekeeper, the controls and the toggles with
+screenshots; this page is the full reference.
+
+Started with **no subcommand** - a double-click, a desktop shortcut, the macOS
+app - `legaia-engine` opens its launcher instead of printing help:
+
+```bash
+./legaia-engine
+```
+
+The launcher is one screen: a disc card at the top, the actions on the left
+(*Play*, *Choose disc...* / *Change disc...*, *Controls*, *Open saves
+folder*, *Quit*) with a help box under them that explains whatever is
+focused, and the options on the right. Once a disc validates, the screen is
+lettered in the game's own dialog font, read from that disc.
+
+| Key / mouse | Does |
+|---|---|
+| Up / Down | move between every control |
+| Tab, Right on a button | jump between the buttons and the option list |
+| Left / Right on an option | change it (a switch flips, a list steps, a volume moves by one) |
+| Enter, Space, click | press the focused button, or step an option forward |
+| Right-click an option | step it back |
+| Ctrl+O | open the file dialog |
+| typing | enter a disc path (Enter uses it, Esc clears it) |
+| Esc | leave the controls page, or quit |
+
+### Choosing the disc
+
+*Choose disc...* opens the system file dialog (`Ctrl+O` does too); dragging
+the `.bin` (or `.cue`) onto the window, or typing its path and pressing
+`Enter`, works as well. On Linux the dialog goes through the desktop's
+file-chooser portal; where no portal runs, the drag-and-drop and typed-path
+routes still work.
+
+On a Wayland desktop the launcher window opens through XWayland, because the
+windowing library has no Wayland drag-and-drop; the compositor carries a drag
+from a Wayland file manager across, so dropping works there too. Without
+XWayland (`DISPLAY` unset), or with `LEGAIA_LAUNCHER_WAYLAND=1`, the window is
+native Wayland and only the file dialog and the typed path take a disc. The
+game itself always opens on the desktop's default backend.
+
+The chosen image is checked before it is accepted, through the same reader the
+game boots from: a `.cue` resolves to its `.bin`, the image must be raw
+Mode 2/2352, its `SYSTEM.CNF` must boot `SCUS_942.54`, and `PROT.DAT` must be
+present. A PAL or Japanese disc is refused with the executable it boots; a
+randomized or translated USA disc is accepted, since it still boots the USA
+executable. The check reads a few sectors, not the whole image - it is not the
+SHA-256 fingerprint `disc-extract verify` computes. The disc card says what is
+wrong in one line (the file moved, is not a disc image, is another region's
+disc) and the help box gives the reason and the fix.
+
+A disc that passes is remembered in `launcher.toml` in the platform config
+directory (`~/.config/legaia-engine` on Linux, `%APPDATA%\legaia-engine` on
+Windows, `~/Library/Application Support/legaia-engine` on macOS); the next
+start shows it ready, with *Play* focused, so `Enter` starts the game.
+*Change disc...* picks another one.
+
+### Options
+
+The option list holds the engine's enhancement knobs, so none of them needs a
+terminal flag. It is grouped, and scrolls when it is longer than the panel:
+the selected row stays in view, a bar on the panel's right edge shows where the
+view is, the mouse wheel scrolls it, and `Page Up` / `Page Down` / `Home` /
+`End` move through it.
+
+| Group | Row | Stored in | In game | Default |
+|---|---|---|---|---|
+| Display | Fullscreen (borderless) | `legaia-options.toml` | `F11`, `Alt+Enter` | off |
+| Display | Window size (640x480 .. 1920x1440, steps of 320x240) | `legaia-options.toml` | - | 960x720 |
+| Display | Camera distance (retail, far, farther) | `legaia-options.toml` | `T` | far |
+| Display | PlayStation pixel look (`--psx-render`) | `launcher.toml` | - | off |
+| Enhancements | Enhanced lighting | `legaia-options.toml` | `I` | on |
+| Enhancements | Time of day (auto, day, dusk, night) | `legaia-options.toml` | `F8` | auto |
+| Enhancements | Lamp shadows | `legaia-options.toml` | `Y` | on |
+| Enhancements | Bloom | `legaia-options.toml` | `F10` | off |
+| Enhancements | Ground fog | `legaia-options.toml` | `F9` | off |
+| Enhancements | See-through walls | `legaia-options.toml` | `F4` | on |
+| Enhancements | Living ground pulse (off = `--no-entry-pulse`) | `launcher.toml` | - | on |
+| Play | Free-angle movement | `legaia-options.toml` | `R` | off |
+| Play | Smarter monsters (`--smart-monsters`) | `launcher.toml` | - | off |
+| Play | Reduce flashing | `legaia-options.toml` | - | on |
+| Gameplay tweaks | Shiny Seru (off = `--no-shiny-seru`) | `launcher.toml` | - | on |
+| Gameplay tweaks | Run-away EXP (`--flee-exp`) | `launcher.toml` | - | off |
+| Gameplay tweaks | Fortress battles fix (off = `--no-fortress-encounter-fix`) | `launcher.toml` | - | on |
+| Gameplay tweaks | Boss casts respect jewels (`--jewel-fix`) | `launcher.toml` | - | off |
+| Gameplay tweaks | Battle freeze guard (off = `--no-hp-readout-guard`) | `launcher.toml` | - | on |
+| Gameplay tweaks | Bonus equipment drops (`--equipment-drops`) | `launcher.toml` | - | off |
+| Battle tuning | EXP rate (`--exp-rate`: 1x, 1.5x, 2x, 3x, 5x, 0.5x) | `launcher.toml` | - | 1x |
+| Battle tuning | Enemy strength (`--enemy-stat-scale`: 1x to 5x, 0.75x, 0.5x) | `launcher.toml` | - | 1x |
+| Battle tuning | Enemy attack count (`--enemy-attack-count`: 1x to 3x, 0.5x) | `launcher.toml` | - | 1x |
+| Battle tuning | Spirit AP (`--spirit-ap`: 32 is the original, negative drains) | `launcher.toml` | - | 32 |
+| Battle tuning | AP from damage (`--damage-ap`: 100 is the original, negative drains) | `launcher.toml` | - | 100 |
+| Battle tuning | Seru catch rate (`--seru-catch-rate`: Original or 10..100%) | `launcher.toml` | - | Original |
+| Sound | Music / sound effects volume (0..10, 8 = the original mix) | `legaia-options.toml` | - | 8 |
+| Sound | Mono output | `legaia-options.toml` | - | off |
+| Original game | Original ground culling (`retail_view_window`) | `legaia-options.toml` | - | on |
+| Original game | Original prop culling (`retail_static_window`) | `legaia-options.toml` | - | on |
+| Original game | Original game only (`--retail`) | `launcher.toml` | - | off |
+
+The rows stored in `legaia-options.toml` are the game's own options: the
+launcher writes the same file the in-game keys change, so a toggle made in
+either place is the one the other shows. The `launcher.toml` rows are launch
+switches with no option behind them; the browser play page has a box for each.
+*Original game only* starts the game retail-faithful (`play-window --retail`):
+every enhancement off for that session, the saved options untouched; the rows
+it overrides read *Original* while it is on. *Controls* swaps the option list
+for the current key bindings (`legaia-input.toml`).
+
+The *Gameplay tweaks* and *Battle tuning* rows are disc-patcher features the engine runs itself,
+so they need no patched disc: each matches one `legaia-patcher` flag, except
+the freeze guard, which is the engine's own fix for a battle softlock the
+original can reach. [Gameplay tweaks](../subsystems/gameplay-tweaks.md) says
+what each does and which patcher features stay with the patcher.
+
+### Playing
+
+*Play* starts the game on the title screen (`play-window --disc <bin>
+--boot-ui`, plus `--psx-render`, `--retail`, `--no-entry-pulse`,
+`--smart-monsters` or a gameplay-tweak flag when those rows ask for them) in a child
+process, and the launcher window closes. When the game exits normally the
+launcher ends with it. When it stops with an error, the launcher comes back
+with the error lines of the game's log; the whole log is
+`legaia-engine-game.log` in the saves folder. Run from a terminal, the game's
+output still prints there too.
+
+`LEGAIA_LAUNCHER_DIRECT=1` skips the screen: a remembered disc that still
+validates boots straight into the game, in the launcher's own process.
+
+On Windows, double-click `Legend of Legaia.exe`: it starts `legaia-engine.exe`
+with no console window. `legaia-engine.exe` is a console program so its
+subcommands behave normally in a terminal; double-clicked directly, it closes
+the console it was given (a brief flash) unless `LEGAIA_KEEP_CONSOLE` is set,
+and run from a command prompt it keeps printing its log there.
+
+A launcher start runs the game from the per-user data directory
+(`~/.local/share/legaia-engine` on Linux; the same folder as the settings on
+Windows and macOS), so key bindings (`legaia-input.toml`), options
+(`legaia-options.toml`) and `saves/` stay in one place however the binary was
+started; *Open saves folder* opens it. `LEGAIA_ENGINE_CONFIG_DIR` and
+`LEGAIA_ENGINE_DATA_DIR` override the two directories. Every subcommand below
+behaves exactly as before; the launcher only answers the no-argument case.
+
+## 1. Boot the engine
+
+```bash
+./legaia-engine play-window --disc "/path/to/Legend of Legaia (USA).bin"
+```
+
+This boots the scene `town01` (Rim Elm) straight off the disc: field
+rendering, BGM, NPC scripts, dialog, and the full gameplay loop - walking
+rolls the scene's own random encounters, a battle opens the command menu, and
+victory returns you to the field with XP, gold and drops.
+
+Keyboard defaults are arrows = D-pad, then:
+
+| Key | Pad button |
+|---|---|
+| `Z` | Cross |
+| `S` | Circle |
+| `A` | Triangle |
+| `X` | Square |
+| `Q` / `W` | L1 / R1 |
+| `1` / `2` | L2 / R2 |
+| `Enter`, `Space` | Start |
+| `RShift` | Select |
+
+`Esc` twice quits: the first press only shows *Press Esc again to quit* at
+the bottom left of the window, and a second press within three seconds closes it,
+so a stray press does not lose an unsaved game. The browser play page ships a *different* default layout (`X` is
+Circle there, `C` / `V` carry Triangle / Square, and WASD doubles the arrows),
+so a key that works in the tab is not necessarily the same button in the
+window. `config show` prints the desktop table, including any rebinding.
+
+Both the native window and the browser pages read a gamepad, by position:
+bottom / right / left / top face buttons are Cross / Circle / Square /
+Triangle, bumpers L1 / R1, triggers L2 / R2, back / start Select / Start, and
+both the d-pad and the left stick drive the d-pad. The browser takes any
+controller it reports with the `standard` mapping; the native window takes any
+controller its platform's gamepad backend sees, and works with the keyboard
+alone when none is connected. Key Config (Select on the Options screen) rebinds
+keys only.
+
+**Camera.** Left-mouse drag orbits the camera around your character
+(horizontal) and tilts it (vertical), the wheel zooms in and out, and a
+double-click puts the framing back to retail, centred on the party (the
+browser play page's **Reset camera** button does the same, and also leaves the
+`F3` debug vantage). All three are locked while a cutscene has the camera.
+
+**Window toggles.** These are the port's enhancements and conveniences; each
+enhancement has a retail-faithful off position
+([what each one does](../subsystems/engine.md#fidelity-and-enhancements)).
+
+| Key | Toggle | Default | Start-up flag |
+|---|---|---|---|
+| `I` | Enhanced lighting: a time-of-day mood, real lights at lamps and glowing props; off is the game's own baked shading | on, remembered | `--no-dynamic-lighting` |
+| `F8` | Lighting time of day: auto, day, dusk, night | auto, remembered | - |
+| `Y` | Shadows cast by the enhanced point lights | on, remembered | `--no-dyn-shadows` |
+| `F4` | Camera-occlusion fade: walls between the camera and your character dissolve to a dither | on, remembered | `--no-occlusion-fade` |
+| `F9` | Volumetric ground fog | off, remembered | `--no-volumetric-fog` |
+| `F10` | Bloom: lamps, glowing props, lit windows and bright sky glow softly, stronger at night | off, remembered | - |
+| `R` | Free-angle movement | off (retail 4/8-way movement), remembered | - |
+| `T` | Camera distance preset: retail, far, farther | far, remembered | - |
+| `F3` | Wide debug orbit camera | off | - |
+| `F2` | Mute audio | off, remembered | `--no-audio` |
+| `F1` | The engine's diagnostic text rows | off | - |
+| `F11`, `Alt+Enter` | Borderless fullscreen | off, remembered | `--fullscreen` / `--windowed` |
+
+In the native window each press shows the toggle's new state at the bottom
+left for a moment (*Ground fog: off*); holding a key toggles once, not
+repeatedly. A key that only acts while you walk
+around (`F3`, `T`, `R`) says so when pressed on the title screen or in a menu.
+`F12` (or `?`) opens a panel listing every toggle key with its current state;
+press it again to close it. A player's window says so for its first few
+seconds (*F12 or ? lists the keys*, bottom left) until the panel is opened. A
+`--screenshot` capture leaves that line, the toggle notices and the quit
+prompt out, so it shows only what the game draws; `--screenshot-chrome` keeps
+them (for a documentation shot - they are timed by the wall clock, so such a
+capture is not frame-exact).
+
+**Window size.** The windowed size is a multiple of the PlayStation's
+320x240 picture, `--window-scale 2..6` (3 = 960x720, the default), stored as
+`window_scale` with the fullscreen state in `legaia-options.toml`; the
+launcher's *Window size* row edits it. Both are window chrome: the frame is
+drawn the same at any surface, and a `--screenshot` run ignores the stored
+pair so a capture never depends on what a player last chose.
+
+The browser play page answers the same keys from the same table, with the
+canvas focused: each moves the matching control under the canvas, and `F1`
+hides the readout bar above it. Every presentation toggle sits in one
+**Visual enhancements** panel there, each row naming its key, a one-line
+description and whether it is a port enhancement or a piece of retail's own
+drawing; the panel also carries the Retail-faithful switch and a **Reset to
+defaults** button for the panel's settings.
+
+A handful of keys are development hand-triggers rather than player controls:
+`N` opens the name-entry screen for the lead character, and `F5`, `F`, `G`,
+`H` and `J` spawn a debug effect, effect model, summon, battle move effect or
+field effect at an actor so those render paths can be exercised without the
+script that normally fires them.
+
+No window toggle sits on a key the pad table can bind, and that is not
+cosmetic: a window key arm runs **before** the pad lookup, so one parked on a
+bindable key deletes that button from the keyboard entirely. The bindable
+vocabulary is the table above plus `C`, `V`, `D` and `E`. Every window toggle
+is either an F-key, which the pad lookup never resolves, or a letter outside
+that vocabulary (`I`, `R`, `T`, `Y`, the dev triggers, and the minigame entries below), so no
+rebinding can collide with one.
+
+`--boot-ui` starts at the title screen → save-select flow instead of jumping
+into the scene.
+
+Two flags turn parts of that back off:
+
+- `--no-live-loop` stops random encounters from rolling, leaving field VM +
+  locomotion only - the mode to use when you are inspecting a scene rather
+  than playing it. A battle the engine is already in still resolves.
+- `--no-player-battle` auto-attacks each party turn instead of opening the
+  command menu.
+
+**Towns have no random encounters, by design.** Rim Elm is one of them, and so
+are most scenes with a shop in them: their encounter regions carry a zero
+trigger rate, exactly as on the retail disc. The window says so in the corner
+(`no random encounters in this scene`) so a quiet walk does not look like a
+broken engine - step onto the overworld, or `--scene map03`, to fight.
+
+### Getting into a battle on purpose
+
+Waiting for a step roll is fine for playing and useless for *checking*
+something on the battle screen: the retail counter takes several hundred steps
+to drain, and blind pad-scripted walking rarely reaches one at all.
+`--battle` names the fight instead:
+
+```bash
+# The scene's lowest formation row that carries monsters.
+./legaia-engine play-window --disc "$DISC" --scene map03 --battle first
+
+# A specific MAN encounter-table row (rikuroa row 17 = the lone Caruban boss).
+./legaia-engine play-window --disc "$DISC" --scene rikuroa --battle 17
+```
+
+The row is an index into the scene's own MAN encounter table - the same id
+space the region roll produces, so `--battle 12` fights what walking into that
+region would have. Unregistered rows are refused with the scene's row list
+logged, and the flag changes nothing at all when it is absent.
+
+The fight is **armed, not injected**: the row goes into the encounter session's
+transition state machine exactly as a roll does, so the intro transition, the
+BGM swap and the battle load are the ordinary ones and what you see is what an
+organic encounter shows. It also means the fight opens a beat after boot rather
+than on frame 0 - allow ~40 ticks when pairing it with a capture:
+
+```bash
+./legaia-engine play-window --disc "$DISC" --scene rikuroa --battle 17 \
+    --seed-party --screenshot /tmp/battle.png --screenshot-tick 200
+```
+
+`--battle` turns the live loop on even under `--no-live-loop`, because the
+loop is what drains the transition.
+
+A `--scene` entry already brings the full party (see
+[Pick a scene](#2-pick-a-scene)). `--seed-party` instead reseeds retail's New
+Game roster, which is **Vahn alone**. Name the members you want and each one
+missing from the roster is seeded from its own row of the executable's
+starting-party template, so it arrives with real level-1 stats and its own
+name:
+
+```bash
+./legaia-engine play-window --disc "$DISC" --scene rikuroa --battle 17 \
+    --seed-party --party vahn,noa,gala
+```
+
+The list is in battle order (`vahn`/`noa`/`gala`/`terra`, or roster indices)
+and caps at the three on-screen positions. A member whose record already
+carries stats - a loaded save - is never overwritten.
+
+### Debug affordances: `--learn-spell` and `--set-flag`
+
+Two screens a parity sweep needs are gated on state no other flag reaches, so
+there are two flags that write that state directly. Both are **debug
+affordances, not player surfaces**: they put the world into a configuration a
+save would otherwise have to carry, and neither changes anything when absent.
+
+`--learn-spell <ID>` (repeatable, decimal or `0x` hex) prepends a spell id at
+level 1 to the lead party member's learned list. The battle Magic arm
+validates a queued action against that list and parks on an unlearned id, so
+without this the cast band cannot be reached at all on a fresh roster. The
+player Seru-magic block is `0x81..=0x8B`
+([`spell-table.md`](../formats/spell-table.md)). It needs a roster to write
+to, so pair it with `--seed-party`:
+
+```bash
+./legaia-engine play-window --disc "$DISC" --scene rikuroa --battle 17 \
+    --seed-party --learn-spell 0x85 --learn-spell 0x88
+```
+
+`--set-flag <N>` (repeatable, same number formats) raises a bit in the shared
+system/story-flag bank - retail's `DAT_80085758`, the one the field VM's op
+`0x07` writes and `FUN_8003CE64` reads - before the scene is entered, and
+again after `--seed-party` resets the bank. A raised bit is indistinguishable
+from one a script raised. The Muscle Dome's course unlocks are the worked
+example: the arena seeds its special-battle word from flags `0x536` / `0x537`
+/ `0x538`, last one set winning, and `0x538` seeds `0x321` - course 2 plus the
+bit that crosses the Ra-Seru chip out of the command ring
+([`minigame-muscle-dome.md`](../subsystems/minigame-muscle-dome.md)).
+
+```bash
+# `M` opens the dome from any field scene; the ring is drawn with the
+# Ra-Seru chip crossed out because flag 0x538 seeded the word to 0x321.
+./legaia-engine play-window --disc "$DISC" --scene town01 --seed-party \
+    --set-flag 0x538 --key-script "60:M" \
+    --screenshot /tmp/dome-ban.png --screenshot-tick 200
+```
+
+The older `LEGAIA_LEARN_SPELLS=0x81,0x9e` environment variable still works and
+is applied after any `--learn-spell`.
+
+## 2. Pick a scene
+
+```bash
+./legaia-engine list-scenes --disc "/path/to/disc.bin"
+./legaia-engine play-window --disc "/path/to/disc.bin" --scene town01
+```
+
+`list-scenes` prints every scene name the game's file map exposes with the
+PROT entry range each covers - the same names feed `--scene`, and a range
+start is where that scene's files land in `extracted/PROT/`.
+
+A scene entered this way - `--scene` with no save, or a scene picked on the
+browser play page - starts with the **full party**: Vahn, Noa and Gala, each
+from their own row of the executable's starting-party template (level 1) and
+wearing a starter loadout, the weakest gear the disc's equipment table lets
+them wear in each slot, their own weapon family first. That is an engine
+choice, not retail's: a true New Game starts with Vahn alone and still does
+(the title screen's NEW GAME, and `--seed-party`, reseed retail's roster).
+Both hosts reach the same seed, `World::seed_picker_party`.
+
+### Cheats
+
+Both hosts carry the same cheats, all written by `legaia_engine_cheats::cheats`
+so the state they leave is one a playthrough could reach:
+
+| Cheat | Native | Effect |
+|---|---|---|
+| Level | `--cheat-level N` | Raising grants each present member the XP that reaches level `N`, so the stat gains are their own retail growth. Lowering rebuilds the character from its New Game stats plus the growth for the levels it keeps; stat-up items used along the way are lost. |
+| Restore | `--cheat-restore` | Refills HP / MP and revives, mid-battle included. |
+| Max AP | `--cheat-max-ap`, `F6` | Fills the AP (Spirit) gauge to 100; in battle the Spirit / Super Art command opens at once. |
+| Grant Seru | `--cheat-seru N` | Teaches the 21 Seru and the member's own Ra-Seru (Vahn also the Sim-Seru and Evil Seru summons, as retail carries them), every spell at level `N` (1-9). |
+| Learn all arts | `--cheat-arts` | Every art in the member's list, Hyper and Miracle Arts included. |
+| Max items | `--cheat-max-items` | Every held item and every usable consumable to 99. Key items and equipment are left alone, so no story gate opens early. |
+| No encounters | `--no-live-loop`, `F7` | Random encounters off; story and boss fights still happen. |
+| Walk through walls | `--cheat-noclip` | The field and world-map walk ignores walls, people and props; a door you walk into still opens. |
+| Gold | `--cheat-gold N` | Sets the purse, capped at 9,999,999. |
+| Coins | `--cheat-coins N` | Sets the casino coin bank, capped at 9,999,999. |
+| Item | `--cheat-item ITEM[:QTY]` | Adds through the bag's own add helper: stacks cap at 99, a full bag refuses. `ITEM` is an id or a name (`healing-leaf:5`). Repeatable. |
+
+On the browser play page they sit in the collapsed **Cheats** panel under the
+canvas, beside **Battle tools**; the panel's **No encounters** box is the same
+switch as the one in Battle tools. Native flags apply once the scene is
+entered; `F6` and `F7` work any time.
+
+```bash
+./legaia-engine play-window --disc "/path/to/disc.bin" --scene vell \
+    --cheat-level 20 --cheat-gold 50000 --cheat-item "healing leaf:20"
+```
+
+## 3. Play the FMVs
+
+```bash
+./legaia-engine play-str MOV/MV1.STR --disc "/path/to/disc.bin"
+```
+
+With `--disc`, the argument is the movie's path *inside* the disc image and
+the interleaved XA audio track plays in sync (the video clock is driven off
+the audio cursor). Without `--disc` it plays a raw extracted `.STR` file
+(video only). To dump frames as PNGs instead, use `mdec`
+([extracting-assets.md](extracting-assets.md)). Background:
+[cutscene.md](../subsystems/cutscene.md).
+
+## 4. Start a minigame from a live scene
+
+Every ported minigame is a **mode suspend** on the running world, not a
+separate program: the field scene stays loaded underneath and comes back when
+you leave, so you start one from wherever you happen to be standing.
+
+In `play-window` each is one key, and the same key leaves again: `L` fishing,
+`K` dance, `U` the how-to dance (the Disco King tutorial), `O` the casino slot
+machine, `B` Baka Fighter, `M` Muscle Dome. While fishing, `P` opens the
+point-exchange prize list (Up / Down move, Left / Right switch venue, Enter
+buys one). Each
+loads that minigame's overlay off the disc and installs a session, so the rules,
+tables and scoring all come from the disc rather than from hardcoded numbers.
+
+While a minigame is up, the port's own status readout and key hints (which
+button attacks, how to quit) sit **outside** the game picture, so the game's
+own chrome never covers them: in the window's title bar in `play-window`, and
+in the strip under the canvas on the browser play page, fullscreen included.
+
+On the browser play page fishing starts where the game starts it: a fishing
+spot's own script hands over through the field VM's minigame warp, as on the
+console - the page has no launcher button of its own. Cross casts and reels, Square reels harder, Cross recasts once a
+catch resolves - the same pad the field controller reads, because the driver is
+the shared per-frame fishing tick rather than a per-host input handler. Points
+bank into the world's persistent pool, so they survive leaving and re-entering,
+and the prize-exchange rows come off the same overlay with retail availability
+gating. Background: [minigame-fishing.md](../subsystems/minigame-fishing.md).
+
+The site's separate **Minigames** page runs the slot machine, the dance, Baka
+Fighter, fishing and the Muscle Dome on their own, without a field scene
+underneath - the same engine sessions, read off the same disc.
+
+One HUD caveat that looks like a bug and is not: the fishing sprite page is the
+one asset in that chain nobody has decoded, so both hosts draw the HUD's digit
+and caption rows from the dialog font and skip its glyphs. The captions are
+engine-side English placeholders at the retail pen positions, so a long
+placeholder can overlap the count beside it.
+
+## 5. What you hear
+
+Both hosts decode their audio from the disc you supply - no samples ship with
+the engine or the site. Music is a SEQ played through the from-scratch SPU against
+the scene's own sound bank; sound effects come from the executable's descriptor
+table plus the resident program bank, and both hosts key them into the **same**
+SPU the music uses, so a cue shares the voice pool exactly as it does on
+hardware.
+
+Cue *provenance* is worth knowing before you judge a sound. Retail fires an
+effect by writing an id into a ring, and only a handful of those writes have
+been traced, so a cue is either `disc` (the id is retail's, at the place retail
+writes it) or `site` (retail's id there is unpinned and the port reuses the
+closest one). The browser page reports the split per event rather than presenting
+a guess as the game's sound. The footstep is the clearest example: its *timing*
+is the retail cadence - a faster walk steps more often, standing still is silent
+- while the cue id it fires is the port's pick.
+
+## 6. Saves and config live next to you
+
+The engine resolves its files against the **current directory**: key bindings
+in `legaia-input.toml`, options (camera preset, movement mode, the
+`bgm_volume` / `sfx_volume` music and sound-effect levels, `0..=10` with `8`
+the retail mix, and `downmix_mono`, the full mono downmix for a single
+speaker - separate from the in-game Monaural setting, which is the original's
+own mono mode and leaves voices and movies in stereo) in
+`legaia-options.toml`, and the save screen's port-1 memory
+card at `saves/memcard1.mcr` - the same raw card image the browser play page
+keeps, which any PSX emulator reads. The first launch that finds no card
+there writes any `slot_NN` save files an older build left into it. Run from the same
+directory each time - or pass explicit paths where supported
+(`--save-dir`, `config set --config-file`). A game started from the
+[launcher](#0-the-launcher) always runs from the per-user data directory, so
+these files sit there however it was started.
+
+Rebind keys with `config`:
+
+```bash
+./legaia-engine config show
+./legaia-engine config set --binding Space=Cross
+./legaia-engine config set --binding Enter=Start
+```
+
+`KEY=BUTTON` uses friendly key names (`Z`, `Up`, `Enter`, `RShift`) and PSX
+pad button names (`Cross`, `Circle`, `Start`, `L1`).
+
+## 7. Record and replay a session
+
+```bash
+./legaia-engine record --disc "/path/to/disc.bin" --out session.toml
+./legaia-engine replay --input session.toml
+```
+
+`record` is `play-window` plus input capture into a small `j-replay-v1` TOML
+file. The file is checkpointed to disk about once a second and finalized on
+window close (`Esc` twice, or the window's close button), so an interrupted session still yields a valid file up
+to the last checkpoint. `replay` runs it back headless and deterministic - the
+same file always produces a bit-identical engine trace, and it needs no disc
+at all. Details: [determinism-replay.md](../tooling/determinism-replay.md).
+
+`legaia-engine --help` lists many more subcommands; the `COMMAND GROUPS`
+footer separates the player-facing ones above from the development
+diagnostics (parity oracles, synthetic state drivers) you can ignore.
+
+## 8. Browse assets interactively
+
+`asset-viewer` reads the `extracted/` tree (there is no `--disc` here - run
+`legaia-extract` first). The `field` and `dialog` demos additionally need the
+dialog font at `extracted/font/`, which the pipeline writes by default (or
+`font-extract --disc` rebuilds).
+
+```bash
+./asset-viewer                                                         # archive browser on ./extracted
+./asset-viewer prot extracted/PROT.DAT                                 # the same, named explicitly
+./asset-viewer tim  extracted/tim_scan/<entry>/<tim-file>              # one texture
+./asset-viewer tmd  extracted/tmd_scan                                 # cycle 3D meshes
+./asset-viewer vab  extracted/PROT/<entry>.BIN --sample 0              # play a sample
+./asset-viewer field town01                                            # playable field demo
+```
+
+The scene name is a positional argument here, not a `--scene` flag (`field`,
+`world` and `dialog` all take their subject that way). Started with no view
+named (a double-click), `asset-viewer` opens the archive browser on the
+`extracted/PROT.DAT` in the current folder or beside the program; with none
+there it says how to make one and points at `legaia-studio`. The browser takes
+entry names from the `CDNAME.TXT` beside `PROT.DAT` unless `--cdname` names
+another.
+
+In the PROT browser: `N` / `P` (or the arrows) = next/prev entry, `PgDn` /
+`PgUp` = jump 10, `Home` / `End` = first/last, typing a number and pressing
+`Enter` jumps to that PROT index (the window title shows what is typed;
+`Esc` cancels it), `Esc` = quit; each entry's format is auto-detected and the
+first viewable sub-asset is shown. `tmd` and `stage` pointed at a directory
+walk every file with the same keys, a typed number naming the 1-based
+position their titles show. The `tim` subcommand also takes `extracted/PROT.DAT` itself with
+`--offset`/`--clut` for the system-UI textures that live outside any TOC
+entry.
+
+## 9. Read the game's scripts
+
+The field/event VM ([script-vm.md](../subsystems/script-vm.md)) drives every
+scene. Its disassembler is a release binary too:
+
+```bash
+./asset field-disasm scan-prot --prot extracted/PROT.DAT  # sweep for event scripts + FMV triggers
+./asset field-disasm file <extracted-script-body>         # walk one raw script linearly
+```
+
+For a specific scene's per-scene scripts (LZS-compressed inside the scene's
+MAN sub-asset), the engine has the direct path:
+
+```bash
+./legaia-engine man-scripts --scene town01 --disc "/path/to/disc.bin"
+```
+
+## 10. Run the browser version locally
+
+The same engine runs in a browser as the static site's play page, sharing the
+simulation kernels with the native window. That build is **not in the clone** -
+`site/wasm/` is generated output. Build it once:
+
+```bash
+scripts/ci/build-wasm.sh            # ~9 min cold; needs wasm-pack
+python3 -m http.server -d site      # then open /play.html
+```
+
+Nothing is uploaded: the disc image you pick stays in the tab.
+
+Rebuild after changing anything the page compiles - which is most of the
+workspace, not just the four `crates/web-*` crates (`web-viewer` over `web-play`, `web-minigames` and `web-patcher`). To check whether the bundle you built
+still matches your sources:
+
+```bash
+python3 scripts/ci/check-wasm-freshness.py
+```
+
+Worth running before concluding a change did or didn't work in the browser: a
+stale bundle looks exactly like a fix that had no effect. See
+[shipped-bundle-freshness.md](../tooling/shipped-bundle-freshness.md).
+
+## Related docs
+
+- [engine.md](../subsystems/engine.md) - the engine's architecture and port boundaries.
+- [shipped-bundle-freshness.md](../tooling/shipped-bundle-freshness.md) - why `site/wasm/` is generated, not committed.
+- [renderer.md](../subsystems/renderer.md) - what "retail-faithful rendering" means here.
+- [determinism-replay.md](../tooling/determinism-replay.md) - the replay format.
+- [modding-and-translation.md](modding-and-translation.md) - randomize or translate the disc you just booted.

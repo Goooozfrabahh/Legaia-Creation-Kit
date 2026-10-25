@@ -1,0 +1,626 @@
+//! Typed accessors over the PSX `SPU` section.
+//!
+//! Mednafen's PSX module stores the full 512 KiB of SPU RAM under the `SPU`
+//! section as the sub-entry `SPURAM`, alongside the 24 per-voice register
+//! snapshots and the global SPU register file (master volume sweep, reverb,
+//! noise, voice-on/off masks). This module mirrors the shape of [`PsxGpu`]
+//! and exposes the entries Legaia audio-parity work actually needs: SPU RAM
+//! bytes, per-voice state snapshots, key-on/-off masks, master volume, and
+//! reverb mode.
+//!
+//! Voice-state sub-entry naming follows mednafen's internal layout exactly,
+//! e.g. `Voices[7].StartAddr`, `Voices[7].Pitch`, `Voices[7].ADSR.Phase`,
+//! `(Voices[7].Sweep[0]).Current`. The 24-voice array is `Voices[0]..Voices[23]`.
+//! Master volume is read off the *current* value of mednafen's global sweep
+//! registers (`(GlobalSweep[0]).Current` for left, `(GlobalSweep[1]).Current`
+//! for right) - what the SPU applied on the last cycle, not the libspu MVOL
+//! write that drives the sweep target.
+//!
+//! **Volumes are reported at register scale.** Mednafen keeps a sweep's
+//! `Current` at twice the register value - a fixed-volume write sets
+//! `Current = (Control & 0x7FFF) << 1`, a Q15 gain where the register is Q14 -
+//! so a voice written `0x0850` reads `Current = 4256`, and a `0x3FFF` master
+//! reads `0x7FFE` (checked against the same states' `Regs` shadow). The
+//! accessors halve it (`Current >> 1`, arithmetic), the scale the hardware
+//! register, libsnd's computed volumes and the engine's `Voice::vol_left`
+//! share. Read raw, every retail volume compared or seeded from a save was
+//! twice the volume retail set.
+//!
+//! ADSR phase values are mednafen's internal enum (4-byte u32 each,
+//! `0 = Attack` .. `3 = Release`, with no `Off` member); we
+//! expose them as raw `u32` rather than re-mapping to the engine-audio
+//! [`crate::engine_audio::spu::adsr::Phase`] - downstream code does the
+//! cross-walk because mednafen and the engine-audio model disagree on the
+//! "off" representation (mednafen tracks per-phase release sub-states that
+//! we treat as plain `Release`).
+
+use crate::container::SaveState;
+
+/// Number of hardware voices on the PSX SPU (matches
+/// `engine_audio::spu::NUM_VOICES`).
+pub const NUM_VOICES: usize = 24;
+
+/// Size of the PSX SPU RAM blob (512 KiB).
+pub const SPU_RAM_BYTES: usize = 512 * 1024;
+
+/// Snapshot of one PSX voice at the moment of capture. Fields are populated
+/// lazily by [`PsxSpu::voice_state`] - if the underlying sub-entry is
+/// missing the field stays `None`. This makes the accessor robust against
+/// older mednafen save-state schemas that may not carry every register.
+#[derive(Debug, Clone, Default)]
+pub struct SpuVoiceState {
+    /// SPU RAM address where this voice's ADPCM stream starts.
+    pub start_addr: Option<u32>,
+    /// Current SPU RAM address (where the decoder will read the next
+    /// 16-byte block). Equal to `start_addr` immediately after key-on,
+    /// then advances forward through the stream.
+    pub cur_addr: Option<u32>,
+    /// Latched loop-back address. PSX hardware records this on the first
+    /// ADPCM block that carries the `loop_start` flag.
+    pub loop_addr: Option<u32>,
+    /// Pitch counter (libspu unit: `0x1000 = 1.0x` sample rate).
+    pub pitch: Option<u16>,
+    /// Fractional sample position within the current 28-sample ADPCM block,
+    /// in mednafen's internal `CurPhase` representation (4-byte u32).
+    pub cur_phase: Option<u32>,
+    /// ADSR envelope phase enum, mednafen-internal: `0 = Attack`,
+    /// `1 = Decay`, `2 = Sustain`, `3 = Release`. There is **no** `Off`
+    /// member - a drained voice stays in `Release` - so this word does not
+    /// answer "is the voice audible"; [`SpuVoiceState::is_active`] reads
+    /// the envelope level instead.
+    pub adsr_phase: Option<u32>,
+    /// Current ADSR envelope level (0..=0x7FFF).
+    pub adsr_env_level: Option<u16>,
+    /// Voice left output volume at register scale (`Sweep[0].Current >> 1`;
+    /// see the module docs). PSX hardware drives this through a sweep
+    /// register; this is what the SPU applied on the last cycle.
+    pub vol_left: Option<i16>,
+    /// Voice right output volume at register scale (`Sweep[1].Current >> 1`).
+    pub vol_right: Option<i16>,
+    /// Raw 32-bit ADSR-control word as stored by mednafen
+    /// (`Voices[N].ADSRControl`). The libspu `(adsr1, adsr2)` words can be
+    /// recovered as `(low_u16, high_u16)`.
+    pub adsr_control: Option<u32>,
+}
+
+impl SpuVoiceState {
+    /// Cheap "is this voice currently audible" predicate: the ADSR envelope
+    /// level is non-zero.
+    ///
+    /// **Not** a phase test. Mednafen's `ADSR.Phase` is `0 = Attack`,
+    /// `1 = Decay`, `2 = Sustain`, `3 = Release` and has no `Off` member -
+    /// a key-off parks the voice in `Release` and leaves it there once the
+    /// envelope reaches zero. Over this workspace's whole retail state
+    /// corpus the phase word is `2` or `3` for all but two dozen voice
+    /// slots and never settles on `0`, so a `phase != 0` predicate calls
+    /// every finished voice audible (and every just-keyed-on one silent).
+    /// The envelope level is what actually scales the voice's output, and
+    /// it is the retail analogue of the engine mixer's `Phase::Off`, which
+    /// is exactly where the engine-side trace draws the same line.
+    pub fn is_active(&self) -> bool {
+        matches!(self.adsr_env_level, Some(l) if l != 0)
+    }
+}
+
+/// Top-level helper over the `SPU` section. Mirrors [`PsxGpu`] in shape.
+#[derive(Debug, Clone, Copy)]
+pub struct PsxSpu<'a> {
+    save: &'a SaveState,
+}
+
+impl<'a> PsxSpu<'a> {
+    pub fn new(save: &'a SaveState) -> Self {
+        Self { save }
+    }
+
+    /// 512 KiB of SPU RAM bytes. Returns `None` if the save state doesn't
+    /// expose the `SPURAM` entry (some non-PSX mednafen modules).
+    pub fn spu_ram_bytes(&self) -> Option<&'a [u8]> {
+        let bytes = self.save.entry_bytes("SPU", "SPURAM")?;
+        if bytes.len() != SPU_RAM_BYTES {
+            return None;
+        }
+        Some(bytes)
+    }
+
+    /// Read one voice's state snapshot. `idx` must be `< NUM_VOICES`.
+    /// Returns `None` if no fields could be resolved.
+    pub fn voice_state(&self, idx: usize) -> Option<SpuVoiceState> {
+        if idx >= NUM_VOICES {
+            return None;
+        }
+        let s = SpuVoiceState {
+            start_addr: self.voice_u32(idx, "StartAddr"),
+            cur_addr: self.voice_u32(idx, "CurAddr"),
+            loop_addr: self.voice_u32(idx, "LoopAddr"),
+            pitch: self.voice_u16(idx, "Pitch"),
+            cur_phase: self.voice_u32(idx, "CurPhase"),
+            adsr_phase: self.voice_u32_dotted(idx, "ADSR.Phase"),
+            adsr_env_level: self.voice_u16_dotted(idx, "ADSR.EnvLevel"),
+            vol_left: self.voice_sweep_current(idx, 0).map(sweep_to_register),
+            vol_right: self.voice_sweep_current(idx, 1).map(sweep_to_register),
+            adsr_control: self.voice_u32(idx, "ADSRControl"),
+        };
+        // Any field set → return a populated snapshot; otherwise None so
+        // callers can distinguish "save state didn't capture SPU" from "all
+        // 24 voices are zero".
+        if s.start_addr.is_some()
+            || s.cur_addr.is_some()
+            || s.loop_addr.is_some()
+            || s.pitch.is_some()
+            || s.cur_phase.is_some()
+            || s.adsr_phase.is_some()
+            || s.adsr_env_level.is_some()
+            || s.vol_left.is_some()
+            || s.vol_right.is_some()
+            || s.adsr_control.is_some()
+        {
+            Some(s)
+        } else {
+            None
+        }
+    }
+
+    /// Full 24-voice state array. Slots with no data are populated with
+    /// `SpuVoiceState::default()` rather than dropped, so the array
+    /// indices line up 1:1 with [`engine_audio::spu::Spu::voices`].
+    pub fn voices(&self) -> [SpuVoiceState; NUM_VOICES] {
+        std::array::from_fn(|i| self.voice_state(i).unwrap_or_default())
+    }
+
+    /// Bitmask of voices that have a pending key-on (`VoiceOn` register).
+    /// libspu writes set this; the SPU clears the bit on the next cycle
+    /// after kicking the envelope into Attack.
+    pub fn voice_on_mask(&self) -> Option<u32> {
+        self.u32_entry("VoiceOn")
+    }
+
+    /// Bitmask of voices with a pending key-off (`VoiceOff` register).
+    pub fn voice_off_mask(&self) -> Option<u32> {
+        self.u32_entry("VoiceOff")
+    }
+
+    /// Bitmask of voices whose current ADPCM block carried an end-flag
+    /// without repeat (PSX `ENDX` status). Useful for distinguishing
+    /// "voice naturally finished" from "host issued key-off".
+    pub fn block_end_mask(&self) -> Option<u32> {
+        self.u32_entry("BlockEnd")
+    }
+
+    /// Mednafen's `Reverb_Mode` sub-entry. **Despite the name this is not a
+    /// libspu mode byte (0..9)** - it is the 24-bit per-voice reverb-enable
+    /// register (`EON`), byte-for-byte equal to [`Self::voice_reverb_mask`]
+    /// across every captured state (mednafen mirrors `EON` here as well as in
+    /// the `Regs` shadow). Prefer [`Self::voice_reverb_mask`]; this accessor
+    /// is kept for callers reading the named field directly. The actual reverb
+    /// *preset* is identified from [`Self::reverb_registers`].
+    pub fn reverb_mode(&self) -> Option<u32> {
+        self.u32_entry("Reverb_Mode")
+    }
+
+    /// SPU control register (`SPUCNT`, 2 bytes). Bit-level layout matches
+    /// the PSX hardware spec.
+    pub fn spu_control(&self) -> Option<u16> {
+        self.u16_entry("SPUControl")
+    }
+
+    /// Master reverb enable (`SPUCNT` bit 7). When clear the SPU mutes the
+    /// reverb network entirely regardless of per-voice routing, so a voice
+    /// can carry a `reverb_send` bit ([`Self::voice_reverb_mask`]) yet
+    /// produce no echo. `None` if the control register wasn't captured.
+    pub fn reverb_master_enabled(&self) -> Option<bool> {
+        Some(self.spu_control()? & 0x0080 != 0)
+    }
+
+    /// `SPUCNT` bit 0, CD audio enable: the CD input (XA) reaches the mix.
+    pub fn cd_audio_enabled(&self) -> Option<bool> {
+        Some(self.spu_control()? & 0x0001 != 0)
+    }
+
+    /// `SPUCNT` bit 2, CD audio reverb: the CD input also feeds the reverb
+    /// send. libspu writes it from `SpuCommonAttr.cd.reverb`.
+    pub fn cd_reverb_enabled(&self) -> Option<bool> {
+        Some(self.spu_control()? & 0x0004 != 0)
+    }
+
+    /// CD input volume `(left, right)` - SPU `0x1F801DB0` / `0x1F801DB2`,
+    /// the register libspu's `SpuSetCommonAttr` writes from `cd.volume`.
+    /// Unlike the voice and master volumes this register has no sweep mode:
+    /// it is a plain signed Q15 gain, `0x7FFF` full scale. libsnd's
+    /// `SsSetSerialVol` (`FUN_800643C4`) writes `v * 0x102` for a `0..=127`
+    /// argument, so a register value names the libsnd level it came from.
+    /// Read from the named `CDVol` entry (two `i32`), which equals the `Regs`
+    /// shadow.
+    pub fn cd_volume(&self) -> Option<(i16, i16)> {
+        let b = self.entry_bytes("CDVol")?;
+        if b.len() < 8 {
+            return None;
+        }
+        let l = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        let r = i32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+        Some((l as i16, r as i16))
+    }
+
+    /// Raw SPU register shadow file. Mednafen stores the 0x1F801C00..0x1F801E00
+    /// register window as 256 `u16` (512 bytes) under the `Regs` sub-entry,
+    /// indexed `Regs[(addr & 0x1FF) >> 1]`. Most named globals
+    /// ([`Self::spu_control`], voice on/off) are mirrored here; a few
+    /// registers (the per-voice reverb-enable mask `EON`) are *only* here.
+    pub fn regs(&self) -> Option<&'a [u8]> {
+        let b = self.entry_bytes("Regs")?;
+        if b.len() < 512 { None } else { Some(b) }
+    }
+
+    /// Read one 16-bit SPU register by its hardware address (e.g. `0x1F801D98`
+    /// for `EON` low). Returns `None` if `Regs` is absent.
+    fn reg_u16_at(&self, hw_addr: u32) -> Option<u16> {
+        let regs = self.regs()?;
+        let idx = ((hw_addr & 0x1FF) >> 1) as usize;
+        let off = idx * 2;
+        Some(u16::from_le_bytes([regs[off], regs[off + 1]]))
+    }
+
+    /// The 32 reverb coefficient/address registers (SPU `0x1F801DC0..0x1F801DFF`,
+    /// `Regs[224..256]`) in hardware order: `[dAPF1, dAPF2, vIIR, vCOMB1..4,
+    /// vWALL, vAPF1, vAPF2, mLSAME, mRSAME, mLCOMB1, mRCOMB1, mLCOMB2,
+    /// mRCOMB2, dLSAME, dRSAME, mLDIFF, mRDIFF, mLCOMB3, mRCOMB3, mLCOMB4,
+    /// mRCOMB4, dLDIFF, dRDIFF, mLAPF1, mRAPF1, mLAPF2, mRAPF2, vLIN, vRIN]`.
+    /// This is exactly the layout the engine's reverb presets store, so the
+    /// block can be matched directly against a known libspu preset to recover
+    /// which reverb *mode* a capture was running. `None` if `Regs` is absent.
+    pub fn reverb_registers(&self) -> Option<[u16; 32]> {
+        let regs = self.regs()?;
+        let mut out = [0u16; 32];
+        let base = 224 * 2; // SPU 0x1F801DC0
+        for (i, slot) in out.iter_mut().enumerate() {
+            let off = base + i * 2;
+            *slot = u16::from_le_bytes([regs[off], regs[off + 1]]);
+        }
+        Some(out)
+    }
+
+    /// Reverb work-area base address (`mBASE`, SPU `0x1F801DA2`), the SPU-RAM
+    /// offset where the reverb buffer starts. The work-area *size* is
+    /// `0x80000 - mBASE*8`; matching it against a preset's `size` corroborates
+    /// the coefficient-register preset match. Read from the named `ReverbWA`
+    /// entry. `None` if not captured.
+    pub fn reverb_work_area(&self) -> Option<u32> {
+        self.u32_entry("ReverbWA")
+    }
+
+    /// Per-voice reverb-send enable mask (`EON`, SPU registers
+    /// `0x1F801D98`/`0x1F801D9A`). Bit `n` set ⇒ voice `n`'s output is fed
+    /// into the reverb network (libspu `SpuSetVoiceReverb` / the engine's
+    /// [`engine_audio::spu::voice::Voice::set_reverb_send`]). This is the
+    /// routing the live engine never sets; reading it from a real cast tells
+    /// us which voices retail actually reverbs. Only the low 24 bits are
+    /// meaningful. `None` if the register shadow wasn't captured.
+    pub fn voice_reverb_mask(&self) -> Option<u32> {
+        let lo = self.reg_u16_at(0x1F80_1D98)? as u32;
+        let hi = self.reg_u16_at(0x1F80_1D9A)? as u32;
+        Some((lo | (hi << 16)) & 0x00FF_FFFF)
+    }
+
+    /// Reverb **output depth** `(vLOUT, vROUT)` - SPU registers
+    /// `0x1F801D84`/`0x1F801D86`, the wet-signal output volumes libspu's
+    /// `SpuSetReverbDepth` writes. These are *not* part of the 32-register
+    /// preset block ([`Self::reverb_registers`] starts at `0x1F801DC0`), so a
+    /// preset match says nothing about how loud the tank is mixed back in.
+    /// Signed Q15 in the SPU's usual voice-volume shape. `None` if the
+    /// register shadow wasn't captured.
+    pub fn reverb_output_volume(&self) -> Option<(i16, i16)> {
+        let l = self.reg_u16_at(0x1F80_1D84)? as i16;
+        let r = self.reg_u16_at(0x1F80_1D86)? as i16;
+        Some((l, r))
+    }
+
+    /// Master volume `(left, right)` as the current accumulated output of
+    /// mednafen's global sweep registers. Distinct from the libspu MVOL
+    /// write that *drives* the sweep target - this is the post-sweep value
+    /// the SPU multiplies the mix by on the cycle the save state captures.
+    pub fn master_volume(&self) -> Option<(i16, i16)> {
+        let l = self.global_sweep_current(0)?;
+        let r = self.global_sweep_current(1)?;
+        Some((sweep_to_register(l), sweep_to_register(r)))
+    }
+
+    // --- internal helpers ---------------------------------------------------
+
+    fn entry_bytes(&self, name: &str) -> Option<&'a [u8]> {
+        self.save.entry_bytes("SPU", name)
+    }
+
+    fn u32_entry(&self, name: &str) -> Option<u32> {
+        let b = self.entry_bytes(name)?;
+        if b.len() < 4 {
+            return None;
+        }
+        Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn u16_entry(&self, name: &str) -> Option<u16> {
+        let b = self.entry_bytes(name)?;
+        if b.len() < 2 {
+            return None;
+        }
+        Some(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn voice_u32(&self, idx: usize, suffix: &str) -> Option<u32> {
+        let name = format!("Voices[{idx}].{suffix}");
+        self.u32_entry(&name)
+    }
+
+    fn voice_u16(&self, idx: usize, suffix: &str) -> Option<u16> {
+        let name = format!("Voices[{idx}].{suffix}");
+        self.u16_entry(&name)
+    }
+
+    fn voice_u32_dotted(&self, idx: usize, suffix: &str) -> Option<u32> {
+        // Same as voice_u32 but written separately so call sites are
+        // self-documenting (the dotted variant is the ADSR nested struct).
+        let name = format!("Voices[{idx}].{suffix}");
+        self.u32_entry(&name)
+    }
+
+    fn voice_u16_dotted(&self, idx: usize, suffix: &str) -> Option<u16> {
+        let name = format!("Voices[{idx}].{suffix}");
+        self.u16_entry(&name)
+    }
+
+    fn voice_sweep_current(&self, voice_idx: usize, sweep_idx: usize) -> Option<i16> {
+        // Mednafen names the per-voice sweep entries with a parenthesised
+        // prefix: "(Voices[7].Sweep[0]).Current". The 2-byte "Current"
+        // field carries the most recent output of the sweep generator.
+        let name = format!("(Voices[{voice_idx}].Sweep[{sweep_idx}]).Current");
+        let b = self.entry_bytes(&name)?;
+        if b.len() < 2 {
+            return None;
+        }
+        Some(i16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn global_sweep_current(&self, idx: usize) -> Option<i16> {
+        let name = format!("(GlobalSweep[{idx}]).Current");
+        let b = self.entry_bytes(&name)?;
+        if b.len() < 2 {
+            return None;
+        }
+        Some(i16::from_le_bytes([b[0], b[1]]))
+    }
+}
+
+/// Mednafen sweep `Current` (Q15, `register << 1`) to register scale (Q14).
+fn sweep_to_register(current: i16) -> i16 {
+    current >> 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::container::{MDFN_HEADER_LEN, MDFN_MAGIC, SECTION_NAME_LEN};
+
+    fn build_save_with_spu(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (name, value) in entries {
+            body.push(name.len() as u8);
+            body.extend_from_slice(name.as_bytes());
+            body.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            body.extend_from_slice(value);
+        }
+        let mut name_buf = [0u8; SECTION_NAME_LEN];
+        name_buf[..3].copy_from_slice(b"SPU");
+        let mut payload = Vec::new();
+        payload.extend_from_slice(MDFN_MAGIC);
+        payload.extend_from_slice(&[0u8; MDFN_HEADER_LEN - MDFN_MAGIC.len()]);
+        payload.extend_from_slice(&name_buf);
+        payload.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&body);
+        payload
+    }
+
+    #[test]
+    fn spu_ram_bytes_returns_full_buffer() {
+        let mut ram = vec![0u8; SPU_RAM_BYTES];
+        ram[0x100] = 0xAB;
+        ram[0x101] = 0xCD;
+        let payload = build_save_with_spu(&[("SPURAM", ram)]);
+        let save = SaveState::from_decompressed(payload).unwrap();
+        let spu = PsxSpu::new(&save);
+        let bytes = spu.spu_ram_bytes().unwrap();
+        assert_eq!(bytes.len(), SPU_RAM_BYTES);
+        assert_eq!(bytes[0x100], 0xAB);
+        assert_eq!(bytes[0x101], 0xCD);
+    }
+
+    #[test]
+    fn spu_ram_rejects_wrong_size() {
+        let ram = vec![0u8; SPU_RAM_BYTES - 1];
+        let payload = build_save_with_spu(&[("SPURAM", ram)]);
+        let save = SaveState::from_decompressed(payload).unwrap();
+        assert!(PsxSpu::new(&save).spu_ram_bytes().is_none());
+    }
+
+    #[test]
+    fn voice_state_reads_known_subset() {
+        let payload = build_save_with_spu(&[
+            ("Voices[3].StartAddr", 0x1000u32.to_le_bytes().to_vec()),
+            ("Voices[3].CurAddr", 0x10A0u32.to_le_bytes().to_vec()),
+            ("Voices[3].LoopAddr", 0x1080u32.to_le_bytes().to_vec()),
+            ("Voices[3].Pitch", 0x1000u16.to_le_bytes().to_vec()),
+            ("Voices[3].CurPhase", 0x0800u32.to_le_bytes().to_vec()),
+            ("Voices[3].ADSR.Phase", 1u32.to_le_bytes().to_vec()),
+            ("Voices[3].ADSR.EnvLevel", 0x4000u16.to_le_bytes().to_vec()),
+            (
+                "Voices[3].ADSRControl",
+                0xDEADBEEFu32.to_le_bytes().to_vec(),
+            ),
+            (
+                "(Voices[3].Sweep[0]).Current",
+                0x3FFFi16.to_le_bytes().to_vec(),
+            ),
+            (
+                "(Voices[3].Sweep[1]).Current",
+                (-0x100i16).to_le_bytes().to_vec(),
+            ),
+        ]);
+        let save = SaveState::from_decompressed(payload).unwrap();
+        let spu = PsxSpu::new(&save);
+        let v = spu.voice_state(3).unwrap();
+        assert_eq!(v.start_addr, Some(0x1000));
+        assert_eq!(v.cur_addr, Some(0x10A0));
+        assert_eq!(v.loop_addr, Some(0x1080));
+        assert_eq!(v.pitch, Some(0x1000));
+        assert_eq!(v.cur_phase, Some(0x0800));
+        assert_eq!(v.adsr_phase, Some(1));
+        assert_eq!(v.adsr_env_level, Some(0x4000));
+        assert_eq!(v.adsr_control, Some(0xDEADBEEF));
+        // Register scale: mednafen's `Current` is the register doubled.
+        assert_eq!(v.vol_left, Some(0x1FFF));
+        assert_eq!(v.vol_right, Some(-0x80));
+        assert!(v.is_active());
+    }
+
+    #[test]
+    fn voice_state_missing_returns_none() {
+        let payload = build_save_with_spu(&[]);
+        let save = SaveState::from_decompressed(payload).unwrap();
+        assert!(PsxSpu::new(&save).voice_state(0).is_none());
+    }
+
+    #[test]
+    fn voice_state_index_out_of_range_returns_none() {
+        let payload =
+            build_save_with_spu(&[("Voices[0].StartAddr", 0x1000u32.to_le_bytes().to_vec())]);
+        let save = SaveState::from_decompressed(payload).unwrap();
+        assert!(PsxSpu::new(&save).voice_state(NUM_VOICES).is_none());
+    }
+
+    #[test]
+    fn voice_state_drained_envelope_is_inaudible() {
+        // A released voice whose envelope has run to zero: mednafen leaves
+        // it parked in phase 3 forever, so only the level says it is done.
+        let payload = build_save_with_spu(&[
+            ("Voices[5].ADSR.Phase", 3u32.to_le_bytes().to_vec()),
+            ("Voices[5].ADSR.EnvLevel", 0u16.to_le_bytes().to_vec()),
+        ]);
+        let save = SaveState::from_decompressed(payload).unwrap();
+        let v = PsxSpu::new(&save).voice_state(5).unwrap();
+        assert_eq!(v.adsr_phase, Some(3));
+        assert!(!v.is_active());
+    }
+
+    #[test]
+    fn voice_state_attacking_voice_is_audible() {
+        // The mirror case: phase 0 is ATTACK, not "off", so a voice that
+        // just keyed on is audible even though the phase word is zero.
+        let payload = build_save_with_spu(&[
+            ("Voices[6].ADSR.Phase", 0u32.to_le_bytes().to_vec()),
+            ("Voices[6].ADSR.EnvLevel", 0x0200u16.to_le_bytes().to_vec()),
+        ]);
+        let save = SaveState::from_decompressed(payload).unwrap();
+        let v = PsxSpu::new(&save).voice_state(6).unwrap();
+        assert_eq!(v.adsr_phase, Some(0));
+        assert!(v.is_active());
+    }
+
+    #[test]
+    fn voices_array_has_24_entries() {
+        let payload = build_save_with_spu(&[]);
+        let save = SaveState::from_decompressed(payload).unwrap();
+        let voices = PsxSpu::new(&save).voices();
+        assert_eq!(voices.len(), NUM_VOICES);
+        assert!(voices.iter().all(|v| v.adsr_phase.is_none()));
+    }
+
+    #[test]
+    fn global_registers_round_trip() {
+        let payload = build_save_with_spu(&[
+            ("VoiceOn", 0x0000_0007u32.to_le_bytes().to_vec()),
+            ("VoiceOff", 0x0000_0001u32.to_le_bytes().to_vec()),
+            ("BlockEnd", 0x0000_0100u32.to_le_bytes().to_vec()),
+            ("Reverb_Mode", 7u32.to_le_bytes().to_vec()),
+            ("SPUControl", 0xC000u16.to_le_bytes().to_vec()),
+            ("(GlobalSweep[0]).Current", 0x3F00i16.to_le_bytes().to_vec()),
+            ("(GlobalSweep[1]).Current", 0x3F00i16.to_le_bytes().to_vec()),
+        ]);
+        let save = SaveState::from_decompressed(payload).unwrap();
+        let spu = PsxSpu::new(&save);
+        assert_eq!(spu.voice_on_mask(), Some(0x0000_0007));
+        assert_eq!(spu.voice_off_mask(), Some(0x0000_0001));
+        assert_eq!(spu.block_end_mask(), Some(0x0000_0100));
+        assert_eq!(spu.reverb_mode(), Some(7));
+        assert_eq!(spu.spu_control(), Some(0xC000));
+        assert_eq!(spu.master_volume(), Some((0x1F80, 0x1F80)));
+    }
+
+    #[test]
+    fn voice_reverb_mask_reads_eon_from_regs() {
+        // EON low (0x1F801D98) = Regs[204], high (0x1F801D9A) = Regs[205].
+        // SPUControl shadow (0x1F801DAA) = Regs[213]; verify the index math
+        // by also checking reverb_master_enabled (SPUCNT bit 7).
+        let mut regs = vec![0u8; 512];
+        // voices 1 and 3 reverb-enabled (low half), voice 16 (high half).
+        regs[204 * 2..204 * 2 + 2].copy_from_slice(&0x000Au16.to_le_bytes());
+        regs[205 * 2..205 * 2 + 2].copy_from_slice(&0x0001u16.to_le_bytes());
+        let payload = build_save_with_spu(&[
+            ("Regs", regs),
+            ("SPUControl", 0xC080u16.to_le_bytes().to_vec()),
+        ]);
+        let save = SaveState::from_decompressed(payload).unwrap();
+        let spu = PsxSpu::new(&save);
+        assert_eq!(
+            spu.voice_reverb_mask(),
+            Some((1 << 1) | (1 << 3) | (1 << 16))
+        );
+        assert_eq!(spu.reverb_master_enabled(), Some(true));
+    }
+
+    #[test]
+    fn reverb_master_disabled_when_bit_clear() {
+        let payload = build_save_with_spu(&[("SPUControl", 0x4000u16.to_le_bytes().to_vec())]);
+        let save = SaveState::from_decompressed(payload).unwrap();
+        assert_eq!(PsxSpu::new(&save).reverb_master_enabled(), Some(false));
+    }
+
+    /// The depth registers sit at `0x1F801D84`/`0x86` = `Regs[194]`/`[195]`,
+    /// well below the preset block that starts at `Regs[224]` - so a
+    /// coefficient match cannot be standing in for them.
+    #[test]
+    fn reverb_output_volume_reads_the_depth_registers() {
+        let mut regs = vec![0u8; 512];
+        regs[194 * 2..194 * 2 + 2].copy_from_slice(&0x3264u16.to_le_bytes());
+        regs[195 * 2..195 * 2 + 2].copy_from_slice(&0x3264u16.to_le_bytes());
+        // A preset-block word, to show the two windows do not overlap.
+        regs[224 * 2..224 * 2 + 2].copy_from_slice(&0x00E3u16.to_le_bytes());
+        let payload = build_save_with_spu(&[("Regs", regs)]);
+        let save = SaveState::from_decompressed(payload).unwrap();
+        let spu = PsxSpu::new(&save);
+        assert_eq!(spu.reverb_output_volume(), Some((0x3264, 0x3264)));
+        assert_eq!(spu.reverb_registers().unwrap()[0], 0x00E3);
+    }
+
+    #[test]
+    fn reverb_output_volume_absent_regs_returns_none() {
+        let payload = build_save_with_spu(&[("SPUControl", 0xC080u16.to_le_bytes().to_vec())]);
+        let save = SaveState::from_decompressed(payload).unwrap();
+        assert!(PsxSpu::new(&save).reverb_output_volume().is_none());
+    }
+
+    #[test]
+    fn voice_reverb_mask_absent_regs_returns_none() {
+        let payload = build_save_with_spu(&[("SPUControl", 0xC080u16.to_le_bytes().to_vec())]);
+        let save = SaveState::from_decompressed(payload).unwrap();
+        assert!(PsxSpu::new(&save).voice_reverb_mask().is_none());
+    }
+
+    #[test]
+    fn master_volume_partial_returns_none() {
+        // Left-only sweep entry → master_volume can't form a pair, returns
+        // None. Distinct from "both halves zero".
+        let payload =
+            build_save_with_spu(&[("(GlobalSweep[0]).Current", 0x3F00i16.to_le_bytes().to_vec())]);
+        let save = SaveState::from_decompressed(payload).unwrap();
+        assert!(PsxSpu::new(&save).master_volume().is_none());
+    }
+}

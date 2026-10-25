@@ -1,0 +1,375 @@
+use super::*;
+use legaia_engine_mode::mode::SceneMode;
+
+// ---------------------------------------------------------------------------
+// Field-NPC motion (motion-VM wiring) + prop walk-touch dispatch
+// ---------------------------------------------------------------------------
+
+/// Tick the world until `n` retail field frames have elapsed. NPC glide legs
+/// step on the retail frame clock (`field_frame_step == 1`, the gate on
+/// [`World::tick_field_npc_motions`]), so motion assertions count frames
+/// rather than ticks.
+///
+/// Under the 1:1 denomination a sim tick *is* a retail frame, so this now
+/// runs exactly `n` ticks - but it stays written in frames because that is
+/// the unit the glide speed is denominated in (`dt = _DAT_1f800393` at 1 per
+/// call), and a future host that oversampled would need it.
+///
+/// The legs move on the game-frame grid, `speed * frame step` a game frame;
+/// the tests below run at frame step `1` ([`one_vsync_frames`]) so a game
+/// frame is one tick and the leg's per-frame step is its base speed.
+fn tick_retail_frames(world: &mut World, n: usize) {
+    let mut fired = 0;
+    while fired < n {
+        let _ = world.tick();
+        if world.clock.display_frame_step == 1 {
+            fired += 1;
+        }
+    }
+}
+
+/// Pin the frame step at `1`: every tick is a game frame.
+fn one_vsync_frames(world: &mut World) {
+    world.set_frame_step_floor(1);
+    world.seed_frame_step(1);
+}
+
+#[test]
+fn scripted_field_npc_leg_walks_through_motion_vm_and_ends_where_it_lands() {
+    let mut world = World::new();
+    one_vsync_frames(&mut world);
+    world.mode = SceneMode::Field;
+    world.npcs.positions.insert(1, (1000, 1000));
+
+    // Nothing started: the NPC rests at its anchor, liveliness flag or not
+    // (there is no autonomous leg - a placement's own `4C 51` ops are seats).
+    world.npcs.animate = true;
+    for _ in 0..20 {
+        let _ = world.tick();
+    }
+    assert_eq!(world.npcs.positions.get(&1), Some(&(1000, 1000)));
+
+    // A script-started leg steps one motion-VM step per retail frame
+    // (FIELD_NPC_MOTION_SPEED = 8 units), clamps at the target and retires.
+    world.npcs.animate = false;
+    assert!(world.start_field_npc_motion(1, 1300, 1000));
+    tick_retail_frames(&mut world, 1);
+    assert_eq!(
+        world.npcs.positions.get(&1),
+        Some(&(1008, 1000)),
+        "one retail frame = one motion-VM step of FIELD_NPC_MOTION_SPEED units"
+    );
+    tick_retail_frames(&mut world, 37);
+    assert_eq!(
+        world.npcs.positions.get(&1),
+        Some(&(1300, 1000)),
+        "the leg clamps at the target (300 units / 8 per frame)"
+    );
+    tick_retail_frames(&mut world, 20);
+    assert_eq!(
+        world.npcs.positions.get(&1),
+        Some(&(1300, 1000)),
+        "a scripted leg ends where it lands - no loop back"
+    );
+    assert!(world.npcs.motions.is_empty());
+}
+
+#[test]
+fn moving_field_npc_collision_box_follows_live_position() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.npcs.solid = true;
+    world.npcs.positions.insert(1, (1000, 1000));
+
+    // Anchor blocks before the walk: the X+ probe from 102 out lands 38
+    // inside the strict ±40 box (104 out reads exactly 40 = clear).
+    assert!(world.field_actor_dir_blocked(1000 - 102, 1000, 3));
+
+    assert!(world.start_field_npc_motion(1, 1300, 1000));
+    tick_retail_frames(&mut world, 60);
+    assert_eq!(world.npcs.positions.get(&1), Some(&(1300, 1000)));
+    assert!(world.npcs.motions.is_empty(), "the leg retires on arrival");
+
+    // The ±40 moving-actor box follows the LIVE position: the abandoned
+    // anchor no longer blocks, the new position does.
+    assert!(!world.field_actor_dir_blocked(1000 - 102, 1000, 3));
+    assert!(world.field_actor_dir_blocked(1300 - 102, 1000, 3));
+}
+
+#[test]
+fn scripted_legs_run_through_a_dialogue() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.npcs.positions.insert(2, (2000, 2000));
+
+    // A dialogue is up: a script-started leg (the interaction partner's own
+    // prologue walk) keeps stepping - it is the interaction's choreography.
+    world.dialog.current = Some(DialogRequest {
+        text_id: 0,
+        inline: vec![],
+        world_x: 0,
+        world_z: 0,
+        depth_id: 0,
+    });
+    assert!(world.start_field_npc_motion(2, 2080, 2000));
+    tick_retail_frames(&mut world, 10);
+    assert_eq!(
+        world.npcs.positions.get(&2),
+        Some(&(2080, 2000)),
+        "scripted leg runs through the dialogue"
+    );
+}
+
+/// The walk kernel writes the heading **once per leg** (plus once per
+/// step-direction change), so a facing another writer poses mid-leg - the
+/// interact face-the-speaker arctan bearing, a scripted `0x38` pose -
+/// survives while the leg keeps stepping in the same direction, instead of
+/// being re-snapped to the compass every moving frame.
+#[test]
+fn walk_leg_heading_write_is_once_per_leg_not_per_frame() {
+    let mut world = World::new();
+    one_vsync_frames(&mut world);
+    world.mode = SceneMode::Field;
+    world.npcs.positions.insert(2, (2000, 2000));
+    assert!(world.start_field_npc_motion(2, 2200, 2000));
+    let _ = world.tick();
+    assert_eq!(
+        world.npcs.headings.get(&2),
+        Some(&0x400),
+        "leg start writes the +X compass heading"
+    );
+    // Mid-leg, another writer poses the NPC onto a NON-compass bearing (the
+    // interact face-the-speaker shape: arctan endpoints like 1075 are not
+    // compass-aligned and must survive).
+    world.npcs.headings.insert(2, 1075);
+    let _ = world.tick();
+    assert!(world.npcs.motions.contains_key(&2), "leg still in flight");
+    assert_eq!(
+        world.npcs.headings.get(&2),
+        Some(&1075),
+        "a straight leg does not re-snap an interleaved facing write"
+    );
+}
+
+#[test]
+fn start_field_npc_motion_requires_installed_slot() {
+    // The retail start kernel's actor-list search miss returns 0: a slot
+    // with no installed placement starts nothing.
+    let mut world = World::new();
+    assert!(!world.start_field_npc_motion(9, 100, 100));
+    assert!(world.npcs.motions.is_empty());
+}
+
+/// Body contact with a minigame cabinet posts the interact and **nothing
+/// else** - it does not enter the minigame, and it does not warp.
+///
+/// `WalkTouchEvent::Warp` is by construction only ever a mode-24 minigame
+/// `sub_id` (`is_genuine_warp` gates the decoded `0x3E`'s `op0` to
+/// `100..=106`). Retail's contact kernel `FUN_801d5b5c` resumes the
+/// placement's *script*, and a cabinet's script is a coin compare into a
+/// confirm dialogue - only the taken arm reaches the `0x3E`. Executing the
+/// structurally-decoded warp on contact skipped both, and because the contact
+/// box is +/-`FIELD_PROP_BOX_HALF` and koin1's casino NPCs stand inside their
+/// neighbouring cabinets' boxes, walking up to an NPC entered a minigame no
+/// shipped host could then leave.
+///
+/// Two things are pinned here, and they fail for different reasons: the
+/// contact still posts exactly one `FieldInteract` (the script resume retail
+/// *does* model), and neither warp channel is touched. The entry lives on the
+/// button probe instead; the field-VM side is unchanged and pinned by
+/// `field_op_3e_warp_arms_the_minigame_door_not_a_scene_change`.
+#[test]
+fn walk_touch_warp_posts_the_interact_but_does_not_enter_the_minigame() {
+    use legaia_engine_field::man_field_scripts::WalkTouchEvent;
+
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    world.actors[0].move_state.world_x = 1000;
+    world.actors[0].move_state.world_z = 2000;
+    world
+        .props
+        .walk_touch
+        .insert(5, ((1200, 2000), WalkTouchEvent::Warp { sub_id: 3 }));
+
+    // Baseline: standing outside the ±80 contact box posts nothing.
+    let _ = world.drain_field_events();
+    for _ in 0..3 {
+        let _ = world.tick();
+    }
+    assert!(world.minigames.pending_warp.is_none());
+    assert!(world.pending_scene_transition.is_none());
+    assert!(world.drain_field_events().is_empty());
+
+    // Hold screen-right (camera azimuth 0: world X+) into the placement.
+    world.set_pad(input::PadButton::Right.mask());
+    for _ in 0..25 {
+        let _ = world.tick();
+    }
+    assert_eq!(
+        world.minigames.pending_warp, None,
+        "brushing a cabinet must not enter its minigame - retail resumes the \
+         record's script (coin compare + confirm), it does not run the \
+         script's terminal warp"
+    );
+    assert_eq!(
+        world.pending_scene_transition, None,
+        "the door-warp sub-id must not reach the map-id resolver either"
+    );
+    assert_eq!(
+        world.mode,
+        SceneMode::Field,
+        "contact leaves the player in the field"
+    );
+    let events = world.drain_field_events();
+    let touches: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, FieldEvent::FieldInteract { slot: 5, .. }))
+        .collect();
+    assert_eq!(touches.len(), 1, "one post per contact (edge latch)");
+
+    // Still inside the box: no re-post while the contact persists.
+    for _ in 0..5 {
+        let _ = world.tick();
+    }
+    assert!(
+        world
+            .drain_field_events()
+            .iter()
+            .all(|e| !matches!(e, FieldEvent::FieldInteract { .. })),
+        "sustained contact does not re-post"
+    );
+}
+
+#[test]
+fn walk_touch_player_moveto_teleports_player() {
+    use legaia_engine_field::man_field_scripts::WalkTouchEvent;
+
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    world.actors[0].move_state.world_x = 1000;
+    world.actors[0].move_state.world_z = 2000;
+    world.props.walk_touch.insert(
+        7,
+        (
+            (1150, 2000),
+            WalkTouchEvent::PlayerMoveTo {
+                world_x: 5000,
+                world_z: 6000,
+                facing: None,
+            },
+        ),
+    );
+
+    world.set_pad(input::PadButton::Right.mask());
+    for _ in 0..30 {
+        let _ = world.tick();
+        // The snap is the contact tick's last write; stop before the next
+        // walk tick moves the player again.
+        if world.actors[0].move_state.world_x >= 4000 {
+            break;
+        }
+    }
+    let ms = &world.actors[0].move_state;
+    assert_eq!(
+        (ms.world_x, ms.world_z),
+        (5000, 6000),
+        "touching the placement snaps the player to the decoded coords"
+    );
+    assert!(
+        world.drain_field_events().iter().any(|e| matches!(
+            e,
+            FieldEvent::MoveTo {
+                world_x: 5000,
+                world_z: 6000,
+                is_player: true
+            }
+        )),
+        "the teleport surfaces as a player MoveTo event"
+    );
+    // One more walking tick: the touch dispatch re-runs (it lives on the
+    // locomotion step) with the player now far outside the contact box, so
+    // the edge latch releases for the next approach.
+    let _ = world.tick();
+    assert!(
+        world.props.active_walk_touch.is_none(),
+        "the teleport leaves the contact box, releasing the latch"
+    );
+}
+
+#[test]
+fn interaction_prologue_npc_run_seats_the_interacted_npc() {
+    // A synthetic interaction record: prologue = one `0x4C 0x51` NPC run to
+    // tile (12, 10), facing index 2, then a text segment. Retail's case-5
+    // sub-1 body stores the tile straight into `+0x14`/`+0x18`
+    // (`0x801E1880` / `0x801E1898`) and arms no walk kernel, so the
+    // interacted NPC is SEATED on the tile on the frame the op runs - it
+    // never glides there.
+    let target_x = 12i16 * 0x80 + 0x40;
+    let target_z = 10i16 * 0x80 + 0x40;
+    let mut body = vec![0x4C, 0x51, 12, 10, 2, 5];
+    let first_segment = body.len();
+    body.extend_from_slice(&[0x1F, b'h', b'i', 0x00, 0x00]);
+
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.toggles.use_vm_dialogue = true;
+    world.npcs.positions.insert(3, (target_x - 80, target_z));
+    world.npcs.dialog.insert(3, body[first_segment..].to_vec());
+    world.npcs.dialog_prologue.insert(
+        3,
+        legaia_engine_field::man_field_scripts::InlineDialogPrologue {
+            body,
+            entry_pc: 0,
+            first_segment,
+        },
+    );
+
+    world.trigger_field_interact(0, 3);
+    let start = (target_x - 80, target_z);
+    let mut seen = vec![start];
+    for _ in 0..15 {
+        tick_retail_frames(&mut world, 1);
+        let p = *world.npcs.positions.get(&3).unwrap();
+        if seen.last() != Some(&p) {
+            seen.push(p);
+        }
+    }
+    assert_eq!(
+        seen,
+        vec![start, (target_x, target_z)],
+        "the prologue's 0x4C 0x51 seats the NPC in one jump, no intermediate glide frames"
+    );
+    assert!(world.npcs.motions.is_empty(), "no walk leg is armed");
+    assert_eq!(
+        world.npcs.headings.get(&3).copied(),
+        legaia_engine_field::man_field_scripts::facing_index_to_engine_heading(2),
+        "operand byte +3's low nibble is the LUT facing"
+    );
+}
+
+/// On a frame step of `2` a walk-to-tile leg moves twice its base speed on
+/// each game frame and not at all on the vsync between: `0x47`'s spend is
+/// `0x80 * DAT_1F800393 / (4 << bits)` a game frame.
+#[test]
+fn a_walk_to_tile_leg_moves_on_the_game_frame_grid() {
+    let mut world = World::new();
+    world.set_frame_step_floor(2);
+    world.seed_frame_step(2);
+    world.mode = SceneMode::Field;
+    world.npcs.positions.insert(1, (1000, 1000));
+    assert!(world.start_field_npc_motion(1, 1300, 1000));
+    let mut xs = Vec::new();
+    for _ in 0..6 {
+        let _ = world.tick();
+        xs.push(world.npcs.positions.get(&1).map(|p| p.0).unwrap_or(0));
+    }
+    // Moves come in steps of 16 (8 a vsync, two vsyncs a frame) and
+    // alternate with vsyncs that move nothing.
+    let deltas: Vec<i16> = std::iter::once(xs[0] - 1000)
+        .chain(xs.windows(2).map(|w| w[1] - w[0]))
+        .collect();
+    assert!(deltas.iter().all(|&d| d == 0 || d == 16), "{deltas:?}");
+    assert_eq!(deltas.iter().filter(|&&d| d == 16).count(), 3, "{deltas:?}");
+}

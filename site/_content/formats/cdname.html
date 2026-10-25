@@ -1,0 +1,223 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">formats</a> &middot; cdname.txt - entry name map</div>
+  <h1>CDNAME.TXT - entry name map <span class="tag tag-done">Confirmed</span></h1>
+  <p class="lede">The developers left a plain-text file at the root of the disc: a list of C-style <code>#define</code> lines that give human-readable names - <code>town01</code>, <code>battle_data</code>, <code>music_01</code> - to the numbered entries of <code>PROT.DAT</code>, the disc's single big asset archive. It is the closest thing the disc has to a directory listing, and the game itself reads it at boot. It also hides a numbering trap: its numbers count entries the way the game does, which is two higher than the way this project's extraction does.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Where</dt><dd><code>CDNAME.TXT</code> at the disc root; ASCII, one <code>#define name N</code> per line. Retail loads it into a 16-byte-record table at RAM <code>0x80088758</code></dd>
+    <dt>Numbering</dt><dd><code>N</code> is a raw TOC index; the content lives at extraction entry <code>N &minus; 2</code></dd>
+    <dt>Parser</dt><dd><code>crates/prot/src/cdname.rs</code>: <code>parse_str</code> (tolerant), <code>parse_retail_str</code> / <code>retail_name_table</code> (byte-exact), <code>block_for_extraction_index</code> (applies the &minus;2 rule)</dd>
+    <dt>Confidence</dt><dd>Confirmed - loader traced; the shift is pinned by four retail loader constants and the v12-sidecar placement (<a href="#how-we-know">how we know</a>)</dd>
+    <dt>Used by</dt><dd><a href="../subsystems/asset-loader.html">Asset loader</a>, <code>prot-extract</code> filenames, every scene window in the engine, <a href="../subsystems/boot.html">boot</a></dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="overview">
+  <h2>What the file says</h2>
+  <p>The file looks like the top of a C header:</p>
+<pre><code>#define init_data 0
+#define gameover_data 1
+#define town01 3
+#define town0b 12
+#define town0c 21
+...
+#define vab_01 1072</code></pre>
+  <p>Each line names a <em>block</em> of consecutive archive entries - usually one scene (a town, a dungeon room, a menu) plus the handful of entries reserved for its assets. Two rules do all the work:</p>
+  <ul class="bullets">
+    <li><strong>Names inherit forward.</strong> <code>#define name N</code> starts a block; every entry after <code>N</code> belongs to it until the next define. Entry 11 is <code>town01</code> because <code>town0b</code> only starts at 12.</li>
+    <li><strong>The numbers are the game's index space.</strong> The game counts raw TOC words, header included; extraction counts payload entries, which start two words later. So <code>#define name N</code> names extraction entry <code>N &minus; 2</code>.</li>
+  </ul>
+  <p>Most blocks reserve 6-8 slots per scene. Unused slots hold the one-sector <a href="pochi.html">pochi filler</a>, never a real asset; the <code>edstati3</code> block is almost entirely filler.</p>
+</section>
+
+<section class="doc-section" id="numbering-space">
+  <h2>Numbering space (the &minus;2 correction)</h2>
+  <p>The boot loader copies <code>PROT.DAT</code> verbatim - 8-byte header included - into RAM at <code>0x801C70F0</code> (<a href="prot.html#in-ram-toc">PROT TOC</a>), so <strong>raw index = extraction index + 2</strong>. The extractor's <code>NNNN_&lt;name&gt;.BIN</code> filenames apply define numbers as extraction indices directly, and are kept that way for stability - so a filename label is systematically two slots early.</p>
+  <figure class="overlay-strip">
+    <svg viewBox="0 0 760 210" width="100%" style="max-width:760px" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three index spaces side by side: the define number, the raw in-RAM TOC index it equals, and the extraction entry two lower where the content lives">
+      <style>
+        .cd-box  { fill: var(--bg-raised); stroke: var(--accent); stroke-width: 1.3; }
+        .cd-hdr  { fill: var(--bg-raised); stroke: var(--border); stroke-width: 1.1; stroke-dasharray: 3 3; }
+        .cd-lab  { font: 12px sans-serif; fill: currentColor; }
+        .cd-mono { font: 11px monospace; fill: var(--text-muted); }
+        .cd-line { stroke: var(--border); stroke-width: 1.2; }
+      </style>
+      <!-- row labels -->
+      <text class="cd-lab" x="10" y="52">CDNAME.TXT</text>
+      <text class="cd-lab" x="10" y="112">raw TOC (RAM)</text>
+      <text class="cd-lab" x="10" y="172">extraction file</text>
+      <!-- raw TOC row: header 2 words + entries 3..6 ; columns 80px from x=150 -->
+      <rect class="cd-hdr" x="150" y="90" width="80" height="34"/>
+      <rect class="cd-hdr" x="230" y="90" width="80" height="34"/>
+      <rect class="cd-box" x="310" y="90" width="80" height="34"/>
+      <rect class="cd-box" x="390" y="90" width="80" height="34"/>
+      <rect class="cd-box" x="470" y="90" width="80" height="34"/>
+      <rect class="cd-box" x="550" y="90" width="80" height="34"/>
+      <rect class="cd-box" x="630" y="90" width="80" height="34"/>
+      <text class="cd-mono" x="190" y="111" text-anchor="middle">hdr 0</text>
+      <text class="cd-mono" x="270" y="111" text-anchor="middle">hdr 1</text>
+      <text class="cd-mono" x="350" y="111" text-anchor="middle">raw 3</text>
+      <text class="cd-mono" x="430" y="111" text-anchor="middle">raw 4</text>
+      <text class="cd-mono" x="510" y="111" text-anchor="middle">raw 5</text>
+      <text class="cd-mono" x="590" y="111" text-anchor="middle">...</text>
+      <text class="cd-mono" x="670" y="111" text-anchor="middle">raw 12</text>
+      <!-- define row -->
+      <rect class="cd-box" x="310" y="30" width="240" height="34"/>
+      <rect class="cd-box" x="630" y="30" width="80" height="34"/>
+      <text class="cd-mono" x="430" y="51" text-anchor="middle">#define town01 3</text>
+      <text class="cd-mono" x="670" y="51" text-anchor="middle">town0b 12</text>
+      <!-- extraction row -->
+      <rect class="cd-box" x="310" y="150" width="80" height="34"/>
+      <rect class="cd-box" x="390" y="150" width="80" height="34"/>
+      <rect class="cd-box" x="470" y="150" width="80" height="34"/>
+      <rect class="cd-box" x="550" y="150" width="80" height="34"/>
+      <rect class="cd-box" x="630" y="150" width="80" height="34"/>
+      <text class="cd-mono" x="350" y="171" text-anchor="middle">0001</text>
+      <text class="cd-mono" x="430" y="171" text-anchor="middle">0002</text>
+      <text class="cd-mono" x="510" y="171" text-anchor="middle">0003</text>
+      <text class="cd-mono" x="590" y="171" text-anchor="middle">...</text>
+      <text class="cd-mono" x="670" y="171" text-anchor="middle">0010</text>
+      <!-- connectors -->
+      <line class="cd-line" x1="350" y1="64" x2="350" y2="90"/>
+      <line class="cd-line" x1="670" y1="64" x2="670" y2="90"/>
+      <line class="cd-line" x1="350" y1="124" x2="350" y2="150"/>
+      <line class="cd-line" x1="670" y1="124" x2="670" y2="150"/>
+      <text class="cd-mono" x="350" y="200" text-anchor="middle">town01 .MAP</text>
+      <text class="cd-mono" x="670" y="200" text-anchor="middle">town0b .MAP</text>
+    </svg>
+    <figcaption>The two header words the game counts are the whole shift: define 3 is raw index 3 is extraction file 0001.</figcaption>
+  </figure>
+  <table>
+    <thead><tr><th><code>#define</code></th><th>Raw TOC index</th><th>Extraction entry</th><th>Content</th></tr></thead>
+    <tbody>
+      <tr><td><code>town01 3</code></td><td>3</td><td>0001</td><td><code>town01</code> slot 0 - the scene's <code>.MAP</code></td></tr>
+      <tr><td>(inherits)</td><td>4</td><td>0002</td><td>slot 1 - the <a href="scene-v12-table.html">v12 trigger sidecar</a></td></tr>
+      <tr><td>(inherits)</td><td>5 .. 11</td><td>0003 .. 0009</td><td>slots 2..8 (prescript, 7-asset table, assets)</td></tr>
+      <tr><td><code>town0b 12</code></td><td>12</td><td>0010</td><td><code>town0b</code> slot 0 - filename still says <code>0010_town01.BIN</code></td></tr>
+    </tbody>
+  </table>
+  <p>A label is a hint, not a verdict. When a shift-corrected block name still conflicts with the bytes, trust the bytes: the leading magic and the loader-call constant in the executable.</p>
+</section>
+
+<section class="doc-section" id="relabelings">
+  <h2>What the dev names really cover</h2>
+  <p>With the shift applied the developers' names are accurate far more often than not. The entries most often misread from their filename:</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Extraction</th><th>Filename says</th><th>Retail block (content)</th></tr></thead>
+    <tbody>
+      <tr><td>raw 0..1</td><td>(unindexed)</td><td><code>init_data</code> (the boot system UI with the menu-glyph atlas) + <code>gameover_data</code> (the GAME OVER screen's art) - <a href="tim-pack.html#boot-resident-system-ui-instance-raw-toc-entries-0-and-1">raw entries 0 and 1</a></td></tr>
+      <tr><td>0863..0866</td><td><code>edstati3</code>/<code>battle_data</code></td><td><code>battle_data</code> - the four <a href="battle-data-pack.html">player battle files</a></td></tr>
+      <tr><td>0867</td><td><code>battle_data</code></td><td><code>monster_data</code> - the monster stat / mesh / animation archive</td></tr>
+      <tr><td>0870..0873</td><td><code>sound_data</code>/<code>befect_data</code></td><td><code>befect_data</code> - <a href="effect.html">effect bundles</a> (<code>etim</code>, <code>etmd</code>+<code>vdf</code>, billboards, <code>efect.dat</code>)</td></tr>
+      <tr><td>0874</td><td><code>befect_data</code></td><td><code>player_data</code> - the <em>field</em> <a href="character-mesh.html">character-mesh</a> pack</td></tr>
+      <tr><td>0891</td><td><code>level_up</code></td><td><code>monster_se</code> - <code>monster.snd</code>, the 206-bank monster sound archive</td></tr>
+      <tr><td>0892</td><td><code>level_up</code></td><td><code>card_data</code> - the memory-card screen's JIS X 0208 level-1 kanji font, a two-member pack of 4bpp TIMs (<a href="data-field.html#card-font-pack">data-field</a>)</td></tr>
+      <tr><td>0893..0894</td><td><code>monster_se</code>/<code>card_data</code></td><td><code>bat_back_dat</code> - <code>summon.dat</code> / <code>readef.DAT</code> (<a href="summon-readef.html">summon-readef</a>)</td></tr>
+      <tr><td>0895..0969</td><td><code>bat_back_dat</code>/<code>xxx_dat</code></td><td><code>xxx_dat</code> - slot 0 is the boot <code>init.pak</code>; then the <a href="mips-overlay.html">overlay code blobs</a></td></tr>
+      <tr><td>0970..0971</td><td><code>xxx_dat</code></td><td><code>move_program_no</code> - <strong>mov</strong>ie program table (<a href="str-fmv-table.html">STR FMV table</a>), not Tactical Arts</td></tr>
+      <tr><td>0972..0977</td><td><code>move_program_no</code>/<code>other_game</code></td><td><code>other_game</code> - casino / minigame overlays</td></tr>
+      <tr><td>1070..1192</td><td><code>music_01</code>/<code>vab_01</code></td><td><code>vab_01</code> - every entry a <a href="vab.html">VAB</a> bank</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The <code>music_01</code> block's bank map is <em>piecewise</em>: BGM id <code>2000+i</code> is extraction <code>988+i</code> for <code>i &le; 67</code> and <code>990+i</code> for <code>i &ge; 68</code> (<a href="../reference/music-tracks.html">music tracks</a>).</p>
+  <details class="disclosure">
+    <summary>Caveats that do not contradict the shift</summary>
+    <div class="disclosure-body">
+      <ul class="bullets">
+        <li><code>level_up</code> entry 0890 is a streaming carrier with its VABs wrapped inside, so a bare-magic check misses it at every shift.</li>
+        <li>Entries 0888 (<code>sound_data2</code>) and 1062 (<code>music_01</code>) carry no VAB header, and both are identified: 0888 is <code>bse.dat</code>, the battle SFX descriptor bank, and 1062 is a <strong>SEQ-only</strong> <code>music_01</code> entry (sound-test track 72, <code>ALNDRA</code>) that borrows another entry's bank. Each also ends in a foreign tone table copied from a neighbour, which is what a bare-magic sweep sees.</li>
+        <li>Only 2 of the 6 <code>other_game</code> entries carry an <code>OTHER&lt;n&gt;</code> banner.</li>
+        <li>Entry 0893 (<code>summon.dat</code>) opens with a shape that mimics a sound-address bank; the byte pins show texture streaming slots.</li>
+        <li><code>other7</code> (extraction 1226+) is a dev-leftover earlier revision of <code>koin3</code>'s field MAN - a name-exact prefix subset of its records, sharing its gate flags. No code loads it.</li>
+        <li>One v12-shaped header sits at 1227, outside the scene region.</li>
+      </ul>
+    </div>
+  </details>
+  <details class="disclosure">
+    <summary>Engine consequence: scene windows are the retail block</summary>
+    <div class="disclosure-body">
+      <p><code>Scene::load</code> converts the raw-TOC block range to the extraction frame so a scene's entries are its retail block: first the <code>.MAP</code>, then the v12 sidecar. An unshifted window is two entries late - it drops those and bleeds in the next block's first two, mis-framing any scene whose load-bearing entry sits at a block edge (an unshifted <code>rikuroa</code> window loads Jeremi's MAN). The two head defines (<code>init_data 0</code>, <code>gameover_data 1</code>) sit inside the TOC header rows and keep their unshifted legacy windows.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="the-loader-mangles-long-names">
+  <h2>What retail holds in RAM: long names are mangled</h2>
+  <p>The boot loader copies each name into a 16-byte record and <em>then</em> stores the index over bytes 12-13 of the same record. The table is BSS, so it starts zeroed; there is no length check and no NUL is ever written.</p>
+  <div class="byte-map" role="img" aria-label="One 16-byte name record: name bytes 0 to 11, the u16 index stored over bytes 12 and 13, then name bytes 14 and 15">
+    <div class="bm-cell bm-accent" style="--w:12"><span class="bm-off">+0x00</span><span class="bm-name">name bytes 0..11</span><span class="bm-size">char[12]</span></div>
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+0x0C</span><span class="bm-name">index</span><span class="bm-size">u16, stored last</span></div>
+    <div class="bm-cell bm-dim" style="--w:2"><span class="bm-off">+0x0E</span><span class="bm-name">name 14..15</span><span class="bm-size">survives</span></div>
+  </div>
+  <p>Read back as a C string, a record therefore holds:</p>
+  <table>
+    <thead><tr><th>Name length</th><th>What the record holds</th></tr></thead>
+    <tbody>
+      <tr><td>&le; 11</td><td>The name, terminated by a table zero. Clean.</td></tr>
+      <tr><td>12-13</td><td>The name with the index's two bytes overlaid at 12..13 and no terminator of its own.</td></tr>
+      <tr><td>14-15</td><td>As above, plus bytes 14-15 of the name, which survive past the index store.</td></tr>
+      <tr><td>&ge; 16</td><td>Spills into the next record. No shipped name is this long; a modded <code>CDNAME.TXT</code> can be.</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Clean C-string capacity is 11 bytes, not 12.</strong> Five shipped names exceed it and none round-trips:</p>
+  <table>
+    <thead><tr><th><code>#define</code> name</th><th>Index</th><th>In-RAM C string</th></tr></thead>
+    <tbody>
+      <tr><td><code>gameover_data</code></td><td>1</td><td><code>gameover_dat</code> + <code>01</code></td></tr>
+      <tr><td><code>monster_data</code></td><td>869</td><td><code>monster_data</code> + <code>65 03</code></td></tr>
+      <tr><td><code>bat_back_dat</code></td><td>895</td><td><code>bat_back_dat</code> + <code>7F 03</code></td></tr>
+      <tr><td><code>move_program_no</code></td><td>972</td><td><code>move_program</code> + <code>CC 03</code> + <code>o</code></td></tr>
+      <tr><td><code>monster_test</code></td><td>980</td><td><code>monster_test</code> + <code>D4 03</code></td></tr>
+    </tbody>
+  </table>
+  <ul class="bullets">
+    <li>Repo tooling uses the tolerant <code>parse_str</code>, which keeps the full spelling. Anything compared against retail RAM must go through <code>retail_name_table</code> / <code>parse_retail_str</code>, which return names as <strong>bytes</strong> - the index bytes are routinely not valid UTF-8, and a lossy conversion prints <code>fd</code> for every one of them.</li>
+    <li>The first line not starting with <code>#</code> ends the map; a line with an empty name still emits a record.</li>
+    <li><strong>Index 990 is declared twice</strong> (<code>music_test</code>, then <code>music_01</code>). Retail emits two records; the tolerant map keeps the later name. Compare the two readers by declaration order, not by index.</li>
+    <li>Retail really does populate the table: <code>main()</code> sets the source flag at cold boot so the loader reads <code>cdname.txt</code> off the disc rather than over the developer-station link.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <details class="disclosure">
+    <summary>Provenance: the loader and the four index constants</summary>
+    <div class="disclosure-body">
+  <table>
+    <thead><tr><th>Function / evidence</th><th>Address</th><th>What it proves</th><th>Dump</th></tr></thead>
+    <tbody>
+      <tr><td>CDNAME loader</td><td><code>FUN_8001D8FC</code></td><td>16-byte records at <code>0x80088758</code>; unbounded copy at <code>0x8001D980</code>, index stores at <code>0x8001DA78</code>/<code>0x8001DA90</code></td><td><code>8001d8fc.txt</code></td></tr>
+      <tr><td>Source flag write</td><td><code>0x80015F08</code> in <code>main()</code></td><td><code>sh v0,0x5aa(gp)</code> stores the <code>1</code> returned by a two-instruction leaf; the only writer among 70 access sites across 84 images, the other 69 all reads</td><td>SCUS disassembly</td></tr>
+      <tr><td>PROT resolver</td><td><code>FUN_8003E8A8</code></td><td>Indexes the raw in-RAM TOC, header included</td><td><code>8003e8a8.txt</code></td></tr>
+      <tr><td>Player-file loader</td><td><code>FUN_800558FC</code></td><td>Constants <code>0x361..0x364</code> = defines <code>battle_data 865..868</code></td><td>live trace</td></tr>
+      <tr><td>Monster SE loader</td><td><code>FUN_8003E104</code></td><td><code>li v0,0x37d</code> = define <code>monster_se 893</code></td><td><code>8003e104.txt</code></td></tr>
+      <tr><td>Side-band loader</td><td><code>FUN_801F17F8</code></td><td><code>0x37F</code>/<code>0x380</code> = <code>bat_back_dat 895</code>; RAM&harr;disc byte-verified at extraction 893/894</td><td><code>overlay_battle_801f17f8.txt</code></td></tr>
+      <tr><td>Overlay pager</td><td><code>FUN_8003EBE4</code> / <code>FUN_8003EC70</code></td><td><code>param + 0x381</code> = <code>xxx_dat 897</code>; param 2 = extraction 0897</td><td><code>8003ec70.txt</code></td></tr>
+      <tr><td>Structural check</td><td><a href="scene-v12-table.html">v12 tables</a></td><td>All 96 scene-region sidecars sit at block slot 1 only at shift &minus;2 (scene blocks vary 7..11 slots)</td><td><code>scripts/asset-investigation/cdname_shift_analysis.py</code></td></tr>
+    </tbody>
+  </table>
+    </div>
+  </details>
+  <p>Source of record: <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/formats/cdname.md" target="_blank" rel="noopener"><code>docs/formats/cdname.md</code></a>.</p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="prot.html">PROT TOC</a>
+    <a href="disc.html">Disc layout</a>
+    <a href="pochi.html">Pochi filler</a>
+    <a href="scene-v12-table.html">Scene v12 table</a>
+    <a href="../subsystems/asset-loader.html">Asset loader</a>
+    <a href="../subsystems/boot.html">Boot sequence</a>
+    <a href="../tooling/extraction.html">Extraction pipeline</a>
+    <a href="../reference/music-tracks.html">Music tracks</a>
+    <a href="../reference/re-do-not-re-walk.html">Do not re-walk</a>
+  </div>
+</section>

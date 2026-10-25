@@ -1,0 +1,138 @@
+# Key functions: asset loading + disc I/O
+
+Part of the [key function directory](../functions.md) - the conventions for reading these tables (bare hex = function entry, `0x`-prefixed = data / instruction, overlay-VA caveats) are on the [index page](../functions.md#how-to-use-this-page).
+
+## Asset loading + dispatch
+
+| Address | Role |
+|---|---|
+| `8001A55C` | LZS decoder. Algorithm reverse-engineered from this function. |
+| `8001A8B0` | Raw memcpy. Used by the asset dispatcher when `copy_only = 1`. |
+| `8001E1B4` | Per-stage init. Allocates the 0x62C00-byte asset buffer at `_DAT_8007B85C`. |
+| `8001F05C` | Asset-type dispatcher. The `(type_size, copy_only)` switch - see [`formats/asset-type.md`](../../formats/asset-type.md). Case 6 (type `0x06` "anm", the `"anm_malloc_err"` slot) mallocs and installs the decoded payload at `DAT_8007B7C8` - on kingdom bundles that payload is the slot-5 ocean CLUT-walk table (`legaia_scene_formats::clut_walk`). |
+| `8001FE70` | Battle-init per-PROT walker for [`scene_tmd_stream`](../../formats/scene-bundles.md) entries. Reads chunk0 as `[TMD body size][TMD body]` (copies into `_DAT_8007B864`), then loops: type `0x01` -> `LoadImage(payload)`, type `0x02` or size `0` -> stop, otherwise skip. Called from `FUN_800513F0` (battle scene-loader state) after `FUN_8001FA88` reads the PROT entry. Distinct from `FUN_8002541C` despite the matching chunk-header packing - type `0x01` here means "single bare TIM", not `TIM_LIST`. See [`formats/scene-bundles.md`](../../formats/scene-bundles.md#streaming-tail---fun_8001fe70-walker). |
+| `80020224` | Descriptor-pair walker. No static caller in `SCUS_942.54`; called at runtime from the town overlay's `FUN_801D6704`. Count from the header word at `+0`, per-pair dispatch through `FUN_8001F05C(base+offset, type_size, param, 0)`, returns the OR-union of every dispatch return; VSync telemetry into `gp+0x684`/`gp+0x6D0`. Port: `legaia_container_formats::walk_descriptor_pairs`. |
+| `80020454` / `80020DE0` | Actor allocator pair. Free-list LIFO at `_DAT_8007C348`, 512-pointer pool at `0x8007C370`. The free-list is primed at scene entry by `FUN_800203EC` (build) / `FUN_80020424` (pop); interior PC `80020E3C` is the template zero-init body of `FUN_80020DE0`. |
+
+## Per-stage asset table machinery
+
+| Address | Role |
+|---|---|
+| `8002541C` | Streaming-asset driver. Top-level for types 0xA (tim.dat) / 0xF (move.mdt) / 0x14 (DATA_FIELD). |
+| `800255B8` | Filename builder + loader. Builds `h:\PROT\FIELD\<stage>\tim.dat`-style paths or falls through to by-index. |
+| `800268DC` | TMD pointer fixup. Patches object-table pointers from offsets to absolute addresses. |
+| `80026B4C` | TMD register. Validates `id == 0x80000002`, stores in TMD pointer table at `0x8007C018 + idx*4`. |
+
+## Disc / loader chain
+
+Full 13-function CD-read API stack documented in [`subsystems/boot.md` § CD-read API stack](../../subsystems/boot.md#cd-read-api-stack).
+
+| Address | Role |
+|---|---|
+| `8003D3C4` | Path-based ISO9660 file loader: `(path, dest)`. Builds `"<vol>:<path>"` via `FUN_80056728` and **uppercases it in place** (`-0x20` on bytes in `a-z`) before the lookup, then `FUN_8005DBB4` (dir lookup) + SetLoc (`FUN_8005BEFC`) + `FUN_8005E9A4` for `(size + 0x7FF) >> 11` sectors in 2048-byte mode, spinning on `FUN_8005EA84` with a VSync per poll. The whole lookup+read retries up to 10000 times, counting failures into `0x8007B86E` / `0x8007B904`. Used for `.STR` / `.XA` filesystem files. |
+| `8003D26C` | 32-byte-block copy `(dst, src, count)`: unrolled `t0..t7` word load/store loop, one `0x20`-byte block per iteration. Do-while - the `addi a2,-1; bgtz` tail means `count <= 0` still copies one block. The battle-scene chunk walker's TMD-body placer (`FUN_8001FE70`, see [`asset-loader.md`](../../subsystems/asset-loader.md)). Port: `engine-vm::block_copy_32::copy_blocks_32`. `see ghidra/scripts/funcs/8003d26c.txt`. |
+| `8003C7EC` | Scripted game-over trigger - helper twin of the party-wipe gate's inline handoff (see [`battle.md`](../../subsystems/battle.md#party-wipe--the-game-over-overlay)): stores master mode `_DAT_8007B83C = 0x16` (22 = CARD INIT, the CARD/CONTINUE title flow), raises `_DAT_8007BB00 = 1`, clears `DAT_8007B750` bit 1, pauses BGM via `FUN_800266E0(0x8007052C)`. Called by field-VM op `4C EA`. Port: `engine-core::world` field host `trigger_game_over`. `see ghidra/scripts/funcs/8003c7ec.txt`. |
+| `8003F210` | CD-read retry step. Reads the pending-retry word `gp[+0x988]`; when it is non-negative it forces the state word `gp[+0x980]` to `6`, then switches on that state: `0` returns `0`, anything but `6` returns `1`, and `6` clears both words, re-runs the CD base lookup `FUN_8005C42C` against the `CdlLOC` buffer at `0x8007BC5C`, re-issues SetLoc through `FUN_8005C328` at `lookup_result + gp[+0x97C]`, and returns `2`. The re-seek arm of the [CD-read API stack](../../subsystems/boot.md#cd-read-api-stack). Unreferenced in any image. `see ghidra/scripts/funcs/8003f210.txt`. |
+| `8003EDAC` | CD subsystem mode toggle. `(mode)`: always `FUN_8003EE7C(0)` first, then for non-zero `mode` calls `FUN_8005C034(9, 0)`, and for zero `FUN_8005C160(0, 0, 0)` followed by `FUN_8003F2B8(0)`. Sibling of the retry step above and likewise unreferenced. `see ghidra/scripts/funcs/8003edac.txt`. |
+| `8003E360` | Demonstrates the **dual-mode loader pattern**: `bne` at `0x8003E37C`, so retail (`_DAT_8007B8C2 != 0`) branches to the PROT TOC index (`FUN_8003E8A8` + `FUN_8003E800`); the `== 0` dev fall-through opens a path via `FUN_800608F0` (`break 0x103` host trap) + `FUN_80060944`. |
+| `8003E4E8` | Boot-time TOC loader. `(filename_str, do_read_flag)`. Called from `FUN_8003F08C(0)` with `"PROT.DAT"`. Reads first 3 sectors of `PROT.DAT` (= 6 KB) into `0x801C70F0`. |
+| `8001F7C0` | **Per-scene field-asset loader.** `(dest, scene_name, field_record)` fills the field buffer at `dest` (`_DAT_1f8003ec` base). The leading region - collision grid (`+0x4000`), object map (`+0x8000`) - is the main `.MAP` file; the `.PCH` trigger sidecar at `+0x12000` and `efect.dat` at `+0x12800` are separate files. Dev (`_DAT_8007B8C2 == 0`): `DATA\FIELD\<scene>.MAP` by name through the `break 0x103` host trap. Retail (`_DAT_8007B8C2 != 0`): `FUN_8003E8A8(field_record, 1)` sets the `CdlLOC` from `PROT_TOC[field_record+2]`, then `FUN_8003E800(dest, 0x28, 1)` streams 40 sectors (`0x14000` bytes). So the per-scene collision grid is the `+0x4000..+0x8000` slice of `<scene>.MAP`. See [`subsystems/field-locomotion.md`](../../subsystems/field-locomotion.md). |
+| `80020118` | **Field-load entry step.** `(scene_name, field_record)`. Runs before the per-scene `.MAP`/bundle walk: resets the **scene model-bank base** `DAT_8007B6F8 = 0` ([below](#dat_8007b6f8-is-the-scene-model-bank-base)), builds the dev path `"DATA_FIELD\" + scene_name`, loads the shared player pack (`FUN_8001E890`), then - only when no DATA_FIELD bundle is staged (`DAT_8007B768 < 0`, the `0xFFFF` sentinel `FUN_80025CB4` seeds) - requests streaming chunk `field_record + 3` into `_DAT_8007B85C` via `FUN_8001EEF0` (retail blocks on `FUN_8003DE7C(0)` when issued), and finally clears the `u16` at scene-buffer `+0x12` (object descriptor 0's flags). Ported as `legaia_engine_scene::scene_bundle::field_load_entry_plan`. `see ghidra/scripts/funcs/80020118.txt`. |
+| `8001FD44` | **Scene-change-packet API** `(name_ptr)`. Sets the next scene by CDNAME string: copies `name_ptr` → `0x8007050C`, syncs to the active buffer `0x80084548` via `FUN_8001D7F8`, and stages the load (gated retail-vs-debug on `_DAT_8007B8C2`). `s_ERR_CHANGE_PACKET` guards re-entry while a packet is pending (`_DAT_8007BA3C`). One argument only - the `a1` the decompiler shows at some call sites is dead. This is the **name-based** scene transition (distinct from the map-id door-warp `FUN_80025980`); it carries the opening intro-skip packet. See [`subsystems/boot.md`](../../subsystems/boot.md#the-opening-scene-chain--the-fun_801d1344-intro-skip). |
+| `801D1344` | **Player actor tick** (PROT 0897): drains the post-warp pad hold, gates the pad controller on the warp pair, and carries the opening **intro skip** packet - [details ↓](#801d1344) |
+| `801D1EC4` | **Walk-on tile trigger** (field overlay). Per-frame: when the player's tile changed, looks up a kind-1 trigger record `[tile_x][tile_z][p2_record][gate]` for the new tile via `FUN_801D5630(1, x, z)` (the `.MAP` `+0x10000` trigger block + `+0x12000` fallback window) and calls `FUN_8003BDE0(x, z, rec[2], rec[3])` (ra `0x801D218C`) to spawn the referenced MAN partition-2 record. The scene-entry SEAT lands on the trigger tile and the stale last-tile compare fires the same tick. Engine: `SceneHost`'s `spawn_arrival_trigger_record` + `legaia_engine_field::field_regions::lookup_tile_trigger`. Timed-warp half: [`runtime-libs.md`](runtime-libs.md#801d1ec4); write-up: [`field-locomotion.md`](../../subsystems/field-locomotion.md#the-walk-on-dispatcher-fun_801d1ec4). |
+| `801D5630` | **Per-tile trigger-record lookup.** `(kind, x, z)` scans the kind-`k` sub-table of the scene `.MAP`'s `+0x10000` trigger block (header: sub-table offset `s16` at `+4k+2`, count at `+4k+4`), primary table first, then the `+0x12000` fallback window; first exact tile match wins. Kind 1 = P2-record spawns/binds, kind 0 = intra-scene teleports, kind 2 = per-tile elevation overrides (the `FUN_80019278` ramp fast path). See [`field-locomotion.md`](../../subsystems/field-locomotion.md#trigger-block-0x10000---four-kind-sub-tables). Engine: `legaia_engine_field::field_regions::parse_tile_triggers`. |
+| `8001D424` | Loads the dev file `initmap.txt` (via `FUN_8003E6BC`) and copies 16 bytes into the scene-name buffer `0x8007050C` - the executable's default start map (`"town01"`). |
+| `8001D7F8` | Syncs the scene name `0x8007050C` → the active buffer `0x80084548` (`FUN_80056758`). Called by `FUN_8001FD44` and the field initializer. |
+| `8001FBCC` | **VDF pointer-table append** (13 instructions, no frame). `(ptr)`: stores `a0` at `0x80083E58 + n*4` where `n = _DAT_8007B7EC`, mirrors that same `n` into `gp+0x6FC`, then writes `n + 1` back to `_DAT_8007B7EC` - so the counter is post-incremented and the `gp` word holds the index of the entry just appended. Two callers: the asset dispatcher's VDF case, once per sub-entry, and the battle loader at `0x80052584`, once per offset of the `vdf` pack (raw TOC 874 = extraction 872). `see ghidra/scripts/funcs/8001fbcc.txt`. |
+| `8003E6BC` | Path-based opener. Resolves dev paths into a PROT index via the CDNAME-driven name map. |
+| `8003E800` | Async sector-count loader. `(dest, sector_count, flags)`. Queues via `gp+0x97c` (**count**, from `FUN_8003E8A8`'s return - `FUN_8003EB98` passes it straight through) / `gp+0x894` (dest), kicks `FUN_8003F128` when `flags & 1`, blocks when `flags & 2`. The LBA is not an argument: `FUN_8003F128` converts the `CdlLOC` at `0x8008BC5C` through `FUN_8005C42C` and adds `gp+0x97c` to get the end sector (`gp+0x8b8`). The older "`(dest, lba, flags)`" reading of this row contradicted [`field-locomotion.md`](../../subsystems/field-locomotion.md), which reads the same call as a 40-sector read. |
+| `8003E8A8` | PROT TOC index resolver. `(prot_index, flag)` → the entry's **sector count**, not its LBA: `0x8003E90C` is `subu s0,v0,s2` over `TOC[idx+3]` and `TOC[idx+2]` and `0x8003E948` returns that difference. The start LBA is a side effect - `sw s2,0x8f0(gp)` - and the index lands at `gp+0x90C`. Matches the [PROT TOC math](../../formats/prot.md) (`size_sectors = toc[p+3] - toc[p+2]`) and the [size-lookup row](renderer.md#renderer--gpu-primitives); the older "→ LBA" reading of this row disagreed with both. |
+| `8003EB98` | By-index sync loader. Wrapper around `FUN_8003E8A8` + `FUN_8003E800(…, 1)`. |
+| `8003EBE4` | **Overlay loader A.** Calls `FUN_8003E8A8(param + 0x381)`; in extraction index space that is **PROT entry `param + 0x37F`** (the resolver indexes the raw in-RAM `PROT.DAT` head, 2 entries above extraction indexing - see [formats/prot.md § In-RAM TOC](../../formats/prot.md#in-ram-toc)). Destination buffer pointer in `*DAT_8001038C`; current-id tracked in `gp+0x924` (= `0x8007BC3C`). |
+| `8003EC70` | **Overlay loader B.** Parallel to `FUN_8003EBE4`; `addiu a0,s1,0x381` indexes the raw TOC, 2 entries above extraction space, so **extraction = `895 + gp[+0x934]`** ([no ceiling](#8003ec70-has-no-ceiling)). Destination buffer in `*DAT_80010390`; current-id tracked in `gp+0x934` (= `0x8007BC4C`). Two can be resident at once. The battle-action SM uses it to page in the **per-summon Seru-magic overlays**: a player Seru-magic cast (spell id `actor[+0x1df]` in `0x81..0x8b`) calls `FUN_8003EC70(id - 0x79)` → extraction **PROT 903..913** (Gimard `0x81` → PROT 903, capture-pinned). Each carries its summon's spawn / animation logic over the `DAT_8007C018` library. See [`subsystems/battle-action.md`](../../subsystems/battle-action.md#seru-magic-summon-overlay-dispatch). |
+| `8003F128` | Async CD read kickoff. Stages parameters, submits to BIOS-level CD library. |
+| `8003F08C` / `8003EFE8` | Boot-time entry points that call `FUN_8003E4E8("PROT.DAT", 1)` to populate the TOC at `0x801C70F0`. |
+| `8005C328` | LBA → BCD-MSF converter. Inverse of `FUN_8005C42C`. |
+| `8005C42C` | BCD-MSF → LBA converter. `((m*60 + s)*75 + f) - 150`. |
+| `8005D9A0` | CD-DMA-channel-3 synchronous read primitive. Writes CD command registers (`*DAT_800796A4` etc.) and triggers DMA via `*DAT_800796B4 = 0x11000000`. Takes `(dest_buffer, mode)`. The address `0x8005DA40` is an instruction inside this function (`lui v1, 0x8008`) - Ghidra promotes that intra-function label to a fake `FUN_8005DA40` entry. There is no real function at `0x8005DA40` and no `_DAT_800795B4` pointer table. |
+| `8005DBB4` | ISO9660 directory lookup. `(file_info_out, filename)` → fills `{msf[3], size_bytes, …}`. |
+| `8005E574` | Streaming-read per-IRQ callback. Drives multi-sector reads via streaming-read working globals (`DAT_800796CC` destination cursor, `DAT_800796D8` sectors remaining, `DAT_800796E4` current LBA). Registered by `FUN_8005E788`. |
+| `8005E788` | Streaming-read starter. Copies source globals (`DAT_800796C8` → `DAT_800796CC`; `DAT_800796C4` → `DAT_800796D8`) and registers `FUN_8005E574` as IRQ callback. Sets initial LBA via `FUN_8005C42C(FUN_8005BD70())` (reads BCD MSF from libcd's GetLoc-equivalent). |
+| `8005E9A4` | **Public streaming-read API.** `(sector_count, dest_buffer, mode_flags)`. Sets the streaming-read source globals + calls `FUN_8005E788(0)`. Caller must SetLoc beforehand. Sector size from `mode_flags`: `& 0x30 == 0` → 0x800 (2048, data); `== 0x20` → 0x924 (2336, XA); else 0x918. |
+| `8005E4D4` | Synchronous LBA-based file reader: `(sector_count, lba, dest_buffer)`. Wraps `FUN_8005C328` + `CdControl(SetLoc)` + `FUN_8005E9A4` + completion poll. |
+| `8005EA84` | Streaming-read completion sync `(poll_once, result)`. Returns sectors remaining / `0` complete / `-1` timed out (`DAT_800796E0 + 0x4B0` vsync window). Negative `DAT_800796D8` or a `>0x3C`-vsync sector stall (`DAT_800796DC`) restarts the stream via `FUN_8005E788(1)`. Callers: `FUN_8005E4D4` (block, `a0=0`), `FUN_8003E4E8` / `FUN_8003D3C4` (poll, `a0=1`). Port: `engine-scene::cd_dma::stream_read_sync`. |
+| `8003EF14` | Field-buffer per-sector streaming poller - [details ↓](#8003ef14) |
+
+## Scene / stage init (mode-0x02 loader callees)
+
+These run during scene entry (`game_mode 0x02`) as callees of the per-stage
+asset loader `FUN_8001E1B4` / boot mode-init `FUN_8001DCF8` and the field
+initializer `FUN_801D6704`; surfaced by the playthrough gap-set trace on the
+town01 (Rim Elm) entry.
+
+| Address | Role |
+|---|---|
+| `80017910` | **Sustained-SFX voice teardown.** Iterates the `gp+0x5D0` held-voice count calling the driver voice-stop `FUN_800653C8(7+i)` (arg bounded at the 24 SPU voices, staged at `_DAT_801CE362`), then clears `gp+0x5D0` and sets the sustained-cue cell `gp+0x40C = -1`; a zero count is a complete no-op. The release half of the cue-ring drainer `FUN_80016B6C`'s sustained-cue key-on loop (the only other writer of the pair); called at mode init (`FUN_8001DCF8`), on battle anim change (`FUN_8004AD80`), and by the debug sound-test stop-all. Also called by the battle tint pass `FUN_80050120` (`0x8005040C`). Port `SfxBank::release_sustained`; callers in [`audio.md`](../../subsystems/audio.md#sustained-cues-loop-until-the-teardown-releases-them). `see ghidra/scripts/funcs/80017910.txt`. |
+| `80017BEC` | **Object-grid marker refresh** (grid-prep half of field scene entry; caller `FUN_801D6704`). Rebuilds the derived bits of the object-index grid (`.MAP +0x8000`): descriptor flag decay, flags-bit mirror into cell bits `0x1000`/`0x2000`, and the kind-0/1/2 trigger-presence stamp `0x200 << kind` - the writer of the `cell & 0x600` walk-on fast gate and the `0x800` elevation marker. Full pass detail: [`field-locomotion.md`](../../subsystems/field-locomotion.md#where-the-collision-grid-comes-from). Ghidra dump has no instruction stream; ported from the static-recomp rendering as `legaia_engine_field::field_regions::refresh_object_grid_marks`, run at field entry; observable ([settled](../re-settled-threads/field.md)). |
+| `800203EC` / `80020424` | **Actor node-pool init + pop.** `_800203EC` builds the 0x8E-entry node free-stack (entries 0xD8 bytes apart, each ptr written into `slot+0x28`) and sets the live count `_DAT_8007C348 = 0x8E`; `_80020424` pops one node (decrement `_DAT_8007C348`) and initialises it as an empty circular doubly-linked list head. The per-scene reset + allocate primitives priming the `_DAT_8007C348` free-list the actor allocator `FUN_80020454` draws from. `see ghidra/scripts/funcs/800203ec.txt`. |
+| `80025C24` | **Field-camera reset on scene entry.** Resets the field-camera defaults: angle words `DAT_8007B790 = 0x1B8` / `DAT_8007B792 = 0x64` / `DAT_8007B794 = 0`, and target `0x800840B8 = 0` / `0x800840BC = 0xFFFFFF00` / `0x800840C0 = 0x4024` (caller `FUN_801D6704`, field init). Seventeen instructions, six stores, and the GTE `H` register `_DAT_8007B6F4` is **not** among them - a port that resets `H` on scene entry adds a store retail does not make. `see ghidra/scripts/funcs/80025c24.txt`. |
+| `8003A1E4` | **Field-NPC placement installer** (reads `[model, anim, tile_x, tile_z]` - no facing byte in the record). Its tail (body `0x8003A474..0x8003A4F8`) runs a **spawn-time field-VM prologue pre-run**: if the placement record's script opens with op `0x24`/`0x25`, it executes the leading ops one at a time through `FUN_801DE840` until a `0x21` NOP or a sub-`0x20` byte - this is where a never-walked NPC's INITIAL FACING comes from (ops `0x4C 0x51` sub-1 and `0x38` write `actor+0x26` from the 8-direction heading LUT at `0x80073F04`, entry `i*0x200`). Port `man_field_scripts::placement_initial_facing` + `World::seed_field_npc_facings`; see [`field-locomotion.md`](../../subsystems/field-locomotion.md). `see ghidra/scripts/funcs/8003a1e4.txt`. |
+| `8003A9D4` | **Motion-script installer - bind MAN tail-section 1 onto actors.** Walks the loaded motion-script block (`*_DAT_801C6EA4` `+0x00`) as a record chain `[u8 count][s16 next_delta][count x (u8 actor_id, u8 enable)][motion stream]`, resolving bindings against the live actor lists (`0xF8` = player, `0xFB` = the world-map entity-SM node, else id-match at `actor+0x50`), then writing `actor+0x80 = record + 3 + 2*count` + the enable byte at `+0x8A`. Feeds `FUN_80038158`; layout in [`motion-vm.md`](../../subsystems/motion-vm.md#the-second-motion-vm---fun_80038158). `see ghidra/scripts/funcs/8003a9d4.txt`. |
+| `8003ADAC` | **Scene-entry overlay-sprite pair build.** Clears a draw-control bit in `_DAT_8007C364+0x10`, sets `DAT_8007B6B4 = 0x28`, reads flag `DAT_8008575B`, then builds two sprite/box primitives (color 0xFF, sizes 0x1E then 0x08) via the panel emitter `FUN_80024E80`. Interior PC `8003ADCC` is its prologue register-save region. `see ghidra/scripts/funcs/8003adac.txt`. |
+| `80020038` | **DISPENV/DRAWENV pair initialiser.** Three stores. `a0` is a **display-env pair**, not an actor struct: its caller `FUN_8001DAF8` calls it twice, with `0x8007BF30` and `+0x74` - the two buffers `FUN_80016B6C` swaps. Relative to the pair base the stores are `+0x28 = 0x1F` (DRAWENV `tpage`), `+0x2A = 0` (`dtd`, dither) and `+0x2C = 1` (`isbg`, clear-on-`PutDrawEnv`). The `dtd` value does not survive the first frame - `FUN_80016B6C` refreshes it from `_DAT_8007BA66`, boot writes `1` there (`FUN_8001D424`) and a field-VM slice at `0x801E350C` sets it from a script operand, so **retail dither is on by default and script-controlled**. Ported as `legaia_engine_system::sound_state::DRAW_ENV_INIT`. `see ghidra/scripts/funcs/80020038.txt`. |
+| `800353E0` / `8003C110` | **Field-subsystem state reset + the glyph-advance setter.** `_800353E0` zeroes `gp+0x148` and `gp+0x138`, calls the setter `FUN_8003C110(0xC)`, and sets `gp+0x13C = 7`; `_8003C110` is the one-line byte setter `DAT_80073F20 = param` - the text writer's glyph-advance byte, which the port drops ([`field-menu.md`](../../subsystems/field-menu.md#ported-painters)). `gp+0x148` is the drawable-list head the tween pass `FUN_80031AE4` walks, and this **discards** it rather than draining - the free-each-node path is the separate `FUN_800355F0`. The `gp+0x13C` store lands after the `jal`, in the epilogue's delay window. Ported as `legaia_engine_field::float_tween::FIELD_SUBSYSTEM_RESET`. `see ghidra/scripts/funcs/800353e0.txt`. |
+| `8005ACF8` / `8005AD54` | **GTE depth-cue (fog) coefficient setup.** Compute the depth-cue slope `(param1*-64)/param2` (`8005ACF8`) or `(param1*-320)/param2` (`8005AD54`) - the two differ only in the baked screen-height constant - and load it into GTE control register **27 (DQA)** via `FUN_8005B7C0` (`ctc2 a0,0xd800`), then the fixed literal `0x1400000` into control register **28 (DQB)** via `FUN_8005B7CC` (`ctc2 a0,0xe000`). These are the depth-cue coefficient pair, **not** rotation/translation setters (those write regs 0..7 and are covered by `8005B618` / `8005B4B8`) - the distinction matters because the retail shading path runs this depth cue and the port reproduces it. `see ghidra/scripts/funcs/8005acf8.txt`. |
+
+## `DAT_8007B6F8` is the scene model-bank base
+
+`FUN_80020118` zeroes it with `sw zero,-0x4908(at)` at `0x80020144`, and
+`FUN_8001E890` re-seeds it at `0x8001EB10..0x8001EB20` to
+`pack_count + DAT_8007B824` - one past the player pack it has just registered
+into `DAT_8007C018` through `FUN_80026B4C`. So the word is the **first pool id
+the scene's own models take**, not a kingdom-specific prefix: the field-load
+reset is what makes the re-seed unconditional for every scene. Both consumers
+of the id space split at `0xF0` against this word and `DAT_8007B824`; the
+split, the measured values and the pool's composition are in
+[`model_bank.rs`](../../../crates/engine-scene/src/model_bank.rs).
+
+## Function details
+
+Full write-ups for the rows above whose detail outgrew a table cell. Linked from each section table by **[details ↓]**.
+
+### `801D1344`
+
+The player actor's per-frame tick (PROT 0897, `0x801D1344..0x801D1878`; the
+`dialog` / `world_map` / `cutscene_dialogue` dumps at this VA are captures of
+the same image and print the same routine). Per frame it drains the post-warp
+pad hold `_DAT_8007B6B4` by the frame delta, clamped at zero
+(`0x801D161C..0x801D1630`), skips the pad controller `FUN_801D01B0` while the
+kind-0 warp timer `_DAT_8007B6B0 > 0` or the hold is non-zero
+(`0x801D16C8..0x801D16E4`), then runs the settle `FUN_801D1BA0`, the follow
+camera `FUN_801DB510` and the view build `FUN_800172C0`
+([`field-locomotion.md`](../../subsystems/field-locomotion.md#the-timed-kind-0-warp)).
+With the pad step skipped nothing rewrites the clip base before the settle reads
+it, so the player idles through a warp on the `2` the system channel stores
+every tick (`0x80039D94`).
+
+It also issues the one-shot opening **intro skip**: when `_DAT_8007B868 == 0 && (_DAT_1F800394 & 0x4000000) && (_DAT_8007B850 & 0x100)` (normal mode + the cutscene-set trigger flag + the player's confirm pad bit), it fades (`FUN_801D58F0`), sets the town01 entry coords (`_DAT_80073EF4 = 0xEC0`, `_DAT_80073EF8 = 0x2DC0`), clears the trigger flag (fire-once), and calls `FUN_8001FD44(s_town01_801ce82c)` - the target name `"town01"` is the overlay literal at `0x801CE82C`. The natural (zero-input) opening chains scene to scene by script instead; this packet only fires on a confirm press after `opdeene` arms `GFLAG 26`.
+
+### `8003EC70` has no ceiling
+
+Nothing in the loader bounds the top of the band it can page in: the index is
+`a0 + 895` and the only clamp anywhere is whatever a caller applies first. That
+matters for the two highest images, because the one site that reaches them,
+`0x8005269C`, passes `_DAT_8007B64A + 71` - so selector byte `2` and `3` page in
+PROT `0968` and `0969` respectively, while `0` skips the load entirely. Those
+two entries are therefore reachable content rather than orphans, and what writes
+the selector is settled: the field entity tick `FUN_801DA51C` clears it at
+`0x801DA69C` and raises `1` at `0x801DA6A8` under system flag `0x19`, while
+battle latches `3` at `0x801E6D2C`. Every access is `gp`-relative, which is why
+an absolute-address sweep reported none
+([settled](../re-settled-threads/battle.md)).
+
+### `8003EF14`
+
+**Field-buffer per-sector streaming poller.** Distinct from the `DAT_800796xx` streaming path above: uses the `0x8007BCxx` global bank (`gp+0x940` destination cursor, `gp+0x968` sectors remaining, `gp+0x8c8` sector sequence, `gp+0x964` timeout). On each CD ready-IRQ, DMAs one 2048-byte sector via `FUN_8005C2C4`/`FUN_8005D9A0` to `*(gp+0x940)`, then advances the cursor `0x800` and decrements `gp+0x968`; on completion calls `FUN_8005BEE4(0)` + `FUN_8005C034(9,0)`. This is the path that streams a field scene's buffer - collision grid (`+0x4000`), object map (`+0x8000`), `.PCH` trigger sidecar (`+0x12000`) - into RAM at scene load.
+
+Pinned by a runtime Write-watchpoint on the live collision grid (caller chain `FUN_8005D9A0` ← `FUN_8005C2C4` ← `FUN_8003EF14`@`0x8003EF68`); see [`subsystems/field-locomotion.md`](../../subsystems/field-locomotion.md). The per-scene start LBA + sector count + dest are set by the field-asset loader `FUN_8001F7C0` (debug branch: `FUN_8003E8A8` sets the `CdlLOC` from `PROT_TOC[field_record+2]`, then `FUN_8003E800(dest, 0x28, 1)`; retail branch: ISO9660 `DATA\FIELD\<scene>.MAP` opened by name).

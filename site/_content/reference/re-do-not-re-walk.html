@@ -1,0 +1,92 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">reference</a> &middot; do not re-walk</div>
+  <h1>Falsified RE readings - do not re-walk</h1>
+  <p class="lede">Every reverse-engineering project accumulates readings of the bytes that looked right, were believed, and turned out wrong. This page indexes Legaia's: what each reading claimed, the verdict, and the reasoning - <em>why</em> it was convincing and what killed it. Check here before committing to a reading that looks obvious.</p>
+</header>
+
+<style>
+/* Register pages: a filterable, scannable thread list. */
+.reg-tools { position: sticky; top: var(--topbar-h, 0); z-index: 2; background: var(--bg); padding: 0.6rem 0 0.7rem; border-bottom: 1px solid var(--border); margin-bottom: 1rem; }
+.reg-nav { margin: 0 0 1.25rem; }
+table td .tag { white-space: nowrap; }
+.reg-filter { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+.reg-filter input { flex: 1 1 16rem; min-width: 0; background: var(--bg-card); color: var(--text); border: 1px solid var(--border-hi); border-radius: 4px; padding: 0.4rem 0.6rem; font: inherit; }
+.reg-filter .reg-count { color: var(--text-dim); font-family: var(--font-mono); font-size: 0.8rem; }
+.reg-table td:first-child { color: var(--text); width: 38%; }
+.reg-table td:nth-child(3) { white-space: nowrap; }
+.reg-table details.reg-why { margin: 0.4rem 0 0; background: transparent; }
+.reg-table details.reg-why > summary { padding: 0.2rem 0.5rem; font-size: 0.72rem; }
+.reg-table details.reg-why .disclosure-body { padding: 0.5rem 0.6rem; font-size: 0.85rem; }
+.reg-kw { color: var(--text-dim); font-family: var(--font-mono); font-size: 0.8rem; }
+.reg-area.reg-empty, .reg-table tr.reg-hide { display: none; }
+@media (max-width: 640px) {
+  .reg-table thead { display: none; }
+  .reg-table, .reg-table tbody, .reg-table tr, .reg-table td { display: block; width: auto !important; }
+  .reg-table tr { border-bottom: 1px solid var(--border); padding: 0.4rem 0; }
+  .reg-table td { border: 0; padding: 0.15rem 0.6rem; }
+  .reg-table td:nth-child(3) { white-space: normal; }
+}
+details.reg-writeup { margin: 0.35rem 0; }
+details.reg-writeup > summary { font-size: 0.9rem; }
+.reg-src { color: var(--text-dim); font-size: 0.8rem; }
+</style>
+
+<!--REGISTER-NAV:falsified-->
+
+<section class="doc-section" id="overview" data-doc="-">
+  <h2>What a falsified reading is, and why it is kept</h2>
+  <p>A reverse engineer looks at a routine or a table and forms a story about what it does. Most stories survive the disassembly or a runtime capture. The ones here did not - but each was <em>plausible</em>, usually backed by real evidence read the wrong way, and the shape of the trap recurs in other subsystems. Rows are terminal: new evidence moves a row back to <a href="open-rev-eng-threads.html">open RE threads</a>, never edits it in place. The answered questions are on <a href="re-settled-threads.html">settled threads</a>. Each row opens to its full reasoning - why it convinced, what killed it - and the longer cases sit under <em>Long write-ups in this area</em>. Every area, row and write-up is rendered from <code>docs/reference/re-do-not-re-walk.md</code> when the site is built.</p>
+  <h3>Three traps behind most rows</h3>
+  <ul class="bullets">
+    <li><strong>VA aliasing.</strong> A bare virtual address is not an identity. The game swaps different overlays into the same RAM window (<code>0x801CE818</code> for slot A, <code>0x801F69D8</code> for slot B), so a dump labelled by address can be a different function entirely. See <a href="#overlay-band">the overlay band</a>.</li>
+    <li><strong>Ghidra's collapsed switch.</strong> A jump table's arms render in the decompiled C as bare <code>break</code>s or fake <code>FUN_x</code> calls, inventing opcode semantics the raw table does not have. The cure is the disassembly, never the C (<a href="../tooling/ghidra.html">Ghidra workflow</a>).</li>
+    <li><strong>The over-reading entry size.</strong> A PROT entry's size is the sector gap to the next entry. An older expression read past that end, so a "field at offset K" was really the <em>next</em> entry (<a href="../formats/prot.html">PROT.DAT</a>).</li>
+  </ul>
+</section>
+
+<div class="reg-tools reg-filter" id="find">
+  <input type="search" id="reg-filter" placeholder="Filter threads: an address, a scene, a word" autocomplete="off" aria-label="Filter threads">
+  <span class="reg-count" id="reg-count" aria-live="polite"></span>
+</div>
+
+<!--REGISTER:falsified-->
+
+<section class="doc-section" id="see-also" data-doc="related-pages">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="open-rev-eng-threads.html">Open RE threads</a>
+    <a href="re-settled-threads.html">Settled threads</a>
+    <a href="functions.html">Key functions</a>
+    <a href="../tooling/ghidra.html">Ghidra workflow (decompiler artifacts)</a>
+    <a href="../tooling/disc-coverage.html">Disc coverage</a>
+    <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/tooling/call-target-integrity.md" target="_blank" rel="noopener">Call-target integrity</a>
+  </div>
+</section>
+
+<script>
+(function () {
+  var input = document.getElementById('reg-filter');
+  var count = document.getElementById('reg-count');
+  if (!input) return;
+  var rows = Array.prototype.slice.call(document.querySelectorAll('.reg-table tbody tr'));
+  var areas = Array.prototype.slice.call(document.querySelectorAll('.reg-area'));
+  rows.forEach(function (r) { r._t = r.textContent.toLowerCase(); });
+  function apply() {
+    var terms = input.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    var shown = 0;
+    rows.forEach(function (r) {
+      var ok = terms.every(function (t) { return r._t.indexOf(t) >= 0; });
+      r.classList.toggle('reg-hide', !ok);
+      if (ok) shown++;
+    });
+    areas.forEach(function (a) {
+      var any = !terms.length || a.querySelector('.reg-table tbody tr:not(.reg-hide)');
+      a.classList.toggle('reg-empty', !any);
+    });
+    count.textContent = terms.length ? shown + ' of ' + rows.length + ' threads' : rows.length + ' threads';
+  }
+  input.addEventListener('input', apply);
+  apply();
+})();
+</script>

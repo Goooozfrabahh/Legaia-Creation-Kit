@@ -1,0 +1,289 @@
+# Tagged-release binary pipeline for legend-of-legaia-re.
+#
+# Pushing a v* tag builds every workspace binary for the release target
+# matrix, packages one archive per target, and attaches the archives plus a
+# SHA256SUMS file to that tag's GitHub release (creating the release if it
+# does not exist yet).
+#
+# Four jobs:
+#
+#   verify          self-hosted   fmt + clippy + test gate
+#   build-cross     self-hosted   the three Linux-hosted targets below
+#   build-macos     macos-14      universal-apple-darwin (arm64 + x86_64, lipo)
+#   publish         ubuntu-latest SHA256SUMS over every archive + one release edit
+#
+# The self-hosted runner is arm64 Linux, which makes both of its non-native
+# targets cross-compiles:
+#
+#   aarch64-unknown-linux-gnu   native            every workspace binary
+#   x86_64-pc-windows-gnu       mingw-w64 cross   every workspace binary
+#   x86_64-unknown-linux-gnu    zig cross         every workspace binary
+#
+# macOS cannot be cross-built from Linux without Apple's SDK, so it builds on
+# a GitHub-hosted macOS runner (free for this public repo), where both slices
+# link natively and `lipo` fuses them into one universal binary per tool.
+#
+# Every archive carries every binary, GUI ones included, plus README-PLAY.txt
+# (start `legaia-engine` with no arguments; it asks for the user's own disc).
+# The x86_64 Linux GUI binaries link cpal -> alsa-sys against a hand-unpacked
+# amd64 ALSA sysroot (setup-cross-toolchain.sh). docs/tooling/releases.md
+# covers the reasoning and the runner provisioning.
+#
+# The two build jobs only upload workflow artifacts; `publish` waits for both
+# AND for `verify`, folds every per-archive .sha256 into one SHA256SUMS, and
+# performs the single release edit -- so a release never appears with a
+# platform missing, and never ahead of the test gate.
+#
+# The tag event is owned by this workflow alone: main-ci.yml deliberately
+# does not trigger on tags, so a release does not race a duplicate full-CI
+# run for the same commit on the same single runner.
+#
+# Artifacts are our own compiled binaries and our own text files only. No
+# step reads a disc image and no game data is packaged -- this repo ships no
+# Sony-owned bytes.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build, e.g. v0.1.0. A build-only dry run (publish unchecked) also takes a branch or commit.'
+        required: true
+        type: string
+      publish:
+        description: 'Attach the artifacts to the GitHub release. Leave unchecked to build only.'
+        required: false
+        default: false
+        type: boolean
+
+# One release at a time, and never cancel one midway through uploading.
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  # -- Test gate --------------------------------------------------------------
+  # Mirrors main-ci.yml's `ci` job. A tag is normally cut from an already-green
+  # main, so this is belt-and-braces -- but a release is exactly where you want
+  # the braces. Disc-gated tests skip here (no LEGAIA_DISC_BIN), as everywhere.
+  verify:
+    name: Verify
+    runs-on: self-hosted
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          clean: true
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --workspace -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --profile release-test
+
+  # -- Linux-hosted targets ---------------------------------------------------
+  # One job rather than a per-target matrix: the three builds share a checkout
+  # and a cargo target dir on the single self-hosted runner.
+  build-cross:
+    name: Build (Linux + Windows)
+    needs: [verify]
+    runs-on: self-hosted
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          clean: true
+
+      - name: Derive version
+        id: version
+        run: |
+          tag="${RELEASE_TAG}"
+          version="${tag#v}"
+          # A dry run may name a branch; keep the archive name one path segment.
+          version="${version//\//-}"
+          if [ -z "$version" ]; then
+            echo "ERROR: could not derive a version from tag '$tag'" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Tag $tag -> version $version"
+
+      - name: Provision cross toolchains
+        run: |
+          for t in aarch64-unknown-linux-gnu \
+                   x86_64-pc-windows-gnu \
+                   x86_64-unknown-linux-gnu; do
+            scripts/ci/setup-cross-toolchain.sh "$t"
+          done
+
+      - name: Build + package all targets
+        run: |
+          rm -rf target/dist
+          for t in aarch64-unknown-linux-gnu \
+                   x86_64-pc-windows-gnu \
+                   x86_64-unknown-linux-gnu; do
+            scripts/ci/release-build.sh \
+              "${{ steps.version.outputs.version }}" "$t" target/dist
+          done
+
+      - name: Upload archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-cross
+          path: |
+            target/dist/*.tar.gz
+            target/dist/*.zip
+            target/dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # -- macOS ------------------------------------------------------------------
+  # GitHub-hosted (arm64). Runs alongside `verify`: nothing is published until
+  # `publish`, which needs `verify`, so a red gate still blocks the release.
+  build-macos:
+    name: Build (macOS universal)
+    runs-on: macos-14
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Derive version
+        id: version
+        run: |
+          tag="${RELEASE_TAG}"
+          version="${tag#v}"
+          version="${version//\//-}"
+          if [ -z "$version" ]; then
+            echo "ERROR: could not derive a version from tag '$tag'" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Provision targets
+        run: scripts/ci/setup-cross-toolchain.sh universal-apple-darwin
+
+      - name: Build + package
+        run: |
+          rm -rf target/dist
+          scripts/ci/release-build.sh \
+            "${{ steps.version.outputs.version }}" universal-apple-darwin target/dist
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos
+          path: |
+            target/dist/*.tar.gz
+            target/dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # -- Checksums + publish ----------------------------------------------------
+  # Waits for every build and the test gate. A single job performs exactly one
+  # release edit -- a per-platform publish would race on creating the release.
+  publish:
+    name: Checksums + Release
+    needs: [verify, build-cross, build-macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Aggregate SHA256SUMS
+        working-directory: dist
+        run: |
+          rm -f SHA256SUMS
+          # Each build verifies its own archive hash here before it is folded
+          # into the one manifest, so a corrupted transfer fails the release.
+          sha256sum -c ./*.sha256
+          cat ./*.sha256 > SHA256SUMS
+          rm -f ./*.sha256
+          for want in aarch64-unknown-linux-gnu.tar.gz \
+                      x86_64-unknown-linux-gnu.tar.gz \
+                      x86_64-pc-windows-gnu.zip \
+                      universal-apple-darwin.tar.gz; do
+            if ! grep -q -- "-${want}\$" SHA256SUMS; then
+              echo "ERROR: no archive for ${want}" >&2
+              exit 1
+            fi
+          done
+          sha256sum -c SHA256SUMS
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+
+      - name: Summary
+        run: |
+          {
+            echo "## Release ${RELEASE_TAG}"
+            echo ""
+            echo "| Artifact | Size |"
+            echo "|---|---|"
+            for f in dist/*.tar.gz dist/*.zip; do
+              [ -f "$f" ] || continue
+              echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"
+            done
+            echo ""
+            echo 'Every archive carries every workspace binary; README-PLAY.txt says how to start the game.'
+            echo 'See docs/tooling/releases.md.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Refuse to publish a non-tag
+        # A dispatch may build a branch as a dry run, but publishing one would
+        # make action-gh-release mint a new tag. Only an existing tag publishes.
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" >/dev/null; then
+            echo "ERROR: '${RELEASE_TAG}' is not an existing tag; refusing to publish" >&2
+            exit 1
+          fi
+
+      - name: Attach to GitHub release
+        # Tag pushes always publish. workflow_dispatch publishes only when
+        # explicitly asked, so the dispatch path is a safe dry run by default.
+        if: github.event_name == 'push' || inputs.publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          draft: false
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS

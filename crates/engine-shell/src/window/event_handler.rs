@@ -1,0 +1,254 @@
+//! Extracted from `window.rs` (mechanical split; behavior-preserving).
+
+use super::*;
+
+/// Two left presses this close together are the double-click that resets
+/// the follow camera's user framing - the common desktop default.
+const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+
+#[path = "event_handler/keyboard.rs"]
+mod keyboard;
+#[path = "event_handler/redraw.rs"]
+mod redraw;
+#[path = "event_handler/redraw_draws.rs"]
+mod redraw_draws;
+#[path = "event_handler/redraw_overlay.rs"]
+mod redraw_overlay;
+#[path = "event_handler/redraw_passes.rs"]
+mod redraw_passes;
+#[path = "event_handler/redraw_prep.rs"]
+mod redraw_prep;
+#[path = "event_handler/redraw_present.rs"]
+mod redraw_present;
+#[path = "event_handler/redraw_render.rs"]
+mod redraw_render;
+#[path = "event_handler/redraw_stage.rs"]
+mod redraw_stage;
+#[path = "event_handler/redraw_tick.rs"]
+mod redraw_tick;
+
+impl ApplicationHandler for PlayWindowApp {
+    fn resumed(&mut self, evl: &ActiveEventLoop) {
+        let setup = self.window_setup();
+        if !self.win.open_with(evl, minigames::WINDOW_TITLE, setup) {
+            return;
+        }
+        // Opt-in PSX-faithful rendering: affine (perspective-incorrect) UV
+        // warp + sub-pixel vertex jitter + 15-bit BGR555 ordered dithering on
+        // the 3D mesh pipelines. Off by default (clean modern output); enable
+        // with `--psx-render` or `LEGAIA_PSX_RENDER=1` (the play page's
+        // "PSX look" box is the runtime twin).
+        if self.psx_render
+            && let Some(r) = self.win.renderer.as_ref()
+        {
+            r.set_psx_mode(true);
+            log::info!("play-window: PSX-faithful render mode enabled");
+        }
+        // Opt-in dynamic-lighting enhancement (`--dynamic-lighting`, or the
+        // `I` key at runtime): soft warm directional light + screen-centred
+        // light pool over the baked shading. Off by default - retail has no
+        // field light source, and the disabled path is pixel-identical.
+        if self.dynamic_lighting
+            && let Some(r) = self.win.renderer.as_ref()
+        {
+            r.set_dynamic_lighting(true);
+            log::info!("play-window: dynamic-lighting enhancement enabled (I toggles)");
+        }
+        // Shadow sub-toggle (`--no-dyn-shadows` / the `Y` key): the derived
+        // per-scene point lights + their PCF shadow maps. Inert while
+        // dynamic lighting is off, so this is safe to stage unconditionally.
+        // Camera-occlusion fade (`--no-occlusion-fade` / the `F4` key):
+        // default-on see-through walls; inert until the field redraw pass
+        // stages a player focus, so staging the toggle here is safe too.
+        if let Some(r) = self.win.renderer.as_ref() {
+            r.set_dyn_shadows(self.options_state.light_shadows);
+            r.set_occlusion_fade(self.options_state.occlusion_fade);
+            r.set_bloom(self.options_state.bloom);
+        }
+        self.upload_assets();
+        self.win.request_redraw();
+    }
+
+    fn window_event(&mut self, evl: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // A `--screenshot` run is driven entirely by `--key-script` /
+        // `--pad-script`; host input must not reach it. The window opens on a
+        // shared desktop and can take focus, so a stray keystroke (every
+        // letter and F-key here is a live toggle), a drag or a wheel notch
+        // would change the captured frame between two runs of the same
+        // command - the shape of a capture-pair oracle going red with no
+        // change to the engine.
+        if self.screenshot.is_some()
+            && matches!(
+                event,
+                WindowEvent::KeyboardInput { .. }
+                    | WindowEvent::CursorMoved { .. }
+                    | WindowEvent::MouseInput { .. }
+                    | WindowEvent::MouseWheel { .. }
+                    | WindowEvent::Focused(_)
+            )
+        {
+            return;
+        }
+        match event {
+            WindowEvent::CloseRequested => {
+                // Flush any pending record log before exiting so an Escape /
+                // window-close mid-session produces a usable replay file.
+                if let Some(log) = self.record_log.as_mut()
+                    && let Err(e) = log.flush()
+                {
+                    log::error!("record: flush on CloseRequested failed: {e:#}");
+                }
+                evl.exit();
+            }
+            WindowEvent::Resized(size) => self.win.handle_resize(size.width, size.height),
+            // Losing focus drops every held key, as the browser page's `blur`
+            // handler does: the release of a key held while the window lost
+            // focus never arrives here, so the player kept walking into a
+            // wall until the key was pressed and released again.
+            // The controller is forgotten too (`StandardGamepad::reset`, the
+            // page's `legaiaResetGamepad`): a button still held re-enters on
+            // the next poll as a fresh press, not a stuck one.
+            WindowEvent::Focused(false) => {
+                let prev = self.pad | self.gamepad_held;
+                self.pad = 0;
+                self.gamepad_held = 0;
+                if let Some(gp) = self.gamepad.as_mut() {
+                    gp.reset();
+                }
+                self.pad_taps.clear();
+                if prev != 0
+                    && let Some(log) = self.record_log.as_mut()
+                {
+                    log.record_transition(self.session.frames, 0);
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(code),
+                        state,
+                        ..
+                    },
+                ..
+            } => {
+                self.handle_keyboard(evl, code, state);
+            }
+            // Alt is read for the Alt+Enter fullscreen toggle only.
+            WindowEvent::ModifiersChanged(m) => self.alt_held = m.state().alt_key(),
+            // Left-mouse drag-orbit. Horizontal drag rotates the field camera
+            // around the player (`Camera::manual_orbit`); the movement
+            // compass reads the same field, so the d-pad remap tracks the
+            // orbited view (see `camera_view::field_follow_view`). Field free-roam
+            // only - world map / battle / menus keep their own cameras.
+            //
+            // Vertical drag pitches the `F3` debug orbit vantage, which is
+            // the one camera this window owns. Both rates and both clamps are
+            // the browser play page's (`window::camera::debug_orbit`), so a
+            // given gesture moves the camera by the same amount on either
+            // host - the yaw rate used to differ by a third, on a field the
+            // *simulation* reads.
+            //
+            // With the retail follow camera live (no `F3`), all three knobs
+            // steer the ENGINE camera through its cutscene-gated setters
+            // (`Camera::orbit_by` / `tilt_by` / `zoom_by`): the view stays
+            // centred on the character, a running scripted shot keeps the
+            // camera where the script put it, and the browser play page
+            // drives the same three fields from the same gestures.
+            WindowEvent::CursorMoved { position, .. } => {
+                let world = &self.session.host.world;
+                if let Some(last) = self.orbit_drag_last_x {
+                    let dx = (position.x - last) as f32;
+                    if dx != 0.0 && !self.boot_ui.is_active() {
+                        let rad = dx * camera::debug_orbit::YAW_RAD_PER_PX;
+                        if self.field_debug_camera {
+                            // The debug orbit is not a second yaw: this
+                            // window's vantage is `fixed diagonal +
+                            // manual_orbit`, so the drag lands on the very
+                            // field the follow camera reads and leaving `F3`
+                            // needs no hand-off. Shared with the browser play
+                            // page as `Camera::debug_orbit_by`, which is
+                            // un-gated by the cutscene (a dev vantage) but
+                            // still field-only.
+                            self.session.camera.debug_orbit_by(world, rad);
+                        } else {
+                            self.session.camera.orbit_by(world, rad);
+                        }
+                    }
+                    self.orbit_drag_last_x = Some(position.x);
+                }
+                if let Some(last) = self.orbit_drag_last_y {
+                    let dy = (position.y - last) as f32;
+                    if dy != 0.0 && !self.boot_ui.is_active() {
+                        let rad = dy * camera::debug_orbit::PITCH_RAD_PER_PX;
+                        if self.field_debug_camera {
+                            self.debug_orbit_pitch = (self.debug_orbit_pitch + rad).clamp(
+                                camera::debug_orbit::PITCH_MIN,
+                                camera::debug_orbit::PITCH_MAX,
+                            );
+                        } else {
+                            self.session.camera.tilt_by(world, rad);
+                        }
+                    }
+                    self.orbit_drag_last_y = Some(position.y);
+                }
+                self.cursor_x = position.x;
+                self.cursor_y = position.y;
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: winit::event::MouseButton::Left,
+                ..
+            } => {
+                let held = state == ElementState::Pressed;
+                self.orbit_drag_last_x = held.then_some(self.cursor_x);
+                self.orbit_drag_last_y = held.then_some(self.cursor_y);
+                // Double-click: the follow camera back to retail framing on
+                // the lead (`Camera::recenter_follow`), the page's `dblclick`.
+                // The `T` preset is a persisted option and stays.
+                if held {
+                    let now = std::time::Instant::now();
+                    let double = self
+                        .last_left_press
+                        .is_some_and(|t| now.duration_since(t) <= DOUBLE_CLICK_WINDOW);
+                    self.last_left_press = (!double).then_some(now);
+                    if double && !self.field_debug_camera && !self.boot_ui.is_active() {
+                        // The page's Reset camera button and `dblclick` run
+                        // the same kernel (`play_camera_reset_framing`).
+                        self.session
+                            .camera
+                            .recenter_follow(&self.session.host.world);
+                        log::info!("camera: follow framing reset (double-click)");
+                    }
+                }
+            }
+            // Wheel: continuous zoom. On the follow camera it scales the
+            // retail eye-back depth (`Camera::manual_zoom`, cutscene-gated);
+            // on the `F3` debug orbit it is the page's `halfWidth` knob. A
+            // notch out pulls back and a notch in closes, by the page's own
+            // factors; the `T` distance preset stays a separate coarse
+            // multiplier under both, as it is on both hosts.
+            WindowEvent::MouseWheel { delta, .. } => {
+                let notches = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 120.0,
+                };
+                if notches != 0.0 && !self.boot_ui.is_active() {
+                    let f = if notches < 0.0 {
+                        camera::debug_orbit::ZOOM_OUT
+                    } else {
+                        camera::debug_orbit::ZOOM_IN
+                    };
+                    if self.field_debug_camera {
+                        self.debug_orbit_zoom = (self.debug_orbit_zoom * f).clamp(0.05, 20.0);
+                    } else {
+                        self.session.camera.zoom_by(&self.session.host.world, f);
+                    }
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                self.handle_redraw();
+            }
+            _ => {}
+        }
+    }
+}

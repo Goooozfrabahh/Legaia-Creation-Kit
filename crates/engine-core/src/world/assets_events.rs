@@ -1,0 +1,520 @@
+//! VDF/global-TMD registration, event/spawn drains, battle-event folding, and status-effect ticking.
+
+use super::*;
+
+impl World {
+    /// Install the VDF ("set_mime") buffer for the active scene. The bytes
+    /// must follow the `[u32 count][u32 byte_offsets[count]][body...]`
+    /// layout the retail asset-dispatcher case 7 produces; see
+    /// [`Self::vdf_buffer`] for citation. Engines that want the
+    /// field-VM `0x4C 0xD8` opcode to surface real spawn bytecode call
+    /// this on scene-load with the extracted asset-type-7 chunk's body.
+    ///
+    /// Passing `None` clears the buffer; the next `0x4C 0xD8` call will
+    /// leave `Actor::spawn_record` empty.
+    pub fn set_vdf_buffer(&mut self, bytes: Option<Vec<u8>>) {
+        self.vdf_buffer = bytes;
+    }
+
+    /// Resolve a VDF body slice by index using the
+    /// `[u32 count][u32 byte_offsets[count]][body...]` layout. Each
+    /// returned slice starts at `byte_offsets[idx]` and runs to the
+    /// next body's offset (or end-of-buffer for the last entry).
+    ///
+    /// Returns `None` when:
+    ///  - no VDF buffer is set (the scene loader skipped the install),
+    ///  - the buffer is too short to read the header,
+    ///  - `idx >= count`, or
+    ///  - the indexed offset walks past end-of-buffer.
+    ///
+    /// Mirrors the retail body at
+    /// `ghidra/scripts/funcs/overlay_cutscene_dialogue_801d77f4.txt:152-203`:
+    /// `puVar11 = (uint *)(iVar12 + *(int *)(((vdf_idx << 16) >> 14) + iVar12 + 4))`.
+    pub fn vdf_record_bytes(&self, idx: u8) -> Option<&[u8]> {
+        legaia_engine_scene::scene_bundle::vdf_entry(self.vdf_buffer.as_deref()?, idx)
+    }
+
+    /// Install a global TMD at pool index `idx`. The pool grows lazily on
+    /// write to accommodate sparse loader-chain installs. Indices that
+    /// later producers fill in stay `None` until they're explicitly set.
+    ///
+    /// Mirrors the retail `FUN_80026B4C` writer
+    /// (`DAT_8007C018[DAT_8007B774++] = tmd_ptr`) but exposes the index
+    /// directly rather than auto-bumping a counter - engines that want
+    /// the retail behaviour can read the next free slot via
+    /// [`Self::global_tmd_pool`]`.len()` and pass it here.
+    pub fn set_global_tmd(&mut self, idx: usize, tmd: Arc<GlobalTmd>) {
+        if idx >= self.global_tmd_pool.len() {
+            self.global_tmd_pool.resize(idx + 1, None);
+        }
+        self.global_tmd_pool[idx] = Some(tmd);
+    }
+
+    /// Resolve a global TMD by pool index. Mirrors the retail field-VM
+    /// allocator's `iVar13 = DAT_8007C018[(int16_t)tmd_idx]` read - the
+    /// caller is responsible for clamping negative indices (the retail
+    /// engine sign-extends the i16 then implicitly treats it as unsigned;
+    /// the port returns `None` for negative or out-of-range
+    /// indices via the `i16 → usize` cast guarded by the bounds check).
+    ///
+    /// Returns `None` when the slot is empty or `idx` is out of range.
+    pub fn global_tmd(&self, idx: i16) -> Option<&Arc<GlobalTmd>> {
+        if idx < 0 {
+            return None;
+        }
+        self.global_tmd_pool.get(idx as usize)?.as_ref()
+    }
+
+    /// Resolve a field model operand the way the `0x4C 0xD8` arm does: the
+    /// arm adds the scene-bank base `*(u16*)0x8007B6F8` to the operand
+    /// (`lhu s0,-0x4908` + `addu` at `0x801E2DE0..0x801E2DE8`) and
+    /// `FUN_801D77F4` then reads `DAT_8007C018[slot]` with no further
+    /// adjustment (`0x801D7854..0x801D7878`). So a non-negative operand is a
+    /// scene-bank index ([`Self::field_scene_bank`]); an operand in `-5..0`
+    /// reaches the player head, which [`Self::global_tmd`] holds.
+    pub fn field_pool_tmd(&self, operand: i16) -> Option<&Arc<GlobalTmd>> {
+        let slot = i32::from(operand) + i32::from(legaia_engine_scene::model_bank::SCENE_BANK_BASE);
+        if slot < 0 {
+            return None;
+        }
+        let bank = slot - i32::from(legaia_engine_scene::model_bank::SCENE_BANK_BASE);
+        if bank >= 0 {
+            self.field_scene_bank.get(bank as usize)?.as_ref()
+        } else {
+            self.global_tmd(slot as i16)
+        }
+    }
+
+    /// Install the field scene's model bank ([`Self::field_scene_bank`]).
+    pub fn install_field_scene_bank(&mut self, bank: Vec<Option<Arc<GlobalTmd>>>) {
+        self.field_scene_bank = bank;
+    }
+
+    /// Drain emitted field-VM events. Engines call once per frame after
+    /// [`World::tick`] to dispatch BGM, dialog, money, etc. Returns events
+    /// in emission order.
+    pub fn drain_field_events(&mut self) -> Vec<FieldEvent> {
+        std::mem::take(&mut self.pending_field_events)
+    }
+
+    /// The play hosts' end-of-frame field-event drain: empty
+    /// [`Self::pending_field_events`] and queue, onto `pending`, every
+    /// [`FieldEvent::ActorSpawned`] slot whose actor carries a TMD reference
+    /// (the `0x4C 0xD8` synchronous-spawn path), once per slot. A host
+    /// uploads each queued slot's mesh on its next render pass.
+    ///
+    /// Every other event is dropped: by the time a host drains, the session
+    /// tick has already routed what it answers (BGM, the camera configure
+    /// beats), and the rest is presentation each host reads off the world's
+    /// own state. A spawn without a TMD reference (the `0x4C 0x80`
+    /// bytecode-only path) has no mesh to upload until its bytecode runs.
+    ///
+    /// One body for both hosts: the native window's copy used to queue a
+    /// slot twice when two spawns of it landed in one queue, while the
+    /// page's deduplicated.
+    pub fn drain_spawned_mesh_slots(&mut self, pending: &mut Vec<u8>) {
+        for ev in self.drain_field_events() {
+            if let FieldEvent::ActorSpawned { slot, .. } = ev {
+                let has_tmd = self
+                    .actors
+                    .get(slot as usize)
+                    .is_some_and(|a| a.tmd_ref.is_some());
+                if has_tmd && !pending.contains(&slot) {
+                    pending.push(slot);
+                }
+            }
+        }
+    }
+
+    /// Drain queued actor-spawn requests emitted by field-VM op `0x4C 0x80`.
+    /// Each entry is the variable-length bytecode stream for one child
+    /// actor. Engines route these into their actor pool.
+    pub fn drain_actor_spawns(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.pending_actor_spawns)
+    }
+
+    /// Engine-side consumer for queued actor-spawn requests.
+    ///
+    /// Drains [`Self::pending_actor_spawns`] (records queued by the
+    /// `0x4C 0x80` halt-acquire-gated path) and, for each record:
+    /// 1. Scans `actors[start_slot..MAX_ACTORS]` for the first inactive
+    ///    slot. Slots `0..start_slot` are skipped so engines keep their
+    ///    party / scripted actors out of the auto-allocation range.
+    /// 2. Activates the slot and stores the record bytes on
+    ///    [`Actor::spawn_record`]. The retail allocator writes the
+    ///    bytecode pointer to `actor[+0x90]` (different from the `+0x4C`
+    ///    VDF-body field that the synchronous `0x4C 0xD8` path uses);
+    ///    the port stores the raw bytes on `spawn_record`
+    ///    regardless and lets the engine route them as field-VM
+    ///    bytecode for a child actor (the records are scripted-child
+    ///    coroutines, not TMD-body or kind/variant tuples).
+    /// 3. Emits a [`FieldEvent::ActorSpawned`] event for the engine.
+    ///
+    /// Leaves [`Actor::kind`] and [`Actor::variant`] at zero. The
+    /// retail allocator for this opcode (overlay code at
+    /// `overlay_world_map_801de840.txt:7080-7123` case `8 sub-0`)
+    /// allocates from pool `0x801f28a0` and writes only
+    /// `actor[+0x90]` (bytecode ptr), `actor[+0x94]` (parent
+    /// back-pointer) and `actor[+0x54] = 0`; the `+0x3C`/`+0x3E`
+    /// kind/variant fields are never written by this path, so zero
+    /// matches retail.
+    ///
+    /// Mirrors the retail allocator's pool-exhausted branch: if no
+    /// inactive slot is available, the record is dropped silently and
+    /// a [`FieldEvent::ActorSpawnFailed`] event is emitted instead.
+    ///
+    /// Returns the count of slots that were actually allocated.
+    pub fn materialize_actor_spawns(&mut self, start_slot: u8) -> usize {
+        let start = (start_slot as usize).min(self.actors.len());
+        let records = std::mem::take(&mut self.pending_actor_spawns);
+        let mut allocated = 0usize;
+        for record in records {
+            match self
+                .actors
+                .iter()
+                .enumerate()
+                .skip(start)
+                .find(|(_, a)| !a.active)
+                .map(|(i, _)| i)
+            {
+                Some(slot_idx) => {
+                    let actor = &mut self.actors[slot_idx];
+                    actor.active = true;
+                    actor.kind = 0;
+                    actor.variant = 0;
+                    actor.spawn_record = Some(record.clone());
+                    self.pending_field_events.push(FieldEvent::ActorSpawned {
+                        slot: slot_idx as u8,
+                        kind: 0,
+                        variant: 0,
+                        record,
+                    });
+                    allocated += 1;
+                }
+                None => {
+                    self.pending_field_events
+                        .push(FieldEvent::ActorSpawnFailed { record });
+                }
+            }
+        }
+        allocated
+    }
+
+    /// Drain emitted battle action events. Engines call once per frame
+    /// after [`World::tick`] to dispatch poses, UI elements, damage, etc.
+    /// Returns events in emission order.
+    pub fn drain_battle_events(&mut self) -> Vec<BattleEvent> {
+        std::mem::take(&mut self.pending_battle_events)
+    }
+
+    /// Drain the presentation-only per-strike HP deltas queued by the live
+    /// battle loop. Engines feed these into a damage-popup model; the HP
+    /// mutation has already happened, so they are never re-applied. Returns
+    /// the FX in the order they were resolved this frame.
+    pub fn drain_battle_hit_fx(&mut self) -> Vec<BattleHitFx> {
+        std::mem::take(&mut self.battle.hit_fx)
+    }
+
+    /// Drain the battle sound cues queued this frame (the art-strike `HitCue`
+    /// sounds [`Self::fold_battle_event`] resolves). The host plays each through
+    /// its `SfxBank::play_one_shot` at the cue's `timing_frames` delay; nothing
+    /// here mutates gameplay state. Returns them in resolve order.
+    /// Take this tick's CD-XA clip requests (see
+    /// [`crate::world::AudioState::battle_xa_cues`]). A host with a staged
+    /// `legaia_engine_audio::XaClipBank` plays each one; the request is a
+    /// `(clip_slot, channel, duration_sectors)` triple in the retail
+    /// starter's own terms.
+    pub fn drain_battle_xa_cues(&mut self) -> Vec<legaia_engine_system::sound_state::XaVoiceClip> {
+        std::mem::take(&mut self.audio.battle_xa_cues)
+    }
+
+    /// Take the cast voices this round's committed spells may raise (see
+    /// [`crate::world::AudioState::battle_xa_prestage`]): every
+    /// `(clip_slot, channel, duration_sectors)` the cast modules' head cues
+    /// can resolve to, both candidates of a coin-flip module included. A host
+    /// that decodes clips lazily stages these ahead; one that decodes on
+    /// demand drains and drops them. Nothing plays from here.
+    pub fn drain_battle_xa_prestage(
+        &mut self,
+    ) -> Vec<legaia_engine_system::sound_state::XaVoiceClip> {
+        std::mem::take(&mut self.audio.battle_xa_prestage)
+    }
+
+    /// Drain the hit events the attack band resolved
+    /// ([`legaia_engine_battle::battle_events::BattleHitEvent`]; one per damage-kernel
+    /// resolution). Cosmetic: the accumulate / apply has already happened.
+    pub fn drain_battle_hit_events(
+        &mut self,
+    ) -> Vec<legaia_engine_battle::battle_events::BattleHitEvent> {
+        std::mem::take(&mut self.battle.hit_events)
+    }
+
+    /// Take the field script's pending audio duck (op `4C 4D`), a percentage
+    /// of the configured level. The session's audio frame hands it to the
+    /// director's duck, the one both play hosts run.
+    pub fn take_field_audio_duck(&mut self) -> Option<u8> {
+        self.audio.field_duck_pct.take()
+    }
+
+    pub fn drain_battle_sfx_cues(&mut self) -> Vec<BattleSfxCue> {
+        std::mem::take(&mut self.audio.battle_sfx_cues)
+    }
+
+    /// Drain the battle **effect-script spawn requests** queued this frame -
+    /// one per effect record the per-actor effect-script walk consumed
+    /// ([`legaia_engine_effects::action_effect_script::step_effect_script`], driven from
+    /// [`World::tick_battle_animations`]). Cosmetic: each carries a world
+    /// position already rotated by the acting actor's facing. The host routes
+    /// the `direct` form into the 2D effect pool
+    /// ([`World::try_spawn_effect`]) and the table form into the
+    /// `0x801F6324` scene-graph spawner
+    /// ([`World::spawn_action_table_effect`]); nothing here mutates gameplay
+    /// state beyond the SFX queue below. Returns them in walk order.
+    ///
+    /// Draining also queues each table-form spawn's **per-effect CLUT stage**
+    /// onto [`crate::world::BattleState::clut_stages`], mirroring retail's table arm: only
+    /// a plain code below
+    /// [`legaia_engine_effects::action_effect_script::TABLE_CLUT_GATE`] consults the
+    /// `0x801F6418` map, and only a non-zero byte performs the copy. The map
+    /// comes off the installed move-power catalog's aux tables (the same PROT
+    /// 0898 parse the table spawner reads its prototypes from), so a
+    /// disc-free battle degrades to unstaged palettes exactly as it degrades
+    /// to no spawns.
+    ///
+    /// That byte was pushed into [`crate::world::AudioState::battle_sfx_cues`] as a sound cue id
+    /// while `0x801F6418` was read as an SFX map and `FUN_80058490` as the
+    /// sound-driver command lane. Both readings are false - the byte is a
+    /// VRAM x and the call is `MoveImage` - so the SFX scheduler was being
+    /// handed palette columns to look up in a sound bank. See
+    /// [`legaia_engine_battle::battle_effect_clut`].
+    ///
+    /// PORT: FUN_801DEA50 (`0x801df0d4..0x801df134`, the CLUT-stage arm)
+    /// REF: FUN_80058490 (`MoveImage` - the blit the `RECT` reaches)
+    pub fn drain_battle_effect_spawns(
+        &mut self,
+    ) -> Vec<legaia_engine_battle::battle_events::BattleEffectSpawn> {
+        if let Some(aux) = self
+            .tables
+            .move_power
+            .as_ref()
+            .and_then(|cat| cat.aux_tables())
+        {
+            let stages: Vec<u8> = self
+                .battle
+                .effect_spawns
+                .iter()
+                .filter(|s| {
+                    !s.direct
+                        && s.effect < legaia_engine_effects::action_effect_script::TABLE_CLUT_GATE
+                })
+                .filter_map(|s| aux.effect_clut_x(s.effect).filter(|&b| b != 0))
+                .collect();
+            self.battle.clut_stages.extend(stages);
+        }
+        std::mem::take(&mut self.battle.effect_spawns)
+    }
+
+    /// Drain the battle **effect CLUT stages** queued this frame - one source
+    /// x per table-form effect spawn whose `0x801F6418` map byte is non-zero.
+    /// A host applies each with
+    /// [`legaia_engine_battle::battle_effect_clut::stage_effect_clut`] against its battle
+    /// VRAM and re-uploads; purely cosmetic, like the spawns themselves.
+    pub fn drain_battle_clut_stages(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.battle.clut_stages)
+    }
+
+    /// Drain the Tactical-Arts shout cues queued this frame (one per executed
+    /// party art with a real action constant, pushed at art start). The host
+    /// resolves each against its arts-voice bank and plays the CD-XA shout
+    /// clip; nothing here mutates gameplay state.
+    pub fn drain_battle_shout_cues(
+        &mut self,
+    ) -> Vec<legaia_engine_battle::battle_events::BattleShoutCue> {
+        std::mem::take(&mut self.audio.battle_shout_cues)
+    }
+
+    /// Apply the gameplay-state side of a single battle event - currently
+    /// `ApplyArtStrike` (subtracts the resolved damage from the target's
+    /// `BattleActor::hp`, clamping at zero, and records the enemy effect on
+    /// the target's `pending_status`). Engines that want both the visual
+    /// dispatch and the gameplay-state update call this for each event
+    /// drained from [`Self::drain_battle_events`].
+    ///
+    /// Returns `Some((target_slot, hp_after))` for events that changed HP,
+    /// `None` otherwise - useful for HUD popups that want the post-hit HP.
+    pub fn fold_battle_event(&mut self, event: &BattleEvent) -> Option<(u8, u16)> {
+        match event {
+            BattleEvent::ApplyArtStrike {
+                actor_slot,
+                target_slot,
+                outcome,
+                ..
+            } => {
+                // Surface the strike's sound cues for the host's SFX bank.
+                // Hit-effect-only cues (kind 0x4C) are dropped deliberately,
+                // and the retail dispatch says why: the only cue consumer is
+                // the effect-script walk (FUN_801DEA50), whose table arm
+                // gives a plain code >= 0x32 no sound (the `sltiu 0x32` gate
+                // at 0x801df0d4) and whose prototype word for 0x4C - read at
+                // 0x801F6454, past the 61-entry table - is zero on disc, a
+                // NULL part record. So a 0x4C cue names no authored visual
+                // either; the real per-strike visuals ride the committed
+                // clip's effect script, already walked per frame by
+                // `World::tick_battle_animations` and routed into both spawn
+                // paths. Note `hit_cue` itself has no live producer today:
+                // the art-record parser never fills `hit_cues`
+                // (`legaia_art::parse::parse_record` stops before the
+                // spreadsheet's cue words), so this loop only fires for
+                // host-installed records.
+                // REF: FUN_801DEA50 (the cue dispatch; see
+                // crates/engine-effects/src/action_effect_script.rs)
+                for cue in &outcome.cues {
+                    if cue.is_sound() {
+                        self.audio.battle_sfx_cues.push(BattleSfxCue {
+                            kind: cue.kind,
+                            timing_frames: cue.timing_frames,
+                            actor_slot: *actor_slot,
+                            target_slot: *target_slot,
+                        });
+                    }
+                }
+                // A petrified target (Stone) can't be damaged - the strike is
+                // fully absorbed (and so doesn't wake a Sleep/Numb either).
+                let petrified = self.actor_is_petrified(*target_slot);
+                if let Some(target) = self.actors.get_mut(*target_slot as usize) {
+                    if let Some(dmg) = outcome.damage
+                        && !petrified
+                    {
+                        target.battle.hp = target.battle.hp.saturating_sub(dmg);
+                        // Damage clears Sleep / Numb on the target (matches
+                        // retail - the unit wakes when hit).
+                        self.battle.status_effects.on_damaged(*target_slot);
+                    }
+                    let applied = if outcome.enemy_effect != legaia_art::record::EnemyEffect::None {
+                        target.pending_status = Some(outcome.enemy_effect);
+                        // Push the status into the tracker so it
+                        // subsequently ticks per-turn.
+                        self.battle
+                            .status_effects
+                            .apply_from_enemy_effect(*target_slot, outcome.enemy_effect)
+                    } else {
+                        None
+                    };
+                    let hp = target.battle.hp;
+                    // Rot's applier rolls the disabled limb (`rand % 3`,
+                    // the retail `1 << (rand%3 + 3)` bit pick).
+                    if applied == Some(legaia_engine_battle_vm::status_effects::StatusKind::Rot) {
+                        let limb = (self.next_rand() % 3) as u8;
+                        self.battle.status_effects.set_rot_limb(*target_slot, limb);
+                    }
+                    return Some((*target_slot, hp));
+                }
+                None
+            }
+            // Cast band (SM path): the per-actor action SM fires
+            // `spell_anim_trigger` at `MagicPreCastWait`. For a player Seru-magic
+            // id, request the summon spawn (the host resolves the overlay PROT
+            // entry + spawns). Origin = the caster party slot's position when
+            // available, else a default forward cast point.
+            BattleEvent::BattleEnd {
+                cause: BattleEndCause::Escaped,
+            } => {
+                // Retail escape teardown (battle SM state 0x66): stage the
+                // 0x40-frame black→white screen fade the SM spawns through
+                // the fade primitive before the battle unloads.
+                self.presentation.fade = Some(legaia_engine_system::fade::FadeState::load(
+                    &legaia_engine_system::fade::escape_fade_template(),
+                ));
+                // A petrified member returns to normal when the party
+                // escapes (retail's run band floors every downed party
+                // slot's HP at 1 on a successful escape; the tracker-level
+                // Stone clear is the engine's model of that restore).
+                self.battle.status_effects.cure_stone_on_escape();
+                // The run band's floor writes the VM-side liveness (`+0x14C`);
+                // mirror it onto the world HP so the live loop's hp==0 dead
+                // scan doesn't re-down the member - a downed member leaves
+                // the battle alive at 1 HP.
+                for slot in 0..self.party.party_count.min(3) as usize {
+                    let b = &mut self.actors[slot].battle;
+                    if b.max_hp > 0 && b.hp == 0 {
+                        b.hp = 1;
+                        b.liveness = 1;
+                    }
+                }
+                None
+            }
+            // The cast trigger's work - the summon sub-route + the stager
+            // arm for a Seru id, the fold for the rest - is done at the host
+            // seam (`BattleHostImpl::spell_anim_trigger`, `FUN_801DBF9C`);
+            // the creature spawn is the stager's first tick, not the
+            // trigger's. The event stays observable.
+            BattleEvent::SpellAnimTrigger { .. } => None,
+            _ => None,
+        }
+    }
+
+    /// Step every actor's status effects forward one turn - folds the
+    /// tick-damage into `BattleActor::hp` and emits per-status events.
+    /// Called by engines once per battle round.
+    pub fn tick_status_effects(&mut self) {
+        let actor_count = self.actors.len();
+        for slot in 0..actor_count as u8 {
+            let (cur, max) = self
+                .actors
+                .get(slot as usize)
+                .map(|a| (a.battle.hp, a.battle.max_hp))
+                .unwrap_or((0, 0));
+            if max == 0 {
+                continue;
+            }
+            use legaia_engine_battle_vm::status_effects::StatusKind;
+            let fx = &self.battle.status_effects;
+            let (toxic, venom) = (
+                fx.has(slot, StatusKind::Toxic),
+                fx.has(slot, StatusKind::Venom),
+            );
+            let dmg = self.battle.status_effects.tick_actor(slot, cur, max);
+            // In a scripted fight a monster's DoT lasts one tick: the arm
+            // that ticked clears its own bit (`andi 0xFFFD` at `0x801E762C`
+            // for Toxic, `andi 0xFFFE` at `0x801E76C4` for Venom, both behind
+            // `ctx[+0x287] != 0` and `slot >= 3`). Toxic is tested first, so
+            // a monster carrying both keeps its Venom for the next round.
+            if self.battle.scripted_fight && slot >= self.party.party_count && cur != 0 {
+                let kind = if toxic {
+                    Some(StatusKind::Toxic)
+                } else if venom {
+                    Some(StatusKind::Venom)
+                } else {
+                    None
+                };
+                if let Some(kind) = kind {
+                    self.battle.status_effects.cure(slot, kind);
+                    if let Some(a) = self.actors.get_mut(slot as usize) {
+                        a.battle.field_flags &= !kind.display_bit();
+                    }
+                }
+            }
+            if dmg > 0
+                && let Some(actor) = self.actors.get_mut(slot as usize)
+            {
+                actor.battle.hp = actor.battle.hp.saturating_sub(dmg);
+                // A DoT kill is a death: pair HP==0 with liveness=0 like every
+                // other damage entry point (fold_spell_outcome /
+                // apply_combo_total). Otherwise the corpse stays "alive" for
+                // the liveness-keyed wipe checks + target/turn resolvers.
+                if actor.battle.hp == 0 {
+                    actor.battle.liveness = 0;
+                }
+                // Retail's ticker force-assigns the displayed bar from live HP
+                // right after each of its two HP writes (`FUN_801E752C`,
+                // `0x801E7600` / `0x801E7698`) rather than seeding the ramp
+                // accumulator. That re-sync is the only one in the dumped
+                // battle corpus, and it is what lets a desynced party actor
+                // recover instead of parking the action SM at state `0x51`
+                // forever.
+                // REF: FUN_801E752C
+                actor.battle.resync_hp_bar();
+            }
+        }
+    }
+}

@@ -1,0 +1,3044 @@
+<!--HEAD: <style>
+.play-shell { display: flex; flex-direction: column; gap: 1rem; }
+
+.play-load {
+  display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap;
+  padding: 0.75rem; border: 1px solid var(--border); background: var(--bg-card);
+}
+.play-load input[type="file"] {
+  color: var(--text-muted); font-family: var(--font-mono); font-size: 0.85rem;
+}
+.play-status {
+  color: var(--text-dim); font-family: var(--font-mono); font-size: 0.82rem;
+  flex: 1; min-width: 14rem;
+}
+
+/* The rich save bar sits directly under the disc chooser, above the boot
+   modes, so importing/resuming a save is the first thing offered next to the
+   playable content. The component styles itself (js/legaia-saves.js). */
+.play-saves-strip { display: block; }
+
+/* Memory-card rack: the two card ports the in-game Load / Save screens read
+   and write. Sits under the save bar it draws its cards from. */
+.play-card-rack {
+  border: 1px solid var(--border); background: var(--bg-card);
+  border-radius: 4px; padding: 0.5rem 0.65rem; font-family: var(--font-mono);
+}
+.play-card-rack-head {
+  font-size: 0.68rem; color: var(--text-dim); text-transform: uppercase;
+  letter-spacing: 0.06em; padding-bottom: 0.4rem;
+}
+.play-card-rack-head b { color: var(--text); }
+.play-card-ports { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.play-card-port {
+  flex: 1 1 16rem; display: flex; align-items: center; gap: 0.5rem;
+  border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg-code); padding: 0.4rem 0.55rem;
+}
+.play-card-port.is-filled { border-color: var(--accent); }
+.play-card-port-name {
+  flex: none; font-size: 0.66rem; color: var(--accent);
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.play-card-port select {
+  flex: 1; min-width: 0; background: var(--bg-card); color: var(--text);
+  border: 1px solid var(--border); border-radius: 3px;
+  font-family: var(--font-mono); font-size: 0.7rem; padding: 0.16rem 0.3rem;
+}
+.play-card-port-dirty { flex: none; font-size: 0.66rem; color: #d8b34b; }
+.play-card-btn {
+  flex: none; background: var(--bg-card); color: var(--text);
+  border: 1px solid var(--border); border-radius: 3px; cursor: pointer;
+  font-family: var(--font-mono); font-size: 0.66rem; padding: 0.16rem 0.45rem;
+}
+.play-card-btn:hover:not([disabled]) { border-color: var(--accent); }
+.play-card-btn[disabled] { opacity: 0.4; cursor: not-allowed; }
+.play-card-note {
+  font-size: 0.7rem; color: var(--text-dim); padding-top: 0.4rem; line-height: 1.5;
+}
+
+/* Boot-mode presets. */
+.play-modes { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0.6rem; }
+.play-mode {
+  text-align: left; background: var(--bg-card); border: 1px solid var(--border);
+  padding: 0.7rem 0.8rem; cursor: pointer; color: var(--text);
+  display: flex; flex-direction: column; gap: 0.25rem;
+  transition: border-color var(--transition), background var(--transition);
+}
+.play-mode:hover:not([disabled]) { border-color: var(--accent); background: var(--bg-raised); }
+.play-mode[disabled] { opacity: 0.45; cursor: not-allowed; }
+.play-mode.is-active { border-color: var(--accent); background: var(--accent-soft); }
+.play-mode-name { font-weight: 600; font-size: 0.92rem; }
+.play-mode-desc { color: var(--text-muted); font-size: 0.76rem; line-height: 1.45; }
+.play-mode-tag {
+  font-family: var(--font-mono); font-size: 0.66rem; color: var(--text-dim);
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+
+/* Stage: canvas + side rail. */
+.play-stage { display: grid; grid-template-columns: 1fr 320px; gap: 1rem; align-items: start; }
+/* The canvas column scrolls with the page: the cheats, battle tools and
+   button rows under the canvas sit in the same column, and a column pinned
+   under the topbar would hold them below the fold for good once a
+   <details> opens past the window height. The wrap's width is capped by the
+   viewport height (4:3, minus room for the HUD + button rows) so the canvas
+   and its first button row fit on screen at once - a wide-but-short window
+   gets a smaller centred canvas instead of one taller than the window. */
+.play-viewport .play-canvas-wrap {
+  max-width: max(320px, calc((100vh - var(--topbar-h) - 9rem) * 4 / 3));
+  margin-inline: auto;
+}
+@media (max-width: 980px) {
+  .play-stage { grid-template-columns: 1fr; }
+  .play-viewport .play-canvas-wrap { max-width: none; margin-inline: 0; }
+}
+
+.play-canvas-wrap { position: relative; }
+.play-canvas {
+  width: 100%; aspect-ratio: 4 / 3; display: block;
+  background: #05070c; border: 1px solid var(--border); outline: none;
+}
+.play-canvas:focus { border-color: var(--accent); }
+.play-focus-veil {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  background: rgba(4, 6, 12, 0.72); color: var(--text); cursor: pointer;
+  font-family: var(--font-mono); font-size: 0.9rem; text-align: center; padding: 1rem;
+}
+.play-focus-veil.is-hidden { display: none; }
+
+/* Dialogue box, drawn over the canvas the way the game does. Colors
+   mirror the retail FUN_8002C69C window fill: two-pass mode-0
+   semi-transparent gouraud quads, top RGB(24,24,40) to bottom
+   RGB(64,64,160) at effective alpha 0.75, framed by the gold
+   double-line 9-slice border (outer gold, dark inset gap, inner
+   gold). */
+.play-dialog {
+  position: absolute; left: 6%; right: 6%; bottom: 5%;
+  background: linear-gradient(to bottom, rgba(24, 24, 40, 0.75), rgba(64, 64, 160, 0.75));
+  border: 2px solid #c9a24a;
+  box-shadow: inset 0 0 0 2px #241a08, inset 0 0 0 3px #8a6d2f;
+  padding: 0.7rem 0.9rem; color: #eef2ff;
+  font-family: var(--font-mono); font-size: 0.86rem; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word;
+}
+.play-dialog.is-hidden { display: none; }
+/* The hotkey notice line ("Ground fog: off"), bottom-left like the native
+   window's: host chrome, not game surface. */
+.play-notice {
+  position: absolute; left: 1.5%; bottom: 1.5%; max-width: 70%;
+  background: rgba(0, 0, 0, 0.7); color: #d9f2ff;
+  font-family: var(--font-mono); font-size: 0.78rem; padding: 0.15rem 0.45rem;
+  pointer-events: none;
+}
+.play-notice.is-hidden { display: none; }
+.play-keys-sub {
+  grid-column: 1 / -1; margin-top: 0.35rem; font-size: 0.7rem;
+  text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-dim);
+}
+.play-dialog-opt { color: #b9c6ff; }
+.play-dialog-opt.is-sel { color: #fff2a8; }
+
+/* Retail pause menu (Start): the real window-descriptor draw path. The engine
+   serves the byte-pinned gold 9-slice chrome + proportional font glyphs as
+   textured quads; this overlay canvas sits pixel-for-pixel over the GL view and
+   the quads blit onto it (see play-view-overlay.js `_drawOverlay` and the
+   `AtlasBlitter` in play-atlas-blitter.js). */
+.play-menu-overlay {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  pointer-events: none; image-rendering: pixelated;
+}
+
+/* Minigame status strip: the engine's status rows and key hints, under the
+   canvas instead of inside the frame. It wraps where the in-frame line ran
+   off the right edge, and holds its two-line place while a game is live so
+   the rows below it do not jump between phases. */
+.play-mg-caption {
+  box-sizing: border-box;
+  min-height: 3.1rem; padding: 0.35rem 0.6rem;
+  border: 1px solid var(--border); border-top: 0; background: var(--bg-card);
+  font-family: var(--font-mono); font-size: 0.76rem; line-height: 1.5;
+  color: var(--text-muted); overflow-wrap: anywhere;
+}
+.play-mg-caption[hidden] { display: none; }
+.play-mg-caption.is-empty { visibility: hidden; }
+.play-mg-line.is-bright { color: var(--text-bright); }
+.play-mg-line span + span::before { content: "\00b7"; margin: 0 0.5em; color: var(--text-dim); }
+/* Two-column layout only (the single-column layout below 981px lets the
+   canvas run full width): the strip takes its height out of the canvas, not
+   out of the button rows, so canvas and strip still fit the window - and it
+   keeps the canvas's width so the two read as one block. */
+@media (min-width: 981px) {
+  .play-viewport:has(.play-mg-caption:not([hidden])) .play-canvas-wrap,
+  .play-mg-caption {
+    max-width: max(320px, calc((100vh - var(--topbar-h) - 13rem) * 4 / 3));
+    margin-inline: auto;
+  }
+}
+/* Fullscreen presents `.play-screen`: the 4:3 canvas wrap, and under it the
+   minigame status strip when a game is live.
+   The browser's own sheet sizes a fullscreen element to the whole screen
+   with `!important` (width / height 100%, inset 0, margin 0), so the element
+   that goes fullscreen cannot itself be the 4:3 box: a wrap that was asked
+   to be `min(100vw, 100vh * 4/3)` wide came out the screen's full width, its
+   4:3 canvas ran taller than the screen, and the bottom of the picture was
+   cut off. The screen-sized element is therefore a flex column that centres
+   the wrap, and the wrap takes its 4:3 width from the height that is left.
+   The overlay canvas and the dialogue box are positioned against the wrap,
+   so they stay pixel-aligned with the GL view. The strip takes its height
+   out of the picture's letterbox: it is never drawn over the picture. */
+.play-screen:fullscreen {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  background: #000;
+  --play-fs-cap: 0px;
+  /* a few pixels of black margin round the picture on every side */
+  --play-fs-pad: 4px;
+}
+.play-screen:fullscreen:has(> .play-mg-caption:not([hidden])) { --play-fs-cap: 4.4rem; }
+.play-screen:fullscreen::backdrop { background: #000; }
+.play-viewport .play-screen:fullscreen > .play-canvas-wrap,
+.play-viewport .play-screen:fullscreen > .play-mg-caption {
+  flex: none; margin: 0;
+  /* the viewport-height width cap must not shrink fullscreen */
+  width: min(calc(100vw - 2 * var(--play-fs-pad)),
+             calc((100vh - var(--play-fs-cap) - 2 * var(--play-fs-pad)) * 4 / 3));
+  max-width: none;
+}
+/* No focus border in fullscreen: the accent outline framed the picture. */
+.play-screen:fullscreen .play-canvas,
+.play-screen:fullscreen .play-canvas:focus { border-color: transparent; }
+/* The reserved height holds three unwrapped rows, which is every game's most
+   on a landscape screen. A narrow portrait screen wraps them; it also has
+   letterbox to spare under the picture, so the strip may grow there. */
+.play-viewport .play-screen:fullscreen > .play-mg-caption {
+  min-height: var(--play-fs-cap);
+  border: 0; background: transparent;
+}
+.play-hud {
+  display: flex; gap: 0.9rem; flex-wrap: wrap;
+  font-family: var(--font-mono); font-size: 0.76rem; color: var(--text-muted);
+  padding: 0.4rem 0.1rem;
+}
+.play-hud b { color: var(--text-dim); font-weight: 500; }
+
+.play-rail { display: flex; flex-direction: column; gap: 0.8rem; }
+.play-card { border: 1px solid var(--border); background: var(--bg-card); padding: 0.6rem 0.7rem; }
+.play-card h3 {
+  margin: 0 0 0.5rem; font-size: 0.78rem; text-transform: uppercase;
+  letter-spacing: 0.05em; color: var(--text-dim); font-weight: 600;
+}
+.play-keys { display: grid; grid-template-columns: auto 1fr; gap: 0.28rem 0.6rem; align-items: center; }
+.play-keys kbd {
+  font-family: var(--font-mono); font-size: 0.72rem;
+  background: var(--bg-code); border: 1px solid var(--border); border-bottom-width: 2px;
+  border-radius: 3px; padding: 0.08rem 0.35rem; color: var(--text); white-space: nowrap;
+}
+.play-keys kbd.is-held { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+.play-keys span { font-size: 0.76rem; color: var(--text-muted); }
+
+.play-scene-search {
+  width: 100%; background: var(--bg-code); color: var(--text);
+  border: 1px solid var(--border); padding: 0.3rem 0.45rem;
+  font-family: var(--font-mono); font-size: 0.78rem; margin-bottom: 0.4rem;
+}
+.play-scene-list { max-height: 320px; overflow-y: auto; display: flex; flex-direction: column; }
+.play-scene-item {
+  display: flex; justify-content: space-between; gap: 0.5rem; align-items: baseline;
+  background: none; border: none; border-bottom: 1px solid var(--border);
+  padding: 0.32rem 0.2rem; cursor: pointer; text-align: left; color: var(--text);
+  font-size: 0.78rem;
+}
+.play-scene-item:hover { background: var(--bg-raised); }
+.play-scene-item.is-active { background: var(--accent-soft); }
+.play-scene-code { font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-dim); }
+.play-scene-group {
+  font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--text-dim); padding: 0.45rem 0.2rem 0.2rem; font-family: var(--font-mono);
+}
+.play-btn-row { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+.play-btn-row button {
+  background: var(--bg-card); color: var(--text); border: 1px solid var(--border);
+  padding: 0.28rem 0.55rem; font-family: var(--font-mono); font-size: 0.74rem; cursor: pointer;
+}
+.play-btn-row button:hover { border-color: var(--accent); }
+.play-btn-row button[disabled] { opacity: 0.45; cursor: not-allowed; }
+.play-volume {
+  display: flex; align-items: center; gap: 0.35rem;
+  background: var(--bg-card); border: 1px solid var(--border);
+  padding: 0.2rem 0.5rem; font-family: var(--font-mono); font-size: 0.74rem;
+  color: var(--text-muted);
+}
+.play-volume input[type="range"] { width: 5.5rem; }
+#play-volume-value { min-width: 2.4rem; text-align: right; color: var(--text); }
+.play-dev-menu {
+  display: flex; align-items: center; gap: 0.35rem; cursor: pointer;
+  background: var(--bg-card); border: 1px solid var(--border);
+  padding: 0.2rem 0.5rem; font-family: var(--font-mono); font-size: 0.74rem;
+  color: var(--text-muted);
+}
+
+/* Visual enhancements panel: one row per presentation toggle - control,
+   name, the shared hotkey (engine-session::hotkeys), a retail / enhancement
+   tag and a one-line description. */
+.play-visuals {
+  margin-top: 0.6rem; border: 1px solid var(--border); background: var(--bg-card);
+  padding: 0.45rem 0.7rem 0.6rem;
+}
+.play-visuals > summary {
+  cursor: pointer; font-family: var(--font-mono); font-size: 0.8rem;
+  color: var(--text); font-weight: 600;
+}
+.play-vis-intro { font-size: 0.78rem; color: var(--text-muted); margin: 0.45rem 0; line-height: 1.5; }
+.play-vis-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; align-items: center; margin-bottom: 0.5rem; }
+.play-vis-actions button, .play-vis-desc button {
+  background: var(--bg-raised); color: var(--text); border: 1px solid var(--border);
+  padding: 0.24rem 0.55rem; font-family: var(--font-mono); font-size: 0.74rem; cursor: pointer;
+}
+.play-vis-actions button:hover, .play-vis-desc button:hover { border-color: var(--accent); }
+.play-vis-desc button { margin-right: 0.3rem; }
+.play-vis-list {
+  list-style: none; margin: 0; padding: 0;
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); gap: 0.4rem;
+}
+.play-vis-row { border: 1px solid var(--border); background: var(--bg); padding: 0.35rem 0.5rem; margin: 0; }
+.play-vis-head {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 0.35rem; cursor: pointer;
+  font-family: var(--font-mono); font-size: 0.76rem; color: var(--text);
+}
+div.play-vis-head { cursor: default; }
+.play-vis-head kbd { font-size: 0.68rem; padding: 0 0.3rem; }
+.play-vis-head select { font-family: var(--font-mono); font-size: 0.72rem; }
+.play-vis-name { font-weight: 600; }
+.play-vis-tag {
+  font-family: var(--font-mono); font-size: 0.62rem; text-transform: uppercase;
+  letter-spacing: 0.04em; padding: 0.02rem 0.32rem; border: 1px solid;
+  white-space: nowrap;
+}
+.play-vis-head .play-vis-tag { margin-left: auto; }
+.play-vis-tag.is-enh { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.play-vis-tag.is-retail { color: var(--ok); border-color: var(--ok-line); background: var(--ok-soft); }
+.play-vis-desc { margin: 0.25rem 0 0; font-size: 0.74rem; color: var(--text-muted); line-height: 1.45; }
+
+/* Saves card (export / import / block chooser status line). */
+.play-save-import { display: block; margin-top: 0.45rem; font-size: 0.74rem; color: var(--text-muted); }
+.play-save-import input {
+  display: block; width: 100%; margin-top: 0.2rem;
+  color: var(--text-muted); font-family: var(--font-mono); font-size: 0.68rem;
+}
+.play-save-status {
+  font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-dim);
+  margin-top: 0.45rem; line-height: 1.55; word-break: break-word;
+}
+.play-save-status.is-error { color: #d84b4b; }
+#play-cheats .play-btn-row { margin-top: 0.4rem; align-items: center; }
+#play-cheats input[type="text"] { max-width: 100%; }
+.play-cheat-party {
+  font-family: var(--font-mono); font-size: 0.7rem; color: var(--text-dim);
+  margin-top: 0.45rem; line-height: 1.55; word-break: break-word;
+}
+.play-save-status button {
+  background: var(--bg-code); color: var(--text); border: 1px solid var(--border);
+  padding: 0.14rem 0.4rem; font-family: var(--font-mono); font-size: 0.68rem;
+  cursor: pointer; margin: 0.12rem 0.25rem 0.12rem 0;
+}
+.play-save-status button:hover { border-color: var(--accent); }
+</style>
+<script src="js/audio-toggle.js"></script>
+<script src="js/rom-cache.js"></script>
+<script src="js/disc-info.js"></script>
+<script src="js/load-progress.js"></script>
+<script src="js/legaia-saves.js"></script>
+-->
+<header class="page-header">
+  <div class="breadcrumb"><a href="index.html">home</a> &middot; play</div>
+  <h1>Play the port</h1>
+  <p class="lede">
+    Walk around inside <em>Legend of Legaia</em>, in this browser, on your own copy of the game.
+    This is the project's from-scratch rewrite of the game engine compiled to WebAssembly - not a
+    video and not an emulator. Pick your disc image, choose New Game or a town, and take the controls.
+    Most of the game plays - towns, battles, menus, minigames, saves - with the occasional bug; the
+    <a href="#what-works">map below</a> says what works and what is still rough. To play the original
+    with mods instead, patch your disc with the <a href="tooling/rom-patcher.html">ROM patcher</a>
+    and run it in your usual emulator.
+  </p>
+</header>
+
+<section class="doc-section" id="run">
+  <div class="play-shell">
+    <div class="disc-bar">
+      <label for="play-file">Disc:</label>
+      <input type="file" id="play-file" accept=".bin">
+      <span class="play-status" id="play-status">
+        No disc loaded - pick a <code>.bin</code> Mode2/2352 image of your own copy. It is read
+        locally, nothing is uploaded; a disc loaded on another page here is picked up automatically.
+      </span>
+    </div>
+
+    <!-- Rich save bar (LegaiaSaves.createRichBar, js/legaia-saves.js) - the
+         SAME polished memory-card tiles the minigames page shows: the SC
+         block's baked lead-face icon, the party's disc portraits, and
+         lead / displayed level / gold / location off the save block. Always
+         visible so "load your save here" can't be missed; its own empty state
+         invites the first import. Resume drops a stored save straight into the
+         running engine. Nothing is uploaded. -->
+    <div id="play-saves-strip" class="play-saves-strip"></div>
+
+    <!-- Memory-card rack: the console's two card ports. Picking a card image
+         here "inserts" it, and the in-game Load / Save screens then read and
+         write THAT card - saving updates the image in place, so Export hands
+         back a card your emulator still loads. Page chrome, not an in-game
+         screen: retail's own save screen only ever picks between the two
+         ports, which is what the SLOT 1 / SLOT 2 pills are. -->
+    <div id="play-card-rack" class="play-card-rack" style="display: none;"></div>
+
+    <div class="play-modes" id="play-modes" style="display: none;">
+      <button class="play-mode" type="button" data-mode="newgame">
+        <span class="play-mode-tag">boot</span>
+        <span class="play-mode-name">New game</span>
+        <span class="play-mode-desc">The real title card off your disc's own art, then the opening
+          prologue - the narrated tableaux in their sepia grade (Z or Space skips ahead, as on the
+          console) - ending at the naming prompt. Continue loads a save from an inserted memory
+          card. Idle on the title for 25 seconds, at the prompt or on the menu, and the attract movie plays, as on the console.</span>
+      </button>
+      <button class="play-mode" type="button" data-mode="scene">
+        <span class="play-mode-tag">explore</span>
+        <span class="play-mode-name">Scene picker</span>
+        <span class="play-mode-desc">Drop into any town or field map on the disc and walk it. The
+          best-supported mode - use the list on the right.</span>
+      </button>
+    </div>
+
+    <div class="play-stage" id="play-stage" style="display: none;">
+      <div class="play-viewport">
+        <!-- What the Fullscreen button presents: the picture, and the
+             minigame status strip under it. -->
+        <div class="play-screen" id="play-screen">
+          <div class="play-canvas-wrap">
+            <canvas id="play-canvas" class="play-canvas" width="960" height="720" tabindex="0"></canvas>
+            <canvas id="play-menu-canvas" class="play-menu-overlay" width="960" height="720"></canvas>
+            <div class="play-focus-veil" id="play-veil">Click to take the controls</div>
+            <div class="play-dialog is-hidden" id="play-dialog"></div>
+            <div class="play-notice is-hidden" id="play-notice" role="status" aria-live="polite"></div>
+          </div>
+          <!-- A minigame's status rows and key hints, as the engine exports
+               them (`play_mg_caption_json`, play-minigames.js
+               `captionSync`): shown here rather than in the frame, where the
+               game's own chrome draws over the text layer. -->
+          <div class="play-mg-caption" id="play-mg-caption" hidden></div>
+        </div>
+        <div class="play-hud">
+          <span><b>Scene</b> <span id="hud-scene">-</span></span>
+          <span><b>Mode</b> <span id="hud-mode">-</span></span>
+          <span><b>FPS</b> <span id="hud-fps">0</span></span>
+          <span><b>Pos</b> <span id="hud-pos">-</span></span>
+          <span><b>NPCs</b> <span id="hud-npcs">0</span></span>
+          <span><b>SFX</b> <span id="hud-sfx">-</span></span>
+        </div>
+        <div class="play-btn-row">
+          <button id="play-recenter" type="button">Reset camera</button>
+          <button id="play-fullscreen" class="btn-accent" type="button" title="Present the viewport full screen (Esc to exit)">&#9974; Fullscreen</button>
+          <label class="play-volume" title="Scene BGM output gain (the engine's SPU mixer runs into a WebAudio GainNode)">
+            &#9834; <input type="range" id="play-volume" min="0" max="10" step="0.5" value="1">
+            <span id="play-volume-value">1x</span>
+          </label>
+          <label class="play-dev-menu"
+                 title="Overlay the retail developer menu on the running scene (the native window's LEGAIA_DEV_MENU opt-in). Edits your own session only; off every page load by design - nothing in a link or in storage can carry it.">
+            <input type="checkbox" id="play-dev-menu"> Dev menu
+          </label>
+          <label class="play-dev-menu"
+                 title="Free-angle movement: the movement vector follows the camera azimuth at full angular resolution instead of retail's quantised 8-way remap (the native window's R toggle, persisted like its other options). Simulation knob - off keeps the retail decode.">
+            <input type="checkbox" id="play-precise-move"> Free-angle movement
+          </label>
+          <label class="play-dev-menu"
+                 title="Photosensitivity guard: slew-limit the palette light animations so scenes like the koin3 dance floor cannot strobe (the native launcher's Reduce flashing row, persisted with the other options). Off restores retail's full-swing palette steps.">
+            <input type="checkbox" id="play-reduce-flashing"> Reduce flashing
+          </label>
+          <label class="play-volume" title="Music level, 0-10 (8 is the retail mix): the mixer's BGM bus, the native launcher's Music volume row. Persisted with the other options.">
+            Music <input type="range" id="play-bgm-volume" min="0" max="10" step="1" value="8">
+            <span id="play-bgm-volume-value">8</span>
+          </label>
+          <label class="play-volume" title="Sound-effect level, 0-10 (8 is the retail mix): the mixer's SFX bus, the native launcher's Sound effects volume row. Persisted with the other options.">
+            SFX <input type="range" id="play-sfx-volume" min="0" max="10" step="1" value="8">
+            <span id="play-sfx-volume-value">8</span>
+          </label>
+          <label class="play-dev-menu"
+                 title="Mono output: mix everything - voices and movie audio included - down to one channel, for single-speaker setups (the native launcher's Mono output row, persisted with the other options). The in-game Sound: Monaural row is the original's own mono mode and is separate.">
+            <input type="checkbox" id="play-downmix-mono"> Mono output
+          </label>
+          <label class="play-dev-menu"
+                 title="Debug overlay: mark every overworld placement (towns, caves, doors) with the port's entity marker (the native window's LEGAIA_WORLD_MAP_MARKERS). Retail draws nothing there.">
+            <input type="checkbox" id="play-world-map-markers"> Overworld markers
+          </label>
+        </div>
+        <details class="play-visuals" id="play-visuals" open>
+          <summary>Visual enhancements</summary>
+          <p class="play-vis-intro">Everything here changes how the game looks, never how it plays.
+            <span class="play-vis-tag is-enh">Enhancement</span> rows are the port&rsquo;s additions;
+            untick them for the PS1 picture. <span class="play-vis-tag is-retail">Retail</span> rows
+            switch a piece of the PS1&rsquo;s own drawing. The key beside a row toggles it from the
+            game window, here and in the desktop build.</p>
+          <div class="play-vis-actions">
+            <label class="play-dev-menu" title="Retail-faithful for this session (the native --retail): every enhancement off - the scene-entry pulse, smart monsters, overworld markers, the saved-chain Arts list and the ledge-hop landing guard off, the battle kernels on retail's own, and every engine-only option pinned to retail (enhanced lighting and its shadows, ground fog, see-through walls, bloom, camera distance, 4/8-way movement, no flash slew, retail tile windows). Nothing is stored; untick to get your own settings back.">
+              <input type="checkbox" id="play-retail-mode"> Retail-faithful (all enhancements off, this session)
+            </label>
+            <button id="play-visuals-reset" type="button"
+                    title="Put every setting in this panel back to the port's shipped defaults (stored like your other options).">Reset to defaults</button>
+          </div>
+          <ul class="play-vis-list">
+            <li class="play-vis-row" title="Enhanced lighting: a time-of-day mood over the baked shading, real point lights at the scene's lamps and glowing props, emissive surfaces (the Genesis Tree) and soft halos (the native window's I toggle, persisted). Not retail - the game's own render has no light source; untick for the faithful shading. Presentation only.">
+              <label class="play-vis-head"><input type="checkbox" id="play-dyn-light"> <span class="play-vis-name">Enhanced lighting</span> <kbd>I</kbd>
+                <span class="play-vis-tag is-enh">Enhancement</span></label>
+              <p class="play-vis-desc">A time-of-day mood, real lamp lights, glowing props and soft halos over the game&rsquo;s baked shading.</p>
+            </li>
+            <li class="play-vis-row" title="Time of day for enhanced lighting (the native window's F8): Auto follows the scene - daylight outdoors, dim caves and dungeons; Day, Dusk and Night force one mood everywhere. Persisted.">
+              <label class="play-vis-head"><select id="play-time-of-day">
+                <option value="auto">Auto</option>
+                <option value="day">Day</option>
+                <option value="dusk">Dusk</option>
+                <option value="night">Night</option>
+              </select> <span class="play-vis-name">Time of day</span> <kbd>F8</kbd>
+                <span class="play-vis-tag is-enh">Enhancement</span></label>
+              <p class="play-vis-desc">Which mood enhanced lighting uses: Auto follows the scene, or force day, dusk or night.</p>
+            </li>
+            <li class="play-vis-row" title="Lamp shadows: each of enhanced lighting's point lights casts soft shadows from the geometry around it (the native window's Y toggle, persisted). Inert while enhanced lighting is off. Presentation only.">
+              <label class="play-vis-head"><input type="checkbox" id="play-dyn-shadows" checked> <span class="play-vis-name">Lamp shadows</span> <kbd>Y</kbd>
+                <span class="play-vis-tag is-enh">Enhancement</span></label>
+              <p class="play-vis-desc">The enhanced lamps cast soft shadows from the walls and props around them.</p>
+            </li>
+            <li class="play-vis-row" title="Bloom: the bright parts of the 3D scene - lamp halos, glowing props, lit windows, sunlit sky - bleed a soft glow into their surroundings, stronger at night (the native window's F10, persisted). Not retail; the HUD never blooms. Presentation only.">
+              <label class="play-vis-head"><input type="checkbox" id="play-bloom"> <span class="play-vis-name">Bloom</span> <kbd>F10</kbd>
+                <span class="play-vis-tag is-enh">Enhancement</span></label>
+              <p class="play-vis-desc">Bright lamps, lit windows and sunlit sky bleed a soft glow into their surroundings.</p>
+            </li>
+            <li class="play-vis-row" title="Ground fog: a low drifting mist bank over the scenes that read as misty or night (Rim Elm under the Mist, Drake Castle, the Voz forests, the Ravine, and any scene whose own fog puffs are live), parted by every character walking through it; a battle inherits its scene's bank (the native window's F9, persisted like its other options). Not retail - the game draws only its fog puffs. Presentation only.">
+              <label class="play-vis-head"><input type="checkbox" id="play-ground-fog"> <span class="play-vis-name">Ground fog</span> <kbd>F9</kbd>
+                <span class="play-vis-tag is-enh">Enhancement</span></label>
+              <p class="play-vis-desc">A low drifting mist over misty and night scenes that parts as characters walk through it.</p>
+            </li>
+            <li class="play-vis-row" title="Dissolve walls and roofs between the camera and your character to a see-through dither so you can always spot yourself (the native window's default-on occlusion-fade enhancement, F4 on both, persisted; retail relies on authored camera framing instead). Presentation only - the simulation never changes.">
+              <label class="play-vis-head"><input type="checkbox" id="play-see-through" checked> <span class="play-vis-name">See-through walls</span> <kbd>F4</kbd>
+                <span class="play-vis-tag is-enh">Enhancement</span></label>
+              <p class="play-vis-desc">Walls and roofs between the camera and your character dissolve so you can always see yourself.</p>
+            </li>
+            <li class="play-vis-row" title="Scene-entry pulse: the rolling vertex-morph envelope over the morph packs retail never arms at entry (the Juggernaut's flesh ground in Rim Elm). On by default, as on the native window; untick for the native --no-entry-pulse (the desktop launcher's Living ground pulse row), which draws those scenes static as retail does. Takes effect at the next scene entry; Retail-faithful holds it off.">
+              <label class="play-vis-head"><input type="checkbox" id="play-entry-pulse" checked> <span class="play-vis-name">Entry pulse</span>
+                <span class="play-vis-tag is-enh">Enhancement</span></label>
+              <p class="play-vis-desc">Keeps a few scenes&rsquo; living-flesh ground rolling, which retail leaves still. Applies at the next scene entry.</p>
+            </li>
+            <li class="play-vis-row" title="Cycle the follow camera's distance preset (retail, far, farther) - the native window's T key, persisted with the other options. Framing only - the simulation never changes.">
+              <div class="play-vis-head"><span class="play-vis-name">Camera distance</span> <kbd>T</kbd>
+                <span class="play-vis-tag is-enh">Enhancement</span></div>
+              <p class="play-vis-desc"><button id="play-camera-distance" type="button">Camera: far</button>
+                How far back the follow camera sits: retail, far or farther.</p>
+            </li>
+            <li class="play-vis-row" title="PSX rasterisation: snap every vertex to the framebuffer's pixel grid (the PS1's integer screen coordinates - the vertex jitter) and dither each shaded pixel down to 15-bit colour with the PSX 4x4 matrix (the native window's LEGAIA_PSX_RENDER). Off draws the clean render; presentation only.">
+              <label class="play-vis-head"><input type="checkbox" id="play-psx-render"> <span class="play-vis-name">PSX rasterisation</span>
+                <span class="play-vis-tag is-retail">Retail look</span></label>
+              <p class="play-vis-desc">The PS1&rsquo;s wobbling vertices and 15-bit colour dither. Off draws a clean image.</p>
+            </li>
+            <li class="play-vis-row" title="Retail's visible-tile crop: at retail framing, draw only the terrain tiles the PS1's camera window covers (the retail_view_window option, persisted like the native config). Off draws the whole scene.">
+              <label class="play-vis-head"><input type="checkbox" id="play-retail-view-window" checked> <span class="play-vis-name">Retail tile crop</span>
+                <span class="play-vis-tag is-retail">Retail</span></label>
+              <p class="play-vis-desc">Draws only the ground tiles the PS1 camera would see. Off draws the whole map.</p>
+            </li>
+            <li class="play-vis-row" title="Retail static-object windowing: placed objects outside the camera's tile window are not drawn (the retail_static_window option, persisted like the native config). Off draws every placement.">
+              <label class="play-vis-head"><input type="checkbox" id="play-retail-static-window" checked> <span class="play-vis-name">Retail object window</span>
+                <span class="play-vis-tag is-retail">Retail</span></label>
+              <p class="play-vis-desc">Hides props outside the camera&rsquo;s area as the PS1 does. Off draws every prop in the map.</p>
+            </li>
+          </ul>
+        </details>
+        <details class="play-battle-tools" id="play-gameplay-tweaks">
+          <summary>Gameplay tweaks</summary>
+          <div class="play-btn-row">
+            <label class="play-dev-menu"
+                   title="Now and then a capturable Seru spawns shiny: +35% stats, and once caught its magic deals +35% damage (the patcher's --shiny-seru; the desktop launcher's Shiny Seru row, play-window --no-shiny-seru turns it off). Not retail; Retail-faithful holds it off. Starts on the engine's default.">
+              <input type="checkbox" id="play-shiny-seru"> Shiny Seru
+            </label>
+            <label class="play-dev-menu"
+                   title="A successful escape banks 5% of the fled fight's EXP into every party member (the patcher's --flee-exp; play-window --flee-exp). Not retail; Retail-faithful holds it off.">
+              <input type="checkbox" id="play-flee-exp"> Run-away EXP
+            </label>
+            <label class="play-dev-menu"
+                   title="Jette's Absolute Fortress keeps its random battles and its Door of Light on a save that left the Floating Castle with under a minute on the clock (the patcher's --fortress-encounter-fix; play-window --no-fortress-encounter-fix turns it off). A healthy save plays the same either way; Retail-faithful holds it off. Starts on the engine's default.">
+              <input type="checkbox" id="play-fortress-fix"> Fortress battles fix
+            </label>
+            <label class="play-dev-menu"
+                   title="Elemental jewels, guards and All Guard protect against the boss cinematic casts (Xain, Cort, the Delilas trio), which retail lets through (the patcher's --jewel-fix; play-window --jewel-fix). Not retail; Retail-faithful holds it off.">
+              <input type="checkbox" id="play-jewel-fix"> Boss casts respect jewels
+            </label>
+            <label class="play-dev-menu"
+                   title="Stops the retail battle softlock where a party member's HP readout stops short of their live HP and the battle waits on it forever, the camera circling (play-window --no-hp-readout-guard turns it off). A port fix with no patcher twin; Retail-faithful holds it off. Starts on the engine's default.">
+              <input type="checkbox" id="play-hp-readout-guard"> Battle freeze guard
+            </label>
+            <label class="play-dev-menu"
+                   title="Now and then a won battle also grants one random piece of equipment, on top of the normal drop (a 5% roll; the patcher's --equipment-drops; play-window --equipment-drops). Not retail; Retail-faithful holds it off.">
+              <input type="checkbox" id="play-bonus-drop"> Bonus equipment drops
+            </label>
+          </div>
+        </details>
+        <details class="play-battle-tools" id="play-battle-tuning">
+          <summary>Battle tuning</summary>
+          <div class="play-btn-row">
+            <label title="Multiplies every monster's EXP reward (the patcher's --exp-scale; play-window --exp-rate). 1x is retail; Retail-faithful holds it at 1x.">
+              EXP rate
+              <select id="play-exp-rate">
+                <option value="1000">1x</option>
+                <option value="1500">1.5x</option>
+                <option value="2000">2x</option>
+                <option value="3000">3x</option>
+                <option value="5000">5x</option>
+                <option value="500">0.5x</option>
+              </select>
+            </label>
+            <label title="Multiplies every monster's HP / MP / ATK / UDF / LDF / INT / SPD; EXP, gold and drops stay retail (a uniform --enemy-stat-scale; play-window --enemy-stat-scale). 1x is retail; Retail-faithful holds it at 1x.">
+              Enemy strength
+              <select id="play-enemy-stats">
+                <option value="1000">1x</option>
+                <option value="1250">1.25x</option>
+                <option value="1500">1.5x</option>
+                <option value="2000">2x</option>
+                <option value="3000">3x</option>
+                <option value="5000">5x</option>
+                <option value="750">0.75x</option>
+                <option value="500">0.5x</option>
+              </select>
+            </label>
+            <label title="Multiplies how many hits monsters land with their standard attacks by dividing each attack's AGL price; a monster keeps at least one hit (the patcher's --enemy-attack-count; play-window --enemy-attack-count). 1x is retail.">
+              Enemy attacks
+              <select id="play-enemy-attacks">
+                <option value="1000">1x</option>
+                <option value="1500">1.5x</option>
+                <option value="2000">2x</option>
+                <option value="3000">3x</option>
+                <option value="500">0.5x</option>
+              </select>
+            </label>
+            <label title="AP the Spirit command charges into the gauge; 32 is retail, negative drains it (the patcher's --spirit-ap; play-window --spirit-ap). Retail-faithful holds 32.">
+              Spirit AP
+              <select id="play-spirit-ap">
+                <option value="32">32</option>
+                <option value="48">48</option>
+                <option value="64">64</option>
+                <option value="100">100</option>
+                <option value="0">0</option>
+                <option value="16">16</option>
+                <option value="-16">-16</option>
+                <option value="-32">-32</option>
+              </select>
+            </label>
+            <label title="AP a party member gains per 100% of max HP an enemy hit takes; 100 is retail, negative drains it (the patcher's --damage-ap; play-window --damage-ap). Retail-faithful holds 100.">
+              AP from damage
+              <select id="play-damage-ap">
+                <option value="100">100</option>
+                <option value="150">150</option>
+                <option value="200">200</option>
+                <option value="50">50</option>
+                <option value="0">0</option>
+                <option value="-50">-50</option>
+                <option value="-100">-100</option>
+              </select>
+            </label>
+            <label title="One catch chance for every capturable Seru; Original keeps each Seru's own (the patcher's --seru-catch-rate; play-window --seru-catch-rate). Retail-faithful holds Original.">
+              Seru catch rate
+              <select id="play-seru-catch-rate">
+                <option value="-1">Original</option>
+                <option value="25">25%</option>
+                <option value="50">50%</option>
+                <option value="75">75%</option>
+                <option value="100">100%</option>
+                <option value="10">10%</option>
+              </select>
+            </label>
+          </div>
+        </details>
+        <details class="play-battle-tools" id="play-battle-tools">
+          <summary>Battle tools</summary>
+          <div class="play-btn-row">
+            <label title="Present-party composition in battle order, the native --party flag: names (vahn, noa, gala, terra) or roster indices, comma-separated. Members without stats are seeded from the disc's new-game template.">
+              Party <input type="text" id="play-party" size="14" placeholder="vahn,noa,gala">
+            </label>
+            <button id="play-party-apply" type="button">Apply party</button>
+            <label class="play-dev-menu"
+                   title="Monsters aim single-target attacks at the weakest living party member instead of retail's uniform random pick (the desktop launcher's Smarter monsters row, play-window --smart-monsters). Not retail; the random stream is unchanged; Retail-faithful holds it off.">
+              <input type="checkbox" id="play-smart-monsters"> Smart monsters
+            </label>
+            <label class="play-dev-menu"
+                   title="Debug: outline every battle effect sprite so a spawn stays visible when its texture is not resident (the native window's LEGAIA_DIAG_FX). Retail draws no outline.">
+              <input type="checkbox" id="play-fx-outline"> Effect outlines
+            </label>
+            <label class="play-dev-menu"
+                   title="Run the battle pass (action state machine, animation, effects) once per battle frame, retail's cadence, instead of once per vsync (the native LEGAIA_BATTLE_FRAME_CADENCE; 0 turns it off). Starts on the engine's default.">
+              <input type="checkbox" id="play-battle-frame-cadence"> Retail battle cadence
+            </label>
+            <label class="play-dev-menu"
+                   title="The Arts command opens the port's saved-chain list instead of retail's per-press directional input (the native LEGAIA_ARTS_SAVED_LIST=1). Not retail; Retail-faithful holds it off.">
+              <input type="checkbox" id="play-arts-saved-list"> Saved-chain Arts list
+            </label>
+            <label title="Walk straight into a minigame from this scene, through the same door warp a casino or arena door arms (the native O / B / M / K keys). Start leaves it.">
+              Minigame
+              <select id="play-mg-warp">
+                <option value="">enter...</option>
+                <option value="3">Slot machine</option>
+                <option value="4">Baka Fighter</option>
+                <option value="5">Muscle Dome</option>
+                <option value="6">Dance</option>
+              </select>
+            </label>
+            <button id="play-force-battle" type="button"
+                    title="Arm a fight from this scene's own encounter table right now (the native --battle first).">Start a battle here</button>
+            <label title="Battle BGM id: 0 keeps the field track playing through the fight, blank restores the shipped default (2026). The native --battle-bgm flag.">
+              Battle BGM <input type="number" id="play-battle-bgm" min="0" max="9999" size="5" placeholder="2026">
+            </label>
+            <label class="play-dev-menu"
+                   title="Auto-resolve party turns (each member attacks the first living monster) instead of the player-driven command flow - the native --no-player-battle. Encounters still roll.">
+              <input type="checkbox" id="play-auto-battle"> Auto-battle
+            </label>
+            <label class="play-dev-menu"
+                   title="Turn OFF random encounters entirely (explore but never fight) - the native --no-live-loop.">
+              <input type="checkbox" id="play-no-encounters"> No encounters
+            </label>
+          </div>
+        </details>
+        <details class="play-battle-tools" id="play-cheats">
+          <summary>Cheats</summary>
+          <div class="play-btn-row">
+            <label title="Set every party member to this level. Raising grants the experience that reaches it, so the stat gains are each character's own retail growth; lowering rebuilds the character from its New Game stats plus the growth for the levels it keeps (stat-up items are lost).">
+              Level <input type="number" id="play-cheat-level" min="1" max="99" size="3" placeholder="20">
+            </label>
+            <button id="play-cheat-level-apply" type="button">Set level</button>
+            <button id="play-cheat-restore" type="button"
+                    title="Restore every party member's HP and MP and revive the fallen - works mid-battle too.">Restore HP/MP</button>
+            <button id="play-cheat-max-ap" type="button"
+                    title="Fill every party member's AP (Spirit) gauge to 100 - in battle the Spirit / Super Art command opens at once.">Max AP</button>
+          </div>
+          <div class="play-btn-row">
+            <label title="Seru magic level to set every learned spell to (1-9).">
+              Seru Lv <input type="number" id="play-cheat-seru-level" min="1" max="9" size="2" value="9">
+            </label>
+            <button id="play-cheat-seru" type="button"
+                    title="Teach every party member all 21 Seru and their own Ra-Seru (Vahn also the Sim-Seru and Evil Seru summons), at the chosen level.">Grant Seru</button>
+            <button id="play-cheat-arts" type="button"
+                    title="Teach every party member every art in their list (Hyper and Miracle Arts included).">Learn all arts</button>
+          </div>
+          <div class="play-btn-row">
+            <button id="play-cheat-max-items" type="button"
+                    title="Raise every held item and every usable consumable to 99. Key items and equipment are left alone.">Max items</button>
+            <label title="The same switch as Battle tools &rarr; No encounters: random encounters off, story and boss fights still happen.">
+              <input type="checkbox" id="play-cheat-no-encounters"> No encounters
+            </label>
+            <label title="Walk through walls, people and props on the field and the world map. Doors still open when you walk into them.">
+              <input type="checkbox" id="play-cheat-noclip"> Walk through walls
+            </label>
+          </div>
+          <div class="play-btn-row">
+            <label title="Gold (capped at 9,999,999).">
+              Gold <input type="number" id="play-cheat-gold" min="0" max="9999999" size="8">
+            </label>
+            <button id="play-cheat-gold-apply" type="button">Set gold</button>
+            <label title="Casino coins (capped at 9,999,999).">
+              Coins <input type="number" id="play-cheat-coins" min="0" max="9999999" size="8">
+            </label>
+            <button id="play-cheat-coins-apply" type="button">Set coins</button>
+          </div>
+          <div class="play-btn-row">
+            <label title="Item name (or its id). Items stack to 99 and land in the bag the way a pickup would.">
+              Item <input type="text" id="play-cheat-item" size="16" list="play-cheat-item-names" placeholder="Healing Leaf" autocomplete="off">
+            </label>
+            <datalist id="play-cheat-item-names"></datalist>
+            <label>
+              &times; <input type="number" id="play-cheat-item-qty" min="1" max="99" size="3" value="1">
+            </label>
+            <button id="play-cheat-item-apply" type="button">Add item</button>
+          </div>
+          <div class="play-btn-row">
+            <label title="Teach a spell to a party member at level 1, prepended to their list (the native --learn-spell): the Seru-magic ids are 0x81..0x8b.">
+              Learn spell
+              <select id="play-learn-slot">
+                <option value="0">Vahn</option>
+                <option value="1">Noa</option>
+                <option value="2">Gala</option>
+              </select>
+              <input type="text" id="play-learn-spell" size="5" placeholder="0x81">
+            </label>
+            <button id="play-learn-apply" type="button">Learn</button>
+            <label title="Raise or clear a story / system flag in the shared bank (the native --set-flag). Decimal or 0x hex.">
+              Flag <input type="text" id="play-flag-id" size="6" placeholder="0x142">
+            </label>
+            <button id="play-flag-set" type="button">Set</button>
+            <button id="play-flag-clear" type="button">Clear</button>
+          </div>
+          <div class="play-btn-row">
+            <label title="GameShark lines (AAAAAAAA VVVV) or a Mednafen .cht file's text. Codes write through the engine's map of retail RAM cells, the same applier as the native window's --cheat-file; codes with no engine cell are counted as unmapped.">
+              Codes <textarea id="play-cheat-codes" rows="2" cols="24" spellcheck="false" placeholder="80084E28 FFFF"></textarea>
+            </label>
+            <label title="Skip every write that follows a D0 / E0 conditional gate (the engine does not emulate the gate) instead of treating the gate as always true - the native --cheat-strict flag.">
+              <input type="checkbox" id="play-cheat-codes-strict"> Strict
+            </label>
+            <button id="play-cheat-codes-apply" type="button">Apply codes</button>
+          </div>
+          <div class="play-cheat-party" id="play-cheat-party" aria-live="polite"></div>
+        </details>
+      </div>
+
+      <div class="play-rail">
+        <div class="play-card">
+          <h3>Controls</h3>
+          <div class="play-keys" id="play-keys">
+            <kbd data-key="ArrowUp">&uarr;&darr;&larr;&rarr;</kbd><span>Walk (camera-relative)</span>
+            <kbd data-key="KeyW">W A S D</kbd><span>Walk, same as the arrows</span>
+            <kbd data-key="KeyZ">Z</kbd><span>Talk / confirm (Cross)</span>
+            <kbd data-key="KeyX">X</kbd><span>Cancel (Circle)</span>
+            <kbd data-key="KeyC">C</kbd><span>Triangle</span>
+            <kbd data-key="KeyV">V</kbd><span>Square (reel harder while fishing)</span>
+            <kbd data-key="Enter">Enter</kbd><span>Start</span>
+            <kbd data-key="ShiftRight">R-Shift</kbd><span>Select</span>
+            <kbd data-key="KeyQ">Q</kbd><span>L1</span>
+            <kbd data-key="KeyE">E</kbd><span>R1</span>
+            <kbd data-key="Digit1">1</kbd><span>L2</span>
+            <kbd data-key="Digit2">2</kbd><span>R2</span>
+            <kbd>Drag</kbd><span>Swing / tilt the camera (locked during cutscenes)</span>
+            <kbd>Wheel</kbd><span>Zoom in / out</span>
+            <kbd>Dbl-click</kbd><span>Reset the camera to retail framing</span>
+            <!-- The host hotkeys, listed from the engine's own table
+                 (`host_hotkeys_json`) once a runtime is up. -->
+          </div>
+        </div>
+
+        <div class="play-card" id="play-saves-card">
+          <h3>Saves</h3>
+          <div class="play-btn-row">
+            <button id="save-export" type="button" disabled>Export save</button>
+          </div>
+          <label class="play-save-import">Import save (.lgsf / memory card)
+            <input type="file" id="save-import" accept=".lgsf,.mcr,.mcd,.gme,.mcs" disabled>
+          </label>
+          <div class="play-save-status" id="save-status">Load a disc to export or import saves.</div>
+        </div>
+
+        <div class="play-card" id="play-scene-card">
+          <h3>Scenes</h3>
+          <input type="search" id="play-scene-search" class="play-scene-search"
+                 placeholder="Filter…" autocomplete="off">
+          <div class="play-scene-list" id="play-scene-list"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<details class="about-data">
+  <summary>About this page - what runs here, what does not yet, VR, and how it is wired</summary>
+  <div class="about-body">
+
+  <p>
+    <strong>What you are looking at.</strong> The project's from-scratch
+    <a href="subsystems/engine.html">engine reimplementation</a>, compiled to WebAssembly and
+    actually running: the same <a href="subsystems/script-vm.html">field script engine</a>,
+    <a href="subsystems/field-locomotion.html">movement controller</a> and NPC
+    <a href="subsystems/motion-vm.html">motion engines</a> the native build uses, with WebGL
+    drawing what they simulate. Nothing is pre-rendered; every frame is computed from your disc.
+  </p>
+  <p>
+    <strong>You supply the game.</strong> The site ships no game data. Pick a <code>.bin</code>
+    disc image of your own copy above; it is read locally in your browser, cached for the other
+    pages here, and never uploaded.
+  </p>
+  <p>
+    <strong>Three ways in.</strong> <em>New game</em> runs the title card and prologue.
+    <em>Scene picker</em> drops you straight into any town, field or dungeon - the best-supported
+    mode. You arrive where the game's own doors land you: a town's gate from the world map, a
+    dungeon's door from the room before it; the few scenes no door leads into (Rim Elm, which the
+    game itself starts in Vahn's yard, and some cutscene-only maps) start at a standable spot
+    inside the map instead. The <em>save bar</em> resumes a session you exported earlier, or a real memory-card
+    image from your emulator.
+  </p>
+  <p>
+    <strong>VR.</strong> Have a headset? The <strong>VR</strong> button under the canvas presents
+    the running scene over WebXR - a diorama you look into, or first-person from Vahn's own eyes
+    (<a href="subsystems/vr-mode.html">VR mode</a>). It needs Chrome or Edge with SteamVR as the
+    active OpenXR runtime and a secure context (https or <code>localhost</code>); if it cannot
+    start, the button says what is missing.
+  </p>
+
+<section class="doc-section" id="what-works">
+  <h3>What works here</h3>
+  <p>
+    The whole game runs on the port, New Game to the credits. This is what plays, and where the
+    known gaps are.
+  </p>
+  <ul>
+    <li><strong>Towns, fields and dungeons.</strong> The map assembles from the same pieces the
+      game uses - environment models, tile grid, floor heights, walkable ground - textured from the
+      PSX video memory the engine builds up (<a href="subsystems/renderer.html">renderer</a>).
+      Movement is the ported controller with retail's stepping and collision
+      (<a href="subsystems/field-locomotion.html">field locomotion</a>).</li>
+    <li><strong>Your character and the townsfolk.</strong> The lead's field model re-posed every
+      frame from the real animation clips; every NPC the scene's placement script puts down,
+      walking its routes. Press <kbd>Z</kbd> at one and the script engine plays out their dialogue,
+      branches and all.</li>
+    <li><strong>Doors.</strong> Walk into one and the destination scene loads under you.</li>
+    <li><strong>The New Game flow.</strong> Title card, prologue, Rim Elm's opening sweep and the
+      <em>"Select your name."</em> grid - the real screen, opened by the scene's own script. The
+      name you commit is written into the party record, so the status panel and your saves carry
+      it (<a href="subsystems/boot.html">boot chain</a>).</li>
+    <li><strong>The pause menu and every screen behind it.</strong> Press <kbd>Enter</kbd> for the
+      retail menu - chrome and glyphs off your disc, every window placed by the ported
+      descriptor table (<a href="subsystems/field-menu.html">field menu</a>). Items, Magic,
+      Equip, Status, Options, Load and Save each run their live engine session.</li>
+    <li><strong>Shops.</strong> Walk into a shopkeeper and the retail gold shop opens, priced from
+      your disc's own item table (<a href="subsystems/shop.html">shop</a>).</li>
+    <li><strong>Saving to a real memory card.</strong> Insert a card image from your emulator and
+      the in-game Load and Save screens read and write <em>that</em> card through retail's own
+      save-select flow (<a href="subsystems/save-screen.html">save screen</a>). Saving edits the
+      block in place, so <em>Export</em> hands back a card your emulator still loads.</li>
+    <li><strong>Music and sound effects.</strong> The scene's BGM plays through the from-scratch
+      <a href="subsystems/audio.html">sound chip and sequencer</a>, off your disc's own instrument
+      bank and score. Browsers require a click first; picking a scene or clicking the canvas
+      enables it.</li>
+    <li><strong>Battles.</strong> Walking a wilderness scene rolls the disc's own
+      step-driven encounters, and the fight that opens is the ported
+      <a href="subsystems/battle.html">battle engine</a> on its own 3D stage: the monster meshes,
+      the party's dressed battle forms and the arena dome, posed by the same battle state machine
+      the native window runs (<a href="subsystems/battle-actor-rendering.html">battle rendering</a>).
+      Real formations, real
+      <a href="subsystems/battle-formulas.html">damage formulas</a>, player-driven turns - pick a
+      command, a target, an art, a spell or an item from the same menus the native window draws,
+      over the battle HUD with damage numerals. Win and you are back on the field with XP,
+      gold and drops. Towns have no encounter table and stay peaceful.</li>
+    <li><strong>Fishing.</strong> The minigame starts where the game starts it - a fishing
+      spot's own script hands over to it, as on the console - and runs the same loop the
+      <a href="minigames.html">minigames page</a> runs, with your points, casts and lure carried
+      between sessions. <kbd>X</kbd> casts and locks the power meter, <kbd>Z</kbd> and
+      <kbd>V</kbd> reel (<a href="subsystems/minigame-fishing.html">fishing</a>).</li>
+    <li><strong>The overworld.</strong> Picking a kingdom map walks it with the world-map
+      controller: step-driven encounters, ports and town doors
+      (<a href="subsystems/world-map.html">world map</a>).</li>
+    <li><strong>Movies.</strong> The FMVs play in the tab off your disc, with their XA
+      soundtrack on the engine's mixer, wherever the game's script arms one
+      (<a href="subsystems/cutscene.html">cutscenes</a>).</li>
+    <li><strong>Inns.</strong> Each inn is the innkeeper's own script, run by the field VM: the
+      offer, the gold check, the rest fade and the restore are the retail record
+      (<a href="subsystems/inn.html">inn</a>).</li>
+    <li><strong>Minigames.</strong> The slot machine, Baka Fighter, the Muscle Dome and the dance
+      floor open from their own doors and cabinets, run by the engine and drawn from your disc;
+      the Muscle Dome fights under the battle screen's chips and plates. Start leaves any
+      minigame from anywhere.</li>
+  </ul>
+  <h3>Not here yet</h3>
+  <ul>
+    <li><strong>The overworld's placed figures.</strong> Retail binds each world-map placement
+      to its own actor model, and which model is still open, so neither host draws one. The
+      <em>Overworld markers</em> box shows each town, port and encounter zone as a coloured
+      post instead, depth-tested against the terrain. The
+      <a href="world-overview.html">world overview</a> shows the continents.</li>
+  </ul>
+  <p class="hint">
+    The camera is retail's follow camera, framed per scene from the scene's own camera-region
+    records, with see-through walls for whatever blocks the view. In caves the
+    floor sampler can disagree with the visible ground - tracked with the
+    <a href="reference/open-rev-eng-threads.html">open questions</a>.
+  </p>
+</section>
+
+<section class="doc-section" id="how">
+  <h3>How this page is wired</h3>
+  <p>
+    The WebAssembly bundle is the engine crates themselves. The page only turns key state into a
+    PSX controller word, ticks the engine once per animation frame, and draws what it reports -
+    the engine decides where you are. Characters are assembled per frame from their animation
+    records' bone transforms, because the meshes ship as object-local pieces
+    (<a href="formats/character-mesh.html">character meshes</a>, <a href="formats/anm.html">ANM</a>).
+  </p>
+  <p>
+    The menus are the same menus as the native window. Every screen's geometry - pause menu, save
+    flow, dialog box, shop panel - is built by one renderer-agnostic crate both hosts call; the
+    page supplies a different framebuffer, not a different UI. A repository check derives the
+    shared surface from the source and fails the build when a screen reaches one host and not
+    the other, so the "not here yet" list above cannot quietly go out of date.
+  </p>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="subsystems/engine.html">Engine reimplementation</a>
+    <a href="subsystems/field-locomotion.html">Field locomotion</a>
+    <a href="subsystems/script-vm.html">Field / event VM</a>
+    <a href="subsystems/vr-mode.html">VR mode</a>
+    <a href="guides/playing-and-viewing.html">Playing natively</a>
+    <a href="viewer.html">Asset viewer</a>
+    <a href="world.html">Game world</a>
+  </div>
+</section>
+
+  </div>
+</details>
+
+<script src="js/vr-mode.js"></script>
+<script src="js/webgl-shaders.js"></script>
+<script src="js/webgl-math.js"></script>
+<script src="js/webgl-tmd.js"></script>
+<script src="js/webgl-tmd-frame-state.js"></script>
+<script src="js/webgl-tmd-assembled-scene.js"></script>
+<script src="js/webgl-fog-volume.js"></script>
+<script src="js/webgl-bloom.js"></script>
+<script src="js/pad-bindings.js"></script>
+<script src="js/field-actors.js"></script>
+<script src="js/play-view-constants.js"></script>
+<script src="js/play-atlas-blitter.js"></script>
+<script src="js/play-app.js"></script>
+<script src="js/play-view-scene-build.js"></script>
+<script src="js/play-view-input.js"></script>
+<script src="js/play-view-overlay.js"></script>
+<script src="js/play-view-field-sync.js"></script>
+<script src="js/play-view-frame.js"></script>
+<script src="js/play-view-battle.js"></script>
+<script src="js/play-fmv.js"></script>
+<script src="js/play-minigames.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  const fileInput = document.getElementById('play-file');
+  const statusEl  = document.getElementById('play-status');
+  const modesEl   = document.getElementById('play-modes');
+  const stageEl   = document.getElementById('play-stage');
+  const canvas    = document.getElementById('play-canvas');
+  const veil      = document.getElementById('play-veil');
+  const dialogEl  = document.getElementById('play-dialog');
+  const menuCanvas = document.getElementById('play-menu-canvas');
+  const listEl    = document.getElementById('play-scene-list');
+  const searchEl  = document.getElementById('play-scene-search');
+  const keysEl    = document.getElementById('play-keys');
+
+  /* Reveal the stage grid. The about-prose keeps its full-width spot below
+   * the stage: the canvas column scrolls with the page, so nothing below the
+   * stage is out of reach. */
+  function showStage() {
+    if (stageEl.style.display === 'grid') return;
+    stageEl.style.display = 'grid';
+  }
+
+  const hud = {
+    scene: document.getElementById('hud-scene'),
+    mode:  document.getElementById('hud-mode'),
+    fps:   document.getElementById('hud-fps'),
+    pos:   document.getElementById('hud-pos'),
+    npcs:  document.getElementById('hud-npcs'),
+    sfx:   document.getElementById('hud-sfx'),
+  };
+
+  let wasm = null, runtime = null, view = null;
+  let scenes = [];
+  let active = null;
+
+  /* Disc bytes cached from the initial upload so a poisoned engine instance can
+   * be re-instantiated without re-reading the file (Bug-3 recovery). */
+  let discBytes = null;
+  /* Re-entrancy + rapid-failure guards for the recovery path. */
+  let recovering = false;
+  let recoveryTimes = [];
+
+  /* One start at a time. Every user-initiated start - a New Game, a scene
+   * picked from the list, a save imported over the title - bumps the
+   * generation and tears down what the previous start left in flight: the
+   * boot title's own rAF + key loop (`cancelBootTitle`, set while it runs),
+   * the page's movie overlay, and on the engine side the logo / title
+   * sessions, a live opening chain, an armed movie and the score
+   * (`play_cancel_start`). A continuation that captured an older generation
+   * (the title loop's next frame, its outcome) bails instead of starting a
+   * second session over the new one. */
+  let startGen = 0;
+  let cancelBootTitle = null;
+  function supersedeStarts() {
+    startGen++;
+    if (cancelBootTitle) {
+      const cancel = cancelBootTitle;
+      cancelBootTitle = null;
+      try { cancel(); } catch (e) { console.warn('cancel boot title', e); }
+    }
+    if (window.LegaiaPlayFmv && typeof window.LegaiaPlayFmv.teardown === 'function') {
+      try { window.LegaiaPlayFmv.teardown(); } catch (e) {}
+    }
+    if (runtime) {
+      try {
+        if (typeof runtime.play_cancel_start === 'function') runtime.play_cancel_start();
+        else if (typeof runtime.boot_title_close === 'function') runtime.boot_title_close();
+      } catch (e) { console.warn('cancel start', e); }
+    }
+    window.__playStartGen = startGen;
+    return startGen;
+  }
+
+  /* The scene the disc's new-game table names as the opening (Rim Elm). Kept in
+   * sync with `legaia_game_tables::new_game::OPENING_SCENE`. */
+  const OPENING_SCENE = 'town01';
+
+  /* Only categories whose scenes are actually walkable are offered: towns,
+   * field areas, and the three kingdom overworlds (the engine's world-map
+   * controller - encounters, ports and town doors - runs on this host too;
+   * the page frames it with its follow camera rather than the native
+   * window's top-view debug camera). Battle / audio / system blocks aren't
+   * scenes at all. */
+  const GROUPS = [
+    { key: 'town',  title: 'Towns' },
+    { key: 'field', title: 'Field areas & dungeons' },
+    { key: 'world_map', title: 'World map' },
+  ];
+
+  fetch('scenes.json').then(r => r.ok ? r.json() : []).then(s => {
+    scenes = s.filter(x => GROUPS.some(g => g.key === x.category));
+    renderList('');
+  }).catch(() => {});
+
+  function renderList(filter) {
+    const f = (filter || '').trim().toLowerCase();
+    const parts = [];
+    for (const g of GROUPS) {
+      const items = scenes
+        .filter(s => s.category === g.key)
+        .filter(s => !f || s.display.toLowerCase().includes(f) || s.label.includes(f))
+        .sort((a, b) => a.display.localeCompare(b.display));
+      if (!items.length) continue;
+      parts.push(`<div class="play-scene-group">${g.title}</div>`);
+      for (const s of items) {
+        const cls = s.label === active ? 'play-scene-item is-active' : 'play-scene-item';
+        parts.push(
+          `<button class="${cls}" type="button" data-scene="${s.label}">` +
+          `<span>${s.display}</span><span class="play-scene-code">${s.label}</span></button>`);
+      }
+    }
+    listEl.innerHTML = parts.join('') || '<div class="play-scene-group">No match</div>';
+  }
+
+  searchEl.addEventListener('input', () => renderList(searchEl.value));
+  listEl.addEventListener('click', (e) => {
+    const b = e.target.closest('.play-scene-item');
+    if (b) enter(b.dataset.scene);
+  });
+
+  document.getElementById('play-modes').addEventListener('click', (e) => {
+    const b = e.target.closest('.play-mode');
+    if (!b) return;
+    for (const el of modesEl.querySelectorAll('.play-mode')) el.classList.remove('is-active');
+    b.classList.add('is-active');
+    if (b.dataset.mode === 'newgame') {
+      /* Boot chain: show the retail title card (New Game / Continue) off the
+       * disc's own title art, then run the prologue cutscene chain (falling
+       * back to Rim Elm directly if the cutscene scene fails to enter).
+       *
+       * Continue and Options are live rows: the engine routes them to the
+       * retail save-select and options screens (the shared pause-menu rows),
+       * and a Continue that loads a card block ends the title with
+       * 'loaded'. What happens next is the engine's (`onTitleOutcome`).
+       *
+       * A New Game supersedes whatever started before it: the running
+       * scene's loop stops (the title owns the screen until its outcome
+       * enters the opening) and any start still in flight is torn down. */
+      if (!runtime) return;
+      supersedeStarts();
+      if (view) { try { view.stop(); } catch (e) {} }
+      runBootTitle(onTitleOutcome);
+    } else {
+      /* The scene list lives inside #play-stage, which starts hidden. Reveal
+       * the stage so the picker is visible and selectable without first
+       * booting a scene via New Game. The canvas stays blank until a scene is
+       * chosen from the list. */
+      showStage();
+      searchEl.focus();
+    }
+  });
+
+  /* ---------------- boot ---------------- */
+
+  async function load(file) {
+    statusEl.textContent = 'Loading the engine…';
+    const prog = LoadProgress.create(statusEl);
+    try {
+      const bytes = await prog.read(file, `Reading ${file.name}`);
+      prog.indeterminate('Starting the engine…');
+      if (!wasm) {
+        wasm = await LegaiaWasm.load();
+      }
+      runtime = new wasm.LegaiaRuntime();
+      prog.indeterminate('Walking ISO9660 + parsing PROT.DAT…');
+      await prog.paint();   /* the parse below blocks the main thread */
+      /* Keep the raw disc bytes so a trapped engine can be rebuilt in place
+       * (no re-upload) - see `recoverRuntime`. */
+      discBytes = bytes;
+      /* The raw disc stays page-side: the runtime keeps only PROT.DAT + the
+       * executable, and hands back raw-sector extents (`disc_file_extent_json`)
+       * so a consumer can slice a named file - an XA voice bank, a movie -
+       * without the engine holding a second copy of the image. */
+      window.__playDiscBytes = bytes;
+      const count = runtime.load_disc(bytes, '');
+      prog.done(`${count} PROT entries. Pick a boot mode.`);
+      statusEl.textContent = `Disc loaded (${count} PROT entries). Pick a boot mode.`;
+      modesEl.style.display = 'grid';
+      window.__playRuntime = runtime;
+      if (typeof window.__playListHotkeys === 'function') window.__playListHotkeys(runtime);
+      if (typeof window.__playApplyDevMenu === 'function') window.__playApplyDevMenu();
+      /* The option boxes reflect the engine's persisted options - after the
+       * page's session switches (Retail-faithful pins them) are applied; the
+       * battle tools are session-only and start at the engine defaults. */
+      if (typeof window.__playSyncAfterRuntime === 'function') window.__playSyncAfterRuntime(false);
+      setSaveUi(true);
+      /* A fresh runtime has an empty rack: mount the browser card (and any
+       * card the player picked) before anything can open a save screen. */
+      remountCards();
+      /* The disc is up: re-render the save bar so it decodes the party
+       * portrait faces + card icons now that WASM + disc bytes are available. */
+      renderSavesStrip();
+      installXaBanks();
+      /* ?resume=<id>: auto-resume a stored session once the disc is up. */
+      if (resumePending) {
+        const entry = LegaiaSaves.listSessions().find(s => s.id === resumePending);
+        resumePending = null;
+        if (entry) resumeSession(entry);
+        else saveMsg('The session in the resume link is no longer in this browser.', true);
+      }
+    } catch (err) {
+      prog.fail(`Couldn't load: ${err.message || err}`);
+      console.warn(err);
+    }
+  }
+
+  /* Slice a named ISO file's raw Mode2/2352 sectors out of the disc bytes
+   * the page holds. `null` when no disc is up or the file is absent. */
+  window.__playSliceDiscFile = function (path) {
+    const bytes = window.__playDiscBytes;
+    if (!bytes || !runtime || typeof runtime.disc_file_extent_json !== 'function') return null;
+    let ext = null;
+    try { ext = JSON.parse(runtime.disc_file_extent_json(path)); } catch (e) { ext = null; }
+    if (!ext || ext.lba == null) return null;
+    const RAW = 2352;
+    const sectors = Math.ceil(ext.size / 2048);
+    const start = ext.lba * RAW, end = Math.min(bytes.length, start + sectors * RAW);
+    if (start >= end) return null;
+    return bytes.subarray(start, end);
+  };
+
+  /* CD-XA voice banks (the arts shouts on XA2/XA4/XA6, the battle stings
+   * and grunts on XA27/XA30): the engine names the files it stages natively,
+   * the page slices each out of the disc bytes it holds and hands the raw
+   * sectors over for decode. Pure decode, no audio needed, staggered onto
+   * idle time so the UI stays responsive (XA27 is the heavy one). */
+  function installXaBanks() {
+    const rt = runtime;
+    if (!rt || typeof rt.play_xa_wanted_files_json !== 'function') return;
+    let wanted = [];
+    try { wanted = JSON.parse(rt.play_xa_wanted_files_json()) || []; } catch (e) { return; }
+    /* Not requestIdleCallback: the play loop's rAF + sim leave a heavy
+     * page with no idle time at all, so the callback never fired and the
+     * banks never installed. A macrotask per file yields to input and
+     * rendering between decodes just as well. */
+    const idle = (fn) => setTimeout(fn, 30);
+    const next = () => {
+      const path = wanted.shift();
+      if (!path || window.__playRuntime !== rt) return;
+      try {
+        const sectors = window.__playSliceDiscFile(path);
+        if (sectors) rt.play_xa_install(path, sectors);
+      } catch (e) { console.warn('xa install', path, e); }
+      idle(next);
+    };
+    idle(next);
+  }
+  window.__playInstallXaBanks = installXaBanks;
+
+  /* Every way into a scene on this page: a picker pick (`enter`), a resumed
+   * save (`resumeLoadedSave`) and a New Game (`startNewGame`). The last two
+   * are ONE engine call each - `play_resume_save` / `play_new_game`, the
+   * browser twins of the native `BootSession::resume_save` /
+   * `BootSession::start_new_game` - so the landing order and its fallbacks
+   * (saved scene, running scene, opening town; opdeene, then town01) are the
+   * engine's, not this page's. The page's scene list is a picker, never a
+   * resume gate. */
+  function enter(label) {
+    if (!runtime) return;
+    /* A picked scene cancels a New Game in flight - its logos, title card,
+     * opening chain, movie and title theme - before the scene starts. */
+    supersedeStarts();
+    active = label;
+    enterWith(label, (v) => v.enter(label));
+  }
+
+  /* Land the save a Load / import parked in the engine. */
+  function resumeLoadedSave() {
+    if (!runtime) return;
+    /* A save imported from the bar while the boot title is still up replaces
+     * that New Game. (The title's own Continue finishes the title first, so
+     * nothing is live by the time it lands here.) */
+    if (cancelBootTitle) supersedeStarts();
+    enterWith('the saved scene', (v) => {
+      const r = v.resumeSave();
+      if (r.landing === 'nowhere') throw new Error('no scene could be entered for this save');
+      return r.state;
+    });
+  }
+
+  /* A New Game: the engine seeds the slate and enters the opening. */
+  function startNewGame() {
+    if (!runtime) return;
+    enterWith('the opening', (v) => v.newGame().state);
+  }
+
+  /* The boot title's (and the post-wipe title's) outcome: 'loaded' = a
+   * Continue loaded a save (land it), anything else = New Game. A Continue
+   * whose save names a scene this page does not list no longer falls
+   * through to a New Game over the loaded save. */
+  function onTitleOutcome(outcome) {
+    if (outcome === 'loaded') {
+      resumeLoadedSave();
+      saveMsg('Continued from a memory-card save.');
+      return;
+    }
+    startNewGame();
+  }
+
+  function enterWith(label, run) {
+    renderList(searchEl.value);
+    showStage();
+    statusEl.textContent = `Entering ${label}…`;
+    try {
+      if (!view) {
+        view = new window.PlayView(runtime, canvas, {
+          onState: onState,
+          menuOverlay: menuCanvas,
+          onScene: (name) => { active = name; renderList(searchEl.value); },
+          /* The opening naming prompt committed: the name is in the party
+           * record from here on (status panel, dialogue, saves), so say so. */
+          onNamed: (name) => {
+            statusEl.textContent = `Named the hero ${name}. Walk with the arrow keys.`;
+          },
+          /* The in-game Load screen read a save off an inserted memory card:
+           * the party is already in the world, so all that is left is to walk
+           * into the scene it was saved in - retail resumes there. */
+          onCardLoad: () => {
+            try { runtime.play_menu_close(); } catch (e) {}
+            saveMsg('Loaded from memory card.');
+            /* One engine call lands it (`play_resume_save`), re-entering the
+             * saved scene even when it is the one already on screen. */
+            resumeLoadedSave();
+          },
+          /* Party wipe -> the title card, which is retail's only answer
+           * here: the wipe arm of FUN_8003AEB0 stores game_mode = 0x16
+           * (CARD INIT) + _DAT_8007BB00 = 1 and the title overlay takes the
+           * screen. There is no chooser to route - the engine holds for the
+           * length of the title's own fade, draws nothing, and fires this
+           * once. The Continue/Retry/Quit panel that used to sit in front of
+           * this hook was an engine invention and is gone. */
+          onQuit: () => {
+            try { view.stop(); } catch (e) {}
+            /* The same title outcome the boot title takes: Continue lands
+             * the loaded save, New Game takes the engine's seeded slate - a
+             * party wipe must not carry the wiped run into the new game. */
+            runBootTitle(onTitleOutcome);
+          },
+          onError: (msg) => {
+            /* A WASM trap poisons the engine instance; rebuild it from the
+             * cached disc bytes and re-enter, so a single bad frame doesn't
+             * cost a page refresh (Bug-3 belt-and-suspenders). */
+            statusEl.textContent = `Engine hiccup - recovering… (${msg})`;
+            recoverRuntime();
+          },
+        });
+        window.__playView = view;
+        /* Headless-verification hook (see the `verify` skill, alongside
+           `__fsState` / `__woWalkStamps`): the resolved state of the two
+           overlay atlases. Once a scene is running, `engineHasChrome === true`
+           must imply `chrome === 'built'`; anything else means the page is
+           dropping every chrome sprite. */
+        window.__playOverlayState = () => view ? view.overlayAtlasState() : null;
+        /* Honour the See-through-walls checkbox state at view creation (it
+         * may have been unchecked before the first scene was entered). */
+        if (window.__playApplySeeThrough) window.__playApplySeeThrough();
+        if (window.__playApplyRenderToggles) window.__playApplyRenderToggles();
+      }
+      const st = run(view);
+      if (st && st.scene) { active = st.scene; renderList(searchEl.value); }
+      view.start();
+      /* Picking a scene is a user gesture: bring up the BGM output now (browser
+       * autoplay policy) so the scene's music sounds without waiting for a
+       * canvas click. The scene's track feeds itself through the engine's
+       * per-tick op-0x35 routing; a canvas click resumes it as a backstop. */
+      if (typeof view._enableAudio === 'function') view._enableAudio();
+      let hint = '';
+      /* Several retail scenes - every town, including Rim Elm - carry only
+       * rate-0 encounter regions, so walking them produces no fights by
+       * design. Say so, or a quiet town reads as a broken engine. */
+      try {
+        if (typeof view.rt?.scene_rolls_encounters === 'function'
+            && !view.rt.scene_rolls_encounters()) {
+          hint = ' No random encounters in this scene (retail) - head out to a field area to fight.';
+        }
+      } catch (e) {}
+      statusEl.textContent =
+        `Running ${active || label}. Click the canvas, then walk with the arrow keys.${hint}`;
+      window.__playState = st;
+      canvas.focus();
+    } catch (err) {
+      statusEl.textContent = `${label}: ${err.message || err}`;
+      window.__playState = null;
+      console.warn(err);
+    }
+  }
+
+  /* ---------------- boot title screen (the --boot-ui chain) ---------------- */
+
+  /* Run the retail title card over the overlay canvas, then call `then(outcome)`
+   * once the player confirms. The engine's TitleSession drives it; the page
+   * blits the disc's title-TIM bands (title atlas) + font glyphs onto the
+   * black overlay and feeds it edge-triggered pad words. This runs BEFORE any
+   * scene / PlayView exists, so it owns a tiny self-contained RAF + key loop. */
+  let bootTitleRAF = 0;
+  /* No BOOT_PAD table here any more. This loop used to carry a third keyboard
+   * map beside play-app.js's and the engine's, and the three disagreed: `X`
+   * was Circle here and Square in the native window, `S` walked down here and
+   * pressed Circle there, and Select / L1 / R1 / L2 / R2 existed in neither
+   * page table. The title loop now shares the one table play-app.js reads out
+   * of the engine (`legaia_engine_system::input::Mapping::default` via
+   * `pad_bindings_json`), so a rebind reaches the title card too. */
+  function runBootTitle(then) {
+    if (!runtime) { then('new_game'); return; }
+    /* A second title over a live one (a party wipe's, a New Game's) replaces
+     * it: the old loop must not keep stepping the session or deliver its
+     * outcome. The generation this title answers to is the current one; a
+     * later start bumps it and the loop below bails. */
+    if (cancelBootTitle) {
+      const prev = cancelBootTitle;
+      cancelBootTitle = null;
+      try { prev(); } catch (e) {}
+    }
+    const gen = startGen;
+    const PAD = window.legaiaAdoptPadBindings
+      ? window.legaiaAdoptPadBindings(runtime)
+      : null;
+    const padMaskOf = window.legaiaPadMaskOf || ((keys) => {
+      let m = 0; for (const k of keys) m |= (PAD && PAD[k]) || 0; return m;
+    });
+    try { runtime.boot_title_start(); } catch (e) { console.warn('boot title', e); then('new_game'); return; }
+    if (!runtime.boot_title_is_active()) { then('new_game'); return; }   /* no disc art path */
+    /* Publisher logos: the boot stage AHEAD of the title card (PROT 0895's own
+     * sequencer - SCEA, Contrail, PROKION, each with its own fade). The engine
+     * has carried the session and the atlas builder all along; only the native
+     * `--boot-ui` chain played them, so this page used to enter the boot chain
+     * one stage late. `false` when the disc has no readable init.pak, which is
+     * the same fallback the native window takes. */
+    let logos = false;
+    try { logos = (typeof runtime.boot_logos_start === 'function') && runtime.boot_logos_start(); }
+    catch (e) { console.warn('boot logos', e); logos = false; }
+    let logoBlit = null;
+    if (logos) {
+      try {
+        const ld = runtime.boot_logos_atlas_dims();
+        if (ld[0] > 0) logoBlit = new window.LegaiaAtlasBlitter(runtime.boot_logos_atlas_rgba(), ld[0], ld[1]);
+      } catch (e) { console.warn('boot logos atlas', e); }
+      if (!logoBlit) logos = false;   /* nothing to draw - skip straight to the card */
+    }
+    /* Title theme: the native window starts it on entry to the title card
+     * (`start_title_bgm`), not under the logos; the click that opened this flow
+     * is the user gesture the browser's autoplay policy wants, so audio can
+     * come up here. */
+    const startTitleBgm = () => {
+      try {
+        if (typeof runtime.audio_init === 'function') {
+          if (typeof runtime.audio_ready !== 'function' || !runtime.audio_ready()) runtime.audio_init();
+          if (typeof runtime.audio_resume === 'function') runtime.audio_resume();
+          if (typeof window.__playApplyVolume === 'function') window.__playApplyVolume();
+          if (typeof runtime.play_title_bgm === 'function') runtime.play_title_bgm();
+        }
+      } catch (e) { console.warn('title bgm', e); }
+    };
+    const TITLE_PROMPT = 'Press Start (Enter). Up/Down to choose, Z to confirm.';
+    if (!logos) startTitleBgm();
+    showStage();
+    statusEl.textContent = logos ? 'Publisher logos - Enter or Z skips.' : TITLE_PROMPT;
+    const ctx = menuCanvas.getContext('2d');
+    /* Blitters, in the engine's own fallback order: the title art carries the
+     * card + menu bands; without it the menu rows come off the menu-glyph
+     * atlas; without that too, the dialog font stands in. */
+    let titleBlit = null, glyphBlit = null, fontBlit = null;
+    try {
+      const td = runtime.boot_title_atlas_dims();
+      if (runtime.boot_title_has_atlas() && td[0] > 0)
+        titleBlit = new window.LegaiaAtlasBlitter(runtime.boot_title_atlas_rgba(), td[0], td[1]);
+      if (typeof runtime.boot_title_glyph_atlas_dims === 'function') {
+        const gd = runtime.boot_title_glyph_atlas_dims();
+        if (gd[0] > 0)
+          glyphBlit = new window.LegaiaAtlasBlitter(runtime.boot_title_glyph_atlas_rgba(), gd[0], gd[1]);
+      }
+    } catch (e) { console.warn('boot title atlas', e); }
+    /* The menu font is the engine's, not the title's, so it shares the
+       readiness problem the chrome blitter below has: `play_menu_font_dims()`
+       is `[0, 0]` until the engine builds its menu assets, which nothing has
+       asked it to do while the title card is up. Resolve on first use. */
+    const ensureFont = () => {
+      if (fontBlit) return fontBlit;
+      try {
+        const fd = runtime.play_menu_font_dims();
+        if (fd[0] > 0) fontBlit = new window.LegaiaAtlasBlitter(runtime.play_menu_font_rgba(), fd[0], fd[1], window.LegaiaAtlasBlitter.tinterFor(runtime));
+      } catch (e) { console.warn('boot title font', e); }
+      return fontBlit;
+    };
+    const pulse = new Set();
+    const onKey = (e) => {
+      if (!PAD || PAD[e.code] === undefined) return;
+      /* Typing in the scene search (or any field) is not a pad press. */
+      const t = e.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) return;
+      e.preventDefault();
+      pulse.add(e.code);
+    };
+    window.addEventListener('keydown', onKey);
+    canvas.focus();
+    let torn = false;
+    const teardownTitle = () => {
+      if (torn) return;
+      torn = true;
+      if (bootTitleRAF) cancelAnimationFrame(bootTitleRAF);
+      bootTitleRAF = 0;
+      window.removeEventListener('keydown', onKey);
+      ctx.clearRect(0, 0, menuCanvas.width, menuCanvas.height);
+      if (cancelBootTitle === cancelThis) cancelBootTitle = null;
+    };
+    /* Superseded (`supersedeStarts`): tear down without an outcome. The
+     * Continue screen or the Options row the title handed off to closes
+     * with it (`boot_title_close` drops the Continue screen). */
+    const cancelThis = () => {
+      const wasHandoff = !torn && handoff;
+      teardownTitle();
+      if (wasHandoff === 'options') { try { runtime.play_menu_close(); } catch (e) {} }
+      if (wasHandoff === 'continue') { try { runtime.boot_title_close(); } catch (e) {} }
+    };
+    cancelBootTitle = cancelThis;
+    const finish = (outcome) => {
+      teardownTitle();
+      if (gen !== startGen) return;   /* a newer start owns the page */
+      try { then(outcome); } catch (e) { console.warn('boot title -> then', e); }
+    };
+    /* Chrome blitter for the Continue screen and the Options sub-screen:
+     * the session's save-select and the pause menu's own Options row (the
+     * engine opens each off the title outcome), so they draw off the same
+     * two atlases the in-game menu uses.
+     *
+     * Resolved on first use, not here. `play_menu_has_chrome()` reports the
+     * engine's *cached* menu assets and answers `false` while it has not built
+     * them - which is exactly the state the title card runs in, since nothing
+     * has opened a menu yet. Asking once at title entry therefore always got
+     * `false` and left these two screens skinless. The same trap cost the
+     * running page every chrome sprite once a per-frame caller was added; see
+     * `_ensureMenuBlitters` in play-view-overlay.js. */
+    let chromeBlit = null;
+    const ensureChrome = () => {
+      if (chromeBlit) return chromeBlit;
+      try {
+        if (runtime.play_menu_has_chrome()) {
+          const cd = runtime.play_menu_chrome_dims();
+          if (cd[0] > 0)
+            chromeBlit = new window.LegaiaAtlasBlitter(runtime.play_menu_chrome_rgba(), cd[0], cd[1], window.LegaiaAtlasBlitter.tinterFor(runtime));
+        }
+      } catch (e) { console.warn('boot title chrome', e); }
+      return chromeBlit;
+    };
+    /* Non-empty once the title handed off: 'continue' to the engine's
+     * Continue screen (`boot_continue_step` / `boot_continue_draws_json`),
+     * 'options' to the pause menu's Options row. The loop then drives that
+     * screen instead of the title card. A Continue that loaded a save
+     * finishes with 'loaded' and the engine lands it (`play_resume_save`). */
+    let handoff = '';
+    let loaded = false;
+    const titleHeld = new Set();
+    /* Ticks this display frame runs, from the engine's one frame stepper
+     * (`play_drain_sim_steps`, the `SimStepper` the in-game loop and the
+     * native window drain): at most four, and none on a frame that carried
+     * less than a tick. The card used to keep its own clock that ran at
+     * least one tick every frame (twice retail speed at 120 Hz) and caught
+     * up to thirty. A press is held until a tick runs to take it. */
+    let titleLast = 0;
+    let titleEdge = 0;
+    const titleTicks = () => {
+      const now = performance.now();
+      const dt = titleLast ? now - titleLast : 0;
+      titleLast = now;
+      try { return runtime.play_drain_sim_steps(dt); } catch (e) { return 1; }
+    };
+    const frame = () => {
+      if (torn) return;
+      if (gen !== startGen) { cancelThis(); return; }
+      bootTitleRAF = requestAnimationFrame(frame);
+      /* A gamepad's press edges reach the title card the way a key's do. */
+      if (window.legaiaPollGamepad) window.legaiaPollGamepad(titleHeld, pulse);
+      titleEdge |= padMaskOf(pulse);
+      pulse.clear();
+      const ticks = titleTicks();
+      const edge = ticks > 0 ? titleEdge : 0;
+      if (ticks > 0) titleEdge = 0;
+      /* Publisher-logo stage: owns the frame until the sequencer finishes or
+       * a Start / Cross edge skips it, then the title card opens. It runs the frame's ticks
+       * (the stepper above) - the fade ramps are counted in
+       * retail frames, so a throttled tab must not stretch them. */
+      if (logos) {
+        let done = false;
+        try {
+          for (let i = 0; i < ticks && !done; i++) done = runtime.boot_logos_step(i === 0 ? edge : 0);
+        } catch (e) { done = true; }
+        let ld = null;
+        try { ld = JSON.parse(runtime.boot_logos_draws_json(menuCanvas.width, menuCanvas.height)); }
+        catch (e) { ld = null; }
+        ctx.clearRect(0, 0, menuCanvas.width, menuCanvas.height);
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, menuCanvas.width, menuCanvas.height);
+        if (ld && ld.sprites && logoBlit) logoBlit.blit(ctx, ld.sprites);
+        if (done) {
+          logos = false;
+          startTitleBgm();
+          statusEl.textContent = TITLE_PROMPT;
+        }
+        return;
+      }
+      /* Attract-mode movie (fmv 0, MV1.STR): the title session arms it on
+       * the idle countdown and stays frozen until the page's movie lane
+       * finishes it or the retail skip edge fires - the same lane the
+       * in-game story movies ride. Must run every title frame. */
+      if (window.LegaiaPlayFmv) {
+        try { window.LegaiaPlayFmv.service(runtime, document.querySelector('.play-canvas-wrap')); }
+        catch (e) { console.warn('title fmv', e); }
+      }
+      /* Draw one save-select / menu frame: black, the title art the
+       * engine keeps behind the Continue screen (retail dims the card
+       * behind the Load window; `boot_title_backdrop_draws_json` answers
+       * inactive for Options and for the phases retail draws over black),
+       * then the chrome and the text. */
+      const drawHandoff = (md) => {
+        ctx.clearRect(0, 0, menuCanvas.width, menuCanvas.height);
+        if (!md || !md.open) return;
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, menuCanvas.width, menuCanvas.height);
+        let bd = null;
+        try { bd = JSON.parse(runtime.boot_title_backdrop_draws_json(menuCanvas.width, menuCanvas.height)); }
+        catch (e) { bd = null; }
+        if (bd && bd.active && titleBlit) titleBlit.blit(ctx, bd.sprites);
+        /* By here the engine has built its menu assets, so the atlas is
+           finally answerable for. */
+        const cb = ensureChrome();
+        if (cb) cb.blitDarkened(ctx, md.sprites, md.darken);
+        const fb = ensureFont();
+        if (fb) fb.blit(ctx, md.texts);
+      };
+      const backToTitle = () => {
+        /* Options closed, or Continue backed out without loading: retail
+         * returns to the title card. */
+        handoff = '';
+        try { runtime.boot_title_start(); } catch (e) { return finish('new_game'); }
+        statusEl.textContent = 'Press Start (Enter). Up/Down to choose, Z to confirm.';
+      };
+      if (handoff === 'continue') {
+        /* The title's Continue: the session's one Continue screen (the
+         * native window's too). One step per tick - the card-read dialog
+         * counts down a frame timer. The step reports 'loaded' (the save
+         * is parked for `play_resume_save`) or 'back'. */
+        let step = '';
+        for (let i = 0; i < ticks && !step; i++) {
+          try { step = runtime.boot_continue_step(i === 0 ? edge : 0); } catch (e) { return finish('new_game'); }
+        }
+        let md = null;
+        try { md = JSON.parse(runtime.boot_continue_draws_json(menuCanvas.width, menuCanvas.height)); }
+        catch (e) { md = null; }
+        drawHandoff(md);
+        if (step === 'loaded') return finish('loaded');
+        if (step === 'back') backToTitle();
+        return;
+      }
+      if (handoff) {
+        /* Options: the retail options screen, reached through the shared
+         * pause-menu row rather than a second copy on this page. One step
+         * per tick, as play-app.js. */
+        for (let i = 0; i < ticks; i++) {
+          try { runtime.play_menu_input(i === 0 ? edge : 0); } catch (e) { return finish('new_game'); }
+        }
+        try { loaded = runtime.play_menu_take_load() || loaded; } catch (e) {}
+        let md = null;
+        try { md = JSON.parse(runtime.play_menu_draws_json(menuCanvas.width, menuCanvas.height)); }
+        catch (e) { md = null; }
+        drawHandoff(md);
+        let stillOpen = false;
+        try { stillOpen = runtime.play_menu_is_open(); } catch (e) {}
+        if (loaded) {
+          try { runtime.play_menu_close(); } catch (e) {}
+          return finish('loaded');
+        }
+        if (!stillOpen) backToTitle();
+        return;
+      }
+      /* The title session counts retail frames - the attract countdown is
+       * 0x5DC of them, 25 s at 60 Hz - so it steps once per tick from the
+       * shared stepper rather than once per
+       * animation frame: a throttled or slow tab used to stretch the
+       * countdown to minutes and the attract movie never came. The pad
+       * edge lands on the first tick of the frame only. */
+      let outcome = '';
+      {
+        try {
+          for (let i = 0; i < ticks && !outcome; i++) outcome = runtime.boot_title_step(i === 0 ? edge : 0);
+        } catch (e) { return finish('new_game'); }
+      }
+      /* Draw the card: black backdrop, title bands, then any text stand-in. */
+      let draws;
+      try { draws = JSON.parse(runtime.boot_title_draws_json(menuCanvas.width, menuCanvas.height)); }
+      catch (e) { draws = null; }
+      ctx.clearRect(0, 0, menuCanvas.width, menuCanvas.height);
+      if (draws && draws.active) {
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, menuCanvas.width, menuCanvas.height);
+        if (titleBlit) titleBlit.blit(ctx, draws.sprites);
+        if (glyphBlit && draws.glyphs) glyphBlit.blit(ctx, draws.glyphs);
+        const fb2 = ensureFont();
+        if (fb2) fb2.blit(ctx, draws.texts);
+      }
+      if (outcome === 'continue' || outcome === 'options') {
+        handoff = outcome;
+        statusEl.textContent = outcome === 'continue'
+          ? 'Pick a memory-card port, then a save block. Z confirms, X backs out.'
+          : 'Options. Up/Down picks a row, Z opens it, X returns to the title.';
+        return;
+      }
+      if (outcome) finish(outcome);   /* new_game */
+    };
+    bootTitleRAF = requestAnimationFrame(frame);
+  }
+  window.__bootTitle = runBootTitle;
+
+  /* Rebuild a fresh engine after a WASM trap and re-enter the current scene,
+   * reusing the existing renderer/canvas and the cached disc bytes (no
+   * re-upload). Guarded against re-entrancy and against a scene that traps every
+   * frame: after a few rapid failures it falls back to the opening scene, then
+   * gives up (a page refresh clears everything). */
+  function recoverRuntime() {
+    if (recovering || !discBytes || !wasm || !view) return;
+    recovering = true;
+
+    const now = performance.now();
+    recoveryTimes = recoveryTimes.filter(t => now - t < 6000);
+    recoveryTimes.push(now);
+
+    try {
+      /* A fresh LegaiaRuntime allocates a clean SceneHost; loading the cached
+       * disc bytes re-parses PROT.DAT in place. */
+      const fresh = new wasm.LegaiaRuntime();
+      fresh.load_disc(discBytes, '');
+      runtime = fresh;
+      window.__playRuntime = runtime;
+      remountCards();
+      if (typeof window.__playApplyDevMenu === 'function') window.__playApplyDevMenu();
+      if (typeof window.__playApplyBattleTools === 'function') window.__playApplyBattleTools();
+      if (typeof window.__playSyncAfterRuntime === 'function') window.__playSyncAfterRuntime(true);
+      installXaBanks();
+
+      /* Too many failures in a short window -> the scene itself is the problem;
+       * retreat to the opening scene, and if even that keeps failing, stop and
+       * ask for a refresh rather than spin. */
+      let label = active || OPENING_SCENE;
+      if (recoveryTimes.length > 3) label = OPENING_SCENE;
+      if (recoveryTimes.length > 6) {
+        view.stop();
+        statusEl.textContent = 'Engine kept failing - please reload the page.';
+        return;
+      }
+
+      const st = view.recover(fresh, label);
+      window.__playState = st;
+      statusEl.textContent = `Recovered. Running ${label}. Click the canvas to continue.`;
+    } catch (e) {
+      view.stop();
+      statusEl.textContent = `Recovery failed: ${e.message || e}. Please reload the page.`;
+      console.warn('recovery failed', e);
+    } finally {
+      recovering = false;
+    }
+  }
+
+  /* ---------------- field pause menu overlay (Bug 1) ---------------- */
+
+  /* The pause menu is drawn by the view itself (engine-driven retail chrome +
+   * font glyphs blitted onto the overlay canvas - see play-view-overlay.js
+   * `_drawOverlay`),
+   * so the HUD no longer renders a DOM menu. */
+
+  /* ---------------- per-frame HUD ---------------- */
+
+  function onState(st, fps) {
+    hud.scene.textContent = st.scene || '-';
+    hud.mode.textContent  = st.mode;
+    hud.fps.textContent   = fps;
+    hud.npcs.textContent  = st.npcs;
+    hud.pos.textContent = st.player
+      ? `${st.player.x}, ${st.player.z}` + (st.player.walking ? ' (walking)' : '')
+      : '-';
+
+    /* Sound-effect channel: how many descriptors decoded off the disc, whether
+       the class-2 program bank is resident in the SPU, and how many cues have
+       keyed a voice. A cue that never keys is a silent channel, so the fired
+       count is the honest readout. */
+    const sfx = view && view.sfxState ? view.sfxState() : null;
+    hud.sfx.textContent = sfx
+      ? `${sfx.descriptors} cues` + (sfx.vab_staged ? '' : ' (bank not staged)')
+        + `, fired ${sfx.fired}`
+      : '-';
+
+    /* The retail dialog reading box is engine-drawn on the overlay canvas at
+     * the TOP of the stage. This DOM text box is a `bottom: 5%` strip and
+     * stands in ONLY where that draw path does not exist at all - a cached
+     * WASM without the export, or no font atlas. That is what
+     * `dialogCanvasCapable` reports: a capability, settled before the first
+     * conversation.
+     *
+     * It must not be the per-frame "is the canvas drawing it right now", which
+     * is what it used to be: this HUD update runs earlier in `PlayView._frame`
+     * than `_drawOverlay`, so a box that opened this frame read last frame's
+     * answer, flashed this strip at the bottom for one frame, and was replaced
+     * by the real box at the top on the next - on every open and every page
+     * break. Two differently-seated surfaces cannot be swapped per frame. */
+    if (st.dialog && st.dialog.text && !(view && view.dialogCanvasCapable)) {
+      let html = window.escapeHtml(st.dialog.text);
+      if (st.dialog.options && st.dialog.options.length) {
+        html += '\n' + st.dialog.options.map((o, i) => {
+          const cls = i === st.dialog.cursor ? 'play-dialog-opt is-sel' : 'play-dialog-opt';
+          return `<span class="${cls}">${i === st.dialog.cursor ? '▸ ' : '  '}${window.escapeHtml(o)}</span>`;
+        }).join('\n');
+      }
+      dialogEl.innerHTML = html;
+      dialogEl.classList.remove('is-hidden');
+    } else {
+      dialogEl.classList.add('is-hidden');
+    }
+
+    /* Light up the keys that are actually held - the legend doubles as an input
+     * monitor, which is the fastest way to see the canvas has focus. */
+    const held = new Set(view ? view.heldKeys() : []);
+    for (const kbd of keysEl.querySelectorAll('kbd[data-key]')) {
+      const k = kbd.dataset.key;
+      const on = k === 'ArrowUp'
+        ? ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'KeyW', 'KeyA', 'KeyS', 'KeyD']
+          .some(x => held.has(x))
+        : held.has(k);
+      kbd.classList.toggle('is-held', on);
+    }
+
+    window.__playState = st;
+  }
+
+  /* ---------------- saves: export / import / resume ---------------- */
+
+  const saveStatusEl  = document.getElementById('save-status');
+  const saveExportBtn = document.getElementById('save-export');
+  const saveImportEl  = document.getElementById('save-import');
+  const savesStripEl  = document.getElementById('play-saves-strip');
+
+  /* Session id from a `?resume=<id>` link (the strips on pages without a
+   * runtime link here). Consumed after the first successful disc load. */
+  let resumePending = new URLSearchParams(location.search).get('resume');
+
+  function saveMsg(msg, isError) {
+    saveStatusEl.textContent = msg;
+    saveStatusEl.classList.toggle('is-error', !!isError);
+  }
+
+  function setSaveUi(enabled) {
+    saveExportBtn.disabled = !enabled;
+    saveImportEl.disabled = !enabled;
+    if (enabled) saveMsg('Export the running session, or import a .lgsf / memory-card save.');
+  }
+
+  function downloadBytes(bytes, filename) {
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  }
+
+
+  function exportSession() {
+    if (!runtime) return;
+    try {
+      const bytes = runtime.export_save();
+      let party = [], money = null;
+      try {
+        const sum = JSON.parse(wasm.save_summary_json(bytes));
+        party = sum.party || [];
+        money = sum.money != null ? sum.money : null;
+      } catch (e) { /* summary is best-effort; the bytes are the save */ }
+      const scene = active || '';
+      const name = `Session ${scene || 'engine'}`;
+      const id = LegaiaSaves.putSession({ kind: 'lgsf', name, scene, party, money }, bytes);
+      downloadBytes(bytes, `${name.replace(/[^\w.-]+/g, '-')}.lgsf`);
+      saveMsg(id ? 'Exported - downloaded and kept in this browser.'
+                 : 'Exported - downloaded (browser storage is full, so it was not kept here).');
+    } catch (err) {
+      saveMsg(`Export failed: ${err.message || err}`, true);
+      console.warn(err);
+    }
+  }
+
+  /* One import path for picked files, stored sessions and ?resume= links.
+   * `opts`: { id, name, scene, block, format } - all optional. A card
+   * container holding several saves parks a block chooser in the status
+   * line rather than guessing. */
+  function importSaveBytes(bytes, opts) {
+    opts = opts || {};
+    if (!runtime) {
+      saveMsg('Load your disc image first - it is picked up from the browser cache automatically.', true);
+      return;
+    }
+    try {
+      const isLgsf = bytes.length >= 4 && bytes[0] === 0x4C && bytes[1] === 0x47
+                  && bytes[2] === 0x53 && bytes[3] === 0x46;   /* "LGSF" */
+      if (isLgsf) {
+        const sum = JSON.parse(runtime.import_save(bytes));
+        LegaiaSaves.putSession({
+          id: opts.id, kind: 'lgsf',
+          name: opts.name || 'Imported session',
+          scene: sum.scene || opts.scene || '',
+          party: sum.party || [],
+          money: sum.money != null ? sum.money : null,
+        }, bytes);
+        const who = sum.party && sum.party.length ? ` - ${sum.party.join(', ')}` : '';
+        saveMsg(`Imported engine save${who}.`);
+        resumeLoadedSave();
+        return;
+      }
+      const listing = JSON.parse(wasm.card_saves_json(bytes));
+      const valid = (listing.saves || []).filter(s => s.valid);
+      if (!valid.length) {
+        saveMsg('No Legaia save found in that card container.', true);
+        return;
+      }
+      let block = opts.block;
+      if (block == null || !valid.some(s => s.block === block)) {
+        if (valid.length === 1) block = valid[0].block;
+        else { chooseCardBlock(bytes, valid, opts, listing.format); return; }
+      }
+      finishCardImport(bytes, block, opts, listing.format);
+    } catch (err) {
+      saveMsg(`Import failed: ${err.message || err}`, true);
+      console.warn(err);
+    }
+  }
+
+  function chooseCardBlock(bytes, saves, opts, format) {
+    saveStatusEl.classList.remove('is-error');
+    saveStatusEl.textContent = `${saves.length} saves in this card - pick one: `;
+    for (const s of saves) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      const who = s.party && s.party.length ? ` ${s.party[0]}` : '';
+      b.textContent = `Block ${s.block}${who}${s.location ? ` - ${s.location}` : ''}`;
+      b.addEventListener('click', () => finishCardImport(bytes, s.block, opts, format));
+      saveStatusEl.appendChild(b);
+    }
+  }
+
+  function finishCardImport(bytes, block, opts, format) {
+    try {
+      const sum = JSON.parse(runtime.import_card_save(bytes, block));
+      const cardId = LegaiaSaves.putSession({
+        id: opts.id, kind: 'card',
+        name: opts.name || `Card block ${block}`,
+        scene: sum.scene || '',
+        block,
+        format: format || opts.format || 'mcr',
+        party: sum.party || [],
+        money: sum.money != null ? sum.money : null,
+        coins: sum.coins != null ? sum.coins : null,
+      }, bytes);
+      saveMsg(`Imported card block ${block}${sum.location ? ` (${sum.location})` : ''}.`);
+      /* The card the player just handed us is almost certainly the one they
+       * want in a slot - put it in a free port so in-game Save works now. */
+      autoInsertCard(cardId);
+      resumeLoadedSave();
+    } catch (err) {
+      saveMsg(`Import failed: ${err.message || err}`, true);
+      console.warn(err);
+    }
+  }
+
+  function resumeSession(entry) {
+    if (!runtime) {
+      saveMsg('Load your disc image first - it is picked up from the browser cache automatically.', true);
+      return;
+    }
+    const stored = LegaiaSaves.getSession(entry.id);
+    if (!stored) {
+      saveMsg('That save is no longer stored in this browser.', true);
+      return;
+    }
+    importSaveBytes(stored.bytes, {
+      id: entry.id, name: entry.name, scene: entry.scene,
+      block: entry.block, format: entry.format,
+    });
+  }
+
+  /* The WASM save tools (card_icon_rgba / save_summary_json / disc_portrait_rgba)
+   * are stateless free functions. Reuse the engine module once the disc is up;
+   * before that, lazily import it (ESM caching dedupes with the engine load, so
+   * this never pulls a second copy of the bundle). */
+  let saveToolsPromise = null;
+  function saveTools() {
+    if (wasm) return Promise.resolve(wasm);
+    if (!saveToolsPromise) {
+      saveToolsPromise = LegaiaWasm.load();
+    }
+    return saveToolsPromise;
+  }
+
+  /* Decode the three load-screen portrait TIMs (Vahn / Noa / Gala) off the
+   * loaded disc so the bar can draw the party roster faces beside each tile,
+   * exactly as the minigames bar does. Async (needs WASM + disc bytes); the
+   * rich bar's synchronous harvest() only kicks this off once and re-renders
+   * when the cached faces land. */
+  let portraitHarvestBusy = false;
+  function harvestPortraits() {
+    if (LegaiaSaves.portraitCanvases()) return false;
+    if (portraitHarvestBusy || !discBytes) return false;
+    portraitHarvestBusy = true;
+    saveTools().then(mod => {
+      if (typeof mod.disc_portrait_rgba !== 'function') return;
+      const rgba = [];
+      for (let i = 0; i < 3; i++) {
+        const buf = mod.disc_portrait_rgba(discBytes, i);
+        if (!buf || buf.length !== 16 * 16 * 4) { portraitHarvestBusy = false; return; }
+        rgba.push(buf);
+      }
+      if (LegaiaSaves.cachePortraits(rgba)) renderSavesStrip();
+    }).catch(() => { portraitHarvestBusy = false; });
+    return false;
+  }
+
+  /* Import a picked save file straight into the running engine (and persist
+   * it), the same path the rail's file input takes. */
+  function addSaveFile(file) {
+    return file.arrayBuffer().then(buf => {
+      importSaveBytes(new Uint8Array(buf), {
+        name: file.name.replace(/\.[^.]+$/, ''),
+        format: (file.name.match(/\.(mcr|mcd|gme|mcs)$/i) || [])[1] || null,
+      });
+    }).catch(err => {
+      saveMsg(`Could not read ${file.name}: ${err.message || err}`, true);
+    });
+  }
+
+  let savesBar = null;
+  function renderSavesStrip() {
+    if (!savesBar) {
+      savesBar = LegaiaSaves.createRichBar(savesStripEl, {
+        heading: 'Your saves',
+        wasm: saveTools,
+        harvest: harvestPortraits,
+        acceptExts: '.lgsf,.mcr,.mcd,.gme,.mcs',
+        onAdd: addSaveFile,
+        primaryButton: (meta) => ({
+          text: 'Resume', cls: 'lgrb-primary',
+          title: 'Load this save into the running engine',
+          onClick: resumeSession,
+        }),
+        emptyText:
+          'No saves in this browser yet. Import an engine <b>.lgsf</b> or an emulator '
+          + 'memory-card save (<b>.mcr / .gme / .mcs</b>) to pick up your party - it persists '
+          + 'here and resumes straight into the running engine. Nothing is uploaded.',
+      });
+    }
+    savesBar.render();
+  }
+
+  /* ---------------- memory-card rack ----------------
+   *
+   * The console has two card ports, which is why retail's save screen shows
+   * exactly two SLOT pills - picking one is the whole of its card choice. So
+   * choosing WHICH card image sits in each port is page chrome, and lives
+   * here; the in-game Load / Save screens then read and write whatever is
+   * inserted (`runtime.insert_card` / `card_slots_json` / `export_card`).
+   *
+   * Port 1 holds the page's own BROWSER CARD unless the player puts another
+   * card there: a formatted card image kept in this browser's storage
+   * (`LegaiaSaves.getBrowserCard`), the twin of the native window's save
+   * directory, which is always the card in its port 1. So the retail Save /
+   * Load screens - a save point, the pause menu's Save / Load rows, the
+   * title's Continue - always have a card to write and read, with nothing to
+   * import first.
+   *
+   * Any stored `card` session from the save bar above is insertable too.
+   * Saving in-game writes into the card image in place and marks the port
+   * dirty; the page stores it back into the browser at once, and Export
+   * downloads it so the player can carry the save back to their emulator. */
+
+  const cardRackEl = document.getElementById('play-card-rack');
+  const CARD_PORTS = 2;
+  /* The port-1 default: the browser card, not a stored session id. */
+  const BROWSER_CARD = '@browser';
+  const BROWSER_CARD_NAME = 'Browser memory card';
+  /* Which stored save id is in each port, so a re-render keeps the picks. */
+  const portSaveIds = [BROWSER_CARD, null];
+
+  /* The browser card's bytes, formatting (and storing) a fresh one the first
+   * time this browser plays. */
+  function browserCardBytes() {
+    let bytes = LegaiaSaves.getBrowserCard();
+    if (!bytes && wasm && typeof wasm.formatted_memory_card === 'function') {
+      bytes = wasm.formatted_memory_card();
+      LegaiaSaves.putBrowserCard(bytes);
+    }
+    return bytes;
+  }
+
+  /* Put every port's card into the engine: after the disc loads (a fresh
+   * runtime starts with an empty rack) and after a trap rebuilt the runtime,
+   * which must not silently pull the cards out from under the player. */
+  function remountCards() {
+    if (!runtime) return;
+    for (let p = 0; p < CARD_PORTS; p++) {
+      if (portSaveIds[p]) insertCard(p, portSaveIds[p], true);
+    }
+    renderCardRack();
+  }
+
+  function cardSessions() {
+    return LegaiaSaves.listSessions().filter(s => s.kind === 'card');
+  }
+
+  function rackSlots() {
+    if (!runtime) return null;
+    try { return JSON.parse(runtime.card_slots_json()); }
+    catch (e) { return null; }
+  }
+
+  /* Insert the stored save `id` (or the browser card) into `port`, or eject
+   * when id is falsy. `quiet` skips the status line (a remount). */
+  function insertCard(port, id, quiet) {
+    if (!runtime) return;
+    if (!id) {
+      runtime.eject_card(port);
+      portSaveIds[port] = null;
+      renderCardRack();
+      return;
+    }
+    let stored;
+    if (id === BROWSER_CARD) {
+      const bytes = browserCardBytes();
+      stored = bytes ? { bytes, meta: { name: BROWSER_CARD_NAME } } : null;
+    } else {
+      stored = LegaiaSaves.getSession(id);
+    }
+    if (!stored) { saveMsg('That card is no longer stored in this browser.', true); return; }
+    try {
+      runtime.insert_card(port, stored.bytes, stored.meta.name || id);
+      portSaveIds[port] = id;
+      if (!quiet) {
+        saveMsg(`"${stored.meta.name || id}" is in MEMORY CARD SLOT ${port + 1} - `
+              + 'the in-game Load and Save screens use it now.');
+      }
+    } catch (err) {
+      saveMsg(`Could not insert that card: ${err.message || err}`, true);
+    }
+    if (!quiet) renderCardRack();
+  }
+
+  /* Store card `bytes` back over the browser session that sits in `port`,
+   * re-deriving the tile's stats off the new bytes. Returns the session's
+   * meta (or `{}` when the port's card is not a stored session). */
+  function storeCardBytes(port, bytes) {
+    const id = portSaveIds[port];
+    if (id === BROWSER_CARD) {
+      if (LegaiaSaves.putBrowserCard(bytes) === null) return null;
+      return { name: 'legaia-browser-card', format: 'mcr' };
+    }
+    const meta = id ? (LegaiaSaves.listSessions().find(s => s.id === id) || {}) : {};
+    const name = meta.name || `card-slot-${port + 1}`;
+    /* Re-store so the browser copy carries the in-game saves too, and the
+     * tile's stats/icon re-derive off the new bytes. */
+    if (id) {
+      let party = meta.party, money = meta.money, location = meta.location, level = meta.level;
+      try {
+        const listing = JSON.parse(wasm.card_saves_json(bytes));
+        const s = (listing.saves || []).find(x => x.block === meta.block);
+        if (s) { party = s.party; money = s.money; location = s.location; level = s.level; }
+      } catch (e) { /* keep the old meta; the bytes are what matter */ }
+      const stored = LegaiaSaves.putSession({
+        id, kind: 'card', name, scene: meta.scene || '', block: meta.block,
+        format: meta.format || 'mcr', party, level, money, location,
+      }, bytes);
+      if (stored === null) return null;
+      if (savesBar) savesBar.invalidateIcon(id);
+    }
+    return meta;
+  }
+
+  /* Pull the (possibly saved-into) card image back out of the engine, store
+   * it over the session it came from, and download it. */
+  function exportCard(port) {
+    if (!runtime) return;
+    let bytes;
+    try { bytes = runtime.export_card(port); }
+    catch (err) { saveMsg(`Export failed: ${err.message || err}`, true); return; }
+    if (!bytes || !bytes.length) return;
+    /* A failed browser store still downloads: the export is the copy. */
+    const meta = storeCardBytes(port, bytes) || {};
+    const name = meta.name || `card-slot-${port + 1}`;
+    downloadBytes(bytes, `${name.replace(/[^\w.-]+/g, '-')}.${meta.format || 'mcr'}`);
+    saveMsg(`Exported MEMORY CARD SLOT ${port + 1} - load it in your emulator to carry on there.`);
+    renderCardRack();
+  }
+
+  function cardPortEl(port, slot, sessions) {
+    const box = document.createElement('div');
+    box.className = 'play-card-port' + (slot && slot.inserted ? ' is-filled' : '');
+
+    const name = document.createElement('span');
+    name.className = 'play-card-port-name';
+    name.textContent = `Slot ${port + 1}`;
+    box.appendChild(name);
+
+    const sel = document.createElement('select');
+    sel.title = `Which card image is in memory card slot ${port + 1}`;
+    const none = document.createElement('option');
+    none.value = '';
+    none.textContent = '(empty)';
+    sel.appendChild(none);
+    for (const s of [{ id: BROWSER_CARD, name: BROWSER_CARD_NAME }].concat(sessions)) {
+      const o = document.createElement('option');
+      o.value = s.id;
+      /* A card can only be in one port at a time, as on the console. */
+      const otherPort = portSaveIds.indexOf(s.id);
+      o.disabled = otherPort !== -1 && otherPort !== port;
+      o.textContent = (s.name || s.id) + (o.disabled ? ` (in slot ${otherPort + 1})` : '');
+      sel.appendChild(o);
+    }
+    sel.value = portSaveIds[port] || '';
+    sel.addEventListener('change', () => insertCard(port, sel.value));
+    box.appendChild(sel);
+
+    if (slot && slot.dirty) {
+      const d = document.createElement('span');
+      d.className = 'play-card-port-dirty';
+      d.textContent = '● not exported';
+      d.title = 'This card has in-game saves (kept in this browser) you have not exported to a file yet';
+      box.appendChild(d);
+    }
+
+    const ex = document.createElement('button');
+    ex.type = 'button';
+    ex.className = 'play-card-btn';
+    ex.textContent = 'Export';
+    ex.title = 'Download this card image, with your in-game saves written into it';
+    ex.disabled = !(slot && slot.inserted);
+    ex.addEventListener('click', () => exportCard(port));
+    box.appendChild(ex);
+
+    return box;
+  }
+
+  function renderCardRack() {
+    if (!cardRackEl) return;
+    const slots = rackSlots();
+    if (!slots) { cardRackEl.style.display = 'none'; return; }
+    const sessions = cardSessions();
+    cardRackEl.style.display = '';
+    cardRackEl.textContent = '';
+
+    const head = document.createElement('div');
+    head.className = 'play-card-rack-head';
+    head.innerHTML = '<b>Memory cards</b> - what the in-game Load / Save screens use';
+    cardRackEl.appendChild(head);
+
+    const ports = document.createElement('div');
+    ports.className = 'play-card-ports';
+    for (let p = 0; p < CARD_PORTS; p++) {
+      ports.appendChild(cardPortEl(p, slots[p], sessions));
+    }
+    cardRackEl.appendChild(ports);
+
+    const note = document.createElement('div');
+    note.className = 'play-card-note';
+    note.innerHTML = 'Save at a save point (or from the world map\'s pause menu) to write into '
+      + 'the inserted card, and <b>Continue</b> / <b>Load</b> to read a save off it. Slot 1 starts '
+      + 'with this browser\'s own card; import an emulator card above (<b>.mcr / .gme / .mcs</b>) '
+      + 'to use yours. Export when you want to carry it back to your emulator.';
+    cardRackEl.appendChild(note);
+  }
+
+  /* A card ejected out from under the engine must not stay "inserted". */
+  function dropEjectedCards() {
+    const live = new Set(cardSessions().map(s => s.id).concat([BROWSER_CARD]));
+    for (let p = 0; p < CARD_PORTS; p++) {
+      if (portSaveIds[p] && !live.has(portSaveIds[p])) insertCard(p, null);
+    }
+  }
+
+  /* Auto-insert a freshly imported card into the first free port: the player
+   * just said "this is my card", so having to also pick it out of a dropdown
+   * is a step for nothing. */
+  function autoInsertCard(id) {
+    if (!runtime || !id) return;
+    if (portSaveIds.indexOf(id) !== -1) return;
+    const free = portSaveIds.indexOf(null);
+    if (free !== -1) insertCard(free, id);
+  }
+
+  saveExportBtn.addEventListener('click', exportSession);
+  saveImportEl.addEventListener('change', async () => {
+    const f = saveImportEl.files && saveImportEl.files[0];
+    if (!f) return;
+    let bytes;
+    try {
+      bytes = new Uint8Array(await f.arrayBuffer());
+    } catch (err) {
+      saveMsg(`Could not read ${f.name}: ${err.message || err}`, true);
+      return;
+    }
+    const ext = (f.name.match(/\.(mcr|mcd|gme|mcs)$/i) || [])[1];
+    importSaveBytes(bytes, {
+      name: f.name.replace(/\.[^.]+$/, ''),
+      format: ext ? ext.toLowerCase() : null,
+    });
+    saveImportEl.value = '';
+  });
+
+  renderSavesStrip();
+  renderCardRack();
+  /* An in-game Save writes the card image inside the engine. Store it back
+   * over its browser session as soon as it lands, the way the native window
+   * persists its card file on the same commit - otherwise a reload before
+   * Export drops the save. Export still downloads (and clears "not exported").
+   * A store the browser refuses (storage full or blocked) raises the save
+   * screen's write-failed notice (`card_store_failed`), as the native
+   * window's failed `card.persist()` does - the screen used to say the save
+   * worked and a reload lost it. */
+  setInterval(() => {
+    if (!runtime || typeof runtime.card_take_written !== 'function') return;
+    for (let p = 0; p < CARD_PORTS; p++) {
+      if (!runtime.card_take_written(p)) continue;
+      const bytes = runtime.card_bytes(p);
+      if (bytes && bytes.length && storeCardBytes(p, bytes) === null) {
+        saveMsg(`Could not store the card in port ${p + 1} in this browser - export it to keep the save.`, true);
+        if (typeof runtime.card_store_failed === 'function') runtime.card_store_failed();
+      }
+      renderCardRack();
+    }
+  }, 100);
+  window.addEventListener('legaia-saves-change', () => {
+    renderSavesStrip();
+    /* A deleted card must not stay in a port. */
+    dropEjectedCards();
+    renderCardRack();
+  });
+  window.__legaiaSaves = window.LegaiaSaves;
+
+  /* ---------------- focus + buttons ---------------- */
+
+  const showVeil = () => veil.classList.remove('is-hidden');
+  const hideVeil = () => veil.classList.add('is-hidden');
+  veil.addEventListener('click', () => { canvas.focus(); });
+  canvas.addEventListener('focus', hideVeil);
+  canvas.addEventListener('blur', showVeil);
+
+  /* Reset camera: the view's shared reset (`resetCamera`, which drives the
+   * engine's `Camera::recenter_follow` - the native double-click's kernel). */
+  document.getElementById('play-recenter').addEventListener('click', () => {
+    if (!view) return;
+    view.resetCamera();
+    canvas.focus();
+  });
+
+  /* BGM volume. The engine's SPU mixer feeds a WebAudio `GainNode` inside
+   * `WebAudioOut`; `audio_set_gain` is the live handle on it, in SLIDER
+   * units - the site's master trim (`window.LEGAIA_MASTER_TRIM`, applied
+   * once inside `WebAudioOut::set_gain`) is WASM-side, so this page never
+   * holds the loudness number. The slider's
+   * HTML `value` is the same number the engine parks at `audio_init`
+   * (`BGM_DEFAULT_GAIN`), so the control starts where the audio actually is
+   * instead of jumping on first drag. Re-applied whenever the runtime is
+   * rebuilt (a WASM trap makes a fresh instance at the default). */
+  const volEl    = document.getElementById('play-volume');
+  const volValEl = document.getElementById('play-volume-value');
+  function applyVolume() {
+    const v = parseFloat(volEl.value);
+    volValEl.textContent = v === 0 ? 'mute' : `${v}x`;
+    /* The site-wide sound toggle (js/audio-toggle.js) gates every other
+     * browser audio path - the minigames page's BGM and cues, the media
+     * browser, the arts viewer. This page's engine output was the one that
+     * ignored it, so muting the site here left the scene's music playing.
+     * A mute is a zero on the same output node the slider drives; the
+     * slider keeps its own value, so un-muting restores the level. */
+    const on = !window.LegaiaSound || window.LegaiaSound.isSoundOn();
+    const rt = window.__playRuntime;
+    if (rt && typeof rt.audio_set_gain === 'function') {
+      try { rt.audio_set_gain(on ? v : 0); } catch (e) { /* audio not up yet */ }
+    }
+  }
+  volEl.addEventListener('input', applyVolume);
+  window.__playApplyVolume = applyVolume;
+  if (window.LegaiaSound) {
+    window.LegaiaSound.onChange(applyVolume);
+    /* The toggle button itself, beside the volume control, so the gate has a
+     * control on this page and not only on the pages that mount their own. */
+    const volLabel = volEl.closest('label');
+    if (volLabel && volLabel.parentNode) {
+      const btn = window.LegaiaSound.button();
+      if (btn) { btn.style.marginLeft = '0.4rem'; volLabel.parentNode.insertBefore(btn, volLabel.nextSibling); }
+    }
+  }
+
+  /* Developer menu (the browser twin of the native window's LEGAIA_DEV_MENU
+   * opt-in). Session-only by design: the checkbox starts unchecked on every
+   * page load, is never persisted and is never read from the URL, so only a
+   * deliberate click by the person at the keyboard enables it. The engine
+   * ticks the session off the same pad words the simulation reads - no keys
+   * are handled here. Re-applied whenever the runtime is rebuilt (a WASM
+   * trap makes a fresh instance with the flag off). */
+  const devMenuEl = document.getElementById('play-dev-menu');
+  function applyDevMenu() {
+    const rt = window.__playRuntime;
+    if (rt && typeof rt.play_dev_menu_set_enabled === 'function') {
+      try { rt.play_dev_menu_set_enabled(!!devMenuEl.checked); } catch (e) {}
+    }
+  }
+  devMenuEl.addEventListener('change', () => { applyDevMenu(); canvas.focus(); });
+  window.__playApplyDevMenu = applyDevMenu;
+
+  /* Camera-occlusion fade ("See-through walls") - default ON, matching the
+   * native play-window. Pure presentation (a fragment-shader dither around
+   * the character when geometry buries it); PlayView stages the per-frame
+   * focus, so unchecking simply stops staging it. The persisted engine
+   * option `occlusion_fade` (the native window's `F4` reads the same one);
+   * the box reflects it once a runtime is up (`syncRenderToggles`).
+   * Re-applied on every view rebuild. */
+  const seeThroughEl = document.getElementById('play-see-through');
+  function applySeeThrough() {
+    const rt = window.__playRuntime;
+    if (rt && typeof rt.set_occlusion_fade === 'function') {
+      try { rt.set_occlusion_fade(!!seeThroughEl.checked); } catch (e) {}
+    }
+    if (view) view.setOcclusionFade(!!seeThroughEl.checked);
+  }
+  seeThroughEl.addEventListener('change', () => { applySeeThrough(); canvas.focus(); });
+  window.__playApplySeeThrough = applySeeThrough;
+
+  /* The native window's render toggles: PSX rasterisation
+   * (LEGAIA_PSX_RENDER, session-only) and enhanced lighting (`I` + `F8`'s
+   * time of day + `Y`'s lamp shadows, all persisted engine options - the
+   * boxes reflect the stored values once a runtime is up). Presentation
+   * only; re-applied on every view rebuild. */
+  const psxRenderEl = document.getElementById('play-psx-render');
+  const dynLightEl = document.getElementById('play-dyn-light');
+  const timeOfDayEl = document.getElementById('play-time-of-day');
+  const dynShadowsEl = document.getElementById('play-dyn-shadows');
+  const bloomEl = document.getElementById('play-bloom');
+  function applyRenderToggles() {
+    const rt = window.__playRuntime;
+    if (rt && typeof rt.set_enhanced_lighting === 'function') {
+      try {
+        rt.set_enhanced_lighting(!!dynLightEl.checked);
+        timeOfDayEl.value = rt.set_lighting_time_of_day(timeOfDayEl.value);
+        if (typeof rt.set_light_shadows === 'function') rt.set_light_shadows(!!dynShadowsEl.checked);
+        if (typeof rt.set_bloom === 'function') rt.set_bloom(!!bloomEl.checked);
+      } catch (e) {}
+    }
+    if (!view) return;
+    view.setPsxRender(!!psxRenderEl.checked);
+    view.setDynamicLighting(!!dynLightEl.checked);
+    view.setDynShadows(!!dynShadowsEl.checked);
+    if (view.setBloom) view.setBloom(!!bloomEl.checked);
+  }
+  function syncRenderToggles() {
+    const rt = window.__playRuntime;
+    if (rt && typeof rt.enhanced_lighting === 'function') {
+      try {
+        dynLightEl.checked = !!rt.enhanced_lighting();
+        timeOfDayEl.value = rt.lighting_time_of_day();
+        if (typeof rt.light_shadows === 'function') dynShadowsEl.checked = !!rt.light_shadows();
+        if (typeof rt.bloom === 'function') bloomEl.checked = !!rt.bloom();
+        if (typeof rt.occlusion_fade === 'function') seeThroughEl.checked = !!rt.occlusion_fade();
+      } catch (e) {}
+    }
+  }
+  psxRenderEl.addEventListener('change', () => { applyRenderToggles(); canvas.focus(); });
+  dynLightEl.addEventListener('change', () => { applyRenderToggles(); canvas.focus(); });
+  timeOfDayEl.addEventListener('change', () => { applyRenderToggles(); canvas.focus(); });
+  dynShadowsEl.addEventListener('change', () => { applyRenderToggles(); canvas.focus(); });
+  bloomEl.addEventListener('change', () => { applyRenderToggles(); canvas.focus(); });
+  window.__playApplyRenderToggles = applyRenderToggles;
+  window.__playSyncRenderToggles = syncRenderToggles;
+
+  /* Precise (free-angle) movement - the native window's `R` toggle. The
+   * engine persists it with the rest of the options, so the box reflects the
+   * stored value once a runtime is up and re-applies on every rebuild. */
+  const preciseEl = document.getElementById('play-precise-move');
+  function applyPreciseMove() {
+    const rt = window.__playRuntime;
+    if (rt && typeof rt.set_precise_movement === 'function') {
+      try { rt.set_precise_movement(!!preciseEl.checked); } catch (e) {}
+    }
+  }
+  function syncPreciseMove() {
+    const rt = window.__playRuntime;
+    if (rt && typeof rt.precise_movement === 'function') {
+      try { preciseEl.checked = !!rt.precise_movement(); } catch (e) {}
+    }
+  }
+  preciseEl.addEventListener('change', () => { applyPreciseMove(); canvas.focus(); });
+
+  /* Reduce flashing, the music / SFX bus levels and the mono downmix - the
+   * native launcher's rows. The engine owns and persists all four (`OptionsState`), so the
+   * controls only write through and mirror the stored values back. */
+  const flashEl = document.getElementById('play-reduce-flashing');
+  const bgmVolEl = document.getElementById('play-bgm-volume');
+  const sfxVolEl = document.getElementById('play-sfx-volume');
+  const bgmVolValEl = document.getElementById('play-bgm-volume-value');
+  const sfxVolValEl = document.getElementById('play-sfx-volume-value');
+  const downmixEl = document.getElementById('play-downmix-mono');
+  function syncAudioOptions() {
+    const rt = window.__playRuntime;
+    if (!rt) return;
+    try {
+      if (typeof rt.reduce_flashing === 'function') flashEl.checked = !!rt.reduce_flashing();
+      if (typeof rt.bgm_volume === 'function') bgmVolEl.value = String(rt.bgm_volume());
+      if (typeof rt.sfx_volume === 'function') sfxVolEl.value = String(rt.sfx_volume());
+      if (typeof rt.downmix_mono === 'function') downmixEl.checked = !!rt.downmix_mono();
+    } catch (e) {}
+    bgmVolValEl.textContent = bgmVolEl.value;
+    sfxVolValEl.textContent = sfxVolEl.value;
+  }
+  flashEl.addEventListener('change', () => { rtCall('set_reduce_flashing', !!flashEl.checked); canvas.focus(); });
+  downmixEl.addEventListener('change', () => { rtCall('set_downmix_mono', !!downmixEl.checked); canvas.focus(); });
+  bgmVolEl.addEventListener('input', () => {
+    bgmVolValEl.textContent = bgmVolEl.value;
+    rtCall('set_bgm_volume', parseInt(bgmVolEl.value, 10));
+  });
+  sfxVolEl.addEventListener('input', () => {
+    sfxVolValEl.textContent = sfxVolEl.value;
+    rtCall('set_sfx_volume', parseInt(sfxVolEl.value, 10));
+  });
+  window.__playApplyPreciseMove = applyPreciseMove;
+  window.__playSyncPreciseMove = syncPreciseMove;
+
+  /* Ground fog - the native window's `F9`. The engine owns the setting
+   * (`OptionsState::volumetric_fog`, persisted with the other options) and
+   * the bank; the page only draws what the engine hands it, so the box is a
+   * mirror of the stored option, re-applied on every rebuild. */
+  const groundFogEl = document.getElementById('play-ground-fog');
+  function applyGroundFog() {
+    const rt = window.__playRuntime;
+    if (rt && typeof rt.set_volumetric_fog === 'function') {
+      try { rt.set_volumetric_fog(!!groundFogEl.checked); } catch (e) {}
+    }
+  }
+  function syncGroundFog() {
+    const rt = window.__playRuntime;
+    if (rt && typeof rt.volumetric_fog === 'function') {
+      try { groundFogEl.checked = !!rt.volumetric_fog(); } catch (e) {}
+    }
+  }
+  groundFogEl.addEventListener('change', () => { applyGroundFog(); canvas.focus(); });
+  window.__playApplyGroundFog = applyGroundFog;
+  window.__playSyncGroundFog = syncGroundFog;
+
+  /* The native launch switches the page throws at runtime
+   * (crates/web-play/src/play_toggles.rs) and the two persisted retail
+   * tile-window options. Retail-faithful pins the engine options for the
+   * session without storing them, then mirrors the pinned values into the
+   * boxes above and turns the page's own enhancements off. */
+  const retailModeEl = document.getElementById('play-retail-mode');
+  const viewWindowEl = document.getElementById('play-retail-view-window');
+  const staticWindowEl = document.getElementById('play-retail-static-window');
+  const markersEl = document.getElementById('play-world-map-markers');
+  const smartEl = document.getElementById('play-smart-monsters');
+  const fxOutlineEl = document.getElementById('play-fx-outline');
+  const entryPulseEl = document.getElementById('play-entry-pulse');
+  const cadenceEl = document.getElementById('play-battle-frame-cadence');
+  const savedListEl = document.getElementById('play-arts-saved-list');
+  const shinyEl = document.getElementById('play-shiny-seru');
+  const fleeExpEl = document.getElementById('play-flee-exp');
+  const expRateEl = document.getElementById('play-exp-rate');
+  const fortressFixEl = document.getElementById('play-fortress-fix');
+  const jewelFixEl = document.getElementById('play-jewel-fix');
+  const hpGuardEl = document.getElementById('play-hp-readout-guard');
+  const bonusDropEl = document.getElementById('play-bonus-drop');
+  /* The battle-tuning selectors: element, setter, getter. Values are the
+   * engine's step lists (GameplayTweaks; a web-play test pins them). */
+  const tuningSelects = [
+    [document.getElementById('play-enemy-stats'), 'set_enemy_stat_permille', 'enemy_stat_permille'],
+    [document.getElementById('play-enemy-attacks'), 'set_enemy_attack_permille', 'enemy_attack_permille'],
+    [document.getElementById('play-spirit-ap'), 'set_spirit_ap', 'spirit_ap'],
+    [document.getElementById('play-damage-ap'), 'set_damage_ap', 'damage_ap'],
+    [document.getElementById('play-seru-catch-rate'), 'set_seru_catch_rate', 'seru_catch_rate'],
+  ];
+  /* The gameplay tweaks start on the engine's defaults
+   * (GameplayTweaks::default, the window's too): read them back from the
+   * fresh runtime before the first write, so no box hardcodes a default. */
+  function syncTweakDefaults() {
+    if (shinyEl.dataset.synced === '1') return;
+    const sh = rtCall('shiny_seru');
+    if (sh === undefined) return;
+    shinyEl.checked = !!sh;
+    fleeExpEl.checked = !!rtCall('flee_exp');
+    expRateEl.value = String(rtCall('exp_rate_permille') || 1000);
+    fortressFixEl.checked = !!rtCall('fortress_encounter_fix');
+    jewelFixEl.checked = !!rtCall('jewel_fix');
+    hpGuardEl.checked = !!rtCall('hp_readout_guard');
+    bonusDropEl.checked = !!rtCall('bonus_drop');
+    for (const [el, , getter] of tuningSelects) {
+      const v = rtCall(getter);
+      if (v !== undefined) el.value = String(v);
+    }
+    shinyEl.dataset.synced = '1';
+  }
+  function rtCall(name, ...args) {
+    const rt = window.__playRuntime;
+    if (!rt || typeof rt[name] !== 'function') return undefined;
+    try { return rt[name](...args); } catch (e) { console.warn(name, e); return undefined; }
+  }
+  function syncPageToggles() {
+    const v = rtCall('retail_view_window');
+    if (v !== undefined) viewWindowEl.checked = !!v;
+    const st = rtCall('retail_static_window');
+    if (st !== undefined) staticWindowEl.checked = !!st;
+    const r = rtCall('retail_mode');
+    if (r !== undefined) retailModeEl.checked = !!r;
+  }
+  function applyPageToggles() {
+    /* The cadence box starts on the engine's default: read it back from the
+     * fresh runtime before the first write (WorldToggles'
+     * DEFAULT_BATTLE_SM_FRAME_CADENCE). */
+    if (cadenceEl.dataset.synced !== '1') {
+      const c = rtCall('battle_frame_cadence');
+      if (c !== undefined) { cadenceEl.checked = !!c; cadenceEl.dataset.synced = '1'; }
+    }
+    rtCall('set_smart_monsters', !!smartEl.checked);
+    rtCall('set_world_map_markers', !!markersEl.checked);
+    rtCall('set_battle_fx_outline', !!fxOutlineEl.checked);
+    rtCall('set_entry_pulse', !!entryPulseEl.checked);
+    rtCall('set_battle_frame_cadence', !!cadenceEl.checked);
+    rtCall('set_arts_saved_list', !!savedListEl.checked);
+    syncTweakDefaults();
+    rtCall('set_shiny_seru', !!shinyEl.checked);
+    rtCall('set_flee_exp', !!fleeExpEl.checked);
+    rtCall('set_exp_rate_permille', parseInt(expRateEl.value, 10) || 1000);
+    rtCall('set_fortress_encounter_fix', !!fortressFixEl.checked);
+    rtCall('set_jewel_fix', !!jewelFixEl.checked);
+    rtCall('set_hp_readout_guard', !!hpGuardEl.checked);
+    rtCall('set_bonus_drop', !!bonusDropEl.checked);
+    for (const [el, setter] of tuningSelects) rtCall(setter, parseInt(el.value, 10));
+    rtCall('set_retail_mode', !!retailModeEl.checked);
+  }
+  retailModeEl.addEventListener('change', () => {
+    const on = !!retailModeEl.checked;
+    rtCall('set_retail_mode', on);
+    /* The engine options are now pinned (or restored): mirror them. */
+    syncRenderToggles();
+    syncGroundFog();
+    syncPreciseMove();
+    syncAudioOptions();
+    syncCameraDistance();
+    syncPageToggles();
+    /* Lamp shadows and see-through walls are engine options the pin covers
+     * too (`OptionsState::pin_retail`), so the sync above has already put
+     * their boxes where the mode wants them; push them to the view. */
+    applySeeThrough();
+    applyRenderToggles();
+    canvas.focus();
+  });
+  viewWindowEl.addEventListener('change', () => {
+    rtCall('set_retail_view_window', !!viewWindowEl.checked);
+    canvas.focus();
+  });
+  staticWindowEl.addEventListener('change', () => {
+    rtCall('set_retail_static_window', !!staticWindowEl.checked);
+    canvas.focus();
+  });
+  markersEl.addEventListener('change', () => { rtCall('set_world_map_markers', !!markersEl.checked); canvas.focus(); });
+  smartEl.addEventListener('change', () => { rtCall('set_smart_monsters', !!smartEl.checked); canvas.focus(); });
+  fxOutlineEl.addEventListener('change', () => { rtCall('set_battle_fx_outline', !!fxOutlineEl.checked); canvas.focus(); });
+  entryPulseEl.addEventListener('change', () => { rtCall('set_entry_pulse', !!entryPulseEl.checked); canvas.focus(); });
+  cadenceEl.addEventListener('change', () => { rtCall('set_battle_frame_cadence', !!cadenceEl.checked); canvas.focus(); });
+  savedListEl.addEventListener('change', () => { rtCall('set_arts_saved_list', !!savedListEl.checked); canvas.focus(); });
+  shinyEl.addEventListener('change', () => { rtCall('set_shiny_seru', !!shinyEl.checked); canvas.focus(); });
+  fleeExpEl.addEventListener('change', () => { rtCall('set_flee_exp', !!fleeExpEl.checked); canvas.focus(); });
+  expRateEl.addEventListener('change', () => { rtCall('set_exp_rate_permille', parseInt(expRateEl.value, 10) || 1000); canvas.focus(); });
+  fortressFixEl.addEventListener('change', () => { rtCall('set_fortress_encounter_fix', !!fortressFixEl.checked); canvas.focus(); });
+  jewelFixEl.addEventListener('change', () => { rtCall('set_jewel_fix', !!jewelFixEl.checked); canvas.focus(); });
+  hpGuardEl.addEventListener('change', () => { rtCall('set_hp_readout_guard', !!hpGuardEl.checked); canvas.focus(); });
+  bonusDropEl.addEventListener('change', () => { rtCall('set_bonus_drop', !!bonusDropEl.checked); canvas.focus(); });
+  for (const [el, setter] of tuningSelects) {
+    el.addEventListener('change', () => { rtCall(setter, parseInt(el.value, 10)); canvas.focus(); });
+  }
+  window.__playSyncPageToggles = syncPageToggles;
+  window.__playApplyPageToggles = applyPageToggles;
+
+  /* After a runtime is built (disc load) or rebuilt (trap recovery): the
+   * page's session switches go first, because Retail-faithful pins the
+   * engine options - every box mirrored before that would show the stored
+   * values the pin has just overridden. Then every box mirrors the engine.
+   * `reapply` (recovery) first re-sends the boxes' session edits to the
+   * fresh runtime, except while Retail-faithful holds: the boxes then show
+   * the pinned values, and writing them would persist retail over the
+   * player's own settings. */
+  function syncAfterRuntime(reapply) {
+    if (reapply && !retailModeEl.checked) {
+      applyPreciseMove();
+      applyGroundFog();
+    }
+    applyPageToggles();
+    syncPreciseMove();
+    syncAudioOptions();
+    syncGroundFog();
+    syncRenderToggles();
+    syncCameraDistance();
+    syncPageToggles();
+    if (reapply) {
+      applySeeThrough();
+      applyRenderToggles();
+    }
+  }
+  window.__playSyncAfterRuntime = syncAfterRuntime;
+
+  /* Learn spell / story flag - the native --learn-spell / --set-flag. */
+  const parseId = (text) => {
+    const t = String(text || '').trim().toLowerCase();
+    if (!t) return NaN;
+    return t.startsWith('0x') ? parseInt(t.slice(2), 16) : parseInt(t, 10);
+  };
+  document.getElementById('play-learn-apply').addEventListener('click', () => {
+    const slot = parseInt(document.getElementById('play-learn-slot').value, 10) || 0;
+    const id = parseId(document.getElementById('play-learn-spell').value);
+    if (!(id >= 0 && id <= 0xFF)) { saveMsg('Learn spell: give a spell id 0..255 (0x81..0x8b are the Seru spells).', true); return; }
+    const ok = !!rtCall('learn_spell', slot, id);
+    saveMsg(ok ? `Spell 0x${id.toString(16)} learned.` : 'Learn spell: load a scene with that party member first.', !ok);
+    canvas.focus();
+  });
+  const flagWrite = (on) => {
+    const id = parseId(document.getElementById('play-flag-id').value);
+    if (!(id >= 0 && id <= 0xFFFF)) { saveMsg('Flag: give an index (decimal or 0x hex).', true); return; }
+    const ok = !!rtCall('set_system_flag', id, on);
+    const now = !!rtCall('system_flag', id);
+    saveMsg(ok ? `Flag 0x${id.toString(16)} is now ${now ? 'set' : 'clear'}.` : 'Flag: load a scene first.', !ok);
+    canvas.focus();
+  };
+  document.getElementById('play-flag-set').addEventListener('click', () => flagWrite(true));
+  document.getElementById('play-flag-clear').addEventListener('click', () => flagWrite(false));
+
+  /* Camera-distance preset - the native window's `T`. The engine steps and
+   * persists the option (`OptionsState::cycle_camera_distance`); the button
+   * only shows the label it hands back. */
+  const camDistEl = document.getElementById('play-camera-distance');
+  function syncCameraDistance() {
+    const rt = window.__playRuntime;
+    if (rt && typeof rt.play_camera_distance === 'function') {
+      try { camDistEl.textContent = 'Camera: ' + rt.play_camera_distance(); } catch (e) {}
+    }
+  }
+  camDistEl.addEventListener('click', () => {
+    const rt = window.__playRuntime;
+    if (rt && typeof rt.play_camera_cycle_distance === 'function') {
+      try { camDistEl.textContent = 'Camera: ' + rt.play_camera_cycle_distance(); } catch (e) {}
+    }
+    canvas.focus();
+  });
+  window.__playSyncCameraDistance = syncCameraDistance;
+
+  /* Visual enhancements panel: Reset to defaults. Retail-faithful is a
+   * session pin over the stored options, so it is released first - the
+   * reset then lands on the player's own settings
+   * (`reset_visual_options` -> `OptionsState::reset_visual_enhancements`).
+   * PSX rasterisation and the entry pulse are session switches the page
+   * holds, so their shipped defaults (off / on) are set here. */
+  document.getElementById('play-visuals-reset').addEventListener('click', () => {
+    if (retailModeEl.checked) {
+      retailModeEl.checked = false;
+      rtCall('set_retail_mode', false);
+    }
+    rtCall('reset_visual_options');
+    psxRenderEl.checked = false;
+    entryPulseEl.checked = true;
+    rtCall('set_entry_pulse', true);
+    syncRenderToggles();
+    syncGroundFog();
+    syncPreciseMove();
+    syncAudioOptions();
+    syncCameraDistance();
+    syncPageToggles();
+    applySeeThrough();
+    applyRenderToggles();
+    canvas.focus();
+  });
+
+  /* Battle tools - the native play-window's battle flags, exposed the way
+   * the page already exposes the dev menu: session-only, nothing persisted,
+   * every control a call the engine already exported. */
+  const partyEl = document.getElementById('play-party');
+  const battleBgmEl = document.getElementById('play-battle-bgm');
+  const autoBattleEl = document.getElementById('play-auto-battle');
+  const noEncEl = document.getElementById('play-no-encounters');
+  function applyBattleTools() {
+    const rt = window.__playRuntime;
+    if (!rt) return;
+    try {
+      if (typeof rt.set_live_battles === 'function') rt.set_live_battles(!noEncEl.checked);
+      if (typeof rt.set_player_driven_battles === 'function') rt.set_player_driven_battles(!autoBattleEl.checked);
+      if (typeof rt.set_battle_bgm === 'function') {
+        const v = battleBgmEl.value.trim();
+        if (v !== '') rt.set_battle_bgm(Math.max(0, parseInt(v, 10) || 0));
+      }
+    } catch (e) { console.warn('battle tools', e); }
+  }
+  autoBattleEl.addEventListener('change', () => { applyBattleTools(); canvas.focus(); });
+  noEncEl.addEventListener('change', () => { applyBattleTools(); canvas.focus(); });
+  battleBgmEl.addEventListener('change', () => { applyBattleTools(); canvas.focus(); });
+  document.getElementById('play-party-apply').addEventListener('click', () => {
+    const rt = window.__playRuntime;
+    if (!rt || typeof rt.set_active_party_spec !== 'function') return;
+    const spec = partyEl.value.trim();
+    if (!spec) return;
+    let err = '';
+    try { err = rt.set_active_party_spec(spec); } catch (e) { err = String(e); }
+    saveMsg(err ? `Party: ${err}` : `Party set to ${spec}.`, !!err);
+    canvas.focus();
+  });
+  document.getElementById('play-force-battle').addEventListener('click', () => {
+    const rt = window.__playRuntime;
+    if (!rt || typeof rt.debug_force_battle !== 'function') return;
+    let ok = false;
+    try { ok = !!rt.debug_force_battle(-1); } catch (e) { ok = false; }
+    saveMsg(ok ? 'Battle armed.' : 'This scene registers no encounter formation to start.', !ok);
+    canvas.focus();
+  });
+  /* Minigame entry: arm the mode-24 door warp for the picked game, the
+   * request a walked door makes (`World::request_minigame_warp`), so the
+   * session that opens is the one the door installs. */
+  const mgWarpEl = document.getElementById('play-mg-warp');
+  mgWarpEl.addEventListener('change', () => {
+    const sub = parseInt(mgWarpEl.value, 10);
+    mgWarpEl.value = '';
+    const rt = window.__playRuntime;
+    if (!rt || isNaN(sub) || typeof rt.play_mg_debug_warp !== 'function') return;
+    let ok = false;
+    try { ok = !!rt.play_mg_debug_warp(sub); } catch (e) { ok = false; }
+    saveMsg(ok ? 'Minigame door armed.' : 'Load a scene before entering a minigame.', !ok);
+    canvas.focus();
+  });
+  window.__playApplyBattleTools = applyBattleTools;
+
+  /* Cheats - every control is a row of the engine's one cheat list
+   * (legaia_engine_cheats::cheats::PlayerCheat, applied by rt.cheat_apply -
+   * the native play-window's --cheat-* flags build the same values): levels
+   * go through the retail growth tables, items through the bag's add
+   * helper. Pasted codes go through the native --cheat-file applier.
+   * Session-only, nothing persisted. */
+  const cheatsEl = document.getElementById('play-cheats');
+  const cheatPartyEl = document.getElementById('play-cheat-party');
+  const cheatItemList = document.getElementById('play-cheat-item-names');
+  let cheatItemsFilled = false;
+  function cheatState() {
+    const rt = window.__playRuntime;
+    if (!rt || typeof rt.cheat_state_json !== 'function') return null;
+    try { return JSON.parse(rt.cheat_state_json()); } catch (e) { return null; }
+  }
+  function syncCheats() {
+    const st = cheatState();
+    if (!st) { cheatPartyEl.textContent = 'Load a disc and pick a scene first.'; return; }
+    // A fresh runtime (a new disc or scene) starts with walls solid; keep
+    // the box's word.
+    if (cheatNoclipEl.checked) {
+      try { window.__playRuntime.cheat_apply('noclip', 1, ''); } catch (e) { /* no runtime */ }
+    }
+    const who = (st.party || []).map((m) =>
+      `${m.name} Lv ${m.level} - HP ${m.hp}/${m.hp_max}, MP ${m.mp}/${m.mp_max}, AP ${m.ap}`);
+    cheatPartyEl.textContent = (who.length ? who.join(' · ') : 'No party.')
+      + ` · Gold ${st.gold} · Coins ${st.coins}`;
+    if (!cheatItemsFilled && st.items && st.items.length) {
+      const frag = document.createDocumentFragment();
+      for (const [, name] of st.items) {
+        const o = document.createElement('option');
+        o.value = name;
+        frag.appendChild(o);
+      }
+      cheatItemList.appendChild(frag);
+      cheatItemsFilled = true;
+    }
+  }
+  function runCheat(fn) {
+    const rt = window.__playRuntime;
+    if (!rt) { saveMsg('Load a disc first.', true); return; }
+    let msg = '';
+    try { msg = fn(rt); } catch (e) { saveMsg(`Cheat failed: ${e}`, true); return; }
+    if (msg) saveMsg(msg, false);
+    syncCheats();
+    canvas.focus();
+  }
+  cheatsEl.addEventListener('toggle', () => {
+    if (!cheatsEl.open) return;
+    cheatNoEncEl.checked = noEncEl.checked;
+    syncCheats();
+  });
+  /* The panel's "No encounters" is the Battle tools switch, not a second one. */
+  const cheatNoEncEl = document.getElementById('play-cheat-no-encounters');
+  cheatNoEncEl.addEventListener('change', () => {
+    noEncEl.checked = cheatNoEncEl.checked;
+    noEncEl.dispatchEvent(new Event('change'));
+    saveMsg(noEncEl.checked ? 'Random encounters off.' : 'Random encounters on.', false);
+  });
+  noEncEl.addEventListener('change', () => { cheatNoEncEl.checked = noEncEl.checked; });
+  const cheat = (rt, key, n, text) => rt.cheat_apply(key, n || 0, text || '');
+  const cheatNoclipEl = document.getElementById('play-cheat-noclip');
+  cheatNoclipEl.addEventListener('change', () => {
+    runCheat((rt) => cheat(rt, 'noclip', cheatNoclipEl.checked ? 1 : 0));
+  });
+  document.getElementById('play-cheat-max-ap').addEventListener('click', () => {
+    runCheat((rt) => cheat(rt, 'max-ap'));
+  });
+  document.getElementById('play-cheat-seru').addEventListener('click', () => {
+    const lv = parseInt(document.getElementById('play-cheat-seru-level').value, 10);
+    if (!(lv >= 1 && lv <= 9)) { saveMsg('Seru level must be 1-9.', true); return; }
+    runCheat((rt) => cheat(rt, 'seru', lv));
+  });
+  document.getElementById('play-cheat-arts').addEventListener('click', () => {
+    runCheat((rt) => cheat(rt, 'arts'));
+  });
+  document.getElementById('play-cheat-max-items').addEventListener('click', () => {
+    runCheat((rt) => cheat(rt, 'max-items'));
+  });
+  document.getElementById('play-cheat-level-apply').addEventListener('click', () => {
+    const lv = parseInt(document.getElementById('play-cheat-level').value, 10);
+    if (!(lv >= 1 && lv <= 99)) { saveMsg('Level must be 1-99.', true); return; }
+    runCheat((rt) => cheat(rt, 'level', lv));
+  });
+  document.getElementById('play-cheat-restore').addEventListener('click', () => {
+    runCheat((rt) => cheat(rt, 'restore'));
+  });
+  document.getElementById('play-cheat-gold-apply').addEventListener('click', () => {
+    const v = parseInt(document.getElementById('play-cheat-gold').value, 10);
+    if (!(v >= 0)) return;
+    runCheat((rt) => cheat(rt, 'gold', v));
+  });
+  document.getElementById('play-cheat-coins-apply').addEventListener('click', () => {
+    const v = parseInt(document.getElementById('play-cheat-coins').value, 10);
+    if (!(v >= 0)) return;
+    runCheat((rt) => cheat(rt, 'coins', v));
+  });
+  document.getElementById('play-cheat-item-apply').addEventListener('click', () => {
+    const q = document.getElementById('play-cheat-item').value.trim();
+    const n = Math.min(99, Math.max(1, parseInt(document.getElementById('play-cheat-item-qty').value, 10) || 1));
+    if (!q) return;
+    runCheat((rt) => cheat(rt, 'item', n, q));
+  });
+  document.getElementById('play-cheat-codes-apply').addEventListener('click', () => {
+    const text = document.getElementById('play-cheat-codes').value;
+    if (!text.trim()) return;
+    const strict = !!document.getElementById('play-cheat-codes-strict').checked;
+    runCheat((rt) => rt.cheat_apply_codes(text, strict));
+  });
+  window.__playSyncCheats = syncCheats;
+
+  /* The host hotkeys' page half, keyed by the engine's hotkey id. The key
+   * itself is resolved engine-side (`play_host_hotkey`, the native window's
+   * table), which has already applied an options hotkey and persisted it by
+   * the time an action here runs - so those actions only mirror the stored
+   * value into the controls. The rest drive the control the key stands for,
+   * so a key and a click are one path. `debug_camera` is PlayView's own. */
+  const hudEl = document.querySelector('.play-hud');
+  /* The state of each hotkey the page holds itself, for the notice line;
+   * the options hotkeys' state is read engine-side. */
+  window.__playHotkeyPageState = {
+    diag_rows: () => (hudEl && hudEl.style.display === 'none' ? 'off' : 'on'),
+    cheat_encounters: () => (cheatNoEncEl.checked ? 'off' : 'on'),
+  };
+  const noticeEl = document.getElementById('play-notice');
+  let noticeTimer = 0;
+  /* Show `text` on the notice line for the native window's
+   * `NOTICE_DURATION`-like span. */
+  window.__playShowNotice = (text) => {
+    if (!noticeEl) return;
+    noticeEl.textContent = text;
+    noticeEl.classList.remove('is-hidden');
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => noticeEl.classList.add('is-hidden'), 2500);
+  };
+  /* List the host hotkeys in the Controls card from the engine's table, so
+   * the page names every key the native window binds (F1 diagnostics, F2
+   * sound, F6 / F7 cheats, R movement, ...) without a second list. */
+  let hotkeysListed = false;
+  window.__playListHotkeys = (rt) => {
+    if (hotkeysListed || !rt || typeof rt.host_hotkeys_json !== 'function') return;
+    let rows = [];
+    try { rows = JSON.parse(rt.host_hotkeys_json()); } catch (_) { return; }
+    if (!rows.length || !rows[0].label) return;
+    hotkeysListed = true;
+    const head = document.createElement('div');
+    head.className = 'play-keys-sub';
+    head.textContent = 'Host keys (game window focused)';
+    keysEl.appendChild(head);
+    for (const r of rows) {
+      const k = document.createElement('kbd');
+      k.textContent = r.key;
+      const t = document.createElement('span');
+      t.textContent = r.label;
+      keysEl.append(k, t);
+    }
+  };
+  window.__playHotkeyActions = {
+    diag_rows: () => { if (hudEl) hudEl.style.display = hudEl.style.display === 'none' ? '' : 'none'; },
+    audio_mute: () => {},
+    occlusion_fade: () => { syncRenderToggles(); applySeeThrough(); },
+    cheat_max_ap: () => document.getElementById('play-cheat-max-ap').click(),
+    cheat_encounters: () => cheatNoEncEl.click(),
+    time_of_day: () => { syncRenderToggles(); applyRenderToggles(); },
+    volumetric_fog: () => syncGroundFog(),
+    enhanced_lighting: () => { syncRenderToggles(); applyRenderToggles(); },
+    light_shadows: () => { syncRenderToggles(); applyRenderToggles(); },
+    bloom: () => { syncRenderToggles(); applyRenderToggles(); },
+    camera_distance: () => syncCameraDistance(),
+    precise_movement: () => syncPreciseMove(),
+  };
+
+  /* Fullscreen `.play-screen` - the canvas wrap plus the minigame status
+   * strip - not the canvas itself, so the menu overlay, focus veil and
+   * dialogue box (positioned against the wrap) and a minigame's status rows
+   * all come along. The browser sizes the fullscreen element to the screen;
+   * the 4:3 wrap is laid out inside it (see the `.play-screen:fullscreen`
+   * rules). The GL canvas is CSS-sized, so no backing-store resize is needed.
+   * Safari still needs the webkit-prefixed entry points. */
+  const fsBtn = document.getElementById('play-fullscreen');
+  const canvasWrap = document.getElementById('play-screen');
+  const fsElement = () => document.fullscreenElement || document.webkitFullscreenElement;
+  const fsSupported = !!(canvasWrap && (canvasWrap.requestFullscreen
+    || canvasWrap.webkitRequestFullscreen));
+  if (!fsSupported) {
+    fsBtn.disabled = true;
+    fsBtn.title = 'This browser does not expose the Fullscreen API';
+  }
+  fsBtn.addEventListener('click', () => {
+    if (fsElement()) {
+      (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+      return;
+    }
+    const req = canvasWrap.requestFullscreen || canvasWrap.webkitRequestFullscreen;
+    /* Chrome rejects the promise if the gesture is stale; keep it non-fatal. */
+    Promise.resolve(req.call(canvasWrap)).catch(() => {
+      fsBtn.title = 'Fullscreen was blocked by the browser';
+    });
+  });
+  /* Sync on every transition, including Esc and the browser's own controls. */
+  ['fullscreenchange', 'webkitfullscreenchange'].forEach((evt) => {
+    document.addEventListener(evt, () => {
+      const on = !!fsElement();
+      fsBtn.textContent = on ? '✖ Exit fullscreen' : '⛶ Fullscreen';
+      /* Keyboard play only works while the canvas holds focus, and entering
+       * fullscreen moves focus to the wrap. */
+      if (on) canvas.focus();
+    });
+  });
+
+  /* Headless-verification entry points (see site/_content/play.html tests). */
+  window.__playLoad = load;
+  window.__playEnter = enter;
+
+  RomCache.attach(fileInput, { onLoad: load });
+})();
+</script>

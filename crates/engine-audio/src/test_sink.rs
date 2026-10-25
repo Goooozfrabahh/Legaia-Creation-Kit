@@ -1,0 +1,602 @@
+//! Device-free audio sink - the cpal device's stand-in for a native test.
+//!
+//! [`crate::AudioOut`] is the only handle that carries the BGM half of the
+//! mixing core: attach / pause / crossfade / swap all live behind a
+//! `cpal::Stream`, and opening one needs a real output device. A headless
+//! test therefore cannot tick the mixer at all, which is why the SFX enqueue,
+//! the VAB upload and the sequencer's voice allocator have no test-side host
+//! (see `docs/tooling/reach-triage.md`, the `engine-audio` (a) rows).
+//!
+//! [`TestAudioSink`] closes that: it owns the **same** [`crate::StreamResampler`]
+//! the cpal callback owns and drives it by pulling frames, so every kernel on
+//! the output path runs exactly as it does under a device - sequencer tick,
+//! SPU tick, ADSR advance, master fade, XA mix, host downmix, master mute. The
+//! only thing missing is the callback that would hand the frames to hardware.
+//!
+//! Two rules this module exists to keep:
+//!
+//! 1. **No second copy of the mixing math.** Every method here delegates to
+//!    the same private [`crate::StreamResampler`] method `AudioOut` delegates
+//!    to. A sink with its own fade/attach logic would assert about itself
+//!    rather than about the device path.
+//! 2. **Measure at the output.** [`Self::render_frames`] returns a
+//!    [`SinkMeasure`] over the emitted PCM, not a count of calls made. A wired
+//!    kernel that runs and produces silence is indistinguishable from an
+//!    unwired one at the call site; it is distinguishable at the samples.
+
+use std::cell::RefCell;
+
+use crate::{AudioSink, StreamResampler};
+
+/// Video frames per second the PSX runs at, for [`TestAudioSink::render_video_frame`].
+pub const VIDEO_HZ: u32 = 60;
+
+/// What a stretch of rendered output actually contained.
+///
+/// Deliberately not a bool: "did any sample move" and "how loud did it get"
+/// fail differently. A cue that resolves to a valid voice but an empty ADPCM
+/// body yields `nonzero > 0, peak` tiny; a cue that never keyed yields all
+/// zeros; a correct one yields a peak in the thousands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SinkMeasure {
+    /// Output frames pulled.
+    pub frames: usize,
+    /// Loudest absolute sample across both channels.
+    pub peak: i32,
+    /// Frames where either channel was non-zero.
+    pub nonzero: usize,
+    /// Sum of `|l| + |r|` across every frame - the level integral, which
+    /// separates "one click" from "a track playing".
+    pub sum_abs: u64,
+}
+
+impl SinkMeasure {
+    /// No sample in the window moved.
+    pub fn is_silent(&self) -> bool {
+        self.nonzero == 0
+    }
+
+    /// Mean absolute level per channel over the window (`0.0` for an empty
+    /// window).
+    pub fn mean_abs(&self) -> f64 {
+        if self.frames == 0 {
+            0.0
+        } else {
+            self.sum_abs as f64 / (self.frames as f64 * 2.0)
+        }
+    }
+
+    fn accumulate(&mut self, (l, r): (i16, i16)) {
+        self.frames += 1;
+        if l != 0 || r != 0 {
+            self.nonzero += 1;
+        }
+        // Widen before the absolute value: `i16::MIN.abs()` overflows i16, and
+        // a full-scale negative sample is exactly the case a mixer produces.
+        let (al, ar) = ((l as i32).abs(), (r as i32).abs());
+        self.peak = self.peak.max(al).max(ar);
+        self.sum_abs += al as u64 + ar as u64;
+    }
+
+    /// Fold another window into this one (used to total a per-frame loop).
+    pub fn merge(&mut self, other: SinkMeasure) {
+        self.frames += other.frames;
+        self.peak = self.peak.max(other.peak);
+        self.nonzero += other.nonzero;
+        self.sum_abs += other.sum_abs;
+    }
+}
+
+/// Device-free audio output: the same mixing core [`crate::AudioOut`] owns,
+/// pulled by the caller instead of by an audio device.
+///
+/// It is an [`AudioSink`], so everything a host does to an output - stage a
+/// [`crate::VabBank`] through [`AudioSink::with_spu`], attach / pause / swap a
+/// [`crate::Sequencer`], play XA - runs through the same provided methods the
+/// cpal and browser outputs use, and a director generic over `AudioSink` runs
+/// over it unchanged. [`Self::render_frames`] then reads back what the
+/// speakers would have received.
+pub struct TestAudioSink {
+    state: RefCell<StreamResampler>,
+    device_rate: u32,
+}
+
+impl AudioSink for TestAudioSink {
+    fn with_core<R>(&self, f: impl FnOnce(&mut StreamResampler) -> R) -> R {
+        f(&mut self.state.borrow_mut())
+    }
+}
+
+impl TestAudioSink {
+    /// A sink emitting at `device_rate` Hz. Pass
+    /// [`crate::SPU_INTERNAL_RATE`] (44 100) for 1:1 output with no
+    /// resampling - the shape a parity assertion wants.
+    pub fn new(device_rate: u32) -> Self {
+        Self {
+            state: RefCell::new(StreamResampler::new(device_rate.max(1))),
+            device_rate: device_rate.max(1),
+        }
+    }
+
+    /// Output frames in one 60 Hz video frame at this sink's rate.
+    pub fn frames_per_video_frame(&self) -> usize {
+        (self.device_rate / VIDEO_HZ).max(1) as usize
+    }
+
+    /// Pull one output frame - identical mixing math to the cpal callback.
+    pub fn next_frame(&self) -> (i16, i16) {
+        self.state.borrow_mut().next_frame()
+    }
+
+    /// Pull `frames` output frames and report what they contained.
+    pub fn render_frames(&self, frames: usize) -> SinkMeasure {
+        let mut state = self.state.borrow_mut();
+        let mut m = SinkMeasure::default();
+        for _ in 0..frames {
+            m.accumulate(state.next_frame());
+        }
+        m
+    }
+
+    /// Pull one 60 Hz video frame's worth of output.
+    pub fn render_video_frame(&self) -> SinkMeasure {
+        self.render_frames(self.frames_per_video_frame())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Sequencer;
+    use crate::spu::ram::TransferDirection;
+    use crate::vab_bind::{UploadedVag, VabBank, VabProgram};
+
+    /// One 16-byte ADPCM block that loops onto itself (`loop start` +
+    /// `end` + `repeat`), decoding to a full-scale square wave, uploaded at
+    /// `SPU_ADDR`; and a bank whose program 0 keys it with an envelope that
+    /// attacks instantly, sustains at full level and releases instantly.
+    /// The shape of a held organ note: it sounds for exactly as long as the
+    /// voice is keyed on.
+    const SPU_ADDR: u32 = 0x1000;
+
+    fn held_tone_bank(spu: &mut crate::Spu) -> VabBank {
+        let mut block = [0x79u8; 16];
+        block[0] = 0x04; // shift 4, filter 0: nibble 7 -> +1792, 9 -> -1792
+        block[1] = 0x07; // loop start | repeat | end
+        spu.ram.set_direction(TransferDirection::CpuToSpu);
+        assert_eq!(spu.ram.write_at(SPU_ADDR, &block), block.len());
+        let tone = legaia_vab::VagAtr {
+            prior: 0,
+            // Reverb-flagged (`mode & 4`): the key-on routes the voice into
+            // the Studio C send, as most retail BGM tones are.
+            mode: crate::vab_bind::TONE_MODE_REVERB,
+            vol: 127,
+            pan: 64,
+            center: 60,
+            shift: 0,
+            min: 0,
+            max: 127,
+            vibw: 0,
+            vibt: 0,
+            porw: 0,
+            port: 0,
+            pbmin: 0,
+            pbmax: 0,
+            reserved1: 0,
+            reserved2: 0,
+            // Attack shift 0 / step 0, decay shift 0 onto sustain level
+            // 0x8000; sustain increase at the slowest shift (holds); linear
+            // release at shift 0 (drops within a handful of samples).
+            adsr1: 0x000F,
+            adsr2: 0x1F00,
+            prog: 0,
+            vag: 1,
+            reserved3: [0; 4],
+        };
+        VabBank {
+            master_vol: 127,
+            samples: vec![Some(UploadedVag {
+                addr: SPU_ADDR,
+                size: block.len() as u32,
+            })],
+            programs: vec![VabProgram {
+                mvol: 127,
+                mpan: 64,
+                tones: vec![tone],
+                key_tones: legaia_vab::TONES_PER_PROGRAM as u8,
+            }],
+        }
+    }
+
+    /// A SEQ (ppqn 480, 120 BPM) holding one note for 2400 ticks = 2.5 s.
+    fn held_note_seq() -> legaia_seq::Seq {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&legaia_seq::SEQ_MAGIC);
+        buf.extend_from_slice(&[0x00, 0x01]); // version
+        buf.extend_from_slice(&[0x01, 0xE0]); // ppqn 480
+        buf.extend_from_slice(&[0x07, 0xA1, 0x20]); // tempo 500000 us/qn
+        buf.push(0x04);
+        buf.push(0x02);
+        buf.extend_from_slice(&[0x00, 0xC0, 0x00]); // prog change 0
+        buf.extend_from_slice(&[0x00, 0x90, 60, 100]); // note on
+        buf.extend_from_slice(&[0x92, 0x60, 60, 0]); // +2400: note off
+        buf.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]); // end of track
+        legaia_seq::Seq::parse(&buf).unwrap()
+    }
+
+    /// Closing the sequencer gate keys off what is sounding - retail's
+    /// paused-slot service (`FUN_800638D8`) - rather than freezing the
+    /// clock over a held voice. Measured at the output: a gate that only
+    /// stopped the clock left this fixture's note ringing at full level for
+    /// as long as it stayed shut, which is the title theme's last note
+    /// sustaining under the whole attract movie.
+    #[test]
+    fn closing_the_pause_gate_keys_off_the_sounding_notes() {
+        let sink = TestAudioSink::new(crate::SPU_INTERNAL_RATE);
+        let bank = sink.with_spu(held_tone_bank);
+        sink.attach_sequencer(Sequencer::new(held_note_seq(), bank));
+        let live = sink.render_frames(4_410);
+        assert!(
+            live.peak > 64 && live.nonzero * 2 > live.frames,
+            "the fixture must sound before the pause: {live:?}"
+        );
+        assert_eq!(sink.sequencer_progress().expect("attached").active_notes, 1);
+
+        sink.set_sequencer_paused(true);
+        assert_eq!(
+            sink.sequencer_progress().expect("attached").active_notes,
+            0,
+            "closing the gate keys off the sounding note"
+        );
+        // The release drains over the next couple of seconds; a voice never
+        // keyed off holds the live level in every window forever.
+        let _release = sink.render_frames(crate::SPU_INTERNAL_RATE as usize * 2);
+        let held = sink.render_frames(4_410);
+        assert!(
+            held.mean_abs() < live.mean_abs() * 0.05,
+            "a paused score must fall quiet, not hold its last note: live {:.1} -> \
+             2 s into the pause {:.1} (mean abs)",
+            live.mean_abs(),
+            held.mean_abs()
+        );
+        let paused_tick = sink.sequencer_progress().expect("attached").tick;
+        // Re-asserting the pause is a no-op; opening the gate resumes the
+        // clock from the playhead, so the note-off at +2400 still fires.
+        sink.set_sequencer_paused(true);
+        sink.set_sequencer_paused(false);
+        let _ = sink.render_frames(crate::SPU_INTERNAL_RATE as usize * 3);
+        let p = sink.sequencer_progress().expect("attached");
+        assert!(
+            p.tick > paused_tick,
+            "the clock must run again after the gate opens ({paused_tick} -> {})",
+            p.tick
+        );
+        assert!(
+            p.finished,
+            "the held note's off event and the end of track were still \
+             reachable after the resume"
+        );
+    }
+
+    /// A rewind puts the playhead back on the first event and keys off what
+    /// was sounding, so the track plays again from its top once the gate is
+    /// open - the re-attach of op-`0x35` sub-op `4`.
+    #[test]
+    fn a_rewind_replays_the_track_from_its_first_event() {
+        let sink = TestAudioSink::new(crate::SPU_INTERNAL_RATE);
+        let bank = sink.with_spu(held_tone_bank);
+        sink.attach_sequencer(Sequencer::new(held_note_seq(), bank));
+        // Past the note-off at +2400 and the end of the track (2.5 s).
+        let _ = sink.render_frames(crate::SPU_INTERNAL_RATE as usize * 3);
+        let played = sink.sequencer_progress().expect("attached");
+        assert!(
+            played.tick > 0 && played.finished,
+            "the fixture ran out: {played:?}"
+        );
+        sink.set_sequencer_paused(true);
+        sink.rewind_sequencer();
+        let p = sink.sequencer_progress().expect("still attached");
+        assert_eq!(p.tick, 0, "the playhead is back on the first event");
+        assert!(!p.finished, "a rewound track is live again");
+        assert_eq!(p.active_notes, 0, "nothing sounds across the rewind");
+        sink.set_sequencer_paused(false);
+        let _ = sink.render_frames(4_410);
+        assert_eq!(
+            sink.sequencer_progress().expect("attached").active_notes,
+            1,
+            "the opening note keys on again"
+        );
+    }
+
+    /// The drain after the gate closes is the **reverb tail**, not the
+    /// envelope. The fixture's release is `adsr2 = 0x1F00` - linear, shift 0,
+    /// two samples to zero (`spu::adsr`) - yet the default sink keeps
+    /// signal for a good part of a second after the key-off, because every
+    /// `StreamResampler` boots with retail's Studio C reverb, and a
+    /// reverb-flagged tone's key-on routes its voice into it. Render the same key-off through a **dry** SPU and the
+    /// output is exactly silent within a few frames. A reading that charged
+    /// the second-long decay to the ADSR would have "fixed" a release that
+    /// is already tick-exact.
+    #[test]
+    fn the_post_key_off_decay_is_the_reverb_tail_not_the_envelope() {
+        let key_off_and_measure = |dry: bool| -> (SinkMeasure, SinkMeasure) {
+            let sink = TestAudioSink::new(crate::SPU_INTERNAL_RATE);
+            if dry {
+                sink.with_spu(|spu| {
+                    spu.set_reverb_mode(crate::spu::ReverbMode::Off);
+                    for v in &mut spu.voices {
+                        v.set_reverb_send(false);
+                    }
+                });
+            }
+            let bank = sink.with_spu(held_tone_bank);
+            sink.attach_sequencer(Sequencer::new(held_note_seq(), bank));
+            let _ = sink.render_frames(4_410);
+            sink.set_sequencer_paused(true);
+            // The envelope's two samples plus the resampler's one-frame
+            // interpolation history: everything after that is the mixer.
+            let _ = sink.render_frames(4);
+            let first_100ms = sink.render_frames(4_410);
+            let next_100ms = sink.render_frames(4_410);
+            (first_100ms, next_100ms)
+        };
+        let (dry_a, dry_b) = key_off_and_measure(true);
+        assert!(
+            dry_a.is_silent() && dry_b.is_silent(),
+            "a dry SPU is silent four samples after the key-off: {dry_a:?} {dry_b:?}"
+        );
+        let (wet_a, _) = key_off_and_measure(false);
+        assert!(
+            !wet_a.is_silent(),
+            "the retail Studio C tail is what rings on after the key-off"
+        );
+    }
+
+    #[test]
+    fn an_idle_sink_emits_silence_and_says_so() {
+        let sink = TestAudioSink::new(crate::SPU_INTERNAL_RATE);
+        let m = sink.render_video_frame();
+        assert_eq!(m.frames, 735, "44100 / 60");
+        assert!(m.is_silent(), "no source attached -> no output");
+        assert_eq!(m.peak, 0);
+        assert_eq!(m.mean_abs(), 0.0);
+    }
+
+    #[test]
+    fn measure_separates_a_click_from_a_level() {
+        let mut click = SinkMeasure::default();
+        click.accumulate((8000, -8000));
+        for _ in 0..7 {
+            click.accumulate((0, 0));
+        }
+        let mut held = SinkMeasure::default();
+        for _ in 0..8 {
+            held.accumulate((4000, 4000));
+        }
+        assert!(click.peak > held.peak, "the click is louder at its peak");
+        assert!(
+            held.mean_abs() > click.mean_abs(),
+            "but the held level integrates higher - which is what tells a \
+             sounding track from one stray sample"
+        );
+        assert!(!click.is_silent() && !held.is_silent());
+    }
+
+    #[test]
+    fn mute_zeroes_the_output_without_stopping_the_clock() {
+        // The gate is on the emitted frame only: a muted sink still advances
+        // the SPU, so unmuting resumes mid-stream rather than replaying.
+        let sink = TestAudioSink::new(crate::SPU_INTERNAL_RATE);
+        sink.set_muted(true);
+        let m = sink.render_frames(64);
+        assert!(m.is_silent());
+        sink.set_muted(false);
+        assert_eq!(sink.render_frames(1).frames, 1);
+    }
+
+    #[test]
+    fn frames_per_video_frame_tracks_the_device_rate() {
+        assert_eq!(TestAudioSink::new(44_100).frames_per_video_frame(), 735);
+        assert_eq!(TestAudioSink::new(48_000).frames_per_video_frame(), 800);
+        // Degenerate rates still yield a usable (non-zero) frame budget.
+        assert_eq!(TestAudioSink::new(0).frames_per_video_frame(), 1);
+    }
+
+    /// The browser pages' pre-rendered music (`render_bgm_to_pcm` over a
+    /// caller-built SPU) and the live mixer core every output drives - cpal,
+    /// WebAudio and this sink alike - produce the same samples, provided the
+    /// pre-render SPU runs the live mixer's global reverb. At a 1:1 rate the
+    /// live core's interpolator emits two samples behind the SPU it pulls
+    /// (the first pull primes it), so the streams agree sample for sample at
+    /// that lag.
+    #[test]
+    fn the_pre_render_path_matches_the_live_mixer_core() {
+        let frames = crate::SPU_INTERNAL_RATE as usize;
+        let sink = TestAudioSink::new(crate::SPU_INTERNAL_RATE);
+        let bank = sink.with_spu(held_tone_bank);
+        sink.attach_sequencer(Sequencer::new(held_note_seq(), bank));
+        let live: Vec<(i16, i16)> = (0..frames + 2).map(|_| sink.next_frame()).collect();
+
+        let render = |wet: bool| {
+            let mut spu = crate::Spu::new();
+            if wet {
+                spu.set_retail_reverb();
+            }
+            let bank = held_tone_bank(&mut spu);
+            let mut seq = Sequencer::new(held_note_seq(), bank);
+            crate::render_bgm_to_pcm(&mut seq, &mut spu, frames)
+        };
+        let wet = render(true);
+        let wet: Vec<(i16, i16)> = wet.chunks(2).map(|c| (c[0], c[1])).collect();
+        assert_eq!(
+            &live[2..],
+            &wet[..],
+            "pre-render with retail reverb == live core"
+        );
+
+        let dry = render(false);
+        let dry: Vec<(i16, i16)> = dry.chunks(2).map(|c| (c[0], c[1])).collect();
+        assert_ne!(
+            &live[2..],
+            &dry[..],
+            "a bare Spu::new() pre-render is dry where the live mixer is wet"
+        );
+    }
+
+    #[test]
+    fn bus_volumes_scale_music_and_cues_independently() {
+        // A sequencer note rides the BGM bus, a cue key-on the SFX bus: each
+        // config level silences only its own voices, and the default level
+        // leaves the mix untouched.
+        assert_eq!(crate::volume_level_gain(crate::VOLUME_LEVEL_UNITY), 0x4000);
+        assert_eq!(crate::volume_level_gain(0), 0);
+        assert_eq!(crate::volume_level_gain(99), crate::volume_level_gain(10));
+        let level = |sequencer: bool, bgm: u8, sfx: u8| {
+            let sink = TestAudioSink::new(crate::SPU_INTERNAL_RATE);
+            sink.set_bus_volumes(bgm, sfx);
+            sink.with_spu(|spu| {
+                let bank = held_tone_bank(spu);
+                if sequencer {
+                    assert!(bank.play_note(spu, 0, 0, 60, 127));
+                } else {
+                    assert!(bank.play_tone(spu, 0, 0, 0, 60, 127));
+                }
+            });
+            sink.render_frames(4096).mean_abs()
+        };
+        for sequencer in [true, false] {
+            let unity = level(sequencer, 8, 8);
+            assert!(unity > 0.0);
+            let (own_off, other_off) = if sequencer {
+                (level(true, 0, 8), level(true, 8, 0))
+            } else {
+                (level(false, 8, 0), level(false, 0, 8))
+            };
+            assert_eq!(
+                own_off, 0.0,
+                "sequencer={sequencer}: own bus at 0 is silent"
+            );
+            assert_eq!(
+                other_off, unity,
+                "sequencer={sequencer}: the other bus is untouched"
+            );
+        }
+    }
+
+    /// The CD input's reverb send, measured at the output: a short XA burst
+    /// ends in silence with `SPUCNT` bit 2 clear, and rings on through the
+    /// Studio C network the mixer installs once the bit is set - the
+    /// Baka Fighter / Muscle Dome hub routing.
+    #[test]
+    fn xa_rings_through_the_reverb_only_with_cd_reverb_set() {
+        let tail = |cd_reverb: bool| {
+            let sink = TestAudioSink::new(crate::SPU_INTERNAL_RATE);
+            sink.set_cd_reverb(cd_reverb);
+            sink.play_xa(
+                vec![12_000i16; 2_000],
+                crate::SPU_INTERNAL_RATE,
+                legaia_xa::Channels::Mono,
+                false,
+                0x4000,
+            );
+            let burst = sink.render_frames(2_000);
+            assert!(!burst.is_silent(), "the burst itself is audible");
+            // The resampler hands the burst's last sample out one frame
+            // late; the tail starts past it.
+            sink.render_frames(16);
+            sink.render_frames(4_410)
+        };
+        assert!(tail(false).is_silent(), "no send, no tail");
+        assert!(!tail(true).is_silent(), "the send leaves a reverb tail");
+    }
+
+    /// A held square wave on voice 0 panned hard toward the left
+    /// (`0x3FFF` / `0x1000`), keyed directly on the SPU.
+    fn key_panned_voice(spu: &mut crate::Spu) {
+        let mut block = [0x79u8; 16];
+        block[0] = 0x04;
+        block[1] = 0x07; // loop start | repeat | end
+        spu.ram.set_direction(TransferDirection::CpuToSpu);
+        spu.ram.write_at(SPU_ADDR, &block);
+        let v = &mut spu.voices[0];
+        v.start_addr = SPU_ADDR;
+        v.vol_left = 0x3FFF;
+        v.vol_right = 0x1000;
+        v.adsr_cfg = crate::spu::adsr::AdsrConfig::from_words(0x000F, 0x1F00);
+        spu.key_on_mask(0b1);
+    }
+
+    /// Render a panned voice under `(monaural, downmix)`.
+    fn render_panned_voice(mono: bool, downmix: bool) -> Vec<(i16, i16)> {
+        let sink = TestAudioSink::new(crate::SPU_INTERNAL_RATE);
+        sink.set_mono(mono);
+        sink.set_downmix(downmix);
+        sink.with_spu(key_panned_voice);
+        (0..256).map(|_| sink.next_frame()).collect()
+    }
+
+    /// Render a stereo XA stream carrying the left channel only.
+    fn render_left_only_xa(mono: bool, downmix: bool) -> Vec<(i16, i16)> {
+        let sink = TestAudioSink::new(crate::SPU_INTERNAL_RATE);
+        sink.set_mono(mono);
+        sink.set_downmix(downmix);
+        let pcm: Vec<i16> = (0..512).flat_map(|_| [8_000i16, 0]).collect();
+        sink.play_xa(
+            pcm,
+            crate::SPU_INTERNAL_RATE,
+            legaia_xa::Channels::Stereo,
+            false,
+            0x4000,
+        );
+        (0..256).map(|_| sink.next_frame()).collect()
+    }
+
+    /// The options screen's "Sound: Monaural" is libsnd's `SsSetMono` and
+    /// nothing more: every voice sounds at the larger of its two volumes on
+    /// both sides (`FUN_80067550`'s fold at `0x800677F4..0x80067818`). The
+    /// sum is not averaged on top, so the louder side keeps its stereo
+    /// level instead of dropping toward the quieter one.
+    #[test]
+    fn retail_monaural_is_the_per_voice_fold_only() {
+        let stereo = render_panned_voice(false, false);
+        let mono = render_panned_voice(true, false);
+        assert!(stereo.iter().any(|(l, r)| l != r), "the fixture is panned");
+        assert!(stereo.iter().any(|&(l, _)| l != 0), "the fixture sounds");
+        for (&(sl, _), &(ml, mr)) in stereo.iter().zip(&mono) {
+            assert_eq!(ml, mr, "monaural sounds the voice on both sides");
+            assert_eq!(ml, sl, "both sides at the louder (left) volume");
+        }
+    }
+
+    /// `SsSetMono` only raises the flag the voice-volume paths read: the CD
+    /// input (XA voice / FMV audio) keeps its own stereo image.
+    #[test]
+    fn retail_monaural_leaves_the_cd_input_stereo() {
+        let stereo = render_left_only_xa(false, false);
+        let mono = render_left_only_xa(true, false);
+        assert_eq!(stereo, mono, "monaural does not touch the CD input");
+        assert!(mono.iter().any(|&(l, r)| l != 0 && r == 0));
+    }
+
+    /// The host full-mono downmix (`downmix_mono`) averages the finished
+    /// mix, voices and XA alike, into both channels - on top of, and
+    /// independent of, the retail fold.
+    #[test]
+    fn host_downmix_averages_the_whole_mix() {
+        let stereo = render_panned_voice(false, false);
+        let down = render_panned_voice(false, true);
+        for (&(sl, sr), &(dl, dr)) in stereo.iter().zip(&down) {
+            assert_eq!(dl, dr);
+            assert_eq!(dl, ((sl as i32 + sr as i32) / 2) as i16);
+        }
+        let folded = render_panned_voice(true, false);
+        let both = render_panned_voice(true, true);
+        assert_eq!(both, folded, "an already-folded voice averages to itself");
+        let xa = render_left_only_xa(false, false);
+        let xa_down = render_left_only_xa(false, true);
+        assert!(xa_down.iter().any(|&(l, _)| l != 0));
+        for (&(sl, sr), &(dl, dr)) in xa.iter().zip(&xa_down) {
+            assert_eq!((dl, dr), (((sl as i32 + sr as i32) / 2) as i16, dl));
+        }
+    }
+}

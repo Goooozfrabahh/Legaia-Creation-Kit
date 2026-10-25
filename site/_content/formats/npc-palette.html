@@ -1,0 +1,202 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">formats</a> &middot; row-479 NPC CLUTs</div>
+  <h1>NPC CLUTs at VRAM row 479 <span class="tag tag-done">Confirmed</span></h1>
+  <p class="lede">Every villager, guard and shopkeeper gets its colours from a palette - on the PSX, a
+  <strong>CLUT</strong> (colour look-up table) is literally a row of pixels somewhere in the console's
+  1024&times;512 video memory. Legaia parks its NPC palettes along <strong>row 479</strong>, near the bottom
+  edge, as plain <a href="tim.html">TIM</a> images inside each scene's data. The two things worth knowing:
+  the row is filled only when a <em>battle</em> loads, and several TIMs share it without clobbering each
+  other.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Shape</dt><dd>Standard TIM (magic <code>0x10</code>) in a type-<code>0x01</code> streaming chunk; CLUT rect <code>(0, 479, 256, 1)</code></dd>
+    <dt>Where on disc</dt><dd>Tail of each scene's <a href="scene-bundles.html">scene_tmd_stream</a> PROT entries (town01: entries 0006..0009, one row-479 TIM each)</dd>
+    <dt>Uploaded</dt><dd>At battle init only, by the <a href="#how-we-know">battle-init TIM walker</a>; a freshly loaded town has the row empty</dd>
+    <dt>Sampled via</dt><dd>CBA cells <code>0x77C0..0x77CF</code> (sixteen 16-colour slots across the row)</dd>
+    <dt>Parser / engine</dt><dd><code>legaia_scene_formats::scene_tmd_stream::battle_tim_chunks</code>, <code>legaia_tim::vram</code>, <code>legaia_tmd::vram_targeted</code></dd>
+    <dt>Confidence</dt><dd>Confirmed - uploader chain traced; row contents byte-matched against emulator VRAM dumps before and after battle</dd>
+    <dt>Used by</dt><dd><a href="../subsystems/renderer.html">Renderer</a>, <a href="../npcs.html">NPC browser</a></dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="layout">
+  <h2>Layout</h2>
+  <p>Each contributing TIM declares a CLUT block at framebuffer rect <code>(0, 479, 256, 1)</code>: one
+  256-colour row that carves into sixteen 16-colour slots (slot N at fb_x <code>N*16..N*16+16</code>).
+  NPC meshes name a slot through their per-primitive CBA field. Contents are scene-specific: the human-villager
+  towns (town01/0b/0c/0d) share one palette set; balden, bubu1, urudre1, nilboa and chitei2 each carry their own.</p>
+  <p>On disc, each TIM sits inside a type-<code>0x01</code> streaming chunk in the entry's tail:</p>
+  <div class="byte-map">
+    <div class="bm-cell bm-accent" style="--w:4"><span class="bm-off">+0x00</span><span class="bm-name">chunk header</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell" style="--w:4"><span class="bm-off">+0x04</span><span class="bm-name">TIM magic 0x10</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell" style="--w:4"><span class="bm-off">+0x08</span><span class="bm-name">flags 0x08</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell" style="--w:4"><span class="bm-off">+0x0C</span><span class="bm-name">CLUT bnum 0x20C</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell bm-accent" style="--w:4"><span class="bm-off">+0x10</span><span class="bm-name">fb_x 0, fb_y 479</span><span class="bm-size">2&times;u16</span></div>
+    <div class="bm-cell" style="--w:4"><span class="bm-off">+0x14</span><span class="bm-name">256 colours, 1 CLUT</span><span class="bm-size">2&times;u16</span></div>
+    <div class="bm-cell bm-dim" style="--w:12"><span class="bm-off">+0x18</span><span class="bm-name">CLUT data: 256 BGR555 halfwords</span><span class="bm-size">512 B</span></div>
+    <div class="bm-cell bm-dim" style="--w:8"><span class="bm-off">after</span><span class="bm-name">TIM image block</span><span class="bm-size">&hellip;</span></div>
+  </div>
+  <table class="layout">
+    <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>chunk header</td><td><code>(type &lt;&lt; 24) | size</code>; e.g. <code>0x01008220</code> = type <code>0x01</code> ("upload TIM"), payload <code>0x8220</code> bytes</td></tr>
+      <tr><td>flags</td><td><code>0x08</code> = 4bpp with a CLUT</td></tr>
+      <tr><td>CLUT block</td><td><code>0x20C</code> bytes = 12-byte block header + 512 bytes of colours, landing at rect <code>(0, 479, 256, 1)</code></td></tr>
+      <tr><td>image block</td><td>a standard TIM image block, typically a 256&times;256 4bpp page at <code>fb_x=832</code></td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure">
+    <summary>Reading trap: the type byte, and why the standard walker crashes here</summary>
+    <div class="disclosure-body">
+      <p>In file order the chunk starts <code>20 82 00 01</code>; the leading <code>0x20</code> is the
+      <em>low byte of the size field</em>, not a type byte. The type is the high byte of the LE u32
+      (<code>0x01</code>) - the same packing the standard <a href="asset-type.html">asset-type dispatcher</a>
+      uses, but with different semantics: the standard dispatcher's case 1 means <code>TIM_LIST</code>
+      (a <code>[count + offsets + TIMs]</code> pack), while the battle-init walker's case 1 means "single bare
+      TIM via <code>LoadImage</code>". Feeding these chunks to the standard streaming walker mis-reads the TIM
+      magic <code>0x10</code> as a 16-entry pack count and crashes.</p>
+      <p><code>legaia_container_formats::tim_scan</code> detects these TIMs by the inner magic alone;
+      <code>scene_tmd_stream::battle_tim_chunks</code> is the walker that understands the wrapper. It tags each
+      chunk <code>WalkSource::Tail</code> (inside the walker's reach - every retail chunk) or
+      <code>WalkSource::Continuation</code> (past the first terminator, i.e. an over-read into the next PROT entry).</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="multi-tim-clut-merge">
+  <h2>Sharing the row: merge-zeros</h2>
+  <p>A town carries <strong>several</strong> row-479 TIMs - town01's entries 6..9 hold four, one per entry
+  (each entry has two TIM chunks; the other one puts its CLUT on row 473), all targeting the same VRAM cells.
+  Entries 7 and 8 are "full" (slots 0..14 populated); entries 6 and 9 are "partial" (slots 0..5 + 7, and
+  0..7, the rest zero-padded on disc). The engine's targeted upload resolves the race with
+  <strong>merge-zeros semantics</strong>: a
+  <code>0x0000</code> halfword in a later upload never overwrites a non-zero halfword from an earlier one.
+  The row ends up as the union of every TIM's non-zero slots.</p>
+  <figure class="overlay-strip">
+    <svg viewBox="0 0 760 210" width="100%" style="max-width:760px" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Two TIM uploads merging into VRAM row 479: zero halfwords never overwrite non-zero ones">
+      <style>
+        .np-lab { font: 12px 'Inter', sans-serif; fill: var(--text-muted); }
+        .np-seg { font: 11px 'Inter', sans-serif; fill: currentColor; text-anchor: middle; }
+        .np-full { fill: var(--bg-raised); stroke: var(--accent); stroke-width: 1.2; }
+        .np-zero { fill: none; stroke: var(--border); stroke-width: 1.1; stroke-dasharray: 3 3; }
+        .np-arrow { stroke: var(--accent); stroke-width: 1.2; fill: none; }
+      </style>
+      <text x="16" y="40" class="np-lab">TIM A (full)</text>
+      <rect x="150" y="20" width="450" height="30" class="np-full"/>
+      <rect x="600" y="20" width="60" height="30" class="np-zero"/>
+      <text x="375" y="40" class="np-seg">slots 0..14 populated</text>
+      <text x="630" y="40" class="np-seg">zero</text>
+
+      <text x="16" y="98" class="np-lab">TIM B (partial)</text>
+      <rect x="150" y="78" width="240" height="30" class="np-full"/>
+      <rect x="390" y="78" width="270" height="30" class="np-zero"/>
+      <text x="270" y="98" class="np-seg">slots 0..7</text>
+      <text x="525" y="98" class="np-seg">zero - does not overwrite</text>
+
+      <path d="M 405 116 L 405 142" class="np-arrow"/>
+      <path d="M 399 136 L 405 142 L 411 136" class="np-arrow"/>
+
+      <text x="16" y="180" class="np-lab">VRAM row 479</text>
+      <rect x="150" y="160" width="450" height="30" class="np-full"/>
+      <rect x="600" y="160" width="60" height="30" class="np-zero"/>
+      <text x="375" y="180" class="np-seg">union of non-zero slots</text>
+    </svg>
+    <figcaption>Later uploads merge into the row; only non-zero halfwords land. The result is one fully populated palette row.</figcaption>
+  </figure>
+  <p>The semantics matter: with plain last-write-wins, the partial TIMs' trailing zeros would blank the full
+  TIMs' upper slots and the NPC meshes anchored there would lose their palettes. In the port the merge lives
+  in <code>legaia_tmd::vram_targeted</code>, which runs the CLUT pass second, after the image blocks.</p>
+  <p>The merge applies among the scene's own TIMs only. The shared <code>init_data</code> block's TIMs are
+  resident before the scene loads, so a scene palette's zeros replace their words, as the PSX
+  <code>LoadImage</code> call does. Merging across that line left an opaque near-black under the Sky Gardens
+  Tower's foliage palettes on row 484, and the vines drew on dark-brown cards.</p>
+</section>
+
+<section class="doc-section" id="retail-dispatch">
+  <h2>When the upload happens</h2>
+  <p>Retail uploads these TIMs only at <strong>battle init</strong>; the field / town scene loader never
+  touches them. The <a href="#how-we-know">battle-init walker</a> scans the streaming tail and DMAs every
+  type-<code>0x01</code> chunk to VRAM with <code>LoadImage</code>, stopping at a zero-size header or
+  type-<code>0x02</code> chunk. On a correctly-sized entry the terminator is followed only by padding, so
+  every TIM chunk the entry owns is reached.</p>
+  <ul class="bullets">
+    <li>Emulator captures inside town01 with no battle yet: row 479 entirely zero.</li>
+    <li>Captures mid- or post-battle: row 479 populated (PSX VRAM persists across scene transitions).</li>
+  </ul>
+  <p>In the port, a field scene load (<code>SceneLoadKind::Field</code>) mirrors this lazy upload: it leaves
+  out every <code>scene_tmd_stream</code> entry - both its leading TMD (a battle character mesh) and its TIM
+  chunks - so field VRAM matches a retail town (row 479 empty). The battle load kind uploads them.</p>
+</section>
+
+<section class="doc-section" id="row510-band">
+  <h2>Not this format: the boot-resident band at rows 510/511</h2>
+  <p>Rows <strong>510 and 511</strong> look like another NPC-palette band but are a different mechanism: the
+  flat-strip CLUTs of the boot-resident <strong>system-UI TIM bundle</strong> (the
+  <a href="tim-pack.html#boot-resident-system-ui-instance-raw-toc-entries-0-and-1">timpack at raw PROT TOC
+  entries 0 and 1</a>), uploaded once at boot and never evicted or scene-touched. The boot uploader flattens
+  every TIM's declared multi-row CLUT bank into a <code>w*h &times; 1</code> strip at its declared origin:</p>
+  <table>
+    <thead><tr><th>Row</th><th>fb_x</th><th>Source TIM (PROT.DAT offset)</th><th>Declared CLUT rect</th></tr></thead>
+    <tbody>
+      <tr><td>510</td><td>0..255</td><td>menu-glyph / interior-page atlas <code>0x11218</code></td><td><code>(0,510,16,16)</code></td></tr>
+      <tr><td>510</td><td>256..319</td><td>UI sprite strip <code>0x19438</code></td><td><code>(256,510,16,4)</code></td></tr>
+      <tr><td>511</td><td>0..255</td><td>system-UI sprite sheet <code>0x018E0</code></td><td><code>(0,511,16,16)</code></td></tr>
+      <tr><td>511</td><td>256..303</td><td>boot cursor <code>0x01858</code></td><td><code>(256,511,16,3)</code></td></tr>
+      <tr><td>511</td><td>304..319</td><td>UI element <code>0x07B00</code></td><td><code>(304,511,16,1)</code></td></tr>
+    </tbody>
+  </table>
+  <p>This is why field and dungeon environment meshes can sample CBA cells on row 510 even though no scene TIM
+  ever uploads that row. For a parity oracle: row 479 is scene/battle-history-dependent; rows 510/511 fb_x
+  0..319 are static disc bytes, byte-identical across captures in every game phase.</p>
+  <details class="disclosure">
+    <summary>Bundle details: readers and row patches</summary>
+    <div class="disclosure-body">
+      <p>The bundle lives at raw TOC entry 0 (CDNAME <code>init_data</code>, <code>PROT.DAT</code> sectors 3..55
+      - the region the extraction index space skips, since extraction entry 0 is raw entry 2); a second
+      single-TIM pack at raw entry 1 is the GAME OVER overlay's, not boot-resident. Parser <code>legaia_ui_formats::system_ui_bundle</code> reads both packs
+      straight out of <code>PROT.DAT</code> and reproduces the full upload (<code>legaia_ui_formats::interior_page</code>
+      is the atlas-only reader). The pack's six 532-byte non-TIM members are bare <strong>row patches</strong> -
+      <code>[u32, u32]</code> preamble + TIM-style <code>[u32 bnum][u16 x,y,w,h]</code> blocks declaring
+      <code>(960, 456..458/460..462, 256, 1)</code> - that overlay the atlas image rows in place, byte-exact vs
+      live captures in every phase. Env-pack samplers pinned on the row: town01 slots 21/26/74 and rikuroa slots
+      50/51/63, CBA <code>(64,510)</code>, texpage <code>(960,256)</code>.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <p>The battle-init walker and the boot uploader are traced in the disassembly, and both bands are byte-matched against emulator VRAM dumps: row 479 is empty in a town before any battle and populated during and after one, while rows 510/511 are identical in every phase.</p>
+  <details class="disclosure">
+    <summary>Provenance: routines and captures</summary>
+    <div class="disclosure-body">
+  <table>
+    <thead><tr><th>Function</th><th>Address</th><th>What it proves</th><th>Dump</th></tr></thead>
+    <tbody>
+      <tr><td>Battle-init TIM walker</td><td><code>FUN_8001FE70</code> (via <code>FUN_800520F0</code> &rarr; <code>FUN_8001FA88</code>)</td><td>Walks the streaming tail; <code>LoadImage</code> per type-0x01 chunk; stops at zero-size or type-0x02</td><td><code>funcs/8001fe70.txt</code></td></tr>
+      <tr><td>Standard chunk dispatcher</td><td><code>FUN_8001F05C</code> case 1</td><td>Same type byte means <code>TIM_LIST</code> there - the two walkers' semantics differ</td><td><code>funcs/8001f05c.txt</code></td></tr>
+      <tr><td>Boot per-TIM uploader</td><td><code>FUN_800198E0</code></td><td>Flattens each CLUT bank to a <code>w*h &times; 1</code> strip - the rows 510/511 band</td><td><code>funcs/800198e0.txt</code></td></tr>
+      <tr><td>VRAM captures</td><td>row 479 = blob offset <code>0xEF800</code></td><td>Row zero in pre-battle town saves, populated mid/post-battle; strips 510/511 byte-identical in every phase</td><td><a href="../tooling/mednafen-automation.html">mednafen automation</a> (<code>vram-dump</code>, <code>bracket-writer.py</code>)</td></tr>
+    </tbody>
+  </table>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="tim.html">PSX TIM</a>
+    <a href="../subsystems/renderer.html">Renderer</a>
+    <a href="scene-bundles.html">Scene bundles</a>
+    <a href="tim-pack.html#boot-resident-system-ui-instance-raw-toc-entries-0-and-1">System-UI bundle (rows 510/511)</a>
+    <a href="../subsystems/asset-loader.html">Asset loader</a>
+    <a href="../npcs.html">NPC browser</a>
+    <a href="../tooling/mednafen-automation.html">Mednafen automation</a>
+  </div>
+  <p>Source of record: <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/formats/npc-palette.md" target="_blank" rel="noopener"><code>docs/formats/npc-palette.md</code></a>.</p>
+</section>

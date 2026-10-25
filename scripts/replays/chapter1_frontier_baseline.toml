@@ -1,0 +1,170 @@
+# Chapter-1 scene-frontier baseline.
+#
+# What `crates/parity/tests/chapter1_frontier_ladder.rs` reached over
+# the whole chapter-1 reachable scene set, rather than along one route. The
+# test asserts `>=` on every number below, so each is a ratchet: it may go up
+# in a reviewed edit, and a drop fails the run.
+#
+# The scene set is not a list. It is the BFS closure of `town01` over each
+# scene's own decoded `0x3F` named-scene-change destinations, stopped at the
+# kingdom boundary - a destination that is another kingdom's overworld
+# (`mapNN` other than `map01`) is recorded and not expanded, because `map02`
+# and `map03` are the chapter-2 / chapter-3 arcs.
+#
+# Rungs, per scene, ordered and cumulative (the score is the count cleared
+# before the first one that was not):
+#   1 assets  Scene::load resolves and a MAN payload comes back
+#   2 man     the MAN parses: partition table + 0x3F destination table
+#   3 enter   SceneHost enters it in Field / WorldMap
+#   4 script  its entry script settles and hands control back
+#   5 walk    pad-only input displaces the player at least one tile
+#   6 exit    an exit record fires and lands in the scene it names
+#
+# Rung 5 is pad-only - nothing is seated. Rung 6 is NOT pad-only and does not
+# claim to be: the player is seated onto the exit's own trigger tile, so the
+# rung scores the transition and its landing, not the locomotion to the door.
+# Walking to a door under pad is `critical_path_baseline.toml`'s number, and
+# it is a different and harder claim.
+#
+# A scene whose entry script leaves on its own (a scripted `0x3F` with no
+# player input) is marked `~` on rungs 5 and 6 and scores 4. That is not an
+# engine failure and the test reports those scenes separately - but the score
+# still does not credit them, because a rung that never ran was never
+# demonstrated.
+#
+# `scenes` is the closure size. It is a ratchet in its own right: a
+# destination-decode regression that drops a scene off the graph would
+# otherwise *raise* the average and read as progress.
+#
+# `full_ladder` counts scenes that cleared all six rungs.
+#
+# WHY THESE NUMBERS MOVED, AND BY HOW MUCH
+#
+# The closure roughly doubled and every rung number rose with it, because a
+# `0x3F` operand's case is invisible to retail and the port's clean-label gate
+# was lower-case-only. Retail never compares the operand against a name table:
+# it copies the name into the next-scene global and the field asset loader
+# concatenates it into the ISO path `DATA\FIELD\<name>.MAP`, and ISO 9660
+# identifiers are upper case. Roughly half the disc's destinations are written
+# `MAP03` / `KOR3` / `RETOCKIN`, and the port silently dropped every one -
+# `uru`'s own exit among them. With the gate folding case, the closure grows
+# from the Drake kingdom to most of the `0x3F` graph reachable from `town01`.
+#
+# Four later corrections raised the rung numbers again, each a port defect
+# rather than a cap:
+#
+# - The field VM read op `0x45` sub-`0xC0` (CAMERA APPLY) as an absolute jump
+#   to its `s16` operand. Retail's arm is a four-byte fall-through and the
+#   `s16` is the apply trigger it hands to the camera composer, so a trigger of
+#   zero sent the PC back to byte 0 and the record replayed forever.
+#   `urudre2`'s only door record is one of those, which is why that room read
+#   as one-way.
+#
+# - The same VM read op `0x43` sub-0/1/A/B (the halt-acquire) as yielding to an
+#   absolute PC taken from an operand `s16`. That `s16` is a coordinate: the
+#   sub-A/B one is negated into the target's Y. Retail falls through past the
+#   op and stops the context on the halt bit instead.
+#
+# - The static partition-2 scene-change join abandoned a record at its first
+#   undecodable byte while the executing walker resyncs past it. Message text
+#   is full of such bytes, so every destination behind the first one was lost -
+#   67 partition-2 records disc-wide gained a destination when the join started
+#   sharing the walker's advance rule.
+#
+# - The cold-entry seat resolver gated "is this tile floor" on the object-grid
+#   bit `0x1000`. Eighteen field scenes author `0x2000` and never `0x1000`, so
+#   the resolver was inert in all of them and `kor5` seated the player inside a
+#   wall. The gate now uses whichever bit the scene authored, and a candidate
+#   seat the player cannot walk off is rejected.
+#
+# Where the frontier stops, and why (each of these is a finding the run
+# prints in full; they are recorded here so the shortfall between
+# `rung_total` and `scenes * 6` is not mistaken for noise):
+#
+# - The rung-5 shortfall is the ending scenes whose vignette record holds the
+#   pad (below). `izumi` clears it now that the settle waits out its
+#   first-visit record. `korb3` stops a rung earlier, at rung 4: its seat
+#   fires a sign-text record that waits on a press (below). It had scored
+#   rung 4 only because the settle returned before the record started.
+#
+# - All five of the late Uru Mais / Drake scenes now leave, and Parts D/E/E2
+#   say exactly how: `uru` -> `map03`, `urudre1` / `urudre3` -> `uru`,
+#   `urudre2` -> `map01` through `.PCH`-carried gate-1 bands, and `jouine` ->
+#   `town0e` through FMV 8 and `cutscene::fmv_post_play_handoff` (its record
+#   carries no `0x3F` at all, so the static exit-site join cannot see it and
+#   the scene still stops at rung 6 in the table while Part E drives it out).
+
+#
+# WHY THE NUMBERS WENT DOWN: 432 -> 415, full ladder 64 -> 58
+#
+# Two changes, each a correction of what the ladder was measuring:
+#
+# - Helper records hold the pad. Retail's script runner `FUN_80039B7C`
+#   raises the player's engaged bit for every context it steps and clears it
+#   only on the context's closing raw `0x21`; `FUN_801D1344` skips the pad
+#   controller while the bit is up (`field-locomotion.md`, "Where the 294
+#   vsyncs go"). The engine used to hold the pad for the modal timeline only,
+#   so a concurrent helper and the pad both drove the player. With helpers
+#   holding it from their first slice, eight ending scenes (`edbubu`,
+#   `edbylon`, `eddoman`, `edkorout`, `edretoin`, `edson`, `edstati3`,
+#   `edteien`) stop scoring a walk: each entry spawns a long vignette record
+#   (camera moves, turns, frame waits) and the pad no longer walks the player
+#   under it. Those rungs had been crediting the defect.
+#   `izumi` gains its rung 5 (4 -> 5): the pad now beats the released-pad
+#   control once its first-visit record has run out.
+# - The settle waits for spawns. `settle` used to test "no helper" on the
+#   entry frame, before the entry script's op-`0x44` spawns had queued, so it
+#   returned at once and the walk probe ran under the record. It now ticks
+#   twice first and also waits for the spawn queue. `korout` then scores its
+#   walk (its first-visit record walks the player eight tiles and ends);
+#   `korb3` (4 -> 3) and `edlast` (5 -> 3) show what they had hidden. The
+#   `pc=` in their notes is the scene's OWN entry script (the field VM's
+#   `field_pc`), not the record that holds the pad, so it read as two
+#   stalls. Neither is one, and neither is expected to come back:
+#   - `korb3`: the picker seat lands on tile (37,27), a gate-1 walk-on band
+#     whose `P2[15]` is three pages of sign text; the timeline waits on the
+#     press to dismiss them, as retail's text box does. Seated where retail
+#     arrives from `korb2` (tile (37,39)), the first-visit `P2[1]` fires
+#     instead and waits on its own dialogue. A released-pad settle passes
+#     neither.
+#   - `edlast`: `P2[1]` is the end-credits vignette, about 14100 vsyncs long,
+#     and it closes on a held-pad poll (`4A 08 00` / `42 01 08` / `42 01 09` /
+#     `26` back) that waits for Circle or Cross. Retail holds the pad the
+#     whole time (the ending states hold the engaged bit), so rung 4 never
+#     clears under a released pad. The port used to read that poll loop as a
+#     wrapped choreography and drop the record, which would have released
+#     the pad at about 14113 ticks; it now waits.
+
+#
+# WHY THE NUMBERS WENT DOWN AGAIN: 415 -> 410, full ladder 58 -> 56
+#
+# Entry scripts now run their guarded story beats. Field-VM op `4C EB` ("run
+# the next op only if this actor exists") used to jump to its skip operand as
+# an absolute address, and the engine never answered the actor lookup, so
+# every guard missed and sent the entry script to byte 5 of its record
+# header. With the guard fixed (relative skip, actor resolved as retail's
+# lookup does), `rikuroa` (6 -> 4) and `korout` (5 -> 4) play a first-visit
+# beat that opens a dialogue and then leaves the scene, and `izumi` (6 -> 4)
+# leaves on its own too. A scripted departure is capped at rung 4 by design,
+# so the rungs these scenes used to score were crediting the skipped beat.
+# The settle now pulses Cross while a dialogue owns input, as a player
+# pages text, so a dialogue that opens on entry is not scored as a stall.
+
+#
+# WHY THE NUMBERS WENT UP: 410 -> 411, full ladder 56 -> 57
+#
+# `tower` clears its walk on locomotion now. Its spawn faces the rapid
+# elevator (P0[4]), whose record tests switch `0x1C6` first: clear, it types
+# "Out of service" and loops back. The engine used to fall back to the
+# record's static decode on that arm and take the ride's tile-(0, 0) parking
+# `MoveTo` for the destination, so the first Up dropped the player into the
+# void corner - the "walked 70 tile(s)" the ladder credited was the Chebyshev
+# distance from (13, 70) to (0, 0), not a walk. With the arm honoured the
+# contact moves nobody and opens the text box, and the walk probe now pages a
+# dialogue the walk opens (Cross pulses while it owns input, as the settle
+# does) instead of standing in it for the remaining cardinals. The scene
+# walks three tiles under pad and leaves for `geremi`.
+
+scenes = 74
+rung_total = 411
+full_ladder = 57

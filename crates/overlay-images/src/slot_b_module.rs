@@ -1,0 +1,1098 @@
+//! End-to-end layout of a **slot-B module image** (PROT `0903..=0966`), the
+//! band of per-spell summon stagers and capture-class cast modules that
+//! timeshare the second overlay window at
+//! [`SLOT_B_LINK_BASE`](crate::summon_overlay::SUMMON_OVERLAY_LINK_BASE).
+//!
+//! [`crate::cast_effect_pool`] indexes the band by PROT entry and hands each
+//! image to [`crate::summon_overlay::parse`], which answers *what a module
+//! spawns* - reading its record pointers through this module's walk, so the
+//! two cannot disagree about a spawn site. This module answers the sibling
+//! question the byte-accounting instruments ask - **which bytes of the image
+//! are what** - and it answers it at a granularity the spawn parser does not:
+//! a per-record half-open extent, cut where the image's own code partition
+//! resumes.
+//!
+//! ## The three regions
+//!
+//! | region | what it is | how it is recovered |
+//! |---|---|---|
+//! | head table | 0 to 256 words of in-image VAs: the jump table of *one* of the module's two switches (which one is settled by the `sltiu` immediate - see [`cast-module.md`](https://andrewaltimit.github.io/legend-of-legaia-re/subsystems/cast-module.html)) | leading run of words inside `[base, base + len)`, capped at the first framed function |
+//! | code | the tick's `ctx+0x279` phase machine, the `0x801F6734` spawn stager, the capture-class trampolines | frame matching: `addiu sp, sp, -F` to the first `jr ra` whose delay slot restores the same `F` |
+//! | spawn-record band | the module's own data: `[i16 model_sel][u16 reserved][move-VM bytecode]` records the stager hands to `FUN_80021B04` / `FUN_80050ED4` | the **consumer's** pointer-forming instruction (below) |
+//!
+//! The three are not laid out head-to-tail in every image. PROT 0943
+//! (`cast_curse`) and PROT 0961 (`cast_dead_end_crisis`) both put a record band
+//! *between* two code partitions, so a rule that reads the band as "everything
+//! past the last function" mislabels real routines as data. [`records`] cuts
+//! every claim at the next framed-function start for exactly that reason.
+//!
+//! ## The evidence a record extent rests on
+//!
+//! A record is named by an instruction, never by a statistic: the module forms
+//! its address with a `lui` / `addiu` pair and passes it in `$a2` to a `jal`
+//! into one of the two spawn helpers. The end of one record is the start of the
+//! next, so both ends of a claim are addresses the module's own code computes.
+//! Four filters keep a spurious pointer out. Two of them fire on retail and two
+//! are guards that do not - the split is measured over the band and recorded on
+//! the format page, so a reader knows which is evidence and which is caution:
+//!
+//! - the resolved address must land in the image with room for a header (drops
+//!   the neighbours' records reached through the shared link base);
+//! - the **call site** must lie inside a framed body of this image - a band
+//!   image's tail is a byte-identical, same-offset copy of another image's
+//!   bytes, and an inherited fragment's spawn calls name the sibling's
+//!   records, not this image's;
+//! - an intervening `jal` between the pair and the consuming call voids the
+//!   value - `$a2` is caller-saved, so a pointer formed before another call is
+//!   not the one the consumer sees;
+//! - a target inside a framed function is dropped (a stale register the static
+//!   window mis-read, not a record) - never fires on retail;
+//! - a `model_sel` outside the set `FUN_80021B04` dispatches (`-1`, a library
+//!   index below [`crate::summon_overlay::LIBRARY_MESH_SEL_MAX`], or the two
+//!   render-mode sentinels) is dropped - never fires on retail.
+//!
+//! ## Bounding the highest record
+//!
+//! The image's highest record has no next pointer above it and the module
+//! carries no length field, so the *band* cannot bound it. Its **program** can:
+//! a record's payload is a move-VM program, and the move VM's own width table
+//! ([`move_program_end`]) walks it to its terminator. Two words terminate a
+//! program, and both of them mean "nothing above this ever executes":
+//!
+//! - `0x08` `HALT`, which sets `flags |= 8` and drops out of the tick loop; and
+//! - an **armed idle loop** - `0x19` (or its `0x1B` mirror) whose paired `0x18`
+//!   / `0x1A` loaded a counter with bit `0x4000` set. That bit makes the branch
+//!   back to the saved PC unconditional, so the VM never advances past it.
+//!
+//! A third word bounds a record only where neither of those turns up: a `0x09`
+//! `WAIT` carrying [`MOVE_WAIT_FOREVER`]. That is a layout argument rather than
+//! a VM one - `WAIT` retires like any other instruction - and the band emits
+//! the operand mid-program too, so the walk remembers the last one and returns
+//! it only when it would otherwise have no bound at all.
+//!
+//! The end is then rounded up to a 4-byte boundary, because the records are
+//! word-aligned: a program whose last halfword lands mid-word is followed by one
+//! halfword of padding before the next record's header. That alignment step is
+//! not cosmetic - it is the difference between reproducing a record's measured
+//! extent and missing it by exactly 4 bytes.
+//!
+//! The rule is checked against the records the band *does* bound: chaining
+//! `[header][program]` from each bounded record's start lands exactly on that
+//! record's measured end for 1021 of the band's 1027 bounded extents, and none
+//! of the chains overruns a measured end. The six that miss stall below it and
+//! are a stated residue, not a rounding tolerance - see
+//! [`slot-b-module-layout.md`](https://andrewaltimit.github.io/legend-of-legaia-re/formats/slot-b-module-layout.html).
+//! Where the walk does **not** terminate, the record stays
+//! [`SlotBLayout::unbounded_record`] and is claimed by nothing; on retail no
+//! image is in that state.
+//!
+//! ## Inherited call sites
+//!
+//! The call-site filter above ("inside a framed body of this image") is
+//! necessary but not sufficient: a module's inherited tail is a byte-identical
+//! copy of a longer image's bytes, and a *whole function* of the donor can sit
+//! in it, frame-matching locally and issuing the donor's spawn calls. Six of the
+//! 64 images have such a site. [`parse_with_tail`] takes the image's own content
+//! end and drops every call site and every record target at or above it; the
+//! tail start comes from `scripts/ghidra-analysis/inherited_tail.py`, or from
+//! [`content_end`] when only the one image is in hand.
+//!
+//! Provenance: disassembly of the 64 extracted band images against
+//! `crates/asset/data/static-overlays.toml`; the frame-matched partition
+//! mirrors `ghidra/scripts/dump/dump_static_overlay.py`, and reproduces its
+//! committed `RANGES` rows.
+
+use std::ops::Range;
+
+use crate::summon_overlay::{
+    LIBRARY_MESH_SEL_MAX, POOL_SPAWN_HELPER, RENDER_NODE_MODE_A, RENDER_NODE_MODE_B, SPAWN_HELPER,
+    SUMMON_OVERLAY_LINK_BASE,
+};
+
+/// Link base every slot-B image is linked at (`*DAT_80010390`).
+pub const SLOT_B_LINK_BASE: u32 = SUMMON_OVERLAY_LINK_BASE;
+
+/// First extraction PROT entry of the module band.
+pub const SLOT_B_PROT_FIRST: u32 = crate::cast_effect_pool::CAST_MODULE_PROT_FIRST;
+
+/// Last extraction PROT entry of the module band.
+pub const SLOT_B_PROT_LAST: u32 = crate::cast_effect_pool::CAST_MODULE_PROT_LAST;
+
+/// Instructions of `$a2`-forming context scanned back from a spawn call while
+/// the followed register is caller-saved.
+const A2_WINDOW_INSNS: usize = 22;
+
+/// Widest head jump table in the band (PROT 0958 fills file `0x0..0x400`).
+pub const MAX_HEAD_TABLE_WORDS: usize = 256;
+
+/// `true` when `entry` is one of the 64 band entries - the cast / summon images
+/// the three PROT 0898 entry tables reach.
+pub fn is_slot_b_module(entry: u32) -> bool {
+    (SLOT_B_PROT_FIRST..=SLOT_B_PROT_LAST).contains(&entry)
+}
+
+/// `true` when `entry` is a mapped image **linked at the slot-B base**.
+///
+/// The band above is an index range, and it answers "which images does the cast
+/// dispatcher reach". This answers the different question the layout walk asks:
+/// the three regions this module recovers - a head table of in-window VAs, the
+/// frame-matched code partition, and a spawn-record band addressed by the
+/// consumer's own `lui`/`addiu` - are properties of the **link base**, not of an
+/// index range, because each is recovered by resolving words against
+/// [`SLOT_B_LINK_BASE`]. Six mapped images sit at that base outside the band:
+/// the two render occupants (PROT 0900 `summon_render`, 0901
+/// `world_map_render`), the three battle stage / tutorial modules (0967 / 0968
+/// / 0969) and the staged texture loader (0978 `field_back_read`). Selecting
+/// this walk on the index band left every one of them measured as if it had no
+/// head table, which is what kept 0967's 408-byte table of in-window VAs in the
+/// residue.
+pub fn is_slot_b_image(entry: u32) -> bool {
+    crate::static_overlay::overlay_map()
+        .by_prot_index(entry)
+        .is_some_and(|r| r.base_va == SLOT_B_LINK_BASE)
+}
+
+/// One frame-matched function body: `addiu sp, sp, -frame` through the first
+/// `jr ra` whose delay slot restores the same `frame`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FramedFn {
+    /// File offset of the prologue.
+    pub start: usize,
+    /// File offset one past the `jr ra` delay slot.
+    pub end: usize,
+    /// Stack frame size the prologue reserves.
+    pub frame: u16,
+}
+
+/// One spawn record, bounded on both sides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordSpan {
+    /// File offset of the record header (`model_sel`).
+    pub start: usize,
+    /// File offset the record ends at: the next record, or the next framed
+    /// function's prologue, whichever comes first.
+    pub end: usize,
+    /// `record[+0]` mesh selector.
+    pub model_sel: i16,
+    /// `record[+2]`, the reserved halfword (see the format page:
+    /// nothing reads it and it is zero in every band record).
+    pub reserved: u16,
+}
+
+impl RecordSpan {
+    /// Byte length of the record, header included.
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// `true` when the record is header-only.
+    pub fn is_empty(&self) -> bool {
+        self.end <= self.start + 4
+    }
+}
+
+/// One slot-B image, region by region.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SlotBLayout {
+    /// Link base the offsets were resolved against.
+    pub link_base: u32,
+    /// Leading run of in-image VA words, if the image heads with one.
+    pub head_table: Option<Range<usize>>,
+    /// Frame-matched function partition, ascending.
+    pub functions: Vec<FramedFn>,
+    /// `jal` sites into either spawn helper, resolvable or not.
+    pub spawn_sites: usize,
+    /// Credited record offsets, ascending - including the highest one, which
+    /// [`Self::records`] bounds only when its program terminates.
+    pub record_offsets: Vec<usize>,
+    /// The bounded record extents. Every start is an address the module's own
+    /// code hands to a spawn helper in `$a2`.
+    pub records: Vec<RecordSpan>,
+    /// Records **above** the highest consumer-credited one, each found by
+    /// chaining `[header][program]` from the end of the record below it. Their
+    /// starts are computed by [`move_program_end`], not by a pointer, so they
+    /// are kept apart from [`Self::records`].
+    pub chained_records: Vec<RecordSpan>,
+    /// The highest credited record offset, kept only when its program does not
+    /// terminate - then nothing bounds it and nothing claims it.
+    pub unbounded_record: Option<usize>,
+}
+
+impl SlotBLayout {
+    /// File offset one past the last framed function, or 0 for an image with
+    /// none. This is the code/data boundary the frame scan puts where
+    /// `scripts/ci/disc-coverage.py`'s `data_floor` independently puts it.
+    pub fn code_end(&self) -> usize {
+        self.functions.last().map_or(0, |f| f.end)
+    }
+
+    /// Bytes the bounded record extents cover.
+    pub fn record_bytes(&self) -> usize {
+        self.records.iter().map(RecordSpan::len).sum()
+    }
+}
+
+fn rd_u32(b: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+
+/// `jr ra`.
+const MIPS_JR_RA: u32 = 0x03E0_0008;
+/// `addiu $sp, $sp, imm` with the immediate's sign bit set.
+const ADDIU_SP_MASK: u32 = 0xFFFF_0000;
+const ADDIU_SP_NEG: u32 = 0x27BD_0000;
+
+/// `jal <target>` word for a kseg0 address.
+fn jal_word(addr: u32) -> u32 {
+    0x0c00_0000 | ((addr >> 2) & 0x03ff_ffff)
+}
+
+/// Frame-matched function partition of a raw image.
+///
+/// Mirrors `ghidra/scripts/dump/dump_static_overlay.py`: a body opens at
+/// `addiu sp, sp, -F` and closes at the first `jr ra` whose delay slot is
+/// `addiu sp, sp, +F` for the same `F`. Unlike a count-and-interleave rule this
+/// survives a frameless leaf, an early `jr ra` inside a body, and a `jr ra`
+/// word that is data in the image's tail.
+pub fn framed_functions(bytes: &[u8]) -> Vec<FramedFn> {
+    let n = bytes.len() / 4;
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        let w = rd_u32(bytes, i * 4);
+        if (w & ADDIU_SP_MASK) == ADDIU_SP_NEG && (w & 0x8000) != 0 {
+            let frame = (0x1_0000u32 - (w & 0xFFFF)) as u16;
+            let want = ADDIU_SP_NEG | u32::from(frame);
+            let mut j = i + 1;
+            while j + 1 < n {
+                if rd_u32(bytes, j * 4) == MIPS_JR_RA && rd_u32(bytes, (j + 1) * 4) == want {
+                    out.push(FramedFn {
+                        start: i * 4,
+                        end: (j + 2) * 4,
+                        frame,
+                    });
+                    i = j + 1;
+                    break;
+                }
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Leading run of words that are VAs inside the image, capped at the first
+/// framed function's prologue. `None` when word 0 is not such a VA.
+fn head_table(bytes: &[u8], link_base: u32, functions: &[FramedFn]) -> Option<Range<usize>> {
+    let cap = functions
+        .first()
+        .map_or(bytes.len(), |f| f.start)
+        .min(MAX_HEAD_TABLE_WORDS * 4)
+        .min(bytes.len());
+    let hi = link_base as u64 + bytes.len() as u64;
+    let mut k = 0usize;
+    while k + 4 <= cap {
+        let w = rd_u32(bytes, k);
+        if w & 3 != 0 || u64::from(w) < u64::from(link_base) || u64::from(w) >= hi {
+            break;
+        }
+        k += 4;
+    }
+    (k > 0).then_some(0..k)
+}
+
+/// The register a MIPS word writes, or `None` for the forms that write none.
+fn writes(w: u32) -> Option<u32> {
+    let op = w >> 26;
+    let rt = (w >> 16) & 0x1F;
+    match op {
+        0x00 => match w & 0x3F {
+            0x08 => None,
+            0x09 => Some(31),
+            0x18..=0x1B | 0x11 | 0x13 => None,
+            _ => Some((w >> 11) & 0x1F),
+        },
+        0x01 | 0x02 | 0x04..=0x07 => None,
+        0x03 => Some(31),
+        0x08..=0x0F => Some(rt),
+        0x20..=0x26 => Some(rt),
+        0x28..=0x2E => None,
+        0x10 | 0x12 => match (w >> 21) & 0x1F {
+            0x00 | 0x02 => Some(rt),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Registers a call may clobber under the o32 convention.
+fn caller_saved(r: u32) -> bool {
+    matches!(r, 1..=15 | 24 | 25 | 31)
+}
+
+/// Longest backward walk while the followed register is a **saved** one
+/// (`s0`-`s8`): a routine forms a record base in a saved register once and
+/// hands it over many calls later (PROT 0912 loads `lui s4` at `0x801F6C38`
+/// and completes it fifty-nine words down). The walk still ends at the
+/// routine's prologue.
+const SAVED_REG_WINDOW_INSNS: usize = 256;
+
+/// The value `reg` holds on reaching the word **after** `start`, walking the
+/// straight-line code backwards from `start` (inclusive), skipping the word at
+/// `skip` (the consuming call itself, whose delay slot `start` usually is).
+/// [`A2_WINDOW_INSNS`] words are walked while the followed register is
+/// caller-saved; a saved register is followed up to
+/// [`SAVED_REG_WINDOW_INSNS`], because calls cannot clobber it.
+///
+/// The last writer must be a `lui` - reached through any chain of `addiu`
+/// adds and register copies (`move a2,s0`: retail stages a record pointer in a
+/// saved register) - or an `addiu` off `$zero`. A load or any other writer
+/// names nothing, and so does a call crossed while the register being followed
+/// is caller-saved, a routine's `jr ra`, its `addiu sp,sp,-N` prologue, or the
+/// delay slot of an unconditional jump above (a `switch` arm's value is not the
+/// fall-through path's).
+fn reg_back(bytes: &[u8], start: usize, mut reg: u32, skip: usize) -> Option<u32> {
+    let mut add: i64 = 0;
+    let mut o = start;
+    let mut steps = 0usize;
+    loop {
+        let cap = if caller_saved(reg) {
+            A2_WINDOW_INSNS
+        } else {
+            SAVED_REG_WINDOW_INSNS
+        };
+        if steps > cap {
+            return None;
+        }
+        steps += 1;
+        if o + 4 > bytes.len() {
+            return None;
+        }
+        let w = rd_u32(bytes, o);
+        if o != skip {
+            let op = w >> 26;
+            if (op == 3 || (op == 0 && w & 0x3F == 0x09)) && caller_saved(reg) {
+                return None;
+            }
+            if w == 0x03E0_0008 && o < start {
+                return None;
+            }
+            if w >> 16 == 0x27BD && w & 0x8000 != 0 {
+                return None;
+            }
+            if writes(w) == Some(reg) {
+                let (rs, rt) = ((w >> 21) & 0x1F, (w >> 16) & 0x1F);
+                let simm = (w & 0xFFFF) as i16 as i64;
+                match op {
+                    0x0F => return Some((((w & 0xFFFF) as i64) << 16).wrapping_add(add) as u32),
+                    0x09 if rs == 0 => return Some(simm.wrapping_add(add) as u32),
+                    0x09 => {
+                        add += simm;
+                        reg = rs;
+                    }
+                    0x00 if matches!(w & 0x3F, 0x21 | 0x25) && (rs == 0) != (rt == 0) => {
+                        reg = rs | rt;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        // The word above is the delay slot of an unconditional jump (`j`,
+        // `jr`, `b`) that never falls through to here: the straight line ends.
+        if o >= 8 && unconditional(rd_u32(bytes, o - 8)) {
+            return None;
+        }
+        o = o.checked_sub(4)?;
+    }
+}
+
+/// `j`, `jr`, or `b` (`beq $zero,$zero`) - a transfer that never falls
+/// through past its delay slot.
+fn unconditional(w: u32) -> bool {
+    let op = w >> 26;
+    op == 0x02 || (op == 0x00 && w & 0x3F == 0x08) || (op == 0x04 && (w >> 16) & 0x3FF == 0)
+}
+
+/// Every `$a2` a spawn call at file offset `site` is handed.
+///
+/// Two paths reach the call. The fall-through one is resolved from the call's
+/// own delay slot back ([`reg_back`] - retail often completes the pair there).
+/// The other is a `switch` whose arms each load `$a2` in the delay slot of a
+/// `j` to one shared `jal`: every `j` that lands on the call, or a few words
+/// above it with nothing between writing `$a2` or transferring control,
+/// contributes the value its own delay slot leaves (PROT 0957's three arms into
+/// the `jal FUN_80050ED4` at `0x801F7F08`).
+fn a2_values(bytes: &[u8], link_base: u32, site: usize, own: &dyn Fn(usize) -> bool) -> Vec<u32> {
+    let mut out: Vec<u32> = reg_back(bytes, site + 4, 6, site).into_iter().collect();
+    let mut targets = vec![site];
+    let mut t = site;
+    for _ in 0..3 {
+        let Some(prev) = t.checked_sub(4) else { break };
+        let w = rd_u32(bytes, prev);
+        let op = w >> 26;
+        let flow = matches!(op, 0x01..=0x07) || (op == 0 && matches!(w & 0x3F, 0x08 | 0x09));
+        if writes(w) == Some(6) || flow {
+            break;
+        }
+        targets.push(prev);
+        t = prev;
+    }
+    let mut j = 0usize;
+    while j + 8 <= bytes.len() {
+        let w = rd_u32(bytes, j);
+        if w >> 26 == 0x02 && own(j) {
+            let va =
+                (link_base.wrapping_add(j as u32 + 4) & 0xF000_0000) | ((w & 0x03FF_FFFF) << 2);
+            let off = va.wrapping_sub(link_base) as usize;
+            if targets.contains(&off) {
+                out.extend(reg_back(bytes, j + 4, 6, j));
+            }
+        }
+        j += 4;
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+// ---------------------------------------------------------------------------
+// The move-VM program walk
+// ---------------------------------------------------------------------------
+
+/// Width in **halfwords** of every move-VM opcode `0x00..=0x46`, as the
+/// dispatcher `FUN_80023070` sets its per-arm `param_3`. `0` marks the five
+/// opcodes whose width is not a constant of the opcode alone, handled by name
+/// in [`move_program_end`]: `0x08` (`HALT`, no advance), `0x0A`
+/// (`3 + 3*count`), `0x0B` (the default break, no advance), `0x2F`
+/// (`OVERLAY_EXT`, the sub-op's width), `0x3C` (`2 + count*6`) and `0x3D`
+/// (`3 + count*6`).
+///
+/// Mirrors the widths in [`move-vm.md`](https://andrewaltimit.github.io/legend-of-legaia-re/subsystems/move-vm.html).
+const MOVE_OP_HALFWORDS: [u8; 0x47] = [
+    4, 4, 2, 2, 4, 4, 2, 4, // 0x00
+    0, 2, 0, 0, 6, 2, 2, 2, // 0x08
+    2, 2, 2, 16, 5, 2, 2, 2, // 0x10
+    2, 1, 2, 1, 2, 2, 8, 8, // 0x18
+    3, 7, 1, 13, 3, 2, 5, 3, // 0x20
+    2, 2, 2, 4, 5, 4, 4, 0, // 0x28
+    1, 2, 2, 1, 9, 3, 3, 3, // 0x30
+    2, 4, 1, 1, 0, 0, 2, 2, // 0x38
+    7, 2, 15, 1, 4, 8, 4, // 0x40
+];
+
+/// Width in halfwords of each `0x2F` `OVERLAY_EXT` sub-opcode `0x00..=0x3C`,
+/// from the extension dispatcher's jump table (`FUN_801D362C`, JT
+/// `0x801CE868`). Mirrors `move-vm-overlay-ext.md`.
+const MOVE_EXT_HALFWORDS: [u8; 0x3D] = [
+    16, 2, 2, 2, 3, 5, 7, 7, // 0x00
+    2, 2, 3, 3, 3, 3, 11, 2, // 0x08
+    2, 2, 8, 4, 4, 2, 2, 8, // 0x10
+    5, 8, 8, 5, 3, 3, 4, 5, // 0x18
+    5, 5, 5, 6, 8, 3, 3, 3, // 0x20
+    5, 5, 8, 6, 7, 6, 13, 3, // 0x28
+    5, 3, 3, 6, 3, 3, 4, 4, // 0x30
+    4, 4, 3, 4, 6, // 0x38
+];
+
+/// `HALT`.
+const MOVE_OP_HALT: u16 = 0x08;
+/// `WAIT` - stall the actor for the operand's frame count.
+const MOVE_OP_WAIT: u16 = 0x09;
+/// The `WAIT` operand the band's authoring tool emits where a part is finished.
+///
+/// 4095 frames is a little over a minute, which no cast or summon part is on
+/// screen for, so a part that reaches it never advances again in practice. It
+/// is not a terminator the dispatcher knows about - `WAIT` retires like any
+/// other instruction once its counter runs out - which is why the evidence for
+/// reading it as one is the band's own layout rather than the VM.
+const MOVE_WAIT_FOREVER: u16 = 0x0FFF;
+/// `LOOP_SET` / `LOOP_SET_B` - arm a counter the matching `0x19` / `0x1B` tests.
+const MOVE_OP_LOOP_SET_A: u16 = 0x18;
+const MOVE_OP_LOOP_SET_B: u16 = 0x1A;
+/// `LOOP_BACK` / `LOOP_BACK_B`.
+const MOVE_OP_LOOP_BACK_A: u16 = 0x19;
+const MOVE_OP_LOOP_BACK_B: u16 = 0x1B;
+/// The counter bit that makes a `LOOP_BACK` unconditional - the branch is taken
+/// forever and the program never advances past it.
+const MOVE_LOOP_FOREVER: u16 = 0x4000;
+/// Highest move-VM opcode; the dispatcher rejects anything above it.
+const MOVE_OP_MAX: u16 = 0x46;
+/// One past the highest `0x2F` sub-opcode.
+const MOVE_EXT_MAX: u16 = 0x3D;
+/// Guard on a walk that neither terminates nor advances off the end.
+const MOVE_WALK_MAX_STEPS: usize = 4096;
+
+/// How a move-VM program walk ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgramEnd {
+    /// `0x08` `HALT`. The payload is the word-aligned byte offset one past it.
+    Halt(usize),
+    /// An armed `0x19` / `0x1B` idle loop. Same payload.
+    IdleLoop(usize),
+    /// A `0x09` `WAIT` carrying [`MOVE_WAIT_FOREVER`]. Same payload.
+    WaitForever(usize),
+    /// The walk ran into a halfword that is not a dispatchable opcode, or off
+    /// the end of the buffer, without meeting a terminator. The payload is the
+    /// offset it stopped at, which bounds nothing.
+    Unterminated(usize),
+}
+
+impl ProgramEnd {
+    /// The word-aligned end offset, for the two terminating outcomes.
+    pub fn bounded(self) -> Option<usize> {
+        match self {
+            ProgramEnd::Halt(e) | ProgramEnd::IdleLoop(e) | ProgramEnd::WaitForever(e) => Some(e),
+            ProgramEnd::Unterminated(_) => None,
+        }
+    }
+}
+
+fn rd_u16(b: &[u8], o: usize) -> Option<u16> {
+    (o + 2 <= b.len()).then(|| u16::from_le_bytes([b[o], b[o + 1]]))
+}
+
+/// Walk the move-VM program that starts at byte offset `start`, returning where
+/// it ends.
+///
+/// This is a **static** walk: `0x19` / `0x1B` with the loop bit clear retire
+/// with width 1 rather than branching, and no `0x18` target is followed, so the
+/// walk is a width sum over the instruction stream rather than an execution.
+/// The one place control flow matters is the armed idle loop, which is a
+/// terminator precisely because its branch is unconditional.
+pub fn move_program_end(bytes: &[u8], start: usize) -> ProgramEnd {
+    move_program_visit(bytes, start, |_, _| {})
+}
+
+/// [`move_program_end`]'s walk, calling `visit(pc, op)` at every instruction
+/// boundary it steps over (the terminator included) - the static instruction
+/// stream a census reads operands off, with the same widths and the same
+/// stopping rules.
+pub fn move_program_visit(
+    bytes: &[u8],
+    start: usize,
+    mut visit: impl FnMut(usize, u16),
+) -> ProgramEnd {
+    let mut pc = start;
+    let mut loop_a = 0u16;
+    let mut loop_b = 0u16;
+    let mut last_forever_wait: Option<usize> = None;
+    // Where forward conditional branches land ([`ext_branch_target`]). A `HALT`
+    // or idle loop below one is the fall-through side of a branch, not the end
+    // of the program: the taken side jumps over it into code the walk must
+    // still cover.
+    let mut targets: Vec<usize> = Vec::new();
+    let stalled = |pc: usize, wait: Option<usize>| match wait {
+        Some(w) => ProgramEnd::WaitForever(align4(w + 4)),
+        None => ProgramEnd::Unterminated(pc),
+    };
+    for _ in 0..MOVE_WALK_MAX_STEPS {
+        let Some(op) = rd_u16(bytes, pc) else {
+            return stalled(pc, last_forever_wait);
+        };
+        if op > MOVE_OP_MAX {
+            return stalled(pc, last_forever_wait);
+        }
+        visit(pc, op);
+        let arg = |i: usize| rd_u16(bytes, pc + i * 2).unwrap_or(0);
+        if op == 0x2F
+            && let Some(t) = ext_branch_target(pc, arg(1), &arg)
+        {
+            targets.push(t);
+        }
+        // A `HALT` some branch above jumps past is the fall-through side, not
+        // the end: resume at the nearest pending target beyond it.
+        let next_target = targets.iter().copied().filter(|&t| t > pc).min();
+        if let (MOVE_OP_HALT, Some(t)) = (op, next_target) {
+            pc = t;
+            continue;
+        }
+        match op {
+            MOVE_OP_HALT => return ProgramEnd::Halt(align4(pc + 2)),
+            MOVE_OP_LOOP_SET_A => loop_a = arg(1),
+            MOVE_OP_LOOP_SET_B => loop_b = arg(1),
+            // An armed idle loop ends the program - UNLESS the author emitted
+            // the record's `HALT` right behind it, which most of them do. The
+            // `HALT` is then the end and the loop is one halfword of body
+            // before it; taking the loop instead lands 4 bytes short.
+            MOVE_OP_LOOP_BACK_A | MOVE_OP_LOOP_BACK_B
+                if armed_idle_loop(op, loop_a, loop_b)
+                    && rd_u16(bytes, pc + 2) != Some(MOVE_OP_HALT)
+                    && next_target.is_none() =>
+            {
+                return ProgramEnd::IdleLoop(align4(pc + 2));
+            }
+            // A `WAIT` long enough that nothing runs after it. Remembered, not
+            // returned: the band emits this operand mid-program too, and
+            // ending there costs 48 of the extents the `HALT` rule reproduces
+            // exactly. It is only a bound where the walk has no other one.
+            MOVE_OP_WAIT if arg(1) == MOVE_WAIT_FOREVER => last_forever_wait = Some(pc),
+            _ => {}
+        }
+        let halfwords = match op {
+            // `KEYFRAME_LOAD`: a 3-halfword header then `count` 3-halfword
+            // lanes, `count` in the header's second operand.
+            0x0A => 3 + 3 * usize::from(arg(2)),
+            // `OVERLAY_EXT`: the sub-op at +1 carries the width.
+            0x2F => {
+                let sub = arg(1);
+                if sub >= MOVE_EXT_MAX {
+                    return stalled(pc, last_forever_wait);
+                }
+                usize::from(MOVE_EXT_HALFWORDS[sub as usize])
+            }
+            // `SCRATCH_WRITE` / anim interpolate: `count` 6-halfword slots.
+            0x3C => 2 + 6 * (arg(1) as i16).max(0) as usize,
+            0x3D => 3 + 6 * (arg(2) as i16).max(0) as usize,
+            _ => usize::from(MOVE_OP_HALFWORDS[op as usize]),
+        };
+        if halfwords == 0 {
+            // `0x0B` - the dispatcher's default break sets no width, so the PC
+            // does not move. Statically that is a stall, not an end.
+            return stalled(pc, last_forever_wait);
+        }
+        pc += halfwords * 2;
+    }
+    stalled(pc, last_forever_wait)
+}
+
+/// Byte offset a `0x2F` conditional-branch sub-op at `pc` lands on when taken,
+/// for a forward displacement; `None` for any other sub-op or a backward
+/// (spin-wait) displacement.
+///
+/// The ten branch arms share the tail at `0x801D4830`: the taken side returns
+/// the fall-through width plus a signed displacement from an operand word
+/// (`move-vm-overlay-ext.md`, the ten conditional-branch arms) - `op[6]` on
+/// `0x06` / `0x07` (base 7), `op[2]` on `0x0A` / `0x0B` (base 3), `op[3]` on
+/// `0x13` / `0x14` and `0x36..=0x39` (base 4).
+fn ext_branch_target(pc: usize, sub: u16, arg: &dyn Fn(usize) -> u16) -> Option<usize> {
+    let (base, delta) = match sub {
+        0x06 | 0x07 => (7, arg(6)),
+        0x0A | 0x0B => (3, arg(2)),
+        0x13 | 0x14 | 0x36..=0x39 => (4, arg(3)),
+        _ => return None,
+    };
+    let delta = delta as i16;
+    (delta > 0).then(|| pc + (base + delta as usize) * 2)
+}
+
+fn align4(x: usize) -> usize {
+    (x + 3) & !3
+}
+
+/// `true` when `op` is a `LOOP_BACK` whose paired counter carries the
+/// unconditional-branch bit, so the VM never advances past it.
+fn armed_idle_loop(op: u16, loop_a: u16, loop_b: u16) -> bool {
+    let counter = match op {
+        MOVE_OP_LOOP_BACK_A => loop_a,
+        MOVE_OP_LOOP_BACK_B => loop_b,
+        _ => return false,
+    };
+    counter & MOVE_LOOP_FOREVER != 0
+}
+
+/// `true` when the eight bytes at `p` are zero - the module's padding between
+/// its last record and whatever the packer's buffer left above it, never a
+/// record.
+///
+/// A zero header is a legal `[model_sel 0][reserved 0]` and a zero halfword is
+/// a legal opcode `0x00`, so the chain would otherwise walk the padding as a
+/// four-halfword record and run on into the inherited tail. The evidence is the
+/// band's own pointers: no pointer-credited record on the disc opens with eight
+/// zero bytes, and every chained one that did sat in that gap. PROT 0944 is the
+/// worked case - its top record ends at `0x1988`, the padding runs to `0x199C`,
+/// and from there the bytes are PROT 0942's records at the same file offsets.
+fn is_record_padding(bytes: &[u8], p: usize) -> bool {
+    bytes
+        .get(p..p + 8)
+        .is_some_and(|w| w.iter().all(|&b| b == 0))
+}
+
+/// `true` when `sel` is a value `FUN_80021B04` dispatches on.
+pub fn dispatchable_model_sel(sel: i16) -> bool {
+    sel == crate::summon_overlay::MODEL_SEL_TRANSFORM_NODE
+        || (0..LIBRARY_MESH_SEL_MAX).contains(&sel)
+        || sel == RENDER_NODE_MODE_A
+        || sel == RENDER_NODE_MODE_B
+}
+
+/// Walk one slot-B image at the band's own link base.
+pub fn parse(bytes: &[u8]) -> SlotBLayout {
+    parse_at(bytes, SLOT_B_LINK_BASE)
+}
+
+/// Walk one slot-B image at an explicit link base.
+///
+/// `bytes` must be exactly one PROT entry
+/// (`legaia_prot::archive::Archive::read_entry`). A window that over-reads into
+/// the next entry resolves record pointers that belong to the neighbour's own
+/// load at the shared base.
+pub fn parse_at(bytes: &[u8], link_base: u32) -> SlotBLayout {
+    parse_with_tail(bytes, link_base, None)
+}
+
+/// Structural end of this image's **own** content, in file bytes.
+///
+/// The top of the spawn-record chain when the image has records, and the end of
+/// the frame-matched code partition otherwise. Everything above is either the
+/// module's trailing padding or a longer image's residue - and this is the
+/// figure that decides which of two equal-extent siblings owns a shared suffix
+/// (`scripts/ghidra-analysis/inherited_tail.py`).
+///
+/// It is deliberately *not* the frame partition alone: a donor's whole function
+/// can sit in the tail and frame-match there, so on PROT 0949 the code
+/// partition reaches `0x1B8C` while the image's own content stops at `0x1828`.
+///
+/// This walks whatever slice it is handed, and the slice matters: over a whole
+/// image the chain runs on into the donor's residue and the figure overshoots.
+/// Measured over the band, handing it the uncut image moves the figure on **10
+/// of 83** images (PROT 0908 / 0910 / 0919 / 0920 / 0932 / 0943 / 0960 / 0961,
+/// plus the slot-A pair 0974 / 0980, whose figure is the frame partition rather
+/// than a record chain). On five of those - 0908 / 0910 / 0920 / 0943 / 0961 -
+/// the overshoot also credits a spawn pointer that belongs to the donor.
+///
+/// The cut and this measurement are mutually recursive, so the band-level
+/// caller iterates them rather than taking the first estimate: see
+/// `scripts/ghidra-analysis/inherited_tail.py`'s `tail_starts_fixpoint`, and
+/// `crates/overlay-images/tests/slot_b_record_bounds_real.rs` for the same loop on this
+/// side. It settles in two rounds and moves no tail cut - the asymmetry this
+/// comment used to argue for (an overshoot can only make an image look less
+/// like a recipient, never invent a tail) is now measured rather than asserted.
+pub fn content_end(bytes: &[u8], link_base: u32) -> usize {
+    let layout = parse_at(bytes, link_base);
+    let chained = layout.chained_records.last().map(|r| r.end);
+    let credited = layout.records.last().map(|r| r.end);
+    chained
+        .or(credited)
+        .or(layout.unbounded_record)
+        .unwrap_or_else(|| layout.code_end())
+}
+
+/// Walk one slot-B image, dropping everything at or above `tail_start`.
+///
+/// `tail_start` is the file offset at which the image stops being its own
+/// content. A spawn call site there belongs to the donor whose bytes those are,
+/// and so does the record pointer it forms - see the module docs. `None` runs
+/// the parse with no tail known, which is what [`parse_at`] does.
+pub fn parse_with_tail(bytes: &[u8], link_base: u32, tail_start: Option<usize>) -> SlotBLayout {
+    let limit = tail_start.unwrap_or(bytes.len()).min(bytes.len());
+    let functions = framed_functions(bytes);
+    let head_table = head_table(bytes, link_base, &functions);
+
+    let spawn = jal_word(SPAWN_HELPER);
+    let pooled = jal_word(POOL_SPAWN_HELPER);
+    let mut spawn_sites = 0usize;
+    let mut offsets: Vec<usize> = Vec::new();
+    let mut o = 0usize;
+    while o + 4 <= limit {
+        let w = rd_u32(bytes, o);
+        if w == spawn || w == pooled {
+            spawn_sites += 1;
+            // The call must be one this image's own code issues. A call word
+            // outside every framed body here is an inherited fragment of a
+            // sibling module's routine (a band image's tail is a same-offset
+            // copy of another image's bytes), and the pointer it forms belongs
+            // to that sibling's load, not to this image.
+            let own_call = functions.iter().any(|f| f.start <= o && o < f.end);
+            if own_call {
+                let own =
+                    |x: usize| x < limit && functions.iter().any(|f| f.start <= x && x < f.end);
+                for a2 in a2_values(&bytes[..limit], link_base, o, &own) {
+                    let f = a2.wrapping_sub(link_base) as usize;
+                    if f + 4 <= limit
+                        && !functions.iter().any(|fun| fun.start <= f && f < fun.end)
+                        && dispatchable_model_sel(i16::from_le_bytes([bytes[f], bytes[f + 1]]))
+                    {
+                        offsets.push(f);
+                    }
+                }
+            }
+        }
+        o += 4;
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+
+    // Boundaries a record can end at: the next record, or the next framed
+    // function's prologue. The image's own content end closes the set so the
+    // arithmetic is total.
+    let mut bounds: Vec<usize> = offsets.clone();
+    bounds.extend(functions.iter().map(|f| f.start).filter(|&s| s <= limit));
+    bounds.push(limit);
+    bounds.sort_unstable();
+    bounds.dedup();
+
+    let span_at = |f: usize, end: usize| RecordSpan {
+        start: f,
+        end,
+        model_sel: i16::from_le_bytes([bytes[f], bytes[f + 1]]),
+        reserved: u16::from_le_bytes([bytes[f + 2], bytes[f + 3]]),
+    };
+
+    let mut records = Vec::new();
+    let mut chained = Vec::new();
+    let mut unbounded = None;
+    for (i, &f) in offsets.iter().enumerate() {
+        let next_bound = bounds.iter().find(|&&x| x > f).copied();
+        if i + 1 < offsets.len() {
+            // Bounded below the top: the next consumer pointer (or the next
+            // function, whichever comes first) closes it.
+            if let Some(end) = next_bound {
+                records.push(span_at(f, end));
+            }
+            continue;
+        }
+        // The top record. Nothing above computes an address, so its end comes
+        // from its own program - and the chain above it keeps going while the
+        // bytes keep reading as `[header][program]`.
+        let cap = next_bound.unwrap_or(limit);
+        match move_program_end(bytes, f + 4).bounded() {
+            Some(end) if end > f && end <= cap => {
+                records.push(span_at(f, end));
+                let mut p = end;
+                while p + 4 <= cap
+                    && !is_record_padding(bytes, p)
+                    && dispatchable_model_sel(i16::from_le_bytes([bytes[p], bytes[p + 1]]))
+                {
+                    match move_program_end(bytes, p + 4).bounded() {
+                        Some(q) if q > p && q <= cap => {
+                            chained.push(span_at(p, q));
+                            p = q;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            _ => unbounded = Some(f),
+        }
+    }
+
+    SlotBLayout {
+        link_base,
+        head_table,
+        functions,
+        spawn_sites,
+        unbounded_record: unbounded,
+        record_offsets: offsets,
+        records,
+        chained_records: chained,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hw(words: &[u16]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// A `HALT` on the fall-through side of a forward ext branch is not the
+    /// end: `urudre1`'s record 14 shape - `2F 37 0086 0001` skips one halfword
+    /// (the `HALT`) on the taken side, and the program runs on to its own.
+    #[test]
+    fn a_halt_a_branch_jumps_is_not_the_program_end() {
+        let b = hw(&[0x2F, 0x37, 0x86, 0x01, 0x08, 0x15, 0x80, 0x08]);
+        assert_eq!(move_program_end(&b, 0), ProgramEnd::Halt(16));
+        // A backward displacement (the spin-wait idiom) extends nothing.
+        let b = hw(&[0x2F, 0x36, 0x76, 0xFFFA, 0x08, 0x15, 0x80, 0x08]);
+        assert_eq!(move_program_end(&b, 0), ProgramEnd::Halt(12));
+    }
+
+    fn w(out: &mut Vec<u8>, word: u32) {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+
+    fn word_of(b: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes(b[off..off + 4].try_into().unwrap())
+    }
+
+    /// A synthetic image: one framed function that spawns two records, then
+    /// the two records at the tail.
+    fn synthetic() -> Vec<u8> {
+        let mut b: Vec<u8> = Vec::new();
+        // 0x00 addiu sp,sp,-0x18
+        w(&mut b, 0x27BD_0000 | 0xFFE8);
+        // 0x04 lui a2, 0x801f ; 0x08 addiu a2,a2,0x6a58 (= base + 0x80)
+        w(&mut b, 0x3C06_801F);
+        w(&mut b, 0x24C6_6A58);
+        // 0x0c jal FUN_80021B04
+        w(&mut b, jal_word(SPAWN_HELPER));
+        w(&mut b, 0); // delay slot
+        // 0x14 lui a2, 0x801f ; 0x18 addiu a2,a2,0x6a78 (= base + 0xa0)
+        w(&mut b, 0x3C06_801F);
+        w(&mut b, 0x24C6_6A78);
+        // 0x1c jal FUN_80050ED4
+        w(&mut b, jal_word(POOL_SPAWN_HELPER));
+        w(&mut b, 0);
+        // 0x24 jr ra ; 0x28 addiu sp,sp,0x18
+        w(&mut b, MIPS_JR_RA);
+        w(&mut b, 0x27BD_0018);
+        while b.len() < 0xC0 {
+            b.push(0);
+        }
+        // record A at 0x80: model_sel -1, reserved 0
+        b[0x80] = 0xFF;
+        b[0x81] = 0xFF;
+        // record B at 0xa0: model_sel 3
+        b[0xA0] = 0x03;
+        b
+    }
+
+    #[test]
+    fn frame_matching_finds_the_one_body() {
+        let img = synthetic();
+        let fns = framed_functions(&img);
+        assert_eq!(fns.len(), 1);
+        assert_eq!(fns[0].start, 0);
+        assert_eq!(fns[0].end, 0x2C);
+        assert_eq!(fns[0].frame, 0x18);
+    }
+
+    #[test]
+    fn records_are_bounded_by_the_next_pointer() {
+        let img = synthetic();
+        let l = parse(&img);
+        assert_eq!(l.spawn_sites, 2);
+        assert_eq!(l.record_offsets, vec![0x80, 0xA0]);
+        // The highest record is reported, not claimed.
+        assert_eq!(l.unbounded_record, Some(0xA0));
+        assert_eq!(l.records.len(), 1);
+        assert_eq!(l.records[0].start, 0x80);
+        assert_eq!(l.records[0].end, 0xA0);
+        assert_eq!(l.records[0].model_sel, -1);
+    }
+
+    #[test]
+    fn a_pointer_inside_a_function_is_dropped() {
+        let mut img = synthetic();
+        // Re-aim the first spawn at file 0x10, inside the framed body.
+        img[0x08..0x0C].copy_from_slice(&0x24C6_69E8u32.to_le_bytes());
+        let l = parse(&img);
+        assert_eq!(l.spawn_sites, 2);
+        assert_eq!(l.record_offsets, vec![0xA0]);
+        assert!(l.records.is_empty());
+    }
+
+    #[test]
+    fn an_intervening_call_voids_the_pointer() {
+        let mut img = synthetic();
+        // Slip an unrelated `jal` between the second pair and its consuming
+        // call, overwriting the first call's delay slot with the pair's own
+        // `lui` is not needed - the second pair is at 0x14/0x18, so putting a
+        // call at 0x10 leaves the pair intact but a call at 0x1C would be the
+        // consumer itself. Use the delay slot at 0x20 instead: move the pooled
+        // call one word later and put the stray `jal` where it was.
+        let pooled = word_of(&img, 0x1C);
+        img[0x1C..0x20].copy_from_slice(&jal_word(0x8001_0000).to_le_bytes());
+        img[0x20..0x24].copy_from_slice(&pooled.to_le_bytes());
+        let l = parse(&img);
+        // Site 0x20's `$a2` was formed before the stray call at 0x1C, so it is
+        // not credited; the first record still is.
+        assert_eq!(l.spawn_sites, 2);
+        assert_eq!(l.record_offsets, vec![0x80]);
+    }
+
+    /// The spawn record pointer staged the two ways retail does beyond a
+    /// plain pair: completed in the call's delay slot, and parked in a saved
+    /// register across an unrelated call and handed over with `move a2,s0`.
+    #[test]
+    fn a_delay_slot_and_a_saved_register_copy_both_resolve() {
+        let mut b: Vec<u8> = Vec::new();
+        w(&mut b, 0x27BD_FFE8); // 0x00 addiu sp,sp,-0x18
+        w(&mut b, 0x3C10_801F); // 0x04 lui s0,0x801f
+        w(&mut b, 0x2610_6A78); // 0x08 addiu s0,s0,0x6a78 (= base + 0xa0)
+        w(&mut b, 0x3C06_801F); // 0x0c lui a2,0x801f
+        w(&mut b, jal_word(SPAWN_HELPER)); // 0x10
+        w(&mut b, 0x24C6_6A58); // 0x14 addiu a2,a2,0x6a58 (delay slot, = base + 0x80)
+        w(&mut b, jal_word(0x8001_0000)); // 0x18 an unrelated call
+        w(&mut b, 0);
+        w(&mut b, 0x0200_3021); // 0x20 move a2,s0
+        w(&mut b, jal_word(POOL_SPAWN_HELPER)); // 0x24
+        w(&mut b, 0);
+        w(&mut b, MIPS_JR_RA);
+        w(&mut b, 0x27BD_0018);
+        b.resize(0xC0, 0);
+        b[0x80] = 0xFF;
+        b[0x81] = 0xFF;
+        b[0xA0] = 0x03;
+        let l = parse(&b);
+        assert_eq!(l.spawn_sites, 2);
+        assert_eq!(l.record_offsets, vec![0x80, 0xA0]);
+    }
+
+    /// A `switch` arm that loads `$a2` in the delay slot of a `j` to a shared
+    /// call is followed from that delay slot; the fall-through walk stops at
+    /// the arm, whose value is not the fall-through path's.
+    #[test]
+    fn a_switch_arm_into_a_shared_call_resolves_from_its_delay_slot() {
+        let mut b: Vec<u8> = Vec::new();
+        w(&mut b, 0x27BD_FFE8); // 0x00 addiu sp,sp,-0x18
+        w(&mut b, 0x3C06_801F); // 0x04 lui a2,0x801f
+        w(&mut b, 0x1480_0003); // 0x08 bnez a0,0x18
+        w(&mut b, 0);
+        let j_to_call = 0x0800_0000 | (((SLOT_B_LINK_BASE + 0x20) >> 2) & 0x03FF_FFFF);
+        w(&mut b, j_to_call); // 0x10 j 0x20
+        w(&mut b, 0x24C6_6A58); // 0x14 addiu a2,a2,0x6a58 (= base + 0x80)
+        w(&mut b, 0x24C6_6A78); // 0x18 addiu a2,a2,0x6a78 (branch path only)
+        w(&mut b, 0);
+        w(&mut b, jal_word(SPAWN_HELPER)); // 0x20
+        w(&mut b, 0);
+        w(&mut b, MIPS_JR_RA);
+        w(&mut b, 0x27BD_0018);
+        b.resize(0xC0, 0);
+        b[0x80] = 0xFF;
+        b[0x81] = 0xFF;
+        let l = parse(&b);
+        assert_eq!(l.record_offsets, vec![0x80]);
+    }
+
+    #[test]
+    fn a_call_outside_every_framed_body_names_nothing() {
+        // The inherited-tail shape: a sibling module's spawn call, copied into
+        // this image's build buffer past the end of its own code, forms a real
+        // pointer that belongs to the sibling's load.
+        let mut img = synthetic();
+        let at = img.len();
+        assert_eq!(at, 0xC0);
+        let mut tail: Vec<u8> = Vec::new();
+        w(&mut tail, 0x3C06_801F);
+        w(&mut tail, 0x24C6_6AB8); // = base + 0xE0, a real record below
+        w(&mut tail, jal_word(SPAWN_HELPER));
+        w(&mut tail, 0);
+        img.extend_from_slice(&tail);
+        img.resize(at + 0x40, 0);
+        img[at + 0x20] = 0xFF; // model_sel -1 at 0xE0
+        img[at + 0x21] = 0xFF;
+        let l = parse(&img);
+        assert_eq!(l.spawn_sites, 3);
+        // Only the two calls inside the framed body name records.
+        assert_eq!(l.record_offsets, vec![0x80, 0xA0]);
+    }
+
+    #[test]
+    fn a_head_va_table_is_bounded_by_the_first_prologue() {
+        let mut b: Vec<u8> = Vec::new();
+        w(&mut b, SLOT_B_LINK_BASE + 0x10);
+        w(&mut b, SLOT_B_LINK_BASE + 0x20);
+        w(&mut b, 0x27BD_0000 | 0xFFE8);
+        w(&mut b, MIPS_JR_RA);
+        w(&mut b, 0x27BD_0018);
+        while b.len() < 0x40 {
+            b.push(0);
+        }
+        let l = parse(&b);
+        // The run stops at the prologue, not at the first non-VA word.
+        assert_eq!(l.head_table, Some(0..8));
+        assert_eq!(l.functions.len(), 1);
+        assert_eq!(l.functions[0].start, 8);
+    }
+
+    #[test]
+    fn band_membership_is_the_dispatcher_band() {
+        assert!(is_slot_b_module(903));
+        assert!(is_slot_b_module(966));
+        assert!(!is_slot_b_module(902));
+        assert!(!is_slot_b_module(967));
+    }
+}

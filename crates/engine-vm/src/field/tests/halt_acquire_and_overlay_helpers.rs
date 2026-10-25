@@ -1,0 +1,718 @@
+//! 0x43 sub-0/1/A/B halt-acquire plus the overlay-helper-driven 0x4C sub-ops.
+
+use super::*;
+
+// -- 0x43 sub-0/1/A/B halt-acquire ----------------------------------
+
+#[test]
+fn op_43_sub_0_halt_acquire_yields_to_the_next_instruction() {
+    // `[43, 0, x, z, s16, s16]` - eight bytes. The two `s16`s are the walk
+    // dispatcher's arguments (retail `FUN_801D25EC` `a2` / `a3`), NOT a resume
+    // PC: the arm exits `j 0x801E3624` with `addiu s8, s8, 8`
+    // (`overlay_0897` `0x801DF5B4`), so the acquire falls through and the
+    // context stops on its halt bit rather than on a moved PC. A `0x0100` in
+    // the first `s16` must therefore NOT send the PC to `0x100`.
+    let bytecode = [0x43u8, 0x00, 0x10, 0x20, 0x00, 0x01, 0x00, 0x00];
+    let mut host = TestHost {
+        halt_acquire_predicate: true,
+        ..TestHost::default()
+    };
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Yield { resume_pc: 8 });
+    assert!(ctx.is_halted());
+    assert_eq!(ctx.saved_pc, 0);
+    assert_eq!(host.halt_acquire_calls.len(), 1);
+    assert_eq!(host.halt_acquire_calls[0].0, 0u8);
+    assert_eq!(host.halt_acquire_calls[0].1, 8);
+}
+
+#[test]
+fn op_43_sub_a_halt_acquire_negates_the_offset_7_s16_into_y() {
+    // `[43, 0xA, x, z, s16, s16, s16]` - ten bytes; the `+7` halfword is the
+    // target's **Y**, negated (`overlay_0897` `0x801DF524..0x801DF530`).
+    let bytecode = [0x43u8, 0x0A, 0x10, 0x20, 0, 0, 0, 0, 0x34, 0x12];
+    let mut host = TestHost {
+        halt_acquire_predicate: true,
+        ..TestHost::default()
+    };
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Yield { resume_pc: 10 });
+    assert!(ctx.is_halted());
+    assert_eq!(
+        host.halt_acquire_calls[0].1, 10,
+        "resume is the fall-through"
+    );
+    assert_eq!(
+        host.halt_acquire_calls[0].2[1], -0x1234,
+        "the +7 s16 is the negated Y, not a jump target"
+    );
+}
+
+// A refused acquire leaves the PC on the instruction: `beqz v0, 0x801DEE4C`
+// at `0x801DF410`, and `0x801DEE4C` is `move s8, s4` - the invocation's own
+// PC - before the shared return. The instruction is retried next frame; it is
+// never skipped.
+#[test]
+fn op_43_sub_0_predicate_false_stays_on_the_instruction() {
+    let bytecode = [0x43u8, 0x00, 0, 0, 0, 0, 0, 0];
+    let mut host = TestHost {
+        halt_acquire_predicate: false,
+        ..TestHost::default()
+    };
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Halt { final_pc: 0 });
+    assert!(!ctx.is_halted());
+    assert!(host.halt_acquire_calls.is_empty());
+}
+
+#[test]
+fn op_43_sub_b_predicate_false_stays_on_the_instruction() {
+    let bytecode = [0x43u8, 0x0B, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut host = TestHost {
+        halt_acquire_predicate: false,
+        ..TestHost::default()
+    };
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Halt { final_pc: 0 });
+}
+
+#[test]
+fn op_43_waits_while_the_target_is_still_arcing() {
+    let bytecode = [0x43u8, 0x01, 0, 0, 0, 0, 0, 0];
+    let mut host = TestHost {
+        halt_acquire_predicate: true,
+        arc_target_halted: true,
+        ..TestHost::default()
+    };
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Halt { final_pc: 0 });
+    assert!(host.halt_acquire_calls.is_empty(), "no acquire, no arc");
+}
+
+// -- helper-driven sub-ops --------------------------------
+
+#[test]
+fn op_4c_n_c_sub_1_flag_loop_reset_advances_2_bytes() {
+    let bytecode = [0x4Cu8, 0xC1];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 2 });
+    assert_eq!(host.n_c_sub_1_flag_loops, 1);
+}
+
+#[test]
+fn op_4c_n_d_sub_1_advances_4_bytes_without_a_live_glide() {
+    let bytecode = [0x4Cu8, 0xD1, 0x10, 0x00];
+    let mut host = TestHost {
+        n_c_sub_d_mover_idle: true,
+        ..TestHost::default()
+    };
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 4 });
+}
+
+#[test]
+fn op_4c_n_d_sub_1_skips_relative_while_a_glide_is_live() {
+    // `0x801E2B74`: the live-mover leg reaches `LAB_801E360C`, which adds
+    // the operand halfword less two to the PC already past the op.
+    let mut bytecode = vec![0x4Cu8, 0xD1, 0x05, 0x00];
+    bytecode.extend([0x4A, 0x01, 0x00, 0x21]);
+    let mut host = TestHost {
+        n_c_sub_d_mover_idle: false,
+        ..TestHost::default()
+    };
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 7 });
+    assert_eq!(bytecode[7], 0x21, "steps over the 3-byte wait");
+}
+
+// The three arms below advance in retail: the nibble-D jump table at
+// `0x801CEFC8` sends sub-2 / sub-6 / sub-7 to `0x801E2B7C` / `0x801E2D64` /
+// `0x801E2DB4`; the first two leave through `0x801E00B8` (`addiu s8,s8,0x3`),
+// the third through its own `addiu s8,s8,0x2`.
+#[test]
+fn op_4c_n_d_sub_2_channel_spawn_advances_3() {
+    let bytecode = [0x4Cu8, 0xD2, 0xFB];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 3 });
+    assert_eq!(host.n_d_sub_2_channel_calls, vec![0xFBu8]);
+}
+
+#[test]
+fn op_4c_n_d_sub_2_back_to_back_runs_each() {
+    // `rugi` runs `4C D2 0F .. 4C D2 16` in a row: each one spawns.
+    let bytecode = [0x4Cu8, 0xD2, 0x0F, 0x4C, 0xD2, 0x10];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    assert_eq!(
+        step(&mut host, &mut ctx, &bytecode, 0),
+        StepResult::Advance { next_pc: 3 }
+    );
+    assert_eq!(
+        step(&mut host, &mut ctx, &bytecode, 3),
+        StepResult::Advance { next_pc: 6 }
+    );
+    assert_eq!(host.n_d_sub_2_channel_calls, vec![0x0Fu8, 0x10]);
+}
+
+#[test]
+fn op_4c_n_d_sub_6_field74_advances_3() {
+    let bytecode = [0x4Cu8, 0xD6, 0x03];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 3 });
+    assert_eq!(ctx.field_74 >> 24, 0x83);
+}
+
+#[test]
+fn op_4c_n_d_sub_7_register_list_walk_advances_2() {
+    let bytecode = [0x4Cu8, 0xD7];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 2 });
+    assert_eq!(host.n_d_sub_7_list_walk_regs, 1);
+}
+
+#[test]
+fn op_4c_n_d_sub_b_e57f0_advances_13_bytes() {
+    // 13 total bytes: opcode + sub-op + 11 payload.
+    let mut bytecode = vec![0x4Cu8, 0xDB];
+    bytecode.extend_from_slice(&[
+        0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0x33, 0x44, 0x55,
+    ]);
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 13 });
+    assert_eq!(host.n_d_sub_b_e57f0_calls.len(), 1);
+    // 12-byte slice starting from the 0xDB sub-op byte.
+    assert_eq!(host.n_d_sub_b_e57f0_calls[0].len(), 12);
+    assert_eq!(host.n_d_sub_b_e57f0_calls[0][0], 0xDB);
+    assert_eq!(host.n_d_sub_b_e57f0_calls[0][11], 0x55);
+}
+
+#[test]
+fn op_4c_n_d_sub_b_truncated_buffer_returns_unknown() {
+    // 12 bytes only - sub-B needs 13.
+    let bytecode = [0x4Cu8, 0xDB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert!(matches!(
+        r,
+        StepResult::Unknown {
+            opcode: 0x4C,
+            pc: 0
+        }
+    ));
+    assert!(host.n_d_sub_b_e57f0_calls.is_empty());
+}
+
+#[test]
+fn op_4c_n_d_sub_c_miss_advances_5_bytes() {
+    let bytecode = [0x4Cu8, 0xDC, 0x42, 0x05, 0x00];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 5 });
+    assert_eq!(*host.n_d_sub_c_calls.borrow(), vec![0x42u8]);
+}
+
+#[test]
+fn op_4c_n_d_sub_c_hit_skips_relative_to_the_instruction_end() {
+    // `koin2` P1[8] at `+0xCE`: `4C DC B2 27 00`, then the "(Silence)"
+    // line. A hit lands on the Soru Bread branch at `+0xF8`: the exit
+    // `LAB_801E360C` adds the halfword less two to `s8`, already past the
+    // instruction (`pc + 5 + 0x27 - 2`).
+    let mut bytecode = vec![0u8; 0x100];
+    bytecode[0xCE..0xD3].copy_from_slice(&[0x4C, 0xDC, 0xB2, 0x27, 0x00]);
+    let mut host = TestHost {
+        n_d_sub_c_hit: true,
+        ..TestHost::default()
+    };
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0xCE);
+    assert_eq!(r, StepResult::Advance { next_pc: 0xF8 });
+    assert_eq!(*host.n_d_sub_c_calls.borrow(), vec![0xB2u8]);
+}
+
+#[test]
+fn op_4c_n_d_sub_c_hit_skips_the_following_jump() {
+    // `town0b` P1[39]: `4C DC 43 05 00` then a 3-byte `JmpRel`; a hit
+    // steps over the jump (`pc + 5 + 5 - 2`).
+    let bytecode = [0x4Cu8, 0xDC, 0x43, 0x05, 0x00, 0x26, 0x10, 0x00, 0x21];
+    let mut host = TestHost {
+        n_d_sub_c_hit: true,
+        ..TestHost::default()
+    };
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 8 });
+}
+
+#[test]
+fn op_4c_n_d_sub_e_asks_the_worn_question_only() {
+    let bytecode = [0x4Cu8, 0xDE, 0x99, 0x05, 0x00];
+    let mut host = TestHost {
+        n_d_sub_c_hit: true,
+        ..TestHost::default()
+    };
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 5 });
+    assert_eq!(*host.n_d_sub_e_calls.borrow(), vec![0x99u8]);
+    assert!(host.n_d_sub_c_calls.borrow().is_empty());
+    host.n_d_sub_e_hit = true;
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 8 });
+}
+
+#[test]
+fn op_4c_n_e_sub_1_text_actor_zero_first_byte_skips_spawn() {
+    // First byte 0 → no spawn; PC still advances by 3 (0 has no payload).
+    // packet_length([0]) = 0 → advance by 3 + 0 = 3.
+    let bytecode = [0x4Cu8, 0xE1, 0x00];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 3 });
+    // No spawn because first byte is 0.
+    assert!(host.n_e_sub_1_text_calls.is_empty());
+}
+
+#[test]
+fn op_4c_n_e_sub_1_text_actor_short_string_advances_correctly() {
+    // [4C, E1, 'A', 'B', 'C', 0] - packet length 3, total advance 6.
+    let bytecode = [0x4Cu8, 0xE1, b'A', b'B', b'C', 0x00];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx {
+        script_id: 0x42,
+        ..FieldCtx::default()
+    };
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 6 });
+    assert_eq!(host.n_e_sub_1_text_calls.len(), 1);
+    assert_eq!(host.n_e_sub_1_text_calls[0].0, vec![b'A', b'B', b'C']);
+    assert_eq!(host.n_e_sub_1_text_calls[0].1, 0x42);
+}
+
+#[test]
+fn op_4c_n_e_sub_1_text_actor_with_escape_sequences() {
+    // [4C, E1, 'A', 0xC1, 0xAB, 'B', 0] - escape pair counts as 2,
+    // total packet length = 4, total advance = 7.
+    let bytecode = [0x4Cu8, 0xE1, b'A', 0xC1, 0xAB, b'B', 0x00];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 7 });
+    assert_eq!(host.n_e_sub_1_text_calls[0].0.len(), 4);
+}
+
+#[test]
+fn op_4c_n_e_sub_1_text_actor_truncated_returns_unknown() {
+    let bytecode = [0x4Cu8, 0xE1]; // first byte missing
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert!(matches!(
+        r,
+        StepResult::Unknown {
+            opcode: 0x4C,
+            pc: 0
+        }
+    ));
+    assert!(host.n_e_sub_1_text_calls.is_empty());
+}
+
+// -----------------------------------------------------------------
+// Five 0x4C nC sub-ops + two 0x4C nE sub-ops.
+// -----------------------------------------------------------------
+
+#[test]
+fn op_4c_n_c_sub_0_phase_draw_advances_2_bytes() {
+    let bytecode = [0x4Cu8, 0xC0];
+    let mut host = TestHost {
+        n_c_sub_0_active: true,
+        ..TestHost::default()
+    };
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 2 });
+    assert_eq!(host.n_c_sub_0_phase_draws, 1);
+}
+
+#[test]
+fn op_4c_n_c_sub_0_phase_draw_advances_2_bytes_when_inactive() {
+    // Even when the host returns false (no active move), PC still
+    // advances by 2 - the phase draw is conditional but the
+    // dispatcher's PC delta is constant.
+    let bytecode = [0x4Cu8, 0xC0];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 2 });
+    assert_eq!(host.n_c_sub_0_phase_draws, 1);
+}
+
+#[test]
+fn op_4c_n_c_sub_3_script_teleport_advances_2_bytes() {
+    let bytecode = [0x4Cu8, 0xC3];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 2 });
+    assert_eq!(host.n_c_sub_3_teleports, 1);
+}
+
+/// Raise system flag `idx` in the test host's MSB-first bank.
+fn raise_system_flag(host: &mut TestHost, idx: u16) {
+    host.ensure_sys_flag_capacity();
+    host.system_flags[usize::from(idx >> 3)] |= 0x80 >> (idx & 7);
+}
+
+#[test]
+fn op_4c_n_c_sub_5_waits_until_the_system_flag_is_set() {
+    // `0x801E2894`: `FUN_8003CE64(idx)` then `0x801E2A10` - a clear flag
+    // restores the entry PC, a set one advances four.
+    let bytecode = [0x4Cu8, 0xC5, 0x0B, 0x00];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Halt { final_pc: 0 });
+    raise_system_flag(&mut host, 0x0B);
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 4 });
+}
+
+#[test]
+fn op_4c_n_c_sub_5_reads_a_16_bit_little_endian_index() {
+    let bytecode = [0x4Cu8, 0xC5, 0x34, 0x01]; // 0x0134
+    let mut host = TestHost::default();
+    raise_system_flag(&mut host, 0x0134);
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 4 });
+}
+
+#[test]
+fn op_4c_n_c_sub_6_waits_until_the_system_flag_is_clear() {
+    // `0x801E28B0` / `0x801E28C4`: the opposite polarity.
+    let bytecode = [0x4Cu8, 0xC6, 0x09, 0x00];
+    let mut host = TestHost::default();
+    raise_system_flag(&mut host, 0x09);
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Halt { final_pc: 0 });
+    host.system_flags.iter_mut().for_each(|b| *b = 0);
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 4 });
+}
+
+#[test]
+fn op_4c_n_c_sub_5_truncated_buffer_returns_unknown() {
+    // Need 3 bytes after pc; only 2 available.
+    let bytecode = [0x4Cu8, 0xC5, 0x05]; // missing high byte
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert!(matches!(
+        r,
+        StepResult::Unknown {
+            opcode: 0x4C,
+            pc: 0
+        }
+    ));
+}
+
+#[test]
+fn op_4c_n_c_sub_d_holds_while_the_camera_mover_is_live() {
+    let bytecode = [0x4Cu8, 0xCD];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Halt { final_pc: 0 });
+    assert_eq!(host.n_c_sub_d_queries, 1);
+    // No glide in flight: the op falls through past its two bytes.
+    host.n_c_sub_d_mover_idle = true;
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 2 });
+}
+
+#[test]
+fn op_4c_n_e_sub_4_bbox_inside_advances_8_bytes() {
+    // Host returns false (= "inside") → PC += 8 (retail case-4
+    // `iVar45 = param_2 + 8`; the earlier 9 was an off-by-one). The
+    // dispatcher computes a tile-center bbox and passes it to the host.
+    let bytecode = [0x4Cu8, 0xE4, 0x10, 0x10, 0x20, 0x20, 0x00, 0x00];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 8 });
+    assert_eq!(host.n_e_sub_4_bboxes.borrow().len(), 1);
+}
+
+#[test]
+fn op_4c_n_e_sub_4_bbox_outside_takes_the_relative_skip() {
+    // Outside -> the 0x801E3614 exit label: s8 = pc + 8, then + skip - 2,
+    // i.e. pc + 6 + skip (not a halt).
+    let bytecode = [0x4Cu8, 0xE4, 0x10, 0x10, 0x20, 0x20, 0x10, 0x00, 0x00];
+    let mut host = TestHost {
+        n_e_sub_4_outside: true,
+        ..TestHost::default()
+    };
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 6 + 0x10 });
+}
+
+#[test]
+fn op_4c_n_e_sub_4_bbox_corners_low_byte() {
+    // Operand byte 0x10 (high bit clear): min corner 0x800 + 0x20,
+    // max corner 0x800 + 0x60 (0x801E31D4..0x801E3208).
+    let bytecode = [0x4Cu8, 0xE4, 0x10, 0x10, 0x10, 0x10, 0x00, 0x00, 0x00];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let _ = step(&mut host, &mut ctx, &bytecode, 0);
+    let bboxes = host.n_e_sub_4_bboxes.borrow();
+    assert_eq!(bboxes.len(), 1);
+    assert_eq!(bboxes[0], [0x820, 0x820, 0x860, 0x860]);
+}
+
+#[test]
+fn op_4c_n_e_sub_4_bbox_corners_high_bit() {
+    // Operand byte 0x90: base 0x800; high bit moves min to +0x60 and max
+    // to +0xA0 (0x801E320C..0x801E3234).
+    let bytecode = [0x4Cu8, 0xE4, 0x90, 0x90, 0x90, 0x90, 0x00, 0x00, 0x00];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let _ = step(&mut host, &mut ctx, &bytecode, 0);
+    let bboxes = host.n_e_sub_4_bboxes.borrow();
+    assert_eq!(bboxes[0], [0x860, 0x860, 0x8A0, 0x8A0]);
+}
+
+#[test]
+fn op_4c_n_e_sub_4_bbox_zero_byte_is_not_special() {
+    // Retail has no b == 0 short-circuit here: byte 0 is min 0x20 / max 0x60.
+    let bytecode = [0x4Cu8, 0xE4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let _ = step(&mut host, &mut ctx, &bytecode, 0);
+    let bboxes = host.n_e_sub_4_bboxes.borrow();
+    assert_eq!(bboxes[0], [0x20, 0x20, 0x60, 0x60]);
+}
+
+#[test]
+fn op_4c_n_e_sub_4_default_host_runs_retails_test() {
+    struct Plain;
+    impl FieldFlagsHost for Plain {
+        fn global_flags(&self) -> u32 {
+            0
+        }
+
+        fn set_global_flags(&mut self, _value: u32) {}
+
+        fn frame_delta(&self) -> u16 {
+            1
+        }
+    }
+
+    impl FieldSceneHost for Plain {}
+
+    impl FieldTerrainHost for Plain {}
+
+    impl FieldCameraHost for Plain {}
+
+    impl FieldCameraMotionHost for Plain {}
+
+    impl FieldScreenHost for Plain {}
+
+    impl FieldAudioHost for Plain {}
+
+    impl FieldPartyInventoryHost for Plain {}
+
+    impl FieldDialogMenuHost for Plain {}
+
+    impl FieldActorHost for Plain {}
+
+    impl FieldActorSpawnHost for Plain {}
+
+    impl FieldActorFxHost for Plain {}
+
+    impl FieldPlayerHost for Plain {}
+
+    impl FieldHaltHost for Plain {}
+    // Box bytes 1..2 on both axes: x, z in [0xA0, 0x160].
+    let bytecode = [0x4Cu8, 0xE4, 0x01, 0x01, 0x02, 0x02, 0x04, 0x00];
+    let mut ctx = FieldCtx {
+        world_x: 0x100,
+        world_z: 0x100,
+        ..FieldCtx::default()
+    };
+    assert_eq!(
+        step(&mut Plain, &mut ctx, &bytecode, 0),
+        StepResult::Advance { next_pc: 8 }
+    );
+    ctx.world_x = 0x161;
+    assert_eq!(
+        step(&mut Plain, &mut ctx, &bytecode, 0),
+        StepResult::Advance { next_pc: 6 + 4 }
+    );
+}
+
+#[test]
+fn op_4c_n_e_sub_4_truncated_buffer_returns_unknown() {
+    let bytecode = [0x4Cu8, 0xE4, 0x10, 0x10]; // missing last 5 bytes
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert!(matches!(
+        r,
+        StepResult::Unknown {
+            opcode: 0x4C,
+            pc: 0
+        }
+    ));
+}
+
+#[test]
+fn op_4c_n_e_sub_5_add_coins_positive_value() {
+    // [4C, E5, 0xE8, 0x03, 0x00] - 0x0003E8 = 1000.
+    let bytecode = [0x4Cu8, 0xE5, 0xE8, 0x03, 0x00];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 5 });
+    assert_eq!(host.n_e_sub_5_coin_deltas, vec![1000]);
+}
+
+#[test]
+fn op_4c_n_e_sub_5_add_coins_negative_value() {
+    // 0xFFFFFE = -2 in 24-bit two's complement.
+    let bytecode = [0x4Cu8, 0xE5, 0xFE, 0xFF, 0xFF];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 5 });
+    assert_eq!(host.n_e_sub_5_coin_deltas, vec![-2]);
+}
+
+#[test]
+fn op_4c_n_e_sub_5_add_coins_zero_advances_5_bytes() {
+    let bytecode = [0x4Cu8, 0xE5, 0x00, 0x00, 0x00];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 5 });
+    assert_eq!(host.n_e_sub_5_coin_deltas, vec![0]);
+}
+
+#[test]
+fn op_4c_n_e_sub_5_truncated_buffer_returns_unknown() {
+    let bytecode = [0x4Cu8, 0xE5, 0x01]; // missing 2 bytes
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert!(matches!(
+        r,
+        StepResult::Unknown {
+            opcode: 0x4C,
+            pc: 0
+        }
+    ));
+    assert!(host.n_e_sub_5_coin_deltas.is_empty());
+}
+
+#[test]
+fn op_4c_n_e_sub_b_actor_resolved_advances_5_bytes() {
+    // [4C, EB, actor_id=0x07, target_lo=0x10, target_hi=0x20]
+    // When the host resolves the actor, take the "pc + 5" path.
+    let bytecode = [0x4Cu8, 0xEB, 0x07, 0x10, 0x20];
+    let mut host = TestHost {
+        n_e_sub_b_resolves: true,
+        ..TestHost::default()
+    };
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 5 });
+    assert_eq!(host.n_e_sub_b_actor_ids, vec![0x07]);
+}
+
+#[test]
+fn op_4c_n_e_sub_b_actor_unresolved_skips_relative() {
+    // Same instruction; host returns None (actor not resolved). Retail's
+    // miss path (`0x801E34F0` -> `0x801E360C`) reads a signed LE16 and exits
+    // through `addiu v0,v0,-2; addu s8,s8,v0` after `s8 += 5`: the skip is
+    // relative, `pc + 5 + i16 - 2`. This test used to assert an absolute
+    // jump to `0x2010`, which sent every missed lookup to a record-header
+    // byte.
+    let bytecode = [0x4Cu8, 0xEB, 0x07, 0x10, 0x20];
+    let mut host = TestHost::default(); // n_e_sub_b_resolves = false
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(
+        r,
+        StepResult::Advance {
+            next_pc: 5 + 0x2010 - 2
+        }
+    );
+    assert_eq!(host.n_e_sub_b_actor_ids, vec![0x07]);
+}
+
+#[test]
+fn op_4c_n_e_sub_b_miss_skips_the_following_op() {
+    // The shipped shape (koin3's entry script): `4C EB 39 05 00` then the
+    // 3-byte `B1 39 03` cross-context flag write it guards. A miss lands on
+    // the byte after that write.
+    let bytecode = [0x4Cu8, 0xEB, 0x39, 0x05, 0x00, 0xB1, 0x39, 0x03, 0x21];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 8 });
+}
+
+#[test]
+fn op_4c_n_e_sub_b_skip_is_a_signed_load_u16_le() {
+    // Endianness: bytes 0x34, 0x12 are a +0x1234 skip, not +0x3412.
+    let bytecode = [0x4Cu8, 0xEB, 0xAA, 0x34, 0x12];
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(
+        r,
+        StepResult::Advance {
+            next_pc: 5 + 0x1234 - 2
+        }
+    );
+    // Sign: 0xFFFE is -2, so the miss lands at `pc + 5 - 2 - 2`.
+    let bytecode = [0x4Cu8, 0xEB, 0xAA, 0xFE, 0xFF];
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert_eq!(r, StepResult::Advance { next_pc: 1 });
+}
+
+#[test]
+fn op_4c_n_e_sub_b_truncated_buffer_returns_unknown() {
+    let bytecode = [0x4Cu8, 0xEB, 0x07]; // missing 2 jump-target bytes
+    let mut host = TestHost::default();
+    let mut ctx = FieldCtx::default();
+    let r = step(&mut host, &mut ctx, &bytecode, 0);
+    assert!(matches!(
+        r,
+        StepResult::Unknown {
+            opcode: 0x4C,
+            pc: 0
+        }
+    ));
+    assert!(host.n_e_sub_b_actor_ids.is_empty());
+}

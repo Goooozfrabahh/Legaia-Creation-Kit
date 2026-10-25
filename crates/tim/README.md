@@ -1,0 +1,104 @@
+# legaia-tim
+
+PSX TIM (texture image) parser, PNG exporter, and PNG->TIM encoder (for
+same-size texture replacement), plus a software model of the PSX VRAM frame
+the renderer reads from.
+
+TIM is Sony's PSX texture format. It's not Legaia-specific - this crate
+follows the canonical PsyQ docs.
+
+## File layout
+
+```text
+magic   u32  0x00000010
+flags   u32  bit0..2 = pmode (0=4bpp, 1=8bpp, 2=16bpp, 3=24bpp)
+             bit3    = has CLUT
+
+[clut block, if bit3 set]
+  bs_len  u32   block length, including itself
+  fb_x    u16   framebuffer X (CLUT load position)
+  fb_y    u16   framebuffer Y
+  w       u16   CLUT width  in 16-bit entries
+  h       u16   CLUT height in rows
+  data    w*h*2 bytes (rows of 16-bit BGR555 + STP)
+
+image block:
+  bs_len  u32
+  fb_x    u16   framebuffer X (image load position, in 16-bit words)
+  fb_y    u16
+  w       u16   image width in 16-bit words (NOT pixels for 4/8 bpp)
+  h       u16   image height in rows
+  data    w*h*2 bytes (raw pixel data)
+```
+
+Pixel widths in real pixels:
+
+- 4bpp:  `fb_w * 4`
+- 8bpp:  `fb_w * 2`
+- 16bpp: `fb_w`
+- 24bpp: `fb_w * 2 / 3` (24-bit packed; 3 bytes per pixel)
+
+16-bit pixels are stored `STP|B|G|R` (1+5+5+5 bits, little-endian).
+
+## What it provides
+
+- `parse(bytes) -> Tim` - lenient header + CLUT + image-block parser
+  (tolerates trailing block padding; for callers decoding known-TIM bytes).
+- `parse_strict(bytes) -> Tim` - reproduces an external reference decoder's
+  TIM detector: no reserved flag bits, pmode 0..=3, exact block lengths,
+  nonzero dims, in-VRAM-bounds image rectangle (CLUT intentionally not
+  bounds-checked - NPC palettes sit at the framebuffer's bottom edge). Used to
+  build the flat `PROT.DAT` TIM catalog in `legaia-disc-audit::tim_catalog`.
+- `Tim::byte_extent` / `Tim::palette_count` - on-disc footprint + CLUT count.
+- `decode_rgba8(tim, clut_idx)` - palette-resolve one CLUT row to RGBA8 for
+  PNG; `write_png` is the encoder beside it.
+- `vram::Vram` - software model of PSX VRAM (1024×512 R16 framebuffer).
+  Used by `legaia-engine-render` for per-primitive texture-page +
+  CLUT-row decode in the fragment shader.
+- `encode` - the write side: `encode_replacement(original, rgba, w, h, opts)`
+  builds a TIM that keeps the original's pixel mode, dimensions, CLUT layout
+  and VRAM placement (so output size == input size, the same-size in-place
+  patching invariant) with the new pixels; `serialize` is the exact inverse of
+  `parse_strict`; `decode_png_rgba` reads any PNG color type. Original
+  indices/texels are reused wherever colors match, so `encode(decode(tim))`
+  is byte-identical; palette overflow errors list offending pixels, or folds
+  behind an explicit quantize opt-in. Alpha -> STP rule + the palette rules:
+  [`docs/formats/tim.md`](../../docs/formats/tim.md#encoding-png---tim-texture-replacement).
+  Consumed by `legaia-patcher tim-replace` and the site ROM-patcher page.
+  Only the palette the image was drawn through (`EncodeOptions::palette`) is
+  ever rewritten.
+- `multi_palette` - editing a TIM with several palettes: per-pixel palette
+  maps (`decode_mapped` / `encode_mapped`, with read-only external palettes),
+  the palette strip, the composite (image + strip), indexed-PNG export, and
+  `import_png`, which recognises which of those shapes a PNG is and writes it
+  back into the original layout with every untouched palette byte-identical.
+  Workflow: [`textures-and-fonts.md`](../../docs/tooling/translation/textures-and-fonts.md#multi-palette-textures).
+
+## CLI
+
+Inputs come from `asset tim-scan extracted/PROT --out extracted/tim_scan`
+(after `legaia-extract`), which names each hit
+`<entry>/raw_off<HEX>_<W>x<H>_<bpp>.tim` by its byte offset in the PROT entry.
+
+```bash
+# Header dump: pmode, CLUT block, image dims, framebuffer position
+tim info extracted/tim_scan/0003_town01/raw_off039188_256x256_4bpp.tim
+
+# Single TIM → PNG. Without -o, writes `<path>.png` next to the input.
+tim convert extracted/tim_scan/0003_town01/raw_off039188_256x256_4bpp.tim -o town01.png
+
+# Pick a palette row on a CLUT-bearing TIM (default row 0), or emit every row
+# as `<path>_clut<N>.png` - the fast way to find which CLUT a mesh expects.
+tim convert extracted/tim_scan/0003_town01/raw_off039188_256x256_4bpp.tim --clut 3 -o row3.png
+tim convert extracted/tim_scan/0003_town01/raw_off039188_256x256_4bpp.tim --all-cluts
+
+# Batch: recursively convert every .tim under a directory.
+# Without -o, mirrors the input layout next to it.
+tim convert-dir extracted/tim_scan -o png_out
+```
+
+## See also
+
+- [`docs/formats/tim.md`](../../docs/formats/tim.md)
+- [`docs/subsystems/renderer.md`](../../docs/subsystems/renderer.md) -
+  how the engine uploads TIMs into the VRAM model.

@@ -1,0 +1,1097 @@
+//! The field overlay's ledge-hop arc **setup** - the routine that turns the
+//! landing-point triple the locomotion controller builds on its stack into a
+//! quadratic-Bezier hop clip on a freshly spawned helper actor.
+//!
+//! REF: FUN_801d1878, FUN_80020de0, FUN_801db510, FUN_801daa50, FUN_801e45bc
+//!
+//! Each ported entry carries its `PORT` tag on the Rust item that implements
+//! it - [`build_hop_arc`] (`FUN_801d2404`), [`spawn_arc_helper`]
+//! (`FUN_801d5780`), [`spawn_arc_with_emitter`] (`FUN_801d25ec`),
+//! [`advance_hop_arc`] (`FUN_801d5c08`) and [`advance_hop_session`]
+//! (`FUN_801d2298`) - never at module level, so the liveness audit sees one
+//! anchor per port site rather than a coarse file-wide one.
+//!
+//! # Three spawners, one arithmetic
+//!
+//! `FUN_801d2404` is not alone. The field overlay carries **three** entries
+//! that build the same clip out of the same `0x801F227C` template, differing
+//! only in where the start point comes from and what else they attach:
+//!
+//! | Entry | Start point | Second record |
+//! |---|---|---|
+//! | `FUN_801d5780` | the `a0` actor's `+0x14..+0x1B` | none |
+//! | `FUN_801d2404` | the player context `_DAT_8007C364` | template `0x801F2294`, `+0x9E = frames` |
+//! | `FUN_801d25ec` | the `a0` actor's `+0x14..+0x1B` | template `0x801F22AC`, an emitter |
+//!
+//! The Bezier arithmetic - midpoints, the `min(P0y, P2y) - apex` control
+//! point, the `0x1000 / frames` cursor step and its `blez` guard - is
+//! instruction-for-instruction identical in all three, which is why
+//! [`build_hop_arc`] is the single implementation and the two siblings are
+//! spawn wrappers around it.
+//!
+//! # Provenance
+//!
+//! `FUN_801d2404` lives in the field overlay (PROT entry `0897_xxx_dat`, file
+//! offset `0x3BEC`, slot-A base `0x801CE818`) and is 122 instructions long.
+//! The short standalone dump `ghidra/scripts/funcs/801d2404.txt` is an
+//! 8-instruction wrong-base fragment; the base-correct body is
+//! `ghidra/scripts/funcs/overlay_0897_door_801d2404.txt`, which agrees
+//! instruction-for-instruction with the extracted `0897_xxx_dat.BIN` bytes at
+//! that offset.
+//!
+//! The image holds exactly **one** `jal 0x801D2404` site, at `0x801D1B70`
+//! inside the ledge-hop trigger `FUN_801d1878`. Reading the argument set-up in
+//! its delay-slot window pins the signature:
+//!
+//! ```text
+//! 801d1b20  addiu a0, sp, 0x18      ; a0 = &stack triple {x, y, z}
+//! 801d1b2c  addiu a1, zero, 0x10    ; a1 = apex height (drop)
+//! 801d1b44  addiu a1, zero, 0x18    ;      or 0x18 (step up)
+//! 801d1b60  addiu a2, zero, 0x10    ; a2 = clip length in frames (always 16)
+//! 801d1b70  jal   0x801d2404
+//! ```
+//!
+//! so the call is `FUN_801d2404(&landing_xyz, apex, frames)`. The engine side
+//! already builds that triple: `engine_core::world::FieldLedgeHop` is posted by
+//! `World::try_field_ledge_hop` with exactly `target_x / target_y / target_z`
+//! and `kind` = the `0x10` / `0x18` value that lands in `a1`.
+//!
+//! # What the routine does
+//!
+//! Reading the disassembly (not the decompiled C - the C renders the apex
+//! store as `(min - apex) * 2 - mid`, which is the same value but hides that
+//! retail computes it as `mid + 2 * (min - apex - mid)`):
+//!
+//! 1. Bail out when the scene control block's player slot
+//!    (`0x8007C348 + 0x1C` = `_DAT_8007C364`, the player context pointer) is
+//!    null.
+//! 2. Allocate a helper actor from the pool (`func_0x80020DE0` with the
+//!    template pointer `0x801F227C` and the pool handle at `0x8007C34C`);
+//!    on failure nothing else happens.
+//! 3. Back-link the player into the helper's `+0x90`, and copy the player's
+//!    8-byte transform block `+0x14..+0x1B` into the helper - this is the
+//!    Bezier start point `P0` (`+0x14` = X, `+0x16` = Y, `+0x18` = Z).
+//! 4. Store the landing triple into `+0x24 / +0x26 / +0x28` - the end point
+//!    `P2`.
+//! 5. Store the three midpoints into `+0x3C / +0x3E / +0x40`, then **replace**
+//!    the Y one with the arc's control point `C`.
+//! 6. Seed the clip cursor `+0x9C = 0` and the per-frame step
+//!    `+0x9E = 0x1000 / frames` (`0x1000` for `frames <= 0`, the retail
+//!    divide-by-zero guard).
+//! 7. Allocate a second helper from template `0x801F2294` with
+//!    `+0x9E = frames`, `+0x9C = 0`, and set the player's movement-lock bit
+//!    `0x80000` in `+0x10`. If that second allocation fails, the first helper
+//!    gets the tear-down bit `8` in its `+0x10` instead and the hop is
+//!    abandoned.
+//!
+//! # The arc
+//!
+//! The control point is the only interesting arithmetic, and it has a clean
+//! closed form. With `mid = (p0 + p2) / 2` (arithmetic shift, so it rounds
+//! toward negative infinity) and `hi = min(p0, p2)`:
+//!
+//! ```text
+//! c = mid + 2 * (hi - apex - mid)
+//! ```
+//!
+//! Evaluating the quadratic Bezier at `t = 0.5` gives `(p0 + 2c + p2) / 4`,
+//! which collapses to exactly `hi - apex`. PSX world Y grows downward, so
+//! subtracting `apex` raises the point: **the hop peaks `apex` units above
+//! whichever endpoint is higher**, independent of how far apart they are.
+//! That invariant is what [`hop_apex_height`] and the unit tests below pin.
+//!
+//! # Two helpers, two ticks - and which is which
+//!
+//! The setup allocates **two** records and they do different jobs. Which
+//! per-frame routine drives which is not a guess: an actor template is six
+//! words, and word `2` is its tick function pointer. Reading the three
+//! templates straight out of the field overlay at slot-A base `0x801CE818`:
+//!
+//! | Template | File offset | Tick fn |
+//! |---|---|---|
+//! | `0x801F227C` (the arc helper) | `0x23A64` | `FUN_801d5c08` |
+//! | `0x801F2294` (the paired helper) | `0x23A7C` | `FUN_801d2298` |
+//! | `0x801F22AC` (the emitter) | `0x23A94` | `FUN_801d5d60` |
+//!
+//! So [`advance_hop_session`] (`FUN_801d2298`) is the **paired** record's
+//! tick - the phase / SFX / movement-lock state machine - and it never
+//! touches a position. The record that actually moves the player is the arc
+//! helper, ticked by `FUN_801d5c08`, ported here as [`advance_hop_arc`]. An
+//! earlier reading had `FUN_801d2298` as "the" advance and left the position
+//! write unaccounted for; the template words are what settle it.
+//!
+//! `FUN_801d5c08` evaluates the seeded quadratic Bezier through the shared
+//! fixed-point evaluator `FUN_801e45bc` (field overlay file `0x15DA4`) and
+//! writes the result into the **parent** actor's `+0x14..+0x1B` - and the
+//! parent is the player, because [`build_hop_arc`]'s setup back-linked
+//! `_DAT_8007C364` there. That is the whole "how does a hop move anything"
+//! question, and it is why the two ticks have to run together: the arc moves
+//! the player, the pair holds the movement lock until six frames after the
+//! landing.
+//!
+//! # Wiring status
+//!
+//! This heading deliberately avoids the module-level disclosure marker. That
+//! marker declares *every* port site in a file inert, which is right for a
+//! wholly-inert module but wrong here: this module is mixed, and claiming it
+//! whole would report the three live hop kernels as stale-tagged. The two
+//! inert spawners carry their own per-function tags instead.
+//!
+//! Only [`spawn_arc_helper`] is inert, and it is **retail-unreachable**:
+//! `FUN_801D5780` has no reference of any form anywhere in the shipped data,
+//! while its three siblings each do, so it is dead code in the retail image
+//! rather than an engine wiring gap. [`spawn_arc_with_emitter`] is live
+//! through the field VM's op `0x43` sub-`0`/`1`/`0xA`/`0xB` arm - see its tag.
+//!
+//! The player hop itself is live: `World::try_field_ledge_hop` classifies the
+//! ledge and starts the session, `World::step_field_vertical` advances both
+//! ticks every frame, and the player arcs to the landing point.
+
+/// Fixed-point full-clip extent: retail's cursor runs `0 ..= 0x1000`.
+pub const CLIP_FULL: i32 = 0x1000;
+
+/// The landing point retail writes into the helper actor's `+0x24 / +0x26 /
+/// +0x28` - the three stack half-words the caller builds at `sp+0x18`.
+///
+/// Mirrors `engine_core::world::FieldLedgeHop`'s `target_*` fields; kept
+/// local so this module stays free of a dependency on the world model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HopTarget {
+    /// Landing X (`+0x24`).
+    pub x: i16,
+    /// Landing Y (`+0x26`) - the floor height sampled one step ahead.
+    pub y: i16,
+    /// Landing Z (`+0x28`).
+    pub z: i16,
+}
+
+/// The clip `FUN_801d2404` seeds on the helper actor it spawns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HopArc {
+    /// Bezier start point - the player's `+0x14 / +0x16 / +0x18` at the
+    /// instant the hop starts, copied verbatim into the helper.
+    pub start: (i16, i16, i16),
+    /// Bezier end point - the caller's landing triple.
+    pub end: (i16, i16, i16),
+    /// Bezier control point, stored at `+0x3C / +0x3E / +0x40`. X and Z are
+    /// plain midpoints; Y carries the apex correction.
+    pub control: (i16, i16, i16),
+    /// Clip cursor `+0x9C`, always seeded to `0`.
+    pub cursor: i16,
+    /// Per-frame cursor step `+0x9E` = `0x1000 / frames`, or `0x1000` when
+    /// `frames <= 0`.
+    pub step: i16,
+    /// The second helper's `+0x9E`: the raw frame count, stored unscaled.
+    pub paired_frames: i16,
+}
+
+/// Signed midpoint exactly as retail computes it: `addu` then `sra 1`, i.e. a
+/// floor-division by two rather than the truncating division Rust's `/` would
+/// give for negative sums.
+fn mid(a: i16, b: i16) -> i16 {
+    ((a as i32 + b as i32) >> 1) as i16
+}
+
+/// Build the hop clip.
+///
+/// `start` is the player's live transform (`+0x14 / +0x16 / +0x18`), `target`
+/// the landing triple, `apex` the `a1` height (`0x10` up / `0x18` down) and
+/// `frames` the `a2` clip length (retail always passes `0x10`).
+///
+/// PORT: FUN_801d2404
+pub fn build_hop_arc(start: (i16, i16, i16), target: HopTarget, apex: i16, frames: i16) -> HopArc {
+    let end = (target.x, target.y, target.z);
+
+    // `+0x3C / +0x3E / +0x40` - the plain midpoints, written first.
+    let mid_x = mid(start.0, end.0);
+    let mid_y = mid(start.1, end.1);
+    let mid_z = mid(start.2, end.2);
+
+    // `+0x3E` is then overwritten with the arc control point. Retail selects
+    // `min(start.y, end.y)` with an `slt`/`move` pair, then evaluates
+    // `mid + 2 * (hi - apex - mid)` with a `subu`/`subu`/`sll 1`/`addu` chain.
+    let hi = start.1.min(end.1) as i32;
+    let ctrl_y = (mid_y as i32 + (((hi - apex as i32) - mid_y as i32) << 1)) as i16;
+
+    // `+0x9E`: `blez` guard first, so a non-positive frame count skips the
+    // divide entirely and stores the full extent.
+    let step = if frames > 0 {
+        (CLIP_FULL / frames as i32) as i16
+    } else {
+        CLIP_FULL as i16
+    };
+
+    HopArc {
+        start,
+        end,
+        control: (mid_x, ctrl_y, mid_z),
+        cursor: 0,
+        step,
+        paired_frames: frames,
+    }
+}
+
+/// The second record `FUN_801d25ec` chains behind the arc helper, allocated
+/// from template `0x801F22AC` and back-linked to the arc helper. It is the
+/// arc's **release watcher**, not an emitter: its tick `FUN_801D5D60`
+/// (template word `2`) waits for the arc helper to retire (`+0x90`'s
+/// `+0x10 & 8`), then clears the `+0x74` mask out of the `+0x94` context's
+/// flag word - and out of the player's too when `+0x50` is set - and retires
+/// itself. While the arc runs, a non-zero `+0x5C` with `+0x50` set runs the
+/// follow-camera ease and focus clamp (`FUN_801DB510` / `FUN_801DAA50`) on the
+/// player every frame.
+///
+/// Field-for-field, from the stores at `0x801D2770..0x801D27AC`, and what the
+/// one caller - the field VM's op `0x43` sub-`0`/`1`/`0xA`/`0xB` arm,
+/// `0x801DF53C..0x801DF5B0` - passes:
+///
+/// | Offset | Source |
+/// |---|---|
+/// | `+0x90` | the arc helper allocated first |
+/// | `+0x94` | `sp+0x38`: the context to release - the calling context when the arced actor is the player (both were halted), else the arced actor |
+/// | `+0x74` | `sp+0x3C`: the flag mask to clear - always `0x400`, the halt bit the arm's acquire raised |
+/// | `+0x5C` | `sp+0x40` byte: `1` for sub-`1`/`0xB`, `0` for sub-`0`/`0xA` - camera follow |
+/// | `+0x9C` | `0` |
+/// | `+0x9E` | the raw `a3` frame count, unscaled |
+/// | `+0x50` | `1` when the `a0` actor **is** the player, else `0` |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HopEmitter {
+    /// `+0x94` - the context whose flag word the watcher clears on release.
+    pub release_ctx: u32,
+    /// `+0x74` - the mask it clears there (`0x400`, the halt bit, at the one
+    /// retail call site).
+    pub release_mask: u32,
+    /// `+0x5C` - the camera-follow byte, `lbu` from `sp+0x40` so never
+    /// sign-extended.
+    pub class: u16,
+    /// `+0x9E` - the frame count, stored raw rather than as `0x1000 / frames`.
+    pub frames: i16,
+    /// `+0x50` - the "owner is the player" flag retail derives with
+    /// `xor` / `sltiu 1` against `_DAT_8007C364`.
+    pub owner_is_player: bool,
+}
+
+/// What a spawn call produced: the arc clip, plus the emitter when the entry
+/// chains one.
+///
+/// Retail returns the *record pointer* and signals failure with a null; the
+/// port returns `None` from the spawners instead, since a pool exhaustion has
+/// no other observable effect on the arc itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HopSpawn {
+    /// The clip seeded on the `0x801F227C` helper.
+    pub arc: HopArc,
+    /// The chained `0x801F22AC` emitter, when the entry allocates one.
+    pub emitter: Option<HopEmitter>,
+}
+
+/// Generic arc-hop spawn: retail `FUN_801d5780(src, &target, apex, frames)`
+/// (field overlay `0897_xxx_dat`, file offset `0x6F68`, 57 instructions).
+///
+/// The four-argument standalone form of the family. It differs from
+/// [`build_hop_arc`] in exactly two ways, both read off the disassembly rather
+/// than inferred:
+///
+/// * the Bezier start point is the **`a0` actor's** `+0x14..+0x1B` block
+///   (`lwl`/`lwr` pair at `0x801D57D8`), not the player context - so any actor
+///   can be arced, and `a0 == 0` returns null at `0x801D57A4` before anything
+///   is allocated;
+/// * there is **no** second allocation and no movement lock: the body runs
+///   straight from the `+0x9E` store to the epilogue.
+///
+/// PORT: FUN_801d5780
+// REPLACED-BY: nothing is owed a port - **retail never calls this function
+// either**, so there is no call site for a host to stand in for. A
+// five-reference-form sweep over every shipped image (literal LE word at every
+// alignment, `lui`+`addiu` / `ori` materialisation, `jal`, `j`, PC-relative
+// branch; `scripts/ghidra-analysis/find-address-word-refs.py 801d5780 --prot
+// --home 0897`, 1234 images) returns nothing, and the two forms that sweep is
+// blind to are empty as well (`find-gp-relative-refs.py 801d5780`: no
+// `imm(gp)`, no `lui`+load pair, no base+displacement, 88 images).
+//
+// Its three siblings in this module are the controls that make that a real
+// zero rather than a scan artifact: `FUN_801D2404` and `FUN_801D25EC` are each
+// found by `jal` in the field overlay, and `FUN_801D2298` is found as a table
+// word at VA `0x801F229C`.
+//
+// The obvious rescue - "it is a pool-actor tick, so no `jal` is expected" -
+// does not apply either: a tick's disc reference is its template's `+0x08`
+// word, and the three templates this family allocates from
+// (`0x801F227C` / `0x801F2294` / `0x801F22AC`) name `FUN_801D5C08`,
+// `FUN_801D2298` and `FUN_801D5D60`. None of them names this one.
+//
+// The bytes are a complete, well-formed routine - field overlay `0897_xxx_dat`
+// at file `0x6F68` opens `addiu sp, sp, -0x28` and the null-`a0` bail at
+// `0x801D57A4` is `bne s0, zero, +3`, exactly as ported - so this is dead code
+// shipped in the image, not a mis-read address. The arithmetic it carries is
+// [`build_hop_arc`], which is live for the player hop; what this entry adds
+// over that is a start point taken from an arbitrary `a0` actor, and nothing
+// on the disc ever asks for one. Do not write a call site to satisfy an audit:
+// there is no production path to put one on.
+//
+// Re-checking this from `ghidra/scripts/funcs/801d5780.txt` will mislead. That
+// dump is a wrong-image import - its header resolves `entry=801d56fc`, so it
+// shows the address as interior to a menu-family function. The address is
+// additionally VA-aliased: in the cutscene images it *is* an entry, of a
+// different 92-instruction function. The field-overlay bytes above are the
+// evidence, not any dump.
+pub fn spawn_arc_helper(
+    src: Option<(i16, i16, i16)>,
+    target: HopTarget,
+    apex: i16,
+    frames: i16,
+) -> Option<HopSpawn> {
+    let start = src?;
+    Some(HopSpawn {
+        arc: build_hop_arc(start, target, apex, frames),
+        emitter: None,
+    })
+}
+
+/// Arc-hop spawn with a chained emitter: retail
+/// `FUN_801d25ec(src, &target, apex, frames, release_ctx, release_mask, class)`
+/// (field overlay `0897_xxx_dat`, file offset `0x3DD4`).
+///
+/// The first half is [`spawn_arc_helper`] inlined verbatim. The second half
+/// allocates from template `0x801F22AC` and fills the [`HopEmitter`] table
+/// above.
+///
+/// The failure ordering matters and is the one thing a re-derivation gets
+/// wrong: when the **emitter** allocation fails retail does not leave the arc
+/// helper running. It sets the tear-down bit `8` in the helper's `+0x10`
+/// (`0x801D27B0..0x801D27BC`) and returns null, so a pool exhaustion abandons
+/// the whole spawn rather than leaving a headless clip - the port models that
+/// as `None`.
+///
+/// PORT: FUN_801d25ec
+///
+/// Live: the field VM's op `0x43` sub-`0`/`1`/`0xA`/`0xB` arm calls it at
+/// `0x801DF5AC`, unconditionally on the success side of that arm's
+/// halt-acquire - so the op is **halt the script and arc this actor**, not a
+/// halt alone. The engine reaches it from both routes the arm has:
+/// `FieldHost::spawn_arc_jump` (NPC channels) and the cutscene timeline's
+/// player-anchor `C3 F8` park, each through `World::start_field_script_arc`,
+/// which keeps one arc per actor in `World::script_actors`; the clip and the
+/// release watcher ([`release_watcher_tick`]) advance in
+/// `World::tick_field_script_arcs`, and both play hosts draw the height
+/// (`World::field_npc_render_y` for NPCs, the player's `world_y`).
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_arc_with_emitter(
+    src: Option<(i16, i16, i16)>,
+    src_is_player: bool,
+    target: HopTarget,
+    apex: i16,
+    frames: i16,
+    release_ctx: u32,
+    release_mask: u32,
+    class: u8,
+) -> Option<HopSpawn> {
+    // Retail inlines `FUN_801D5780`'s body here rather than calling it (the
+    // standalone entry has no caller at all), so this builds the clip
+    // directly too.
+    let start = src?;
+    Some(HopSpawn {
+        arc: build_hop_arc(start, target, apex, frames),
+        emitter: Some(HopEmitter {
+            release_ctx,
+            release_mask,
+            class: u16::from(class),
+            frames,
+            owner_is_player: src_is_player,
+        }),
+    })
+}
+
+/// The per-frame phase global `_DAT_8007BDD8` the hop advance stamps.
+///
+/// Only the three values `FUN_801d2298` writes are named; the global itself
+/// is wider than a hop.
+pub mod hop_phase {
+    /// Take-off frame (`+0x9C == 0`).
+    pub const AIRBORNE: u32 = 6;
+    /// The frame the cursor crosses `+0x9E`.
+    pub const LANDING: u32 = 7;
+    /// Tear-down, `+0x9C >= +0x9E + 6`.
+    pub const GROUNDED: u32 = 1;
+}
+
+/// SFX cue ids the hop brackets itself with (`FUN_80035b50`).
+pub mod hop_sfx {
+    /// Take-off.
+    pub const TAKE_OFF: u8 = 0x2A;
+    /// Landing.
+    pub const LAND: u8 = 0x29;
+}
+
+/// The live half of the clip: retail's `+0x9C` cursor against the `+0x9E`
+/// extent on the **paired** record (the one whose `+0x9E` is the raw frame
+/// count, not the `0x1000 / frames` step).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HopSession {
+    /// `+0x9C`.
+    pub cursor: i16,
+    /// `+0x9E`.
+    pub extent: i16,
+}
+
+/// Everything one `FUN_801d2298` tick writes outside the session itself.
+///
+/// Modelled as a record rather than as direct mutation because every one of
+/// these writes lands on the *player context* `_DAT_8007C364`, which this
+/// module deliberately does not reach into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HopTick {
+    /// A write to `_DAT_8007BDD8`, when the tick makes one.
+    pub phase: Option<u32>,
+    /// A `FUN_80035b50` cue, when the tick fires one.
+    pub sfx: Option<u8>,
+    /// Bits ORed into the player actor's `+0x62` (`8` = anim-active).
+    pub player_anim_set: u16,
+    /// Bits cleared from the player actor's `+0x62`.
+    pub player_anim_clear: u16,
+    /// Bits ORed into the player actor's `+0x10`.
+    pub player_flags_set: u32,
+    /// Bits cleared from the player actor's `+0x10`.
+    pub player_flags_clear: u32,
+    /// The tick set the helper's own tear-down bit `8` - the clip is done.
+    pub finished: bool,
+}
+
+/// Per-frame advance of a spawned hop: retail `FUN_801d2298(helper)`
+/// (field overlay `0897_xxx_dat`, file offset `0x3A80`, 91 instructions).
+///
+/// `step` is `DAT_1F800393`, the per-frame delta scalar the free-movement step
+/// loop also paces on, read as an **unsigned byte** (`lbu`).
+///
+/// The three phases and their exact guards, from the disassembly:
+///
+/// | Phase | Guard | Writes |
+/// |---|---|---|
+/// | take-off | `cursor == 0` | `+0x62 \|= 8`, phase `6`, `+0x10 \|= 0x200000`, SFX `0x2A` |
+/// | crossing | `cursor < extent && cursor + step >= extent` | `+0x10 &= ~0x200000`, phase `7`, `+0x62 \|= 8` |
+/// | end | `cursor + step >= extent + 6` | `+0x62 &= ~8`, `+0x10 &= ~0x80000`, phase `1`, helper `+0x10 \|= 8`, SFX `0x29` |
+///
+/// The cursor store at `0x801D233C` sits in a branch **delay slot**, so it
+/// happens on every tick regardless of which guard fires, and it is
+/// **unclamped**: the sum is stored as-is and the end phase compares against
+/// `extent + 6` rather than against a saturated cursor. A port that clamps the
+/// cursor to `extent` - as this repo's own locomotion page used to say retail
+/// does - can never reach the end phase at a step of `1`, so the hop never
+/// releases the movement lock.
+///
+/// PORT: FUN_801d2298
+pub fn advance_hop_session(session: &mut HopSession, step: u8) -> HopTick {
+    let mut tick = HopTick::default();
+
+    if session.cursor == 0 {
+        tick.player_anim_set |= 8;
+        tick.phase = Some(hop_phase::AIRBORNE);
+        tick.player_flags_set |= 0x0020_0000;
+        tick.sfx = Some(hop_sfx::TAKE_OFF);
+    }
+
+    let before = session.cursor;
+    // `addu` on the halfword then `sh` back: retail wraps rather than
+    // saturates, and the compare that follows re-reads the stored halfword.
+    let next = (before as u16).wrapping_add(u16::from(step)) as i16;
+    session.cursor = next;
+
+    if before < session.extent && next >= session.extent {
+        tick.player_flags_clear |= 0x0020_0000;
+        tick.phase = Some(hop_phase::LANDING);
+        tick.player_anim_set |= 8;
+    }
+
+    if next >= session.extent.saturating_add(6) {
+        tick.player_anim_clear |= 8;
+        tick.player_flags_clear |= 0x0008_0000;
+        tick.phase = Some(hop_phase::GROUNDED);
+        tick.finished = true;
+        tick.sfx = Some(hop_sfx::LAND);
+    }
+
+    tick
+}
+
+/// What one [`advance_hop_arc`] tick produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HopArcTick {
+    /// The transform the tick writes into the parent actor's
+    /// `+0x14 / +0x16 / +0x18`.
+    pub position: (i16, i16, i16),
+    /// The cursor reached the full extent this tick: retail clamps `+0x9C` to
+    /// `0x1000`, snaps the parent to the end point verbatim rather than
+    /// evaluating the curve, and sets its own tear-down bit `8`.
+    pub arrived: bool,
+}
+
+/// Per-frame advance of the **arc** helper - the record that moves the player:
+/// retail `FUN_801d5c08` (field overlay `0897_xxx_dat`, file offset `0x73F0`,
+/// 86 instructions), the tick function word of template `0x801F227C`.
+///
+/// `step_scalar` is `DAT_1F800393`, read as an unsigned byte (`lbu`) exactly
+/// as [`advance_hop_session`] reads it - but here it **multiplies** the
+/// `0x1000 / frames` step rather than being added raw, so the arc and the
+/// phase machine stay in lockstep at any frame pacing.
+///
+/// From the disassembly, in order:
+///
+/// 1. `+0x9C += (s16)(+0x9E) * scalar`, stored back as a halfword (`sh`, so
+///    the 16-bit wrap is retail's, not a port artefact).
+/// 2. `(s16)cursor < 0x1000` - evaluate the Bezier at the cursor through
+///    `FUN_801e45bc` and write the result to the parent's transform.
+/// 3. Otherwise the clip is over: clamp `+0x9C` to `0x1000`, copy the **end
+///    point** `+0x24..+0x2B` into the parent verbatim (no final curve
+///    evaluation - the landing is exact by construction), and tear down.
+///
+/// Not modelled: the entry gate `*(parent + 0x10) & 8` (the parent already
+/// carries the pool's tear-down bit) and the non-player arm at
+/// `0x801D5CB0` / `0x801D5D40`, which writes `-y` into a non-player parent's
+/// `+0x8E`. The player hop never takes that arm - `FUN_801d2404` back-links
+/// `_DAT_8007C364` itself, and the compare against that same global is what
+/// selects it.
+///
+/// PORT: FUN_801d5c08
+/// REF: FUN_801e45bc
+pub fn advance_hop_arc(arc: &mut HopArc, step_scalar: u8) -> HopArcTick {
+    let delta = i32::from(arc.step) * i32::from(step_scalar);
+    let next = (arc.cursor as u16).wrapping_add(delta as u16) as i16;
+    arc.cursor = next;
+    if (next as i32) < CLIP_FULL {
+        let cursor = next as i32;
+        HopArcTick {
+            position: (
+                bezier_at(arc.start.0, arc.control.0, arc.end.0, cursor) as i16,
+                bezier_at(arc.start.1, arc.control.1, arc.end.1, cursor) as i16,
+                bezier_at(arc.start.2, arc.control.2, arc.end.2, cursor) as i16,
+            ),
+            arrived: false,
+        }
+    } else {
+        arc.cursor = CLIP_FULL as i16;
+        HopArcTick {
+            position: arc.end,
+            arrived: true,
+        }
+    }
+}
+
+/// Evaluate the seeded quadratic Bezier at `t = cursor / 0x1000`, in the same
+/// `0x1000`-scaled fixed point the clip cursor uses: retail `FUN_801e45bc`
+/// (field overlay `0897_xxx_dat`, file offset `0x15DA4`, 118 instructions),
+/// called once per tick by [`advance_hop_arc`] with the control point in `a0`
+/// as an in/out triple.
+///
+/// Retail cannot afford a 64-bit numerator, so it splits each basis
+/// coefficient into its integer and fractional halves (`sra 12` / `andi
+/// 0xfff`), accumulates the two sums separately, folds the fractional sum
+/// down by `sra 12` and shifts once more. That is *exactly*
+/// `floor(num / 0x1000^2)` - `floor(floor(x)/n) == floor(x/n)` for positive
+/// `n` - so the widened form below is equal instruction-for-instruction, and
+/// the `tests` module pins the equality against a literal transcription of
+/// the split.
+///
+/// The division must **floor**, not truncate: world Y grows downward, so a
+/// raised tile's height is negative and a truncating divide would round a
+/// mid-air Y the wrong way against retail on every negative sample.
+///
+/// # Why this routine is elsewhere called a lerp
+///
+/// `FUN_801E45BC` is elsewhere described as a **midpoint / linear blend** -
+/// by the move-VM's overlay ext sub-ops `0x0E` / `0x12`, and by an earlier
+/// reading of this module's own `FUN_801D5C08` as a "cutscene position
+/// tween". Both readings are right,
+/// and they are the same routine's degenerate case: `a0` arrives holding the
+/// control point, so when the caller seeds it with the plain midpoint of the
+/// endpoints the quadratic collapses exactly to `(1-t)*P0 + t*P2`. The hop is
+/// the case that *overwrites* the Y midpoint with an apex-corrected control
+/// point, which is the only thing that bends the path into an arc.
+///
+/// REF: FUN_801e45bc
+pub fn bezier_at(p0: i16, c: i16, p2: i16, cursor: i32) -> i32 {
+    let t = cursor.clamp(0, CLIP_FULL) as i64;
+    let u = CLIP_FULL as i64 - t;
+    let full = CLIP_FULL as i64;
+    // (u^2 * p0 + 2*u*t*c + t^2 * p2) / 0x1000^2 - widened because the
+    // numerator alone needs 40-odd bits at full i16 range.
+    let acc = u * u * p0 as i64 + 2 * u * t * c as i64 + t * t * p2 as i64;
+    acc.div_euclid(full * full) as i32
+}
+
+/// How far above the higher endpoint the seeded arc peaks, in world units.
+///
+/// Always equals the `apex` argument by construction - see the module docs.
+pub fn hop_apex_height(arc: &HopArc) -> i32 {
+    let hi = arc.start.1.min(arc.end.1) as i32;
+    hi - bezier_at(arc.start.1, arc.control.1, arc.end.1, CLIP_FULL / 2)
+}
+
+/// The landing-tile decode the op `0x43` arc arm applies to each of its two
+/// tile bytes (`0x801DF484..0x801DF4E4`): `(b & 0x7F) << 7` plus `0x40`, or
+/// plus `0x80` when bit 7 is set - a tile centre, or the far tile edge.
+pub fn arc_tile_to_world(b: u8) -> i16 {
+    let base = i16::from(b & 0x7F) << 7;
+    base + if b & 0x80 != 0 { 0x80 } else { 0x40 }
+}
+
+/// The decoded operand of the field VM's op `0x43` sub-`0` / `1` / `0xA` /
+/// `0xB` - the scripted **arc jump** - read off the arm's own operand loads
+/// (`FUN_801DE840` case `0x43`, `0x801DF418..0x801DF5B0` in PROT 0897; `s6`
+/// is the operand cursor, pointing at the sub-op byte).
+///
+/// | Operand | Load | Meaning |
+/// |---|---|---|
+/// | `+0` | `lbu (s6)` | sub-op; `1` / `0xB` set the camera-follow byte (`s2`) |
+/// | `+1` / `+2` | `lbu 1(s6)` / `lbu 2(s6)` | landing tile X / Z ([`arc_tile_to_world`]); both zero = hop in place |
+/// | `+3` | `jal 0x8003CE9C` on `s6+3` | the arc's apex height -> `FUN_801D25EC` `a2` |
+/// | `+5` | `jal 0x8003CE9C` on `s6+5` | the clip length in frames -> `a3` |
+/// | `+7` | `jal 0x8003CE9C` on `s6+7`, `negu` | sub-A/B only: the landing Y, stored negated |
+///
+/// None of the halfwords is a PC. The landing Y of a tile target is the
+/// floor under it: retail parks the actor on the tile (`sh` to `+0x14` /
+/// `+0x18`), calls the floor sampler `FUN_80019278`, stores the result as Y
+/// and restores the actor's own X / Z (`0x801DF4E8..0x801DF50C`). The
+/// in-place form takes the actor's own `+0x14..+0x18` as the landing point
+/// and mirrors `-Y` into `+0x8E`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScriptArcRequest {
+    /// `0`, `1`, `0xA` or `0xB`.
+    pub sub_op: u8,
+    /// Raw landing-tile X byte.
+    pub tile_x: u8,
+    /// Raw landing-tile Z byte.
+    pub tile_z: u8,
+    /// Apex height above the higher endpoint (`a2`).
+    pub apex: i16,
+    /// Clip length in frames (`a3`).
+    pub frames: i16,
+    /// Sub-A/B's explicit landing Y, already negated as retail stores it.
+    pub explicit_y: Option<i16>,
+}
+
+impl ScriptArcRequest {
+    /// Decode from the operand slice starting at the sub-op byte. `None` for
+    /// a sub-op outside the arc family or a truncated operand.
+    pub fn decode(operand: &[u8]) -> Option<Self> {
+        let sub_op = *operand.first()?;
+        let wide = match sub_op {
+            0 | 1 => false,
+            0xA | 0xB => true,
+            _ => return None,
+        };
+        let need = if wide { 9 } else { 7 };
+        if operand.len() < need {
+            return None;
+        }
+        let s16 = |at: usize| i16::from_le_bytes([operand[at], operand[at + 1]]);
+        Some(Self {
+            sub_op,
+            tile_x: operand[1],
+            tile_z: operand[2],
+            apex: s16(3),
+            frames: s16(5),
+            explicit_y: wide.then(|| s16(7).wrapping_neg()),
+        })
+    }
+
+    /// Operand length in bytes, sub-op byte included (`7` or `9`).
+    pub fn operand_len(&self) -> usize {
+        if self.explicit_y.is_some() { 9 } else { 7 }
+    }
+
+    /// `1` for sub-`1` / `0xB` - the byte the arm passes as `FUN_801D25EC`'s
+    /// class argument, which becomes the watcher's camera-follow `+0x5C`.
+    pub fn camera_follow(&self) -> bool {
+        self.sub_op == 1 || self.sub_op == 0xB
+    }
+
+    /// The landing X / Z, or `None` for the hop-in-place form (both tile
+    /// bytes zero, `0x801DF438..0x801DF450`).
+    pub fn landing_xz(&self) -> Option<(i16, i16)> {
+        if self.tile_x == 0 && self.tile_z == 0 {
+            None
+        } else {
+            Some((
+                arc_tile_to_world(self.tile_x),
+                arc_tile_to_world(self.tile_z),
+            ))
+        }
+    }
+
+    /// The full landing triple the arm builds at `sp+0x30`, given the arced
+    /// actor's current position and a floor sampler standing in for
+    /// `FUN_80019278` at the landing tile.
+    pub fn landing(
+        &self,
+        actor: (i16, i16, i16),
+        floor_at: impl FnOnce(i16, i16) -> i16,
+    ) -> HopTarget {
+        let (x, y, z) = match self.landing_xz() {
+            None => actor,
+            Some((x, z)) => (x, floor_at(x, z), z),
+        };
+        HopTarget {
+            x,
+            y: self.explicit_y.unwrap_or(y),
+            z,
+        }
+    }
+}
+
+/// What one tick of the release watcher decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WatcherTick {
+    /// `+0x5C` and `+0x50` were both set: retail ran the follow-camera
+    /// ease `FUN_801DB510(player)` and `FUN_801DAA50()` this frame.
+    pub camera_follow: bool,
+    /// The arc helper had retired: clear this mask out of the `+0x94`
+    /// context's flag word.
+    pub release_mask: Option<u32>,
+    /// ...and out of the player's too (`+0x50` set).
+    pub release_player: bool,
+}
+
+/// Per-frame tick of the arc's release watcher: retail `FUN_801d5d60`
+/// (field overlay PROT 0897, `0x801D5D60..0x801D5E1C`), the tick word of
+/// template `0x801F22AC`.
+///
+/// `arc_retired` is the back-linked arc helper's `+0x10 & 8` - set by
+/// [`advance_hop_arc`]'s arrival tick. The camera call runs before the
+/// retire test, so the landing frame still eases the camera.
+///
+/// PORT: FUN_801d5d60
+pub fn release_watcher_tick(emitter: &HopEmitter, arc_retired: bool) -> WatcherTick {
+    let mut t = WatcherTick {
+        camera_follow: emitter.class != 0 && emitter.owner_is_player,
+        ..WatcherTick::default()
+    };
+    if arc_retired {
+        t.release_mask = Some(emitter.release_mask);
+        t.release_player = emitter.owner_is_player;
+    }
+    t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(x: i16, y: i16, z: i16) -> HopTarget {
+        HopTarget { x, y, z }
+    }
+
+    #[test]
+    fn generic_spawner_refuses_a_null_owner() {
+        assert!(spawn_arc_helper(None, target(0, 0, 0), 0x10, 0x10).is_none());
+        assert!(
+            spawn_arc_with_emitter(None, false, target(0, 0, 0), 0x10, 0x10, 1, 2, 3).is_none()
+        );
+    }
+
+    #[test]
+    fn generic_spawner_matches_the_player_form_arithmetic() {
+        let start = (10, 40, 70);
+        let t = target(90, 120, 150);
+        let direct = build_hop_arc(start, t, 0x18, 0x10);
+        let spawned = spawn_arc_helper(Some(start), t, 0x18, 0x10).unwrap();
+        assert_eq!(spawned.arc, direct);
+        assert!(spawned.emitter.is_none());
+    }
+
+    #[test]
+    fn emitter_stores_the_raw_frame_count_not_the_scaled_step() {
+        let s = spawn_arc_with_emitter(
+            Some((0, 0, 0)),
+            true,
+            target(64, 0, 0),
+            0x10,
+            0x10,
+            0xdead_beef,
+            0xfeed_face,
+            0x0c,
+        )
+        .unwrap();
+        let e = s.emitter.unwrap();
+        // `+0x9E` on the arc helper is `0x1000 / frames`; on the emitter it is
+        // the raw `a3`.
+        assert_eq!(s.arc.step, 0x100);
+        assert_eq!(e.frames, 0x10);
+        assert_eq!(e.class, 0x0c);
+        assert_eq!(e.release_ctx, 0xdead_beef);
+        assert_eq!(e.release_mask, 0xfeed_face);
+        assert!(e.owner_is_player);
+    }
+
+    #[test]
+    fn hop_tick_fires_take_off_only_on_the_zero_frame() {
+        let mut s = HopSession {
+            cursor: 0,
+            extent: 0x10,
+        };
+        let first = advance_hop_session(&mut s, 1);
+        assert_eq!(first.sfx, Some(hop_sfx::TAKE_OFF));
+        assert_eq!(first.phase, Some(hop_phase::AIRBORNE));
+        assert_eq!(first.player_flags_set, 0x0020_0000);
+        assert_eq!(s.cursor, 1);
+        let second = advance_hop_session(&mut s, 1);
+        assert_eq!(second.sfx, None);
+        assert_eq!(second.phase, None);
+    }
+
+    #[test]
+    fn hop_tick_reaches_the_end_phase_because_the_cursor_is_unclamped() {
+        let mut s = HopSession {
+            cursor: 0,
+            extent: 0x10,
+        };
+        let mut crossing = None;
+        let mut end = None;
+        for frame in 0..64 {
+            let t = advance_hop_session(&mut s, 1);
+            if t.phase == Some(hop_phase::LANDING) {
+                crossing = Some(frame);
+            }
+            if t.finished {
+                end = Some(frame);
+                break;
+            }
+        }
+        // Crossing on the frame the cursor first reaches `extent`, tear-down
+        // six frames later.
+        assert_eq!(crossing, Some(0x0f));
+        assert_eq!(end, Some(0x15));
+        let t = advance_hop_session(
+            &mut HopSession {
+                cursor: 0x10,
+                extent: 0x10,
+            },
+            1,
+        );
+        assert_eq!(t.player_flags_clear, 0);
+        assert!(!t.finished);
+    }
+
+    #[test]
+    fn hop_tick_end_phase_releases_the_movement_lock() {
+        let mut s = HopSession {
+            cursor: 0x15,
+            extent: 0x10,
+        };
+        let t = advance_hop_session(&mut s, 1);
+        assert!(t.finished);
+        assert_eq!(t.player_flags_clear, 0x0008_0000);
+        assert_eq!(t.player_anim_clear, 8);
+        assert_eq!(t.phase, Some(hop_phase::GROUNDED));
+        assert_eq!(t.sfx, Some(hop_sfx::LAND));
+    }
+
+    #[test]
+    fn midpoints_are_plain_for_x_and_z() {
+        let arc = build_hop_arc((100, 0, 200), target(300, 0, 400), 0x10, 0x10);
+        assert_eq!(arc.control.0, 200);
+        assert_eq!(arc.control.2, 300);
+    }
+
+    #[test]
+    fn step_is_full_extent_over_frame_count() {
+        let arc = build_hop_arc((0, 0, 0), target(0, 0, 0), 0x10, 0x10);
+        assert_eq!(arc.step, 0x100);
+        assert_eq!(arc.cursor, 0);
+        assert_eq!(arc.paired_frames, 0x10);
+    }
+
+    #[test]
+    fn non_positive_frame_count_takes_the_blez_arm() {
+        for frames in [0i16, -1, -0x10] {
+            let arc = build_hop_arc((0, 0, 0), target(0, 0, 0), 0x10, frames);
+            assert_eq!(arc.step, CLIP_FULL as i16, "frames = {frames}");
+        }
+    }
+
+    #[test]
+    fn arc_peaks_apex_units_above_the_higher_endpoint() {
+        // PSX Y grows downward, so "higher" is the smaller value.
+        for (p0y, p2y) in [(0i16, 0i16), (0, 200), (200, 0), (-64, 96), (96, -64)] {
+            for apex in [0x10i16, 0x18] {
+                let arc = build_hop_arc((0, p0y, 0), target(0, p2y, 0), apex, 0x10);
+                assert_eq!(
+                    hop_apex_height(&arc),
+                    apex as i32,
+                    "p0y={p0y} p2y={p2y} apex={apex}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn endpoints_are_exact() {
+        let arc = build_hop_arc((10, 40, 70), target(90, 120, 150), 0x10, 0x10);
+        assert_eq!(bezier_at(arc.start.1, arc.control.1, arc.end.1, 0), 40);
+        assert_eq!(
+            bezier_at(arc.start.1, arc.control.1, arc.end.1, CLIP_FULL),
+            120
+        );
+    }
+
+    /// Literal transcription of `FUN_801e45bc`'s split accumulator, kept as a
+    /// test-only oracle so [`bezier_at`]'s widened form has something exact to
+    /// be equal to.
+    fn bezier_split_form(p0: i16, c: i16, p2: i16, cursor: i32) -> i32 {
+        let t = cursor;
+        let u = CLIP_FULL - t;
+        let uu = u * u; // t1
+        let tt = t * t; // t2
+        let ut2 = (u * t) << 1; // t0
+        let int_sum =
+            (uu >> 12) * i32::from(p0) + (ut2 >> 12) * i32::from(c) + (tt >> 12) * i32::from(p2);
+        let frac_sum = (uu & 0xfff) * i32::from(p0)
+            + (ut2 & 0xfff) * i32::from(c)
+            + (tt & 0xfff) * i32::from(p2);
+        (int_sum + (frac_sum >> 12)) >> 12
+    }
+
+    #[test]
+    fn bezier_matches_the_split_accumulator_including_negative_heights() {
+        // Negative Y is the raised-tile case (world Y grows downward), which
+        // is exactly where a truncating divide would drift off retail.
+        for (p0, c, p2) in [
+            (0i16, -16i16, 0i16),
+            (-192, -216, 0),
+            (0, -24, -192),
+            (2624, 2560, 2496),
+            (-3, -3, -3),
+            (i16::MIN, 0, i16::MAX),
+        ] {
+            for cursor in (0..=CLIP_FULL).step_by(0x40) {
+                assert_eq!(
+                    bezier_at(p0, c, p2, cursor),
+                    bezier_split_form(p0, c, p2, cursor),
+                    "p0={p0} c={c} p2={p2} cursor={cursor:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn arc_tick_walks_the_cursor_to_the_full_extent_in_sixteen_frames() {
+        let start = (2624, 0, 2624);
+        let mut arc = build_hop_arc(start, target(2624, -192, 2720), 0x18, 0x10);
+        assert_eq!(arc.step, 0x100);
+        let mut ticks = 0;
+        let last;
+        loop {
+            let t = advance_hop_arc(&mut arc, 1);
+            ticks += 1;
+            if t.arrived {
+                last = t.position;
+                break;
+            }
+            assert!(ticks < 64, "the arc must terminate");
+        }
+        assert_eq!(ticks, 0x10, "0x1000 / 0x100 = 16 frames");
+        assert_eq!(arc.cursor, CLIP_FULL as i16);
+        // The landing is the end point verbatim - retail copies `+0x24..+0x2B`
+        // rather than evaluating the curve at t = 1.
+        assert_eq!(last, (2624, -192, 2720));
+    }
+
+    #[test]
+    fn arc_tick_clears_the_upper_endpoint_mid_flight() {
+        let start = (0, 0, 0);
+        let mut arc = build_hop_arc(start, target(0, -192, 96), 0x18, 0x10);
+        let mut peak = 0i16;
+        let mut half = None;
+        for frame in 0..0x10 {
+            let t = advance_hop_arc(&mut arc, 1);
+            peak = peak.min(t.position.1);
+            if frame == 7 {
+                half = Some(t.position.1); // cursor 0x800 = t 0.5
+            }
+        }
+        // Y grows downward, so clearing the *higher* endpoint (-192) means
+        // sampling below it. The `t = 0.5` sample is the pinned invariant:
+        // exactly `min(p0, p2) - apex`.
+        assert_eq!(half, Some(-192 - 0x18));
+        assert!(peak < -192, "peak {peak} did not clear the upper endpoint");
+        // The vertex of the parabola is not at `t = 0.5` for asymmetric
+        // endpoints, so the deepest sample sits past the mid-flight height -
+        // but never past the far endpoint's own apex allowance either way.
+        assert!(peak >= -192 - 0x18 - 96, "peak {peak} is not a hop arc");
+    }
+
+    #[test]
+    fn arc_tick_scales_the_step_by_the_frame_delta() {
+        // `DAT_1F800393` multiplies here (`mult`), where the phase machine
+        // adds it - a scalar of 2 halves the flight time.
+        let mut arc = build_hop_arc((0, 0, 0), target(0, 0, 96), 0x10, 0x10);
+        let mut ticks = 0;
+        while !advance_hop_arc(&mut arc, 2).arrived {
+            ticks += 1;
+            assert!(ticks < 64);
+        }
+        assert_eq!(ticks + 1, 8);
+    }
+
+    #[test]
+    fn midpoint_uses_arithmetic_shift_not_truncating_division() {
+        // -3 + 0 = -3; `sra 1` floors to -2, whereas `-3 / 2` truncates to -1.
+        assert_eq!(mid(-3, 0), -2);
+    }
+}
+
+#[cfg(test)]
+mod script_arc_tests {
+    use super::*;
+
+    #[test]
+    fn tile_bytes_decode_to_centres_or_far_edges() {
+        assert_eq!(arc_tile_to_world(0x18), 0x18 * 128 + 0x40);
+        assert_eq!(arc_tile_to_world(0x98), 0x18 * 128 + 0x80);
+    }
+
+    #[test]
+    fn town01_player_arc_decodes_apex_and_frames_not_a_pc() {
+        // `C3 F8 00 5F 0D 26 00 1C 00` - operand from the sub-op byte.
+        let r = ScriptArcRequest::decode(&[0x00, 0x5F, 0x0D, 0x26, 0x00, 0x1C, 0x00]).unwrap();
+        assert_eq!((r.apex, r.frames), (0x26, 0x1C));
+        assert!(!r.camera_follow());
+        assert_eq!(r.landing_xz(), Some((0x5F * 128 + 0x40, 0x0D * 128 + 0x40)));
+        let t = r.landing((0, -64, 0), |_, _| -32);
+        assert_eq!((t.x, t.y, t.z), (0x5F * 128 + 0x40, -32, 0x0D * 128 + 0x40));
+    }
+
+    #[test]
+    fn in_place_hop_lands_on_the_actor_and_sub_a_overrides_y() {
+        let r = ScriptArcRequest::decode(&[0x00, 0, 0, 0x0C, 0, 0x0C, 0]).unwrap();
+        let t = r.landing((100, -48, 200), |_, _| unreachable!());
+        assert_eq!((t.x, t.y, t.z), (100, -48, 200));
+        let r = ScriptArcRequest::decode(&[0x0B, 0x76, 0x70, 0x50, 0, 0x32, 0, 0xA0, 0]).unwrap();
+        assert!(r.camera_follow());
+        assert_eq!(r.operand_len(), 9);
+        assert_eq!(r.landing((0, 0, 0), |_, _| 7).y, -0xA0);
+        assert!(ScriptArcRequest::decode(&[0x02, 0, 0, 0, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn watcher_releases_only_once_the_arc_retires() {
+        let e = HopEmitter {
+            release_ctx: 1,
+            release_mask: 0x400,
+            class: 1,
+            frames: 12,
+            owner_is_player: true,
+        };
+        let running = release_watcher_tick(&e, false);
+        assert!(running.camera_follow);
+        assert_eq!(running.release_mask, None);
+        let done = release_watcher_tick(&e, true);
+        assert_eq!(done.release_mask, Some(0x400));
+        assert!(done.release_player);
+        let npc = HopEmitter {
+            owner_is_player: false,
+            ..e
+        };
+        assert!(!release_watcher_tick(&npc, false).camera_follow);
+        assert!(!release_watcher_tick(&npc, true).release_player);
+    }
+}

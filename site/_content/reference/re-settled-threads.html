@@ -1,0 +1,109 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">reference</a> &middot; settled threads</div>
+  <h1>Settled reverse-engineering threads</h1>
+  <p class="lede">Questions about how Legaia works that have an answer, and how firmly each answer is pinned. This is the archive half of the RE register: the live hunts are on <a href="open-rev-eng-threads.html">open RE threads</a>, and the readings that turned out wrong are on <a href="re-do-not-re-walk.html">do not re-walk</a>. Every answer and write-up here is rendered from the source documents when the site is built.</p>
+</header>
+
+<style>
+/* Register pages: a filterable, scannable thread list. */
+.reg-tools { position: sticky; top: var(--topbar-h, 0); z-index: 2; background: var(--bg); padding: 0.6rem 0 0.7rem; border-bottom: 1px solid var(--border); margin-bottom: 1rem; }
+.reg-nav { margin: 0 0 1.25rem; }
+table td .tag { white-space: nowrap; }
+.reg-filter { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+.reg-filter input { flex: 1 1 16rem; min-width: 0; background: var(--bg-card); color: var(--text); border: 1px solid var(--border-hi); border-radius: 4px; padding: 0.4rem 0.6rem; font: inherit; }
+.reg-filter .reg-count { color: var(--text-dim); font-family: var(--font-mono); font-size: 0.8rem; }
+.reg-table td:first-child { color: var(--text); width: 38%; }
+.reg-table td:nth-child(3) { white-space: nowrap; }
+.reg-table details.reg-why { margin: 0.4rem 0 0; background: transparent; }
+.reg-table details.reg-why > summary { padding: 0.2rem 0.5rem; font-size: 0.72rem; }
+.reg-table details.reg-why .disclosure-body { padding: 0.5rem 0.6rem; font-size: 0.85rem; }
+.reg-kw { color: var(--text-dim); font-family: var(--font-mono); font-size: 0.8rem; }
+.reg-area.reg-empty, .reg-table tr.reg-hide { display: none; }
+@media (max-width: 640px) {
+  .reg-table thead { display: none; }
+  .reg-table, .reg-table tbody, .reg-table tr, .reg-table td { display: block; width: auto !important; }
+  .reg-table tr { border-bottom: 1px solid var(--border); padding: 0.4rem 0; }
+  .reg-table td { border: 0; padding: 0.15rem 0.6rem; }
+  .reg-table td:nth-child(3) { white-space: normal; }
+}
+details.reg-writeup { margin: 0.35rem 0; }
+details.reg-writeup > summary { font-size: 0.9rem; }
+.reg-src { color: var(--text-dim); font-size: 0.8rem; }
+</style>
+
+<!--REGISTER-NAV:settled-->
+
+<section class="doc-section" id="overview" data-doc="how-a-thread-is-laid-out">
+  <h2>How to read this page</h2>
+  <p>A <strong>thread</strong> is one question the project stopped to ask - why a boss battle freezes with the camera circling, where the party's battle models come from, which routine swaps the music. A thread is <strong>settled</strong> when it has an answer that can be pointed at: an instruction sequence, a runtime capture, or a measurement taken off the disc. <code>resolved</code> is a claim, not a warranty - which is what the evidence column is for.</p>
+  <p>Each area below is one table. A row gives the question, its verdict, the <a href="#grades">evidence grade</a>, and under <em>Why</em> the full answer - addresses, captures and corrections. A thread whose answer outgrew a table cell links to its write-up under <em>Long write-ups in this area</em>. Every area, row and write-up is rendered from <code>docs/reference/re-settled-threads/</code> when the site is built, so this page cannot state a verdict the docs have since overturned. The areas run from the overworld inwards (world map, battle, field, text, animation, audio, boot, rendering) and end with the project's own instruments.</p>
+  <dl class="kv">
+    <dt>Source of record</dt><dd><a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/reference/re-settled-threads.md" target="_blank" rel="noopener"><code>docs/reference/re-settled-threads.md</code></a></dd>
+    <dt>Row lifecycle</dt><dd><a href="open-rev-eng-threads.html">open</a> &rarr; settled (here) &rarr; <a href="re-do-not-re-walk.html">falsified</a> if a later reading overturns it</dd>
+    <dt>Function names</dt><dd>A <code>FUN_&lt;addr&gt;</code> in a row is described in <a href="functions.html">key functions</a></dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="grades" data-doc="the-evidence-column">
+  <h2>What an evidence grade means</h2>
+  <p>Every thread is graded by what its stated evidence rests on. A thread citing more than one kind is graded by the <strong>weakest load-bearing</strong> claim - the one that breaks the conclusion if it is wrong.</p>
+  <table>
+    <thead><tr><th>Grade</th><th>The thread cites</th></tr></thead>
+    <tbody>
+      <tr><td><span class="tag tag-done">disassembly</span></td><td>Instructions, addresses, opcode encodings, branch or store sequences read from the MIPS code. The strongest grade.</td></tr>
+      <tr><td><span class="tag tag-done">capture</span></td><td>A runtime capture: a save state, an emulator probe, a write watchpoint, a trace, or a measurement taken off the disc.</td></tr>
+      <tr><td><span class="tag tag-partial">decompiled-C</span></td><td>Ghidra's C output, a <code>FUN_x(...)</code> call signature, a Ghidra label, or a claim about store order / count / a boolean operator with no instruction behind it.</td></tr>
+      <tr><td><span class="tag tag-partial">inference</span></td><td>Reasoning from surrounding facts, corpus absence, or analogy, with no direct evidence cited.</td></tr>
+    </tbody>
+  </table>
+  <p><strong><code>decompiled-C</code> is the re-audit bucket, not a wrong-answer bucket.</strong> It marks a claim nobody has confirmed against instructions. Three shapes carry most of the risk: evidence citing a call signature or a <code>funcs/&lt;addr&gt;.txt</code> dump rather than instructions, any claim about store <em>order</em> or <em>count</em>, and any claim about which boolean operator a predicate uses. The catalogue of C-rendering artifacts is on <a href="../tooling/ghidra.html">Ghidra workflow</a>.</p>
+  <p><strong>A <code>disassembly</code> grade is only as good as the addresses in its cell.</strong> A row that names a function and a behaviour but no instruction address reads the same as one that was checked, and is the same bucket in practice. Re-audits of such rows have found a &quot;nothing increments it&quot; beside an add-one, a &quot;neither subtracts HP&quot; beside two HP stores, and a pad test sitting in a hole in a function dump. A checked row carries the addresses that settle it.</p>
+</section>
+
+<div class="reg-tools reg-filter" id="find">
+  <input type="search" id="reg-filter" placeholder="Filter threads: an address, a scene, a word" autocomplete="off" aria-label="Filter threads">
+  <span class="reg-count" id="reg-count" aria-live="polite"></span>
+</div>
+
+<!--REGISTER:settled-->
+
+<section class="doc-section" id="see-also" data-doc="related-pages">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="open-rev-eng-threads.html">Open RE threads</a>
+    <a href="re-do-not-re-walk.html">Do not re-walk</a>
+    <a href="functions.html">Key functions</a>
+    <a href="memory-map.html">RAM map</a>
+    <a href="../tooling/ghidra.html">Ghidra workflow</a>
+    <a href="../tooling/port-catalog.html">Port catalog</a>
+  </div>
+  <p class="hint">A thread whose verdict no longer matches the disassembly moves back to the open list; the row here is not edited in place.</p>
+</section>
+
+<script>
+(function () {
+  var input = document.getElementById('reg-filter');
+  var count = document.getElementById('reg-count');
+  if (!input) return;
+  var rows = Array.prototype.slice.call(document.querySelectorAll('.reg-table tbody tr'));
+  var areas = Array.prototype.slice.call(document.querySelectorAll('.reg-area'));
+  rows.forEach(function (r) { r._t = r.textContent.toLowerCase(); });
+  function apply() {
+    var terms = input.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    var shown = 0;
+    rows.forEach(function (r) {
+      var ok = terms.every(function (t) { return r._t.indexOf(t) >= 0; });
+      r.classList.toggle('reg-hide', !ok);
+      if (ok) shown++;
+    });
+    areas.forEach(function (a) {
+      var any = !terms.length || a.querySelector('.reg-table tbody tr:not(.reg-hide)');
+      a.classList.toggle('reg-empty', !any);
+    });
+    count.textContent = terms.length ? shown + ' of ' + rows.length + ' threads' : rows.length + ' threads';
+  }
+  input.addEventListener('input', apply);
+  apply();
+})();
+</script>

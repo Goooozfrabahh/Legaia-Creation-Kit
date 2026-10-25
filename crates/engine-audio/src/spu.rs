@@ -1,0 +1,455 @@
+//! From-scratch PSX SPU model.
+//!
+//! 24 voices, 512 KB SPU RAM, ADSR-shaped per-voice envelopes, libspu-shaped
+//! transfer engine. The mixer's job is simple:
+//!
+//! 1. Each output frame, advance every voice that's on by one SPU-internal
+//!    sample (44.1 kHz). Mix into a shared (left, right) accumulator.
+//! 2. Apply a master volume (set by libspu `SsSetMVol`).
+//! 3. Resample the result to the host sample rate.
+//!
+//! What this does NOT model:
+//!
+//! - Pitch modulation, noise mode, FM. None of these are used by Legaia
+//!   (verified against the libspu calls in the SCUS dumps - `SpuSetPitch`
+//!   is the only pitch path, `SpuSetVoiceAttr` writes only sample addr +
+//!   ADSR + volume).
+//!
+//! ## Reverb
+//!
+//! [`Reverb`] is a faithful register-driven port of the hardware reverb
+//! network (same/different-side IIR reflections + 4-tap comb + two all-pass
+//! stages) with the standard libspu [`ReverbMode`] presets covering the 9
+//! PSX modes plus Off. Routing is per-voice: set [`Voice::reverb_send`] to
+//! opt a voice into the wet signal (libspu `SpuSetVoiceReverb` analogue).
+//! The network runs at 22.05 kHz behind the hardware's half-band FIR resampler; see the [`reverb`] module.
+//!
+//! See `docs/subsystems/audio.md` "engine-audio model" for the consumer.
+
+pub mod adpcm;
+pub mod adsr;
+pub mod gauss;
+pub mod ram;
+pub mod reverb;
+pub mod voice;
+
+pub use reverb::{Reverb, ReverbMode};
+pub use voice::VoiceBus;
+
+/// Unity [`Spu::bus_gain`] (Q1.14).
+pub const BUS_GAIN_UNITY: u16 = 0x4000;
+
+use ram::SpuRam;
+use voice::Voice;
+
+/// Number of hardware voices on the PSX SPU.
+pub const NUM_VOICES: usize = 24;
+
+/// The full SPU model.
+#[derive(Debug, Clone)]
+pub struct Spu {
+    /// SPU RAM (512 KB).
+    pub ram: SpuRam,
+    /// Per-voice state. Indexed 0..24.
+    pub voices: [Voice; NUM_VOICES],
+    /// Master volume, 0x0000..=0x3FFF (libspu `MVOL` shape).
+    pub master_left: i16,
+    pub master_right: i16,
+    /// Active reverb processor. Defaults to [`ReverbMode::Off`]. Voices
+    /// with `reverb_send = true` route their output through this; the wet
+    /// signal is mixed back into the master in [`Spu::tick`].
+    pub reverb: Reverb,
+    /// Optional note-level recorder. `None` (the default) costs nothing;
+    /// the normal audio path never touches it. See [`crate::note_trace`].
+    pub note_trace: Option<crate::note_trace::NoteTrace>,
+    /// Last raw `reverb_mode` value written by libspu - preserved for
+    /// debugging / tooling. The active mode in the [`Reverb`] processor
+    /// is set via [`Spu::set_reverb_mode`].
+    pub reverb_mode_raw: u32,
+    /// libsnd's monaural mode (`SsSetMono`, the options screen's "Sound:
+    /// Monaural"): every voice sounds at the **larger** of its two volumes on
+    /// both sides. `FUN_80067550` folds it per voice at key-on when
+    /// `_DAT_801CE330 == 1` (`sltu` / `move` at `0x800677F4..0x80067818`);
+    /// the mednafen states saved in monaural mode carry `L == R == max` on
+    /// every voice. Applied here at mix time - both volumes are positive, so
+    /// the sample with the larger magnitude is the one the larger volume
+    /// scaled - which also covers a voice whose volume a CC changes mid-note.
+    pub mono: bool,
+    /// Engine-only per-bus gain, Q1.14 (`0x4000` = unity), indexed by
+    /// [`VoiceBus::index`]: `[bgm, sfx]`. Each voice's output is scaled by its
+    /// [`Voice::bus`]'s gain before it reaches the dry mix and the reverb
+    /// send. Unity on both (the default) is the retail mix, bit-identical.
+    pub bus_gain: [u16; 2],
+    /// `SPUCNT` bit 2, "CD audio reverb": the CD input (the decoded XA the
+    /// host mixes beside the voices) also feeds the reverb send. libspu's
+    /// `SpuSetCommonAttr` writes it from `cd.reverb` under mask `0x100`.
+    /// Off at boot and everywhere but two minigame overlays, which raise it
+    /// on entry and drop it on the way out: the Baka Fighter init
+    /// `FUN_801CF00C` and the Muscle Dome contest (re-)entry `FUN_801CEA6C`
+    /// set it, the dome's opponent installer `FUN_801D1510`, its settlement
+    /// `FUN_801D0F60` and the shared exit clear it. The library states agree
+    /// (`SPUCNT = 0xC085` in the duel and the dome hub, `0xC081` elsewhere).
+    /// Off, the mix is bit-identical to a model without the bit.
+    pub cd_reverb: bool,
+}
+
+impl Default for Spu {
+    fn default() -> Self {
+        Self {
+            ram: SpuRam::new(),
+            voices: std::array::from_fn(|_| Voice::default()),
+            master_left: 0x3FFF,
+            master_right: 0x3FFF,
+            reverb: Reverb::new(ReverbMode::Off),
+            note_trace: None,
+            reverb_mode_raw: 0,
+            mono: false,
+            bus_gain: [BUS_GAIN_UNITY; 2],
+            cd_reverb: false,
+        }
+    }
+}
+
+impl Spu {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Issue libspu-style key-on for the voices with the corresponding bit
+    /// set in `mask` (bit 0 = voice 0, etc.). Equivalent to `SpuKeyOn` /
+    /// `SpuSetKey(SpuOn, mask)`.
+    pub fn key_on_mask(&mut self, mask: u32) {
+        for i in 0..NUM_VOICES {
+            if mask & (1u32 << i) != 0 {
+                let v = &mut self.voices[i];
+                let ram = &self.ram;
+                v.key_on(ram);
+            }
+        }
+    }
+
+    /// Mirror of `key_on_mask` for key-off.
+    pub fn key_off_mask(&mut self, mask: u32) {
+        for i in 0..NUM_VOICES {
+            if mask & (1u32 << i) != 0 {
+                self.voices[i].key_off();
+            }
+        }
+    }
+
+    /// Record a key-on for `voice` into the note trace, if one is attached.
+    ///
+    /// Called next to the real key-on rather than from [`Self::key_on_mask`]:
+    /// the sequencer's voice path keys voices on directly, so a hook on the
+    /// mask API would miss every BGM note.
+    pub fn record_key_on(&mut self, voice: usize) {
+        let Some(v) = self.voices.get(voice) else {
+            return;
+        };
+        let snap = crate::note_trace::VoiceSnapshot {
+            addr: v.start_addr,
+            pitch: v.pitch,
+            voll: v.vol_left,
+            volr: v.vol_right,
+            adsr1: v.adsr_cfg.raw.0,
+            adsr2: v.adsr_cfg.raw.1,
+        };
+        if let Some(t) = self.note_trace.as_mut() {
+            t.push(crate::note_trace::NoteEventKind::On, voice as u8, snap);
+        }
+    }
+
+    /// Record a key-off for `voice` into the note trace, if one is attached.
+    pub fn record_key_off(&mut self, voice: usize) {
+        let addr = self.voices.get(voice).map(|v| v.start_addr).unwrap_or(0);
+        if let Some(t) = self.note_trace.as_mut() {
+            t.push(
+                crate::note_trace::NoteEventKind::Off,
+                voice as u8,
+                crate::note_trace::VoiceSnapshot {
+                    addr,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    /// Set the active reverb mode. The [`Reverb`] processor's buffers are
+    /// resized; in-flight wet signal is dropped.
+    pub fn set_reverb_mode(&mut self, mode: ReverbMode) {
+        self.reverb.set_mode(mode);
+    }
+
+    /// libspu `SpuCommonAttr.reverb` analogue - accepts the raw mode byte
+    /// and updates both the live processor and the bookkeeping register.
+    pub fn write_reverb_mode_byte(&mut self, raw: u8) {
+        self.reverb_mode_raw = raw as u32;
+        self.set_reverb_mode(ReverbMode::from_byte(raw));
+    }
+
+    /// Install the global reverb configuration retail actually runs: the
+    /// `Studio C` preset at the measured output depth.
+    ///
+    /// The mednafen save-state corpus gives reverb master-on in every state
+    /// and a byte-identical Studio C coefficient block, and `vLOUT`/`vROUT`
+    /// read [`reverb::RETAIL_OUTPUT_VOL`]. The network is a fixed global; the
+    /// per-voice **send** is not. Retail sets or clears a voice's `EON` bit
+    /// at every key-on from the keyed tone's `mode & 4` (`FUN_80067550`), so
+    /// this installs no routing: [`crate::VabBank`]'s key-on does, per tone.
+    /// See `docs/subsystems/audio.md`.
+    pub fn set_retail_reverb(&mut self) {
+        self.reverb_mode_raw = 4; // libspu SPU_REV_MODE_STUDIO_C
+        self.set_reverb_mode(ReverbMode::StudioC);
+        self.reverb
+            .set_output_volume(reverb::RETAIL_OUTPUT_VOL, reverb::RETAIL_OUTPUT_VOL);
+    }
+
+    /// Advance every voice by one sample tick at the SPU internal rate
+    /// (44.1 kHz). Returns the (left, right) sample, master-volume scaled
+    /// and clamped to i16.
+    pub fn tick(&mut self) -> (i16, i16) {
+        self.tick_with_cd_input((0, 0))
+    }
+
+    /// [`Self::tick`] with this sample's CD input: the decoded XA stream the
+    /// host mixes in beside the voices. The CD input's dry path stays with
+    /// the host (it rides outside the BGM fade); what the SPU owns is the
+    /// reverb send, which takes the CD input when [`Self::cd_reverb`] is
+    /// set - `SPUCNT` bit 2, the hardware's "CD audio reverb" enable.
+    pub fn tick_with_cd_input(&mut self, cd: (i16, i16)) -> (i16, i16) {
+        let mut acc_l: i64 = 0;
+        let mut acc_r: i64 = 0;
+        let mut send_l: i64 = 0;
+        let mut send_r: i64 = 0;
+        let mono = self.mono;
+        let bus_gain = self.bus_gain;
+        for v in &mut self.voices {
+            let (l, r) = v.tick(&self.ram);
+            let g = bus_gain[v.bus.index()];
+            let (l, r) = if g == BUS_GAIN_UNITY {
+                (l, r)
+            } else {
+                let g = g as i64;
+                (((l as i64 * g) >> 14) as i32, ((r as i64 * g) >> 14) as i32)
+            };
+            let (l, r) = if mono {
+                let m = if l.abs() >= r.abs() { l } else { r };
+                (m, m)
+            } else {
+                (l, r)
+            };
+            acc_l += l as i64;
+            acc_r += r as i64;
+            if v.reverb_send {
+                send_l += l as i64;
+                send_r += r as i64;
+            }
+        }
+        if self.cd_reverb {
+            send_l += cd.0 as i64;
+            send_r += cd.1 as i64;
+        }
+        // Drive the reverb network with the reverb-tagged voices' sum.
+        let send_l_i16 = send_l.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+        let send_r_i16 = send_r.clamp(i16::MIN as i64, i16::MAX as i64) as i16;
+        let (wet_l, wet_r) = self.reverb.tick(send_l_i16, send_r_i16);
+        acc_l += wet_l as i64;
+        acc_r += wet_r as i64;
+        // Apply master volume.
+        let l = ((acc_l * self.master_left as i64) >> 14).clamp(i16::MIN as i64, i16::MAX as i64);
+        let r = ((acc_r * self.master_right as i64) >> 14).clamp(i16::MIN as i64, i16::MAX as i64);
+        (l as i16, r as i16)
+    }
+
+    /// Drain `n` samples into a stereo i16 buffer (pairs of left, right).
+    /// Convenience for tests + the cpal callback's resampler.
+    pub fn render_into(&mut self, out: &mut [i16]) {
+        debug_assert_eq!(out.len() % 2, 0);
+        for chunk in out.as_chunks_mut::<2>().0 {
+            let (l, r) = self.tick();
+            chunk[0] = l;
+            chunk[1] = r;
+        }
+    }
+
+    /// Returns the count of voices currently in the `Off` envelope phase,
+    /// i.e. available for a fresh allocation.
+    pub fn idle_voice_count(&self) -> usize {
+        self.voices.iter().filter(|v| v.is_off()).count()
+    }
+
+    /// Find an idle voice index. Mirrors the libspu pattern of "scan for a
+    /// voice whose envelope has finished".
+    pub fn find_idle_voice(&self) -> Option<usize> {
+        self.voices.iter().position(|v| v.is_off())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoke: 24 silent voices key-on simultaneously, render 1 second of
+    /// stereo, finish without panics.
+    #[test]
+    fn render_silence_one_second() {
+        let mut spu = Spu::new();
+        let mut buf = vec![0i16; 44100 * 2];
+        spu.render_into(&mut buf);
+        assert!(buf.iter().all(|&s| s == 0));
+    }
+
+    /// key_on_mask actually triggers the per-voice key-on for the right
+    /// voices and not the others.
+    #[test]
+    fn key_on_mask_only_affects_set_bits() {
+        let mut spu = Spu::new();
+        // Stick a one-block silence stream at 0x1000 so each voice has
+        // something to "play".
+        let stream = vec![0u8; 16];
+        spu.ram.write_at(0x1000, &stream);
+        for v in spu.voices.iter_mut() {
+            v.start_addr = 0x1000;
+        }
+        spu.key_on_mask(0b101);
+        // Voices 0 and 2 should be in Attack; the rest still Off.
+        for (i, v) in spu.voices.iter().enumerate() {
+            if i == 0 || i == 2 {
+                assert!(!v.is_off(), "voice {i} should be on");
+            } else {
+                assert!(v.is_off(), "voice {i} should still be off");
+            }
+        }
+    }
+
+    /// idle_voice_count starts at 24, drops to 23 after one key-on.
+    #[test]
+    fn idle_voice_count_tracks_keyons() {
+        let mut spu = Spu::new();
+        let stream = vec![0u8; 16];
+        spu.ram.write_at(0x1000, &stream);
+        for v in spu.voices.iter_mut() {
+            v.start_addr = 0x1000;
+        }
+        assert_eq!(spu.idle_voice_count(), NUM_VOICES);
+        spu.key_on_mask(0b1);
+        assert_eq!(spu.idle_voice_count(), NUM_VOICES - 1);
+    }
+
+    /// find_idle_voice returns None when all voices are busy.
+    #[test]
+    fn find_idle_voice_returns_none_when_all_busy() {
+        let mut spu = Spu::new();
+        let stream = vec![0u8; 16];
+        spu.ram.write_at(0x1000, &stream);
+        for v in spu.voices.iter_mut() {
+            v.start_addr = 0x1000;
+        }
+        spu.key_on_mask(0xFFFFFFFF);
+        assert!(spu.find_idle_voice().is_none());
+    }
+
+    /// Reverb mode round-trips through the libspu-style mode byte API
+    /// and updates the live processor.
+    #[test]
+    fn write_reverb_mode_byte_updates_processor() {
+        let mut spu = Spu::new();
+        assert_eq!(spu.reverb.mode, ReverbMode::Off);
+        spu.write_reverb_mode_byte(7); // Echo
+        assert_eq!(spu.reverb_mode_raw, 7);
+        assert_eq!(spu.reverb.mode, ReverbMode::Echo);
+        spu.write_reverb_mode_byte(5); // Hall
+        assert_eq!(spu.reverb.mode, ReverbMode::Hall);
+        // Out-of-range falls back to Off.
+        spu.write_reverb_mode_byte(0xFE);
+        assert_eq!(spu.reverb.mode, ReverbMode::Off);
+    }
+
+    /// `set_retail_reverb` selects Studio C at the retail depth and leaves
+    /// the per-voice sends to the key-on, which sets them per tone.
+    #[test]
+    fn set_retail_reverb_selects_studio_c_without_routing() {
+        let mut spu = Spu::new();
+        assert_eq!(spu.reverb.mode, ReverbMode::Off);
+        spu.set_retail_reverb();
+        assert_eq!(spu.reverb.mode, ReverbMode::StudioC);
+        assert!(spu.voices.iter().all(|v| !v.reverb_send));
+    }
+
+    /// A voice with `reverb_send` set produces an echo tail past the
+    /// reverb mode's delay length when the master tick is run.
+    #[test]
+    fn reverb_send_voice_produces_wet_tail() {
+        let mut spu = Spu::new();
+        spu.set_reverb_mode(ReverbMode::Room);
+        // Plant a non-zero stream and key one voice on with reverb_send.
+        let stream = vec![0u8; 16];
+        spu.ram.write_at(0x1000, &stream);
+        spu.voices[0].start_addr = 0x1000;
+        spu.voices[0].vol_left = 0x3FFF;
+        spu.voices[0].vol_right = 0x3FFF;
+        spu.voices[0].set_reverb_send(true);
+        spu.key_on_mask(0b1);
+        // Render long enough to fill the room delay buffer.
+        let delay = spu.reverb.tick(0, 0);
+        let _ = delay;
+        let mut buf = vec![0i16; 4_410 * 2]; // 100 ms of stereo
+        spu.render_into(&mut buf);
+        // Silence stream → output is silence (no decoded samples), so we
+        // can't validate non-zero output here. Rely on the per-Reverb
+        // unit tests for that. The smoke value is "no panics".
+    }
+
+    /// Monaural mode sounds each voice at the larger of its two volumes on
+    /// both sides (`FUN_80067550`'s fold under `_DAT_801CE330 == 1`), not at
+    /// their average.
+    #[test]
+    fn mono_sounds_a_voice_at_its_larger_volume_on_both_sides() {
+        let render = |mono: bool| {
+            let mut spu = Spu::new();
+            spu.mono = mono;
+            let mut block = [0x79u8; 16];
+            block[0] = 0x04;
+            block[1] = 0x07; // loop start | repeat | end: a held square wave
+            spu.ram
+                .set_direction(crate::spu::ram::TransferDirection::CpuToSpu);
+            spu.ram.write_at(0x1000, &block);
+            let v = &mut spu.voices[0];
+            v.start_addr = 0x1000;
+            v.vol_left = 0x3FFF;
+            v.vol_right = 0x1000;
+            v.adsr_cfg = crate::spu::adsr::AdsrConfig::from_words(0x000F, 0x1F00);
+            spu.key_on_mask(0b1);
+            (0..64).map(|_| spu.tick()).collect::<Vec<_>>()
+        };
+        let stereo = render(false);
+        let mono = render(true);
+        assert!(stereo.iter().any(|(l, r)| l != r), "the fixture is panned");
+        for ((sl, _), (ml, mr)) in stereo.iter().zip(mono.iter()) {
+            assert_eq!(ml, mr);
+            assert_eq!(ml, sl, "both sides take the louder (left) volume");
+        }
+    }
+
+    /// `SPUCNT` bit 2: with it clear the CD input never reaches the network
+    /// (the SPU output is silent with no voice sounding, whatever the CD
+    /// carries); with it set the CD input drives the reverb send, and the
+    /// network's wet tail comes back through the SPU output.
+    #[test]
+    fn cd_input_feeds_the_reverb_send_only_with_cd_reverb_set() {
+        let render = |cd_reverb: bool| {
+            let mut spu = Spu::new();
+            spu.set_retail_reverb();
+            spu.cd_reverb = cd_reverb;
+            (0..8192)
+                .map(|i| spu.tick_with_cd_input(if i < 2048 { (8000, -8000) } else { (0, 0) }))
+                .collect::<Vec<_>>()
+        };
+        assert!(render(false).iter().all(|&s| s == (0, 0)));
+        let wet = render(true);
+        assert!(
+            wet[2048..].iter().any(|&(l, r)| l != 0 || r != 0),
+            "the reverb tail outlives the CD burst"
+        );
+    }
+}

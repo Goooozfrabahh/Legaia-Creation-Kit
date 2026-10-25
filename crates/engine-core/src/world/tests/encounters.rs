@@ -1,0 +1,1109 @@
+use super::*;
+use legaia_engine_field::man_field_scripts::FieldCarrierConfig;
+use legaia_engine_mode::mode::SceneMode;
+
+#[test]
+fn install_encounter_for_scene_resolves_field_pattern() {
+    use legaia_engine_battle::encounter_registry::vanilla_encounter_registry;
+    let mut world = World::new();
+    let r = vanilla_encounter_registry();
+    let installed = world.install_encounter_for_scene(&r, "map01");
+    assert!(installed, "field pattern should match");
+    assert!(world.encounters.session.is_some());
+}
+
+#[test]
+fn install_encounter_for_scene_quiets_in_towns() {
+    use legaia_engine_battle::encounter_registry::vanilla_encounter_registry;
+    let mut world = World::new();
+    let r = vanilla_encounter_registry();
+    let installed = world.install_encounter_for_scene(&r, "town01");
+    assert!(!installed, "town pattern resolves but is quiet");
+    assert!(
+        world.encounters.session.is_some(),
+        "session installed for nil checks"
+    );
+}
+
+#[test]
+fn install_encounter_for_scene_returns_false_with_no_default() {
+    use legaia_engine_battle::encounter_registry::EncounterRegistry;
+    let mut world = World::new();
+    let r = EncounterRegistry::new(); // empty, no default
+    let installed = world.install_encounter_for_scene(&r, "anything");
+    assert!(!installed);
+    assert!(world.encounters.session.is_none());
+}
+
+#[test]
+fn install_encounter_for_scene_replaces_active_session() {
+    use legaia_engine_battle::encounter_registry::vanilla_encounter_registry;
+    let mut world = World::new();
+    let r = vanilla_encounter_registry();
+    // Install a field session, then a town session - the town call
+    // should replace the field session even though it's quiet.
+    world.install_encounter_for_scene(&r, "map01");
+    assert!(world.encounters.session.is_some());
+    let initial_table_label = world
+        .encounters
+        .session
+        .as_ref()
+        .unwrap()
+        .tracker()
+        .table()
+        .scene_label
+        .clone();
+    world.install_encounter_for_scene(&r, "town01");
+    let new_table_label = world
+        .encounters
+        .session
+        .as_ref()
+        .unwrap()
+        .tracker()
+        .table()
+        .scene_label
+        .clone();
+    assert_ne!(initial_table_label, new_table_label);
+}
+
+#[test]
+fn install_encounter_from_record_registers_and_arms() {
+    use legaia_scene_formats::encounter_record::EncounterRecord;
+    let mut world = World::new();
+    // mc2-shaped record: two monsters, both id 4.
+    let record = EncounterRecord {
+        count: 2,
+        monster_ids: [0x04, 0x04, 0, 0],
+    };
+    let formation_id = world
+        .install_encounter_from_record("map01", &record)
+        .expect("non-empty record produces an id");
+    // Formation registered.
+    let formation = world
+        .tables
+        .formation_table
+        .formation(formation_id)
+        .expect("formation registered");
+    assert_eq!(formation.slots.len(), 2);
+    assert_eq!(formation.slots[0].monster_id, 4);
+    assert_eq!(formation.slots[1].monster_id, 4);
+    // Session installed and rate forced high.
+    let session = world
+        .encounters
+        .session
+        .as_ref()
+        .expect("session installed");
+    assert_eq!(session.tracker().table().trigger_rate_q8, 0xFF);
+    assert_eq!(session.tracker().table().entries.len(), 1);
+    assert_eq!(
+        session.tracker().table().entries[0].formation_id,
+        formation_id
+    );
+}
+
+#[test]
+fn install_scripted_encounter_parses_window_and_arms_battle() {
+    let mut world = World::new();
+    world.set_formation_table(
+        legaia_engine_battle::monster_catalog::vanilla_formation_table(),
+        legaia_engine_battle::monster_catalog::vanilla_monster_catalog(),
+    );
+    world.set_active_scene_label("town01");
+    world.mode = SceneMode::Field;
+    world.arm_scripted_encounter(true);
+    // Record window overlaying the arm opcode: [op][op1][op2][count=2][ids..].
+    let window = [0x37u8, 0x00, 0x00, 0x02, 0x4F, 0x50, 0x00, 0x00];
+    let formation_id = world
+        .install_scripted_encounter(&window)
+        .expect("non-empty record installs a formation");
+    // Fire-once: a successful install disarms the carrier flag.
+    assert!(!world.encounters.scripted_armed);
+    // Formation registered with the window's two ids.
+    let formation = world
+        .tables
+        .formation_table
+        .formation(formation_id)
+        .expect("formation registered");
+    assert_eq!(formation.slots.len(), 2);
+    assert_eq!(formation.slots[0].monster_id, 0x4F);
+    assert_eq!(formation.slots[1].monster_id, 0x50);
+    // Session installed at the forced-high rate.
+    assert_eq!(
+        world
+            .encounters
+            .session
+            .as_ref()
+            .unwrap()
+            .tracker()
+            .table()
+            .trigger_rate_q8,
+        0xFF
+    );
+    // Event surfaced for engine visibility.
+    assert!(world.pending_field_events.iter().any(|e| matches!(
+        e,
+        FieldEvent::ScriptedEncounter { record } if record == &window
+    )));
+    // The very next field step flips Field -> a triggered encounter.
+    assert!(
+        world.on_field_step(),
+        "forced-rate roll triggers the battle"
+    );
+}
+
+#[test]
+fn install_scripted_encounter_empty_or_short_window_returns_none() {
+    let mut world = World::new();
+    world.set_active_scene_label("town01");
+    // count = 0 -> empty record -> no install.
+    assert_eq!(world.install_scripted_encounter(&[0, 0, 0, 0]), None);
+    assert!(world.encounters.session.is_none());
+    // Too short to even hold the count byte -> parse fails.
+    assert_eq!(world.install_scripted_encounter(&[0, 0]), None);
+}
+
+#[test]
+fn seed_party_battle_stats_folds_live_stats_and_equipment() {
+    use legaia_engine_battle::battle_stats::{EquipmentTable, ItemModifier};
+    use legaia_save::EquipmentSlots;
+    use legaia_save::character::LiveStats;
+
+    let mut world = World::new();
+    let mut party = legaia_save::Party::zeroed(1);
+    party.members[0].set_live_stats(LiveStats {
+        agl: 12,
+        atk: 30,
+        udf: 10,
+        ldf: 8,
+        spd: 5,
+        int: 4,
+    });
+    let mut slots = [0u8; 8];
+    slots[0] = 5; // a weapon in the first slot
+    party.members[0].set_equipment(EquipmentSlots { slots });
+    world.load_party(party);
+
+    // Item 5 grants +7 attack, +3 UDF, +2 LDF.
+    let mut table = EquipmentTable::new();
+    table.set(
+        5,
+        ItemModifier {
+            atk: 7,
+            udf: 3,
+            ldf: 2,
+            spd: 0,
+            int: 0,
+            ability_bits: [0; 32],
+        },
+    );
+    world.set_equipment_table(table);
+
+    world.seed_party_battle_stats();
+    // Retail seeds the actor's ATK without equipment (`FUN_80053CB8` folds
+    // UDF / LDF / SPD only); the weapon's +7 reaches a swing at execution
+    // time as `+7 >> 1` for the command that reads its slot.
+    assert_eq!(world.battle.attack[0], 30, "base ATK, no equipment fold");
+    assert_eq!(
+        world.battle.equip_atk[0],
+        [7, 0, 0, 0, 0],
+        "per-slot equipment attack bytes"
+    );
+    assert_eq!(
+        legaia_engine_battle_vm::battle_formulas::arms_weapon_atk_fold(
+            0x11,
+            &world.battle.equip_atk[0]
+        ),
+        Some(3),
+        "an art folds half the sum of all five slots"
+    );
+    assert_eq!(
+        legaia_engine_battle_vm::battle_formulas::arms_weapon_atk_fold(
+            0x0C,
+            &world.battle.equip_atk[0]
+        ),
+        Some(0),
+        "the left-arm command reads slot 2, which is empty here"
+    );
+    assert_eq!(
+        world.battle.defense_split[0],
+        Some((13, 10)),
+        "(10+3) UDF, (8+2) LDF"
+    );
+}
+
+#[test]
+fn seed_party_battle_stats_skips_zeroed_roster() {
+    // A synthetic battle sets battle_attack directly then loads a zeroed
+    // roster; seeding must not clobber the manual value.
+    let mut world = World::new();
+    world.set_battle_attack(0, 60);
+    world.load_party(legaia_save::Party::zeroed(3));
+    world.seed_party_battle_stats();
+    assert_eq!(world.battle.attack[0], 60, "zeroed roster leaves it intact");
+    assert_eq!(world.battle.defense_split[0], None);
+}
+
+#[test]
+fn seed_party_battle_stats_scales_ap_base_with_level() {
+    use legaia_save::character::LiveStats;
+
+    let mut world = World::new();
+    let mut party = legaia_save::Party::zeroed(3);
+    // Slot 0 at level 1 (base 4), slot 1 at level 23 (base 6), slot 2 at
+    // level 99 (capped 10). A non-zero atk so the seed doesn't skip them.
+    for (slot, level) in [(0usize, 1u8), (1, 23), (2, 99)] {
+        party.members[slot].set_live_stats(LiveStats {
+            agl: 10,
+            atk: 20,
+            udf: 8,
+            ldf: 8,
+            spd: 5,
+            int: 4,
+        });
+        party.members[slot].set_level(level);
+    }
+    world.load_party(party);
+
+    world.seed_party_battle_stats();
+    assert_eq!(world.battle.ap_gauges[0].base_ap, 4, "level 1 -> base 4");
+    assert_eq!(
+        world.battle.ap_gauges[1].base_ap, 6,
+        "level 23 -> 4 + 23/10 = 6"
+    );
+    assert_eq!(
+        world.battle.ap_gauges[2].base_ap, 10,
+        "level 99 -> capped at 10"
+    );
+
+    // The round-start reset picks up the seeded base as the per-turn budget.
+    world.reset_party_ap();
+    assert_eq!(world.battle.ap_gauges[1].current_ap, 6);
+    assert_eq!(world.battle.ap_gauges[2].current_ap, 10);
+}
+
+#[test]
+fn seed_party_battle_stats_seeds_the_mp_ceiling_from_the_record() {
+    use legaia_save::character::{HpMpSp, LiveStats};
+
+    // `character_max_mp` is the only max-MP the world carries: the battle
+    // actor holds current MP and no ceiling, so the battle party bar's MP
+    // field, the item screen's target rows and the in-battle MP-restore clamp
+    // all read this vector. Seeding it here is what keeps every entry into a
+    // fight (New Game, a loaded save, either host's play loop) from fighting
+    // with a zero ceiling - no MP on the bar and an MP potion that heals 0.
+    let mut world = World::new();
+    let mut party = legaia_save::Party::zeroed(2);
+    for slot in 0..2 {
+        party.members[slot].set_live_stats(LiveStats {
+            agl: 10,
+            atk: 20,
+            udf: 8,
+            ldf: 8,
+            spd: 5,
+            int: 4,
+        });
+    }
+    party.members[0].set_hp_mp_sp(HpMpSp {
+        hp_cur: 180,
+        hp_max: 180,
+        mp_cur: 20,
+        mp_max: 20,
+        ..Default::default()
+    });
+    party.members[1].set_hp_mp_sp(HpMpSp {
+        hp_cur: 90,
+        hp_max: 90,
+        mp_cur: 7,
+        mp_max: 35,
+        ..Default::default()
+    });
+    world.load_party(party);
+
+    world.seed_party_battle_stats();
+    assert_eq!(world.tables.character_max_mp.first().copied(), Some(20));
+    assert_eq!(world.tables.character_max_mp.get(1).copied(), Some(35));
+}
+
+#[test]
+fn seed_party_battle_stats_leaves_a_synthetic_mp_ceiling_alone() {
+    // A record with no MP ceiling must not clobber one a synthetic battle set
+    // directly - the same contract the zeroed-roster guard keeps for attack.
+    use legaia_save::character::LiveStats;
+
+    let mut world = World::new();
+    let mut party = legaia_save::Party::zeroed(1);
+    party.members[0].set_live_stats(LiveStats {
+        agl: 10,
+        atk: 20,
+        udf: 8,
+        ldf: 8,
+        spd: 5,
+        int: 4,
+    });
+    world.load_party(party);
+    world.set_character_max_mp(0, 99);
+
+    world.seed_party_battle_stats();
+    assert_eq!(world.tables.character_max_mp.first().copied(), Some(99));
+}
+
+#[test]
+fn drain_pending_scripted_encounter_only_when_queued() {
+    let mut world = World::new();
+    world.set_formation_table(
+        legaia_engine_battle::monster_catalog::vanilla_formation_table(),
+        legaia_engine_battle::monster_catalog::vanilla_monster_catalog(),
+    );
+    world.set_active_scene_label("town01");
+    // Nothing queued -> no-op.
+    world.drain_pending_scripted_encounter();
+    assert!(world.encounters.session.is_none());
+    // Queue a window (as the armed forwarded-PC hook would) and drain.
+    world.encounters.pending_scripted = Some(vec![0, 0, 0, 1, 0x12, 0, 0, 0]);
+    world.drain_pending_scripted_encounter();
+    assert!(world.encounters.pending_scripted.is_none());
+    assert!(world.encounters.session.is_some());
+}
+
+#[test]
+fn install_encounter_from_record_empty_returns_none() {
+    use legaia_scene_formats::encounter_record::EncounterRecord;
+    let mut world = World::new();
+    let id = world.install_encounter_from_record("map01", &EncounterRecord::EMPTY);
+    assert!(id.is_none());
+    // No session installed.
+    assert!(world.encounters.session.is_none());
+}
+
+#[test]
+fn install_man_formation_forces_registered_row() {
+    use legaia_engine_battle::monster_catalog::{FormationDef, FormationSlot};
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.set_active_scene_label("town01");
+    // Register a lone-monster formation at id 4 (town01's Tetsu row shape).
+    world
+        .tables
+        .formation_table
+        .insert(FormationDef::new(4, vec![FormationSlot::new(0x4F)]));
+
+    // Unknown id -> None, no session.
+    assert!(world.install_man_formation(9).is_none());
+    assert!(world.encounters.session.is_none());
+
+    // Registered id installs a forced-rate session that triggers next step.
+    assert_eq!(world.install_man_formation(4), Some(4));
+    assert!(world.encounters.session.is_some());
+    assert!(
+        world.on_field_step(),
+        "forced-rate session triggers on the next step"
+    );
+}
+
+#[test]
+fn field_carrier_engage_launches_battle_and_returns_to_field() {
+    use legaia_engine_battle::monster_catalog::{
+        FormationDef, FormationSlot, MonsterCatalog, MonsterDef,
+    };
+    use legaia_scene_formats::encounter_record::RIM_ELM_TRAINING_FORMATION_ID;
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.mode = SceneMode::Field;
+    world.toggles.live_gameplay_loop = true; // auto-resolve the battle leg
+    world.set_active_scene_label("town01");
+    // A capable lone party member so the battle can resolve.
+    world.actors[0].active = true;
+    world.actors[0].battle.hp = 400;
+    world.actors[0].battle.max_hp = 400;
+    world.actors[0].battle.liveness = 1;
+    world.set_battle_attack(0, 80);
+    // town01's Tetsu row: formation index 4 = lone monster id 0x4F.
+    world.tables.formation_table.insert(FormationDef::new(
+        RIM_ELM_TRAINING_FORMATION_ID,
+        vec![FormationSlot::new(0x4F)],
+    ));
+    let mut cat = MonsterCatalog::new();
+    cat.insert(MonsterDef::new(0x4F, "Tetsu", 999, 40));
+    world.set_monster_catalog(cat);
+
+    // Place one scripted-encounter carrier (the Tetsu NPC) - the field-mode
+    // use of the FUN_801DA51C SM.
+    world.install_field_carriers(vec![FieldCarrierConfig::ScriptedEncounter {
+        formation_id: RIM_ELM_TRAINING_FORMATION_ID,
+    }]);
+
+    // Idle: ticking does NOT launch a battle (towns are 0% random; the
+    // carrier waits for the dialogue-accept).
+    world.tick();
+    assert_eq!(
+        world.mode,
+        SceneMode::Field,
+        "an idle scripted carrier never self-fires"
+    );
+    assert_eq!(world.carriers.entities[0].state, 0, "carrier still Idle");
+
+    // The dialogue-accept advances the carrier to Activating; the next tick
+    // runs the state-1 body (formation copy) and the case 2/3 fall-through
+    // (battle handoff), which arms the field-to-battle intro transition -
+    // the mode flips once its 132 display frames elapse.
+    world.engage_field_carrier(0);
+    for _ in 0..200 {
+        if world.mode == SceneMode::Battle {
+            break;
+        }
+        world.tick();
+    }
+    assert_eq!(world.mode, SceneMode::Battle);
+    assert_eq!(world.battle.return_mode, SceneMode::Field);
+    assert!(world.field_return.is_some());
+    let formation = world
+        .battle
+        .active_formation
+        .as_ref()
+        .expect("active formation");
+    assert_eq!(
+        formation.slots[0].monster_id, 0x4F,
+        "Tetsu in the enemy slot"
+    );
+    assert_eq!(
+        world.carriers.entities[0].state,
+        legaia_engine_field::world_map_entity::EntityState::Terminal as u16,
+        "carrier retired to Terminal after the transition"
+    );
+
+    // Drive the fight to completion; it must return to the field.
+    let mut returned = false;
+    for _ in 0..8000 {
+        world.tick();
+        if world.mode != SceneMode::Battle {
+            returned = true;
+            break;
+        }
+    }
+    assert!(returned, "battle resolves");
+    assert_eq!(world.mode, SceneMode::Field, "returns to the field");
+    // The carrier stays Terminal - the scripted fight fires exactly once.
+    assert_eq!(
+        world.carriers.entities[0].state,
+        legaia_engine_field::world_map_entity::EntityState::Terminal as u16
+    );
+}
+
+#[test]
+fn field_carrier_unengaged_never_fires() {
+    use legaia_engine_battle::monster_catalog::{FormationDef, FormationSlot};
+    use legaia_scene_formats::encounter_record::RIM_ELM_TRAINING_FORMATION_ID;
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.mode = SceneMode::Field;
+    world.set_active_scene_label("town01");
+    world.tables.formation_table.insert(FormationDef::new(
+        RIM_ELM_TRAINING_FORMATION_ID,
+        vec![FormationSlot::new(0x4F)],
+    ));
+    world.install_field_carriers(vec![FieldCarrierConfig::ScriptedEncounter {
+        formation_id: RIM_ELM_TRAINING_FORMATION_ID,
+    }]);
+
+    // Many idle ticks must never flip into battle (no random rate).
+    for _ in 0..256 {
+        world.tick();
+        assert_eq!(world.mode, SceneMode::Field);
+    }
+    assert!(world.field_return.is_none());
+    assert!(world.carriers.pending_battle.is_none());
+}
+
+#[test]
+fn begin_new_game_clears_state_and_enters_field() {
+    let mut world = World::new();
+    // Dirty the world as if a prior session had been played.
+    world.mode = SceneMode::Battle;
+    world.flags.story_flags = 0xDEAD_BEEF;
+    world.flags.story_flag_bits = vec![1, 2, 3];
+    world.party.money = 4242;
+    world.party.inventory.insert(0x10, 5);
+    world.encounters.scripted_armed = true;
+    world.game_over = true;
+    world.clock.play_time_seconds = 9999;
+
+    world.begin_new_game();
+
+    // The retail field-launch (master mode 3) clean slate.
+    assert_eq!(world.mode, SceneMode::Field);
+    assert_eq!(world.flags.story_flags, 0);
+    assert!(world.flags.story_flag_bits.is_empty());
+    // New-game gold is the retail constant (FUN_80034A6C), not zero.
+    assert_eq!(world.party.money, NEW_GAME_STARTING_GOLD);
+    assert!(world.party.inventory.is_empty());
+    assert!(!world.encounters.scripted_armed);
+    assert!(world.encounters.session.is_none());
+    assert!(!world.game_over);
+    assert_eq!(world.clock.play_time_seconds, 0);
+}
+
+#[test]
+fn prologue_handoff_fires_once_on_confirm_in_the_opening_chain() {
+    let mut world = World::new();
+    world.set_active_scene_label(legaia_game_tables::new_game::OPENING_CUTSCENE_SCENE);
+    world.cutscene.opening_chain_active = true;
+
+    // Not armed yet: confirm does nothing.
+    assert_eq!(world.take_prologue_handoff(true), None);
+
+    world.arm_prologue_handoff();
+    assert_ne!(world.flags.story_flags & PROLOGUE_HANDOFF_FLAG, 0);
+
+    // Armed but no confirm: stays in the cutscene.
+    assert_eq!(world.take_prologue_handoff(false), None);
+    assert_ne!(world.flags.story_flags & PROLOGUE_HANDOFF_FLAG, 0);
+
+    // Armed + confirm: skips to town01 and clears the bit (fire-once). This
+    // is the retail intro-skip - it fires mid-narration too.
+    world.open_cutscene_narration(vec!["Page".into()]);
+    assert_eq!(
+        world.take_prologue_handoff(true),
+        Some(legaia_game_tables::new_game::OPENING_SCENE)
+    );
+    assert_eq!(world.flags.story_flags & PROLOGUE_HANDOFF_FLAG, 0);
+    assert!(
+        world.cutscene.narration.is_none(),
+        "the skip tears down the playing narration"
+    );
+    assert!(world.cutscene.entering_town01_opening);
+    assert!(!world.cutscene.opening_chain_active);
+
+    // A second confirm does not re-fire.
+    assert_eq!(world.take_prologue_handoff(true), None);
+}
+
+/// The prologue skip's `town01` entry is not a free-roam picker visit. The
+/// skip clears the chain flag and the timeline before any host enters the
+/// scene, so a host that asked only "is the opening running?" (the browser
+/// page's old test) staged it - and staging drops town01's entry-window BGM
+/// pause, the opening's silent dawn. Both hosts ask
+/// `World::picker_entry_stages_free_roam` now.
+#[test]
+fn prologue_skip_town01_entry_is_not_a_picker_visit() {
+    let town01 = legaia_game_tables::new_game::OPENING_SCENE;
+    let mut world = World::new();
+    world.set_active_scene_label(legaia_game_tables::new_game::OPENING_CUTSCENE_SCENE);
+    world.cutscene.opening_chain_active = true;
+    assert!(
+        !world.picker_entry_stages_free_roam(town01, false),
+        "an opening-chain leg is never staged"
+    );
+    world.arm_prologue_handoff();
+    assert_eq!(world.take_prologue_handoff(true), Some(town01));
+    // The skip's own teardown left nothing the chain/timeline tests see.
+    assert!(!world.cutscene.opening_chain_active);
+    assert!(!world.cutscene_timeline_active());
+    assert!(!world.stage_picker_entry(town01, false));
+    assert!(!world.field_vm.free_roam_staging);
+
+    // A plain picker visit stages; a resume and an overworld label do not.
+    let mut picker = World::new();
+    assert!(picker.picker_entry_stages_free_roam("town0c", false));
+    assert!(!picker.picker_entry_stages_free_roam("town0c", true));
+    assert!(!picker.picker_entry_stages_free_roam("map01", false));
+    assert!(picker.stage_picker_entry("town01", false));
+    assert!(picker.field_vm.free_roam_staging);
+}
+
+#[test]
+fn prologue_handoff_only_fires_while_the_opening_chain_plays() {
+    let mut world = World::new();
+    // Armed, confirm pressed, but no opening chain is playing (e.g. a normal
+    // field visit) - the skip gate stays closed.
+    world.set_active_scene_label(legaia_game_tables::new_game::OPENING_SCENE);
+    world.arm_prologue_handoff();
+    assert_eq!(world.take_prologue_handoff(true), None);
+    // Bit is left intact for the gate to fire only during the opening.
+    assert_ne!(world.flags.story_flags & PROLOGUE_HANDOFF_FLAG, 0);
+}
+
+// ---- boss-stager placements (approach/interact -> record execution) ----
+
+#[test]
+fn run_boss_stager_refuses_when_the_park_gate_is_latched() {
+    let mut world = World::new();
+    world.props.boss_stagers.insert(
+        3,
+        crate::world::FieldBossStager {
+            record: 3,
+            park_gate: Some(0x142),
+        },
+    );
+    world.system_flag_set(0x142);
+    assert!(
+        !world.run_boss_stager_record(3),
+        "a latched park gate refuses the launch"
+    );
+    assert!(
+        !world.props.boss_stagers.contains_key(&3),
+        "the stale binding is dropped"
+    );
+}
+
+#[test]
+fn run_boss_stager_requires_a_resident_scene_man() {
+    let mut world = World::new();
+    world.props.boss_stagers.insert(
+        3,
+        crate::world::FieldBossStager {
+            record: 3,
+            park_gate: None,
+        },
+    );
+    // No `field_channels_man` installed: nothing to execute.
+    assert!(!world.run_boss_stager_record(3));
+    assert!(
+        world.props.boss_stagers.contains_key(&3),
+        "an unresolvable launch keeps the binding for a later approach"
+    );
+}
+
+/// Minimal MAN carrying `n` partition-1 placement records, each
+/// `[N=1][2 locals][model, anim, tile_x, tile_z]` then `3E FF <row>` and a
+/// `0x21` halt - i.e. every record reads as a boss-stager site. Mirrors the
+/// fixture shape in [`super::script_teleport`], with the scripted-battle op
+/// in the body.
+fn man_with_stager_records(rows: &[u8]) -> Vec<u8> {
+    let mut man = vec![0u8; 0x2B + rows.len() * 3];
+    man[0x24] = rows.len() as u8; // N1 = placement count (N0 = N2 = 0)
+    let mut bodies = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let off = bodies.len() as u32;
+        let p = 0x2B + i * 3;
+        man[p..p + 3].copy_from_slice(&off.to_le_bytes()[..3]);
+        bodies.push(0x01); // N = 1 local pair
+        bodies.extend_from_slice(&[0xAA, 0xBB]); // the local pair
+        bodies.extend_from_slice(&[0x00, 0x00, 0x03, 0x04]); // header: tile (3,4)
+        bodies.extend_from_slice(&[0x3E, 0xFF, *row]); // scripted-battle entry
+        bodies.push(0x21); // halt
+    }
+    let sec_off = bodies.len() as u32;
+    man[0x28..0x2B].copy_from_slice(&sec_off.to_le_bytes()[..3]);
+    man.extend_from_slice(&bodies);
+    man.extend_from_slice(&[0u8; 18]); // six zero-length sections
+    man
+}
+
+/// A placement the carrier install already owns is **not** armed as a boss
+/// stager. Retail's Rim Elm sparring partner (`town01` P1[10], row 4) is a
+/// talk-first scripted-encounter carrier whose `3E FF 04` sits behind its
+/// dialogue and its four-option picker; arming it as a stager gives one
+/// placement two dispatch owners, and the stager wins inside
+/// `World::trigger_field_interact` - the box never opens and the fight never
+/// starts. It is the only placement in the retail corpus where the two
+/// models collide.
+#[test]
+fn a_scripted_encounter_carrier_slot_is_not_armed_as_a_boss_stager() {
+    use legaia_engine_battle::monster_catalog::{FormationDef, FormationSlot};
+
+    let man = man_with_stager_records(&[4, 4]);
+    let man_file = legaia_scene_formats::man_section::parse(&man).expect("fixture parses");
+
+    let mut world = World::new();
+    // Row 4 must resolve for either placement to arm at all.
+    world
+        .tables
+        .formation_table
+        .insert(FormationDef::new(4, vec![FormationSlot::new(0x4F)]));
+    // Placement 0 is a scripted-encounter carrier (the sparring-partner
+    // shape); placement 1 is a plain stager.
+    world.carriers.slots.insert(0, 0);
+
+    world.install_boss_stagers_from_man(&man_file, &man);
+
+    assert!(
+        !world.props.boss_stagers.contains_key(&0),
+        "the carrier-owned placement keeps its dialogue dispatch"
+    );
+    assert!(
+        world.props.boss_stagers.contains_key(&1),
+        "a placement no carrier owns still arms as a stager"
+    );
+    // The stager install must not move the carrier's interact-probe anchor
+    // to a station point either.
+    assert!(
+        !world.npcs.positions.contains_key(&0),
+        "the carrier placement's probe position is left to the carrier install"
+    );
+}
+
+#[test]
+fn boss_battle_entry_writes_no_flags() {
+    use legaia_engine_battle::monster_catalog::{FormationDef, FormationSlot};
+    // Entering a scripted-battle formation writes NO system flags: the
+    // staged marker (rikuroa 0x289) is the stager record's own `52 89`,
+    // and the gate flag (0x142) is the post-victory record's `51 42`.
+    let mut world = World::new();
+    world.set_active_scene_label("rikuroa");
+    // rikuroa row 17 carries header byte 1, like every flagged boss row.
+    world
+        .tables
+        .formation_table
+        .insert(FormationDef::new(17, vec![FormationSlot::new(73)]).with_header_flags(1));
+    world.mode = SceneMode::Field;
+    assert!(world.trigger_scripted_battle(17));
+    assert!(
+        !world.battle.no_escape,
+        "the op sets no flag; battle entry derives it from the row"
+    );
+    // Drain the latch, then clock the intro transition through to the flip.
+    for _ in 0..200 {
+        if world.mode == SceneMode::Battle {
+            break;
+        }
+        world.tick();
+    }
+    assert!(matches!(world.mode, SceneMode::Battle));
+    // The flagged row refuses the Run command (retail `ctx+0x287`).
+    assert!(world.battle.no_escape, "a flagged row sets no-escape");
+    assert!(world.battle.scripted_fight);
+    assert!(
+        !world.system_flag_test(0x289),
+        "no engine stamp: the marker comes from the record's bytes"
+    );
+    assert!(!world.system_flag_test(0x142), "no victory latch either");
+    // Loot resolution also writes no flags.
+    let cat = legaia_engine_battle::monster_catalog::MonsterCatalog::new();
+    let formation = world.tables.formation_table.formation(17).cloned().unwrap();
+    let _ = world.apply_battle_loot(&formation, &cat);
+    assert!(!world.system_flag_test(0x289));
+    assert!(!world.system_flag_test(0x142));
+}
+
+#[test]
+fn a_zero_header_scripted_row_is_an_escapable_fight() {
+    use legaia_engine_battle::monster_catalog::{FormationDef, FormationSlot};
+    // The Rim Elm ambush shape: `3E FF 03` onto a row whose header byte is
+    // `0` (town0c row 3). Retail keeps `ctx+0x287 = 0` for it, so Run stays
+    // open, the formation roll runs, and the map arm alone seats it.
+    let mut world = World::new();
+    world.set_active_scene_label("town0c");
+    world.battle.map_id = 0x15;
+    world.tables.formation_table.insert(FormationDef::new(
+        3,
+        [0x3F, 0x3E, 0x3E, 0x3E]
+            .into_iter()
+            .map(FormationSlot::new)
+            .collect(),
+    ));
+    world.mode = SceneMode::Field;
+    assert!(world.trigger_scripted_battle(3));
+    for _ in 0..200 {
+        if world.mode == SceneMode::Battle {
+            break;
+        }
+        world.tick();
+    }
+    assert!(matches!(world.mode, SceneMode::Battle));
+    assert!(!world.battle.no_escape, "zero header byte: Run stays open");
+    assert!(!world.battle.scripted_fight);
+    assert_eq!(world.battle_ctx.scripted_fight, 0);
+    assert_eq!(
+        world.battle.special_word,
+        legaia_engine_battle_vm::battle_formulas::SPECIAL_RASERU_FORBIDDEN,
+        "the formation roll ran and its map-gated arm raised 0x200"
+    );
+}
+
+#[test]
+fn the_battle_intro_sm_runs_through_the_transition_phase() {
+    use legaia_engine_battle::encounter::{EncounterPhase, EncounterRoll};
+    use legaia_render_kernels::battle_intro_transition::TransitionEffect;
+
+    let mut world = World::new();
+    let mut session = legaia_engine_battle::encounter::EncounterSession::new(
+        legaia_engine_battle::encounter::EncounterTracker::new(
+            legaia_engine_battle::encounter::EncounterTable::default(),
+        ),
+    );
+    session.trigger_with(EncounterRoll {
+        formation_id: 3,
+        row_index: 0,
+        roll_q8: 0,
+    });
+    world.set_encounter_session(Some(session));
+    world.set_battle_bgm(Some(2001));
+
+    // Phase 0 arms the audio cue, phase 1 clears mesh assembly, phase 2 is the
+    // BGM + bundle load - three ticks reach it.
+    world.tick_encounter();
+    assert!(
+        world.battle.intro.is_some(),
+        "armed on the transition frame"
+    );
+    world.tick_encounter();
+    world.tick_encounter();
+    assert!(
+        world
+            .battle
+            .intro_effects
+            .iter()
+            // The id is the field script's battle sound set (`0` after a
+            // scene entry), never the formation id.
+            .any(|e| matches!(e, TransitionEffect::LoadBattleBgm { battle_id: 0 })),
+        "phase 2 loads the battle BGM: {:?}",
+        world.battle.intro_effects
+    );
+    assert_eq!(
+        world.audio.current_bgm,
+        Some(2001),
+        "the BGM swap runs during the spin, not at battle entry"
+    );
+
+    // Leaving the phase drops the entity. The transition's length is retail's
+    // `DAT_801D2458` (`battle_intro_styles::INTRO_DURATION_FRAMES`), so the
+    // bound is read off the session rather than written as a literal.
+    let frames = world.encounters.session.as_ref().unwrap().transition_frames;
+    for _ in 0..frames + 4 {
+        world.tick_encounter();
+    }
+    assert!(matches!(
+        world.encounters.session.as_ref().unwrap().phase(),
+        EncounterPhase::Triggered(_)
+    ));
+    assert!(world.battle.intro.is_none());
+}
+
+#[test]
+fn the_battle_intro_phase_zero_enqueues_the_battle_start_cue() {
+    use legaia_engine_battle::encounter::EncounterRoll;
+    use legaia_render_kernels::battle_intro_transition::{AUDIO_CUE_FLAGGED, AUDIO_CUE_PLAIN};
+
+    // Plain row: retail's phase-0 pre-arm writes ring cue 0x1F, once, on the
+    // first transition frame - the queue both hosts drain every tick.
+    let mut world = World::new();
+    let mut session = legaia_engine_battle::encounter::EncounterSession::new(
+        legaia_engine_battle::encounter::EncounterTracker::new(
+            legaia_engine_battle::encounter::EncounterTable::default(),
+        ),
+    );
+    session.trigger_with(EncounterRoll {
+        formation_id: 3,
+        row_index: 0,
+        roll_q8: 0,
+    });
+    world.set_encounter_session(Some(session));
+    world.tick_encounter();
+    let cues = world.drain_battle_sfx_cues();
+    assert_eq!(cues.len(), 1, "one battle-start cue: {cues:?}");
+    assert_eq!(cues[0].kind, AUDIO_CUE_PLAIN);
+    assert_eq!(cues[0].timing_frames, 0, "fires on the spin's first frame");
+    world.tick_encounter();
+    world.tick_encounter();
+    assert!(
+        world.drain_battle_sfx_cues().is_empty(),
+        "phase 0 runs once per transition - no further cue during the spin"
+    );
+
+    // Flagged row (record[+0] non-zero raises bit 0x80 in the per-battle
+    // flags) under a script's "no battle track" sound set `-1` - the only
+    // arm that reads the flags byte: the flagged store overwrites the plain
+    // one in ring slot 0, so exactly one cue - 0x4D - reaches the queue.
+    let mut world = World::new();
+    world.audio.battle_sound_set = -1;
+    world.tables.formation_table.insert(
+        legaia_engine_battle::monster_catalog::FormationDef::new(9, Vec::new())
+            .with_header_flags(1),
+    );
+    let mut session = legaia_engine_battle::encounter::EncounterSession::new(
+        legaia_engine_battle::encounter::EncounterTracker::new(
+            legaia_engine_battle::encounter::EncounterTable::default(),
+        ),
+    );
+    session.trigger_with(EncounterRoll {
+        formation_id: 9,
+        row_index: 0,
+        roll_q8: 0,
+    });
+    world.set_encounter_session(Some(session));
+    world.tick_encounter();
+    let cues = world.drain_battle_sfx_cues();
+    assert_eq!(
+        cues.len(),
+        1,
+        "slot-0 overwrite: one cue, not two: {cues:?}"
+    );
+    assert_eq!(cues[0].kind, AUDIO_CUE_FLAGGED);
+}
+
+/// The battle track follows the field script's battle sound set
+/// (`_DAT_8007B880`, op-`0x35` sub-op `7`): `-1` keeps the field score
+/// through the fight with nothing stashed, `N > 0` plays battle bundle
+/// `0x36F + N`'s track, and `0` the configured default.
+#[test]
+fn the_battle_sound_set_picks_the_battle_track() {
+    use legaia_engine_battle::encounter::EncounterRoll;
+    let run = |set: i32| {
+        let mut world = World::new();
+        world.audio.current_bgm = Some(2028);
+        world.audio.battle_sound_set = set;
+        world.set_battle_bgm(Some(
+            legaia_engine_system::music_labels::BATTLE_THEME_1_BGM_ID,
+        ));
+        let mut session = legaia_engine_battle::encounter::EncounterSession::new(
+            legaia_engine_battle::encounter::EncounterTracker::new(
+                legaia_engine_battle::encounter::EncounterTable::default(),
+            ),
+        );
+        session.trigger_with(EncounterRoll {
+            formation_id: 3,
+            row_index: 0,
+            roll_q8: 0,
+        });
+        world.set_encounter_session(Some(session));
+        for _ in 0..3 {
+            world.tick_encounter();
+        }
+        (
+            world.audio.current_bgm,
+            world.audio.battle_bgm_active,
+            world.audio.field_bgm_resume,
+        )
+    };
+    assert_eq!(run(0), (Some(2026), true, Some(2028)));
+    assert_eq!(run(8), (Some(2061), true, Some(2028)), "Cort's bundle");
+    assert_eq!(
+        run(-1),
+        (Some(2028), false, None),
+        "the boss theme plays on"
+    );
+}
+
+#[test]
+fn op_35_sub_7_stores_the_battle_sound_set() {
+    let mut world = World::new();
+    {
+        use legaia_engine_vm::field::FieldAudioHost;
+        let mut host = FieldHostImpl { world: &mut world };
+        host.bgm(0xFFFF, 7);
+    }
+    assert_eq!(world.audio.battle_sound_set, -1);
+}
+
+#[test]
+fn the_bgm_op_sub_5_arms_the_timed_sound_release() {
+    // Field-VM op `0x35` sub-`5` is `FUN_800267A8(0, operand)` - a deadline in
+    // vsyncs, not a volume set.
+    let mut world = World::new();
+    world.arm_sound_release(4);
+    let arm = world
+        .audio
+        .sound_arm
+        .expect("the arm half latches its cells");
+    assert_eq!(arm.deadline, 4);
+    assert_eq!(arm.shim_deadline(), 5, "deadline | 1");
+    assert!(world.audio.sound_release.armed);
+}
+
+#[test]
+fn the_sfx_cue_delay_lands_on_the_slot_the_enqueue_parked() {
+    // Two enqueues park slots 0 then 1; the op-0x36 sub-4 delay writes slot 1.
+    let mut world = World::new();
+    for _ in 0..2 {
+        let slot = world.audio.sfx_cue_cursor;
+        world.audio.sfx_cue_cursor = world.audio.sfx_cue_delays.park(slot);
+        world.audio.sfx_parked_slot = slot;
+    }
+    assert_eq!(world.audio.sfx_parked_slot, 1);
+    assert_eq!(world.audio.sfx_cue_cursor, 2);
+    world
+        .audio
+        .sfx_cue_delays
+        .set_delay(world.audio.sfx_parked_slot, 0x30);
+    assert_eq!(world.audio.sfx_cue_delays.delay(1), Some(0x30));
+    assert_eq!(world.audio.sfx_cue_delays.delay(0), Some(0));
+}
+
+#[test]
+fn a_scene_load_clears_the_tile_board_with_the_control_block() {
+    // `FUN_8003A024` zeroes `_DAT_8007B450` (the tile-descriptor pointer) as
+    // part of the per-scene control-block reset, so a board cannot survive a
+    // scene change.
+    let mut world = World::new();
+    world.board.grid = Some(legaia_engine_minigames::tile_board::TileBoard::from_header(
+        &legaia_engine_minigames::tile_board::TileBoardHeader {
+            width: 2,
+            height: 2,
+            ..Default::default()
+        },
+        vec![0; 4],
+    ));
+    world.board.armed = true;
+    world.reset_scene_control_block();
+    assert!(world.board.grid.is_none());
+    assert!(!world.board.armed);
+    assert_eq!(
+        world.scene_control_block,
+        legaia_engine_system::scus_leaf_kernels::SCENE_CONTROL_BLOCK_RESET
+    );
+}
+
+/// The swirl (formation slot 0 `0xB5`) runs retail's 252-frame transition;
+/// every other style keeps 132. The session arms before the style is known,
+/// so the world rebases it on the transition's first frame - and the entity
+/// clock counts the whole longer window.
+#[test]
+fn the_swirl_transition_runs_its_own_252_frames() {
+    use legaia_engine_battle::encounter::{EncounterPhase, EncounterRoll};
+    use legaia_engine_battle::monster_catalog::{FormationDef, FormationSlot};
+    use legaia_render_kernels::battle_intro_styles::{
+        INTRO_DURATION_FRAMES, INTRO_DURATION_FRAMES_SWIRL,
+    };
+
+    let run = |slot0: u16| {
+        let mut world = World::new();
+        world
+            .tables
+            .formation_table
+            .insert(FormationDef::new(7, vec![FormationSlot::new(slot0)]));
+        let mut session = legaia_engine_battle::encounter::EncounterSession::new(
+            legaia_engine_battle::encounter::EncounterTracker::new(
+                legaia_engine_battle::encounter::EncounterTable::default(),
+            ),
+        );
+        session.trigger_with(EncounterRoll {
+            formation_id: 7,
+            row_index: 0,
+            roll_q8: 0,
+        });
+        world.encounters.session = Some(session);
+        let mut ticks = 0;
+        let mut last_elapsed = 0;
+        while matches!(
+            world.encounters.session.as_ref().unwrap().phase(),
+            EncounterPhase::Transition { .. }
+        ) {
+            world.tick_encounter();
+            if let Some(e) = world.battle.intro {
+                last_elapsed = e.elapsed;
+            }
+            ticks += 1;
+            assert!(ticks < 1000, "the transition ends");
+        }
+        (ticks, last_elapsed)
+    };
+
+    let (swirl_ticks, swirl_clock) = run(0xB5);
+    assert_eq!(swirl_clock as i32, INTRO_DURATION_FRAMES_SWIRL);
+    assert_eq!(swirl_ticks, INTRO_DURATION_FRAMES_SWIRL + 1);
+    let (plain_ticks, plain_clock) = run(0x01);
+    assert_eq!(plain_clock as i32, INTRO_DURATION_FRAMES);
+    assert_eq!(plain_ticks, INTRO_DURATION_FRAMES + 1);
+}

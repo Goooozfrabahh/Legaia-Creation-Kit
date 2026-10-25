@@ -1,0 +1,706 @@
+//! World-level constants, collision/probe tables, timeline budgets, and
+//! small pure helpers extracted verbatim from `world.rs`.
+
+use super::*;
+
+/// Number of stat-bearing battle slots (party + monsters). Indexes
+/// [`crate::world::BattleState::attack`] / [`crate::world::BattleState::defense`] / [`crate::world::BattleState::speed`]
+/// and bounds the turn-order initiative scan.
+pub(crate) const BATTLE_SLOTS: usize = 8;
+
+/// Default `start_slot` engines pass to
+/// [`World::materialize_actor_spawns`]. Slots `0..FIELD_SPAWN_START_SLOT`
+/// stay reserved so the field-VM actor-allocator path can't clobber the
+/// party (slots `0..party_count`, typically 0..3) or the small band of
+/// scripted NPC / cutscene actors the scene reserves above the party.
+/// The exact retail value is unknown - 8 is the smallest power-of-two
+/// that comfortably brackets every observed `party_count + scripted-NPC`
+/// span and matches the start-slot the field-VM unit tests use.
+pub const FIELD_SPAWN_START_SLOT: u8 = 8;
+
+/// Per-frame opcode cap for the move VM. Retail has no explicit cap (relies
+/// on opcodes naturally yielding via `WAIT_SET` / `HALT`); for a software
+/// port we set a generous defensive cap so a buggy script can't hang the
+/// engine. 4096 is well above the largest real Tactical-Arts move script.
+pub const MOVE_VM_BUDGET: usize = 4096;
+
+/// World units the player actor advances per frame while interpolating
+/// to a target tile centre during a tile-board step. Retail derives the
+/// per-frame delta from the frame-speed scalar `DAT_1f800393`
+/// (`overlay_0897_801ef2b0` case 2); the engine uses a fixed cadence of
+/// `TILE / 8` (16 units) - eight frames to cross one 128-unit tile.
+pub(crate) const TILE_BOARD_SPEED: i32 = legaia_engine_minigames::tile_board::TILE / 8;
+
+/// Bytes per row of the field collision grid (retail `0x80`-byte rows at
+/// `*(_DAT_1F8003EC) + 0x4000`).
+pub(crate) const FIELD_GRID_STRIDE: usize = 0x80;
+/// Total field-collision-grid size: `0x80` rows of `0x80` bytes.
+pub(crate) const FIELD_GRID_LEN: usize = FIELD_GRID_STRIDE * 0x80;
+/// How far [`crate::world::World::nearest_standable_seat`] will nudge a seat
+/// that lands off the walkable grid, in 64-unit collision sub-cells (8 = four
+/// 128-unit tiles). Retail's own door-arrival tiles are standable and never
+/// reach this path; the bound keeps a *derived* seat's correction local
+/// enough to still be the spot the caller named.
+pub(crate) const SEAT_RESCUE_RADIUS_SUBCELLS: i32 = 8;
+/// Smallest enclosed open-floor region, in 64-unit sub-cells (32 = eight
+/// 128-unit tiles), a door arrival must stand in to seat a scene-picker entry
+/// ([`crate::world::World::picker_arrival_seat`]); anything smaller is a
+/// sealed pocket the grid leaves open, not a room.
+pub const PICKER_ARRIVAL_MIN_REGION_SUBCELLS: usize = 32;
+/// Retail's field **run-button mask**, in this crate's `PadButton` bit
+/// layout: `Cross | R1`. Hold either to invert the Field Move option (the
+/// XOR in [`crate::world::World::field_run_active`]).
+///
+/// Retail keeps it as the config word `0x800846DC` (= `0x80084140 + 0x59C`),
+/// whose value is the *packed* pad word's `0x48` - `li v0,0x48` /
+/// `sw v0,0x59c(s0)` at `0x80034AB4`/`0x80034AB8` in the new-game data init
+/// `FUN_80034A6C`, read at `lw v1,0x59c(a0)` / `and v0,v0,v1` against the
+/// held pad `_DAT_8007B850` at `0x801D0364`. `FUN_80034A6C` is its only
+/// writer anywhere on the disc, so retail's run button is not configurable;
+/// the port's is, because the pad word is assembled from the host's key
+/// bindings (`legaia-engine config set --binding W=R1`) rather than from a
+/// PSX controller.
+///
+/// See [`field-locomotion.md`](../../../../docs/subsystems/field-locomotion.md).
+///
+/// REF: FUN_80034A6C
+pub const FIELD_RUN_BUTTON_MASK_RETAIL: u16 = legaia_engine_system::input::PadButton::Cross as u16
+    | legaia_engine_system::input::PadButton::R1 as u16;
+
+/// The engine's default run-button mask: retail's two buttons plus **Square**
+/// as an alternate.
+///
+/// Square is not retail's - it is the *debug turbo* bit (`_DAT_8007B850 &
+/// 0x80`, the arm at `0x801D03DC`, gated off by two debug words on retail) and
+/// it was for a while the port's only run binding, which is the divergence
+/// this default removes. It stays in the mask so a player who learned the
+/// port's binding keeps it; a host that wants the retail button set exactly
+/// assigns [`FIELD_RUN_BUTTON_MASK_RETAIL`] to
+/// [`crate::world::FieldLocomotion::run_button_mask`].
+pub const FIELD_RUN_BUTTON_MASK_DEFAULT: u16 =
+    FIELD_RUN_BUTTON_MASK_RETAIL | legaia_engine_system::input::PadButton::Square as u16;
+
+/// Base walk step (retail `base_step = 8` in `FUN_801d01b0`). Scaled by the
+/// player's `+0x72` speed multiplier and the per-frame delta scalar.
+///
+/// One of four values the controller's selector picks between before the
+/// multiply at `0x801D056C` (`mult $s4, $v0`, `$s4` = base step, `$v0` =
+/// `player[+0x72]`). The other three are below; the selector itself is
+/// [`crate::world::World::field_base_step`].
+pub(crate) const FIELD_BASE_STEP: i32 = 8;
+/// Run base step (retail `0x801D03A0`: `addiu $s4, $zero, 0xc`). Selected
+/// when the run condition holds - see
+/// [`crate::world::World::field_run_active`] for the XOR that picks it.
+pub(crate) const FIELD_BASE_STEP_RUN: i32 = 0xc;
+/// Forced-slow base step (retail `0x801D0354`: `addiu $s4, $zero, 5`, in the
+/// delay slot of the `j 0x801D03A4` the set `_DAT_8007B6A8` arm takes). The
+/// jump lands past the run test, so a forced walk cannot be run out of; the
+/// debug-turbo test after it still runs. The byte is set on the kingdom
+/// world maps, so this is the overworld's step.
+pub(crate) const FIELD_BASE_STEP_FORCED_SLOW: i32 = 5;
+/// Debug turbo base step (retail `0x801D03DC`: `addiu $s4, $zero, 0x18`).
+///
+/// Taken when the debug-mode word `_DAT_8007B98C`, the dev word
+/// `_DAT_8007B868` and held-pad bit `_DAT_8007B850 & 0x80` (Square) are all
+/// set, and it overwrites whatever the forced-slow or run arm chose. The gate
+/// is [`crate::world::World::field_debug_turbo_held`]; on a retail disc the dev
+/// word is never non-zero, so neither retail nor a shipped host takes it.
+pub(crate) const FIELD_BASE_STEP_DEBUG_TURBO: i32 = 0x18;
+/// The frame step `DAT_1F800393` retail runs the kingdom world maps at: three
+/// vsyncs per game frame, measured off the state-poll `dt` rows of every
+/// retail overworld capture (a town runs at `1` or `2`, where every walk step
+/// is already a whole number of 2-unit sub-steps per vsync).
+///
+/// The port ticks once per vsync, so the overworld walk spreads one retail
+/// frame's displacement - `((5 * 0xC00) >> 12) * 3 = 9`, rounded up to `10`
+/// by the 2-unit stepper - across three ticks
+/// ([`legaia_engine_field::world_map_entity_config::WorldMapState::walk_carry`]). Ticking at `dt = 1` instead
+/// rounds every tick's `3` up to `4`: `4` units a vsync against retail's
+/// `10 / 3`.
+pub(crate) const WORLD_MAP_FRAME_STEP: i32 = 3;
+/// Per-iteration advance of the locomotion step loop (retail commits in
+/// 2-unit increments per axis).
+pub(crate) const FIELD_STEP_UNIT: i32 = 2;
+/// Magnitude retail records into the step-delta globals `0x8007BDE0` /
+/// `0x8007BDE4` alongside each committed [`FIELD_STEP_UNIT`] sub-step
+/// (`0x801d07bc`: `addiu v0, zero, -8` next to the `-= 2` position write).
+///
+/// It is a **probe scale, not a distance**: nothing moves 8 units per
+/// sub-step. The ledge-hop probe `FUN_801d1878` multiplies it by 4 and
+/// samples the collision grid at 2x and 3x the product, putting its two
+/// probes 64 and 96 world units ahead - exactly one and one-and-a-half
+/// 64-unit collision sub-cells.
+pub(crate) const FIELD_PROBE_DELTA: i16 = 8;
+/// Retail's ledge-hop floor-height thresholds (`FUN_801d1878`, the
+/// `slti 0x61` / `slti -0x60` pair at `0x801D1B14` / `0x801D1B1C`), applied
+/// to `floor_ahead - actor_y`.
+///
+/// The names carry the **world** direction, not the sign of the difference,
+/// because world Y grows downward and the two disagree: a difference
+/// `>= +0x61` means the floor ahead sits at a numerically larger Y, i.e.
+/// lower, so it is the **drop** arm (`kind 0x10`, the shorter apex). One
+/// `< -0x60` is the floor ahead sitting above the actor - the **step up**
+/// (`kind 0x18`, the taller apex that clears the lip). Anything between is
+/// flat ground and starts no hop.
+pub(crate) const FIELD_HOP_DOWN_THRESHOLD_DOWNWARD: i32 = 0x61;
+/// Upward companion of [`FIELD_HOP_DOWN_THRESHOLD_DOWNWARD`].
+pub(crate) const FIELD_HOP_UP_THRESHOLD_DOWNWARD: i32 = -0x60;
+/// Clip length retail always passes as `FUN_801d2404`'s `a2`
+/// (`addiu a2, zero, 0x10` at `0x801D1B60`): 16 frames of arc, which the
+/// setup turns into the `0x1000 / 0x10` cursor step.
+// REF: FUN_801d2404
+pub(crate) const FIELD_HOP_CLIP_FRAMES: i16 = 0x10;
+/// Retail player speed multiplier installed by the scene-entry map-init
+/// `FUN_8003aeb0` (`player[+0x72] = 0x1000`, a `12.0` fixed-point `1.0`).
+pub(crate) const FIELD_PLAYER_SPEED_MULT: u16 = 0x1000;
+
+/// Retail static-wall leading-edge probe table `DAT_801f2214` (field overlay
+/// 0897, file offset `0x239FC`), decoded from the disc. Indexed by travel
+/// direction (`0` = Z-, `1` = X-, `2` = Z+, `3` = X+; the `FUN_801cfe4c`
+/// `param_3` convention), three `(dx, dz)` pairs each, applied to the
+/// player's CURRENT position as `(x + dx, z - dz)` - note the Z delta is
+/// SUBTRACTED, exactly as the retail probe reads it. A direction is blocked
+/// when ANY of its three probes lands on a wall sub-cell.
+///
+/// The lookahead is asymmetric on purpose: the `+2`-biased Z mapping and the
+/// `ceil-1` X mapping ([`World::field_tile_is_wall`]) make 48 the crossing
+/// distance in the positive directions and 47 in the negative ones, so each
+/// edge sits one full tile ahead in cell space. (The on-disc rows are
+/// 16 bytes; the trailing fourth pair - a half-distance centre point - is
+/// never read by the wall probe and is omitted here.)
+pub(crate) const FIELD_WALL_PROBES: [[(i16, i16); 3]; 4] = [
+    [(-16, 48), (0, 48), (16, 48)], // dir 0: Z- (edge at z-48, ±16 in X)
+    [(-47, -16), (-47, 0), (-47, 16)], // dir 1: X- (edge at x-47, ±16 in Z)
+    [(-16, -47), (0, -47), (16, -47)], // dir 2: Z+ (edge at z+47, ±16 in X)
+    [(48, -16), (48, 0), (48, 16)], // dir 3: X+ (edge at x+48, ±16 in Z)
+];
+
+/// Retail actor-collision probe table `DAT_801f21b4` (field overlay 0897,
+/// file offset `0x2399C`, the sibling 0x60 bytes before
+/// [`FIELD_WALL_PROBES`]'s `DAT_801f2214`), decoded from the disc. Same
+/// shape and `(x + dx, z - dz)` application as the wall table, but the
+/// probes feed the per-actor box test `FUN_801cfc40` instead of the
+/// walkability grid: a wider sweep (64/63 ahead, ±32 lateral vs the wall
+/// probes' 48/47, ±16) because actors block with a body box rather than a
+/// sub-cell edge. The trailing fourth on-disc pair (a half-distance centre
+/// point, `(0,32)`-class) is never read by `FUN_801cfe4c` and is omitted.
+pub(crate) const FIELD_ACTOR_PROBES: [[(i16, i16); 3]; 4] = [
+    [(-32, 64), (0, 64), (32, 64)], // dir 0: Z- (probes at z-64, ±32 in X)
+    [(-63, -32), (-63, 0), (-63, 32)], // dir 1: X- (probes at x-63, ±32 in Z)
+    [(-32, -63), (0, -63), (32, -63)], // dir 2: Z+ (probes at z+63, ±32 in X)
+    [(64, -32), (64, 0), (64, 32)], // dir 3: X+ (probes at x+64, ±32 in Z)
+];
+
+/// Half-extent of the box a field NPC blocks with, around its live position:
+/// retail `FUN_801cfc40` classes village NPCs as **moving actors** (`flags &
+/// 0x1020000 != 0`) and tests `|probe - pos| < 0x40 + (ex - 0x18)` per axis
+/// with the locomotion's caller extents `ex = 0`, i.e. ±40 units.
+/// Capture-pinned by `rimelm_npc_press_tetsu`: the sparring partner's flags
+/// (`0x08020884`) carry the `0x20000` class bit, putting him on this arm
+/// (result bit `1`), with the mutual `+0x98` collision link live in-frame.
+/// (STATIC entities - props, `flags & 0x1020000 == 0` - use a wider
+/// `0x40 + 0x10` = 80-unit box around their MAN record anchor instead; see
+/// [`FIELD_PROP_BOX_HALF`] / [`crate::world::FieldPropState::colliders`].)
+pub(crate) const FIELD_NPC_BOX_HALF: i32 = 0x40 - 0x18;
+
+/// Retail interact facing-probe table `DAT_801f2254` (field overlay 0897,
+/// file offset `0x23A3C`, `0x40` bytes after [`FIELD_WALL_PROBES`]'s
+/// `DAT_801f2214`), decoded from the disc. One `(dx, dz)` displacement per
+/// 45° facing sector - a radius-64 compass point - applied to the player's
+/// position with the shared `(x + dx, z - dz)` convention, so every entry
+/// points 64 units *ahead* of the player along its sector's facing.
+/// Indexed by the retail sector `(facing & 0xfff) >> 9` where retail facing
+/// `0` looks along Z- (the engine's field heading stores `0` = Z+, a
+/// half-turn off - see [`World::field_interact_probe_slot`]).
+///
+/// Retail reads this table in `FUN_801d01b0`'s touch dispatch: when the
+/// configured interact button is just-pressed (`_DAT_8007b874 &
+/// _DAT_800846d0`) it probes this single point through `FUN_801cf9f4` with
+/// extents `0x20` and treats a result bit `1` (moving-class actor hit) as
+/// "talk to that actor".
+pub(crate) const FIELD_FACING_PROBES: [(i16, i16); 8] = [
+    (0, 64),    // sector 0: facing Z- -> probe (x, z-64)
+    (-64, 64),  // sector 1: Z- / X- diagonal
+    (-64, 0),   // sector 2: facing X- -> probe (x-64, z)
+    (-64, -64), // sector 3: X- / Z+ diagonal
+    (0, -64),   // sector 4: facing Z+ -> probe (x, z+64)
+    (64, -64),  // sector 5: Z+ / X+ diagonal
+    (64, 0),    // sector 6: facing X+ -> probe (x+64, z)
+    (64, 64),   // sector 7: X+ / Z- diagonal
+];
+
+/// Half-extent of the box a field NPC answers the *interact* probe with:
+/// the touch dispatch passes extents `0x20` into `FUN_801cf9f4`, whose
+/// moving-actor arm tests `|probe - pos| < 0x40 + (extent - 0x18)` per axis
+/// - ±72 units, wider than the ±40 the locomotion probe gets with its zero
+///   extents ([`FIELD_NPC_BOX_HALF`]).
+pub(crate) const FIELD_INTERACT_BOX_HALF: i32 = 0x40 + 0x20 - 0x18;
+
+/// Half-extent of a STATIC entity's (prop's) collision box: retail's
+/// static arm always tests `|probe - centre| < 0x40 + 0x10` per axis (the
+/// `0x10` is hard-coded, independent of the caller extents that widen the
+/// moving-actor box) - ±80 units around the record-derived footprint centre.
+pub(crate) const FIELD_PROP_BOX_HALF: i32 = 0x40 + 0x10;
+
+/// Retail camera-relative pad-direction ring (`DAT_800766fc`, static
+/// `SCUS_942.54` file offset `0x66EFC`, eight `u32` masks), decoded from the
+/// disc. The eight 45° compass directions in rotation order: `Z+`, `Z+/X+`,
+/// `X+`, `X+/Z-`, `Z-`, `Z-/X-`, `X-`, `X-/Z+`. `func_0x800467e8` remaps a
+/// held direction `d` by the camera's rotation index (`gp+0x2d8`, 0..7 eighth
+/// -turns) to `RING[(index_of(d) + rot) & 7]` - see
+/// [`World::remap_pad_direction`].
+pub(crate) const FIELD_DIR_RING: [u16; 8] = [
+    0x1000, 0x3000, 0x2000, 0x6000, 0x4000, 0xC000, 0x8000, 0x9000,
+];
+
+/// Retail wall-slide direction rows (`DAT_800766bc`, static `SCUS_942.54`
+/// file offset `0x66EBC`, four 8-byte `{u32 mask, s16 dx, s16 dy}` records),
+/// decoded from the disc. One per cardinal direction: the direction bit and
+/// the ±62-unit forward probe offset the slide resolver tests. Same axis
+/// convention as [`FIELD_WALL_PROBES`] (`0x1000`=Z+, `0x4000`=Z-,
+/// `0x2000`=X+, `0x8000`=X-), applied as `(x + dx, z + dy)`. See
+/// [`World::resolve_field_slide`] (`FUN_80046494`).
+pub(crate) const FIELD_SLIDE_DIRS: [(u16, i32, i32); 4] = [
+    (0x4000, 0, -62), // Z-
+    (0x8000, -62, 0), // X-
+    (0x1000, 0, 62),  // Z+
+    (0x2000, 62, 0),  // X+
+];
+
+/// Retail wall-slide lateral sweep offsets (`DAT_800766ec`, static
+/// `SCUS_942.54` file offset `0x66EEC`; the resolver reads the first **seven**
+/// `s16` entries - the eighth is padding), decoded from the disc. Probed
+/// perpendicular to the travel axis from the blocked candidate point; the
+/// signed sum of the offsets that come back walkable picks the slide side.
+pub(crate) const FIELD_SLIDE_SWEEP: [i32; 7] = [-96, -64, -32, 0, 32, 64, 96];
+
+/// Retail wall-slide result bits (`DAT_800766dc`/`DAT_800766de`, static
+/// `SCUS_942.54` file offset `0x66EDC`), decoded from the disc: per direction
+/// row, `(negative_total_bit, positive_total_bit)` - the perpendicular
+/// direction ORed into the resolved mask when the sweep sum is negative /
+/// positive respectively (a symmetric dead end sums to zero and slides
+/// nowhere). Z-travel rows slide sideways in X, X-travel rows slide in Z.
+pub(crate) const FIELD_SLIDE_BITS: [(u16, u16); 4] = [
+    (0x8000, 0x2000), // row0 Z-: X- / X+
+    (0x4000, 0x1000), // row1 X-: Z- / Z+
+    (0x8000, 0x2000), // row2 Z+: X- / X+
+    (0x4000, 0x1000), // row3 X+: Z- / Z+
+];
+
+/// The lateral half-spread of the wall-slide resolver's three-point block
+/// test (`0x21` = 33 units): retail probes the candidate point at
+/// `±FIELD_SLIDE_LATERAL` along the axis perpendicular to travel plus dead
+/// centre, so a corner clips before the centre does.
+pub(crate) const FIELD_SLIDE_LATERAL: i32 = 0x21;
+
+/// Per-frame world-unit budget for one field-NPC motion-VM step.
+///
+/// Retail derivation (static, `FUN_8003774C` in `overlay_0897`, cases 0x37 /
+/// 0x41 / 0x47 - the NPC glide/pursue path): the per-frame glide magnitude is
+/// the global per-frame delta `_DAT_1f800393` scaled by a base step encoded
+/// **in the motion op's own operand** (`4 << (operand bits)`; the 0x47 case
+/// steps `0x80 / (4 << (op[2] & 7))` units per inner iteration, iterated
+/// `_DAT_1f800393` times). The actor `+0x72` speed multiplier does **not**
+/// participate: `FUN_8003774C` never reads `+0x72`. The `+0x72` multiplier
+/// path (`speed = ((base_step * actor[+0x72]) >> 12) * _DAT_1f800393`) is
+/// exclusive to the player free-movement controller `FUN_801d01b0`
+/// (`overlay_0897_801d0684`) - the sole `>> 0xc` speed-scale in the corpus.
+/// The task-B6 "+0x72 NPC glide path" premise is falsified by the dumps.
+///
+/// The engine drives NPC legs through a synthetic single-op `0x47` program
+/// (see [`FIELD_NPC_MOTION_PROGRAM`]) whose operand bytes are zero, so the
+/// motion VM cannot decode the base step from the program itself; instead the
+/// engine derives each placement's glide speed from the placement's **real
+/// walk-kernel operands** off the disc
+/// ([`legaia_engine_field::man_field_scripts::placement_glide_speed`]: the MAN
+/// tail-section-1 wander/step ops first, then the record's own field-VM
+/// `0x37`/`0x41`/`0x47` yield ops) and writes it into the leg's
+/// [`vm::motion_vm::MotionState::speed`]. This constant is the **fallback**
+/// used when a placement carries no walk-kernel op at all (and for the
+/// actor-VM sprite glide, which has no MAN motion operand): base step 8 =
+/// `field_npc_glide_speed(2)`, so a placement with the default base-step
+/// selector paces exactly as this stand-in did.
+pub(crate) const FIELD_NPC_MOTION_SPEED: u16 = 8;
+
+#[cfg(test)]
+use legaia_engine_field::man_field_scripts::field_npc_glide_speed;
+pub(crate) use legaia_engine_field::man_field_scripts::field_npc_walk_step_speed;
+
+/// Motion-VM bytecode for one field-NPC walk leg: a single `0x47`
+/// `MoveTowardTarget` op (the pursue/glide opcode of `FUN_8003774C`). The
+/// engine resets the cursor per leg, so the one-op program is the whole
+/// script.
+pub(crate) const FIELD_NPC_MOTION_PROGRAM: [u8; 1] =
+    [legaia_engine_motion_vm::motion_vm::MotionOp::MoveTowardTarget as u8];
+
+/// One NPC's **ambient facing** channel - the idle turn-in-place behaviour of
+/// the second motion VM (`FUN_80038158` ops `0x04` / `0x0D`), driven by the
+/// [`legaia_engine_motion_vm::ambient_motion::AmbientMotion`] port.
+///
+/// The stream arrives as MAN tail-section 1: one motion record per bound
+/// actor, each carrying a table of gated *variants*
+/// ([`legaia_scene_formats::man_motion::stream_variants`]). Retail's interpreter
+/// preamble re-selects the live variant every tick - the first variant whose
+/// `DAT_80085758` system flag is set, else the `0xFFFF` default - so the
+/// selection is re-run per tick here too rather than frozen at scene load,
+/// and a swap reseeds the VM cursor the way the retail preamble does.
+#[derive(Debug, Clone)]
+pub struct FieldNpcAmbient {
+    /// `(selector, bytecode)` per variant, in header-table order. The
+    /// selector is the raw `MotionVariant::selector`: `0xFFFF` = default,
+    /// else `selector & 0xFFF` is the gating system-flag id.
+    pub variants: Vec<(u16, Vec<u8>)>,
+    /// Index into [`Self::variants`] the VM is currently running, or `None`
+    /// before the first tick has selected one.
+    pub live: Option<usize>,
+    /// The ambient facing interpreter (PC, cursor, raw `+0x26` heading, and
+    /// the actor's own slice of the `0x801C66A0` ramp pool).
+    pub vm: legaia_engine_motion_vm::ambient_motion::AmbientMotion,
+    /// Any variant of this stream carries a walk op (`0x03`/`0x19`/`0x20`
+    /// directional step or `0x18` AABB wander), so this placement's motion
+    /// is the ambient VM's business.
+    ///
+    /// Retail dispatches the two per-actor motion VMs off *different* actor
+    /// flag bits (`+0x10 & 0x80` for this one, `& 0x400` for the pursue VM
+    /// at `FUN_8003774C`), so no actor is ever walked by both. The engine
+    /// keeps that exclusivity by standing the autonomous patrol substitute
+    /// down for the slots this flag marks - scripted legs (interaction
+    /// prologue, cutscene timeline) still win, exactly as they outrank a
+    /// patrol.
+    pub walks: bool,
+    /// The binding's `+0x8A` bit 0: the stream **defers to the player**.
+    /// `FUN_80038158` opens by testing it (`0x80038188..0x80038194`), and
+    /// with it set the tick returns without executing anything while the
+    /// player carries the engaged bit `+0x10 & 0x80000` (a conversation, a
+    /// menu, a scripted beat), while the actor's own `+0x10 & 0x500` is up
+    /// (its script running, or a walk-kernel halt), or while it stands on the
+    /// off-map park (`0x8003819C..0x800381F4`). A zero byte keeps
+    /// choreographing through a cutscene.
+    pub defers: bool,
+}
+
+impl FieldNpcAmbient {
+    /// Retail's per-tick variant re-selection: the first flag-gated variant
+    /// whose system flag is set, else the `0xFFFF` default. Returns an index
+    /// into [`Self::variants`].
+    ///
+    /// REF: FUN_80038158 (interpreter preamble), FUN_8003A9D4 (binding)
+    pub fn select_variant(&self, flag: impl Fn(u16) -> bool) -> Option<usize> {
+        self.variants
+            .iter()
+            .position(|(sel, _)| {
+                *sel != legaia_scene_formats::man_motion::SELECTOR_DEFAULT && flag(*sel & 0x0FFF)
+            })
+            .or_else(|| {
+                self.variants
+                    .iter()
+                    .position(|(sel, _)| *sel == legaia_scene_formats::man_motion::SELECTOR_DEFAULT)
+            })
+    }
+}
+
+/// Cold field-entry player spawn coordinate (both X and Z).
+///
+/// On a non-warp (cold) field scene entry, the per-scene initializer
+/// `FUN_801D6704` creates the player actor at actor coords
+/// `(0xA40, 0, 0xA40)` - the centre of the camera's `0x20`-tile view window
+/// (`func_0x80024c88(&local_68=...)`, with the `sVar13`/`sVar14` sub-tile
+/// terms zero for a cold entry). Warp entries (`_DAT_8007b8b8 == 2`) override
+/// X/Z from the saved transition coords `_DAT_80084568`/`_DAT_8008456C`.
+///
+/// Cold entry only ever happens for the New Game opening scene (`town01`,
+/// Rim Elm), so this doubles as Vahn's authored opening spawn. See
+/// `ghidra/scripts/funcs/overlay_0897_801d6704.txt` (the
+/// `func_0x80024c88` call) and `docs/subsystems/field-locomotion.md`.
+pub const FIELD_COLD_SPAWN_XZ: i16 = 0x0A40;
+
+/// Free-roam picker staging: retail-frame width of the scene-entry window in
+/// which a script-issued BGM **pause** is dropped (see
+/// [`crate::world::World::seed_free_roam_story_baseline`]). Entry scripts
+/// pause the just-started track for story moments whose repair (a cutscene
+/// record's sub-9 restart) never runs on a picker visit; five seconds
+/// comfortably covers every observed entry prologue (town01 pauses ~34 sim
+/// ticks in) while leaving player-triggered pauses untouched.
+pub const FREE_ROAM_ENTRY_PAUSE_WINDOW: u64 = 300;
+
+/// Remap a screen-space d-pad delta into overworld direction bits using the
+/// world-map camera azimuth, so "screen up" always walks away from the camera
+/// and "screen right" walks screen-right regardless of how the map is framed.
+///
+/// Mirrors retail `func_0x800467e8`, which remaps the held pad through the same
+/// camera yaw the renderer frames the overworld with. `azimuth` is PSX angle
+/// units (`4096` = full turn).
+///
+/// The frame this compensates is the **walk-view camera** - the retail GTE
+/// composition the play window renders overworld locomotion through
+/// (`psx_camera_mvp(pitch, az, ...) * FIELD_WORLD_FLIP * Scale(6) *
+/// Translate(-player)`, see `window/event_handler/redraw_passes.rs`). At
+/// azimuth `0` that camera is retail's identity frame: world `X+` = screen
+/// right, world `Z+` = screen up, so the unrotated d-pad is the identity
+/// (Up walks `Z+`, Right walks `X+`) - exactly retail's compass ring with
+/// zero octant offset (`docs/subsystems/world-map.md#overworld-axis-convention`).
+/// Non-zero azimuths apply the plain rotation (determinant `+1`).
+///
+/// An earlier body compensated `world_map_camera_mvp` instead - the
+/// **top-view debug** camera, which frames azimuth `0` from `+X` with a
+/// reflected screen frame (determinant `-1`). But locomotion never runs
+/// under that camera ([`crate::world::World::step_world_map_locomotion`]
+/// early-returns in top view), so the reflection only ever applied to the
+/// walk view it was wrong for: Up walked screen-left, Right walked screen-
+/// down - the whole d-pad turned 90° + mirrored. If top view ever regains a
+/// mover, it needs its own remap against its own camera; do not re-point
+/// this one at it.
+///
+/// `engine-core`'s `world_map_axis_convention` integration test pins the
+/// pad→`move_state` leg of this contract.
+///
+/// `sx` is the screen-right delta (`+1` = Right pressed), `sy` the
+/// screen-up delta (`+1` = Up pressed). Returns the post-remap convention
+/// bits (`0x1000` = Z+, `0x4000` = Z-, `0x2000` = X+, `0x8000` = X-), quantised
+/// to 8 directions (a world axis is taken when its component is within ~22.5°
+/// of that axis); `0` when nothing is held.
+pub fn world_map_camera_relative_bits(azimuth: i32, sx: i32, sy: i32) -> u16 {
+    if sx == 0 && sy == 0 {
+        return 0;
+    }
+    let theta = (azimuth as f32) / 4096.0 * std::f32::consts::TAU;
+    let (sin, cos) = theta.sin_cos();
+    // screen-up    -> world ( -sinθ,  cosθ )   at θ=0: Z+ (retail identity)
+    // screen-right -> world (  cosθ,  sinθ )   at θ=0: X+
+    let wx = (sx as f32) * cos - (sy as f32) * sin;
+    let wz = (sx as f32) * sin + (sy as f32) * cos;
+    // sin(22.5°): within this band of an axis the press is treated as cardinal;
+    // beyond it (a rotated framing) both bits set and the player walks diagonally.
+    const T: f32 = 0.382_683_43;
+    let mut bits = 0u16;
+    if wz > T {
+        bits |= 0x1000; // Z+
+    } else if wz < -T {
+        bits |= 0x4000; // Z-
+    }
+    if wx > T {
+        bits |= 0x2000; // X+
+    } else if wx < -T {
+        bits |= 0x8000; // X-
+    }
+    bits
+}
+
+/// Starting gold (money) a New Game grants the party.
+///
+/// The retail new-game data-init `FUN_80034A6C` writes the party-gold global
+/// `_DAT_8008459C` (the same word the battle-victory reward writer
+/// `FUN_8004F0E8` credits) to a hardcoded `500` - it is a constant in the
+/// init routine, not a field of the starting-party template. The same routine
+/// also zeroes the story-flag region and calls the stat seed `FUN_800560B4`.
+/// See `ghidra/scripts/funcs/80034a6c.txt`.
+pub const NEW_GAME_STARTING_GOLD: i32 = 500;
+
+/// Scratchpad flag-word bit (`_DAT_1F800394 & 0x0400_0000`, bit 26) that
+/// the opening cutscene `opdeene` raises to arm the handoff to Rim Elm
+/// (`town01`). Retail sets it with field-VM `GFLAG_SET 26` (op `0x2E`
+/// operand `0x1A`) at the end of the prologue cutscene timeline, and the
+/// per-frame field controller `FUN_801D1344` consumes it (with the
+/// confirm-press gate) to issue the name-based scene change. See
+/// [`World::arm_prologue_handoff`] / [`World::take_prologue_handoff`].
+pub const PROLOGUE_HANDOFF_FLAG: u32 = 1 << PROLOGUE_HANDOFF_BIT;
+
+/// Scratchpad flag-bit index (`26`) of [`PROLOGUE_HANDOFF_FLAG`]. This is
+/// the operand of the prologue cutscene's `GFLAG_SET` op (`0x2E 0x1A`); the
+/// data-driven arm [`World::arm_prologue_handoff_from_man`] matches a MAN
+/// `GFLAG_SET` against this bit.
+pub const PROLOGUE_HANDOFF_BIT: u32 = 26;
+
+/// Scratchpad flag-word bit (`_DAT_1F800394 & 0x0040_0000`, bit `22`) that
+/// enables the field camera's **per-frame zone re-query**.
+///
+/// The field per-frame update tests it at `0x801D17F0` before running
+/// `FUN_801DE234` + `FUN_801DE3E0` at the player's tile; with the bit clear
+/// it only eases (`FUN_801DB510`) and clamps the focus (`FUN_801DAA50`), so
+/// the camera parameter block stays whatever the last script arm or player
+/// seat loaded. The per-mode seed of the flag word copies a `u16`
+/// (`_DAT_1F800394 = *(u16 *)(DAT_800707A0 + mode * 0x18)`), so bit `22`
+/// can only be raised by a field script - op `0x2E` / `0x2F` with operand
+/// `0x16`. **Eight** of the disc's CDNAME scenes carry such a site
+/// (`ropeway`, `station`, `tunnela`, `tunnelb`, `tunnelc`, `nilboa`,
+/// `nilboa2`, `noaru`), all of them `0x2E` SET; a count of fifteen comes from
+/// matching the masked flag bit instead of the literal operand.
+///
+/// REF: FUN_801D1344
+pub const ZONE_REQUERY_FLAG: u32 = 1 << ZONE_REQUERY_BIT;
+
+/// Scratchpad flag-bit index (`22`) of [`ZONE_REQUERY_FLAG`] - the operand
+/// of the `GFLAG_SET` / `GFLAG_CLR` ops that drive it.
+pub const ZONE_REQUERY_BIT: u32 = 22;
+
+/// Per-frame field-VM step budget for the opening-cutscene timeline
+/// ([`World::step_cutscene_timeline`]). Bounds a non-yielding stretch of real
+/// disc bytecode so it can't hang the tick; the timeline normally yields or
+/// waits well within this.
+pub(crate) const CUTSCENE_TIMELINE_STEP_BUDGET: u32 = 256;
+
+/// Frame cap for a cutscene timeline that must return control (the `town01`
+/// opening). If the spawned context never reaches its terminal within this
+/// many frames (≈40 s at 60 fps), the engine forces it complete.
+///
+/// It is an **anti-hang** cap, not a record-length one: the frames a timeline
+/// spends in real authored playout do not count toward it. `World::step_cutscene_timeline`
+/// discounts a walk park, a rotate park, a narration hold and an authored
+/// `0x4A WAIT_FRAMES` hold, and a dialogue park freezes the counter outright.
+/// Counting the `WAIT_FRAMES` holds turned this into a length cap and cut two
+/// real door records - `urudre3` `P2[0]` and `jouine` `P2[16]` need ~5400 and
+/// ~4900 stepping frames to reach their exits - before their tails.
+///
+/// And it counts frames on **one PC**: the counter restarts whenever the
+/// context's PC moves (`CutsceneTimeline::cap_pc`). Retail has no cap on a
+/// script context; one that loops on the player's input plays on until it
+/// comes. `jouinb`'s rapids (P2[6..8]) lap until a direction is held at a
+/// landing, and a counter over the whole ride cut the lap after about
+/// 75000 frames and left the rider on the lap's `MoveTo` seat. Over the
+/// full-game ladder (both passes) the cap ends no record at all.
+///
+/// A record parked on a `4C C5` / `4C C6` system-flag wait holds one PC while
+/// the move-VM part it staged counts its `WAIT_SET`s down in vsyncs (the part
+/// tick drains `frame_step * 8`): `ropeway` `P2[31]` sits on `4C C6 0B` for
+/// about 1200 ticks at frame step 1 before its part clears `0x0B`, so the cap
+/// stands well above that.
+pub(crate) const CUTSCENE_TIMELINE_MAX_FRAMES: u32 = 2400;
+
+/// Frame cap for the `opdeene` prologue timeline. The record arms the
+/// hand-off bit near its TOP (`GFLAG_SET 26` at body `+0x17`) and then plays
+/// the whole vignette choreography - camera beats, actor-channel pokes,
+/// waits - for the narration's duration, so it must NOT complete on the bit;
+/// it runs until the record reaches a terminal state, the player confirms the
+/// hand-off (the scene change drops it), or this generous cap (≈60 s).
+pub(crate) const PROLOGUE_TIMELINE_MAX_FRAMES: u32 = 3600;
+
+/// Per-frame, per-channel field-VM step budget for the spawned per-actor
+/// channels' spawn pre-run ([`World::pre_run_field_channel_prologues`]). Retail slices end at a yield /
+/// park / `0x21` NOP, normally within a handful of ops; the budget bounds a
+/// malformed non-yielding stretch.
+pub(crate) const FIELD_CHANNEL_STEP_BUDGET: u32 = 128;
+
+/// Per-frame field-VM step budget for the **scene system script** (ctx
+/// `0xFB`), the sibling of [`FIELD_CHANNEL_STEP_BUDGET`] for
+/// [`World::step_field_frame_slice`]. Retail's own runner (`FUN_8003CF7C`)
+/// has no cap - it leaves on the `0x21` NOP, a parked PC, or a text byte -
+/// so this only bounds a stream that finds none of the three, which in the
+/// port means a decode that has gone wrong. Overrunning it is not a failure
+/// state: the remaining instructions simply run on the next frame, i.e. the
+/// slice degrades toward the one-instruction-per-tick pacing it replaced.
+/// `town01`'s scene-entry prologue - the longest slice a field scene runs -
+/// is 44 instructions.
+pub(crate) const FIELD_FRAME_SLICE_BUDGET: usize = 256;
+
+/// Bound on the concurrent spawned-record contexts
+/// ([`crate::world::FieldVmState::helper_contexts`]) and the pending op-`0x44` spawn queue
+/// ([`crate::world::FieldVmState::pending_record_spawns`]). Retail's context table is a small
+/// fixed actor-slot pool (`FUN_8003BDE0` allocates from the actor list), so
+/// the container is bounded rather than open-ended; a scene never
+/// legitimately runs this many helper records at once.
+pub const SPAWNED_CONTEXT_SLOTS: usize = 8;
+
+/// Frame budget for a cutscene-timeline channel-completion PARK (the
+/// cross-context `CFLAG_TST` handshake, `B3 <id> <bit>`; see
+/// [`World::step_cutscene_timeline`] and
+/// [`legaia_engine_field::cutscene_timeline::ChannelWait`]).
+///
+/// Retail's op-`0x33` arm parks the timeline at the flag-test while the poked
+/// channel's bit is set and releases it once the bit is clear - normally a
+/// handful of frames while the channel's own script plays its beat. This
+/// bound caps that wait so a channel our port never clears can't stall the
+/// timeline: on expiry the
+/// timeline falls back to the by-width step-past (the pre-handshake behaviour),
+/// keeping the prologue flowing. Sized to a couple of beat-lengths, well under
+/// the [`CUTSCENE_TIMELINE_MAX_FRAMES`] / [`PROLOGUE_TIMELINE_MAX_FRAMES`] caps
+/// so many parks in one record still complete comfortably.
+pub(crate) const CHANNEL_WAIT_PARK_TIMEOUT: u32 = 30;
+
+/// Sub-cell budget (64-unit) for the collision-only walk from a player a
+/// spawned record left off the walk-visible floor back onto it
+/// ([`crate::world::World::field_collision_boxed_in`]). Within it the
+/// player is **not** stranded and the cold-spawn rescue in the helper-context
+/// drain stands aside.
+pub(crate) const STRANDED_COLLISION_REACH: usize = 1024;
+
+/// Park bound for a cross-context **walk-to-tile yield**
+/// (`C7 <id> <tx> <tz> <mode>`, [`legaia_engine_field::cutscene_timeline::TimelineWalk`]).
+/// A walk park is a real playout - the longest authored legs cross a dozen
+/// tiles at the slowest operand speed (1 unit/tick ≈ 1500 ticks) - so this is
+/// sized as a safety net, not a beat length; on expiry the walker snaps to
+/// the op target so the choreography stays coherent.
+pub(crate) const WALK_PARK_TIMEOUT: u32 = 2400;
+
+/// Spin bound for a cutscene record waiting on an NPC's clip end latch
+/// (`AD <id> 08`, [`legaia_engine_field::cutscene_timeline::CutsceneTimeline::npc_clip_spin_frames`]).
+/// A looping clip latches once per wrap and a clamped one on its last frame,
+/// so a live latch lands within one clip length (the scene banks' longest
+/// records run a few hundred frames); only a held clip never latches, and
+/// the record then steps past by width.
+pub const NPC_CLIP_SPIN_TIMEOUT: u32 = 600;
+
+/// Move `cur` toward `target` by at most `max_delta`, snapping exactly
+/// onto `target` when within range. Used by the tile-board interpolator.
+pub(crate) fn step_toward(cur: i32, target: i32, max_delta: i32) -> i32 {
+    let d = target - cur;
+    if d.abs() <= max_delta {
+        target
+    } else if d > 0 {
+        cur + max_delta
+    } else {
+        cur - max_delta
+    }
+}
+
+/// The held d-pad as retail's direction nibble (`0x1000` up, `0x4000` down,
+/// `0x2000` right, `0x8000` left) - the mask the tile board's walker hands
+/// the remapper `FUN_800467E8` (`_DAT_8007B850`, the held word). Opposite
+/// keys cancel, as in the field decode: a d-pad cannot press both, and a
+/// mask outside the compass ring would fall out of the remapper's scan.
+pub(crate) fn tile_board_held_mask(input: &input::InputState) -> u16 {
+    let up = input.pressed(input::PadButton::Up);
+    let down = input.pressed(input::PadButton::Down);
+    let right = input.pressed(input::PadButton::Right);
+    let left = input.pressed(input::PadButton::Left);
+    let mut held = 0u16;
+    if up != down {
+        held |= if up { 0x1000 } else { 0x4000 };
+    }
+    if right != left {
+        held |= if right { 0x2000 } else { 0x8000 };
+    }
+    held
+}
+
+/// Bit 19 of the scratchpad word `0x1F800394` (`World::flags.story_flags`):
+/// while it is up, the walk-on dispatcher `FUN_801D1EC4` re-runs the kind-1
+/// record of the tile the player is standing on every tick
+/// (`0x801D2090..0x801D20F8`), and a tile crossing clears it
+/// (`0x801D2110..0x801D2120`). Field-VM op `2E 13` is its only setter and
+/// `2F 13` its script clear.
+pub const WALK_ON_REPOLL_FLAG: u32 = 0x0008_0000;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn field_npc_glide_speed_derives_the_retail_base_step_ladder() {
+        // `0x80 >> (2 + (bits & 7))`, floored at 1. bits==2 reproduces the
+        // FIELD_NPC_MOTION_SPEED stand-in exactly, so the default path is
+        // behaviourally unchanged.
+        assert_eq!(field_npc_glide_speed(0), 32);
+        assert_eq!(field_npc_glide_speed(1), 16);
+        assert_eq!(field_npc_glide_speed(2), 8);
+        assert_eq!(field_npc_glide_speed(2), FIELD_NPC_MOTION_SPEED);
+        assert_eq!(field_npc_glide_speed(3), 4);
+        assert_eq!(field_npc_glide_speed(4), 2);
+        // 5..=7 floor at 1 (retail never stalls a glide at 0).
+        assert_eq!(field_npc_glide_speed(5), 1);
+        assert_eq!(field_npc_glide_speed(6), 1);
+        assert_eq!(field_npc_glide_speed(7), 1);
+        // Only the low 3 bits select the base step (matches `op[2] & 7`).
+        assert_eq!(field_npc_glide_speed(0xF8), field_npc_glide_speed(0));
+        assert_eq!(field_npc_glide_speed(0x82), field_npc_glide_speed(2));
+    }
+}

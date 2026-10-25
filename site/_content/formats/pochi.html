@@ -1,0 +1,70 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">formats</a> &middot; pochi-filler placeholder slots</div>
+  <h1>Pochi-filler placeholder slots <span class="tag tag-done">Confirmed</span></h1>
+  <p class="lede">Nothing a player ever sees - and that is the point. 266 of the 1233 entries in <code>PROT.DAT</code> (the disc's single big asset archive) are unused placeholder slots, padded with the repeating ASCII word <code>pochi</code> - a common Japanese dog name (<code>ポチ</code>), the kind of fill pattern a developer picks so that uninitialised data is instantly recognisable in a debugger. Each is exactly one 2048-byte sector of fill and nothing else. The game never loads them; tools must learn to step over them, and the one rendering bug ever blamed on them turned out to belong to the entry next door.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>In the game</dt><dd>Never loaded. Reserved slots a scene's asset block set aside and never filled.</dd>
+    <dt>Magic / marker</dt><dd>ASCII <code>pochi</code> at offset 0 and a DOS end-of-file byte <code>0x1A</code> at <code>+0x786</code></dd>
+    <dt>Lives in</dt><dd>266 <a href="prot.html">PROT.DAT</a> entries, each exactly one 2048-byte sector, clustered at fixed positions inside scene <a href="cdname.html">CDNAME</a> blocks</dd>
+    <dt>Parser</dt><dd>Detection class <code>pochi_filler</code> (<code>legaia_disc_audit::categorize::is_pochi_filler</code>)</dd>
+    <dt>Confidence</dt><dd>Confirmed - measured over the whole corpus: every slot is one sector, none carries a parseable TIM.</dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="layout">
+  <h2>Byte layout</h2>
+  <div class="byte-map">
+    <div class="bm-cell bm-accent" style="--w:16"><span class="bm-off">+0x000</span><span class="bm-name">fill: 37 lines of "pochi" &times; 10 + CRLF, then an empty CRLF</span><span class="bm-size">1926 B</span></div>
+    <div class="bm-cell bm-accent" style="--w:1"><span class="bm-off">+0x786</span><span class="bm-name">0x1A</span><span class="bm-size">1</span></div>
+    <div class="bm-cell bm-pad" style="--w:3"><span class="bm-off">+0x787</span><span class="bm-name">inherited</span><span class="bm-size">121 B</span></div>
+  </div>
+  <p>The fill is one 1927-byte text file, byte-identical in every slot; <code>0x1A</code> is the DOS end-of-file marker that closes it. The two bytes before it are the empty line, not a truncated <code>po</code> (both readings give <code>0x786 = 37 &times; 52 + 2</code>; the bytes say <code>\r\n</code>). <code>pochi</code> (ポチ) is a stock Japanese dog name, a common developer fill pattern.</p>
+  <p>The last 121 bytes are <strong>not fill</strong>. In all 266 slots they are byte-identical to what some other, non-filler entry holds at the same file offset - usually the previous entry in archive order. The mastering buffer is indexed by file offset and not cleared between writes, so a 1927-byte file in a 2048-byte sector leaves 121 bytes of the previous write showing through. They say nothing about this slot.</p>
+  <p>Detection is two checks: <code>buf.starts_with(b"pochi") &amp;&amp; buf[0x786] == 0x1A</code>.</p>
+  <p>The same 1927-byte file appears again on the disc, LZS-compressed to 239 bytes: as the trailing type-<code>0x14</code> descriptor of 28 of the 105 count-prefixed <a href="scene-bundles.html">scene bundles</a> - not only the count-4/5 ones, but 9 of 10 count-4, 4 of 4 count-5, 3 of 8 count-6 and 12 of 80 count-7 - and as the leading type-<code>0x0A</code> descriptor of three more. The asset dispatcher answers those types without reading the payload, so those bytes are never decompressed at runtime - the authoring tool filled a reserved descriptor with the same file it fills a reserved archive slot with.</p>
+</section>
+
+<section class="doc-section" id="why-so-many">
+  <h2>Why 266 of them exist</h2>
+  <p>The archive's entries are grouped into named blocks, one per scene, by <a href="cdname.html"><code>CDNAME.TXT</code></a> (the disc's plain-text map of entry names). Each scene's block reserves a fixed run of 6-8 slots for asset variants, but most scenes only fill some of them; whatever a scene didn't use got pochi-filled. That's why the filler slots cluster at fixed <em>offsets within their CDNAME block</em> - typically positions 2, 4, 5, 6.</p>
+  <p>Some scene blocks are almost entirely pochi. The <code>edstati3</code> block (the ending's station-gondola scene in the <a href="../reference/scene-names.html">scene-name table</a>) has 36 of ~38 pochi entries.</p>
+</section>
+
+<section class="doc-section" id="how-to-handle">
+  <h2>What a contributor must do</h2>
+  <p>Treat these slots as known-empty:</p>
+  <ul class="bullets">
+    <li>Don't run format detectors against them.</li>
+    <li>Don't include them in TMD/TIM bulk-scan totals.</li>
+    <li>Skip them in any "what's still uncategorised" tally.</li>
+    <li>Size every entry as the sector gap to its successor (<a href="prot.html">PROT TOC</a>) - a pochi slot then has no reach into its neighbour at all.</li>
+  </ul>
+  <p>In the port, the field VRAM pre-pass skips these entries outright (<code>legaia_engine_scene::scene_resources</code>).</p>
+</section>
+
+<section class="doc-section" id="scratch-tail">
+  <h2>The ground-atlas hazard belongs to the next entry</h2>
+  <p>A rendering bug is worth keeping on this page precisely because its symptom points at the wrong entry. Two <code>64 x 256</code> texture pages land at framebuffer <code>(768, 0)</code> and <code>(832, 0)</code> - a scene block's battle-side character pages, CLUT rows 473 / 479 - and fb <code>(768, 0)</code> is tpage <code>0x0C</code>, where most field scenes put their <strong>ground-tile atlas</strong> (the per-cell page in the <code>.MAP</code> object record's <code>+0x15</code>; see <a href="../subsystems/world-map.html">world-map</a> "Ground texturing"). Uploaded last, they erase the atlas and the ground quads sample character / backdrop texels: Jeremi's floor becomes a grid of grey "tombstones", Mt. Dhini's a repeating vine/crack pattern.</p>
+  <p>Those pages are the <strong><code>scene_tmd_stream</code> entry that follows the pochi slot</strong> - its <code>FUN_8001FE70</code> type-<code>0x01</code> chunks. A "scan every entry in the CDNAME block for TIMs" sweep reached them by standing on the pochi slot and reading past its end. Rim Elm escapes because its sibling slots are all <code>scene_tmd_stream</code> entries, which the field build already excludes - which is the same statement about the neighbour, read as a statement about the slot.</p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="prot.html">PROT TOC</a>
+    <a href="cdname.html">CDNAME name map</a>
+    <a href="dmy.html">DMY.DAT</a>
+    <a href="scene-bundles.html">Scene bundles</a>
+    <a href="../reference/re-do-not-re-walk.html">Do not re-walk</a>
+  </div>
+  <div class="see-also">
+    <span class="see-also-label">Tooling</span>
+    <a href="../tooling/disc-coverage.html">Disc coverage</a>
+    <a href="../tooling/extraction.html">Extraction pipeline</a>
+  </div>
+</section>

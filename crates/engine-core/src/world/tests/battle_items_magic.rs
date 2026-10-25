@@ -1,0 +1,860 @@
+use super::*;
+use legaia_engine_mode::mode::SceneMode;
+
+#[test]
+fn battle_item_bomb_damages_enemy_and_cursor_lands_on_the_monster() {
+    use legaia_engine_battle_vm::battle_action::ActionState;
+    use legaia_engine_system::input::PadButton;
+
+    let mut world = offensive_item_world(500, 7);
+    // Bomb (0x13) deals 200 HP to an enemy.
+    world.party.inventory.insert(0x13, 1);
+    world.battle.item_menu = Some(world.build_battle_item_session());
+    {
+        let m = world.battle.item_menu.as_ref().unwrap();
+        assert_eq!(m.targets.len(), 2, "one ally + one enemy target");
+        assert!(!m.targets[0].is_enemy, "ally row first");
+        assert!(m.targets[1].is_enemy, "enemy row second");
+    }
+
+    // Frame 1: Cross confirms the Bomb -> target select. The cursor must
+    // skip the ally and land on the enemy row (offensive item).
+    world.set_pad(0);
+    world.set_pad(PadButton::Cross.mask());
+    world.tick_battle_item_menu();
+    take_commit_begin(&mut world);
+    {
+        let m = world.battle.item_menu.as_ref().unwrap();
+        match m.state {
+            legaia_engine_menus::inventory_use::InventoryUseState::TargetSelect {
+                cursor, ..
+            } => {
+                assert_eq!(cursor, 1, "cursor positioned on the enemy row");
+            }
+            other => panic!("expected TargetSelect, got {other:?}"),
+        }
+    }
+
+    // Frame 2: Cross confirms the enemy -> 200 damage.
+    world.set_pad(0);
+    world.set_pad(PadButton::Cross.mask());
+    world.tick_battle_item_menu();
+    take_commit_begin(&mut world);
+
+    assert_eq!(world.actors[1].battle.hp, 300, "500 -> 300 after Bomb");
+    assert_eq!(
+        world.party.inventory.get(&0x13).copied(),
+        None,
+        "Bomb consumed"
+    );
+    assert!(world.battle.item_menu.is_none(), "menu closed after use");
+    // The use arms the action SM's Item band (retail category 1 through
+    // `FUN_801E295C`'s item arm) rather than parking at EndOfAction - the
+    // band is what fires the cast cue + cue group; the live loop's cycle
+    // reaches EndOfAction when it completes (battle_item_cast_band.rs).
+    assert_eq!(
+        world.battle_ctx.action_state,
+        ActionState::Begin.as_byte(),
+        "the item use arms the SM's Item band"
+    );
+    let active = world.battle_ctx.active_actor as usize;
+    assert_eq!(
+        world.actors[active].battle.action_category,
+        legaia_engine_battle_vm::battle_action::ActionCategory::Item.as_byte()
+    );
+    assert_eq!(world.actors[active].battle.params[0], 0x13);
+    let fx = world.drain_battle_hit_fx();
+    assert_eq!(fx.len(), 1);
+    assert!(!fx[0].is_heal, "damage-coloured popup");
+    assert_eq!(fx[0].amount, 200);
+    assert_eq!(fx[0].target_slot, 1);
+}
+
+/// The target panel the hosts draw lists ONLY the selected item's side -
+/// retail's rule is structural, not a confirm-time buzz: state `0x64`'s
+/// cursor walk wraps inside the seated party band `[0, ctx[+0x00])`
+/// (`FUN_801D0748` `0x801D2BE8`/`0x801D2C78`), so a heal item's panel is
+/// the party roster and an enemy row is unrepresentable; the (test-only)
+/// offensive items take the monster-ring side (`0x5B`).
+#[test]
+fn heal_item_target_panel_lists_party_rows_only() {
+    use legaia_engine_system::input::PadButton;
+
+    let mut world = offensive_item_world(500, 7);
+    world.actors[0].battle.hp = 120; // hurt, so the heal is admissible
+    world.party.inventory.insert(0x01, 1); // Heal (ally-side).
+    world.battle.item_menu = Some(world.build_battle_item_session());
+    // The session roster still carries both sides (the offensive items
+    // need the enemy rows) - the model is where the side rule lands.
+    assert_eq!(world.battle.item_menu.as_ref().unwrap().targets.len(), 2);
+    world.set_pad(0);
+    world.set_pad(PadButton::Cross.mask());
+    world.tick_battle_item_menu(); // confirm the heal -> target select
+    take_commit_begin(&mut world);
+    let m = world.battle_item_menu_model().expect("menu model");
+    let (rows, cursor) = m.targets.expect("target select armed");
+    assert_eq!(rows.len(), 1, "party rows only - no enemy in a heal panel");
+    assert_eq!(cursor, 0);
+    // The mirror side: the Bomb's panel lists only the enemy.
+    let mut world = offensive_item_world(500, 7);
+    world.party.inventory.insert(0x13, 1);
+    world.battle.item_menu = Some(world.build_battle_item_session());
+    world.set_pad(0);
+    world.set_pad(PadButton::Cross.mask());
+    world.tick_battle_item_menu();
+    take_commit_begin(&mut world);
+    let m = world.battle_item_menu_model().expect("menu model");
+    let (rows, cursor) = m.targets.expect("target select armed");
+    assert_eq!(rows.len(), 1, "enemy rows only in an offensive panel");
+    assert_eq!(cursor, 0, "session cursor remapped onto the filtered list");
+}
+
+#[test]
+fn battle_item_bomb_downs_a_low_hp_enemy() {
+    use legaia_engine_system::input::PadButton;
+
+    let mut world = offensive_item_world(120, 7);
+    world.party.inventory.insert(0x13, 1); // Bomb, 200 dmg vs 120 HP.
+    world.battle.item_menu = Some(world.build_battle_item_session());
+
+    world.set_pad(0);
+    world.set_pad(PadButton::Cross.mask());
+    world.tick_battle_item_menu(); // confirm item -> target
+    take_commit_begin(&mut world);
+    world.set_pad(0);
+    world.set_pad(PadButton::Cross.mask());
+    world.tick_battle_item_menu(); // confirm enemy
+    take_commit_begin(&mut world);
+
+    assert_eq!(world.actors[1].battle.hp, 0, "HP floored at zero");
+    assert_eq!(world.actors[1].battle.liveness, 0, "monster downed");
+}
+
+#[test]
+fn battle_item_capture_downs_a_weakened_enemy_and_logs_the_id() {
+    use legaia_engine_system::input::PadButton;
+
+    // Weakened monster (10/500 HP) so the missing-HP capture roll is
+    // near-certain; pin the RNG so the roll (23) lands.
+    let mut world = offensive_item_world(500, 42);
+    world.actors[1].battle.hp = 10;
+    world.rng_state = 0;
+    world.party.inventory.insert(0x11, 1); // Genocide Crystal (capture).
+    world.battle.item_menu = Some(world.build_battle_item_session());
+
+    world.set_pad(0);
+    world.set_pad(PadButton::Cross.mask());
+    world.tick_battle_item_menu(); // item -> target (lands on enemy)
+    take_commit_begin(&mut world);
+    world.set_pad(0);
+    world.set_pad(PadButton::Cross.mask());
+    world.tick_battle_item_menu(); // confirm enemy
+    take_commit_begin(&mut world);
+
+    assert_eq!(
+        world.actors[1].battle.liveness, 0,
+        "captured monster downed"
+    );
+    assert_eq!(
+        world.drain_battle_captures(),
+        vec![42],
+        "monster id logged for post-battle Seru learning"
+    );
+}
+
+#[test]
+fn battle_item_escape_returns_to_field() {
+    use legaia_engine_system::input::PadButton;
+
+    let mut world = offensive_item_world(500, 7);
+    world.party.inventory.insert(0x12, 1); // Goblin Foot (escape).
+    world.battle.item_menu = Some(world.build_battle_item_session());
+
+    world.set_pad(0);
+    world.set_pad(PadButton::Cross.mask());
+    world.tick_battle_item_menu(); // item -> target
+    take_commit_begin(&mut world);
+    world.set_pad(0);
+    world.set_pad(PadButton::Cross.mask());
+    world.tick_battle_item_menu(); // confirm
+    take_commit_begin(&mut world);
+
+    // Retail does not leave the battle on the confirm frame: the `0x66`
+    // teardown spawns the exit fade and parks the SM in the `0x67` hold, and
+    // the results sequencer's escape arm then counts `ctx[+0x6CE]` up from
+    // zero until `FUN_80046A20`'s `0x43` exit gate returns to the field
+    // (`world::battle::victory`).
+    assert_eq!(
+        world.mode,
+        SceneMode::Battle,
+        "the exit hold keeps the battle scene up"
+    );
+    assert!(
+        world.battle_end_sequence_active(),
+        "the escape arm is armed"
+    );
+    assert!(world.battle.item_menu.is_none(), "battle menus cleared");
+    assert_eq!(
+        world.party.inventory.get(&0x12).copied(),
+        None,
+        "item consumed"
+    );
+    let mut exit_tick = None;
+    for i in 1..=(usize::from(World::VICTORY_EXIT_PHASE) + 8) {
+        world.tick();
+        if world.mode != SceneMode::Battle {
+            exit_tick = Some(i);
+            break;
+        }
+    }
+    assert_eq!(
+        exit_tick,
+        Some(usize::from(World::VICTORY_EXIT_PHASE)),
+        "the `0x43` gate fires once the phase halfword reaches it"
+    );
+    assert_eq!(world.mode, SceneMode::Field, "escaped back to the field");
+    assert!(!world.battle.escaped, "escape flag reset by finish_battle");
+}
+
+#[test]
+fn battle_magic_cast_damages_monster_spends_mp_and_cycles_turn() {
+    use legaia_engine_battle::spells::SpellCatalog;
+    use legaia_engine_battle_vm::battle_action::ActionState;
+    use legaia_engine_system::input::PadButton;
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.battle.player_driven = true;
+    world.mode = SceneMode::Battle;
+    world.set_spell_catalog(SpellCatalog::vanilla());
+    // Caster with a magic stat + MP; one monster.
+    world.actors[0].battle.max_hp = 200;
+    world.actors[0].battle.hp = 200;
+    world.actors[0].battle.mp = 50;
+    world.actors[0].battle.liveness = 1;
+    world.set_battle_magic(0, 100);
+    world.actors[1].battle.max_hp = 300;
+    world.actors[1].battle.hp = 300;
+    world.actors[1].battle.liveness = 1;
+    // Give the caster a learned offensive spell: Flame (0x20, 5 MP).
+    let mut party = legaia_save::Party::zeroed(1);
+    let mut list = party.members[0].spell_list();
+    list.count = 1;
+    list.ids[0] = 0x20;
+    party.members[0].set_spell_list(list);
+    world.party.roster = party;
+
+    // Open the spell submenu for the caster.
+    world.battle_ctx.active_actor = 0;
+    world.battle.spell_menu = world.build_battle_spell_session(0);
+    {
+        let m = world.battle.spell_menu.as_ref().expect("spell menu built");
+        assert_eq!(m.spells.len(), 1, "one learned spell");
+        assert!(m.spells[0].affordable, "50 MP covers a 5 MP spell");
+    }
+
+    // Frame 1: Cross opens the target cursor on the lone monster.
+    world.set_pad(0);
+    world.set_pad(PadButton::Cross.mask());
+    world.tick_battle_spell_menu();
+    take_commit_begin(&mut world);
+    assert!(world.battle.spell_menu.is_some(), "still picking a target");
+
+    // Frame 2: Cross confirms the monster; the confirm arms the action SM's
+    // Magic band (nothing lands yet - retail's confirm commits the action,
+    // the band charges the MP at 0x28 and the outcome folds at its seam).
+    world.set_pad(0);
+    world.set_pad(PadButton::Cross.mask());
+    world.tick_battle_spell_menu();
+    take_commit_begin(&mut world);
+
+    assert!(world.battle.spell_menu.is_none(), "spell menu closed");
+    assert_eq!(world.battle_ctx.action_state, ActionState::Begin.as_byte());
+    assert_eq!(
+        world.actors[0].battle.mp, 50,
+        "nothing charged at the confirm"
+    );
+    assert_eq!(
+        world.actors[1].battle.hp, 300,
+        "nothing landed at the confirm"
+    );
+    tick_until_cast_folds(&mut world);
+    assert_eq!(world.actors[0].battle.mp, 45, "5 MP spent on Flame, once");
+    assert!(
+        world.actors[1].battle.hp < 300,
+        "Flame should have damaged the monster"
+    );
+    assert!(
+        world.battle_ctx.action_state >= ActionState::MagicAnimChain.as_byte(),
+        "the fold is the band's 0x29 exit, not the confirm"
+    );
+    let fx = world.drain_battle_hit_fx();
+    assert_eq!(fx.len(), 1);
+    assert!(!fx[0].is_heal, "offensive spell is damage, not heal");
+    assert_eq!(fx[0].target_slot, 1);
+}
+
+#[test]
+fn silenced_caster_cannot_open_the_magic_submenu() {
+    use legaia_engine_battle::spells::SpellCatalog;
+    use legaia_engine_battle_vm::status_effects::StatusKind;
+
+    let mut world = World::new();
+    world.mode = SceneMode::Battle;
+    world.set_spell_catalog(SpellCatalog::vanilla());
+    world.actors[0].battle.mp = 50;
+    world.actors[0].battle.liveness = 1;
+    world.set_battle_magic(0, 100);
+    // A learned offensive spell, so the submenu would build absent any status.
+    let mut party = legaia_save::Party::zeroed(1);
+    let mut list = party.members[0].spell_list();
+    list.count = 1;
+    list.ids[0] = 0x20;
+    party.members[0].set_spell_list(list);
+    world.party.roster = party;
+
+    // No status: the Magic submenu builds.
+    assert!(
+        world.build_battle_spell_session(0).is_some(),
+        "control: an unafflicted caster can open Magic"
+    );
+
+    // Curse: the submenu refuses to open, so the caller bounces the player
+    // back to the command menu (the party-side mirror of the monster path).
+    world
+        .battle
+        .status_effects
+        .apply_with_duration(0, StatusKind::Curse, 4);
+    assert!(
+        world.build_battle_spell_session(0).is_none(),
+        "a silenced caster must not open the Magic submenu"
+    );
+}
+
+#[test]
+fn battle_magic_cast_applies_mp_half_ability_bit() {
+    use legaia_engine_battle::spells::SpellCatalog;
+    use legaia_engine_system::input::PadButton;
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.battle.player_driven = true;
+    world.mode = SceneMode::Battle;
+    world.set_spell_catalog(SpellCatalog::vanilla());
+    world.actors[0].battle.max_hp = 200;
+    world.actors[0].battle.hp = 200;
+    world.actors[0].battle.mp = 50;
+    world.actors[0].battle.liveness = 1;
+    world.set_battle_magic(0, 100);
+    world.actors[1].battle.max_hp = 300;
+    world.actors[1].battle.hp = 300;
+    world.actors[1].battle.liveness = 1;
+    // MP-half accessory bit (0x20) on the caster's character record.
+    world.party.character_ability_bits[0] = 0x20;
+
+    let mut party = legaia_save::Party::zeroed(1);
+    let mut list = party.members[0].spell_list();
+    list.count = 1;
+    list.ids[0] = 0x20; // Flame, 5 MP
+    party.members[0].set_spell_list(list);
+    world.party.roster = party;
+
+    world.battle_ctx.active_actor = 0;
+    world.battle.spell_menu = world.build_battle_spell_session(0);
+
+    world.set_pad(0);
+    world.set_pad(PadButton::Cross.mask());
+    world.tick_battle_spell_menu();
+    take_commit_begin(&mut world);
+    world.set_pad(0);
+    world.set_pad(PadButton::Cross.mask());
+    world.tick_battle_spell_menu();
+    take_commit_begin(&mut world);
+    // The band's 0x28 charges the cost.
+    tick_until_cast_folds(&mut world);
+
+    // Flame is 5 MP; the MP-half bit charges `5 - (5>>1) = 3` (retail rounds
+    // up on odd costs, not floor 5/2 = 2), so 50 -> 47 (vs 45 flat).
+    assert_eq!(
+        world.actors[0].battle.mp, 47,
+        "MP-half ability bit should reduce the live-cast cost by half (round up)"
+    );
+}
+
+#[test]
+fn refresh_party_ability_bits_derives_and_propagates_party_wide() {
+    use legaia_engine_battle::accessory_passives::AccessoryPassives;
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 2,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    // Synthetic catalog: item 0x50 grants wearer-only passive 0x05 (the
+    // MP-half bit 0x20); item 0x51 grants party-wide passive 0x0E.
+    world.set_accessory_passives(AccessoryPassives::from_entries(
+        [(0x50, 0x05), (0x51, 0x0E)],
+        [0x0E],
+    ));
+    let mut party = legaia_save::Party::zeroed(2);
+    let mut eq = party.members[0].equipment();
+    eq.slots[7] = 0x50;
+    party.members[0].set_equipment(eq);
+    let mut eq = party.members[1].equipment();
+    eq.slots[5] = 0x51;
+    party.members[1].set_equipment(eq);
+    world.party.roster = party;
+
+    world.refresh_party_ability_bits();
+
+    // Wearer-only bit lands on member 0 only.
+    assert_eq!(world.party.character_ability_bits[0] & 0x20, 0x20);
+    assert_eq!(world.party.character_ability_bits[1] & 0x20, 0);
+    // Party-wide bit (index 0x0E) propagates into every member's effective
+    // mask, and into the global mask (the FUN_800431D0 port).
+    assert_eq!(
+        world.party.character_ability_bits[0] & (1 << 0x0E),
+        1 << 0x0E
+    );
+    assert_eq!(
+        world.party.character_ability_bits[1] & (1 << 0x0E),
+        1 << 0x0E
+    );
+    assert!(world.party_has_ability(0x0E));
+    assert!(!world.party_has_ability(0x06));
+    // The record-side bitfield is rebuilt with each wearer's OWN bits.
+    assert_eq!(world.party.roster.members[0].ability_bits()[0], 0x20);
+    assert_eq!(world.party.roster.members[1].ability_bits()[1], 0x40); // bit 14
+}
+
+/// `FUN_80042558` walks the three character records with no active-member
+/// test (`0x80042D8C..0x80042D94`), so a member who has left the party keeps
+/// a rebuilt bitfield and still feeds the global mask.
+#[test]
+fn refresh_party_ability_bits_walks_records_outside_the_party() {
+    use legaia_engine_battle::accessory_passives::AccessoryPassives;
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.set_accessory_passives(AccessoryPassives::from_entries(
+        [(0x50, 0x05), (0x51, 0x0E)],
+        [0x0E],
+    ));
+    let mut party = legaia_save::Party::zeroed(3);
+    let mut eq = party.members[2].equipment();
+    eq.slots[5] = 0x51;
+    party.members[2].set_equipment(eq);
+    world.party.roster = party;
+
+    world.refresh_party_ability_bits();
+
+    assert_eq!(world.party.roster.members[2].ability_bits()[1], 0x40); // bit 14
+    assert!(world.party_has_ability(0x0E));
+    // The lone active member sees the party-wide bit through the global mask.
+    assert_eq!(
+        world.party.character_ability_bits[0] & (1 << 0x0E),
+        1 << 0x0E
+    );
+}
+
+#[test]
+fn refresh_party_ability_bits_noops_without_a_catalog() {
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.party.roster = legaia_save::Party::zeroed(1);
+    // Synthetic setups write the bits directly; an empty catalog must not
+    // clobber them.
+    world.party.character_ability_bits[0] = 0x20;
+    world.refresh_party_ability_bits();
+    assert_eq!(world.party.character_ability_bits[0], 0x20);
+}
+
+#[test]
+fn seed_party_battle_stats_applies_accessory_stat_and_hp_boosts() {
+    use legaia_engine_battle::accessory_passives::AccessoryPassives;
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    // Item 0x52 grants passive 0x06 (ATK +20%); item 0x53 grants passive
+    // 0x00 (max HP +10%).
+    world.set_accessory_passives(AccessoryPassives::from_entries(
+        [(0x52, 0x06), (0x53, 0x00)],
+        [],
+    ));
+    let mut party = legaia_save::Party::zeroed(1);
+    let rec = &mut party.members[0];
+    rec.set_record_stats(legaia_save::character::RecordStats {
+        hp_max: 100,
+        mp_max: 30,
+        cap_constant: 100,
+        agl: 40,
+        atk: 100,
+        udf: 50,
+        ldf: 60,
+        spd: 35,
+        int: 20,
+    });
+    rec.set_live_stats(legaia_save::character::LiveStats {
+        agl: 40,
+        atk: 100,
+        udf: 50,
+        ldf: 60,
+        spd: 35,
+        int: 20,
+    });
+    let mut eq = rec.equipment();
+    eq.slots[6] = 0x52;
+    eq.slots[7] = 0x53;
+    rec.set_equipment(eq);
+    let mut hms = rec.hp_mp_sp();
+    hms.hp_cur = 100;
+    hms.hp_max = 100;
+    rec.set_hp_mp_sp(hms);
+    world.load_party(party);
+
+    world.seed_party_battle_stats();
+
+    // ATK +20% of the base: 100 + 100/5 = 120.
+    assert_eq!(world.battle.attack[0], 120);
+    // Max HP +10% of the base, applied to the live battle actor.
+    assert_eq!(world.actors[0].battle.max_hp, 110);
+    // The ability bits are populated for the MP-cost consumers.
+    assert_eq!(world.party.character_ability_bits[0] & 0x41, 0x41); // bits 0 + 6
+}
+
+#[test]
+fn battle_magic_buff_raises_scalar_refreshes_and_expires() {
+    use legaia_engine_battle::spells::{BuffStat, SpellOutcome};
+
+    let mut world = World::default();
+    world.set_battle_attack(0, 50);
+
+    // Power Up: retail stat-up is the x6/5 ramp (50 -> 60), not a flat +20.
+    world.fold_spell_outcome(SpellOutcome::Buff {
+        target: 0,
+        stat: BuffStat::Attack,
+        magnitude: 20,
+        turns: 2,
+    });
+    assert_eq!(
+        world.battle.attack[0], 60,
+        "stat-up ramps the scalar by x6/5"
+    );
+    assert_eq!(world.battle.buffs.len(), 1);
+
+    // Re-casting refreshes (reverts the old delta first, so the ramp re-applies
+    // from the base 50 -> 60, no compounding).
+    world.fold_spell_outcome(SpellOutcome::Buff {
+        target: 0,
+        stat: BuffStat::Attack,
+        magnitude: 20,
+        turns: 2,
+    });
+    assert_eq!(
+        world.battle.attack[0], 60,
+        "refresh does not compound the ramp"
+    );
+    assert_eq!(world.battle.buffs.len(), 1);
+
+    // Ages one turn per the buffed actor's turn; expires on the 2nd.
+    world.tick_battle_buffs_on_turn(0);
+    assert_eq!(world.battle.attack[0], 60);
+    world.tick_battle_buffs_on_turn(0);
+    assert_eq!(
+        world.battle.attack[0], 50,
+        "expiry reverts the ramp delta exactly"
+    );
+    assert!(world.battle.buffs.is_empty());
+}
+
+#[test]
+fn battle_magic_buff_ramp_is_multiplicative_not_additive() {
+    use legaia_engine_battle::spells::{BuffStat, SpellOutcome};
+
+    let mut world = World::default();
+    // At a 200 scalar the retail x6/5 ramp (->240) diverges from a flat +20
+    // (->220): proves the live buff is multiplicative, not additive.
+    world.set_battle_magic(1, 200);
+    world.fold_spell_outcome(SpellOutcome::Buff {
+        target: 1,
+        stat: BuffStat::MagicAttack,
+        magnitude: 20,
+        turns: 1,
+    });
+    assert_eq!(world.battle.magic[1], 240, "x6/5 ramp, not flat +20");
+    world.tick_battle_buffs_on_turn(1);
+    assert_eq!(world.battle.magic[1], 200, "ramp delta reverts exactly");
+
+    // The ramp clamps at 0xFFFF (buff_ramp ceiling) without overflow.
+    world.set_battle_attack(2, 60_000);
+    world.fold_spell_outcome(SpellOutcome::Buff {
+        target: 2,
+        stat: BuffStat::Attack,
+        magnitude: 20,
+        turns: 1,
+    });
+    assert_eq!(world.battle.attack[2], 0xFFFF, "ramp clamps at u16 max");
+    world.tick_battle_buffs_on_turn(2);
+    assert_eq!(
+        world.battle.attack[2], 60_000,
+        "clamped delta still reverts"
+    );
+}
+
+#[test]
+fn battle_magic_debuff_saturates_at_zero_and_reverts_exactly() {
+    use legaia_engine_battle::spells::{BuffStat, SpellOutcome};
+
+    let mut world = World::default();
+    // Power Down on an enemy with a small attack: -25 saturates the u16
+    // scalar at 0, and the recorded delta is the actual change (-10).
+    world.set_battle_attack(3, 10);
+    world.fold_spell_outcome(SpellOutcome::Buff {
+        target: 3,
+        stat: BuffStat::Attack,
+        magnitude: -25,
+        turns: 1,
+    });
+    assert_eq!(world.battle.attack[3], 0, "debuff saturates at zero");
+
+    // One tick expires it; the exact -10 delta is reverted back to 10.
+    world.tick_battle_buffs_on_turn(3);
+    assert_eq!(world.battle.attack[3], 10);
+    assert!(world.battle.buffs.is_empty());
+}
+
+#[test]
+fn battle_magic_capture_downs_a_weakened_monster_and_logs_the_id() {
+    use legaia_engine_battle::spells::SpellOutcome;
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.mode = SceneMode::Battle;
+    // Seed 83 -> first retail draw `(s' >> 16) & 0x7FFF` = 21323 with
+    // `s' = 83 * 0x41C64E6D + 0x3039`, and `21323 % 100 == 23`.
+    world.rng_state = 83;
+    world.actors[1].battle.max_hp = 100;
+    world.actors[1].battle.hp = 10; // missing 90
+    world.actors[1].battle.liveness = 1;
+    world.actors[1].battle_monster_id = Some(42);
+
+    // hit_pct 60, missing 90/100 -> effective 54; roll 23 < 54 -> captured.
+    world.fold_spell_outcome(SpellOutcome::CaptureRoll {
+        target: 1,
+        hit_pct: 60,
+    });
+    assert_eq!(
+        world.actors[1].battle.liveness, 0,
+        "captured monster is downed"
+    );
+    assert_eq!(world.actors[1].battle.hp, 0);
+    assert_eq!(world.drain_battle_captures(), vec![42]);
+
+    // A near-full-HP monster has a tiny effective chance -> the same roll
+    // misses and the monster is untouched.
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.mode = SceneMode::Battle;
+    world.rng_state = 6; // roll 23
+    world.actors[1].battle.max_hp = 100;
+    world.actors[1].battle.hp = 95; // missing 5 -> effective 3
+    world.actors[1].battle.liveness = 1;
+    world.actors[1].battle_monster_id = Some(7);
+    world.fold_spell_outcome(SpellOutcome::CaptureRoll {
+        target: 1,
+        hit_pct: 60,
+    });
+    assert_eq!(
+        world.actors[1].battle.liveness, 1,
+        "healthy monster resists"
+    );
+    assert!(world.seru.battle_captures.is_empty());
+}
+
+#[test]
+fn battle_magic_escape_returns_to_field() {
+    use legaia_engine_battle::spells::SpellCatalog;
+    use legaia_engine_system::input::PadButton;
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.battle.player_driven = true;
+    world.mode = SceneMode::Battle;
+    world.actors[0].battle.max_hp = 100;
+    world.actors[0].battle.hp = 100;
+    world.actors[0].battle.mp = 20;
+    world.actors[0].battle.liveness = 1;
+    world.actors[1].battle.max_hp = 200;
+    world.actors[1].battle.hp = 200;
+    world.actors[1].battle.liveness = 1;
+    world.tables.spell_catalog = SpellCatalog::vanilla();
+
+    // Open the spell submenu with Warp (0x41, SelfOnly escape) learned.
+    world.battle_ctx.active_actor = 0;
+    world.battle.spell_menu = Some(legaia_engine_battle::battle_magic::BattleSpellSession::new(
+        0,
+        0,
+        &[0x41],
+        &world.tables.spell_catalog,
+        20,
+        0,
+    ));
+
+    // SelfOnly target resolves immediately, so one Cross commits Warp; the
+    // band folds it at its 0x29 exit and the live loop ends the encounter
+    // on that frame.
+    world.set_pad(0);
+    world.set_pad(PadButton::Cross.mask());
+    world.tick_battle_spell_menu();
+    take_commit_begin(&mut world);
+    assert_eq!(
+        world.mode,
+        SceneMode::Battle,
+        "the confirm only arms the band"
+    );
+    tick_until_cast_folds(&mut world);
+    world.set_pad(0);
+
+    // Same exit hold as the escape item: the field returns through the
+    // sequencer's `0x67` arm, `VICTORY_EXIT_PHASE` ticks later.
+    assert_eq!(
+        world.mode,
+        SceneMode::Battle,
+        "the exit hold keeps the battle scene up"
+    );
+    assert!(
+        world.battle_end_sequence_active(),
+        "the escape arm is armed"
+    );
+    assert!(
+        world.battle.spell_menu.is_none(),
+        "submenu dropped on escape"
+    );
+    let mut exit_tick = None;
+    for i in 1..=(usize::from(World::VICTORY_EXIT_PHASE) + 8) {
+        world.tick();
+        if world.mode != SceneMode::Battle {
+            exit_tick = Some(i);
+            break;
+        }
+    }
+    assert_eq!(
+        exit_tick,
+        Some(usize::from(World::VICTORY_EXIT_PHASE)),
+        "the `0x43` gate fires once the phase halfword reaches it"
+    );
+    assert_eq!(world.mode, SceneMode::Field, "escape returns to the field");
+    assert!(
+        !world.battle.escaped,
+        "escape flag cleared by finish_battle"
+    );
+    assert!(world.battle.last_rewards.is_none(), "escape grants no loot");
+}
+
+/// A capture roll aimed at a party seat (a monster cast the boot catalog
+/// resolves to the demo "Reseal") never downs it: only a monster is captured.
+/// The roll is still drawn, so the rand stream matches the monster case.
+#[test]
+fn a_capture_roll_never_downs_a_party_member() {
+    use legaia_engine_battle::spells::SpellOutcome;
+
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.mode = SceneMode::Battle;
+    world.rng_state = 6; // roll 23
+    world.actors[0].battle.max_hp = 100;
+    world.actors[0].battle.hp = 10;
+    world.actors[0].battle.liveness = 1;
+    world.fold_spell_outcome(SpellOutcome::CaptureRoll {
+        target: 0,
+        hit_pct: 60,
+    });
+    assert_eq!(world.actors[0].battle.hp, 10);
+    assert_eq!(world.actors[0].battle.liveness, 1);
+    assert!(world.drain_battle_captures().is_empty());
+    assert_ne!(world.rng_state, 6, "the roll is drawn");
+}
+
+/// The battle Magic window's model: one row per learned spell, the hand on
+/// the session cursor, the highlighted spell's effective MP cost in the
+/// `MP` tab and a level of at least 1 - and no model outside battle.
+#[test]
+fn the_battle_spell_menu_model_projects_the_open_window() {
+    use legaia_engine_battle::spells::SpellCatalog;
+    let mut world = World {
+        party: legaia_engine_menus::party_state::PartyState {
+            party_count: 1,
+            ..Default::default()
+        },
+        ..World::default()
+    };
+    world.mode = SceneMode::Battle;
+    world.tables.spell_catalog = SpellCatalog::vanilla();
+    assert!(world.battle_spell_menu_model().is_none(), "no window open");
+    world.battle.spell_menu = Some(legaia_engine_battle::battle_magic::BattleSpellSession::new(
+        0,
+        0,
+        &[0x41],
+        &world.tables.spell_catalog,
+        200,
+        0,
+    ));
+    let cost = world.tables.spell_catalog.get(0x41).unwrap().mp_cost;
+    let m = world.battle_spell_menu_model().expect("browsing model");
+    assert_eq!(m.rows.len(), 1);
+    assert!(m.rows[0].1, "200 MP covers the spell");
+    assert_eq!(m.cursor, Some(0));
+    let (lv, mp) = m.level_mp.expect("the Lv / MP tabs");
+    assert!(lv >= 1);
+    assert_eq!(mp, u16::from(cost));
+
+    world.mode = SceneMode::Field;
+    assert!(world.battle_spell_menu_model().is_none(), "battle only");
+}

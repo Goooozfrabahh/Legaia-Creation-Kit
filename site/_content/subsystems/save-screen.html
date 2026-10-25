@@ -1,0 +1,225 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">subsystems</a> &middot; save screen</div>
+  <h1>Save Screen</h1>
+  <p class="lede">Everything between choosing "Save" and bytes landing on the memory card: the SLOT 1 / SLOT 2 pills, the "Now checking. Do not remove MEMORY CARD" beat, the fifteen-block preview grid, the overwrite prompt and the card write. The saved block is a straight copy of the live game state in RAM with an additive checksum stamped on the end - which is why a card editor only needs the layout, not a cipher.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Lives in</dt><dd>The <strong>menu overlay</strong> (PROT <code>0899</code>) - the same code chunk as the shop, inn and status screens. There is no save overlay of its own.</dd>
+    <dt>Driver</dt><dd><code>FUN_801DC6B4</code>: a 9-state outer machine that fades in, dispatches one sub-screen from a 33-entry function table, and fades out.</dd>
+    <dt>Card I/O</dt><dd>A 5-state machine over Sony's libcd (<code>FUN_801E3294</code>), sequenced by a per-frame ticker; BIOS <code>bu</code> device calls underneath.</dd>
+    <dt>Block</dt><dd>One card block, <code>0x2000</code> bytes: <code>SC</code> header + icon, then <code>0x1A18</code> bytes copied verbatim from RAM <code>0x80084140</code>; checksum word at <code>+0x1FFC</code>.</dd>
+    <dt>In the port</dt><dd><code>engine-menus::save_select</code> (session + card machine), <code>save_subscreen</code> (the screen graph), <code>legaia_save</code> (block layout, round-trip).</dd>
+    <dt>Confidence</dt><dd>Confirmed - overlay captures, disassembly, GP0 draw-list pins (<a href="#how-we-know">how we know</a>).</dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="flow">
+  <h2>The flow, screen by screen</h2>
+  <figure class="diagram">
+    <svg viewBox="0 0 860 390" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Save and load flow. Four entries - the pause menu's Save row (overworld only), a field save point, the pause menu's Load row and the title's Continue - all lead to the memory-card port pick, the Now checking card read and the fifteen-block grid. Saving then asks to confirm (save to a free block, or overwrite), composes the block from live RAM with a checksum and writes it. Loading reads the block and re-sums the checksum: a mismatch shows Damaged data, a match copies the block back over live RAM and resumes the saved scene.">
+      <defs><marker id="ss-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="dg-node" x="20" y="14" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="95" y="38">Pause: Save</text><text class="dg-sub" x="95" y="56">overworld only</text>
+      <rect class="dg-node" x="200" y="14" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="275" y="38">Save point</text><text class="dg-sub" x="275" y="56">a field script</text>
+      <rect class="dg-node" x="380" y="14" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="455" y="38">Pause: Load</text><text class="dg-sub" x="455" y="56">from the menu</text>
+      <rect class="dg-node" x="560" y="14" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="635" y="38">Title: Continue</text><text class="dg-sub" x="635" y="56">card manager</text>
+      <rect class="dg-node-accent" x="100" y="120" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="175" y="144">Port pick</text><text class="dg-sub" x="175" y="162">SLOT 1 / SLOT 2</text>
+      <rect class="dg-node-accent" x="330" y="120" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="405" y="144">Now checking</text><text class="dg-sub" x="405" y="162">read, 120-frame cap</text>
+      <rect class="dg-node-accent" x="560" y="120" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="635" y="144">Block grid</text><text class="dg-sub" x="635" y="162">15 blocks, 5 x 3</text>
+      <rect class="dg-node" x="20" y="230" width="170" height="56" rx="5"/>
+      <text class="dg-label" x="105" y="254">Confirm</text><text class="dg-sub" x="105" y="272">Yes / No, default No</text>
+      <rect class="dg-node" x="210" y="230" width="190" height="56" rx="5"/>
+      <text class="dg-label" x="305" y="254">Compose block</text><text class="dg-sub" x="305" y="272">copy live RAM + checksum</text>
+      <rect class="dg-node-ok" x="420" y="230" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="495" y="254">Card write</text><text class="dg-sub" x="495" y="272">erase, then write</text>
+      <rect class="dg-node" x="600" y="230" width="240" height="56" rx="5"/>
+      <text class="dg-label" x="720" y="254">Read block</text><text class="dg-sub" x="720" y="272">re-sum the checksum</text>
+      <rect class="dg-node-ok" x="420" y="320" width="240" height="56" rx="5"/>
+      <text class="dg-label" x="540" y="344">Restore live RAM</text><text class="dg-sub" x="540" y="362">resume the saved scene</text>
+      <rect class="dg-node-warn" x="690" y="320" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="765" y="344">Damaged data</text><text class="dg-sub" x="765" y="362">sum mismatch</text>
+      <path class="dg-edge" d="M95 70 L95 100 M275 70 L275 100 M455 70 L455 100 M635 70 L635 100 M95 100 L635 100"/>
+      <path class="dg-edge" d="M175 100 L175 118" marker-end="url(#ss-arrow)"/>
+      <path class="dg-edge" d="M250 148 L328 148" marker-end="url(#ss-arrow)"/>
+      <path class="dg-edge" d="M480 148 L558 148" marker-end="url(#ss-arrow)"/>
+      <path class="dg-edge" d="M600 176 L600 205 L105 205 L105 228" marker-end="url(#ss-arrow)"/>
+      <text class="dg-edge-label" x="120" y="222">saving</text>
+      <path class="dg-edge" d="M690 176 L690 228" marker-end="url(#ss-arrow)"/>
+      <text class="dg-edge-label" x="698" y="214">loading</text>
+      <path class="dg-edge" d="M190 258 L208 258" marker-end="url(#ss-arrow)"/>
+      <path class="dg-edge" d="M400 258 L418 258" marker-end="url(#ss-arrow)"/>
+      <path class="dg-edge" d="M690 286 L690 300 L540 300 L540 318" marker-end="url(#ss-arrow)"/>
+      <path class="dg-edge" d="M790 286 L790 318" marker-end="url(#ss-arrow)"/>
+    </svg>
+    <figcaption>Two pick stages in two id spaces: the pills choose a memory-card <em>port</em>, the grid chooses one of that card's fifteen <em>blocks</em>; the card read sits between them, which is why &ldquo;Now checking&rdquo; exists at all. Saving and loading share the whole front half, and one routine runs both directions.</figcaption>
+  </figure>
+  <table class="data-table">
+    <thead><tr><th>Stage</th><th>What the player picks</th><th>Count</th><th>Retail anchor</th></tr></thead>
+    <tbody>
+      <tr><td>Pill row</td><td>a memory-card <strong>port</strong></td><td>2</td><td>the libcd channel's port (<code>chan = port &times; 16 + sub_op</code>)</td></tr>
+      <tr><td>Preview grid</td><td>a <strong>save block</strong> on that card</td><td>15 (+ a Return cell)</td><td>the directory walk; per-slot preview buffer <code>0x801EF1B8 + N &times; 0x100</code></td></tr>
+    </tbody>
+  </table>
+  <p>A third id lives in the filename: retail files a save as <code>BASCUS-94254PRO-nn</code> where <code>nn</code> is the list position it was standing on, and lets the BIOS put the file in any free block. The grid index, the port and that number are three different spaces.</p>
+</section>
+
+<section class="doc-section" id="how-it-works">
+  <h2>Three layers of code</h2>
+  <table class="data-table">
+    <thead><tr><th>Layer</th><th>Routine</th><th>Job</th></tr></thead>
+    <tbody>
+      <tr><td>Outer dispatcher</td><td><code>FUN_801DC6B4</code></td><td>State 0 decodes the entry context into a sub-screen id and starts the fade; state 2 calls the sub-screen through the table at <code>0x801E4F40</code>; states 3..5 fade out; 6+ returns.</td></tr>
+      <tr><td>Sub-screens</td><td>table <code>0x801E4F40</code></td><td>33 small step machines sharing one shape: run a display script, wait for it to go idle, take input, write the next screen id. The save flow uses about a third of them; the rest are the pause menu, shop and casino exchange.</td></tr>
+      <tr><td>Card I/O</td><td><code>FUN_801E3294</code></td><td>Five states over libcd with a 5-try retry budget; result codes <code>1</code> ok, <code>-1</code> no card, <code>-2</code> stray event, <code>-3</code> abort / timeout.</td></tr>
+    </tbody>
+  </table>
+  <p>The entry context (<code>_DAT_8007B450</code>) is what a field script parks when it opens the menu; its first byte decides where the save UI opens.</p>
+  <table class="data-table">
+    <thead><tr><th>Entry context</th><th>Opens</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>sentinel <code>1</code></td><td><code>0x02</code></td><td>Save from the pause menu</td></tr>
+      <tr><td>kind <code>0x01</code></td><td><code>0x19</code></td><td>Save from a field script's save point - straight to the card driver</td></tr>
+      <tr><td>kind <code>0x07</code></td><td><code>0x20</code></td><td>Casino prize exchange (shares the table; touches no card)</td></tr>
+      <tr><td>kind <code>0x0D</code></td><td><code>0x04</code></td><td>Post-save "press any button" return</td></tr>
+      <tr><td>kind <code>0x00</code></td><td><code>0x1A</code></td><td>Shop mode select (Buy / Sell / Quit)</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure">
+    <summary>Save-flow sub-screens</summary>
+    <div class="disclosure-body">
+      <table class="data-table">
+        <thead><tr><th>Id</th><th>Function</th><th>Role</th></tr></thead>
+        <tbody>
+          <tr><td><code>0x00</code></td><td><code>FUN_801DD12C</code></td><td>Final exit: terminal display script, then arms the fade-out delta and outer state 3.</td></tr>
+          <tr><td><code>0x01</code></td><td><code>FUN_801D6B20</code></td><td>Root command picker - the pause menu's own top level, 7 rows. Row 5 <em>Load</em> opens <code>0x18</code> unless the entry context is kind <code>0x0D</code>; row 6 <em>Save</em> opens <code>0x19</code> unless the scene's save-allow byte <code>_DAT_8007B6A8</code> is zero. Blocked rows buzz (cue <code>0x23</code>).</td></tr>
+          <tr><td><code>0x03</code></td><td><code>FUN_801D6D38</code></td><td>Yes / No confirm, default cursor on No; Yes advances to <code>0x00</code>.</td></tr>
+          <tr><td><code>0x04</code></td><td><code>FUN_801DD1B8</code></td><td>Post-save "press any button": waits for a held confirm-or-cancel button, returns to <code>0x01</code>.</td></tr>
+          <tr><td><code>0x18</code></td><td><code>FUN_801DAE24</code></td><td>Load-card driver: install the card handle, run the display script, call <code>FUN_801DD35C(1, 2)</code> until done, return to <code>0x01</code>.</td></tr>
+          <tr><td><code>0x19</code></td><td><code>FUN_801DAEF4</code></td><td>Save-card driver: same four steps with <code>FUN_801DD35C(1, 1)</code>. Returns to <code>0x01</code>, or exits to <code>0x00</code> when a field script parked the context.</td></tr>
+        </tbody>
+      </table>
+      <p>Op <code>1</code> is save and op <code>2</code> is load: the row labels (<code>@Load</code> row 5, <code>@Save</code> row 6), the op flag (op 1 erases the file before writing), and the op-2 arm's "Unable to load data." message all agree. Both directions share <code>FUN_801DD35C</code>, whose load branch copies the <code>0x2000</code>-byte read buffer at <code>0x801E5120</code> back over the live window; the save branch composes into <code>0x801E7120</code>.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="save-rules">
+  <h2>Rules a player runs into</h2>
+  <ul>
+    <li><strong>Save is overworld-only.</strong> The Save row is gated by a per-scene byte seeded from the scene MAN's header bit; across the disc that bit is set only on the three kingdom world maps. A field save comes through a script's save point instead, which opens the card driver directly.</li>
+    <li><strong>"Now checking" ends when the card answers - or after 120 frames.</strong> The per-frame poll tests four card event handles in order (last one wins) and forces a timeout status on the 121st poll; timeout and a stray complete event both tear the read down.</li>
+    <li><strong>A foreign save is never offered as free.</strong> The directory walk clears every slot to "unreadable", stamps "Legaia save" on each filename matching <code>BASCUS-94254PRO-</code> (JP: <code>BISCPS-10059PRO-</code>), and only then spends the card's reported free-block count marking the rest free. A slot the walk cannot afford to call free stays unreadable.</li>
+    <li><strong>The block is checksummed.</strong> The compose path zeroes a <code>0x2000</code> buffer, copies <code>0x1A18</code> bytes of live state over the front, sums the first <code>0x7FF</code> words and stores the sum at <code>+0x1FFC</code>; the load path re-sums and routes a mismatch to "Damaged data."</li>
+    <li><strong>A damaged save is refused after the read, not on the grid.</strong> The grid classifies a block by its directory filename, so a save with a bad sum still shows its cell and preview; only the checksum verify behind a Load turns it away, with a box that waits for a button.</li>
+    <li><strong>Both directions ask first.</strong> Confirming a block raises a Yes / No box opening on No: a Load asks to load, a Save asks to save on a free block and to overwrite on anything else. A Yes then holds the screen through the write or read under its own panel - a sliding box with the block number and a progress tube - and a result line, and the panel parks on black. A load holds its panel for at least 128 sixtieth-second units even when the card answers sooner; a save waits on the card alone.</li>
+    <li><strong>Continue belongs to the title, not the pause menu.</strong> The title's own front-end state machine runs it: confirming its second row fades into the card manager, which walks the port pick, the read and the grid and ends in a launch fade that writes the game mode on its load route. No field runs underneath, so nothing that blocks the pause menu - a conversation, a lock, a script's save point holding the Load row - can stand in its way. Both play hosts run it as one shared Continue screen, <code>ContinueScreen</code>, over the same Load screen; backing out returns to the title card.</li>
+    <li><strong>The options come back with the save.</strong> Field Move, Select Attack, Battle Command, Battle Camera, Field HP Display, Sound and the vibration rows sit in the live-state window the block copies, so loading a save made with Run on resumes running. In the port both play hosts adopt them on load, except a row the session overrides (a command-line or capture pin), whose override stands.</li>
+    <li><strong>A blank card takes the first save.</strong> A formatted card with nothing on it answers the directory read like any other card. The pause menu reaches the screen through a short wipe: the field darkens before any window exists and comes back after the menu closes.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="block-layout">
+  <h2>What the block holds</h2>
+  <p>The game-data region is a linear copy of RAM from <code>0x80084340</code>: any live field lands at <code>block + 0x200 + (addr &minus; 0x80084340)</code>.</p>
+  <table class="layout">
+    <thead><tr><th>Offset</th><th>Size</th><th>Field</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x0000</code></td><td>2</td><td><code>SC</code> magic; icon flags, title (Shift-JIS), 16-colour palette and 16x16 icon follow through <code>0x1FF</code></td></tr>
+      <tr><td><code>0x0200</code></td><td><code>0x3C8</code></td><td>Display / global header: location name <code>+0</code>, leader name <code>+0x54</code>, scene labels <code>+0x208</code> / <code>+0x218</code>, play clock <code>+0x230</code> (RAM <code>0x80084570</code>, 60 ticks a second), gold <code>+0x25C</code></td></tr>
+      <tr><td><code>0x05C8</code></td><td><code>0x414</code> &times; 4</td><td><a href="../formats/save-record.html">Character records</a> Vahn, Noa, Gala, Terra (RAM <code>0x80084708</code>)</td></tr>
+      <tr><td><code>0x14C0</code></td><td><code>0x358</code></td><td>Story-flag window (RAM <code>0x80085600..0x80085958</code>), including the <code>0x200</code>-byte system-flag bank from <code>0x80085758</code>; overlaps Terra's tail</td></tr>
+      <tr><td><code>0x1818</code></td><td><code>0x200</code></td><td>The <a href="inventory.html">item bag</a>, 256 &times; <code>(id, count)</code> (RAM <code>0x80085958</code>); ends the live-state copy at <code>0x1A18</code></td></tr>
+      <tr><td><code>0x1A18</code></td><td><code>0x5E4</code></td><td>Unread tail: zero on a retail card; a card the engine writes keeps its <code>LGXE</code> extension here (party composition, chain library), which retail never reads</td></tr>
+      <tr><td><code>0x1FFC</code></td><td>4</td><td>Additive checksum of words <code>0..0x7FE</code></td></tr>
+    </tbody>
+  </table>
+  <p>Two stores share the name "story flags" and never sync: the bitmap above persists; the field VM's 32-bit scratchpad word at <code>0x1F800394</code> (opcodes <code>0x2E</code>/<code>0x2F</code>/<code>0x30</code>) does not, and is re-seeded from the mode table on mode init. </p>
+</section>
+
+<section class="doc-section" id="sprite-sources">
+  <h2>What the screen is drawn from</h2>
+  <p>Every sprite on the Continue / Load screen is pinned to a source texture and palette row by reading the GPU's own draw list out of a capture.</p>
+  <table class="data-table">
+    <thead><tr><th>Element</th><th>Source</th><th>Note</th></tr></thead>
+    <tbody>
+      <tr><td>Title art behind</td><td>PROT 0890 title TIM</td><td>Drawn dimmed at <code>(33, 6)</code>.</td></tr>
+      <tr><td>"Load" panel chrome</td><td>System-UI sheet at <code>PROT.DAT[0x018E0]</code>, CLUT row 2</td><td>9-slice: 14 textured sprites compose the 81x29 panel at <code>(6, 4)</code>; 3 gouraud quads tile the marbled interior.</td></tr>
+      <tr><td>"Load" glyphs</td><td>The <a href="../formats/dialog-font.html">dialog font</a>, VRAM page <code>(896, 0)</code></td><td>Four 14x15 sprites; bright colour is CLUT entry 15.</td></tr>
+      <tr><td>Pointing-finger cursor</td><td>Same sheet, CLUT row 7, <code>(152, 64, 16, 16)</code></td><td>At <code>(114, 100)</code>; 17 px lower for SLOT 2.</td></tr>
+      <tr><td>SLOT pills</td><td>Save-menu TIM at PROT 0899 <code>+0x16908</code>, CLUT 7</td><td>Baked "SLOT 1" / "SLOT 2" labels.</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure">
+    <summary>Panel geometry, slide-ins and the info panel</summary>
+    <div class="disclosure-body">
+      <p><strong>Messagebox drawer <code>FUN_801E36C4</code>.</strong> Its <code>x</code> is a centre, and the box emitter inflates the rect by 8 px on every side: <code>footprint = (cx &minus; w/2 &minus; 10, y &minus; 2, w + 16, h + 16)</code>. The header tab <code>(48, 6, 65, 13)</code> predicts <code>(6, 4, 81, 29)</code>, the Load panel's pinned rect; the confirm prompt is two panels, a bar at <code>(8, 86, 300, 29)</code> and a Yes/No box at <code>(129, 118, 58, 42)</code>.</p>
+      <p><strong>Slide-in primitive <code>FUN_801E1C1C</code>.</strong> 12-bit fixed-point lerp, timer ramps <code>+0x100</code> per frame to <code>0x1000</code> - a 16-frame slide.</p>
+      <table class="data-table">
+        <thead><tr><th>Mode</th><th>Element</th><th>Start &rarr; target</th></tr></thead>
+        <tbody>
+          <tr><td>0</td><td>"Now checking" dialog</td><td><code>(416, 112)</code> &rarr; <code>(160, 112)</code></td></tr>
+          <tr><td>2</td><td>"Load" tab + active pill</td><td><code>(160, 96)</code> &rarr; <code>(48, 40)</code></td></tr>
+          <tr><td>3</td><td>Yes/No confirm</td><td><code>(160, 344)</code> &rarr; <code>(160, 88)</code></td></tr>
+          <tr><td>4</td><td>Card-format dialog</td><td><code>(576, 112)</code> &rarr; <code>(160, 112)</code></td></tr>
+        </tbody>
+      </table>
+      <p><strong>Bottom info panel <code>FUN_801E08D8</code>.</strong> Slides vertically from 394 to 138 once "Now checking" retracts; draws the slot's kingdom, play time and up to three party columns 96 px apart (portrait, name, LV, HP, MP; HP/MP go yellow at half and red at a quarter). The view mode per cell comes from <code>FUN_801E3F74</code>: readable save, foreign block, or free block. Its fourth arm, a &quot;Return&quot; caption for cell <code>0xF</code>, is dead code &mdash; the grid cursor is clamped to <code>col 0..4</code> / <code>row 0..2</code>, so the cell index tops out at 14 and nothing ever asks for 15. Slot data is read from <code>0x801EF1B8 + N &times; 0x100</code> (kingdom name <code>+0</code>, seconds <code>+0x24</code>, party count <code>+0x28</code>, names <code>+0x54 + i &times; 0xC</code>).</p>
+      <p><strong>Text slots, two live and four dead.</strong> Six <code>0x80</code>-byte text slots sit at <code>0x801EED24</code>. Slot 0 is the play-time line, its digits poked in place by <code>FUN_801DD35C</code>, and slot 3 a two-digit counter <code>FUN_801DE234</code> pokes the same way. The other four - a load-failure line, a wrong-game line, a not-available line and a not-used line - are named by nothing on the disc, in any address form, so they are dead text: the failure messages the screen really shows come from the overlay's message pool.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="engine-port">
+  <h2>In the port</h2>
+  <p><code>engine-menus::save_select</code> models the screen and the card machine; the host decides what a &ldquo;port&rdquo; is - the browser mounts the player's own card images, and the native window mounts its own card, a raw 128 KiB <code>memcard1.mcr</code> in the save directory, read and written through the same kernels (port 2 is a card image given on the command line). A directory with no card yet gets a freshly formatted one, seeded once from any engine-format slot files an older build left there. Every save on both play hosts goes through this screen - a gate checks that no host writes save bytes around it - and the load confirm, the overwrite question, the write and read panels and the damaged-block refusal all follow retail. The directory walk, the status poll and the checksum are line-for-line ports of the routines above, and <code>legaia_save</code> patches a real retail block in place and restamps its checksum, so an edited card save still loads on a PlayStation. The options screen's nine words travel the same way: the lift reads them, a load applies them to the world and then to the host's own options (a session-pinned row keeps its override), and every save writes the live ones back. The play clock travels both ways: a retail block lifts as whole seconds and an engine-written block stores <code>seconds &times; 60</code> back, so its time prints on retail's own screen. A disc-gated test runs every save on the library memory cards through Load, play, Save and Load again on the shared kernels and requires the two readings to agree field for field and land in the same scene and track. The engine's own richer save container (LGSF) is described on the <a href="engine.html">engine page</a>.</p>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <table class="data-table">
+    <thead><tr><th>Function / data</th><th>Address</th><th>What it proves</th><th>Dump</th></tr></thead>
+    <tbody>
+      <tr><td>Outer dispatcher</td><td><code>FUN_801DC6B4</code></td><td>9-state machine on <code>_DAT_8007B43C</code>; entry-context decode; fade constants <code>0xF2</code> / <code>0x79</code>.</td><td><code>overlay_menu_801dc6b4.txt</code></td></tr>
+      <tr><td>Root picker</td><td><code>FUN_801D6B20</code></td><td>Row 5 Load / row 6 Save gates; the <code>@Load</code> / <code>@Save</code> string pointers at <code>0x801CEA00</code> / <code>0x801CEA08</code>.</td><td>menu overlay dump</td></tr>
+      <tr><td>Card drivers</td><td><code>FUN_801DAE24</code> / <code>FUN_801DAEF4</code></td><td>Identical four-step machines; op 2 = load, op 1 = save.</td><td><code>overlay_menu_801daef4.txt</code></td></tr>
+      <tr><td>Load / save main</td><td><code>FUN_801DD35C</code></td><td>Op flag <code>0x801F0200</code>; erase-before-write on op 1; checksum compare at <code>0x801DF888</code>.</td><td>menu overlay dump</td></tr>
+      <tr><td>libcd machine</td><td><code>FUN_801E3294</code></td><td>Five states, retry budget <code>DAT_801E4FC4</code>, result codes; status strings <code>NOT_CARD</code> / <code>card_sts</code>.</td><td>menu overlay dump</td></tr>
+      <tr><td>Status poll</td><td><code>FUN_801E3900</code></td><td>Four <code>TestEvent</code> handles, last wins; 120-frame backstop with the increment in the delay slot.</td><td>menu overlay dump</td></tr>
+      <tr><td>Directory walk</td><td><code>FUN_801E1208</code></td><td>15-entry table at <code>0x801F32A8</code>, 16-byte <code>strncmp</code> against the regional prefix; class-then-budget order.</td><td>menu overlay dump</td></tr>
+      <tr><td>Checksum</td><td><code>FUN_801E38D8</code></td><td>Sums <code>0x7FF</code> words; compose buffer <code>0x801E7120</code>, read buffer <code>0x801E5120</code>.</td><td>menu overlay dump</td></tr>
+      <tr><td>List navigator</td><td><code>FUN_801D688C</code></td><td>Packed cursor (low 12 bits index, high nibble flags); cues <code>0x36</code> / <code>0x37</code> / <code>0x21</code>.</td><td><code>overlay_save_ui_select_801d688c.txt</code></td></tr>
+      <tr><td>Draw-list pins</td><td>PCSX-Redux state, GP0 scan</td><td>Sprite sources, CLUT rows, panel rects; VRAM dump + <code>PROT.DAT</code> signature grep.</td><td><code>scan_panel_prims.py</code>, <code>scan_panel_rects.py</code></td></tr>
+      <tr><td>Block layout</td><td>real <code>.mcr</code> saves vs RAM dumps</td><td>The <code>0x200 + (addr &minus; 0x80084340)</code> mapping.</td><td><code>crates/save</code> tests</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure">
+    <summary>History: readings this page replaced</summary>
+    <div class="disclosure-body"><p>The card-driver pair reads naturally the other way round (<code>0x18</code> before <code>0x19</code>, save before load); three independent signs put load on <code>0x18</code>. Several table slots once carried save labels - "slot confirm", "card-full screen", "auto-save" - and are the shop's mode picker, the shop's buy list and the casino prize exchange. The card filename separator is a hyphen, not an underscore. The "menu-glyph atlas" pin for the Load text was wrong; the glyphs are the dialog font. See <a href="../reference/re-do-not-re-walk.html">do-not-re-walk</a>.</p></div>
+  </details>
+  <p class="hint">Full write-up, including the debug character editor and sub-screen <code>0x15</code>: <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/subsystems/save-screen.md" target="_blank" rel="noopener"><code>docs/subsystems/save-screen.md</code></a>.</p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../formats/save-record.html">Save record</a>
+    <a href="../formats/save-icon.html">Save icons</a>
+    <a href="field-menu.html">Field menu</a>
+    <a href="shop.html">Shop</a>
+    <a href="inn.html">Inn</a>
+    <a href="actor-vm.html">Window-widget VM</a>
+    <a href="../formats/window-script.html">Window scripts</a>
+    <a href="../reference/cheats.html">Cheat database (RAM offsets)</a>
+    <a href="../tooling/pcsx-redux-automation.html">PCSX-Redux capture</a>
+  </div>
+</section>

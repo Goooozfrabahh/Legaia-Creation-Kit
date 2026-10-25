@@ -1,0 +1,416 @@
+//! Per-voice state for the SPU mixer.
+//!
+//! A voice owns:
+//!  - a base sample address into SPU RAM (the start of its ADPCM stream)
+//!  - a loop point (latched the first time a block with `loop_start` is seen,
+//!    or set explicitly via [`Voice::set_loop_addr`])
+//!  - a streaming ADPCM decoder (one 28-sample block at a time)
+//!  - a fractional pitch counter - the SPU runs internally at 44.1 kHz and
+//!    advances each voice by `pitch / 0x1000` samples per output tick,
+//!    resampling through the hardware's 4-point Gaussian interpolator
+//!    ([`gauss`])
+//!  - an ADSR envelope
+//!  - linear left/right volume registers (signed 16-bit, peak 0x3FFF in
+//!    libspu)
+//!
+//! The PSX SPU outputs 44.1 kHz; the host stream rate is decoupled by the
+//! mixer.
+//!
+//! No Sony bytes - this is the standard PSX SPU model.
+
+use super::adpcm::{AdpcmDecoder, BLOCK_BYTES, SAMPLES_PER_BLOCK};
+use super::adsr::{AdsrConfig, AdsrState, Phase};
+use super::gauss;
+use super::ram::SpuRam;
+
+/// Internal SPU output rate (constant per hardware).
+pub const SPU_INTERNAL_RATE: u32 = 44_100;
+
+/// Pitch unit: 0x1000 = 1× sample rate.
+pub const PITCH_UNITY: u16 = 0x1000;
+
+/// The engine mix bus a voice belongs to (see [`Voice::bus`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VoiceBus {
+    /// Background music: voices keyed by the SEQ sequencer.
+    Bgm,
+    /// Sound effects: voices keyed by a cue (field / battle / menu SFX).
+    #[default]
+    Sfx,
+}
+
+impl VoiceBus {
+    /// Index into [`crate::spu::Spu::bus_gain`].
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Bgm => 0,
+            Self::Sfx => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Voice {
+    /// Base address (bytes) into SPU RAM where this voice's ADPCM stream
+    /// starts. Set by libspu `SpuSetVoiceStartAddr`.
+    pub start_addr: u32,
+    /// Loop-back address. Latched on the first block with `loop_start`,
+    /// or set explicitly. `None` means "no loop set" - when an end-flag
+    /// block plays out the voice will go silent.
+    pub loop_addr: Option<u32>,
+    /// Pitch, 0x1000 = 1.0×. Sample step = pitch / 0x1000.
+    pub pitch: u16,
+    /// Left output volume, 0..=0x3FFF (libspu convention).
+    pub vol_left: i16,
+    /// Right output volume.
+    pub vol_right: i16,
+    /// ADSR envelope settings.
+    pub adsr_cfg: AdsrConfig,
+    /// ADSR runtime state.
+    pub adsr: AdsrState,
+    /// Per-voice reverb routing flag. When `true` this voice's pre-master
+    /// output is summed into the SPU's reverb send bus. libspu calls this
+    /// `SpuSetVoiceReverb`. Defaults to `false`; `VabBank`'s key-on sets it
+    /// per keyed tone from the VAB tone's `mode & 4`, as retail's
+    /// `FUN_80067550` sets the voice's `EON` bit.
+    pub reverb_send: bool,
+    /// Which engine mix bus the voice's output sums into ([`VoiceBus`]):
+    /// stamped at key-on by whoever keys it - a sequencer note is
+    /// [`VoiceBus::Bgm`], a cue key-on [`VoiceBus::Sfx`]. Engine-only (retail
+    /// has one SPU mix); it lets the config file's `bgm_volume` /
+    /// `sfx_volume` scale the two independently ([`crate::spu::Spu::bus_gain`]).
+    pub bus: VoiceBus,
+
+    // --- runtime state --------------------------------------------------
+    /// Absolute address of the *current* ADPCM block in SPU RAM.
+    cur_block_addr: u32,
+    /// Which sample within the current 28-sample block we're playing.
+    sample_idx: u8,
+    /// Fractional sample counter (in `1 / 0x1000` units of an input sample).
+    sample_frac: u32,
+    /// 28-sample buffer for the current block.
+    block_pcm: [i16; SAMPLES_PER_BLOCK],
+    /// Decoder state (carries `prev1`/`prev2` between blocks).
+    decoder: AdpcmDecoder,
+    /// True if the voice has at least one decoded block ready.
+    has_block: bool,
+    /// The four most recent decoded samples for the hardware's 4-point
+    /// Gaussian interpolator (`[0]` = oldest .. `[3]` = newest = the sample
+    /// at the current pitch-counter position). Survives block boundaries.
+    hist: [i16; 4],
+    /// Key-ons since construction. An owner that remembers the count at its
+    /// own key-on can tell whether someone else has re-keyed the voice since.
+    key_on_count: u32,
+}
+
+impl Default for Voice {
+    fn default() -> Self {
+        Self {
+            start_addr: 0,
+            loop_addr: None,
+            pitch: PITCH_UNITY,
+            vol_left: 0x3FFF,
+            vol_right: 0x3FFF,
+            adsr_cfg: AdsrConfig::default(),
+            adsr: AdsrState::default(),
+            reverb_send: false,
+            bus: VoiceBus::Sfx,
+            cur_block_addr: 0,
+            sample_idx: 0,
+            sample_frac: 0,
+            block_pcm: [0; SAMPLES_PER_BLOCK],
+            decoder: AdpcmDecoder::new(),
+            has_block: false,
+            hist: [0; 4],
+            key_on_count: 0,
+        }
+    }
+}
+
+impl Voice {
+    /// Set the explicit loop address. Equivalent to libspu's
+    /// `SpuSetVoiceLoopStartAddr`.
+    pub fn set_loop_addr(&mut self, addr: u32) {
+        self.loop_addr = Some(addr);
+    }
+
+    /// Toggle the per-voice reverb send flag (libspu `SpuSetVoiceReverb`
+    /// analogue).
+    pub fn set_reverb_send(&mut self, on: bool) {
+        self.reverb_send = on;
+    }
+
+    /// Trigger a key-on: rewind to start, decode the first block, kick the
+    /// envelope into the Attack phase.
+    pub fn key_on(&mut self, ram: &SpuRam) {
+        self.cur_block_addr = self.start_addr;
+        self.sample_idx = 0;
+        self.sample_frac = 0;
+        self.decoder.reset();
+        self.fetch_block(ram);
+        // Interpolator history starts silent; the stream's first sample is
+        // the "newest" tap at the initial counter position.
+        self.hist = [0, 0, 0, if self.has_block { self.block_pcm[0] } else { 0 }];
+        self.adsr.key_on();
+        self.key_on_count = self.key_on_count.wrapping_add(1);
+    }
+
+    /// How many times this voice has been keyed on. The sequencer stamps
+    /// each of its notes with this value; a later mismatch means another
+    /// client (an SFX cue) took the voice, so the note no longer owns it -
+    /// retail's equivalent is the cue key-on rewriting the voice's libsnd
+    /// note record (`+0x10 = 0x21`), which the sequencer's note-off then no
+    /// longer matches.
+    pub fn key_on_count(&self) -> u32 {
+        self.key_on_count
+    }
+
+    /// Trigger a key-off - the envelope transitions to Release. Voice keeps
+    /// playing until the envelope drains.
+    pub fn key_off(&mut self) {
+        self.adsr.key_off();
+    }
+
+    /// True when the envelope is in `Off` (envelope finished or never started).
+    pub fn is_off(&self) -> bool {
+        self.adsr.phase == Phase::Off
+    }
+
+    /// Sample-level tick. Advances envelope by one tick and produces one
+    /// (left, right) output sample at the SPU internal rate. Voices that
+    /// are off produce silence.
+    pub fn tick(&mut self, ram: &SpuRam) -> (i32, i32) {
+        if !self.has_block || self.adsr.phase == Phase::Off {
+            return (0, 0);
+        }
+        let env = self.adsr.tick(&self.adsr_cfg) as i32;
+        // Resample through the hardware's 4-point Gaussian interpolator:
+        // fraction bits 4..11 of the pitch counter index the coefficient
+        // table (see [`gauss`]).
+        let frac_idx = ((self.sample_frac >> 4) & 0xFF) as u8;
+        let raw = gauss::interpolate(&self.hist, frac_idx);
+
+        // Mix: raw * env / 0x7FFF * vol / 0x3FFF.
+        let enveloped = (raw * env) >> 15;
+        let left = (enveloped * self.vol_left as i32) >> 14;
+        let right = (enveloped * self.vol_right as i32) >> 14;
+
+        // Advance fractional pitch counter and walk forward through samples,
+        // pushing each newly-reached sample into the interpolator history.
+        self.sample_frac += self.pitch as u32;
+        while self.sample_frac >= PITCH_UNITY as u32 {
+            self.sample_frac -= PITCH_UNITY as u32;
+            self.sample_idx += 1;
+            if self.sample_idx as usize >= SAMPLES_PER_BLOCK {
+                self.sample_idx = 0;
+                self.advance_to_next_block(ram);
+                if !self.has_block {
+                    break;
+                }
+            }
+            self.hist = [
+                self.hist[1],
+                self.hist[2],
+                self.hist[3],
+                self.block_pcm[self.sample_idx as usize],
+            ];
+        }
+
+        (left, right)
+    }
+
+    /// Decode the block at `cur_block_addr` into `block_pcm`. Sets
+    /// `has_block = false` on bad-header (treats as EOS).
+    fn fetch_block(&mut self, ram: &SpuRam) {
+        let bytes = ram.slice(self.cur_block_addr, BLOCK_BYTES as u32);
+        if bytes.len() < BLOCK_BYTES {
+            self.has_block = false;
+            return;
+        }
+        let (pcm, flags) = self.decoder.decode_block(bytes);
+        if flags.bad_header {
+            self.has_block = false;
+            return;
+        }
+        // Latch loop address if we don't have one yet and this block sets it.
+        if self.loop_addr.is_none() && flags.loop_start {
+            self.loop_addr = Some(self.cur_block_addr);
+        }
+        self.block_pcm = pcm;
+        self.has_block = true;
+    }
+
+    /// Decide what comes after the current block: jump to loop, advance to
+    /// next sequential block, or stop.
+    fn advance_to_next_block(&mut self, ram: &SpuRam) {
+        let bytes = ram.slice(self.cur_block_addr, BLOCK_BYTES as u32);
+        let flag = if bytes.len() >= 2 { bytes[1] } else { 0 };
+        let end = flag & 0x01 != 0;
+        let repeat = flag & 0x02 != 0;
+        if end {
+            if repeat {
+                // Loop back. Use loop_addr if latched, otherwise stop.
+                if let Some(addr) = self.loop_addr {
+                    self.cur_block_addr = addr;
+                    self.fetch_block(ram);
+                } else {
+                    self.has_block = false;
+                    self.adsr.phase = Phase::Off;
+                }
+            } else {
+                self.has_block = false;
+                self.adsr.phase = Phase::Off;
+            }
+        } else {
+            self.cur_block_addr += BLOCK_BYTES as u32;
+            self.fetch_block(ram);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::ram::SpuRam;
+    use super::*;
+
+    /// Build a synthetic ADPCM stream of `n_blocks` silence-blocks; final
+    /// block carries an end flag and (optionally) the repeat flag.
+    fn synth_silence_stream(n: usize, repeat_at_end: bool) -> Vec<u8> {
+        let mut out = vec![0u8; n * BLOCK_BYTES];
+        let last = (n - 1) * BLOCK_BYTES;
+        out[last + 1] = if repeat_at_end { 0x03 } else { 0x01 };
+        out
+    }
+
+    /// Voice with default ADSR (instant attack) plays the first block and
+    /// envelope advances toward decay.
+    #[test]
+    fn voice_key_on_starts_envelope_and_yields_silence_for_silent_stream() {
+        let stream = synth_silence_stream(1, false);
+        let mut ram = SpuRam::new();
+        ram.write_at(0x1000, &stream);
+        let mut v = Voice {
+            start_addr: 0x1000,
+            ..Voice::default()
+        };
+        v.key_on(&ram);
+        let mut sum = 0i64;
+        for _ in 0..32 {
+            let (l, _r) = v.tick(&ram);
+            sum += l as i64;
+        }
+        // Silence block + any envelope -> still silence.
+        assert_eq!(sum, 0);
+    }
+
+    /// End-flag without repeat halts the voice.
+    #[test]
+    fn voice_stops_at_end_flag_no_repeat() {
+        let stream = synth_silence_stream(1, false);
+        let mut ram = SpuRam::new();
+        ram.write_at(0x1000, &stream);
+        let mut v = Voice {
+            start_addr: 0x1000,
+            ..Voice::default()
+        };
+        v.key_on(&ram);
+        // 28 samples at unity pitch consumes the whole block -> next tick stops.
+        for _ in 0..32 {
+            v.tick(&ram);
+        }
+        assert!(v.is_off());
+    }
+
+    /// Build an "infinite-sustain" ADSR config so the envelope doesn't
+    /// drain the voice during a streaming-loop test.
+    fn hold_forever_adsr() -> AdsrConfig {
+        AdsrConfig {
+            sustain_level: 0x8000,   // SL 15: (15 + 1) * 0x800
+            sustain_decrease: false, // not strictly needed at peak
+            sustain_shift: 0x1F,     // huge shift -> tiny step
+            decay_shift: 0xF,        // one -8 step off the peak, then sustain
+            ..AdsrConfig::default()
+        }
+    }
+
+    /// End-flag with repeat + an explicit loop addr keeps the voice's
+    /// playback head looping forever.
+    #[test]
+    fn voice_loops_when_end_repeat_and_loop_addr_set() {
+        let stream = synth_silence_stream(1, true);
+        let mut ram = SpuRam::new();
+        ram.write_at(0x1000, &stream);
+        let mut v = Voice {
+            start_addr: 0x1000,
+            adsr_cfg: hold_forever_adsr(),
+            ..Voice::default()
+        };
+        v.set_loop_addr(0x1000);
+        v.key_on(&ram);
+        for _ in 0..200 {
+            v.tick(&ram);
+        }
+        // Voice's playback head should still be valid (repeat brought it
+        // back to start). Envelope held by config -> not off.
+        assert!(!v.is_off());
+    }
+
+    /// Half-pitch playback of a DC (constant) stream settles on the source
+    /// level rather than a staircase: the Gaussian interpolator's fractional
+    /// positions must not introduce steps on constant input.
+    #[test]
+    fn voice_half_pitch_dc_stream_is_smooth() {
+        // Filter-0 shift-0 block: every nibble 7 decodes to 7 << 12 = 28672.
+        let mut block = [0x77u8; BLOCK_BYTES];
+        block[0] = 0x00; // filter 0, shift 0
+        block[1] = 0x03; // end + repeat
+        let mut ram = SpuRam::new();
+        ram.write_at(0x1000, &block);
+        let mut v = Voice {
+            start_addr: 0x1000,
+            pitch: 0x800,
+            adsr_cfg: hold_forever_adsr(),
+            ..Voice::default()
+        };
+        v.set_loop_addr(0x1000);
+        v.key_on(&ram);
+        // Warm up past the attack ramp + the interpolator's group delay.
+        for _ in 0..64 {
+            v.tick(&ram);
+        }
+        let mut min = i32::MAX;
+        let mut max = i32::MIN;
+        for _ in 0..64 {
+            let (l, _r) = v.tick(&ram);
+            min = min.min(l);
+            max = max.max(l);
+        }
+        // Settled DC: near the decoded level (28672 scaled by the table's
+        // ~0.996 unity sum), with no fraction-position wobble to speak of.
+        assert!(max - min <= 16, "DC wobble {min}..{max}");
+        assert!((27500..=28672).contains(&min), "level {min}");
+    }
+
+    /// Pitch=0x800 means we walk through samples at half speed -> twice as
+    /// many ticks needed to consume a block.
+    #[test]
+    fn voice_pitch_half_doubles_block_lifetime() {
+        // Two-block stream so we can detect block-edge crossing.
+        let stream = synth_silence_stream(2, false);
+        let mut ram = SpuRam::new();
+        ram.write_at(0x1000, &stream);
+        let mut v = Voice {
+            start_addr: 0x1000,
+            pitch: 0x800,
+            adsr_cfg: hold_forever_adsr(),
+            ..Voice::default()
+        };
+        v.key_on(&ram);
+        // After 55 ticks at half pitch, fractional advance = 55*0x800 =
+        // 27.5 input samples -> still inside block 0. Voice active.
+        for _ in 0..55 {
+            v.tick(&ram);
+        }
+        assert!(!v.is_off());
+    }
+}

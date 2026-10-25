@@ -1,0 +1,599 @@
+/* webgl-math.js - pure-function math + placement helpers for the
+ * WASM viewer's TMD pipeline. Split out of webgl-tmd.js for file
+ * modularity; consumed by webgl-tmd.js's TmdRenderer class.
+ *
+ * Loads as a classic global script - exposes: IDENTITY4, MESH_SCALE,
+ * compileProgram, mulMat4, perspective, translate, rotateY, rotateX,
+ * scaleMat, buildMvp, placementModelScaled, placementModelScaledY,
+ * placementModelEuler,
+ * placementModelCentered,
+ * computeAabb, buildTopDownVp, buildWorldOrbitVp, ortho, lookAt,
+ * occlProjScaleY, attachWorldOrbitControls. Must be loaded before
+ * webgl-tmd.js.
+ */
+
+const IDENTITY4 = new Float32Array([
+  1, 0, 0, 0,
+  0, 1, 0, 0,
+  0, 0, 1, 0,
+  0, 0, 0, 1,
+]);
+
+function compileProgram(gl, vsSrc, fsSrc) {
+  const vs = gl.createShader(gl.VERTEX_SHADER);
+  gl.shaderSource(vs, vsSrc);
+  gl.compileShader(vs);
+  if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(vs);
+    throw new Error('vertex shader: ' + log);
+  }
+  const fs = gl.createShader(gl.FRAGMENT_SHADER);
+  gl.shaderSource(fs, fsSrc);
+  gl.compileShader(fs);
+  if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+    const log = gl.getShaderInfoLog(fs);
+    throw new Error('fragment shader: ' + log);
+  }
+  const prog = gl.createProgram();
+  gl.attachShader(prog, vs);
+  gl.attachShader(prog, fs);
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    throw new Error('link: ' + gl.getProgramInfoLog(prog));
+  }
+  gl.deleteShader(vs);
+  gl.deleteShader(fs);
+  return prog;
+}
+
+/* Multiply two 4x4 column-major matrices: out = a * b. */
+function mulMat4(a, b) {
+  const out = new Float32Array(16);
+  for (let r = 0; r < 4; r++) {
+    for (let c = 0; c < 4; c++) {
+      let s = 0;
+      for (let k = 0; k < 4; k++) {
+        s += a[k * 4 + r] * b[c * 4 + k];
+      }
+      out[c * 4 + r] = s;
+    }
+  }
+  return out;
+}
+
+/* Standard right-handed perspective. Camera at origin, looking down -Z,
+ * +Y up. Visible points have negative z_view; w_clip = -z_view. */
+function perspective(fov, aspect, near, far) {
+  const f = 1 / Math.tan(fov / 2);
+  const nf = 1 / (near - far);
+  return new Float32Array([
+    f / aspect, 0, 0,                       0,
+    0,          f, 0,                       0,
+    0,          0, (far + near) * nf,      -1,
+    0,          0, 2 * far * near * nf,     0,
+  ]);
+}
+
+/* The projection's vertical scale P[1][1] (= 1 / tan(fovY / 2)) recovered
+ * from a finished column-major view-projection.
+ *
+ * vp = P * V with V a rigid transform, so the product's second row is
+ * P[1][1] times the view's UNIT up axis - its length is the scale. That is
+ * what lets the occlusion fade size its circle in world units without the
+ * renderer being handed a camera basis. Unaffected by buildWorldOrbitVp's
+ * retail screen-X mirror (`P[0] = -P[0]`), which touches only row 0.
+ * Column-major index = col * 4 + row, so row 1 is 1, 5, 9.
+ * Rust twin: occlusion_fade::view_proj_scale_y. */
+function occlProjScaleY(vp) {
+  return Math.hypot(vp[1], vp[5], vp[9]);
+}
+
+/* Translation matrix as column-major. */
+function translate(tx, ty, tz) {
+  return new Float32Array([
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+    tx, ty, tz, 1,
+  ]);
+}
+
+function rotateY(a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return new Float32Array([
+     c, 0, -s, 0,
+     0, 1,  0, 0,
+     s, 0,  c, 0,
+     0, 0,  0, 1,
+  ]);
+}
+
+function rotateX(a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return new Float32Array([
+    1,  0, 0, 0,
+    0,  c, s, 0,
+    0, -s, c, 0,
+    0,  0, 0, 1,
+  ]);
+}
+
+function scaleMat(s) {
+  return new Float32Array([
+    s, 0, 0, 0,
+    0, s, 0, 0,
+    0, 0, s, 0,
+    0, 0, 0, 1,
+  ]);
+}
+
+/* Build a model-view-projection matrix in column-major order (matching glsl
+ * mat4 layout). Centers the model at origin, scales to unit radius, rotates
+ * Y then X, pushes back to camera space, perspective-projects.
+ *
+ * PSX TMD coords have +Y pointing down, so we negate Y in the model scale
+ * to bring "up" back to +Y for the rest of the pipeline.
+ *
+ * `fovY` (optional, radians) overrides the default 1.2-rad vertical field of
+ * view - the dance stage passes a narrower PSX-like value so its interior
+ * framing matches the retail camera's apparent scale. */
+function buildMvp(yaw, pitch, distance, panX, panY, center, radius, viewportW, viewportH, fovY) {
+  const s = 1.0 / radius;
+  /* Model: translate to origin, then non-uniform scale that flips Y. */
+  const T = translate(-center[0], -center[1], -center[2]);
+  const S = new Float32Array([
+    s,  0,  0, 0,
+    0, -s,  0, 0,    /* flip Y: PSX +Y down → screen +Y up */
+    0,  0,  s, 0,
+    0,  0,  0, 1,
+  ]);
+  const M = mulMat4(S, T);
+
+  /* View: rotate Y, then X, then push camera away by `distance` (in unit-
+   * radius units; 2.5 is the default), then apply view-space pan. The pan
+   * goes after the rotate so it's relative to camera orientation: the model
+   * stays oriented as you orbit, and W/A/S/D pans relative to your view.
+   *
+   * Distance is allowed to go below 1.0 - the camera enters the bounding
+   * sphere and you fly through the model. Floor at a tiny epsilon to avoid
+   * matrix singularities. */
+  const cameraDist = Math.max(distance, 0.001);
+  const Ry = rotateY(yaw);
+  const Rx = rotateX(pitch);
+  const Tv = translate(panX, panY, -cameraDist);
+  const V = mulMat4(Tv, mulMat4(Rx, Ry));
+
+  /* Projection. The near plane scales with the framing distance: a fixed
+   * tiny near plane (the old 0.001) spent virtually all of the 24-bit depth
+   * buffer's precision inside [0.001, 0.002] and left the model itself with
+   * ~0.4-unit depth ambiguity at real mesh scale - authored ~1-unit decal
+   * offsets z-fought. At `distance * 0.01` the buffer resolves sub-0.02-unit
+   * separations at the default framing, while a fly-through (distance below
+   * 1) still gets a small enough plane not to clip the near walls. */
+  const aspect = viewportW / viewportH;
+  const near = Math.max(0.0005, cameraDist * 0.01);
+  const P = perspective(fovY || 1.2, aspect, near, 100.0);
+
+  return mulMat4(P, mulMat4(V, M));
+}
+
+/* Per-placement model matrix for the assembled world view.
+ *
+ * Takes a TMD-local mesh (PSX +Y down, ~tens of units across) and places it at
+ * world (x, z) with optional Y-axis rotation. Also flips Y so PSX +Y down
+ * renders as +Y up (height above the ground plane), matching `buildMvp`.
+ *
+ * x / z are world coords (0..16320 per the Man asset). World-map TMDs are
+ * tiny "flat" icons (|Z| <= ~64 in PSX units) and would render as
+ * specks against the kingdom-scale frustum, so we scale them up by
+ * `MESH_SCALE` to make landmarks legible. This is a viewer-side
+ * presentation knob, not the retail engine's behaviour - the in-game
+ * top-view debug camera is much closer to its meshes. */
+const MESH_SCALE = 6.0;
+
+/* Legacy per-placement model: scale by `sc`, rotate Y, place at (x, 0, z).
+ * The mesh's TMD-local origin is the placement pivot; meshes with a
+ * non-zero AABB centroid will render offset from the placement coord. */
+function placementModelScaled(x, z, rotY, scale) {
+  const c = Math.cos(rotY), s = Math.sin(rotY);
+  const sc = scale;
+  return new Float32Array([
+     sc * c,    0,  sc * s, 0,
+     0,       -sc,  0,      0,    /* flip Y so PSX +Y down -> world +Y up */
+    -sc * s,    0,  sc * c, 0,
+     x,         0,  z,      1,
+  ]);
+}
+
+/* Per-placement model that also positions the anchor in Y (world height).
+ * Same as `placementModelScaled` but translates by (x, y, z) instead of
+ * (x, 0, z). Used for walk-frame landmarks, whose world Y comes from the
+ * scene floor-height LUT (`-lut[nibble] + y_off`) so they sit on the
+ * continent heightfield rather than the y=0 plane. The mesh-local geometry
+ * is still Y-flipped (PSX +Y down -> world +Y up); the translation is applied
+ * after the flip, matching the native engine's
+ * `T(x, world_y, z) * S(1, -1, 1)`. */
+function placementModelScaledY(x, y, z, rotY, scale) {
+  const c = Math.cos(rotY), s = Math.sin(rotY);
+  const sc = scale;
+  return new Float32Array([
+     sc * c,    0,  sc * s, 0,
+     0,       -sc,  0,      0,    /* flip Y so PSX +Y down -> world +Y up */
+    -sc * s,    0,  sc * c, 0,
+     x,         y,  z,      1,
+  ]);
+}
+
+/* Per-placement model carrying all THREE authored angles from the object
+ * record (`+0x08` / `+0x0A` / `+0x0C`), composed in retail's `Rx * Ry * Rz`
+ * order (`FUN_80026988`). Angles are radians, positive, in the retail sense -
+ * the same values the Rust side feeds `battle_intro::placement_rotation`.
+ *
+ * `placementModelScaledY` is the yaw-only special case of this: its linear
+ * part expands to `diag(sc,-sc,sc) * Ry(angle)`, which is why it takes a
+ * NEGATED yaw (its inline Ry is transposed, and the two negations cancel).
+ * That cancellation does not generalise to X and Z, so a tilted placement
+ * must come through here instead. */
+function placementModelEuler(x, y, z, rotX, rotY, rotZ, scale) {
+  const cx = Math.cos(rotX), sx = Math.sin(rotX);
+  const cy = Math.cos(rotY), sy = Math.sin(rotY);
+  const cz = Math.cos(rotZ), sz = Math.sin(rotZ);
+  /* R = Rx * Ry * Rz, row-major. */
+  const r00 = cy * cz,                  r01 = -cy * sz,                 r02 = sy;
+  const r10 = sx * sy * cz + cx * sz,   r11 = -sx * sy * sz + cx * cz,  r12 = -sx * cy;
+  const r20 = -cx * sy * cz + sx * sz,  r21 = cx * sy * sz + sx * cz,   r22 = cx * cy;
+  /* M = T * diag(sc,-sc,sc) * R; emitted column-major for WebGL. */
+  const sc = scale;
+  return new Float32Array([
+     sc * r00, -sc * r10,  sc * r20, 0,
+     sc * r01, -sc * r11,  sc * r21, 0,
+     sc * r02, -sc * r12,  sc * r22, 0,
+     x,         y,         z,        1,
+  ]);
+}
+
+/* Centroid-anchored per-placement model. Pre-translates the mesh so its
+ * AABB centroid sits at the placement coord before rotation + Y-flip
+ * scale + world translation. The math expands `T_world * Sflip_scaled *
+ * Ry * T(-centroid)`. Used for `kind: 'unplaced'` placements where the
+ * TMD-local origin doesn't carry meaningful world-position information. */
+function placementModelCentered(x, z, rotY, scale, aabb) {
+  const c = Math.cos(rotY), s = Math.sin(rotY);
+  const sc = scale;
+  const cx = aabb.cx, cy = aabb.cy, cz = aabb.cz;
+  return new Float32Array([
+     sc * c,                            0,      sc * s,                          0,
+     0,                                -sc,     0,                                0,
+    -sc * s,                            0,      sc * c,                          0,
+     sc * (-c * cx + s * cz) + x,       sc * cy, sc * (-s * cx - c * cz) + z,    1,
+  ]);
+}
+
+/* Compute AABB + bounding-sphere radius over a Float32Array of vec3s.
+ * Empty input collapses to a zero-extent box at origin. */
+function computeAabb(positions) {
+  if (!positions || positions.length < 3) {
+    return { cx: 0, cy: 0, cz: 0, sx: 0, sy: 0, sz: 0, radius: 0 };
+  }
+  let minX = positions[0], maxX = positions[0];
+  let minY = positions[1], maxY = positions[1];
+  let minZ = positions[2], maxZ = positions[2];
+  for (let i = 3; i < positions.length; i += 3) {
+    const x = positions[i], y = positions[i + 1], z = positions[i + 2];
+    if (x < minX) minX = x; else if (x > maxX) maxX = x;
+    if (y < minY) minY = y; else if (y > maxY) maxY = y;
+    if (z < minZ) minZ = z; else if (z > maxZ) maxZ = z;
+  }
+  const sx = maxX - minX, sy = maxY - minY, sz = maxZ - minZ;
+  return {
+    cx: (minX + maxX) * 0.5,
+    cy: (minY + maxY) * 0.5,
+    cz: (minZ + maxZ) * 0.5,
+    sx, sy, sz,
+    radius: Math.hypot(sx, sy, sz) * 0.5,
+  };
+}
+
+/* Per-vertex smoothed normals for the opt-in dynamic light - the JS twin of
+ * legaia_tmd::mesh::compute_smooth_normals, which builds the native VRAM
+ * mesh's normal stream. Every triangle's unnormalised face normal (its
+ * cross product, so the weight is the triangle's area) accumulates into a
+ * bin keyed by the integer-truncated position, so prims that share a vertex
+ * of the TMD's vertex table share a normal; each vertex then takes its bin's
+ * normalised sum, or zero for a degenerate bin (the shader's cue to fall
+ * back to the facet normal). `positions` is f32 x3 per vertex, `indices` u32
+ * triangles. Returns a Float32Array the length of `positions`. */
+function computeSmoothNormals(positions, indices) {
+  const n = (positions.length / 3) | 0;
+  const keys = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const o = i * 3;
+    keys[i] = Math.trunc(positions[o]) + ',' + Math.trunc(positions[o + 1]) + ','
+      + Math.trunc(positions[o + 2]);
+  }
+  const bins = new Map();
+  const triCount = (indices.length / 3) | 0;
+  for (let t = 0; t < triCount; t++) {
+    const a = indices[t * 3], b = indices[t * 3 + 1], c = indices[t * 3 + 2];
+    if (a >= n || b >= n || c >= n) continue;
+    const ax = positions[a * 3], ay = positions[a * 3 + 1], az = positions[a * 3 + 2];
+    const abx = positions[b * 3] - ax, aby = positions[b * 3 + 1] - ay;
+    const abz = positions[b * 3 + 2] - az;
+    const acx = positions[c * 3] - ax, acy = positions[c * 3 + 1] - ay;
+    const acz = positions[c * 3 + 2] - az;
+    const nx = aby * acz - abz * acy;
+    const ny = abz * acx - abx * acz;
+    const nz = abx * acy - aby * acx;
+    for (const v of [a, b, c]) {
+      let bin = bins.get(keys[v]);
+      if (!bin) { bin = [0, 0, 0]; bins.set(keys[v], bin); }
+      bin[0] += nx; bin[1] += ny; bin[2] += nz;
+    }
+  }
+  const out = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const bin = bins.get(keys[i]);
+    if (!bin) continue;
+    const len = Math.hypot(bin[0], bin[1], bin[2]);
+    if (len > 1e-6) {
+      out[i * 3] = bin[0] / len;
+      out[i * 3 + 1] = bin[1] / len;
+      out[i * 3 + 2] = bin[2] / len;
+    }
+  }
+  return out;
+}
+
+/* Top-down orthographic view-projection.
+ *
+ * Camera looks straight down (-Y) by default; `cam.pitch` tilts it toward
+ * the +Z horizon (radians, 0 = pure top-down). The visible frame is sized
+ * around (centerX, centerZ) with the requested half-extents in world units,
+ * letterboxed to fit the canvas aspect ratio.
+ *
+ * Z-up note: world coords on the ground plane are (X, Z). After Y-flip in
+ * placementModel, mesh height contributes to Y, so we keep Y as the view's
+ * vertical-clip axis when the camera tilts. */
+function buildTopDownVp(viewportW, viewportH, worldExtent, cam) {
+  const aspect = viewportW / viewportH;
+  let hw = cam.halfWidth;
+  let hh = cam.halfHeight;
+  /* Letterbox to fit. Expand the shorter axis so nothing in the requested
+   * window is clipped. */
+  if (hw / hh < aspect) hw = hh * aspect; else hh = hw / aspect;
+  /* Far plane needs to clear the world diagonal + mesh height with a
+   * generous margin so terrain at the world's edge doesn't z-clip. */
+  const wx = worldExtent[0], wz = worldExtent[1];
+  const farPad = Math.max(wx, wz) * 2 + 4096;
+
+  /* View: place camera above the center, look down (slightly tilted by
+   * `pitch`). +Y is up after placementModel's flip. */
+  const pitch = cam.pitch || 0;
+  const eyeY = Math.max(wx, wz);  /* high enough to clear any mesh height */
+  /* World-space target = (centerX, 0, centerZ). Camera position offset by
+   * pitch toward -Z so a non-zero pitch tilts the view "forward". */
+  const eyeX = cam.centerX;
+  const eyeZ = cam.centerZ - eyeY * Math.tan(pitch);
+  const target = [cam.centerX, 0, cam.centerZ];
+  /* Rotate the top-down map 180 deg on screen. With the camera looking
+   * straight down, up = +Z makes screen-up = world +Z and screen-right =
+   * world -X (vs the un-rotated up = -Z, which gave screen-up = -Z /
+   * screen-right = +X). */
+  const up = [0, 0, 1];
+  const V = lookAt([eyeX, eyeY, eyeZ], target, up);
+
+  /* ...then mirror the horizontal screen axis to match retail. Retail
+   * draws this view rotated 180 deg *and* horizontally flipped (left
+   * becomes right), so after the up = +Z rotation above we negate screen
+   * X by swapping ortho's left/right. The net world->screen basis becomes
+   * screen-up = world +Z, screen-right = world +X. This reverses triangle
+   * winding, which is harmless here (renderAssembled disables CULL_FACE).
+   * The pan controls in attachTopDownControls map drag deltas back through
+   * this same (post-mirror) basis. */
+  const P = ortho(hw, -hw, -hh, hh, 1.0, farPad);
+  return mulMat4(P, V);
+}
+
+/* Perspective orbit view-projection for the assembled world view.
+ *
+ * The retail world map is genuinely 3D (GTE RTPT perspective; confirmed by
+ * moving the camera with GameShark in retail), so the world-overview page
+ * renders it with a real perspective camera instead of the ortho top-down.
+ *
+ * `cam` extends the top-down camera record with orbit angles:
+ *   centerX / centerZ        - ground-plane target (world units)
+ *   halfWidth / halfHeight   - requested half-extents at the target plane;
+ *                              zoom keeps its ortho meaning (the visible
+ *                              window at the target distance), so wheel
+ *                              zoom and pan speed behave identically in
+ *                              both camera modes.
+ *   yaw                      - azimuth in radians; 0 matches the retail
+ *                              screen basis (screen-up = world +Z,
+ *                              screen-right = world +X).
+ *   pitch                    - tilt from straight-down in radians; 0 is
+ *                              the pure top-down view, larger values lean
+ *                              the camera toward the horizon.
+ *
+ * The eye orbits the target on a sphere: at pitch=0 it sits directly
+ * above (up = world +Z rotated by yaw, matching buildTopDownVp), and the
+ * projection mirrors screen X the same way the ortho path does so the
+ * retail horizontal flip is preserved. Winding flips with the mirror,
+ * which is harmless (renderAssembled disables CULL_FACE); the one thing
+ * that reads facing is the double-sided-pair discard, and renderAssembled
+ * already tells it this parity via u_pair_front = 0. */
+function buildWorldOrbitVp(viewportW, viewportH, worldExtent, cam) {
+  /* Explicit view-projection override: a cam carrying a ready column-major
+   * `vp` matrix (Float32Array(16)) bypasses the orbit construction entirely.
+   * The play page's battle frame uses this to hand through the engine-built
+   * retail GTE battle camera (`battle_cam_script::battle_vp` - the same
+   * matrix the native window renders with) instead of remapping the pose
+   * onto this orbit model. Checked here rather than in renderAssembled so
+   * vr-mode.js's per-eye monkey-patch (which wraps AROUND this function)
+   * still wins while an XR session presents. */
+  if (cam && cam.vp) return cam.vp;
+  const aspect = viewportW / viewportH;
+  let hw = cam.halfWidth;
+  let hh = cam.halfHeight;
+  /* Same letterbox rule as the ortho path: expand the shorter axis. */
+  if (hw / hh < aspect) hw = hh * aspect; else hh = hw / aspect;
+
+  /* Distance so the vertical half-extent at the target plane equals hh
+   * (perspective analogue of the ortho window). */
+  const FOV_Y = 0.9;   /* ~52 deg - close to the retail world-map FOV feel */
+  const dist = Math.max(hh / Math.tan(FOV_Y / 2), 1.0);
+
+  const yaw = cam.yaw || 0;
+  const pitch = Math.max(0, Math.min(1.45, cam.pitch || 0));
+  const sinY = Math.sin(yaw), cosY = Math.cos(yaw);
+  const sinP = Math.sin(pitch), cosP = Math.cos(pitch);
+
+  /* Eye direction (target -> eye): pitch=0 is straight up; tilting at
+   * yaw=0 moves the eye toward -Z (looking north over the map), the same
+   * convention buildTopDownVp's eyeZ offset used. */
+  /* `centerY` (optional, default 0) lifts the look-at off the ground plane -
+   * the play page's follow camera targets the player's chest on an elevated
+   * floor tier, where a y=0 target would aim under the terrain. Omit it and the
+   * camera behaves exactly as the world-overview / full-map views always have. */
+  const target = [cam.centerX, cam.centerY || 0, cam.centerZ];
+  const eye = [
+    target[0] + dist * sinP * sinY,
+    target[1] + dist * cosP,
+    target[2] - dist * sinP * cosY,
+  ];
+  /* Up = the world +Y axis projected perpendicular to the view ray; at
+   * pitch=0 this degenerates to +Z rotated by yaw (the top-down up). */
+  let up = [-cosP * sinY, sinP, cosP * cosY];
+  /* `roll` (optional, default 0) tilts the frame about the view ray - the
+   * retail op-0x45 slot-2 angle (`_DAT_8007B794`, the third factor
+   * `FUN_8001CF50` composes after pitch and yaw). Retail authors it, so the
+   * cutscene camera hands it through rather than dropping the term. `up` is
+   * perpendicular to the ray by construction, so Rodrigues collapses to
+   * `up*cos + (k x up)*sin`. */
+  const roll = cam.roll || 0;
+  if (roll) {
+    /* k = unit view ray (target - eye), i.e. the negated eye offset. */
+    const k = [-sinP * sinY, -cosP, sinP * cosY];
+    const c = Math.cos(roll), sn = Math.sin(roll);
+    const cx = k[1] * up[2] - k[2] * up[1];
+    const cy = k[2] * up[0] - k[0] * up[2];
+    const cz = k[0] * up[1] - k[1] * up[0];
+    up = [up[0] * c + cx * sn, up[1] * c + cy * sn, up[2] * c + cz * sn];
+  }
+  const V = lookAt(eye, target, up);
+
+  /* Near/far sized to the orbit distance + the world diagonal so tilted
+   * views keep the widened ocean backdrop inside the frustum. */
+  const wx = worldExtent[0], wz = worldExtent[1];
+  const worldSpan = Math.max(wx, wz);
+  const near = Math.max(dist / 500, 1.0);
+  const far = dist + worldSpan * 10 + 4096;
+  const P = perspective(FOV_Y, aspect, near, far);
+  /* Mirror screen X (retail horizontal flip) - the perspective matrix
+   * keeps X only in element [0], so negating it is the full mirror. */
+  P[0] = -P[0];
+  return mulMat4(P, V);
+}
+
+/* Standard right-handed orthographic projection. Column-major. */
+function ortho(l, r, b, t, n, f) {
+  return new Float32Array([
+    2 / (r - l),         0,                   0,                   0,
+    0,                   2 / (t - b),         0,                   0,
+    0,                   0,                  -2 / (f - n),         0,
+    -(r + l) / (r - l), -(t + b) / (t - b), -(f + n) / (f - n),   1,
+  ]);
+}
+
+/* Right-handed lookAt. eye / target / up are 3-element arrays. */
+function lookAt(eye, target, up) {
+  const fx = target[0] - eye[0], fy = target[1] - eye[1], fz = target[2] - eye[2];
+  const fl = Math.hypot(fx, fy, fz) || 1;
+  const f = [fx / fl, fy / fl, fz / fl];
+  /* s = normalize(f x up) */
+  let sx = f[1] * up[2] - f[2] * up[1];
+  let sy = f[2] * up[0] - f[0] * up[2];
+  let sz = f[0] * up[1] - f[1] * up[0];
+  const sl = Math.hypot(sx, sy, sz) || 1;
+  sx /= sl; sy /= sl; sz /= sl;
+  /* u = s x f */
+  const ux = sy * f[2] - sz * f[1];
+  const uy = sz * f[0] - sx * f[2];
+  const uz = sx * f[1] - sy * f[0];
+  /* Column-major: rows of rotation are s, u, -f; translation = -R * eye. */
+  return new Float32Array([
+     sx,  ux, -f[0], 0,
+     sy,  uy, -f[1], 0,
+     sz,  uz, -f[2], 0,
+    -(sx * eye[0] + sy * eye[1] + sz * eye[2]),
+    -(ux * eye[0] + uy * eye[1] + uz * eye[2]),
+     (f[0] * eye[0] + f[1] * eye[1] + f[2] * eye[2]),
+     1,
+  ]);
+}
+
+
+/* Shared pan / orbit / zoom mouse controls for the assembled world /
+ * full-map orbit camera (buildWorldOrbitVp). Left-drag pans the map
+ * (yaw-aware); right-drag or shift+left-drag pivots (yaw + tilt); wheel
+ * zooms. Used by both the world-overview page and viewer.html's full-map
+ * mode so the two assembled views handle identically.
+ *
+ * `cam` is the live camera record ({ centerX, centerZ, halfWidth,
+ * halfHeight, yaw, pitch }) - mutated in place. `opts`:
+ *   minHalf / maxHalf - wheel-zoom clamp on the half-extents
+ *                       (default 200 / 20000, the kingdom-scale range).
+ *   maxPitch          - orbit tilt clamp in radians (default 1.40,
+ *                       just short of horizon edge-on). */
+function attachWorldOrbitControls(canvas, cam, opts) {
+  const minHalf = (opts && opts.minHalf != null) ? opts.minHalf : 200;
+  const maxHalf = (opts && opts.maxHalf != null) ? opts.maxHalf : 20000;
+  const maxPitch = (opts && opts.maxPitch != null) ? opts.maxPitch : 1.40;
+  let mode = null, lastX = 0, lastY = 0;   /* mode: 'pan' | 'orbit' */
+  canvas.style.cursor = 'grab';
+  canvas.addEventListener('mousedown', e => {
+    mode = (e.button === 2 || e.shiftKey) ? 'orbit' : 'pan';
+    lastX = e.clientX; lastY = e.clientY;
+    canvas.style.cursor = 'grabbing';
+    e.preventDefault();
+  });
+  /* Right-drag is the orbit gesture; suppress the context menu. */
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+  window.addEventListener('mouseup', () => {
+    mode = null;
+    canvas.style.cursor = 'grab';
+  });
+  window.addEventListener('mousemove', e => {
+    if (!mode) return;
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
+    if (mode === 'orbit') {
+      /* Drag right rotates the view; drag down tilts toward the
+       * horizon. Pitch 0 = straight-down; clamp short of the horizon
+       * so the ground plane never edge-on degenerates. */
+      cam.yaw += dx * 0.008;
+      cam.pitch = Math.max(0, Math.min(maxPitch, cam.pitch + dy * 0.008));
+      return;
+    }
+    /* Pan: camera grabs the map (content follows the cursor).
+     * Convert pixel deltas to world units via the current camera
+     * half-extents, through the yaw-rotated retail screen basis
+     * (at yaw = 0: screen-right = world +X, screen-down = world -Z).
+     * Apply the same letterbox rule the projection uses (expand the
+     * shorter axis to the canvas aspect) so the point under the
+     * cursor tracks the drag exactly. */
+    const aspect = canvas.width / canvas.height;
+    let hw = cam.halfWidth, hh = cam.halfHeight;
+    if (hw / hh < aspect) hw = hh * aspect; else hh = hw / aspect;
+    const sx = (hw * 2) / canvas.width;
+    const sy = (hh * 2) / canvas.height;
+    const cosY = Math.cos(cam.yaw), sinY = Math.sin(cam.yaw);
+    cam.centerX += -dx * sx * cosY - dy * sy * sinY;
+    cam.centerZ += -dx * sx * sinY + dy * sy * cosY;
+  });
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    const f = Math.exp(e.deltaY * 0.001);
+    cam.halfWidth  = Math.max(minHalf, Math.min(maxHalf, cam.halfWidth  * f));
+    cam.halfHeight = Math.max(minHalf, Math.min(maxHalf, cam.halfHeight * f));
+  }, { passive: false });
+}

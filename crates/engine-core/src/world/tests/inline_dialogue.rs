@@ -1,0 +1,735 @@
+use super::*;
+use legaia_engine_mode::mode::SceneMode;
+
+/// The inline box's page waits for confirm (a picker prompt: the press
+/// opens its menu).
+fn prompt_waits(world: &World) -> bool {
+    world
+        .dialog
+        .inline
+        .as_ref()
+        .and_then(|d| d.panel.as_ref())
+        .is_some_and(|p| p.is_waiting_for_input() && !p.menu_active())
+}
+
+/// Step an open menu until its slide rests and it takes input
+/// ([`legaia_engine_dialog::dialog_picker_slide`]): Up / Down and confirm do nothing before.
+fn slide_menu_in(world: &mut World) {
+    let mut guard = 0;
+    while !world.dialog.inline.as_ref().unwrap().picker_takes_input() {
+        world.step_inline_dialogue(false, false, false);
+        guard += 1;
+        assert!(guard < 80, "the menu never came to rest");
+    }
+}
+
+#[test]
+fn inline_dialogue_runs_branch_flag_set_through_field_vm() {
+    // A menu box ("Hi" + A/B picker) whose option branches each SET a distinct
+    // system flag before their reply. The faithful runner must (a) show the
+    // menu, (b) on confirm apply the chosen option's relative jump, (c) run the
+    // branch's `0x50` SET through the field VM, (d) show the reply. Choosing B
+    // must set flag 6 and NOT flag 5.
+    let mut b = vec![0x1F, b'H', b'i', 0x00]; // prompt, ends at pc 4
+    let open = b.len(); // 4
+    b.push(0x27); // 2-option picker
+    let entries_at = b.len(); // 5
+    b.extend_from_slice(&[0, 0, 0, 0]); // 2 jump entries, filled below
+    b.push(0x24); // continuation
+    b.extend_from_slice(&[0x1F, b'A', 0x00]); // label 0
+    b.extend_from_slice(&[0x1F, b'B', 0x00]); // label 1
+    let branch0 = b.len();
+    b.extend_from_slice(&[0x50, 0x05]); // option A: SET system flag 5
+    b.extend_from_slice(&[0x1F, b'a', 0x00]); // reply "a"
+    b.push(0x00); // conversation end
+    let branch1 = b.len();
+    b.extend_from_slice(&[0x50, 0x06]); // option B: SET system flag 6
+    b.extend_from_slice(&[0x1F, b'b', 0x00]); // reply "b"
+    b.push(0x00); // conversation end
+    let j0 = (branch0 as i32 - (open as i32 + 1)) as i16;
+    let j1 = (branch1 as i32 - (open as i32 + 1 + 2)) as i16;
+    b[entries_at..entries_at + 2].copy_from_slice(&j0.to_le_bytes());
+    b[entries_at + 2..entries_at + 4].copy_from_slice(&j1.to_le_bytes());
+
+    let mut world = World::new();
+    world.start_inline_dialogue(b);
+
+    // Tick until the menu box is awaiting a choice.
+    let mut guard = 0;
+    while !world.dialog.inline.as_ref().unwrap().menu_active() {
+        // The prompt's page waits for the press that opens the menu
+        // (`FUN_801D84D0` state `0x19`).
+        let waiting = prompt_waits(&world);
+        world.step_inline_dialogue(waiting, false, false);
+        guard += 1;
+        assert!(guard < 50, "menu never became active");
+    }
+    slide_menu_in(&mut world);
+    // The pager is silent while it types and while the menu slides in:
+    // retail's `FUN_801D84D0` carries two cue calls, both in the picker's
+    // cursor handler, and none on the typewriter.
+    use legaia_engine_dialog::dialog::{PICKER_CONFIRM_CUE, PICKER_MOVE_CUE};
+    use legaia_engine_system::sound_state::SfxRingOp;
+    assert_eq!(world.take_sfx_ring_ops(), vec![], "typing raises no cue");
+    // Move the cursor to option B and confirm.
+    world.step_inline_dialogue(false, false, true);
+    assert_eq!(world.dialog.inline.as_ref().unwrap().last_choice, None);
+    assert_eq!(
+        world.take_sfx_ring_ops(),
+        vec![SfxRingOp::Push(PICKER_MOVE_CUE)],
+        "a cursor move cues 0x21 (`0x801D9510`)"
+    );
+    world.step_inline_dialogue(true, false, false);
+    assert_eq!(world.dialog.inline.as_ref().unwrap().last_choice, Some(1));
+    assert_eq!(
+        world.take_sfx_ring_ops(),
+        vec![SfxRingOp::Push(PICKER_CONFIRM_CUE)],
+        "the committing confirm cues 0x20 (`0x801D9530`)"
+    );
+
+    // The VM should run branch B (SET flag 6) and surface the "b" reply.
+    let mut guard = 0;
+    while world.dialog.inline.as_ref().unwrap().page_bytes() != b"b" {
+        world.step_inline_dialogue(false, false, false);
+        guard += 1;
+        assert!(guard < 50, "branch reply never typed");
+    }
+    // The row ends on its glyph count (retail pacing), a call or two after
+    // its last glyph shows; a confirm lands once the box waits.
+    while world
+        .dialog
+        .inline
+        .as_ref()
+        .unwrap()
+        .panel
+        .as_ref()
+        .is_some_and(|p| p.state() == legaia_engine_dialog::dialog::PanelState::Typing)
+    {
+        world.step_inline_dialogue(false, false, false);
+        guard += 1;
+        assert!(guard < 50, "branch reply never finished");
+    }
+    assert!(
+        world.system_flag_test(6),
+        "option B branch SET flag 6 via the VM"
+    );
+    assert!(
+        !world.system_flag_test(5),
+        "option A branch must not have run"
+    );
+
+    // Confirming the reply ends the conversation.
+    world.step_inline_dialogue(true, false, false);
+    world.step_inline_dialogue(false, false, false);
+    assert!(world.dialog.inline.as_ref().unwrap().is_done());
+}
+
+/// Step the inline runner until a box is open and the typewriter has fully
+/// revealed it (the glyph bytes stop growing), then return its page glyph bytes.
+/// Panics if no stable box appears within a bounded number of ticks.
+fn run_inline_until_box(world: &mut World) -> Vec<u8> {
+    let mut last: Vec<u8> = Vec::new();
+    let mut stable = 0;
+    for _ in 0..400 {
+        world.step_inline_dialogue(false, false, false);
+        let pb = world.dialog.inline.as_ref().unwrap().page_bytes();
+        if pb.is_empty() {
+            continue;
+        }
+        if pb == last {
+            stable += 1;
+            if stable >= 2 {
+                return pb;
+            }
+        } else {
+            stable = 0;
+            last = pb;
+        }
+    }
+    panic!("box never opened / finished typing");
+}
+
+#[test]
+fn inline_dialogue_prologue_selects_segment_by_story_flag() {
+    // The interaction record's prologue is a single `SysFlag.Test` (op `0x70`)
+    // on story flag 7: when the flag is set it jumps to segment B, otherwise it
+    // falls through to segment A. This is the retail segment-selection mechanism
+    // - the prologue's story-flag-gated jump chooses which line the box opens at.
+    //
+    // Segment A ends with a `0x25` teardown dispatch before segment B's lead:
+    // two directly adjacent `0x1F` rows would be ONE 2-row box under the
+    // retail pager grammar (`pack_box`), which is not the alternative-branch
+    // shape this test models - real records separate story branches with
+    // dispatch/jump bytecode.
+    //
+    //   pc 0: 70 07 07 00   SysFlag.Test flag 7 -> jump to pc (2 + 7) = 9
+    //   pc 4: 1F 'A' 'A' 00  segment A (fall-through)
+    //   pc 8: 25             segment A's teardown dispatch
+    //   pc 9: 1F 'B' 'B' 00  segment B (selected when flag 7 set)
+    let body = vec![
+        0x70, 0x07, 0x07, 0x00, // SysFlag.Test flag 7
+        0x1F, b'A', b'A', 0x00, // segment A @ 4
+        0x25, // A's post-box dispatch: teardown
+        0x1F, b'B', b'B', 0x00, // segment B @ 9
+    ];
+    let entry_pc = 0;
+    let first_segment = 4;
+
+    // Flag clear: the test falls through to segment A.
+    let mut world = World::new();
+    assert!(!world.system_flag_test(7));
+    world.start_inline_dialogue_with_prologue(body.clone(), entry_pc, first_segment);
+    assert_eq!(run_inline_until_box(&mut world), b"AA");
+
+    // Flag set: the prologue jumps to segment B.
+    let mut world = World::new();
+    world.system_flag_set(7);
+    world.start_inline_dialogue_with_prologue(body, entry_pc, first_segment);
+    assert_eq!(run_inline_until_box(&mut world), b"BB");
+}
+
+#[test]
+fn inline_dialogue_prologue_falls_back_when_it_cannot_reach_a_segment() {
+    // A prologue that can't proceed (here a `CFLAG_TST` on a bit the prologue
+    // itself just set, which holds the PC) must not silently drop the
+    // dialogue: the runner falls back to the first segment so the box still
+    // shows - never worse than the truncated path.
+    //
+    //   pc 0: 31 05         CFLAG_SET bit 5
+    //   pc 2: 33 05         CFLAG_TST bit 5 (set) -> Halt
+    //   pc 4: 1F 'X' 'X' 00 first segment (fallback target)
+    let body = vec![0x31, 0x05, 0x33, 0x05, 0x1F, b'X', b'X', 0x00];
+    let mut world = World::new();
+    world.start_inline_dialogue_with_prologue(body, 0, 4);
+    assert_eq!(run_inline_until_box(&mut world), b"XX");
+}
+
+#[test]
+fn inline_dialogue_resident_loop_ends_after_one_pass() {
+    // Interaction records are resident conversation drivers: every branch
+    // exits by jumping to a shared tail that loops back to the top selector
+    // (town01's Val record: each talk plays ONE branch, then the context
+    // parks until the next interaction). The runner must end the
+    // conversation at that loop-back instead of replaying the branch
+    // forever - the "infinite Val dialog" play-test regression.
+    //
+    //   pc 0: 50 09          SET system flag 9 (top selector body)
+    //   pc 2: 1F 'V' 00      the branch box
+    //   pc 5: 26 FA FF       JmpRel back to pc 0 (base = pc+1, delta -6)
+    let body = vec![0x50, 0x09, 0x1F, b'V', 0x00, 0x26, 0xFA, 0xFF];
+    let mut world = World::new();
+    world.start_inline_dialogue_with_prologue(body, 0, 2);
+    assert_eq!(run_inline_until_box(&mut world), b"V");
+    // Dismiss the box: the VM resumes, takes the loop-back, and the wrap
+    // rule ends the conversation (one pass, like retail's park).
+    world.step_inline_dialogue(true, false, false);
+    let mut guard = 0;
+    while !world.dialog.inline.as_ref().unwrap().is_done() {
+        world.step_inline_dialogue(false, false, false);
+        guard += 1;
+        assert!(
+            guard < 50,
+            "the resident loop-back must end the conversation"
+        );
+    }
+    assert!(world.system_flag_test(9), "the pass body executed");
+}
+
+#[test]
+fn a_menu_reply_parks_on_its_jump_back_and_the_next_talk_reopens_the_menu() {
+    // A menu record that re-emits its menu by jumping BACK after a branch
+    // reply (the izumi book-menu shape). The reply box is followed directly
+    // by the `0x26` jump, a byte retail's dialog SM does not continue on
+    // (`FUN_80038050`'s default): the talk ends there with the cursor parked
+    // on the jump, and the NEXT talk runs it and re-opens the menu.
+    let mut b = vec![0x1F, b'M', 0x00]; // menu prompt @ 0
+    let open = b.len(); // 3
+    b.push(0x27); // 2-option picker
+    let entries_at = b.len();
+    b.extend_from_slice(&[0, 0, 0, 0]);
+    b.push(0x24); // continuation
+    b.extend_from_slice(&[0x1F, b'A', 0x00]); // label 0
+    b.extend_from_slice(&[0x1F, b'Q', 0x00]); // label 1 (quit)
+    let branch0 = b.len();
+    // Option A: reply "a", then jump back to the menu prompt (re-emit).
+    b.extend_from_slice(&[0x1F, b'a', 0x00]);
+    b.push(0x26);
+    let back_at = b.len();
+    b.extend_from_slice(&[0, 0]);
+    // JmpRel target = (pc + 1) + delta; the op byte sits at back_at - 1, so
+    // jumping to the menu prompt at pc 0 needs delta = -back_at.
+    let delta0 = 0u16.wrapping_sub(back_at as u16);
+    b[back_at..back_at + 2].copy_from_slice(&delta0.to_le_bytes());
+    let branch1 = b.len();
+    // Option Q: reply "q", then end.
+    b.extend_from_slice(&[0x1F, b'q', 0x00, 0x00]);
+    let j0 = (branch0 as i32 - (open as i32 + 1)) as i16;
+    let j1 = (branch1 as i32 - (open as i32 + 1 + 2)) as i16;
+    b[entries_at..entries_at + 2].copy_from_slice(&j0.to_le_bytes());
+    b[entries_at + 2..entries_at + 4].copy_from_slice(&j1.to_le_bytes());
+
+    let mut world = World::new();
+    world.start_inline_dialogue(b);
+    let mut guard = 0;
+    while !world.dialog.inline.as_ref().unwrap().menu_active() {
+        // The prompt's page waits for the press that opens the menu
+        // (`FUN_801D84D0` state `0x19`).
+        let waiting = prompt_waits(&world);
+        world.step_inline_dialogue(waiting, false, false);
+        guard += 1;
+        assert!(guard < 50, "menu never became active");
+    }
+    slide_menu_in(&mut world);
+    // Pick option A: reply "a" plays, then the record jumps back to the menu.
+    world.step_inline_dialogue(true, false, false);
+    let mut guard = 0;
+    while world.dialog.inline.as_ref().unwrap().page_bytes() != b"a" {
+        world.step_inline_dialogue(false, false, false);
+        guard += 1;
+        if guard >= 80 {
+            let id = world.dialog.inline.as_ref().unwrap();
+            panic!(
+                "branch reply never typed: pc={} done={} page={:?} menu={}",
+                id.pc,
+                id.is_done(),
+                String::from_utf8_lossy(&id.page_bytes()),
+                id.menu_active()
+            );
+        }
+    }
+    // The row ends on its glyph count (retail pacing), after its glyph shows.
+    while world
+        .dialog
+        .inline
+        .as_ref()
+        .unwrap()
+        .panel
+        .as_ref()
+        .is_some_and(|p| p.state() == legaia_engine_dialog::dialog::PanelState::Typing)
+    {
+        world.step_inline_dialogue(false, false, false);
+        guard += 1;
+        assert!(guard < 80, "reply never finished");
+    }
+    // Dismiss the reply: the talk ends parked on the backward jump, which
+    // does not run in this talk.
+    world.step_inline_dialogue(true, false, false);
+    let id = world.dialog.inline.as_ref().unwrap();
+    assert!(id.is_done(), "the reply's parking byte ends the talk");
+    assert_eq!(id.parked_pc, Some(back_at - 1), "parked on the 0x26");
+    // The next talk resumes at the parked jump and re-opens the menu.
+    let body = std::sync::Arc::clone(&id.bytecode);
+    world.dialog.inline = Some(legaia_engine_field::inline_dialogue::InlineDialogue::new(
+        body,
+        back_at - 1,
+    ));
+    let mut guard = 0;
+    while !world.dialog.inline.as_ref().unwrap().menu_active() {
+        assert!(
+            !world.dialog.inline.as_ref().unwrap().is_done(),
+            "the next talk re-emits the menu"
+        );
+        let waiting = prompt_waits(&world);
+        world.step_inline_dialogue(waiting, false, false);
+        guard += 1;
+        assert!(guard < 80, "menu never re-emitted");
+    }
+}
+
+/// Build the A/B menu script used by the inline-dialogue tests: prompt "Hi",
+/// a 2-option picker whose option A branch SETs system flag 5 and option B SETs
+/// flag 6, each followed by a reply + conversation-end terminator.
+fn ab_menu_inline_script() -> Vec<u8> {
+    let mut b = vec![0x1F, b'H', b'i', 0x00];
+    let open = b.len();
+    b.push(0x27);
+    let entries_at = b.len();
+    b.extend_from_slice(&[0, 0, 0, 0]);
+    b.push(0x24);
+    b.extend_from_slice(&[0x1F, b'A', 0x00]);
+    b.extend_from_slice(&[0x1F, b'B', 0x00]);
+    let branch0 = b.len();
+    b.extend_from_slice(&[0x50, 0x05, 0x1F, b'a', 0x00, 0x00]);
+    let branch1 = b.len();
+    b.extend_from_slice(&[0x50, 0x06, 0x1F, b'b', 0x00, 0x00]);
+    let j0 = (branch0 as i32 - (open as i32 + 1)) as i16;
+    let j1 = (branch1 as i32 - (open as i32 + 1 + 2)) as i16;
+    b[entries_at..entries_at + 2].copy_from_slice(&j0.to_le_bytes());
+    b[entries_at + 2..entries_at + 4].copy_from_slice(&j1.to_le_bytes());
+    b
+}
+
+#[test]
+fn vm_dialogue_tick_executes_branch_through_field_vm() {
+    // Drive the inline-script runner through the LIVE `World::tick` field path:
+    // `use_vm_dialogue` + a `current_dialog` request + pad edges. Selecting
+    // option B must run its branch's SET (flag 6) through the field VM.
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.toggles.use_vm_dialogue = true;
+    world.dialog.current = Some(DialogRequest {
+        text_id: 0,
+        inline: ab_menu_inline_script(),
+        world_x: 0,
+        world_z: 0,
+        depth_id: 0,
+    });
+
+    // Tick (no input) until the menu is awaiting a choice.
+    let mut guard = 0;
+    while !world
+        .dialog
+        .inline
+        .as_ref()
+        .is_some_and(|d| d.menu_active())
+    {
+        // A Cross edge on the waiting prompt opens the menu.
+        let press = prompt_waits(&world) && guard % 2 == 0;
+        world.set_pad(if press {
+            input::PadButton::Cross.mask()
+        } else {
+            0
+        });
+        let _ = world.tick();
+        guard += 1;
+        assert!(guard < 60, "menu never became active through tick");
+    }
+    // The menu slides in before it reads the pad.
+    let mut guard = 0;
+    while !world
+        .dialog
+        .inline
+        .as_ref()
+        .is_some_and(|d| d.picker_takes_input())
+    {
+        world.set_pad(0);
+        let _ = world.tick();
+        guard += 1;
+        assert!(guard < 80, "the menu never came to rest through tick");
+    }
+    world.set_pad(0);
+    let _ = world.tick();
+    // Down edge → option B; Cross edge → confirm.
+    world.set_pad(input::PadButton::Down.mask());
+    let _ = world.tick();
+    world.set_pad(0);
+    let _ = world.tick();
+    world.set_pad(input::PadButton::Cross.mask());
+    let _ = world.tick();
+    // Tick out the branch + reply with no further input.
+    let mut guard = 0;
+    while !world.system_flag_test(6) {
+        world.set_pad(0);
+        let _ = world.tick();
+        guard += 1;
+        assert!(guard < 60, "branch SET flag 6 never landed through tick");
+    }
+    assert!(
+        !world.system_flag_test(5),
+        "option A branch must not have run"
+    );
+}
+
+#[test]
+fn inline_dialogue_raw_0x21_ends_the_conversation() {
+    // Retail's run-to-next-text helper (`FUN_8003CF7C`) executes a raw
+    // `0x21` byte and then stops, returning it to the dialog SM as
+    // "conversation over" - even when more script (here another text
+    // segment) follows. The engine loop must not run past it.
+    let mut b = vec![0x50, 0x05]; // SET system flag 5 (prologue op runs)
+    b.push(0x21); // raw NOP: executed, then the conversation ends
+    b.extend_from_slice(&[0x1F, b'x', 0x00]); // unreachable text segment
+
+    let mut world = World::new();
+    world.start_inline_dialogue(b);
+    world.step_inline_dialogue(false, false, false);
+
+    let id = world.dialog.inline.as_ref().unwrap();
+    assert!(id.is_done(), "0x21 ends the conversation");
+    assert!(id.panel.is_none(), "the trailing segment never opened");
+    assert!(world.system_flag_test(5), "ops before the 0x21 still ran");
+}
+
+#[test]
+fn inline_dialogue_extended_0xa1_nop_runs_through() {
+    // The retail stop compares the RAW byte (`bVar1 == 0x21`): an extended
+    // `0xA1` NOP is executed and the run continues to the next segment.
+    let b = vec![0xA1, 0xF8, 0x1F, b'y', 0x00];
+
+    let mut world = World::new();
+    world.start_inline_dialogue(b);
+    world.step_inline_dialogue(false, false, false);
+
+    let id = world.dialog.inline.as_ref().unwrap();
+    assert!(!id.is_done(), "0xA1 is not a conversation end");
+    assert!(id.panel.is_some(), "the segment after the 0xA1 opened");
+}
+
+#[test]
+fn a_talk_face_at_on_another_placement_turns_it_to_its_bind() {
+    // A talk record's `CC <id> 85 <lo> <hi> F8` turns placement `<id>`
+    // toward the player over the budget while the talk runs on to its box -
+    // the walk kernel's FaceTarget leg on the target, not a halt on the
+    // talker. The jouine geometry mirrored: the NPC lands a half-turn from
+    // the player's own `0x23B` bearing toward it.
+    use legaia_engine_field::field_channels::FieldChannel;
+    use legaia_engine_vm::field::FieldCtx;
+    let mut world = World {
+        mode: legaia_engine_mode::mode::SceneMode::Field,
+        ..World::default()
+    };
+    world.spawn_actor(0);
+    world.player_actor_slot = Some(0);
+    world.actors[0].move_state.world_x = 2368;
+    world.actors[0].move_state.world_z = 2496;
+    world.field_vm.channels = vec![FieldChannel {
+        placement_index: 4,
+        ctx: FieldCtx {
+            script_id: 0x26,
+            ..FieldCtx::default()
+        },
+        record_offset: 0,
+        pc: 0,
+        done: false,
+        object_bind: false,
+    }];
+    world.npcs.positions.insert(4, (3136, 3136));
+    let body = vec![0xCC, 0x26, 0x85, 0x0A, 0x00, 0xF8, 0x1F, b'N', 0x00];
+    world.start_inline_dialogue_with_prologue(body, 0, 6);
+    assert_eq!(run_inline_until_box(&mut world), b"N");
+    assert!(
+        world.npcs.face_legs.contains_key(&4),
+        "the turn is in flight"
+    );
+    for _ in 0..12 {
+        world.tick_field_npc_motions();
+    }
+    assert!(world.npcs.face_legs.is_empty(), "the leg landed");
+    let h = i32::from(*world.npcs.headings.get(&4).expect("heading written"));
+    let d = (h - (0x23B + 0x800)).rem_euclid(0x1000);
+    assert!(d.min(0x1000 - d) <= 1, "the NPC faces the player: {h:#x}");
+}
+
+#[test]
+fn a_talkers_own_face_at_turns_the_talker() {
+    // `4C 85 <lo> <hi> F8` with no target byte acquires the talker itself:
+    // its walk kernel turns it toward the player (`rayman` `P1[6]`, Kina).
+    let mut world = World {
+        mode: legaia_engine_mode::mode::SceneMode::Field,
+        ..World::default()
+    };
+    world.spawn_actor(0);
+    world.player_actor_slot = Some(0);
+    world.actors[0].move_state.world_x = 2368;
+    world.actors[0].move_state.world_z = 2496;
+    world.npcs.positions.insert(4, (3136, 3136));
+    let body = vec![0x4C, 0x85, 0x0A, 0x00, 0xF8, 0x1F, b'K', 0x00];
+    world.start_inline_dialogue_with_prologue(body, 0, 5);
+    world.dialog.inline.as_mut().unwrap().npc_slot = Some(4);
+    // The acquire raised the talker's own `0x400`, and the dispatcher
+    // refuses every op of a context carrying it: the box waits for the
+    // walk kernel to land the turn (budget 10) and clear the bit.
+    for _ in 0..4 {
+        world.step_inline_dialogue(false, false, false);
+        world.tick_field_npc_motions();
+    }
+    let id = world.dialog.inline.as_ref().unwrap();
+    assert!(id.page_bytes().is_empty(), "the box held for the turn");
+    assert_eq!(id.own_turn, Some(4));
+    for _ in 0..12 {
+        world.tick_field_npc_motions();
+    }
+    assert_eq!(run_inline_until_box(&mut world), b"K");
+    let id = world.dialog.inline.as_ref().unwrap();
+    assert_eq!(id.own_turn, None);
+    assert_eq!(id.ctx.flags & 0x400, 0, "the landed turn cleared the bit");
+    let h = i32::from(*world.npcs.headings.get(&4).expect("heading written"));
+    let d = (h - (0x23B + 0x800)).rem_euclid(0x1000);
+    assert!(
+        d.min(0x1000 - d) <= 1,
+        "the talker faces the player: {h:#x}"
+    );
+}
+
+/// A "Hi" prompt with a two-option picker whose continuation byte is
+/// `continuation`; both options wait three frames (`4A 03 00`) before the
+/// "a" reply.
+fn held_box_script(continuation: u8) -> Vec<u8> {
+    let mut b = vec![0x1F, b'H', b'i', 0x00];
+    let open = b.len();
+    b.push(0x27);
+    let entries_at = b.len();
+    b.extend_from_slice(&[0, 0, 0, 0]);
+    b.push(continuation);
+    b.extend_from_slice(&[0x1F, b'A', 0x00]);
+    b.extend_from_slice(&[0x1F, b'B', 0x00]);
+    let branch = b.len();
+    b.extend_from_slice(&[0x4A, 0x03, 0x00]);
+    b.extend_from_slice(&[0x1F, b'a', 0x00]);
+    b.push(0x00);
+    let j0 = (branch as i32 - (open as i32 + 1)) as i16;
+    let j1 = (branch as i32 - (open as i32 + 3)) as i16;
+    b[entries_at..entries_at + 2].copy_from_slice(&j0.to_le_bytes());
+    b[entries_at + 2..entries_at + 4].copy_from_slice(&j1.to_le_bytes());
+    b
+}
+
+/// Open the menu of [`held_box_script`] and commit option A.
+fn commit_first_option(world: &mut World) {
+    let mut guard = 0;
+    while !world.dialog.inline.as_ref().unwrap().menu_active() {
+        let waiting = prompt_waits(world);
+        world.step_inline_dialogue(waiting, false, false);
+        guard += 1;
+        assert!(guard < 50, "menu never became active");
+    }
+    slide_menu_in(world);
+    world.step_inline_dialogue(true, false, false);
+    assert_eq!(world.dialog.inline.as_ref().unwrap().last_choice, Some(0));
+}
+
+/// The pager is a list-0 actor tick that draws in every state but `1`, `2`
+/// and `0x0B` (`FUN_801D84D0`, `0x801D9660..0x801D9774`), and a picker
+/// commit on a `0x24` continuation stores state `3` (`0x801D9554..0x801D9568`),
+/// which the dialog SM steps to the idle `4` that keeps the rows
+/// (`0x80039C70`, `0x801D8708`). So the prompt's box stays on screen - rows,
+/// no picker, no page mark - while the branch's opcodes run, until the
+/// reply's line loads. `retock`'s innkeeper keeps "Do you want to stay the
+/// night?" up through Vahn's nod after "Yes".
+#[test]
+fn a_picker_commit_on_a_next_line_continuation_keeps_the_prompt_box_up() {
+    let mut world = World::new();
+    world.start_inline_dialogue(held_box_script(0x24));
+    commit_first_option(&mut world);
+    for _ in 0..2 {
+        let id = world.dialog.inline.as_ref().unwrap();
+        assert!(
+            id.panel.is_none(),
+            "the branch's wait runs with no box typing"
+        );
+        let held = id
+            .held_box
+            .as_ref()
+            .expect("the prompt's box is still drawn");
+        assert!(held.until_next_line);
+        assert_eq!(held.panel.page_bytes(), b"Hi");
+        assert!(held.panel.picker().is_none() && !held.panel.menu_active());
+        assert_eq!(held.panel.advance_icon(), None, "no page mark outside 0x19");
+        world.step_inline_dialogue(false, false, false);
+    }
+    let mut guard = 0;
+    while world.dialog.inline.as_ref().unwrap().panel.is_none() {
+        world.step_inline_dialogue(false, false, false);
+        guard += 1;
+        assert!(guard < 50, "the reply never opened");
+    }
+    assert!(
+        world.dialog.inline.as_ref().unwrap().held_box.is_none(),
+        "the next line's load ends the held box"
+    );
+}
+
+/// An op-`0x49` park that opens a screen under a held `0x24` box takes the
+/// box down: the subsystem actor's installer `FUN_801F1278` rewinds the
+/// pager from its idle `4` to `1` (`0x801F1434..0x801F144C`), and state `1`
+/// draws nothing.
+#[test]
+fn a_park_opening_a_screen_takes_down_a_held_continuation_box() {
+    let mut world = World::new();
+    world.start_inline_dialogue(held_box_script(0x24));
+    commit_first_option(&mut world);
+    let held = world.dialog.inline.as_ref().unwrap().held_box.as_ref();
+    assert_eq!(held.and_then(|h| h.pager_state()), Some(4));
+    world.run_submode_installer();
+    assert!(world.dialog.inline.as_ref().unwrap().held_box.is_none());
+}
+
+/// Any other continuation stores state `0` (a picker's default at
+/// `0x801D9548`), which draws on the commit's own pager call and is followed
+/// by the idle `1`, which draws nothing: the box lasts the commit frame only.
+#[test]
+fn a_picker_commit_on_a_teardown_continuation_draws_the_box_for_one_frame() {
+    let mut world = World::new();
+    world.start_inline_dialogue(held_box_script(0x25));
+    commit_first_option(&mut world);
+    let held = world.dialog.inline.as_ref().unwrap().held_box.as_ref();
+    assert!(held.is_some_and(|h| !h.until_next_line));
+    world.step_inline_dialogue(false, false, false);
+    assert!(world.dialog.inline.as_ref().unwrap().held_box.is_none());
+}
+
+#[test]
+fn a_talkers_own_compass_walk_moves_the_talker_before_the_box() {
+    // `41 07 C1` with no target byte walks the talker itself (`tunnelc`
+    // `P1[4]`, Xain's second stage): direction 7 is `+X -Z`, half a tile
+    // over a 32-unit budget. The record holds at the next op until the walk
+    // kernel lands the leg and clears the talker's `0x400`.
+    let mut world = World {
+        mode: legaia_engine_mode::mode::SceneMode::Field,
+        ..World::default()
+    };
+    world.npcs.positions.insert(4, (3136, 3136));
+    let body = vec![0x41, 0x07, 0xC1, 0x1F, b'X', 0x00];
+    world.start_inline_dialogue_with_prologue(body, 0, 3);
+    world.dialog.inline.as_mut().unwrap().npc_slot = Some(4);
+    world.step_inline_dialogue(false, false, false);
+    assert!(world.npcs.glide_legs.contains_key(&4), "the leg is armed");
+    let id = world.dialog.inline.as_ref().unwrap();
+    assert!(id.page_bytes().is_empty(), "the box held for the walk");
+    for _ in 0..40 {
+        world.tick_field_npc_motions();
+    }
+    assert_eq!(world.npcs.positions.get(&4), Some(&(3200, 3072)));
+    assert_eq!(run_inline_until_box(&mut world), b"X");
+    let id = world.dialog.inline.as_ref().unwrap();
+    assert_eq!(id.ctx.flags & 0x400, 0, "the landed walk cleared the bit");
+}
+
+#[test]
+fn a_talks_cross_context_compass_walks_move_their_target_in_turn() {
+    // `C1 3B 02 46` then `C1 3B 02 41` (`town0c` `P1[21]`): each walks
+    // placement `0x3B` along `-X` (6 then 1 half-tiles); the record runs on
+    // past the first, and the second waits at its PC until the first lands.
+    use legaia_engine_field::field_channels::FieldChannel;
+    use legaia_engine_vm::field::FieldCtx;
+    let mut world = World {
+        mode: legaia_engine_mode::mode::SceneMode::Field,
+        ..World::default()
+    };
+    world.field_vm.channels = vec![FieldChannel {
+        placement_index: 23,
+        ctx: FieldCtx {
+            script_id: 0x3B,
+            ..FieldCtx::default()
+        },
+        record_offset: 0,
+        pc: 0,
+        done: false,
+        object_bind: false,
+    }];
+    world.npcs.positions.insert(23, (2752, 2752));
+    let body = vec![
+        0xC1, 0x3B, 0x02, 0x46, 0xC1, 0x3B, 0x02, 0x41, 0x1F, b'B', 0x00,
+    ];
+    world.start_inline_dialogue_with_prologue(body, 0, 8);
+    world.step_inline_dialogue(false, false, false);
+    assert!(
+        world.npcs.glide_legs.contains_key(&23),
+        "the first leg is armed"
+    );
+    assert_eq!(
+        world.dialog.inline.as_ref().unwrap().pc,
+        4,
+        "held on the second"
+    );
+    for _ in 0..80 {
+        world.tick_field_npc_motions();
+    }
+    assert_eq!(world.npcs.positions.get(&23), Some(&(2368, 2752)));
+    world.step_inline_dialogue(false, false, false);
+    for _ in 0..80 {
+        world.tick_field_npc_motions();
+    }
+    assert_eq!(world.npcs.positions.get(&23), Some(&(2304, 2752)));
+    assert_eq!(run_inline_until_box(&mut world), b"B");
+}

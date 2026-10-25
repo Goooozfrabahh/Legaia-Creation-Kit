@@ -1,0 +1,164 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">formats</a> &middot; seq - psyq sequenced-music format</div>
+  <h1>SEQ - PsyQ sequenced-music format <span class="tag tag-done">Confirmed</span></h1>
+  <p class="lede">SEQ is the sheet music. Every tune in Legaia - the town themes, the battle loop, the world-map fanfare - is stored not as recorded audio but as a list of notes and timings that the console plays live against a <a href="vab.html">VAB</a> instrument bank. It is the PlayStation SDK's sequenced-music format: essentially a single-track MIDI file, <em>close enough</em> to MIDI that generic tools almost work and different enough that they fail in two specific, diagnosable ways.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Magic</dt><dd><code>pQES</code> (bytes <code>70 51 45 53</code>) at the track's own offset 0</dd>
+    <dt>Where on disc</dt><dd>Behind a VAB inside <a href="scene-bundles.html">scene-VAB-prefixed streaming</a> entries, never at the entry's start; 92 tracks. The <code>music_01</code> bank map is piecewise (sound-test track <code>i</code> = extraction <code>988+i</code> for <code>i &lt;= 67</code>, <code>990+i</code> above) - see <a href="../reference/music-tracks.html">music tracks</a></dd>
+    <dt>Header</dt><dd>15 bytes (Legaia variant) - u32 big-endian version; PPQN always 480</dd>
+    <dt>Parser</dt><dd><code>crates/seq</code> (binary <code>seq</code>); playback <code>engine-audio::Sequencer</code></dd>
+    <dt>Confidence</dt><dd>Confirmed - public PsyQ shape; the divergences are pinned by the retail loader and by round-BPM arithmetic across the corpus (<a href="#how-we-know">how we know</a>)</dd>
+    <dt>Used by</dt><dd><a href="../subsystems/audio.html">Audio stack</a>, <a href="../media.html">Media player</a>, <a href="../viewer.html">Asset viewer</a></dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="overview">
+  <h2>Why your MIDI tool chokes</h2>
+  <div class="notice warn">
+    <div class="notice-title">Two divergences from the PsyQ documentation</div>
+    <ol class="bullets">
+      <li><strong>The version field is a u32 big-endian</strong> where the documentation says u16, shifting every later field by two bytes. A 13-byte-header parser reads the wrong PPQN and tempo.</li>
+      <li><strong>Meta events carry no length byte.</strong> MIDI writes a tempo change as <code>FF 51 03 tt tt tt</code>; SEQ writes <code>FF 51 tt tt tt</code>. Read a phantom length byte and the first tempo override is lost - and since every retail track ships a 240&nbsp;BPM placeholder header tempo that the first body event corrects, <strong>everything plays ~3x too fast</strong>.</li>
+    </ol>
+  </div>
+
+  <p>The meta-event difference, byte for byte:</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 720 180" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="seq-fig-title">
+      <title id="seq-fig-title">The same two meta events in a standard MIDI file and in a Legaia SEQ. MIDI puts a length byte after the meta type; SEQ does not, so its tempo event is five bytes and its end-of-track is two.</title>
+      <text class="dg-edge-label" x="150" y="20">set tempo</text>
+      <text class="dg-edge-label" x="522" y="20">end of track</text>
+      <text class="dg-edge-label" x="20" y="52">standard MIDI</text>
+      <rect class="dg-node" x="150" y="30" width="56" height="34"/><text class="dg-label" x="178" y="52">FF</text>
+      <rect class="dg-node" x="206" y="30" width="56" height="34"/><text class="dg-label" x="234" y="52">51</text>
+      <rect class="dg-node-warn" x="262" y="30" width="56" height="34"/><text class="dg-label" x="290" y="52">03</text>
+      <rect class="dg-node-accent" x="318" y="30" width="56" height="34"/><text class="dg-label" x="346" y="52">tt</text>
+      <rect class="dg-node-accent" x="374" y="30" width="56" height="34"/><text class="dg-label" x="402" y="52">tt</text>
+      <rect class="dg-node-accent" x="430" y="30" width="56" height="34"/><text class="dg-label" x="458" y="52">tt</text>
+      <rect class="dg-node" x="522" y="30" width="56" height="34"/><text class="dg-label" x="550" y="52">FF</text>
+      <rect class="dg-node" x="578" y="30" width="56" height="34"/><text class="dg-label" x="606" y="52">2F</text>
+      <rect class="dg-node-warn" x="634" y="30" width="56" height="34"/><text class="dg-label" x="662" y="52">00</text>
+      <text class="dg-edge-label" x="20" y="112">Legaia SEQ</text>
+      <rect class="dg-node" x="150" y="90" width="56" height="34"/><text class="dg-label" x="178" y="112">FF</text>
+      <rect class="dg-node" x="206" y="90" width="56" height="34"/><text class="dg-label" x="234" y="112">51</text>
+      <rect class="dg-node-accent" x="262" y="90" width="56" height="34"/><text class="dg-label" x="290" y="112">tt</text>
+      <rect class="dg-node-accent" x="318" y="90" width="56" height="34"/><text class="dg-label" x="346" y="112">tt</text>
+      <rect class="dg-node-accent" x="374" y="90" width="56" height="34"/><text class="dg-label" x="402" y="112">tt</text>
+      <rect class="dg-node" x="522" y="90" width="56" height="34"/><text class="dg-label" x="550" y="112">FF</text>
+      <rect class="dg-node" x="578" y="90" width="56" height="34"/><text class="dg-label" x="606" y="112">2F</text>
+      <text class="dg-edge-label" x="150" y="148">A MIDI parser takes the first tempo byte for the length, mis-sizes the event and</text>
+      <text class="dg-edge-label" x="150" y="164">loses the tempo - so the track keeps its 240 BPM placeholder.</text>
+    </svg>
+    <figcaption>Amber cells are the length bytes MIDI writes and SEQ omits. The three <code>tt</code> bytes are the tempo, big-endian microseconds per quarter note.</figcaption>
+  </figure>
+</section>
+
+<section class="doc-section" id="header">
+  <h2>Header</h2>
+  <p>Every retail track uses the 15-byte Legaia layout; <code>crates/seq::parse_header</code> also accepts the documented 13-byte PsyQ layout, dispatching on whether the u32 at <code>+4</code> reads 1.</p>
+  <div class="byte-map" role="img" aria-label="Legaia SEQ header: magic, u32 BE version, PPQN, u24 tempo, time signature numerator and denominator, then events">
+    <div class="bm-cell bm-dim" style="--w:4"><span class="bm-off">+0x00</span><span class="bm-name">magic <code>pQES</code></span><span class="bm-size">4 B</span></div>
+    <div class="bm-cell bm-accent" style="--w:4"><span class="bm-off">+0x04</span><span class="bm-name">version = 1</span><span class="bm-size">u32 BE</span></div>
+    <div class="bm-cell" style="--w:2"><span class="bm-off">+0x08</span><span class="bm-name">PPQN = 480</span><span class="bm-size">u16 BE</span></div>
+    <div class="bm-cell" style="--w:3"><span class="bm-off">+0x0A</span><span class="bm-name">tempo</span><span class="bm-size">u24 BE</span></div>
+    <div class="bm-cell" style="--w:1"><span class="bm-off">+0x0D</span><span class="bm-name">ts num</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell" style="--w:1"><span class="bm-off">+0x0E</span><span class="bm-name">ts den</span><span class="bm-size">u8</span></div>
+  </div>
+  <table>
+    <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>version</code></td><td>Always 1 in retail. It is a u32 where the PsyQ documentation has a u16 at <code>+4</code>; the two extra bytes shift every field below.</td></tr>
+      <tr><td>PPQN</td><td>Ticks per quarter note - always 480.</td></tr>
+      <tr><td><code>tempo</code></td><td>Microseconds per quarter note. A 240 BPM placeholder that the first body event overrides.</td></tr>
+      <tr><td>time signature</td><td>Numerator (e.g. 4) and a power-of-two denominator (2 = /4, 3 = /8).</td></tr>
+    </tbody>
+  </table>
+  <p>The event stream starts at <code>+0x0F</code>.</p>
+  <p>The retail loader checks <code>version</code> and rejects any other value as an old SEQ format.</p>
+</section>
+
+<section class="doc-section" id="event-stream">
+  <h2>Event stream</h2>
+  <p>Each event is a variable-length delta time, a status byte and its data - standard MIDI encoding, with running status (a first byte below <code>0x80</code> reuses the previous status). Channel is the low nibble.</p>
+  <p id="meta-running-status"><strong>A meta is a running status too.</strong> The retail decoder (<code>FUN_80063CEC</code>) latches <code>0xFF</code> as the channel's running status when it reads a meta, so a data byte after a meta is the next meta's <em>kind</em>: <code>FF 51 t t t &lt;delta&gt; 51 t t t</code> is two tempo events, and a channel event after a meta needs its own status byte. A parser that keeps the previous channel status across a meta falls one byte out of phase on the one track that relies on this.</p>
+  <table>
+    <thead><tr><th>Status</th><th>Event</th><th>Data</th><th>Retail use</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x9n</code></td><td>Note On</td><td>key, velocity</td><td>The note event; <code>velocity == 0</code> is Note Off (<code>0x8n</code> is never used)</td></tr>
+      <tr><td><code>0xBn</code></td><td>Control Change</td><td>controller, value</td><td>CC7 volume and CC10 pan are dynamic and busy; CC99 carries loop markers</td></tr>
+      <tr><td><code>0xCn</code></td><td>Program Change</td><td>program</td><td>Selects a VAB program slot</td></tr>
+      <tr><td><code>0xEn</code></td><td>Pitch Bend</td><td>LSB, MSB</td><td>Heavy use - thousands of events; scaled over the tone's own <code>pbmin</code>/<code>pbmax</code></td></tr>
+      <tr><td><code>0xAn</code> / <code>0xDn</code></td><td>Aftertouch</td><td>2 / 1</td><td>Absent from retail data</td></tr>
+      <tr><td><code>FF 51</code></td><td>Set Tempo</td><td>3 bytes, u24 BE</td><td>No length prefix; overrides future events only</td></tr>
+      <tr><td><code>FF 2F</code></td><td>End of Track</td><td>none</td><td>Two bytes total; retail writes a trailing <code>00</code> the parser never reads</td></tr>
+    </tbody>
+  </table>
+  <p>Any other meta type has an unknown fixed length, so the parser (like the retail reader) cannot skip it and ends the track there.</p>
+
+  <h3 id="loop-markers">Loop markers</h3>
+  <p>Looping is encoded as ordinary control changes: controller 99 value 20 = Loop Start, value 30 = Loop Forever (jump back to the last Loop Start). 88 of 92 tracks carry them. The engine <code>Sequencer</code> rewinds to the event <em>after</em> the marker and resets its sample clock, so the loop re-fires on the same sample offset every pass; an end-of-track after a Loop Start also rewinds.</p>
+
+  <h3 id="tempo-math">Tempo math</h3>
+  <p>Per-tick duration is <code>tempo / ppqn</code> microseconds as written. The engine clock keeps every term integer - it accumulates in units of <code>sample &times; ppqn &times; 1&nbsp;000&nbsp;000</code> and fires a delta-<code>d</code> event once the accumulator reaches <code>d &times; tempo &times; 44100</code> - so long tracks never drift. <code>legaia_seq::us_per_tick</code> returns the float form for inspection only.</p>
+  <p>Retail does not play the written tempo exactly: its driver turns each tempo into an integer BPM and a per-vsync tick budget rounded to tenths of a tick, so a track runs at the rate that budget implies - <code>80</code> BPM plays at <code>80.25</code>, and the slow closing tempos drift furthest. The engine <code>Sequencer</code> plays that retail rate by default and the written score behind <code>set_exact_tempo(true)</code>; the <a href="../subsystems/audio-internals.html#ssapi">audio internals</a> page has the derivation.</p>
+</section>
+
+<section class="doc-section" id="program-change-unused-slot">
+  <h2>Edge cases the engine reproduces</h2>
+  <ul class="bullets">
+    <li><strong>Program change to an unused VAB slot.</strong> Retail's bank-open writes a running used-program counter into each slot, so a change to an unused slot aliases onto the <em>next used</em> slot's tone page (see <a href="vab.html#program-slots-vs-tone-pages">VAB</a>). Eight such changes exist across four entries; two are audible (PROT 868 program 5, PROT 996 program 19) and the engine aliases them the same way. Past the last used slot retail reads garbage; the engine stays silent there.</li>
+    <li><strong>Truncation.</strong> An unknown meta type or a system status byte (<code>0xF0..=0xFE</code>) stops parsing; the parser appends a synthetic End of Track and marks the track truncated so players and parity oracles can tell it from a clean end.</li>
+  </ul>
+  <details class="disclosure">
+    <summary>Details: the track that needs the meta latch (PROT 1045)</summary>
+    <div class="disclosure-body">
+      <p>Every stream in the corpus parses to a clean end. PROT 1045 (sound test 57, the "sorrowful event" requiem) closes on a ritardando written with the meta latch: <code>FF 51 0E C4 3E</code> (62 BPM), then <code>51 0F 42 40</code> (60 BPM) with no second <code>FF</code>. Read <code>51 0F 42</code> as a note instead and the parser falls one byte out of phase, reads the closing volume fade (<code>B5 07 nn</code> / <code>B6 07 nn</code>) as long deltas and notes, walks through the real <code>FF 2F 00</code> and halts on a <code>0xF4</code> eleven bytes past it - the last bars garbled and the loop never reached.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="where-the-data-lives">
+  <h2>Where the data lives and how it is played</h2>
+  <p>SEQ payloads ride behind a VAB inside the scene streaming containers (<a href="scene-bundles.html">scene bundles</a>), so the bytes sit at a non-zero offset. The field VM's BGM opcode (<code>0x35</code>) writes a slot that the BGM loader resolves through the <a href="cdname.html">CDNAME</a> map to the containing entry; playback goes through the PsyQ <code>SsSeqOpen</code> family (<a href="../subsystems/audio.html">audio stack</a>).</p>
+  <h3 id="in-the-port">In the port</h3>
+  <div class="cli"><code>seq info &lt;PATH&gt;</code></div>
+  <div class="cli"><code>seq events &lt;PATH&gt;</code></div>
+  <div class="cli"><code>seq json &lt;PATH&gt;</code></div>
+  <p><code>info</code> prints the header plus an event-type histogram, <code>events</code> disassembles every event, <code>json</code> dumps the full parse. The engine side is <code>legaia_engine_audio::Sequencer</code>: a parsed <code>Seq</code> plus a loaded <code>VabBank</code> driving the from-scratch SPU model.</p>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <details class="disclosure"><summary>Provenance by claim</summary>
+  <table>
+    <thead><tr><th>Claim</th><th>Function / address</th><th>What it proves</th></tr></thead>
+    <tbody>
+      <tr><td>Version check</td><td><code>FUN_80062410</code> (SsAPI loader, SCUS)</td><td>Reads the version word and rejects <code>!= 1</code></td></tr>
+      <tr><td>No meta length byte</td><td>Corpus arithmetic</td><td>Read raw, every retail tempo lands on a round BPM (65, 70, 80, 128, 130, 140, 150, 160, 170); a phantom length byte scatters them</td></tr>
+      <tr><td>A meta latches the running status</td><td><code>FUN_80063CEC</code> (<code>sb v0,0x16(s3)</code> at <code>0x80063EE4</code>)</td><td><code>0xFF</code> stored as the channel's running status; a data byte under it dispatches as a meta kind (<code>0x80063F44</code>)</td></tr>
+      <tr><td>Retail tempo quantisation</td><td><code>FUN_80062410</code> / <code>FUN_80061954</code> (shared tail)</td><td>Integer BPM plus a rounded tenths-of-a-tick budget per <code>SsSeqCalc</code></td></tr>
+      <tr><td>Event usage, loop markers, pitch bend</td><td>Disc-wide sweep of every SEQ-bearing entry</td><td>Which status bytes occur, how often, and where program changes land on unused slots</td></tr>
+      <tr><td>BGM slot resolution</td><td><code>_DAT_8007BAC8</code> &rarr; <code>FUN_800243F0</code></td><td>Field-VM BGM slot resolved through CDNAME to the streaming entry</td></tr>
+      <tr><td>Program-slot aliasing</td><td><code>FUN_80068D94</code> (bank open)</td><td>Used-program counter stored per slot, read back as tone-page index</td></tr>
+    </tbody>
+  </table>
+  </details>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="vab.html">VAB sound bank</a>
+    <a href="sound-driver.html">Sound-driver outputs</a>
+    <a href="scene-bundles.html">Scene bundles (the wrapper)</a>
+    <a href="../subsystems/audio.html">Audio stack</a>
+    <a href="../reference/music-tracks.html">Music tracks</a>
+    <a href="../media.html">Media player</a>
+    <a href="../viewer.html">Asset viewer</a>
+  </div>
+</section>

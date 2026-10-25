@@ -1,0 +1,1165 @@
+//! Byte-level ports of the retail action-queue kernels that make up the tail
+//! of the arts queue-builder `FUN_801EED1C` (battle overlay, PROT 0898).
+//!
+//! PORT: FUN_801EF9E4, FUN_801DA34C, FUN_801EFBFC, FUN_801E91E8
+//!
+//! These are the *byte-exact* forms operating on the raw 19-byte per-actor
+//! queue at `actor[+0x1DF..+0x1F2]` and the resident trigger tables
+//! (Miracle `0x801F64F4`, 16-byte stride; Super `find` `0x801F6524`, 13-byte
+//! stride; Super `replace` `0x801F65E8`, 16-byte stride) - the shapes
+//! `docs/subsystems/battle-action.md` ("The retail queue-builder and Super
+//! applier") pins from the disassembly.
+//!
+//! [`resolve_action_queue`](super::resolve_action_queue) - the entry point the
+//! engine's battle layer calls once per committed arts input - runs these
+//! appliers in retail's own order, so the live path is byte-level, not
+//! structural. The retail finish order, read off the `FUN_801EED1C`
+//! disassembly, is:
+//!
+//! 1. the per-command build loop, which on a Miracle-armed slot
+//!    (`ctx[+0x25F + slot] != 0`) overwrites `queue[0..16]` from the resident
+//!    Miracle row ([`apply_miracle_replace`], block `0x801EF4E8`);
+//! 2. the MSB-clear sweep over `queue[0..16]` ([`clear_queue_msb`], block
+//!    `0x801EF85C`) - this is what strips the on-disc `0x8C..0x8F` quirk off
+//!    the Miracle row's leading direction bytes;
+//! 3. the marked-starter reorder at `0x801EF8A0`
+//!    ([`reorder_marked_starters`]);
+//! 4. `jal 0x801EF9E4` ([`apply_super_tail_replace`]) at `0x801EF9AC`,
+//!    unconditionally, with `a0` = actor slot and `a1` = the roster char id
+//!    minus one.
+//!
+//! `legaia_art`'s structural [`MiracleMatcher`] / [`SuperMatcher`] remain the
+//! *table* source - [`miracle_row_for`] / [`super_rows_for`] project the
+//! modeled tables into the resident row shapes the appliers index - but the
+//! queue arithmetic on the live path is now retail's.
+//!
+//! [`MiracleMatcher`]: legaia_art::MiracleMatcher
+//! [`SuperMatcher`]: legaia_art::SuperMatcher
+//!
+/// Capacity of the per-actor action-parameter byte stream
+/// (`actor[+0x1DF..+0x1F2]`, 19 bytes). The queue-length scan and the
+/// preseed only ever touch the first [`QUEUE_SCAN_LEN`] bytes; a Super
+/// `replace` longer than its `find` can legally spill past 16 (e.g. a
+/// 16-byte queue tail-matched by an 8-byte `find` with a 10-byte
+/// `replace` writes through index 17).
+pub const ACTION_QUEUE_CAP: usize = 0x13;
+
+/// The queue-length zero-terminator scan bound (`slti v0,t4,0x10` at
+/// `0x801EFA28`) and the preseed copy length.
+pub const QUEUE_SCAN_LEN: usize = 0x10;
+
+/// Fixed row shapes of the resident Super trigger tables.
+pub const SUPER_FIND_STRIDE: usize = 13;
+pub const SUPER_REPLACE_STRIDE: usize = 16;
+/// Rows per character in both tables (`slti v0,a1,0x5` at `0x801EFBE0`).
+pub const SUPER_ROWS: usize = 5;
+
+/// Stride of the resident Miracle replacement table at `0x801F64F4`
+/// (`sll v0,v0,0x4` at `0x801EF504` - one 16-byte row per character, indexed
+/// by the roster char id minus one).
+pub const MIRACLE_ROW_STRIDE: usize = 16;
+
+/// The 8 equipment-slot bytes of a character record (`+0x196..=+0x19D`
+/// record-relative, `0x80084140 + (id-1)*0x414 + 0x75E..` in RAM).
+pub const EQUIP_SLOT_COUNT: usize = 8;
+
+/// The equipment-slot index [`miracle_marker_armed`] reads for roster char id
+/// `2`, and the one it reads for every other id. Retail's two arms load
+/// `+0x760` and `+0x761` off the record base `0x80084140 + (id-1)*0x414`,
+/// i.e. record-relative `+0x198` and `+0x199` - equipment slots 2 and 3.
+pub const MIRACLE_GATE_SLOT_ID2: usize = 2;
+/// See [`MIRACLE_GATE_SLOT_ID2`].
+pub const MIRACLE_GATE_SLOT_OTHER: usize = 3;
+/// The roster char id whose gate reads [`MIRACLE_GATE_SLOT_ID2`]
+/// (`beq v0,a3,0x80054228` with `a3 = 2` at `0x800541E4`).
+pub const MIRACLE_GATE_SWAPPED_ID: u8 = 2;
+
+/// PORT: FUN_80053CB8 (`0x800541D0..0x80054274`) - the arm of the party
+/// battle-actor seeding routine that raises the per-slot Miracle marker
+/// `ctx[+0x25F + slot]`.
+///
+/// The marker is **not** set by an input recognizer. It is written exactly
+/// once in the corpus, by the routine that seats a party member's battle
+/// actor (the same body that copies the record's HP `+0x6CE` into actor
+/// `+0x14C`, its MP `+0x6CC` into `+0x14E` and its name `+0x86F` into
+/// `+0x1BC`, which is what pins the `-0x5C8` skew between the RAM base
+/// `0x80084140` and the record offsets `docs/formats/save-record.md`
+/// tabulates). It reads one equipment byte and stores `1`:
+///
+/// ```text
+/// 800541dc  lbu   v0,0x0(a1)       ; a1 = 0x8007BD10 + slot -> roster char id
+/// 800541e4  beq   v0,a3,80054228   ;   id == 2 -> the +0x760 arm
+/// 80054210  lbu   v0,0x761(v0)     ; else record +0x761  (equip slot 3)
+/// 80054218  bne   v0,zero,80054260 ;   occupied -> set
+/// 80054220  bne   a2,a3,80054278   ;   else skip (a2 != 2 always here)
+/// 80054250  lbu   v0,0x760(v0)     ; id == 2: record +0x760  (equip slot 2)
+/// 80054258  beq   v0,zero,80054278 ;   empty -> skip
+/// 80054270  sb    v1,0x25f(v0)     ; ctx[+0x25F + slot] = 1
+/// ```
+///
+/// Which byte that is: `crates/save/src/character.rs` records the per-character
+/// weapon index `_DAT_8007B42C` as `2, 3, 2` for Vahn / Noa / Gala, so the slot
+/// this gate reads is in every case the **other** member of the `{2, 3}` pair -
+/// the non-weapon byte, which `docs/formats/save-record.md` names
+/// `accessory_or_seru_lock` (the Ra-Seru slot) at record `+0x199`. The gate is
+/// therefore "this character's Ra-Seru slot is occupied", expressed in retail
+/// as a per-id slot index rather than a lookup.
+///
+/// The marker gates every **special** art record, not only the Miracle: the
+/// builder routes ordinal `0` (Miracle) and ordinals `1..=3` (the Hyper Arts)
+/// through the same `+0x25F` test at `0x801EF4C8`, and with it clear that arm
+/// writes nothing (`bne t5,zero,0x801EF7B4` at `0x801EF6E0`).
+///
+/// `equip` is the record's 8 slot bytes in record order (`+0x196..=+0x19D`).
+pub fn miracle_marker_armed(roster_char_id: u8, equip: &[u8; EQUIP_SLOT_COUNT]) -> bool {
+    let slot = if roster_char_id == MIRACLE_GATE_SWAPPED_ID {
+        MIRACLE_GATE_SLOT_ID2
+    } else {
+        MIRACLE_GATE_SLOT_OTHER
+    };
+    equip[slot] != 0
+}
+
+/// PORT: FUN_801EED1C (the Miracle applier block `0x801EF4E8..0x801EF528`)
+///
+/// Overwrite the whole 16-byte queue window from the acting character's
+/// resident Miracle row. Retail reaches this block when the slot's Miracle
+/// marker `ctx[+0x25F + slot]` is non-zero and the build loop is on its first
+/// pass; the copy is a flat 16-iteration `lbu`/`sb` pair over
+/// `0x801F64F4 + (char_id - 1)*16`, so the row's zero padding is copied too
+/// and everything the build had staged past the Miracle string is erased.
+///
+/// The bytes are copied **raw** - the leading direction bytes carry the
+/// on-disc MSB-set quirk (`0x8C..0x8F`) at this point. [`clear_queue_msb`] is
+/// what strips it, several blocks later; the two must run in that order.
+///
+/// Retail also latches `ctx[+0x28D] = 1` and the shared trigger flag
+/// `0x801F696C = 1` here, and (when the character record's `+0x6C0` bit
+/// `0x800` is set) moves 4 points from `actor[+0x170]` into `actor[+0x224]`.
+/// Those are actor / ctx side effects rather than queue arithmetic, so they
+/// stay with the caller.
+pub fn apply_miracle_replace(queue: &mut [u8; ACTION_QUEUE_CAP], row: &[u8; MIRACLE_ROW_STRIDE]) {
+    queue[..MIRACLE_ROW_STRIDE].copy_from_slice(row);
+}
+
+/// PORT: FUN_801EED1C (the MSB-clear sweep `0x801EF85C..0x801EF898`)
+///
+/// Clear bit 7 of every byte in the 16-byte queue window. Retail does it with
+/// a signed load and an *add*, not an AND: `lb v0,0x1df(a0)` /
+/// `lbu v1,0x1df(a0)` / `bgez v0, skip` / `addiu v0,v1,0x80` / `sb`. Adding
+/// `0x80` to a byte that already has bit 7 set wraps it off, so the two forms
+/// agree for every input - the add is transcribed here because it is what the
+/// disassembly does.
+///
+/// This is the runtime half of the on-disc MSB quirk `docs/formats/art-data.md`
+/// records for the Miracle strings: the resident Miracle row stores its leading
+/// direction bytes as `0x8C..0x8F` and this sweep is what turns them back into
+/// `0x0C..0x0F` in the live queue. Nothing else in the queue normally carries
+/// bit 7, so the sweep is a no-op on a queue built from plain input.
+pub fn clear_queue_msb(queue: &mut [u8; ACTION_QUEUE_CAP]) {
+    for b in queue[..QUEUE_SCAN_LEN].iter_mut() {
+        if *b & 0x80 != 0 {
+            *b = b.wrapping_add(0x80);
+        }
+    }
+}
+
+/// The byte a marked queue slot must carry for [`reorder_marked_starters`] to
+/// act on it: the **newly learned** art starter (`FUN_801EFBFC` verdict `2`,
+/// `addiu v1,t3,0x18` at `0x801EF6F0`). A known art's starter is `0x19` and
+/// the reorder skips it (`li v0,0x1a` / `bne v1,v0` at
+/// `0x801EF8E4..0x801EF8E8`).
+pub const SPECIAL_STARTER: u8 = 0x1A;
+
+/// The **known** art starter (`FUN_801EFBFC` verdict `1`). The Attack x2
+/// refill rewrites every marked slot to this byte (`li a0,0x19` at
+/// `0x801E3A28`), so a second pass never re-fires the learn banner.
+pub const REGULAR_STARTER: u8 = 0x19;
+
+/// The mark value the build loop writes at an accepted art's starter index
+/// (`li v0,0x1` / `sw v0,0x0(v1)` at `0x801EF788..0x801EF78C`). The Super
+/// applier writes `4` at its own starters, but it runs *after* the reorder,
+/// so only this value is ever observed by it.
+pub const BUILD_STARTER_MARK: u32 = 1;
+
+/// The mark value the **Super tail-replace** writes at each starter it stamps
+/// (`li v1,0x4` / `sw v1,0x0(v0)` at `0x801EFB8C..0x801EFBA8` in
+/// `FUN_801EF9E4`), and only where the byte it just wrote is
+/// [`SPECIAL_STARTER`] (`li v0,0x1a` / `bne v1,v0` at `0x801EFB84`).
+///
+/// It exists to be *unequal* to [`BUILD_STARTER_MARK`]: the Attack x2 refill
+/// (`0x801E3A44..0x801E3A64`) rewrites a queue slot only when its mark reads
+/// exactly `1` (`bne v0,a1` at `0x801E3A4C`, `a1 = 1`), so a Super's starter
+/// is the one starter the second pass leaves at `0x1A`.
+///
+/// REF: FUN_801EF9E4 (`0x801EFB84..0x801EFBA8`)
+pub const SUPER_STARTER_MARK: u32 = 4;
+
+/// The reorder's outer bound: `sltiu v0,v0,0xf` at `0x801EF960` - the sweep
+/// visits indices `0..=14`, one short of the 16-byte scan window, because
+/// index `i` always reads `queue[i + 1]`.
+pub const REORDER_SCAN_LEN: usize = 0xF;
+
+/// Reconstruct the build loop's side-array marks (`0x801F6990`) from a queue
+/// window the build loop produced.
+///
+/// Retail writes the marks incrementally: the array is zeroed at the builder's
+/// head (`sw zero,0x0(v0)` loop at `0x801EED5C..0x801EED74`, 16 words), each
+/// accepted art writes `1` at the index its starter lands on
+/// (`0x801EF788..0x801EF78C`), and every queue shift the insert performs moves
+/// the marks in lockstep with the bytes (`0x801EF69C..0x801EF6B0` and
+/// `0x801EF730..0x801EF744` each copy the byte and its word together). So the
+/// marks the reorder reads sit on exactly the starter bytes of the finished
+/// build window - which is what this reconstructs.
+///
+/// The one detail the reconstruction drops is retail's *push-down* of a stale
+/// mark onto the art constant that follows a starter (`marks[i + 1] =
+/// marks[i]` at `0x801EF77C..0x801EF784`). That mark can only ever land on an
+/// art constant (`0x1B..`), and [`reorder_marked_starters`] admits an index
+/// only when its queue byte is [`SPECIAL_STARTER`], so it is inert.
+///
+/// REF: FUN_801EED1C (the build loop's `0x801F6990` writes)
+pub fn build_starter_marks(queue: &[u8; ACTION_QUEUE_CAP]) -> [u32; ACTION_QUEUE_CAP] {
+    let mut marks = [0u32; ACTION_QUEUE_CAP];
+    for i in 0..QUEUE_SCAN_LEN {
+        if queue[i] == SPECIAL_STARTER || queue[i] == REGULAR_STARTER {
+            marks[i] = BUILD_STARTER_MARK;
+        }
+    }
+    marks
+}
+
+/// PORT: FUN_801EED1C (the marked-starter reorder `0x801EF8A0..0x801EF968`)
+///
+/// The builder's second sweep, run between the MSB clear and the Super
+/// tail-replace. It walks the per-token side array `0x801F6990` and, for every
+/// marked index `i > 0` whose queue byte is a [`SPECIAL_STARTER`], scans
+/// `j < i` and swaps `queue[j]` with `queue[i]` wherever `queue[j + 1]` equals
+/// `queue[i + 1]`.
+///
+/// Transcribed from the disassembly:
+///
+/// ```text
+/// 801ef8c4  lw    v0,0x0(v0)       ; marks[i]
+/// 801ef8cc  beq   v0,zero,801ef958 ;   unmarked -> next i
+/// 801ef8e0  lbu   v1,0x1df(v0)     ; queue[i]
+/// 801ef8e8  bne   v1,v0,801ef958   ;   != 0x1A  -> next i
+/// 801ef8f0  beq   a0,zero,801ef958 ;   i == 0   -> next i
+/// 801ef8f4  _clear s8              ; j = 0
+/// 801ef910  lbu   a0,0x1e0(v0)     ; queue[j + 1]
+/// 801ef914  lbu   v0,0x1df(v1)     ; queue[i + 1]
+/// 801ef91c  bne   a0,v0,801ef944   ;   differ -> j++
+/// 801ef928  lbu   v0,0x1df(v0)     ; queue[i]
+/// 801ef92c  lbu   t3,0x1df(v1)     ; queue[j]
+/// 801ef930  sb    v0,0x1df(v1)     ; queue[j] = queue[i]
+/// 801ef940  sb    t3,0x1df(v0)     ; queue[i] = old queue[j]
+/// 801ef94c  sltu  v0,v0,t0         ; j < i
+/// 801ef960  sltiu v0,v0,0xf        ; i < 15
+/// ```
+///
+/// Three laws the transcription preserves, each of which a "tidier" rewrite
+/// would lose:
+///
+/// - **no early exit.** The inner loop runs to `j == i - 1` whatever it did,
+///   so the swap can fire more than once for one `i` - each firing moves a
+///   different byte into `queue[i]`, and the *last* match is what stays there.
+/// - **the compare re-reads the queue every iteration.** `queue[j + 1]` and
+///   `queue[i + 1]` are loaded inside the loop, so a swap at `j == i - 1`
+///   (which writes the byte `queue[j + 1]` aliases) is visible to no later
+///   compare only because `j` has run out - the order is load-bearing.
+/// - **the outer bound is 15, not 16** ([`REORDER_SCAN_LEN`]).
+///
+/// What it accomplishes, in queue terms: when one art appears more than once
+/// in a built queue, the `0x1A` "newly learned" starter is exchanged with the
+/// `0x19` starter of the same art earlier in the stream, so the learn verdict
+/// travels to the art's **first** performance in the turn.
+pub fn reorder_marked_starters(
+    queue: &mut [u8; ACTION_QUEUE_CAP],
+    starter_marks: &[u32; ACTION_QUEUE_CAP],
+) {
+    for i in 0..REORDER_SCAN_LEN {
+        if starter_marks[i] == 0 || queue[i] != SPECIAL_STARTER || i == 0 {
+            continue;
+        }
+        for j in 0..i {
+            if queue[j + 1] != queue[i + 1] {
+                continue;
+            }
+            queue.swap(j, i);
+        }
+    }
+}
+
+/// The four party **arms command** bytes an action queue records, in the
+/// direction order `FUN_801EED1C`'s own status-limb strip loop pins
+/// (`0x801EF04C..0x801EF1A4`): the loop drops a `0x0D` when the actor's
+/// `+0x16E` carries bit `0x10`, a `0x0C` on bit `0x08`, and either of
+/// `0x0E`/`0x0F` on bit `0x20` - the same three limb bits
+/// `docs/subsystems/arts-command-gauge.md` tabulates as RIGHT / LEFT /
+/// UP+DOWN. `0x0C` is the **arm** command whose AP cost carries the
+/// weapon-specialty penalty.
+pub const SWING_LEFT: u8 = 0x0C;
+/// See [`SWING_LEFT`].
+pub const SWING_RIGHT: u8 = 0x0D;
+/// See [`SWING_LEFT`].
+pub const SWING_LOW: u8 = 0x0E;
+/// See [`SWING_LEFT`].
+pub const SWING_HIGH: u8 = 0x0F;
+
+/// The target class that collapses [`basic_attack_queue`] to a single low
+/// swing: the monster record's `+0x1E` byte, read record-direct through the
+/// `0x801C9348` record-pointer table (`0x801EEFA8..0x801EEFCC`), compared
+/// against `2` at `0x801EEFD0`.
+///
+/// `+0x1E` sits between the record's element byte `+0x1D` and its size class
+/// `+0x1F`, and `legaia_actor_formats::monster_archive` does not parse it. What the
+/// disassembly establishes is only its *effect*: a class-`2` target is struck
+/// with one `SWING_LOW` instead of two arm swings, which reads as the height /
+/// posture class behind retail's limb-vs-height "Miss".
+pub const LOW_SWING_TARGET_CLASS: u8 = 2;
+
+/// The swing count [`basic_attack_queue`] writes for an ordinary target.
+pub const BASIC_ATTACK_SWINGS: usize = 2;
+
+/// PORT: FUN_801EED1C (the no-directional-input attack-queue arm,
+/// `0x801EEFC8..0x801EF02C`)
+///
+/// Build the action-parameter stream for a physical attack that carries **no
+/// player directional input**, and return how many bytes it wrote.
+///
+/// This is the one queue shape retail produces without running the Arts
+/// command gauge. `FUN_801EED1C`'s head selects it on the acting slot's
+/// control byte `(&DAT_8007BD10)[slot] == 4` (`0x801EEE40..0x801EEE48`) - an
+/// AI-driven party member - and the arm then commits category `3`
+/// (`sb v0,0x1de` at `0x801EEF28`), rolls a living monster target, and writes
+/// the queue:
+///
+/// ```text
+/// 801eefc8  lbu   v1,0x1e(v0)      ; target record +0x1E
+/// 801eefd0  beq   v1,v0,801ef028   ;   == 2 -> single low swing
+/// 801eefd4  _li   v0,0xe
+/// 801ef02c  _sb   v0,0x1df(a0)     ;            queue[0] = 0x0E
+/// 801eefd8  jal   0x80056798       ; else rand()
+/// 801eeff8  addiu v0,v0,0xc        ;   0x0C + (rand % 2)
+/// 801ef000  _sb   v0,0x1df(v1)     ;            queue[0] = 0x0C | 0x0D
+/// 801eeffc  jal   0x80056798       ; rand()
+/// 801ef01c  addiu v0,v0,0xc        ;   0x0C + (rand % 2)
+/// 801ef024  _sb   v0,0x1e0(v1)     ;            queue[1] = 0x0C | 0x0D
+/// ```
+///
+/// So an ordinary target takes **two** arm swings, each independently rolled
+/// Left / Right, and a [`LOW_SWING_TARGET_CLASS`] target takes **one** low
+/// swing. The `% 2` is retail's signed-safe `v0 - (v0/2)*2` idiom
+/// (`0x801EEFE0..0x801EEFF0`), which agrees with `% 2` for the non-negative
+/// values `func_0x80056798` returns.
+///
+/// The arm writes no terminator - the queue window it writes into is already
+/// zeroed (the round-boundary clear `FUN_801D88CC` at `0x801D89D8`, or the
+/// per-action clear the engine calls before this), and `0x00` is what the
+/// attack band terminates on. This function zeroes the rest of the window for
+/// the same reason, so the stream is self-terminating either way.
+///
+/// RNG: two draws for an ordinary target, **none** for a low-swing target -
+/// exactly the retail draw count, so a host mirroring the shared battle RNG
+/// stays in step.
+pub fn basic_attack_queue(
+    queue: &mut [u8; ACTION_QUEUE_CAP],
+    target_swing_class: u8,
+    rng: &mut dyn FnMut() -> u32,
+) -> usize {
+    queue.fill(0);
+    if target_swing_class == LOW_SWING_TARGET_CLASS {
+        queue[0] = SWING_LOW;
+        return 1;
+    }
+    for slot in queue.iter_mut().take(BASIC_ATTACK_SWINGS) {
+        *slot = SWING_LEFT + (rng() % 2) as u8;
+    }
+    BASIC_ATTACK_SWINGS
+}
+
+/// True when `byte` is one of the four party arms-command swings
+/// ([`SWING_LEFT`]..=[`SWING_HIGH`]) rather than an art starter / action
+/// constant or a monster archive entry index. The attack chain's damage
+/// seam keys on it: a direction swing is a committed arms command, which is
+/// what `FUN_801EC3E4` resolves one hit for.
+pub fn is_swing_command(byte: u8) -> bool {
+    (SWING_LEFT..=SWING_HIGH).contains(&byte)
+}
+
+/// Outcome of [`apply_super_tail_replace`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SuperTailReplace {
+    /// Matched table row (0..5), in resident-table order.
+    pub row: usize,
+    /// Queue index the replace copy started at (`len - find_len`).
+    pub start: usize,
+    /// Bytes written from the `replace` row (0 when the row's replace
+    /// string is empty - retail still latches the trigger flag then).
+    pub written: usize,
+}
+
+/// PORT: FUN_801EF9E4 - the Super Art find -> tail-replace applier the
+/// queue-builder `FUN_801EED1C` invokes at its end (`jal` at `0x801EF9AC`).
+///
+/// `queue` is the actor's raw action-parameter stream; `starter_marks` is
+/// the per-token side array at `0x801F6990` (u32 stride). `find_rows` /
+/// `replace_rows` are the character's five resident trigger rows
+/// (`0x801F6524 + row*13 + char*65` / `0x801F65E8 + row*16 + char*80`),
+/// `find` as `[len u8][bytes...]`, `replace` zero-terminated.
+///
+/// Retail laws mirrored exactly (disassembly
+/// `overlay_battle_action_801ef9e4.txt`):
+/// - queue length = index of the first zero byte in `queue[0..16]`
+///   (16 when none);
+/// - rows are scanned **in table order** and the first full tail match
+///   wins (`iVar1 = 5` terminates the row loop);
+/// - a row is skipped when its `find` is longer than the queue;
+/// - on a match the `replace` bytes overwrite the queue from
+///   `len - find_len`, **without** re-zero-terminating - the copy stops at
+///   the replace string's own terminator;
+/// - every written `0x1A` (`SpecialStarter`) marks its queue position in
+///   the side array with `4`;
+/// - the shared trigger flag (`0x801F696C = 1` in retail) corresponds to
+///   `Some(_)` here - it latches even for an empty replace row.
+///
+/// Returns `None` when no row matches.
+pub fn apply_super_tail_replace(
+    queue: &mut [u8; ACTION_QUEUE_CAP],
+    starter_marks: &mut [u32; ACTION_QUEUE_CAP],
+    find_rows: &[[u8; SUPER_FIND_STRIDE]; SUPER_ROWS],
+    replace_rows: &[[u8; SUPER_REPLACE_STRIDE]; SUPER_ROWS],
+) -> Option<SuperTailReplace> {
+    // Queue-length scan: first zero byte in the 16-byte window.
+    let len = queue[..QUEUE_SCAN_LEN]
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(QUEUE_SCAN_LEN);
+
+    for row in 0..SUPER_ROWS {
+        let find = &find_rows[row];
+        let find_len = find[0] as usize;
+        if find_len > len {
+            continue;
+        }
+        // Tail compare: queue[len - find_len + j] vs find[1 + j].
+        let start = len - find_len;
+        let mismatches = (0..find_len)
+            .filter(|&j| queue[start + j] != find[1 + j])
+            .count();
+        if mismatches != 0 {
+            continue;
+        }
+        // Copy the zero-terminated replace string over the tail. The
+        // terminator itself is NOT written (retail `do { write } while
+        // (next != 0)` shape), and each written SpecialStarter (0x1A)
+        // marks the side array.
+        let replace = &replace_rows[row];
+        let mut written = 0usize;
+        if replace[0] != 0 {
+            for (k, &b) in replace.iter().enumerate() {
+                if b == 0 {
+                    break;
+                }
+                queue[start + k] = b;
+                if b == SPECIAL_STARTER {
+                    starter_marks[start + k] = SUPER_STARTER_MARK;
+                }
+                written = k + 1;
+            }
+        }
+        return Some(SuperTailReplace {
+            row,
+            start,
+            written,
+        });
+    }
+    None
+}
+
+/// PORT: FUN_801DA34C - the round driver's arts-queue preseed (leaf; called
+/// from `FUN_801D0748` at `0x801D15C8` / `0x801D1734`).
+///
+/// Wired: `engine-core`'s `World::preseed_auto_command_string` calls it when a
+/// party member's Attack is dispatched and when the arts entry opens, over the record accessors
+/// `legaia_save::CharacterRecord::auto_command_string` and the band selector
+/// `legaia_save::AutoCommandBand::for_gauge`; an empty read falls through to
+/// the engine's own no-input swing roll, which is what retail's zero-fill leg
+/// leaves the queue builder to do. Both playable hosts reach it - the dispatch
+/// is shared world state.
+///
+/// The slot pair the earlier note called unaddressable is the addition that
+/// closed it: `legaia_save`'s retail `0x414` record model now declares
+/// `+0x1A7` / `+0x1B7`, so the `u16[+0x156] < u16[+0x154]` predicate has two
+/// slots to choose between.
+///
+/// Not to be confused with `World::party.saved_chains`: that is the engine's
+/// **named** chain library (LGSF v2, edited by `tactical_arts_editor`) and
+/// survives a save file; this is retail's unnamed last-confirmed string, which
+/// every arts commit overwrites.
+///
+/// Copies one of the character's two saved 16-byte arts-input strings
+/// (char record `+0x76F` = first slot, `+0x77F` = second slot, off
+/// `0x80084140 + (id-1)*0x414`) byte-for-byte into `queue[0..16]`, or
+/// zero-fills the window.
+///
+/// Selection laws (disassembly `overlay_battle_action_801da34c.txt`):
+/// - `staged == false` (the gate byte `DAT_8007BD04` is zero): zero-fill.
+/// - `prefer_second == false` (`actor.u16[+0x156] < actor.u16[+0x154]`):
+///   copy the **first** slot if its head byte is non-zero, else fall back
+///   to the second slot, else zero-fill.
+/// - `prefer_second == true` (`actor.u16[+0x156] >= actor.u16[+0x154]`):
+///   copy the **second** slot if its head byte is non-zero, else
+///   zero-fill. **There is no fallback to the first slot on this leg** -
+///   the two branches are asymmetric in the retail body (the
+///   `0x801DA4A8` block's empty-head exit at `0x801DA51C` is the
+///   zero-fill loop, not the `+0x76F` copy).
+pub fn preseed_action_queue(
+    queue: &mut [u8; ACTION_QUEUE_CAP],
+    staged: bool,
+    prefer_second: bool,
+    chain_first: &[u8; QUEUE_SCAN_LEN],
+    chain_second: &[u8; QUEUE_SCAN_LEN],
+) {
+    let src: Option<&[u8; QUEUE_SCAN_LEN]> = if !staged {
+        None
+    } else if !prefer_second {
+        if chain_first[0] != 0 {
+            Some(chain_first)
+        } else if chain_second[0] != 0 {
+            Some(chain_second)
+        } else {
+            None
+        }
+    } else if chain_second[0] != 0 {
+        Some(chain_second)
+    } else {
+        None
+    };
+    match src {
+        Some(chain) => queue[..QUEUE_SCAN_LEN].copy_from_slice(chain),
+        None => queue[..QUEUE_SCAN_LEN].fill(0),
+    }
+}
+
+/// Wired as the twin of [`preseed_action_queue`]:
+/// `engine-core`'s `World::save_auto_command_string` runs it on the arts
+/// commit, which is the moment retail's own call site sits at and the state
+/// its two guards expect - the actor alive and its category already stamped.
+///
+/// PORT: FUN_801DA59C - the write-back twin of [`preseed_action_queue`]:
+/// saves the actor's executed 16-byte arts-input string back into the
+/// character record so the next battle's preseed can replay it.
+///
+/// Retail walks one actor slot (`&DAT_801C9370 + slot`): a dead/empty actor
+/// (`+0x14C == 0`) or a non-arts action category (`+0x1DE != 3`) writes
+/// nothing. Otherwise the 16 bytes at `actor[+0x1DF..+0x1EF]` are copied
+/// into the char record's chain slot - the same `actor.u16[+0x156] <
+/// u16[+0x154]` predicate the preseed uses picks the destination (`+0x76F`
+/// first slot / `+0x77F` second slot, off `0x80084140 + (id-1)*0x414`;
+/// `sb` loops at `0x801DA638` / `0x801DA69C`). Unlike the preseed there is
+/// no head-byte fallback: exactly one slot is overwritten.
+pub fn save_action_queue(
+    queue: &[u8; QUEUE_SCAN_LEN],
+    alive: bool,
+    category_is_arts: bool,
+    prefer_second: bool,
+    chain_first: &mut [u8; QUEUE_SCAN_LEN],
+    chain_second: &mut [u8; QUEUE_SCAN_LEN],
+) -> bool {
+    if !alive || !category_is_arts {
+        return false;
+    }
+    if prefer_second {
+        chain_second.copy_from_slice(queue);
+    } else {
+        chain_first.copy_from_slice(queue);
+    }
+    true
+}
+
+/// Result band of [`check_and_learn_art`] (the retail return register).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtUseCheck {
+    /// `0` - not in the learned list and not learnable now.
+    Unknown,
+    /// `1` - already in the learned list.
+    Known,
+    /// `2` - was unknown and has just been inserted (learn-on-use).
+    Learned,
+}
+
+/// PORT: FUN_801EFBFC - learned-art membership check **plus learn-on-use
+/// insert** (called from the queue-builder at `0x801EF44C` per accepted
+/// art).
+///
+/// The engine reaches this from `engine-core`'s `TacticalArtsTracker`, which
+/// holds the `+0x74D` count / `+0x74E` ascending id list per character and is
+/// driven from the live art-strike host (`BattleActionHost::apply_art_strike`
+/// -> `World::notify_art_used`). Two retail inputs the engine cannot read are
+/// supplied instead: the learn gate `ctx[+0x266 + slot]` has no engine
+/// analogue and so reads as permanently clear (gate open, which is retail's
+/// behaviour for a clear marker), and the innate cap at
+/// `0x801F686C + char_id - 1` is un-parsed battle-overlay disc data that
+/// defaults to `0` until a host supplies it.
+///
+/// The character's learned-arts list lives in the char record: count at
+/// `+0x74D`, ascending-sorted ids at `+0x74E..`. Laws (disassembly
+/// `overlay_battle_action_801efbfc.txt`):
+/// - membership scan first; a hit returns [`ArtUseCheck::Known`] and the
+///   learn leg never runs;
+/// - the learn leg runs only when `learn_gate_open` - retail:
+///   `actor[+0x266] == 0` **or** `rand() & 0x1FF == 0` (a 1/512 roll)
+///   **or** the debug byte `DAT_8007BD0C == 'O'`;
+/// - an unknown art is inserted only when `art_id > innate_cap` (the
+///   per-character byte at `0x801F686C + char_id - 1`) **or**
+///   `art_id == 0` (a retail edge: the zero id passes the cap gate);
+/// - the insert keeps the list ascending-sorted: entries greater than
+///   `art_id` shift up one slot, then the id lands in the gap and the
+///   count increments; returns [`ArtUseCheck::Learned`].
+///
+/// Defensive deviation: retail has no bound on the shift loop (a full
+/// 16-entry list would spill into the equip bytes at `+0x75E`); this port
+/// refuses the insert when the list is full and returns
+/// [`ArtUseCheck::Unknown`].
+pub fn check_and_learn_art(
+    count: &mut u8,
+    ids: &mut [u8; 16],
+    art_id: u8,
+    learn_gate_open: bool,
+    innate_cap: u8,
+) -> ArtUseCheck {
+    let n = (*count as usize).min(ids.len());
+    if ids[..n].contains(&art_id) {
+        return ArtUseCheck::Known;
+    }
+    if !learn_gate_open {
+        return ArtUseCheck::Unknown;
+    }
+    if art_id != 0 && art_id <= innate_cap {
+        return ArtUseCheck::Unknown;
+    }
+    if n >= ids.len() {
+        // Deviation from retail (which would overflow into +0x75E).
+        return ArtUseCheck::Unknown;
+    }
+    // Ascending sorted insert: shift entries > art_id up by one.
+    let mut slot = n;
+    while slot > 0 && ids[slot - 1] > art_id {
+        ids[slot] = ids[slot - 1];
+        slot -= 1;
+    }
+    ids[slot] = art_id;
+    *count += 1;
+    ArtUseCheck::Learned
+}
+
+/// The **already-learned Seru** lookup: the 1-based position of Seru `token`
+/// in the acting character's learned-spell list, `0` when the list does not
+/// hold it.
+///
+/// An earlier reading named this a "Miracle-command token position lookup"
+/// and the list a Miracle command string. Both are wrong, and the bytes say
+/// so. The list it scans - count at `0x80084140 + char*0x414 + 0x704`, ids
+/// from `+0x705` - is the **spell** list: `FUN_801E92DC` prepends there
+/// (`sb v1,0x705(v0)` at `0x801E93AC`, ported as
+/// `engine-battle::magic_xp::learn_spell_prepend`), and the ids it holds are
+/// full `0x8x` spell ids, which is why the compare subtracts `0x80`
+/// (`addiu v0,v0,-0x80` at `0x801E92B0`). The token is monster record `+0x3E`,
+/// the Seru a killing blow can absorb. Its one caller is the arts resolver
+/// `FUN_801EC3E4` (`jal` at `0x801EE2C0`, five-form sweep: `jal = 1`, no other
+/// reference), right after the absorb roll succeeds: a `0` answer stages the
+/// Seru into `ctx[+0x269]` for the Done band to grant.
+///
+/// The "not applicable" answer is `1` - "already known" - so none of these
+/// can absorb: an acting slot `>= 3`; a slot whose `ctx[+0x25F + slot]` is
+/// clear, which is the **Ra-Seru** marker ([`miracle_marker_armed`] - the
+/// character's Ra-Seru equipment slot is occupied), not a Miracle marker; and
+/// a battle whose `_DAT_8007BAC0` word is set.
+///
+/// PORT: FUN_801E91E8
+///
+/// Called by `engine-core`'s killing-blow absorb
+/// (`World::roll_seru_absorb`, from the melee hit fold both hosts run each
+/// battle frame). `pending` is the three gates above folded to one bool;
+/// `spell_ids` is the list as stored (`0x8x` ids).
+pub fn learned_seru_position(token: u8, pending: bool, spell_ids: &[u8]) -> u8 {
+    if !pending {
+        return 1;
+    }
+    for (i, &c) in spell_ids.iter().enumerate() {
+        if token == c.wrapping_sub(0x80) {
+            return (i as u8).wrapping_add(1);
+        }
+    }
+    0
+}
+
+/// Build a character's resident-table-shaped Miracle row from the modeled
+/// `legaia_art` table: the replacement action constants, zero-padded to
+/// [`MIRACLE_ROW_STRIDE`], with the leading run of direction constants
+/// (`0x0C..=0x0F`) MSB-set to mirror the on-disc `0x8C..0x8F` form the
+/// resident row stores and [`clear_queue_msb`] strips.
+///
+/// This is the bridge that lets [`apply_miracle_replace`] run against the
+/// modeled table; keeping the row in its on-disc form is what makes the
+/// MSB-clear sweep observable instead of vacuous.
+pub fn miracle_row_for(character: legaia_art::Character) -> [u8; MIRACLE_ROW_STRIDE] {
+    let mut row = [0u8; MIRACLE_ROW_STRIDE];
+    let Some(art) = legaia_art::MIRACLE_ARTS
+        .iter()
+        .find(|m| m.character == character)
+    else {
+        return row;
+    };
+    let mut leading = true;
+    for (slot, action) in row.iter_mut().zip(art.replacement.iter()) {
+        let b = action.as_byte();
+        // The MSB quirk covers the row's leading direction bytes only; the
+        // starter + art constants that follow are stored plain.
+        if leading && (0x0C..=0x0F).contains(&b) {
+            *slot = b | 0x80;
+        } else {
+            leading = false;
+            *slot = b;
+        }
+    }
+    row
+}
+
+/// Build a character's five resident-table-shaped Super rows from the
+/// modeled `legaia_art` table: `find` as `[len][bytes][zero pad]` at the
+/// 13-byte stride, `replace` zero-padded at the 16-byte stride, in
+/// `SUPER_ARTS` order (the capture-validated resident order).
+///
+/// This is the bridge between the byte-exact applier and the structural
+/// matcher - the shipped tables have exactly [`SUPER_ROWS`] entries per
+/// character.
+pub fn super_rows_for(
+    character: legaia_art::Character,
+) -> (
+    [[u8; SUPER_FIND_STRIDE]; SUPER_ROWS],
+    [[u8; SUPER_REPLACE_STRIDE]; SUPER_ROWS],
+) {
+    let mut find_rows = [[0u8; SUPER_FIND_STRIDE]; SUPER_ROWS];
+    let mut replace_rows = [[0u8; SUPER_REPLACE_STRIDE]; SUPER_ROWS];
+    let mut row = 0usize;
+    for sa in legaia_art::SUPER_ARTS {
+        if sa.character != character {
+            continue;
+        }
+        assert!(
+            row < SUPER_ROWS,
+            "more than {SUPER_ROWS} supers per character"
+        );
+        assert!(sa.find.len() < SUPER_FIND_STRIDE);
+        assert!(sa.replace.len() <= SUPER_REPLACE_STRIDE);
+        find_rows[row][0] = sa.find.len() as u8;
+        find_rows[row][1..1 + sa.find.len()].copy_from_slice(sa.find);
+        replace_rows[row][..sa.replace.len()].copy_from_slice(sa.replace);
+        row += 1;
+    }
+    assert_eq!(
+        row, SUPER_ROWS,
+        "expected {SUPER_ROWS} supers per character"
+    );
+    (find_rows, replace_rows)
+}
+
+#[cfg(test)]
+mod queue_applier_tests {
+    use super::*;
+    use legaia_art::Character;
+
+    fn queue_from(bytes: &[u8]) -> [u8; ACTION_QUEUE_CAP] {
+        let mut q = [0u8; ACTION_QUEUE_CAP];
+        q[..bytes.len()].copy_from_slice(bytes);
+        q
+    }
+
+    #[test]
+    fn basic_attack_queue_writes_two_rolled_arm_swings() {
+        // Two draws, each `0x0C + (rand % 2)`, and nothing past them.
+        let draws = [0u32, 1];
+        let mut i = 0usize;
+        let mut q = [0xFFu8; ACTION_QUEUE_CAP];
+        let n = basic_attack_queue(&mut q, 0, &mut || {
+            let v = draws[i];
+            i += 1;
+            v
+        });
+        assert_eq!(n, BASIC_ATTACK_SWINGS);
+        assert_eq!(i, 2, "two rand draws, one per swing");
+        assert_eq!(&q[..3], &[SWING_LEFT, SWING_RIGHT, 0]);
+    }
+
+    #[test]
+    fn basic_attack_queue_low_class_target_is_one_swing_and_no_rng() {
+        let mut q = [0xFFu8; ACTION_QUEUE_CAP];
+        let mut draws = 0usize;
+        let n = basic_attack_queue(&mut q, LOW_SWING_TARGET_CLASS, &mut || {
+            draws += 1;
+            0
+        });
+        assert_eq!(n, 1);
+        assert_eq!(draws, 0, "the low-swing arm draws no RNG in retail");
+        assert_eq!(&q[..2], &[SWING_LOW, 0]);
+    }
+
+    #[test]
+    fn basic_attack_queue_is_self_terminating() {
+        // A stale queue is fully cleared, so the attack band's 0x00
+        // terminator is reached right after the written swings.
+        let mut q = [0x1Bu8; ACTION_QUEUE_CAP];
+        let n = basic_attack_queue(&mut q, 0, &mut || 0);
+        assert!(q[n..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn swing_command_span_is_the_four_arms_commands() {
+        for b in 0u8..=0xFF {
+            assert_eq!(
+                is_swing_command(b),
+                (0x0C..=0x0F).contains(&b),
+                "byte {b:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_miracle_gate_reads_slot_three_except_for_roster_id_two() {
+        let mut slot2 = [0u8; EQUIP_SLOT_COUNT];
+        slot2[MIRACLE_GATE_SLOT_ID2] = 0x40;
+        let mut slot3 = [0u8; EQUIP_SLOT_COUNT];
+        slot3[MIRACLE_GATE_SLOT_OTHER] = 0x40;
+        for id in 1u8..=4 {
+            let expect_two = id == MIRACLE_GATE_SWAPPED_ID;
+            assert_eq!(miracle_marker_armed(id, &slot2), expect_two, "id {id}");
+            assert_eq!(miracle_marker_armed(id, &slot3), !expect_two, "id {id}");
+        }
+        // Every other slot is inert - the gate reads exactly one byte.
+        for i in 0..EQUIP_SLOT_COUNT {
+            if i == MIRACLE_GATE_SLOT_ID2 || i == MIRACLE_GATE_SLOT_OTHER {
+                continue;
+            }
+            let mut eq = [0u8; EQUIP_SLOT_COUNT];
+            eq[i] = 0xFF;
+            assert!(!miracle_marker_armed(1, &eq), "slot {i} must be inert");
+            assert!(!miracle_marker_armed(2, &eq), "slot {i} must be inert");
+        }
+    }
+
+    #[test]
+    fn build_marks_land_on_starters_only() {
+        // `19 27 0F 1A 2B` - two starters, each followed by its art
+        // constant. Retail writes `1` at each starter index.
+        let q = queue_from(&[0x19, 0x27, 0x0F, 0x1A, 0x2B]);
+        let marks = build_starter_marks(&q);
+        assert_eq!(marks[0], BUILD_STARTER_MARK);
+        assert_eq!(marks[3], BUILD_STARTER_MARK);
+        for (i, &m) in marks.iter().enumerate() {
+            if i != 0 && i != 3 {
+                assert_eq!(m, 0, "slot {i} must be unmarked");
+            }
+        }
+    }
+
+    #[test]
+    fn reorder_moves_the_learned_starter_to_the_arts_first_occurrence() {
+        // The same art (`0x27`) performed twice: the second occurrence
+        // carries the newly-learned `0x1A`, the first the plain `0x19`.
+        // Retail's sweep swaps them, so the learn verdict travels to the
+        // art's first performance.
+        let mut q = queue_from(&[0x19, 0x27, 0x1A, 0x27]);
+        let marks = build_starter_marks(&q);
+        reorder_marked_starters(&mut q, &marks);
+        assert_eq!(&q[..4], &[0x1A, 0x27, 0x19, 0x27]);
+    }
+
+    #[test]
+    fn reorder_leaves_an_unmarked_queue_untouched() {
+        // Same bytes, no marks: the `beq v0,zero` at `0x801EF8CC` skips
+        // every index.
+        let before = queue_from(&[0x19, 0x27, 0x1A, 0x27]);
+        let mut q = before;
+        reorder_marked_starters(&mut q, &[0u32; ACTION_QUEUE_CAP]);
+        assert_eq!(q, before);
+    }
+
+    #[test]
+    fn reorder_skips_a_known_starter_and_index_zero() {
+        // `0x19` at a marked index is not a SpecialStarter: no swap.
+        let before = queue_from(&[0x1A, 0x27, 0x19, 0x27]);
+        let mut q = before;
+        let marks = build_starter_marks(&q);
+        reorder_marked_starters(&mut q, &marks);
+        assert_eq!(q, before, "a 0x19 at i does not trigger the swap");
+        // And a marked SpecialStarter at index 0 is skipped by the
+        // `beq a0,zero` guard - there is no j < 0 to swap with.
+        let mut q0 = queue_from(&[0x1A, 0x27]);
+        let marks0 = build_starter_marks(&q0);
+        reorder_marked_starters(&mut q0, &marks0);
+        assert_eq!(&q0[..2], &[0x1A, 0x27]);
+    }
+
+    #[test]
+    fn reorder_swap_can_fire_more_than_once_for_one_index() {
+        // Three slots whose following byte is the same art constant, the
+        // marked SpecialStarter last. The inner loop has no early exit, so
+        // `i = 4` swaps with `j = 0` **and then again** with `j = 2`: slot 4
+        // is written twice (0x1A -> 0x19 -> 0x05) and it is the *last* match
+        // that decides what stays there.
+        let mut q = queue_from(&[0x19, 0x27, 0x05, 0x27, 0x1A, 0x27]);
+        let mut marks = [0u32; ACTION_QUEUE_CAP];
+        marks[4] = BUILD_STARTER_MARK;
+        reorder_marked_starters(&mut q, &marks);
+        assert_eq!(&q[..6], &[0x1A, 0x27, 0x19, 0x27, 0x05, 0x27]);
+    }
+
+    #[test]
+    fn reorder_outer_bound_is_fifteen_not_sixteen() {
+        // Index 15 is outside the sweep (`sltiu v0,v0,0xf` at
+        // `0x801EF960`), so a marked SpecialStarter there never moves.
+        let mut q = [0u8; ACTION_QUEUE_CAP];
+        q[0] = 0x19;
+        q[1] = 0x27;
+        q[15] = SPECIAL_STARTER;
+        q[16] = 0x27;
+        let mut marks = [0u32; ACTION_QUEUE_CAP];
+        marks[0] = BUILD_STARTER_MARK;
+        marks[15] = BUILD_STARTER_MARK;
+        let before = q;
+        reorder_marked_starters(&mut q, &marks);
+        assert_eq!(q, before);
+    }
+
+    #[test]
+    fn super_applier_replaces_tail_for_every_shipped_super() {
+        for ch in [Character::Vahn, Character::Noa, Character::Gala] {
+            let (find_rows, replace_rows) = super_rows_for(ch);
+            for (row, sa) in legaia_art::SUPER_ARTS
+                .iter()
+                .filter(|s| s.character == ch)
+                .enumerate()
+            {
+                // Queue = exactly the find pattern.
+                let mut q = queue_from(sa.find);
+                let mut marks = [0u32; ACTION_QUEUE_CAP];
+                let hit = apply_super_tail_replace(&mut q, &mut marks, &find_rows, &replace_rows)
+                    .unwrap_or_else(|| panic!("{} did not match", sa.name));
+                assert_eq!(hit.row, row, "{}", sa.name);
+                assert_eq!(hit.start, 0, "{}", sa.name);
+                assert_eq!(hit.written, sa.replace.len(), "{}", sa.name);
+                assert_eq!(&q[..sa.replace.len()], sa.replace, "{}", sa.name);
+                // Every written SpecialStarter is marked with 4.
+                for (i, &b) in sa.replace.iter().enumerate() {
+                    if b == 0x1A {
+                        assert_eq!(marks[i], 4, "{} starter mark at {i}", sa.name);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn super_applier_matches_at_tail_with_prefix_preserved() {
+        // Vahn's Tri-Somersault behind a two-byte prefix: the prefix
+        // survives and the replace lands at the tail.
+        let (find_rows, replace_rows) = super_rows_for(Character::Vahn);
+        let tri = legaia_art::SUPER_ARTS
+            .iter()
+            .find(|s| s.name == "Tri-Somersault")
+            .unwrap();
+        let mut bytes = vec![0x1B, 0x1C];
+        bytes.extend_from_slice(tri.find);
+        let mut q = queue_from(&bytes);
+        let mut marks = [0u32; ACTION_QUEUE_CAP];
+        let hit = apply_super_tail_replace(&mut q, &mut marks, &find_rows, &replace_rows).unwrap();
+        assert_eq!(hit.start, 2);
+        assert_eq!(&q[..2], &[0x1B, 0x1C]);
+        assert_eq!(&q[2..2 + tri.replace.len()], tri.replace);
+    }
+
+    #[test]
+    fn super_applier_no_match_leaves_queue_untouched() {
+        let (find_rows, replace_rows) = super_rows_for(Character::Vahn);
+        let mut q = queue_from(&[0x1B, 0x1C, 0x1D]);
+        let before = q;
+        let mut marks = [0u32; ACTION_QUEUE_CAP];
+        assert_eq!(
+            apply_super_tail_replace(&mut q, &mut marks, &find_rows, &replace_rows),
+            None
+        );
+        assert_eq!(q, before);
+        assert_eq!(marks, [0u32; ACTION_QUEUE_CAP]);
+    }
+
+    #[test]
+    fn super_applier_agrees_with_structural_matcher() {
+        // The byte applier and legaia_art's SuperMatcher must produce the
+        // same queue for a matching tail.
+        use legaia_art::{ActionConstant, ActionQueue, SuperMatcher};
+        let matcher = SuperMatcher::with_default_table();
+        for sa in legaia_art::SUPER_ARTS {
+            let (find_rows, replace_rows) = super_rows_for(sa.character);
+            let mut q = queue_from(sa.find);
+            let mut marks = [0u32; ACTION_QUEUE_CAP];
+            apply_super_tail_replace(&mut q, &mut marks, &find_rows, &replace_rows).unwrap();
+
+            let mut structural = ActionQueue::new();
+            for &b in sa.find {
+                structural.push(ActionConstant::from_byte(b).unwrap());
+            }
+            matcher
+                .try_trigger_at_tail(sa.character, &mut structural)
+                .unwrap();
+            let structural_bytes: Vec<u8> =
+                structural.actions().iter().map(|a| a.as_byte()).collect();
+            assert_eq!(
+                &q[..structural_bytes.len()],
+                structural_bytes.as_slice(),
+                "{}",
+                sa.name
+            );
+        }
+    }
+
+    #[test]
+    fn preseed_copies_first_slot_when_preferred_and_nonempty() {
+        let a = [7u8; QUEUE_SCAN_LEN];
+        let b = [9u8; QUEUE_SCAN_LEN];
+        let mut q = [0xFFu8; ACTION_QUEUE_CAP];
+        preseed_action_queue(&mut q, true, false, &a, &b);
+        assert_eq!(&q[..QUEUE_SCAN_LEN], &a);
+        // Bytes past the 16-byte window are untouched.
+        assert_eq!(q[QUEUE_SCAN_LEN], 0xFF);
+    }
+
+    #[test]
+    fn preseed_first_slot_falls_back_to_second() {
+        let a = [0u8; QUEUE_SCAN_LEN];
+        let b = [9u8; QUEUE_SCAN_LEN];
+        let mut q = [0xFFu8; ACTION_QUEUE_CAP];
+        preseed_action_queue(&mut q, true, false, &a, &b);
+        assert_eq!(&q[..QUEUE_SCAN_LEN], &b);
+    }
+
+    #[test]
+    fn preseed_second_slot_leg_has_no_fallback() {
+        // The retail asymmetry: prefer_second with an empty second slot
+        // zero-fills even when the first slot is populated.
+        let a = [7u8; QUEUE_SCAN_LEN];
+        let b = [0u8; QUEUE_SCAN_LEN];
+        let mut q = [0xFFu8; ACTION_QUEUE_CAP];
+        preseed_action_queue(&mut q, true, true, &a, &b);
+        assert_eq!(&q[..QUEUE_SCAN_LEN], &[0u8; QUEUE_SCAN_LEN]);
+    }
+
+    #[test]
+    fn preseed_unstaged_zero_fills() {
+        let a = [7u8; QUEUE_SCAN_LEN];
+        let b = [9u8; QUEUE_SCAN_LEN];
+        let mut q = [0xFFu8; ACTION_QUEUE_CAP];
+        preseed_action_queue(&mut q, false, false, &a, &b);
+        assert_eq!(&q[..QUEUE_SCAN_LEN], &[0u8; QUEUE_SCAN_LEN]);
+    }
+
+    #[test]
+    fn save_action_queue_writes_exactly_one_slot() {
+        let q = [3u8; QUEUE_SCAN_LEN];
+        let mut a = [0u8; QUEUE_SCAN_LEN];
+        let mut b = [0u8; QUEUE_SCAN_LEN];
+        // First-slot leg (+0x156 < +0x154).
+        assert!(save_action_queue(&q, true, true, false, &mut a, &mut b));
+        assert_eq!(a, q);
+        assert_eq!(b, [0u8; QUEUE_SCAN_LEN]);
+        // Second-slot leg.
+        let mut a2 = [0u8; QUEUE_SCAN_LEN];
+        assert!(save_action_queue(&q, true, true, true, &mut a2, &mut b));
+        assert_eq!(b, q);
+        assert_eq!(a2, [0u8; QUEUE_SCAN_LEN]);
+        // Guards: dead actor / non-arts category write nothing.
+        let mut c = [0u8; QUEUE_SCAN_LEN];
+        assert!(!save_action_queue(&q, false, true, false, &mut c, &mut b));
+        assert!(!save_action_queue(&q, true, false, false, &mut c, &mut b));
+        assert_eq!(c, [0u8; QUEUE_SCAN_LEN]);
+    }
+
+    #[test]
+    fn learn_art_known_id_short_circuits() {
+        let mut count = 3u8;
+        let mut ids = [0u8; 16];
+        ids[..3].copy_from_slice(&[0x22, 0x28, 0x30]);
+        assert_eq!(
+            check_and_learn_art(&mut count, &mut ids, 0x28, true, 0x20),
+            ArtUseCheck::Known
+        );
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn learn_art_inserts_sorted_above_cap() {
+        let mut count = 3u8;
+        let mut ids = [0u8; 16];
+        ids[..3].copy_from_slice(&[0x22, 0x28, 0x30]);
+        assert_eq!(
+            check_and_learn_art(&mut count, &mut ids, 0x2B, true, 0x20),
+            ArtUseCheck::Learned
+        );
+        assert_eq!(count, 4);
+        assert_eq!(&ids[..4], &[0x22, 0x28, 0x2B, 0x30]);
+    }
+
+    #[test]
+    fn learn_art_gate_closed_returns_unknown() {
+        let mut count = 1u8;
+        let mut ids = [0u8; 16];
+        ids[0] = 0x22;
+        assert_eq!(
+            check_and_learn_art(&mut count, &mut ids, 0x2B, false, 0x20),
+            ArtUseCheck::Unknown
+        );
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn learn_art_at_or_below_cap_is_not_learnable() {
+        let mut count = 0u8;
+        let mut ids = [0u8; 16];
+        assert_eq!(
+            check_and_learn_art(&mut count, &mut ids, 0x1B, true, 0x20),
+            ArtUseCheck::Unknown
+        );
+        // The retail zero-id edge passes the cap gate.
+        assert_eq!(
+            check_and_learn_art(&mut count, &mut ids, 0, true, 0x20),
+            ArtUseCheck::Learned
+        );
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn learn_art_full_list_refuses_insert() {
+        let mut count = 16u8;
+        let mut ids = [0u8; 16];
+        for (i, id) in ids.iter_mut().enumerate() {
+            *id = 0x20 + i as u8;
+        }
+        assert_eq!(
+            check_and_learn_art(&mut count, &mut ids, 0x60, true, 0x10),
+            ArtUseCheck::Unknown
+        );
+        assert_eq!(count, 16);
+    }
+
+    #[test]
+    fn miracle_position_bypass_and_lookup() {
+        // Not applicable -> unconditional 1.
+        assert_eq!(learned_seru_position(0x0C, false, &[0x8C, 0x8D]), 1);
+        // Match -> 1-based position of the masked byte.
+        assert_eq!(learned_seru_position(0x0D, true, &[0x8C, 0x8D, 0x8E]), 2);
+        // Absent (or empty string) -> 0.
+        assert_eq!(learned_seru_position(0x0F, true, &[0x8C, 0x8D, 0x8E]), 0);
+        assert_eq!(learned_seru_position(0x0F, true, &[]), 0);
+    }
+}

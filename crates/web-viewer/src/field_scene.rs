@@ -1,0 +1,1242 @@
+//! Assembled **full-scene** exports: load a CDNAME field/town scene through
+//! the engine's real scene loaders and surface everything the WebGL
+//! assembled view needs - the environment mesh pack, the `.MAP` placement /
+//! terrain-tile draws, the walk-ground heightfield, and the field VRAM.
+//!
+//! This is the browser twin of the play-window's static field layer: the
+//! same [`legaia_engine_scene::scene_resources::SceneResources`] build (field
+//! VRAM pre-pass + LZS-packed env TMD scan), the same
+//! [`legaia_engine_scene::field_env`] pack vote + placement resolution, the
+//! same floor-height-LUT world Y. A `scene_asset_table` entry viewed alone
+//! shows one object-local mesh at the origin; this path shows the map those
+//! meshes assemble into.
+
+use super::*;
+use legaia_engine_scene::field_env::EnvDraw;
+use legaia_engine_scene::scene::{ProtIndex, Scene};
+use legaia_engine_scene::scene_resources::SceneResources;
+use legaia_web_play::field_actors::{ActorBanks, FieldActors};
+use legaia_web_play::field_scene_anim::FieldSceneAnim;
+use std::sync::Arc;
+
+/// A fully-assembled field scene held by [`LegaiaViewer`] between
+/// `set_scene_field` and the per-mesh accessors. Built by
+/// [`build_field_scene`] (public so the disc-gated integration tests can
+/// exercise the assembly without a browser canvas).
+pub struct FieldScenePack {
+    /// CDNAME label the scene was loaded as (status line).
+    pub name: String,
+    /// Engine scene resources: field-mode VRAM + every parsed scene TMD.
+    pub res: SceneResources,
+    /// Environment-pack subset of `res.tmds` (pack-index order) - the index
+    /// space the placement records select from.
+    pub env_tmds: Vec<usize>,
+    /// Placed-object draws (`flags & 0x4`; buildings / props / landmarks).
+    /// For world-map scenes this is the whole sparse mesh layer: the walk
+    /// `.MAP`'s placed landmarks followed by its decoration cells (trees /
+    /// mountain groups / props), concatenated in that order to match the
+    /// native play-window's `resolve_world_map_terrain_draws`.
+    pub placements: Vec<EnvDraw>,
+    /// Bulk terrain-tile draws (`CELL_VISIBLE`; ground / decor tiles).
+    /// Empty for world-map scenes (their ground is the heightfield).
+    pub terrain: Vec<EnvDraw>,
+    /// Walk-ground heightfield surface (`None` when the scene has no
+    /// resolvable `.MAP` floor grid / floor LUT).
+    pub ground: Option<legaia_scene_formats::field_objects::WalkHeightfield>,
+    /// Cross-draw coplanar lifts (`legaia_engine_scene::coplanar_draws`) for
+    /// the combined terrain + placement lists, applied by the position
+    /// exporters so overlapping same-plane tiles resolve deterministically
+    /// instead of z-fighting (mirrors the native play-window).
+    pub coplanar_offsets: std::collections::HashMap<EnvDraw, [f32; 3]>,
+    /// Currently-selected env-pack slot + its built mesh + the parallel
+    /// per-vertex flat-colour array (see [`build_hybrid_env_mesh`]), cached
+    /// so the positions/uvs/cba_tsb/indices accessors don't rebuild per call.
+    pub cur: Option<(usize, legaia_tmd::mesh::VramMesh, Vec<u8>)>,
+    /// The bundle's type-6 CLUT-walk animator
+    /// ([`LegaiaViewer::field_scene_anim_init`]). `None` until initialised
+    /// (or when the scene has none).
+    pub anim: Option<FieldSceneAnim>,
+    /// The scene running live and headless
+    /// ([`legaia_engine_scene_host::scene_live::LiveScene`]): its world drives the
+    /// floor-height ladder, the placed-prop clips, the ambient move-VM tree
+    /// and the scripted VRAM effects exactly as the play hosts' world does.
+    /// The overworld runs live too (its actors play the kingdom slot-4
+    /// clips). `None` until [`LegaiaViewer::field_scene_anim_init`], or when
+    /// the host refuses the scene.
+    pub live: Option<Box<legaia_engine_scene_host::scene_live::LiveScene>>,
+    /// The scene's ANM bundle - the clips placed props pose from.
+    pub scene_anm: Option<legaia_actor_formats::player_anm::PlayerAnmBundle>,
+    /// The live ladders (the live room's, then every other room's) the
+    /// ground's drawn positions were last re-resolved against
+    /// ([`LegaiaViewer::field_scene_ground_live_positions`]).
+    pub ground_lut_applied: Option<Vec<[i16; 16]>>,
+    /// Each ground vertex's cell ([`legaia_engine_scene::field_ground::vertex_cells`]),
+    /// the key its room's ladder is looked up by.
+    pub ground_cells: Vec<Option<(i32, i32)>>,
+    /// Per-placement windowed-list identity
+    /// ([`legaia_engine_scene::field_env::placed_window_key`]): which spawn
+    /// sweep owns each placed object, and so which ladder it stands on.
+    pub window_keys: Vec<Option<legaia_engine_scene::field_env::PlacedWindowKey>>,
+    /// The PROT 0874 locomotion bundle - the clips the party / global-pool
+    /// actors pose from.
+    pub locomotion_anm: Option<legaia_actor_formats::player_anm::PlayerAnmBundle>,
+    /// The scene's MAN-placed actors over the live world
+    /// ([`FieldActors`], the play page's own actor
+    /// layer), exported as `field_scene_npc_*`.
+    pub actors: FieldActors,
+}
+
+// Hybrid env-mesh builders - in the shared assembly kernel
+// (`engine-scene::scene_assembly`) so the browser pages and the native
+// `export-glb` path bake identical meshes.
+use legaia_engine_scene::scene_assembly::{build_hybrid_env_mesh, build_hybrid_env_mesh_posed};
+
+/// Assemble a CDNAME scene's full static map: field-mode
+/// [`SceneResources`] (VRAM + env TMD pack) + the `.MAP` placement /
+/// terrain-tile draws resolved through [`field_env`] + the walk-ground
+/// heightfield. The engine-parity core of [`LegaiaViewer::set_scene_field`].
+pub fn build_field_scene(index: &ProtIndex, name: &str) -> Result<FieldScenePack, String> {
+    let legaia_engine_scene::scene_assembly::AssembledScene {
+        name,
+        res,
+        env_tmds,
+        placements,
+        terrain,
+        ground,
+        coplanar_offsets,
+    } = legaia_engine_world_views::scene_staging::assemble_field_scene(index, name)?;
+    Ok(FieldScenePack {
+        name,
+        res,
+        env_tmds,
+        placements,
+        terrain,
+        ground,
+        coplanar_offsets,
+        cur: None,
+        anim: None,
+        live: None,
+        scene_anm: None,
+        ground_lut_applied: None,
+        ground_cells: Vec::new(),
+        window_keys: Vec::new(),
+        locomotion_anm: None,
+        actors: Default::default(),
+    })
+}
+
+/// Build the CLUT-walk animator for a loaded field scene: parse the bundle's
+/// type-6 walker table, parking its source strips into the pack's VRAM.
+/// `None` when the scene has no walker.
+pub fn build_field_scene_anim(
+    index: &ProtIndex,
+    pack: &mut FieldScenePack,
+) -> Option<FieldSceneAnim> {
+    let scene = Scene::load(index, &pack.name).ok()?;
+    let is_world_map = legaia_engine_scene::scene::is_world_map_scene(&pack.name);
+    let frame_step: u8 = if is_world_map { 3 } else { 2 };
+    // Resolved and parked by the engine kernel the play hosts call
+    // (`ClutWalkAnim::install`), into the VRAM the page draws.
+    let clut = legaia_engine_scene::clut_walk_anim::ClutWalkAnim::install(
+        &scene,
+        index,
+        pack.display_vram_mut(),
+    )?
+    .anim;
+    Some(FieldSceneAnim::clut_only(clut, frame_step))
+}
+
+/// Enter the pack's scene live and headless
+/// ([`legaia_engine_scene_host::scene_live::LiveScene`]), resolve the pose banks its
+/// props and actors use, build the actor layer over the live world, and
+/// install the CLUT walker into the VRAM the page draws. The live scene is
+/// `None` only for a scene the host refuses: a kingdom overworld map runs
+/// live as the play page runs it (`SceneHost::enter_world_map_scene`).
+pub fn build_field_scene_live(index: Arc<ProtIndex>, pack: &mut FieldScenePack) {
+    let scene = Scene::load(&index, &pack.name).ok();
+    pack.scene_anm = scene
+        .as_ref()
+        .and_then(legaia_engine_scene::npc_catalog::scene_anm_bundle);
+    let binds = scene
+        .as_ref()
+        .and_then(|s| s.field_object_binds(&index).ok().flatten());
+    pack.window_keys = pack
+        .placements
+        .iter()
+        .map(|d| legaia_engine_scene::field_env::placed_window_key(d, binds.as_ref()))
+        .collect();
+    pack.ground_lut_applied = None;
+    pack.ground_cells = pack
+        .ground
+        .as_ref()
+        .map(legaia_engine_scene::field_ground::vertex_cells)
+        .unwrap_or_default();
+    pack.locomotion_anm = index
+        .entry_bytes(legaia_actor_formats::character_pack::PROT_ENTRY_INDEX)
+        .ok()
+        .and_then(|b| legaia_actor_formats::character_pack::field_locomotion_anm(&b).ok());
+    pack.live = legaia_engine_scene_host::scene_live::LiveScene::enter(index.clone(), &pack.name)
+        .map_err(|e| console_log(&format!("field scene {}: not live: {e}", pack.name)))
+        .ok()
+        .map(Box::new);
+    let FieldScenePack {
+        live,
+        actors,
+        scene_anm,
+        locomotion_anm,
+        ..
+    } = pack;
+    match live.as_mut() {
+        Some(live) => actors.rebuild(
+            &mut live.host,
+            ActorBanks {
+                scene_anm: scene_anm.as_ref(),
+                locomotion_anm: locomotion_anm.as_ref(),
+            },
+        ),
+        None => actors.clear(),
+    }
+    // After the live scene: the walker parks into the VRAM the page draws.
+    pack.anim = build_field_scene_anim(&index, pack);
+}
+
+impl FieldScenePack {
+    /// The field light the light-source rows shade through: the live
+    /// world's (what the scene's own `4C 8A` set - every Rim Elm variant's
+    /// `P1[0]` sets a white back colour on its first tick), else the scene
+    /// loader's reset ([`FieldLight::SCENE_LOAD`]).
+    ///
+    /// [`FieldLight::SCENE_LOAD`]: legaia_render_kernels::field_light::FieldLight::SCENE_LOAD
+    pub fn field_light(&self) -> legaia_render_kernels::field_light::FieldLight {
+        self.live.as_ref().map_or(
+            legaia_render_kernels::field_light::FieldLight::SCENE_LOAD,
+            |l| l.host.world.presentation.field_light,
+        )
+    }
+
+    /// Env-pack slot `slot` - posed at frame 0 of scene ANM record
+    /// `anim_id - 1` when `anim_id` is non-zero - with its light-source rows
+    /// shaded under [`Self::field_light`] for a draw at the record angles
+    /// `rot` (`legaia_engine_field::field_lit_mesh`, the play hosts'
+    /// kernel). Returns the mesh, its hybrid flat-colour stream and whether
+    /// it carries lit rows at all.
+    pub fn lit_env_mesh(
+        &self,
+        slot: usize,
+        anim_id: u32,
+        rot: [u16; 3],
+    ) -> Result<(legaia_tmd::mesh::VramMesh, Vec<u8>, bool), String> {
+        let Some(&res_idx) = self.env_tmds.get(slot) else {
+            return Err(format!("slot {slot} >= count {}", self.env_tmds.len()));
+        };
+        let rtmd = &self.res.tmds[res_idx];
+        let offsets = (anim_id != 0)
+            .then(|| {
+                self.scene_anm.as_ref().and_then(|b| {
+                    legaia_engine_scene::field_env::posed_prop_offsets(
+                        b,
+                        anim_id.min(u8::MAX as u32) as u8,
+                        legaia_engine_scene::field_env::PropPoseKey::REST,
+                        rtmd.tmd.objects.len(),
+                    )
+                })
+            })
+            .flatten();
+        let (mut mesh, mut flat, lit) = match &offsets {
+            Some(o) => {
+                legaia_engine_scene::scene_assembly::build_hybrid_env_mesh_posed_lit(rtmd, o)
+            }
+            None => {
+                legaia_engine_scene::scene_assembly::build_hybrid_env_mesh_lit(rtmd, &self.res.vram)
+            }
+        };
+        let has_lit = legaia_engine_field::field_lit_mesh::has_lit_rows(&lit);
+        if has_lit {
+            let rot = legaia_engine_field::field_lit_mesh::draw_rotation(rot[0], rot[1], rot[2]);
+            legaia_engine_field::field_lit_mesh::shade_lit_rows_rgba(
+                &mut mesh.colors,
+                &mut flat,
+                &lit,
+                &self.field_light(),
+                &rot,
+            );
+        }
+        Ok((mesh, flat, has_lit))
+    }
+
+    /// The VRAM the page draws: the live scene host's when the scene runs
+    /// live - it carries what the world uploads at entry (the party /
+    /// global-pool actors' pages) and is what the world's VRAM effects write -
+    /// else the static assembly's.
+    pub fn display_vram(&self) -> &legaia_tim::Vram {
+        self.live
+            .as_ref()
+            .and_then(|l| l.host.resources.as_ref())
+            .map_or(&self.res.vram, |r| &r.vram)
+    }
+
+    /// The actor layer's `[x, y, z, facing, ...]` per catalog entry and its
+    /// `[pose, generation, ...]` clip states - what the page's actor draw
+    /// reads each frame (`field_scene_npc_transforms` /
+    /// `field_scene_npc_clip_states`). Empty while the scene is not live.
+    pub fn actor_frame_state(&self) -> (Vec<f32>, Vec<i32>) {
+        match self.live.as_ref() {
+            Some(l) => (
+                self.actors.transforms(&l.host),
+                self.actors.clip_states(Some(&l.host)),
+            ),
+            None => (Vec::new(), Vec::new()),
+        }
+    }
+
+    /// Mutable [`Self::display_vram`].
+    pub fn display_vram_mut(&mut self) -> &mut legaia_tim::Vram {
+        match self.live.as_mut().and_then(|l| l.host.resources.as_mut()) {
+            Some(r) => &mut r.vram,
+            None => &mut self.res.vram,
+        }
+    }
+
+    /// Per-draw Y offsets (retail frame, +Y down) of the terrain draws then
+    /// the placement draws under the live floor-height ladder
+    /// ([`legaia_engine_scene::field_env::FloorWave`]). Empty while the
+    /// ladder sits where the scene shipped it.
+    ///
+    /// The terrain / decoration cells follow the live rungs; a placed object
+    /// stands on the ladder its actor was spawned against
+    /// (`World::placed_floor_offsets`) - the play page's split. A full map
+    /// shows every room at once, so each draw takes the ladder of the room
+    /// its cell is in (`LiveScene`'s rooms), not only the live player's.
+    pub fn floor_wave_offsets(&self) -> Vec<f32> {
+        let Some(live) = self.live.as_ref() else {
+            return Vec::new();
+        };
+        let terrain = live.floor_wave_offsets(&self.terrain);
+        let placed = live.placed_wave_offsets(&self.placements, &self.window_keys);
+        if terrain.is_none() && placed.iter().all(|&o| o == 0) {
+            return Vec::new();
+        }
+        let terrain = terrain.unwrap_or_else(|| vec![0; self.terrain.len()]);
+        terrain
+            .into_iter()
+            .chain(placed)
+            .map(|o| o as f32)
+            .collect()
+    }
+
+    /// The ground's drawn positions, each cell under its room's live ladder,
+    /// flattened, when any of those ladders moved since the last call (empty
+    /// otherwise, and always on the overworld, whose ground does not follow
+    /// the field ladder).
+    pub fn ground_live_positions(&mut self) -> Vec<f32> {
+        let Some(live) = self.live.as_ref().filter(|l| !l.is_world_map()) else {
+            return Vec::new();
+        };
+        let Some(hf) = self.ground.as_ref() else {
+            return Vec::new();
+        };
+        let key = live.ground_key();
+        if self.ground_lut_applied.as_ref() == Some(&key) {
+            return Vec::new();
+        }
+        self.ground_lut_applied = Some(key);
+        live.ground_positions(hf, &self.ground_cells)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// Per-placement live pose key (`PropPoseKey::to_i32`), `-1` for a static
+    /// prop.
+    pub fn placement_frames(&self) -> Vec<i32> {
+        let live = self.live.as_ref();
+        self.placements
+            .iter()
+            .map(|d| {
+                live.and_then(|l| l.prop_pose_key(d))
+                    .map_or(-1, |k| k.to_i32())
+            })
+            .collect()
+    }
+}
+
+/// One retail vsync of the viewer's whole animation: the live scene's world
+/// tick, the CLUT walker, and the world's VRAM effects (ambient move-VM tree,
+/// scripted CLUT fx) - in the play runtime's per-sim-tick order. Returns
+/// `true` when VRAM texels changed.
+pub fn tick_field_scene_vsync(pack: &mut FieldScenePack) -> bool {
+    let mut wrote = false;
+    let FieldScenePack {
+        live,
+        anim,
+        res,
+        actors,
+        scene_anm,
+        locomotion_anm,
+        ..
+    } = pack;
+    let Some(live) = live.as_mut() else {
+        // No live world: the CLUT walker alone, on the static VRAM.
+        if let Some(anim) = anim.as_mut() {
+            wrote |= anim.tick(1, &mut res.vram);
+        }
+        return wrote;
+    };
+    live.tick();
+    if live.is_live() {
+        // The actor layer's clip step, in the play runtime's place for it
+        // (after the world tick).
+        actors.drive(
+            &mut live.host,
+            ActorBanks {
+                scene_anm: scene_anm.as_ref(),
+                locomotion_anm: locomotion_anm.as_ref(),
+            },
+        );
+    }
+    let frame_step = live.host.world.clock.frame_step;
+    let host = &mut live.host;
+    let Some(hres) = host.resources.as_mut() else {
+        return wrote;
+    };
+    if let Some(anim) = anim.as_mut() {
+        anim.set_frame_step(frame_step);
+        wrote |= anim.tick(1, &mut hres.vram);
+    }
+    wrote |= host.world.step_field_vram_effects(&mut hres.vram, false);
+    wrote
+}
+
+impl LegaiaViewer {
+    /// Build (and cache) the engine-core [`ProtIndex`] over the loaded disc.
+    /// After `load_disc`, `self.disc` holds the extracted PROT.DAT bytes and
+    /// `self.cdname_text` the CDNAME.TXT captured from the full image (raw
+    /// PROT.DAT loads have no CDNAME - scene names then can't resolve and
+    /// `set_scene_field` errors).
+    pub(crate) fn ensure_prot_index(&mut self) -> Result<Arc<ProtIndex>, String> {
+        if let Some(ix) = &self.prot_index {
+            return Ok(ix.clone());
+        }
+        let prot_bytes = if legaia_iso::image::is_mode2_2352_disc(&self.disc) {
+            extract_prot_dat(&self.disc)
+                .ok_or_else(|| "PROT.DAT not found in disc image".to_string())?
+        } else {
+            self.disc.clone()
+        };
+        let ix = ProtIndex::from_bytes(prot_bytes, self.cdname_text.as_deref())
+            .map_err(|e| format!("PROT index: {e:#}"))?;
+        let ix = Arc::new(ix);
+        self.prot_index = Some(ix.clone());
+        Ok(ix)
+    }
+}
+
+#[wasm_bindgen]
+impl LegaiaViewer {
+    /// Load a CDNAME scene (e.g. `"town01"`, `"korb3"`) as an **assembled
+    /// full map**: field-mode VRAM + the environment mesh pack + the `.MAP`
+    /// placement / terrain draws + the walk-ground heightfield. Returns the
+    /// environment pack's TMD count (the `field_scene_mesh` slot space).
+    ///
+    /// Requires a full disc image (CDNAME.TXT resolves the scene block).
+    /// World-map scenes (`map01..03`) load their walk-frame landmark
+    /// placements; every other field scene loads the placed-object +
+    /// terrain-tile layers.
+    pub fn set_scene_field(&mut self, name: &str) -> Result<u32, JsValue> {
+        self.field_scene = None;
+        self.field_npcs = None;
+        let index = self
+            .ensure_prot_index()
+            .map_err(|e| JsValue::from_str(&format!("set_scene_field({name}): {e}")))?;
+        let pack = build_field_scene(&index, name)
+            .map_err(|e| JsValue::from_str(&format!("set_scene_field({name}): {e}")))?;
+        let count = pack.env_tmds.len() as u32;
+        console_log(&format!(
+            "field scene {name}: {} env meshes, {} placements, {} terrain tiles, {} ground quads",
+            count,
+            pack.placements.len(),
+            pack.terrain.len(),
+            pack.ground.as_ref().map(|h| h.quad_count()).unwrap_or(0),
+        ));
+        self.field_scene = Some(pack);
+        Ok(count)
+    }
+
+    /// Number of TMDs in the loaded field scene's environment pack. 0 when
+    /// no field scene is loaded.
+    pub fn field_scene_pack_count(&self) -> u32 {
+        self.field_scene
+            .as_ref()
+            .map(|f| f.env_tmds.len() as u32)
+            .unwrap_or(0)
+    }
+
+    /// One-line JSON status for the UI:
+    /// `{"name", "pack_count", "placements", "terrain", "ground_quads"}`.
+    pub fn field_scene_status_json(&self) -> String {
+        match &self.field_scene {
+            Some(f) => format!(
+                r#"{{"name":"{}","pack_count":{},"placements":{},"terrain":{},"ground_quads":{}}}"#,
+                f.name.replace('"', ""),
+                f.env_tmds.len(),
+                f.placements.len(),
+                f.terrain.len(),
+                f.ground.as_ref().map(|h| h.quad_count()).unwrap_or(0),
+            ),
+            None => "null".to_string(),
+        }
+    }
+
+    /// Select the active environment-pack slot and build its mesh: the
+    /// textured prims whose pages/CLUTs are resident in the field VRAM
+    /// (matches the engine's per-prim filter) **plus** the untextured
+    /// `F*`/`G*` vertex-colour prims, merged by [`build_hybrid_env_mesh`]
+    /// (the engine-shell's colour-mesh pipeline sibling). Returns the slot,
+    /// or an error when out of range. Subsequent `field_scene_mesh_*` calls
+    /// read the built mesh.
+    pub fn field_scene_mesh(&mut self, slot: u32) -> Result<u32, JsValue> {
+        let f = self
+            .field_scene
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("field_scene_mesh: no field scene loaded"))?;
+        let s = slot as usize;
+        let Some(&res_idx) = f.env_tmds.get(s) else {
+            return Err(JsValue::from_str(&format!(
+                "field_scene_mesh: slot {s} >= count {}",
+                f.env_tmds.len()
+            )));
+        };
+        if f.cur.as_ref().map(|(cs, _, _)| *cs) != Some(s) {
+            let (mesh, flat) = build_hybrid_env_mesh(&f.res.tmds[res_idx], &f.res.vram);
+            f.cur = Some((s, mesh, flat));
+        }
+        Ok(slot)
+    }
+
+    pub fn field_scene_mesh_positions(&self) -> Vec<f32> {
+        let Some((_, mesh, _)) = self.field_scene.as_ref().and_then(|f| f.cur.as_ref()) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(mesh.positions.len() * 3);
+        for p in &mesh.positions {
+            out.extend_from_slice(p);
+        }
+        out
+    }
+
+    pub fn field_scene_mesh_uvs(&self) -> Vec<u8> {
+        let Some((_, mesh, _)) = self.field_scene.as_ref().and_then(|f| f.cur.as_ref()) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(mesh.uvs.len() * 2);
+        for uv in &mesh.uvs {
+            out.extend_from_slice(uv);
+        }
+        out
+    }
+
+    pub fn field_scene_mesh_cba_tsb(&self) -> Vec<u16> {
+        let Some((_, mesh, _)) = self.field_scene.as_ref().and_then(|f| f.cur.as_ref()) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(mesh.cba_tsb.len() * 2);
+        for ct in &mesh.cba_tsb {
+            out.extend_from_slice(ct);
+        }
+        out
+    }
+
+    pub fn field_scene_mesh_indices(&self) -> Vec<u32> {
+        self.field_scene
+            .as_ref()
+            .and_then(|f| f.cur.as_ref())
+            .map(|(_, m, _)| m.indices.clone())
+            .unwrap_or_default()
+    }
+
+    /// Per-vertex `[r, g, b, flag]` bytes for the current mesh's hybrid
+    /// flat-colour render (`flag` 255 = textured vertex, sample VRAM; 0 =
+    /// untextured vertex, use the RGB). **Empty** when the mesh carries no
+    /// untextured prims - the JS side then skips binding the attribute and
+    /// the draw behaves exactly like the pure-textured path.
+    pub fn field_scene_mesh_flat_rgba(&self) -> Vec<u8> {
+        self.field_scene
+            .as_ref()
+            .and_then(|f| f.cur.as_ref())
+            .map(|(_, _, flat)| flat.clone())
+            .unwrap_or_default()
+    }
+
+    /// Field-mode VRAM bytes (1 MB) shared by every env-pack mesh + the
+    /// ground heightfield. Empty when no field scene is loaded.
+    pub fn field_scene_vram_bytes(&self) -> Vec<u8> {
+        self.field_scene
+            .as_ref()
+            .map(|f| f.display_vram().as_bytes().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Start the loaded field scene's animation: the bundle's type-6
+    /// CLUT-walk table (water / waterfall shimmer) and the scene itself,
+    /// entered live and headless through the engine's scene host
+    /// ([`legaia_engine_scene_host::scene_live::LiveScene`]) - whose world runs the
+    /// scene's scripts, so the floor-height ladder, placed-prop clips,
+    /// ambient move-VM tree and scripted VRAM effects move as they do on the
+    /// play hosts. Returns a JSON status
+    /// `{"walker_entries", "ambient_parts", "live"}`. Call once after
+    /// `set_scene_field`, before the first VRAM upload (the walker parks its
+    /// source strips into VRAM); then drive [`Self::field_scene_anim_tick`].
+    pub fn field_scene_anim_init(&mut self) -> Result<String, JsValue> {
+        let index = self
+            .ensure_prot_index()
+            .map_err(|e| JsValue::from_str(&format!("field_scene_anim_init: {e}")))?;
+        let Some(pack) = self.field_scene.as_mut() else {
+            return Err(JsValue::from_str("field_scene_anim_init: no field scene"));
+        };
+        build_field_scene_live(index, pack);
+        let walker = pack.anim.as_ref().map_or(0, |a| a.walker_entries());
+        let ambient = pack
+            .live
+            .as_ref()
+            .map_or(0, |l| l.host.world.ambient.fx.len());
+        let live = pack.live.is_some();
+        Ok(format!(
+            r#"{{"walker_entries":{walker},"ambient_parts":{ambient},"live":{live}}}"#
+        ))
+    }
+
+    /// Advance the field scene by `vsyncs` retail vsyncs (pass the vsyncs of
+    /// wall clock elapsed; capped at 64): one live-world tick, CLUT-walk step
+    /// and VRAM-effect drain each ([`tick_field_scene_vsync`]). Returns `true`
+    /// when VRAM texels changed - re-upload [`Self::field_scene_vram_bytes`]
+    /// to the GPU then.
+    pub fn field_scene_anim_tick(&mut self, vsyncs: u32) -> bool {
+        let Some(pack) = self.field_scene.as_mut() else {
+            return false;
+        };
+        let mut wrote = false;
+        for _ in 0..vsyncs.min(64) {
+            wrote |= tick_field_scene_vsync(pack);
+        }
+        wrote
+    }
+
+    /// Whether the scene is running live (see [`Self::field_scene_anim_init`]).
+    pub fn field_scene_is_live(&self) -> bool {
+        self.field_scene
+            .as_ref()
+            .and_then(|p| p.live.as_ref())
+            .is_some_and(|l| l.is_live())
+    }
+
+    /// Drain the environment-pack slots whose VDF morph deltas changed
+    /// since the last call (the live world's ambient morph parts + the
+    /// scene-entry pulse). For each returned slot the page re-uploads that
+    /// mesh's positions from [`Self::field_scene_morph_positions`] - the
+    /// browser side of the `FUN_8001C604` render substitution, the same
+    /// drain the play page reads.
+    pub fn field_scene_morph_slots(&mut self) -> Vec<u32> {
+        let Some(live) = self.field_scene.as_mut().and_then(|p| p.live.as_mut()) else {
+            return Vec::new();
+        };
+        let mut slots: Vec<u32> = live
+            .host
+            .world
+            .take_morph_dirty_slots()
+            .into_iter()
+            .map(|(s, _)| s as u32)
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
+
+    /// The morphed vertex-position stream for environment-pack slot `slot`
+    /// (`World::morphed_env_tmd` through the same hybrid mesh build as
+    /// [`Self::field_scene_mesh`]). The prim walk is position-independent,
+    /// so the stream aligns 1:1 with the uploaded mesh; the page swaps
+    /// positions only. Empty when no morph targets the slot.
+    pub fn field_scene_morph_positions(&mut self, slot: u32) -> Vec<f32> {
+        let Some(pack) = self.field_scene.as_ref() else {
+            return Vec::new();
+        };
+        let Some(live) = pack.live.as_ref() else {
+            return Vec::new();
+        };
+        let s = slot as usize;
+        let Some(&res_idx) = pack.env_tmds.get(s) else {
+            return Vec::new();
+        };
+        let Some(m) = live.host.world.morphed_env_tmd(s, &pack.res.tmds[res_idx]) else {
+            return Vec::new();
+        };
+        let (mesh, _) = build_hybrid_env_mesh(&m, &pack.res.vram);
+        mesh.positions.iter().flatten().copied().collect()
+    }
+
+    /// Per-draw Y offsets (retail frame, +Y down) of the terrain draws then
+    /// the placement draws, under the live floor-height ladder
+    /// ([`legaia_engine_scene::field_env::FloorWave`], the kernel the play
+    /// page's `field_floor_wave_offsets` calls). Empty while the ladder sits
+    /// where the scene shipped it.
+    pub fn field_scene_floor_wave_offsets(&self) -> Vec<f32> {
+        self.field_scene
+            .as_ref()
+            .map(|p| p.floor_wave_offsets())
+            .unwrap_or_default()
+    }
+
+    /// The walk-ground heightfield's drawn positions under the live ladder
+    /// ([`legaia_engine_scene::field_ground::live_render_positions`], the play
+    /// hosts' kernel), when the ladder moved since the last call - empty
+    /// otherwise, so the page re-uploads only on a frame it changed.
+    pub fn field_scene_ground_live_positions(&mut self) -> Vec<f32> {
+        self.field_scene
+            .as_mut()
+            .map(|p| p.ground_live_positions())
+            .unwrap_or_default()
+    }
+
+    /// Per-placement object-bind animation id (parallel to
+    /// [`Self::field_scene_placement_slots`]): `0` = a static mesh; nonzero =
+    /// a prop posed by scene ANM record `id - 1`, built through
+    /// [`Self::field_scene_mesh_posed`].
+    pub fn field_scene_placement_anim_ids(&self) -> Vec<u32> {
+        self.field_scene
+            .as_ref()
+            .map(|f| f.placements.iter().map(|d| d.anim_id as u32).collect())
+            .unwrap_or_default()
+    }
+
+    /// Live pose key of each placement (parallel to
+    /// [`Self::field_scene_placement_slots`]): `-1` for a static prop, else
+    /// the prop bank's pose key (`PropPoseKey::to_i32`) - the same value the
+    /// play page's `field_placement_frames` reports, from the same
+    /// world-ticked cursor (the windmill's sails turn).
+    pub fn field_scene_placement_frames(&self) -> Vec<i32> {
+        self.field_scene
+            .as_ref()
+            .map(|p| p.placement_frames())
+            .unwrap_or_default()
+    }
+
+    /// Select + build env-pack slot `slot` **posed at frame 0** of scene ANM
+    /// record `anim_id - 1` - the rest state of a placed prop whose bind
+    /// names a clip (a multi-object mesh whose parts are the clip's bones:
+    /// windmill sails on their hub, cupboard doors on the cabinet). Falls
+    /// back to the raw mesh when the pose can't resolve (retail's
+    /// count-equality contract, `field_env::posed_prop_offsets`). Subsequent
+    /// `field_scene_mesh_*` calls read the built mesh.
+    pub fn field_scene_mesh_posed(&mut self, slot: u32, anim_id: u32) -> Result<u32, JsValue> {
+        let f = self
+            .field_scene
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("field_scene_mesh_posed: no field scene loaded"))?;
+        let s = slot as usize;
+        let Some(&res_idx) = f.env_tmds.get(s) else {
+            return Err(JsValue::from_str(&format!(
+                "field_scene_mesh_posed: slot {s} >= count {}",
+                f.env_tmds.len()
+            )));
+        };
+        let rtmd = &f.res.tmds[res_idx];
+        let offsets = f.scene_anm.as_ref().and_then(|b| {
+            legaia_engine_scene::field_env::posed_prop_offsets(
+                b,
+                anim_id.min(u8::MAX as u32) as u8,
+                legaia_engine_scene::field_env::PropPoseKey::REST,
+                rtmd.tmd.objects.len(),
+            )
+        });
+        let (mesh, flat) = match &offsets {
+            Some(o) => build_hybrid_env_mesh_posed(rtmd, o),
+            None => build_hybrid_env_mesh(rtmd, &f.res.vram),
+        };
+        // Keyed on a slot no plain build uses, so the next plain
+        // `field_scene_mesh(slot)` rebuilds.
+        f.cur = Some((usize::MAX, mesh, flat));
+        Ok(slot)
+    }
+
+    /// Select + build env-pack slot `slot` - posed at frame 0 of scene ANM
+    /// record `anim_id - 1` when `anim_id` is non-zero, as
+    /// [`Self::field_scene_mesh_posed`] - with its **light-source rows**
+    /// shaded for a draw at the record angles `(rot_x, rot_y, rot_z)`: the
+    /// `legaia_engine_field::field_lit_mesh` kernel both play hosts run, under
+    /// the live scene's field light (the scene-load light before the scene
+    /// runs live). Returns whether the mesh has lit rows; the page keeps one
+    /// shared upload for a slot without any.
+    pub fn field_scene_mesh_posed_lit(
+        &mut self,
+        slot: u32,
+        anim_id: u32,
+        rot_x: u32,
+        rot_y: u32,
+        rot_z: u32,
+    ) -> Result<bool, JsValue> {
+        let f = self.field_scene.as_mut().ok_or_else(|| {
+            JsValue::from_str("field_scene_mesh_posed_lit: no field scene loaded")
+        })?;
+        let (mesh, flat, has_lit) = f
+            .lit_env_mesh(
+                slot as usize,
+                anim_id,
+                [rot_x as u16, rot_y as u16, rot_z as u16],
+            )
+            .map_err(|e| JsValue::from_str(&format!("field_scene_mesh_posed_lit: {e}")))?;
+        f.cur = Some((usize::MAX, mesh, flat));
+        Ok(has_lit)
+    }
+
+    /// The live field light as one comparable key (angles + back colour):
+    /// the page re-shades its lit copies when it changes - the scene's own
+    /// `4C 8A` lands on its first tick, after the copies were first built.
+    /// The play runtime's `field_light_key` twin.
+    pub fn field_scene_light_key(&self) -> String {
+        self.field_scene
+            .as_ref()
+            .map(|f| {
+                let l = f.field_light();
+                format!(
+                    "{},{},{},{},{},{}",
+                    l.angles[0], l.angles[1], l.angles[2], l.back[0], l.back[1], l.back[2]
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether env-pack slot `slot` carries light-source rows.
+    pub fn field_scene_mesh_has_lit_rows(&self, slot: u32) -> bool {
+        let Some(f) = self.field_scene.as_ref() else {
+            return false;
+        };
+        f.env_tmds.get(slot as usize).is_some_and(|&res_idx| {
+            let (_, lit) = f.res.tmds[res_idx].build_filtered_vram_mesh_lit_vertices(&f.res.vram);
+            legaia_engine_field::field_lit_mesh::has_lit_rows(&lit)
+        })
+    }
+
+    /// Positions of env-pack slot `slot` posed at pose key `frame`
+    /// ([`Self::field_scene_placement_frames`]' value) of scene ANM record
+    /// `anim_id - 1` - same vertex order as [`Self::field_scene_mesh_posed`],
+    /// so the page rewrites positions only. Empty when the pose can't
+    /// resolve.
+    pub fn field_scene_mesh_posed_frame_positions(
+        &self,
+        slot: u32,
+        anim_id: u32,
+        frame: u32,
+    ) -> Vec<f32> {
+        let Some(f) = self.field_scene.as_ref() else {
+            return Vec::new();
+        };
+        let Some(&res_idx) = f.env_tmds.get(slot as usize) else {
+            return Vec::new();
+        };
+        let rtmd = &f.res.tmds[res_idx];
+        let Some(offsets) = f.scene_anm.as_ref().and_then(|b| {
+            legaia_engine_scene::field_env::posed_prop_offsets(
+                b,
+                anim_id.min(u8::MAX as u32) as u8,
+                legaia_engine_scene::field_env::PropPoseKey::from_i32(frame as i32),
+                rtmd.tmd.objects.len(),
+            )
+        }) else {
+            return Vec::new();
+        };
+        let (mesh, _) = build_hybrid_env_mesh_posed(rtmd, &offsets);
+        mesh.positions.iter().flatten().copied().collect()
+    }
+
+    /// Per-placement env-pack slot, one `u32` per placed object. Feed each
+    /// into [`Self::field_scene_mesh`] and draw at the matching
+    /// [`Self::field_scene_placement_positions`] entry.
+    pub fn field_scene_placement_slots(&self) -> Vec<u32> {
+        self.field_scene
+            .as_ref()
+            .map(|f| f.placements.iter().map(|d| d.env_slot as u32).collect())
+            .unwrap_or_default()
+    }
+
+    /// Per-placement world positions `[x, y, z, ...]` (flattened), same
+    /// pre-Y-flip world frame as the ground heightfield (draw with the shared
+    /// `(1, -1, 1)` model flip at scale 1).
+    pub fn field_scene_placement_positions(&self) -> Vec<f32> {
+        let Some(f) = self.field_scene.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(f.placements.len() * 3);
+        for d in &f.placements {
+            let off = f.coplanar_offsets.get(d).copied().unwrap_or([0.0; 3]);
+            out.push(d.world_x as f32 + off[0]);
+            out.push(d.world_y as f32 + off[1]);
+            out.push(d.world_z as f32 + off[2]);
+        }
+        out
+    }
+
+    /// Per-placement authored yaw (object record `+0x0A`), PSX angle units
+    /// (`4096` = full revolution), in placement order. Convert with
+    /// `rotY = -(rot & 0xFFF) * Math.PI / 2048` for `placementModelScaled*`.
+    pub fn field_scene_placement_rot_y(&self) -> Vec<u16> {
+        self.field_scene
+            .as_ref()
+            .map(|f| f.placements.iter().map(|d| d.rot_y).collect())
+            .unwrap_or_default()
+    }
+
+    /// Per-placement authored pitch (object record `+0x08`), PSX angle units,
+    /// in placement order - the sibling of [`Self::field_scene_placement_rot_y`]
+    /// on the X axis.
+    ///
+    /// A placement carrying a nonzero `rot_x` or `rot_z` cannot go through the
+    /// yaw-only `placementModelScaled*` path: that builder's negated-yaw
+    /// convention is a cancellation specific to `Ry`. The page composes
+    /// retail's `Rx * Ry * Rz` instead (`placementModelEuler`), which is what
+    /// `legaia_render_kernels::battle_intro::placement_rotation` applies on the
+    /// native host. Not a rarity to skip: across the field corpus ~6% of
+    /// placements tilt, and some scenes tilt every one of theirs.
+    pub fn field_scene_placement_rot_x(&self) -> Vec<u16> {
+        self.field_scene
+            .as_ref()
+            .map(|f| f.placements.iter().map(|d| d.rot_x).collect())
+            .unwrap_or_default()
+    }
+
+    /// Per-placement authored roll (object record `+0x0C`); see
+    /// [`Self::field_scene_placement_rot_x`].
+    pub fn field_scene_placement_rot_z(&self) -> Vec<u16> {
+        self.field_scene
+            .as_ref()
+            .map(|f| f.placements.iter().map(|d| d.rot_z).collect())
+            .unwrap_or_default()
+    }
+
+    /// Per-terrain-tile env-pack slot (the dense `CELL_VISIBLE` decor layer).
+    pub fn field_scene_terrain_slots(&self) -> Vec<u32> {
+        self.field_scene
+            .as_ref()
+            .map(|f| f.terrain.iter().map(|d| d.env_slot as u32).collect())
+            .unwrap_or_default()
+    }
+
+    /// Per-terrain-tile world positions `[x, y, z, ...]` (flattened).
+    pub fn field_scene_terrain_positions(&self) -> Vec<f32> {
+        let Some(f) = self.field_scene.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(f.terrain.len() * 3);
+        for d in &f.terrain {
+            let off = f.coplanar_offsets.get(d).copied().unwrap_or([0.0; 3]);
+            out.push(d.world_x as f32 + off[0]);
+            out.push(d.world_y as f32 + off[1]);
+            out.push(d.world_z as f32 + off[2]);
+        }
+        out
+    }
+
+    /// Per-terrain-tile authored yaw, same encoding as
+    /// [`Self::field_scene_placement_rot_y`].
+    pub fn field_scene_terrain_rot_y(&self) -> Vec<u16> {
+        self.field_scene
+            .as_ref()
+            .map(|f| f.terrain.iter().map(|d| d.rot_y).collect())
+            .unwrap_or_default()
+    }
+
+    /// Per-terrain-tile authored pitch / roll, same encoding as
+    /// [`Self::field_scene_placement_rot_x`]. The native shell composes all
+    /// three angles for the terrain layer too (one `static_env_draws` list
+    /// feeds one `placement_rotation`), so the layer is exported here rather
+    /// than assumed flat.
+    pub fn field_scene_terrain_rot_x(&self) -> Vec<u16> {
+        self.field_scene
+            .as_ref()
+            .map(|f| f.terrain.iter().map(|d| d.rot_x).collect())
+            .unwrap_or_default()
+    }
+
+    /// See [`Self::field_scene_terrain_rot_x`].
+    pub fn field_scene_terrain_rot_z(&self) -> Vec<u16> {
+        self.field_scene
+            .as_ref()
+            .map(|f| f.terrain.iter().map(|d| d.rot_z).collect())
+            .unwrap_or_default()
+    }
+
+    /// Ground-heightfield accessors (same layout as the kingdom
+    /// `walk_ground_*` family; empty when the scene has no resolvable floor
+    /// grid).
+    pub fn field_scene_ground_positions(&self) -> Vec<f32> {
+        let Some(hf) = self.field_scene.as_ref().and_then(|f| f.ground.as_ref()) else {
+            return Vec::new();
+        };
+        // Ground sinks below the env pack's authored floor art, through the
+        // same `field_ground` render kernel the play page and the native
+        // window build their ground from.
+        legaia_engine_scene::field_ground::render_positions(hf)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// The ground's per-vertex flat-depth references, eight floats per vertex
+    /// in [`Self::field_scene_ground_positions`] order - the shared
+    /// [`legaia_engine_scene::field_ground::flat_refs`] the play page and the
+    /// native window upload too, which marks each sloped far-bucket cell so
+    /// the shader draws it under everything, as retail's ground pass does.
+    pub fn field_scene_ground_flat_refs(&self) -> Vec<f32> {
+        let Some(hf) = self.field_scene.as_ref().and_then(|f| f.ground.as_ref()) else {
+            return Vec::new();
+        };
+        let positions = legaia_engine_scene::field_ground::render_positions(hf);
+        legaia_engine_scene::field_ground::flat_refs(hf, &positions)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    pub fn field_scene_ground_uvs(&self) -> Vec<u8> {
+        let Some(hf) = self.field_scene.as_ref().and_then(|f| f.ground.as_ref()) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(hf.uvs.len() * 2);
+        for uv in &hf.uvs {
+            out.extend_from_slice(uv);
+        }
+        out
+    }
+
+    pub fn field_scene_ground_cba_tsb(&self) -> Vec<u16> {
+        let Some(hf) = self.field_scene.as_ref().and_then(|f| f.ground.as_ref()) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(hf.cba_tsb.len() * 2);
+        for ct in &hf.cba_tsb {
+            out.extend_from_slice(ct);
+        }
+        out
+    }
+
+    pub fn field_scene_ground_indices(&self) -> Vec<u32> {
+        self.field_scene
+            .as_ref()
+            .and_then(|f| f.ground.as_ref())
+            .map(|hf| hf.indices.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn field_scene_ground_quad_count(&self) -> u32 {
+        self.field_scene
+            .as_ref()
+            .and_then(|f| f.ground.as_ref())
+            .map(|hf| hf.quad_count() as u32)
+            .unwrap_or(0)
+    }
+}
+
+/// The map viewer's actor exports: the loaded scene's MAN-placed actors over
+/// its live world, through [`FieldActors`] - the play
+/// page's own actor layer, whose `play_npc_*` exports these mirror one for
+/// one (`site/js/field-actors.js` draws both). Every export answers empty /
+/// `-1` / `null` while no scene runs live.
+#[wasm_bindgen]
+impl LegaiaViewer {
+    pub fn field_scene_npc_catalog_json(&self) -> String {
+        self.field_scene
+            .as_ref()
+            .filter(|p| p.live.is_some())
+            .map_or_else(|| "null".to_string(), |p| p.actors.catalog_json())
+    }
+
+    pub fn field_scene_npc_mesh(&mut self, i: u32) -> Result<u32, JsValue> {
+        let pack = self
+            .field_scene
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("field_scene_npc_mesh: no scene"))?;
+        let FieldScenePack {
+            live,
+            actors,
+            scene_anm,
+            locomotion_anm,
+            ..
+        } = pack;
+        let live = live
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("field_scene_npc_mesh: not live"))?;
+        actors
+            .build_mesh(
+                &live.host,
+                ActorBanks {
+                    scene_anm: scene_anm.as_ref(),
+                    locomotion_anm: locomotion_anm.as_ref(),
+                },
+                i,
+            )
+            .map_err(|e| JsValue::from_str(&e))?;
+        Ok(i)
+    }
+
+    /// [`FieldActors::shatter_states`] over the live
+    /// scene - the play page's `play_npc_shatter_states`.
+    pub fn field_scene_npc_shatter_states(&self) -> Vec<u8> {
+        self.npc_ctx()
+            .map(|(a, h, _)| a.shatter_states(h))
+            .unwrap_or_default()
+    }
+
+    /// [`FieldActors::shatter`] over the live scene -
+    /// the play page's `play_npc_shatter`.
+    pub fn field_scene_npc_shatter(&mut self, i: u32) -> Vec<f32> {
+        let Some(pack) = self.field_scene.as_mut() else {
+            return Vec::new();
+        };
+        let FieldScenePack {
+            live,
+            actors,
+            scene_anm,
+            locomotion_anm,
+            ..
+        } = pack;
+        let Some(live) = live.as_ref() else {
+            return Vec::new();
+        };
+        actors.shatter(
+            &live.host,
+            ActorBanks {
+                scene_anm: scene_anm.as_ref(),
+                locomotion_anm: locomotion_anm.as_ref(),
+            },
+            i,
+        )
+    }
+
+    pub fn field_scene_npc_mesh_positions(&self) -> Vec<f32> {
+        self.npc_actors()
+            .map(|a| a.mesh_positions())
+            .unwrap_or_default()
+    }
+
+    pub fn field_scene_npc_mesh_uvs(&self) -> Vec<u8> {
+        self.npc_actors().map(|a| a.mesh_uvs()).unwrap_or_default()
+    }
+
+    pub fn field_scene_npc_mesh_cba_tsb(&self) -> Vec<u16> {
+        self.npc_actors()
+            .map(|a| a.mesh_cba_tsb())
+            .unwrap_or_default()
+    }
+
+    pub fn field_scene_npc_mesh_indices(&self) -> Vec<u32> {
+        self.npc_actors()
+            .map(|a| a.mesh_indices())
+            .unwrap_or_default()
+    }
+
+    pub fn field_scene_npc_mesh_object_ids(&self) -> Vec<u32> {
+        self.npc_actors()
+            .map(|a| a.mesh_object_ids())
+            .unwrap_or_default()
+    }
+
+    pub fn field_scene_npc_mesh_flat_rgba(&self) -> Vec<u8> {
+        self.npc_actors()
+            .map(|a| a.mesh_flat_rgba())
+            .unwrap_or_default()
+    }
+
+    pub fn field_scene_npc_mesh_cut(&self, i: u32) -> i32 {
+        self.npc_ctx().map_or(-1, |(a, h, b)| a.mesh_cut(h, b, i))
+    }
+
+    pub fn field_scene_npc_live_model(&self, i: u32) -> i32 {
+        self.npc_ctx().map_or(-1, |(a, h, _)| a.live_model(h, i))
+    }
+
+    pub fn field_scene_npc_pose_frames(&self, i: u32) -> Vec<i32> {
+        self.npc_ctx()
+            .map(|(a, h, b)| a.pose_frames(h, b, i))
+            .unwrap_or_default()
+    }
+
+    pub fn field_scene_npc_pose_dims(&self, i: u32) -> Vec<u32> {
+        self.npc_ctx()
+            .map_or_else(|| vec![0, 0], |(a, h, b)| a.pose_dims(h, b, i))
+    }
+
+    pub fn field_scene_npc_transforms(&self) -> Vec<f32> {
+        self.npc_ctx()
+            .map(|(a, h, _)| a.transforms(h))
+            .unwrap_or_default()
+    }
+
+    pub fn field_scene_npc_draw_poses(&self) -> Vec<f32> {
+        self.npc_ctx()
+            .map(|(a, h, _)| a.draw_poses(h))
+            .unwrap_or_default()
+    }
+
+    pub fn field_scene_npc_tilts(&self) -> Vec<f32> {
+        self.npc_ctx()
+            .map(|(a, h, _)| a.tilts(h))
+            .unwrap_or_default()
+    }
+
+    pub fn field_scene_npc_clip_states(&self) -> Vec<i32> {
+        self.npc_ctx()
+            .map(|(a, h, _)| a.clip_states(Some(h)))
+            .unwrap_or_default()
+    }
+
+    pub fn field_scene_npc_live_bones(&self, i: u32) -> Vec<i32> {
+        self.npc_ctx()
+            .map(|(a, h, _)| a.live_bones(i, Some(h)))
+            .unwrap_or_default()
+    }
+
+    pub fn field_scene_npc_morph_states(&self) -> Vec<i32> {
+        self.npc_actors()
+            .map(|a| a.morph_states())
+            .unwrap_or_default()
+    }
+
+    pub fn field_scene_npc_morph_base(&self, i: u32) -> Vec<f32> {
+        self.npc_ctx()
+            .map(|(a, h, b)| a.morph_base(h, b, i))
+            .unwrap_or_default()
+    }
+
+    /// The off-map hide-box coordinate the actor draw skips.
+    pub fn field_offmap_hide_xz(&self) -> i32 {
+        legaia_engine_field::man_field_scripts::FIELD_OFFMAP_HIDE_XZ as i32
+    }
+}
+
+impl LegaiaViewer {
+    fn npc_actors(&self) -> Option<&FieldActors> {
+        self.field_scene
+            .as_ref()
+            .filter(|p| p.live.is_some())
+            .map(|p| &p.actors)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn npc_ctx(
+        &self,
+    ) -> Option<(
+        &FieldActors,
+        &legaia_engine_scene_host::scene_host::SceneHost,
+        ActorBanks<'_>,
+    )> {
+        let p = self.field_scene.as_ref()?;
+        let live = p.live.as_ref()?;
+        Some((
+            &p.actors,
+            &live.host,
+            ActorBanks {
+                scene_anm: p.scene_anm.as_ref(),
+                locomotion_anm: p.locomotion_anm.as_ref(),
+            },
+        ))
+    }
+}

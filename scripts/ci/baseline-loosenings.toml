@@ -1,0 +1,304 @@
+# Every time a ratchet baseline was let out, and why.
+#
+# `check-baseline-loosening.py` fails when a baselined value moves the wrong
+# way against the base revision unless the exact transition is recorded here.
+# Generate the entries, then write the reason:
+#
+#     scripts/ci/check-baseline-loosening.py --propose >> scripts/ci/baseline-loosenings.toml
+#
+# An entry is never removed: it only matches the one `from -> to` step it
+# names, so it cannot excuse a later fall, and the file stays the history of
+# what the ratchets gave back.
+#
+# [[loosening]]
+# file = "scripts/ci/retail-compare-baseline.json"
+# reason = "why the measurement moved, in a sentence"
+# changes = [
+#   ["states/<state>/<channel>", 0.98, 0.95],
+# ]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "Field-VM waits now credit on the game-frame grid (capture-verified at steps 2, 3 and 4), which moves 623 pixels around Vahn at the cabinet and flips one scored block. The capture is parked late in the sit-down clip while the gate samples the engine at the clip's start; that mismatch predates the change. Patched-disc state, outside the ratchet."
+changes = [
+  ["states/minigame_baka_pcsx/image", 0.962, 0.961],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "The frame was never one value: the coplanar draw-lift pass ranked planes in hash-map order, so jouine's stacked flesh shells sat about a unit apart from launch to launch and the score ran 0.893 to 0.900 on one binary (1000 to 1008 of 1120 blocks over ten runs). The baseline held the top of that spread. With the planes in key order the frame is one frame and scores 1007 blocks. Patched-disc state, outside the ratchet."
+changes = [
+  ["states/cort_evolved_pre_battle/image", 0.9, 0.899],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "PROT 0903's fire tunnel rings carry colour-word mode bit 0x20, which selects prim handler bank 3, whose quad leaf FUN_80045BB4 draws each GT4 as sixteen POLY_GT3 (the state's ordering table holds the rings as GT3 packets only). The port now draws that split (render_kernels::sprite_arm::subdivide_quad), so the tunnel's affine texture map follows retail's. The residual is the tunnel's rotation and scroll phase, a clock the seed does not carry: A/B on one binary, split off 0.518, split on 0.512 (block-score approximation); the corpus reads 0.519 -> 0.514."
+changes = [
+  ["states/gimard_burning_attack/image", 0.519, 0.514],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "The phase is Gaza's swing on Vahn, a monster target draw, and the seed search keeps the first stream whose drive reaches it within 4000 ticks. The 0.967 / 0.608 came from the seventh stream (0x6A09E667) reaching it in round one at +660 after six ran out of budget; since the drive releases the round prompt's open-glide pad hold (squash 8a397ae7e; bisected b8bcf448f 0.967 -> 8a397ae7e 0.899) the first stream reaches it at +3803 with Gaza pushed back by earlier rounds and its approach ending at clip age 352 short of retail's 552. Retail's Gaza never walked (dead Move clip, parked at (0, 1490)), so neither stream frames retail's pose: the old value was the luck of the search. Patched-disc state, outside the ratchet."
+changes = [
+  ["states/battle_gaza2_park_0x19_target_vahn/camera", 0.967, 0.899],
+  ["states/battle_gaza2_park_0x19_target_vahn/image", 0.608, 0.503],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "The state is captured inside PROT 0913's arm 2, which waits on the creature stream's CD read: retail spends 4 vsyncs there in a full cast (cast-sequence oracle), and this frame is one of them, with slot 7 still empty under a white ground fade. The engine's stream read is instant, so the seeded engine leaves arm 2 at once and draws arm 3: the yaw spin the arm now ports (cast_module_camera::nova) and the creature the seat installer FUN_801F19EC now stands on the caster, a dark body in the fade. The old camera score came from the unported arm 3 leaving the shot put. Closing it needs the CD-read latency modelled, not a camera change. The capture phase gate now places a stream-poll arm by the arm alone, so the seeded engine stands on arm 2 as retail does: image 1.000 (above the old 0.963), camera 0.996, one thousandth under, inside the comparison's noise. The two Gimard image drops are the fire tunnel's rotation phase, a clock the seed does not carry, under the creature that now rises from the floor at retail's spot."
+changes = [
+  ["states/gimard_burning_attack/image", 0.54, 0.533],
+  ["states/nova_summon_mid_cast/camera", 0.997, 0.996],
+  ["states/shiny_refactor_gimard_levelup/image", 0.839, 0.835],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "The image child's seat lands the state's own eye translation over the arrival snap; the record the gate resumes snaps the same pose on the same spot again, which used to put the engine's composed eye (Z 11978) back over retail's (11882). The zone camera now keeps the seated eye through such a snap (SeatHold). Against the retail crop the frame's mean absolute error falls from 33.1 to 31.7 and the blocks above an error of 30 from 452 to 343, while the block-tolerance score moves one thousandth the other way; the residual is the Genesis tree's morph and Caruban's pose, which the seed does not carry."
+changes = [
+  ["states/rikuroa_pre_caruban/image", 0.938, 0.937],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "The image child's clip seed now also lands on placement actors (the per-slot cursor a record's A2 binds) and takes every cursor back by the display lag's game frames at the clip's own step, wrapping a loop. Across the field corpus that raises thirteen rows (nivora_cutscene_delilas_intro 0.961 -> 0.973, conc_field_card_boot 0.951 -> 0.959, cort_evolved_pre_battle 0.899 -> 0.905, the card-boot states); these three move one or two scored blocks the other way; which seeded clip moves them is not traced (a loop the wrap stands on its previous cycle, for a clip bound inside the lag, is the candidate)."
+changes = [
+  ["states/vahn_walks_out/image", 1.0, 0.999],
+  ["states/minigame_dance_pcsx/image", 0.723, 0.721],
+  ["states/ending_vignette_biron/image", 1.0, 0.999],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "Bisected to e4aec598f (0.778 at ac5104652, 0.777 from e4aec598f on): that wave ported FUN_801DEA50's floor part (codes 0x81..=0x83, record 0x801F5EB0), the flat ring under Vahn. Retail's state holds the same node (pos (144,0,-1173), scale 0x500, b4/b6 224/320); the engine's sits at (124,0,-1181), scale 1280, b4/b6 168/240 - retail's minus two frames of growth, the displayed frame. Content and phase match; one 8x8 block flips on the ring's edge."
+changes = [
+  ["states/battle_gimard_tail_fire_a/image", 0.778, 0.777],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "Bisected to 17f58ff8a (0.909 at e4aec598f): the only changed block is the damage numeral over Gimard, an 8 before and a 7 after - the swing's rand() damage roll, which moved because wave 5 added draws ahead of it on the replay's pinned stream. The capture's roll is not on that stream either way (its digit reads as neither), so the frame scores whichever value the stream happens to land on."
+changes = [
+  ["states/rim_elm_gimard_victory/image", 0.909, 0.908],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "The battle seed now lands every looping clip on the capture's displayed keyframe (LEGAIA_SEAT_BATTLE_CLIPS), which raised 37 battle frames in the same run (theeder_summon_mid_cast 0.779 -> 0.857, zora_glare_petrify_post 0.706 -> 0.769, arts_bar_offclass_gala_nail 0.931 -> 0.977). Here Noa and Delilas move by under a keyframe and three blocks of the drifting ground mist, which dominates the frame, flip: seated party-only 0.875, monster-only 0.876, neither 0.877."
+changes = [
+  ["states/nivora_duel_pre_plasma_strike/image", 0.877, 0.874],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "The world stream now steps the BIOS rand() recurrence (0x41C64E6D / 0x3039) in place of the Numerical Recipes LCG, which re-deals every BATTLE_RNG_SEEDS stream. The super art's drive reaches its phase on every stream tried with the camera at 1.000, but none of the twenty streams swept with frames (from the list's head and tail) frames it as the old first stream did: the best, 0x8BAE8BFB, is pinned at 0.880 against 0.883 (and the 0.897 the battle clip seating raised it to). Which stream replays a drive is a search result; the capture's own 0x80009010 word cannot be stepped back to the entry because the engine's draw count to the phase moves with the stream."
+changes = [
+  ["states/battle_vahn_tri_somersault_super/image", 0.883, 0.88],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "Stale before this change, not a regression in it: main's own tree (built from a clean worktree at the merge base) scores this overworld frame 0.997, the same as the tree here, on repeated runs. The two frames differ by under a hundredth of the 8x8 blocks."
+changes = [
+  ["states/sebucus_overworld_resident/image", 0.999, 0.997],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "The battle draw now draws only the objects the seat's per-channel model table names (FUN_80048A08's channel loop after the mesh-variant swap FUN_8004CCD4). On Noa's idle loop that drops her 0xFF variant, which on her assemblies is an alternate-vertex copy of her attach piece the engine used to draw on top of it; retail's idle never draws it. The variant's few pixels sat over a region retail fills with a different pose of the same limb (the frame's pose residual), so removing them loses nine pixels of chance agreement. The same run raised 16 other battle frames."
+changes = [
+  ["states/noa_levelup_fight_pre/image", 0.833, 0.832],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "Move-VM op 0x1C now stores its length-channel rate at +0xCA (0x8002367C), where the beam builder reads it; the port had stored it to a field nothing read, so every op-0x1C beam stayed at zero length and Call Wave's red rays never drew. They draw now, but their angles come from rand(), so the thin lines land on different 8x8 blocks than retail's. The same lane raised six cast frames (horn_summon_mid_cast 0.541 -> 0.966)."
+changes = [
+  ["states/zeto_call_wave_mid_cast/image", 0.932, 0.929],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "A cast module's arm that hands over now leaves the next arm to the next battle frame on the per-vsync cadence (World::module_pass): retail enters the module once a pass, so arms that finish on their first pass (Big Wave's arm 0 cut 0x801F6B08, arm 4 pan 0x801F6E90) follow a frame apart, not a vsync apart. Each band's timeline shifts by up to a tick per hand-over against the capture gates, which moves Gimard's yaw drift and Vera's yaw at the gate and the rand() draws Call Wave's rays take their angles from; Horn's frame moves by a few blocks with its band's timing. The same run raised vera_summon_mid_cast image 0.835 -> 0.969, cort_mystic_shield_mid_cast 0.972 -> 0.992, zeto_big_wave_mid_cast 0.496 -> 0.520, gimard_burning_attack image 0.541 -> 0.570 and five camera channels."
+changes = [
+  ["states/gimard_burning_attack/camera", 0.989, 0.96],
+  ["states/horn_summon_mid_cast/image", 0.966, 0.963],
+  ["states/vera_summon_mid_cast/camera", 0.994, 0.99],
+  ["states/zeto_call_wave_mid_cast/image", 0.929, 0.918],
+  ["states/zeto_call_wave_mid_cast/image", 0.932, 0.918],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "Text now drawn in retail's exact inks (battle captions and numeral cells at the tier-7 206 / 33 instead of 255 or 166 / 27, font shadow 33 instead of 26). Every text pixel these four frames carry now matches retail's, but each sits in an 8x8 block whose background differs (sebucus's horizon row, a cast effect behind a move name, a monster behind the strip), and the corrected glyphs moved the block mean across the threshold the other way. The same run raised eleven frames and cut every menu state's error (menu_status 0.994 -> 0.997). The two shiny_refactor rows are patched-disc states that read 0.847 / 0.999 on this machine before the change too, with identical frames before and after; the committed values were another machine's."
+changes = [
+  ["states/gimard_burning_attack/image", 0.57, 0.569],
+  ["states/sebucus_overworld_resident/image", 0.997, 0.995],
+  ["states/shiny_refactor_gimard_levelup/image", 0.854, 0.847],
+  ["states/shiny_refactor_gimard_plus35/camera", 1.0, 0.999],
+  ["states/terra_party_battle/image", 0.993, 0.992],
+  ["states/zeto_call_wave_mid_cast/image", 0.918, 0.917],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "The overlay now tints with retail's 5-bit modulation (ui_tint). In each of these frames a panel or plate texel that was a grid step bright now reads retail's value exactly (noa_levelup_banner's strip interior (19, 25, 108) -> retail's (16, 24, 107)), and the one block it moves across the threshold holds a glyph or effect that sits at a different pixel than retail's (block (29, 22) went 23.9 -> 24.1 of a 24 limit). The two delilas rows are patched-disc states, a cast effect behind the strip. The same run cut every menu state's error by 2-2.6 (menu_options 2.91 -> 0.33) and raised seven frames."
+changes = [
+  ["states/delilas_gi_spirit_artifact/image", 0.74, 0.738],
+  ["states/delilas_gi_spirit_streaks_v2/image", 0.861, 0.859],
+  ["states/noa_levelup_banner/image", 0.962, 0.961],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "The arts after-image ghosts now stand at retail's ring depth (slot depth * frame_step on the per-vsync cadence, slot 0 the live frame; FUN_80049348 0x80049454..0x800494A0) and turn by the body's live facing in the native host. Both Tail Fire captures draw Gimard's two ghosts in retail too (FT4 packets at (79, 79, 47) and (63, 63, 31) on CLUT 0x7900/0x7901, ring ids 0x11), but the engine's Gimard stands off retail's body (the hit rays run on the engine's own clock), so the ghosts that now trail at retail's depth land a few blocks off retail's. The two delilas rows are patched-disc party-swap states with a cast effect behind the ghosts. The same run raised cort_guilty_cross_mid_cast 0.772 -> 0.838 and battle_melee_hit_spark 0.713 -> 0.720."
+changes = [
+  ["states/battle_gimard_tail_fire_a/image", 0.804, 0.801],
+  ["states/battle_gimard_tail_fire_b/image", 0.805, 0.804],
+  ["states/delilas_gi_spirit_distortion_v3/image", 0.723, 0.718],
+  ["states/delilas_gi_spirit_streaks_v2/image", 0.859, 0.856],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "A monster cast's homing hit now turns its victim onto the caster (FUN_801E09F8, 0x801E1A10..0x801E1A54). Both Tail Fire captures hold the struck Vahn at heading 4068; the engine's read 0 and now reads 4068, with his body pair within six units of retail's. battle_gimard_tail_fire_a rises 0.801 -> 0.808, past its pre-ghost 0.804. In _b the turned body is Vahn on his knockdown (entry 4 from +0x1F1, cursor 68 against retail's 72), and the frame keeps a pose difference the heading does not cause: retail's Vahn stands upright mid-fall where the engine's lies sprawled, so the turn moves which of the fire blob's blocks that body covers. The rest of the full battle set did not move."
+changes = [
+  ["states/battle_gimard_tail_fire_b/image", 0.805, 0.782],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "The port now runs FUN_80047430's in-range back-off (0x80047C3C..0x80047D1C): an attacker inside its reach steps back along its facing every frame of an Attack. Both captures are strike-loop or Done-band frames of a party combo, so the replayed strikes now stand the attacker at the edge of its reach and the hits, knockbacks and the undrift search's winning run land on another timeline. The phase seat (ground_snap) now stands every combatant on its captured ground, which lifts victory's camera to 1.0 and seven other combo frames; what these two frames still read is the replay's clock. rim_elm_gimard_victory shows the engine's Vahn on another keyframe of the Somersault under hit-spark rays drawn on its own rand() stream. noa_levelup_fight_pre's case-8 yaw reads the swing counter ctx[+0x6DA], which the capture holds at 724 and the replay at 644 - 80 frames apart, outside the clock's slack, so no alignment carries it; the old frame's counter sat nearer only because another undrift run won, and its yaw was off too (1245 against 1202, now 1274)."
+changes = [
+  ["states/noa_levelup_fight_pre/camera", 0.981, 0.971],
+  ["states/noa_levelup_fight_pre/image", 0.832, 0.787],
+  ["states/rim_elm_gimard_victory/image", 0.908, 0.841],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "The Auto | Command prompt 0x78 now keeps the member's case-0 close-up: its opening step 0x2A (FUN_801D388C body 0x801D3980) arms no framing, where the port had framed the enemy on case 1. noa_levelup_fight_pre's pad drive passes the prompt on every member's turn, so the replayed rounds reach the Done band on a camera history a step different; its case-8 yaw lands at 1276 against the previous 1274 (retail 1202 - the ctx[+0x6DA] clock gap the previous entry records), while the same run's image rose 0.787 -> 0.790. The rest of the battle set did not move on this change."
+changes = [
+  ["states/noa_levelup_fight_pre/camera", 0.971, 0.97],
+  # The net move against main, stacked on the back-off entry above.
+  ["states/noa_levelup_fight_pre/camera", 0.981, 0.97],
+  ["states/noa_levelup_fight_pre/image", 0.832, 0.79],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "Monster specials now roll on the move-power word FUN_801DD0AC actually reads (the whole +0 halfword, not its >> 2 modulus base), so Tail Fire deals retail's 10..22 instead of 6-7 and draws three stream values where the quartered roll's retry arm drew five. Every later draw moves, and with it the flame's particle realisation. Re-swept all 48 streams under the fixed roll: the best frame is 0xA54FF53A at 0.805 (old pin 0x1F83D9AB now 0.765); the 0.809 was the old stream's luck. The sibling battle_gimard_tail_fire_a rose 0.808 -> 0.818 on the same change."
+changes = [
+  ["states/battle_gimard_tail_fire_b/image", 0.809, 0.805],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "The party separation radius is now the seat stager's 0x280 (0x400 on Terra), and the action seed's formation recentre and melee make-way step are ported, so party members stand at retail's spacing instead of packed together. Frames held mid-swing or mid-summon now replay on a different formation history: battle_melee_hit_spark measured 0.772 before the radius change and 0.747 after it, and the separation pass moving to once a battle frame brought it back to 0.761 (one binary gives one frame every run). The gaza2 park frames sit on patched-disc fights whose seed search picks another RNG stream with the new spacing."
+changes = [
+  ["states/battle_gaza2_park_0x19/image", 0.774, 0.74],
+  ["states/battle_gaza2_park_0x19_summon_melee/camera", 0.895, 0.886],
+  ["states/battle_gaza2_park_0x19_summon_melee/image", 0.685, 0.682],
+  ["states/battle_gaza2_park_0x19_target_vahn/image", 0.836, 0.824],
+  ["states/battle_melee_hit_spark/image", 0.771, 0.761],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "The summon-creature stagers of PROT 0914-0933, Horn's stager and the 0x6F release on the landing pass replace the whole-set seat for these casts, so the mid-cast frames stand their parts on the stager's own records and timing. Final Crisis, Big Wave and theeder rose on the same changes; Mystic Circle and Call Wave each lose a sliver (one image block, a 35-unit eye depth at the captured zoom), traced to the stager seats and not to any later change (identical on every later integration binary)."
+changes = [
+  ["states/cort_mystic_circle_mid_cast/image", 0.986, 0.983],
+  ["states/zeto_call_wave_mid_cast/camera", 1.0, 0.998],
+  ["states/zeto_call_wave_mid_cast/image", 0.961, 0.96],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "The image child now takes a seeded clip cursor back by clip step * frame step per displayed game frame (FUN_800204F8 multiplies the step by DAT_1F800393 at 0x80020660 / 0x80020680) and leaves a one-shot parked on its clamp limit. That lifts nivora_cutscene_delilas_intro 0.973 -> 0.995 and rikuroa_pre_caruban 0.988 -> 1.000; two states each lose one 8x8 block at the tolerance edge on an NPC or prop pose (doman's save-point shell, the dolk2 market actors)."
+changes = [
+  ["states/dolk2_market_noa/image", 0.994, 0.993],
+  ["states/doman_field_card_boot/image", 0.993, 0.992],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "Three patched-disc rows move by 0.001 across the wave 12-13 battle changes (party spacing, the stager seats, the per-frame separation pass): the two Delilas frames show a swapped party model the engine does not draw, and the shiny Gimard camera sits one unit off on the captured zoom. Not traced to a single change; each is one block or one camera unit at the tolerance edge."
+changes = [
+  ["states/delilas_gi_spirit_artifact/image", 0.74, 0.739],
+  ["states/delilas_gi_spirit_distortion_v3/image", 0.718, 0.717],
+  ["states/shiny_refactor_gimard_plus35/camera", 0.999, 0.998],
+]
+
+[[loosening]]
+file = "scripts/ci/port-catalog-baseline.json"
+reason = "Port-tag honesty audit against the disassembly: twelve PORT tags claimed routines the Rust does not implement and are now REF. Seven named a routine only in passing or as a subsumption note (8004695C, 800583C8, 8005842C, 80056798, 8003D344, 80026520, 800266E0, all already on the ignore list); 8003D53C, 80061954, 80062410 and 80068D94 port one arithmetic tail of a CD or libsnd routine the engine replaces; 80058298 (ClearImage) only forwards to a trait no host implements. The four not already ignored joined the ignore list, so the port worklist is unchanged."
+changes = [
+  ["totals/ported", 1026, 1014],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "The battle body pair now averages the playing stream's own part count, as FUN_8004998C does (lbu v1,0x0(s4) then div at 0x8004A3DC..0x8004A42C), instead of every expanded equipment channel; recomputed from retail RAM it reproduces the stored body pairs to the unit for summon invoke, melee and monster reaction clips. The fix lifts freed .954 -> .994, noa_levelup_banner .962 -> .999 and the swordie / meta / mule / nighto close-ups. Three close-ups fall because the old wrong centroid cancelled a cadence-off 2 px lead: with the battle frame cadence on, juggernaut reads 1.000 and gimard_summon_start .998 on the same build. The shiny Gimard precast is the same close-up on a patched disc."
+changes = [
+  ["states/gimard_summon_start/image", 0.989, 0.981],
+  ["states/juggernaut_summon_mid_cast/image", 0.999, 0.981],
+  ["states/shiny_refactor_gimard_precast/image", 0.954, 0.94],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "The strike loop's clip commit now snaps the attacker to its reach in 4-unit steps, re-facing each step (FUN_8004AD80's tail, 0x8004BF7C..0x8004C118, confirmed by a per-frame PCSX-Redux trace of Vahn's 0D 0F 0E string). battle_melee_hit_spark rises .699 -> .765; two Vahn states lose one 8x8 block or one camera unit at the tolerance edge."
+changes = [
+  ["states/battle_vahn_tri_somersault_super/image", 0.931, 0.93],
+  ["states/rim_elm_gimard_seru_capture_before/camera", 0.999, 0.998],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "The blend pass now cuts the semi-transparent foreground (texel * colour / 128) to the GPU's 5-bit precision before it adds to the frame, on both hosts; full precision over-brightened large dim additive layers. It lifts cort_evolved_ultra_charge .921 -> .988, the Megaton Press duel .962 -> .982 and vera .968 -> .985. The casino spotlight cones were already darker than retail and darken further (an existing cone error the fix unmasks, confirmed against the pre-fix binary); the other rows here move one 8x8 block or less on additive sprites at the tolerance edge."
+changes = [
+  ["states/baka_fighter_entry_pretransition/image", 0.976, 0.975],
+  ["states/casino_ticket_counter/image", 0.997, 0.991],
+  ["states/casino_ticket_counter_dialog/image", 0.996, 0.992],
+  ["states/evil_medallion_rage_battle/image", 0.973, 0.971],
+  ["states/minigame_baka_pcsx/image", 0.998, 0.995],
+  ["states/minigame_dance_pcsx/image", 0.835, 0.834],
+  ["states/nivora_duel_mid_blazing_slash/image", 0.997, 0.996],
+  ["states/rugi_field_card_boot/image", 0.993, 0.992],
+  ["states/s5_tetsu_battle/image", 0.996, 0.994],
+  ["states/v0_1_battle_command_menu/image", 0.978, 0.976],
+  ["states/v0_1_battle_command_submenu/image", 1.0, 0.999],
+  ["states/zora_glare_petrify_post/image", 0.996, 0.995],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "The battle action SM now runs once per battle frame by default (retail's VSync(2) cadence, FUN_801E295C). Over the battle corpus the flip nets image +.265 / -.065 (theeder .880 -> .994, juggernaut 1.000, Burning Attack .817 -> .846). Three summon close-ups trail their target by up to four camera units at the capture tick because the cast replay's pass grid sits half a pass off retail's there."
+changes = [
+  ["states/cort_mystic_shield_mid_cast/camera", 0.993, 0.991],
+  ["states/horn_summon_mid_cast/camera", 1.0, 0.996],
+  ["states/jedo_summon_mid_cast/camera", 1.0, 0.997],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "Patched-disc rows (our own mods, not retail ground truth) under the battle frame cadence and the 5-bit blend: the two Gaza park frames end their fight before the image child reaches the captured phase on the cadence's pass grid, and the shiny Gimard frames carry a recoloured Seru the blend change shifts. Kept as mod regression checks, not engine defects."
+changes = [
+  ["states/battle_gaza2_park_0x19/image", 0.74, "absent"],
+  ["states/battle_gaza2_park_0x19_target_vahn/image", 0.824, "absent"],
+  ["states/shiny_refactor_gimard_levelup/camera", 0.987, 0.984],
+  ["states/shiny_refactor_gimard_levelup/image", 0.847, 0.842],
+  ["states/shiny_refactor_gimard_plus35/image", 0.948, 0.921],
+]
+
+[[loosening]]
+file = "scripts/ci/retail-compare-baseline.json"
+reason = "Three one-thousandth drops that hold on every pinned and unpinned stream since the summon-cast fixes (part-pool flush, reaction-commit rate decay, per-vsync module-shot steps): retail's own frame for these close-ups sits within one camera unit of the replay, and the residual is the half-pass the cast replay's pass grid sits off retail there, not a new divergence."
+changes = [
+  ["states/cort_mystic_shield_mid_cast/image", 0.994, 0.993],
+  ["states/horn_summon_mid_cast/camera", 0.996, 0.995],
+  ["states/nivora_duel_pre_megaton_press/image", 0.969, 0.968],
+]

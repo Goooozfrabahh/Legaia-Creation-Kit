@@ -1,0 +1,171 @@
+# Key functions: world map
+
+Part of the [key function directory](../functions.md) - the conventions for reading these tables (bare hex = function entry, `0x`-prefixed = data / instruction, overlay-VA caveats) are on the [index page](../functions.md#how-to-use-this-page).
+
+## World map
+
+Two overlay variants: normal-walk (`overlay_world_map`) and top-view debug (`overlay_world_map_top`).
+Both live at `0x801C0000+`. Full architecture in `docs/subsystems/world-map.md`.
+
+| Address | Role |
+|---|---|
+| `801DA390` (row on [`runtime-libs.md`](runtime-libs.md)) | The camera **vertical-offset** ease this overlay's camera path uses - `_DAT_8007BCAC` toward `cam[+0x4A] - player[+0x16]`. Listed here because it was read as a camera *yaw* for as long as the world-map camera work cited it; `+0x16` is the player's Y. |
+| `FUN_801E76D4` (world_map overlay) | World map controller. Handles the debug top-view toggle (combo: `_DAT_8007B98C != 0` + `pad 0x4A` + `held 0x40`), flips `DAT_801F2B94` (view flag at offset past 192 KB window), captures camera origin into `_DAT_801F35A8/AA/AC`. In top-view mode processes D-pad input into `_DAT_80089120/_18` (XZ scroll) and `_DAT_8007B794`/`_6F4` (azimuth/zoom). Normal-walk path ticks field VM + actor + motion VM. |
+| `FUN_801EA9B0` (field overlay 0897, `0x801EA9B0..0x801EAD98`) | **Dev-menu confirm half** - the sibling directly below the renderer, running a row's action once the player commits. Its `BGM CALL` arm is the fourth disc-wide writer of the BGM request global `_DAT_8007BAC8`: it indexes the sound-test table `0x801F2E94` (10-byte stride, `[i16 global bgm id][8-byte label]`) by the cursor `_DAT_801F2E90` and installs the row's id; the `-1` row (`OFF`) raises `_DAT_8007B438` instead. The row index is **not** the id - the 71 rows carry `2000..=2043` then `2045..=2071`. [details](../../subsystems/world-map.md#fun_801ea9b0---dev-menu-row-action-dispatcher-1000-bytes). |
+| `FUN_801CE850` (PROT 0981, the map display image) | **Map display tick** (game mode `0x0D`, called by `FUN_80025F2C`). `sltiu a0, 6` on the mode word `0x801CF76C`, six-word table at `0x801CE838` - all six are `jr $v0` arms inside this one 3164-byte body, so the corpus' `0x801CE9C4` extent is an arm, not an entry. The arms stage the survey camera, fade in, and fade back out; mode `0x32` is past the table and runs the interactive tail alone - pad pan, place stepping, the mini-map panel and the place-label pass (`0x801CF368..0x801CF438`). Port `legaia_engine_field::map_display::MapDisplay::tick`; [details](../../subsystems/world-map.md#the-map-display---prot-0981). `see ghidra/scripts/funcs/overlay_monster_test_0981_801ce850.txt`. |
+| `FUN_801CF4AC` (PROT 0981) | **Map display enter / reset** (called by the mode-12 handler `FUN_80025DA0`). Zeroes the mode word, sets the record cursor `0x801CF77C` and its neighbour to `-1`, snapshots the live world-map state (`0x800840B8` quad, scroll trio `0x8007B790`, camera pair `0x80089118`, projection `0x8007B6F4`, four scratchpad bytes) into the image's own zeroed block `0x801CF70C..0x801CF790`, and sets the game-mode word `0x8007B83C = 0x0D`. Port `MapDisplay::enter`. |
+| `FUN_801CF5E8` (PROT 0981) | **Location-record stepper.** Walks the `DAT_80073EE0` table (count byte at `[0]`, `0x20` stride) backward (`a0 != 0`, wrapping from below zero to the last record) or forward (running off the end parks it on `-1`) until a record's `region` matches `uRam8007b970`, and stores the index back to `0x801CF77C`. It does not read the discovery flag. Port `map_display::step_cursor`. |
+| `FUN_801CF678` (PROT 0981) | **Map display camera clamp.** Bounds `_DAT_80089118` to `[-0x3380, -0xD00]` and `_DAT_80089120` to `[-0x3580, -0xC00]`. Port `map_display::clamp_camera`. |
+| `FUN_801EAD98` (world_map overlay) | World map developer menu renderer (display-only - the tools it fronts live in field overlay 0897, rows below). Scrollable 24-entry list incl. MAP_CHANGE / CARD_OPTION / PLAYER_STATUS / CAMERA / ENCOUNT / OTHER_SETTINGS / BGM_CALL / DEBUG / EVENT FLAG / PLAY POS / GET ITEM. Its row-string table at `0x801CF344` is **PROT 0897 data**, file offset `0xB2C`, formed by the `lui`/`addiu` pairs at `0x801EAE44` / `0x801EAE48` and `0x801EB320` / `0x801EB324` inside this body. `_DAT_8007B868` gates MAP_CHANGE and CARD_OPTION to "CLOSED". Row model + digit formatter ported at `legaia_engine_dev_menu::dev_menu_leaves`; draws stay render-side. |
+| `FUN_801EE094` (field overlay 0897, file `+0x1F87C`) | **Riremito travel art** (handler id `0x29`, `"ON RIREMITO,"`) - what the Door of Light runs. Scans the resident CDNAME define table (`0x80088758`, count `_DAT_8007B806`) for the TOC index `_DAT_80084628`, loads it via `FUN_8001FD44` and seats the player from `_DAT_80084624` / `_DAT_8008462C`; a miss prints `"UNFIND MAP NUMBER %d"`. Sibling `FUN_801EE328` (`+0x1FB10`, handler `0x2B`) = Rula, the Door of Wind's rise-up variant. Both clear the pad hold `_DAT_8007B6B4` and spawn a fade that holds black. The developer menu reaches them too. [details ↓](#fun_801ee094--fun_801ee328) |
+| `FUN_801DBD04` (field overlay 0897, file `+0xD4EC`) | **Dev-menu EVENT FLAG editor.** Pad-driven cursor `DAT_801f2aa0` over flag ids `0..0xFFF` (steps +/-1 / +/-8 / +/-0x80); appliers at `0x801EA4F8` (CLEAR) / `0x801EA52C` (SET) poke the flag at the cursor through `FUN_8003CE08`-class calls - the debug path that can set ANY story flag incl. the spine gates. Also carries the register-pointer nibble editor the FMV corpus states were produced with. |
+| `FUN_801EF014` (field overlay 0897, file `+0x207FC`) | **Flag-window picker widget.** Descriptor via `_DAT_8007B450` (op-`0x49`-installed MAN operands: `+1` count, `+2` default = **first visible row**, `+3` rows = **visible row count**, `+4..5` u16 base flag). State 0 cursors to the set bit in `[base, base+count)` (fallback `default`), remembers it as the current row, clears the window; confirm on a **different** row sets `base + selection` - the remembered row or cancel sets nothing (the caller's ladder falls through). Disc usage: the only genuine family is kor/kor3/kor4 sub-4 `base=0x138 count=8` - the Uru Mais warp-pad memory ([details](../re-settled-threads/battle.md#kor-family-op-0x49-flag-window-0x1380x13f---uru-mais-warp-pad-picker)); no window holds a spine flag. |
+| `FUN_801F159C` (field overlay 0897) | **Subsystem actor handler** - the actor op `0x49` and the menu button spawn. Installer `FUN_801F1278` sets `+0x50` to `7` or to `byte_map_0x801F33A4[sub-op]`; this routine then `jalr`s (`0x801F1634`) the 52-entry id table `0x801F33B4` (0897 file `+0x24B9C`) by value: `7` = state pick `FUN_801F1F4C`, `0x30` = pause-menu session `FUN_801ED308`, `0x23` = flag-window picker `FUN_801EF014`, `0x24` = tile-board walk SM `801EF2B0`, `0x25` = `FUN_801F0ADC` (flag id from descriptor `+2`), `0x29` / `0x2B` = the Riremito / Rula travel arts, `0x1A` = `FUN_801F20B0` (picker hand-off). Because the ids are reached by value, no word or `lui`/`addiu` pair anywhere on the disc references a slot. |
+| `FUN_801D2EBC` (field overlay 0897, file `+0x46A4`) | **Timed-flag scheduler consumer** (installer = field-VM op `0x4C 0xD3`, see [`script-vm-menuctrl.md`](../../subsystems/script-vm-menuctrl.md)): per tick decrements the `_DAT_800845B8` counter by the clock delta; on expiry `FUN_8003CE08(hi16 & 0xFFF)` + disarm; below threshold `FUN_8003CE08(lo16 & 0xFFF)`. Retail use: `chitei2` escape timer (flag `0x4C7`). Port `legaia_engine_field::escape_timer`, drained per frame by `World::tick_escape_timer`. |
+| `FUN_801ECA08` (world_map overlay) | World map panel sizer. Computes panel height `= (row_end - row_start + 1) * 8`, centres in 208 px. 6-way dispatch on `ctx[+0x54]`; cases 1 + 3 delegate to `FUN_801EAD98`. Sizing + swap-wrap cursor + phase×gate draw gate ported at `legaia_engine_dev_menu::dev_menu_leaves` (`panel_geometry`, `cursor_step`, `list_body_draws`). |
+| `FUN_801EE90C` (world_map overlay) | World map text-box dispatcher. 15-entry JT on `ctx[+0x54]`; out-of-range path calls `FUN_80031D00` (text-actor tick) when `ctx[+0x54] < 10`. |
+| `FUN_801CFC40` (world_map_top only) | World map sprite batcher (top-view). Writes `actor[+0x14/16/18]` into GPU coord registers `0x1F800020/22/24`, iterates sprite list at `DAT_801C93C8`. Delegates to `FUN_801CF9F4` when `_DAT_8007B6B8 == 0x20`. |
+| `FUN_801DA51C` (world_map overlay) | World map entity tick. 5-state SM on `entity[+0x8A]` (JT `0x801CEC28`); at state 0 calls `FUN_800243F0` (BGM/scene resolver) and checks `_DAT_8007BB38` pad for interaction. Also the **value writer** of the slot-B stage selector `_DAT_8007B64A`: clear at `0x801DA69C` (in a `jal` delay slot), `1` at `0x801DA6A8` when system flag `0x19` is set, which pages the battle-tutorial image. |
+| `FUN_801D9E1C` (world_map overlay) | World-map encounter handler - [details ↓](#fun_801d9e1c-world_map-overlay) |
+| `FUN_801ED308` (field/world 0897 band) | **Pause-menu session** (subsystem handler `0x30`, reached from default id `7` through `FUN_801F1F4C`) - not a brightness fade/flash. 8-phase jump table `0x801CF4FC` on `+0x54`: ramps `_DAT_8007B440` (clamped `0xF2`, applied via `FUN_8003479C`), spawns the menu through `FUN_801D841C`, parks on the exit code `_DAT_8007B43C`. Phase 4 stores `code - 1`; phase 5 is the ordinary close; phases 6 / 7 install `0x29` Riremito / `0x2B` Rula (Door of Light / Door of Wind, Use screens `FUN_801D8A58` / `FUN_801D8B90`, codes 4 / 5 plus `3` on close). Engine `World::tick_pause_session`. `see ghidra/scripts/funcs/801ed308.txt`. |
+| `FUN_801ED590` (field/world 0897 band) | **Sub-list open/close SM.** Actor-handler body, 4-state on `+0x54`. State 0 halves the live audio level `_DAT_8007b910` - a menu duck, not a screen dim ([battle-action.md](../../subsystems/battle-action.md#the-_dat_8007b910-ramps-are-an-audio-duck)) - and draws the window (`FUN_801e9b3c(0x801f3274)`); state 1 polls a two-option cursor (`FUN_801e9dc8(&_DAT_8007bb88)`, confirm SFX `0x20`) while unlocked (`_DAT_8007bb80 == 0`); states 2/3 restore by doubling `_DAT_8007b910`, redraw (`0x801f3284`), write the scene struct `DAT_801c6ea4 +0x2e/+0x40`, and hand off (`FUN_801d84b4` / `FUN_800266e0`). Always ticks the text-actor list (`FUN_80031d00`). `see ghidra/scripts/funcs/801ed590.txt`. |
+| `FUN_801EDF00` (field/world 0897 band) | **Return-to-title / soft-reset SM.** Actor-handler body, 4-state on `+0x54`, animating a counter `_DAT_801f35b8` through `FUN_801ed710`. State 1 ramps the counter down to `0xe` and, on a pad edge (`_DAT_8007b850 & 0x9f0`), fires a `0x78`-frame white fade (`FUN_801d58f0`); state 2 ramps up by `DAT_1f800393` and on reaching `0x78` reloads the boot executable by name (`FUN_80017714` on the `SCUS_942.54` string) - a full soft reset. `see ghidra/scripts/funcs/801edf00.txt`. |
+| `FUN_801EE5D4` (field/world 0897 band) | **Screen-fill fade transition SM.** Actor-handler body, 5-case jump table on `+0x54`. Posts full-screen fill-rect primitives via `FUN_80024e80`, saves/restores the RGB tint triple, spawns a sub-actor (`FUN_80020de0(0x800706bc, _DAT_8007c34c)`) and sets scene-struct bit `0x80000` and `+0x2e/+0x40`. **Not** the place-name banner: its panel script `0x801F32B4` only closes every panel, and it copies `_DAT_801C6EA0` into `_DAT_8007B44C`, which only the save screen reads ([place-names.md](../../formats/place-names.md#the-latch-is-the-save-screens-not-the-banners)). `see ghidra/scripts/funcs/801ee5d4.txt`. |
+| `FUN_801EED58` (field/world 0897 band) | **Symbol-code entry puzzle SM** Actor-handler body, 5-case on `+0x54`. State 1 reads new-press **face-button** bits out of `_DAT_8007b874` (`0x20/0x40/0x80/0x10` -> symbol `1/0/2/3`; the d-pad occupies `0x1000..0x8000` in that packed byte, so the code is entered with the face buttons, not the directions) and writes one symbol per position into a 5-byte buffer at `DAT_801c6ea4 + _DAT_8007bb88 + 0x54` (index `_DAT_8007bb88` 0..4, SFX `0x36` each). State 3 compares the five entered bytes (`+0x54..+0x58`) against the target code in the descriptor `_DAT_8007b450 + 1..+5`: a full match plays success SFX `0x25` (`FUN_8003ce08(9)`), otherwise failure SFX `0x23` (`FUN_8003ce34(9)`). `see ghidra/scripts/funcs/801eed58.txt`. |
+
+### `FUN_801EE094` / `FUN_801EE328`
+
+The define table's records are `0x10` bytes, a scene name with an `s16` define
+number at `+0xC` (read by `FUN_8003CE9C`); `FUN_80019788` returns its base.
+Riremito seats the player at `_DAT_80084624` / `_DAT_8008462C` `* 0x80 + 0x40`.
+For the Door of Light that triple is the region record's, refreshed by
+`FUN_801F1278` (`0x801F12F8`, a `FUN_801D9E1C(player, 0)` call) when the menu
+button is pressed - not the tile the party last stood on; the Door of Wind's
+Use screen stages it from `0x80073A98`. The fade is a kind-2, `0x20`-frame,
+hold `-1` template passed to `FUN_80024E80(t, 1)` (Riremito
+`0x801EE160..0x801EE1A0`, Rula `0x801EE470..0x801EE4B0`); Riremito clears
+`_DAT_8007B6B4` at `0x801EE168`. With the EVENT FLAG editor these explain the
+debug menu's "jump to beat" behaviour - no per-FMV event table exists. See
+[field-locomotion.md](../../subsystems/field-locomotion.md#provenance-and-why-the-old-reading-was-wrong)
+and the captured timeline in
+[field-locomotion.md](../../subsystems/field-locomotion.md#a-door-use-captured).
+`see ghidra/scripts/funcs/801ee094.txt`.
+
+### World-map render pipeline
+
+The render chain that gets the POLY_FT4 batch from the per-frame SCUS dispatch into the overlay-resident emitter. Walked end-to-end in [`docs/subsystems/world-map.md`](../../subsystems/world-map.md#render-pipeline). The SCUS dispatcher entries `FUN_80025EEC` and `FUN_80025F2C` are documented under [Game-mode state machine](game-modes.md#game-mode-state-machine); both route through the per-frame render tick below.
+
+| Address | Role |
+|---|---|
+| `FUN_80016444` (SCUS, 1352 bytes) | Per-frame world-map render tick reached via `FUN_80025EEC(1)` (default per-mode handler) or `FUN_80025F2C(0)` (Mode 13 MAPDSIP handler). Reads `_DAT_8007BC3C`; if `== 2` performs a direct `jal 0x801D7EA0` (PC `0x80016764`) into the overlay-resident POLY_FT4 emitter. |
+| `FUN_801D7EA0` (world_map overlay, 832 bytes) | Parametric POLY_FT4 emitter - [details ↓](#fun_801d7ea0-world_map-overlay-832-bytes) |
+| `FUN_801D8258` (world_map overlay, 40 bytes) | Gate-arm trigger. Writes `_DAT_801F351C = 1`, then `_DAT_801F3520/3524/3528 = param_2/3/4` (scale / step / OT-layer for the next emission). |
+| `FUN_801D1344` (**world_map overlay**, 1332 bytes) | The field overlay's **player actor tick** ([`asset-loading.md`](asset-loading.md#801d1344)), not a world-map-only routine: the `world_map`, `dialog` and `cutscene_dialogue` dumps at this VA are one routine of PROT 0897, which carries the world map as a subsystem - same extent, same calls (`jal 0x801D8258` at `0x801D1470`, the three `_DAT_8007BCD0/_D4/_D8` words its argument; `jal 0x8001FD44` at `0x801D15B0`; `jal 0x801D01B0` at `0x801D16F4`). An older row read them as different code per overlay. Sub-helpers under [Dialog-overlay actor-frame helpers](renderer.md#dialog-overlay-actor-frame-helpers). |
+| `0x801C2B2C` (phantom VA) | **Not a second copy of anything.** `FUN_801D1344` printed `0xE818` low: all 296 instructions of `overlay_0897_xxx_dat_801c2b2c.txt` match by VA `+0xE818` against the base-correct `overlay_cutscene_dialogue_801d1344.txt` / `overlay_world_map_801d1344.txt`, and its `jal 0x801D8258` at printed PC `0x801C2C58` is the same call `FUN_801D1344` makes at `0x801D1470`. There is no "relocation copy" - PSX overlays are not relocated. |
+| `0x801C9688` (phantom VA) | **Not a field-mode copy of the horizon emitter.** `FUN_801D7EA0` printed `0xE818` low: all 208 instructions match by VA `+0xE818` against `overlay_world_map_801d7ea0.txt`, operands included. "Same 224-band loop, same four packets per band, same trig-warped extents" is what one function looks like when it is compared with itself. See [`overlay-va-aliases.md`](../overlay-va-aliases.md) and `FUN_801D7EA0` above. |
+| `801F7644`..`801F8690` (PROT 0901) | **World-map per-prim draw leaves**, eight of them - the band `0x801F7644..0x801F8968`, split leaf by leaf below. Frameless, no `jr ra`; each tail-jumps into the SCUS emitter `0x80043580`. Selected through the overlay-mode handler table **based at `0x801F8968`** (slots `12..19`). |
+| `801F89B8` (PROT 0901, 1284 bytes) | The band's ninth routine, and a different shape: same frameless style, four local `j`s to its own tail at `0x801F8E54`, returning through the `jr ra` at `0x801F8EB4`. It is the **bulk terrain-cell emitter** - a hand-written GTE loop over the camera's visible-tile window that draws one textured quad per map cell - and it is `jal`'d from `0x801F733C` in this same image. Each cell links at ordering-table bucket `(max corner SZ >> 5) + 14` off `*0x1F8003F4` (`0x801F8DC8..0x801F8E20`), near-clips on `SZ1 < 0x40`, depth-cues its colour with `IR0 = max(SZ1 - 0x5000, 0) >> 3` (`dpcs` at `0x801F8DB0`), and tests no `0x1000` cell bit. [Detail](#801f89b8-draws-terrain-cells). `overlay_world_map_render_0901_801f89b8.txt`. |
+| `0x801F8968` (PROT 0901) | **Overlay-mode handler table**, twenty words indexed by the same per-prim kind the SCUS table uses - [details ↓](#the-overlay-mode-handler-table-is-based-at-0x801f8968). Slots `0..7` are zero, `8..11` are the SCUS emitters `0x8004409C` / `0x8004423C` / `0x80044434` / `0x800445B0`, and `12..19` are the eight leaves in the order `7644`, `7838`, `7F78`, `8198`, `7AA4`, `7CCC`, `8454`, `8690`. |
+| `80044798` (SCUS) | **Cluster-A primitive off-screen reject test.** Shared helper `jal`'d by the per-prim handlers in the `0x80043390` dispatcher band after RTPT projection. Reads the three projected screen-XY GTE FIFO regs `SXY0/SXY1/SXY2` (cop2 `0x6000/0x6800/0x7000`, sign-extended `>>16`) plus a fourth coord pre-loaded in `s3`; returns `1` in `s3` only when all four corners lie past one edge of the 320x240 frame, else `0`: a quad straddling an edge is kept ([details](../../subsystems/renderer.md#per-prim-dispatch-table-fun_80043390)). Callers (`FUN_800445B0`, `FUN_80044C14`, …) skip the GP0 emit when it returns nonzero. (Ghidra's decompiled C drops the `s3` return - read the disassembly.) `see ghidra/scripts/funcs/80044798.txt`. |
+| `80044C14` (SCUS) | **Cluster-A kind-16 `POLY_G4` (gouraud quad) handler** (bank-1/2 variant; `0x80043390` band, cmd stride `0x14`, GP0 stride `0x20` = 7-word packet). Per command word reads two packed vertex indices (low `& 0x7FF8`, high `>>0x10`) into the `param_3` vertex pool, runs RTPT (cop2 `0x280030`), backface-tests SZ vs `in_t2-0x2D8`, derives a fog/depth value, `jal`s `FUN_80044798` for the off-screen reject, then emits the GP0 packet at the pool cursor and advances it `0x20`; the tail dispatches the next command through the shared `0x80043614` handler table. See [`formats/world-map-overlay.md`](../../formats/world-map-overlay.md) kind-16 row. `see ghidra/scripts/funcs/80044c14.txt`. |
+| `80045BB4` (SCUS) | **Cluster-A kind-19 quad handler, subtractive bank (bank 3)** - the last arm of the per-prim dispatch table and the only one that had never been dumped. Frameless, 1272 bytes: it opens by materialising four packed `(u, v)` texture-page words into the `t2`-relative scratch window at `-0x2B4..-0x2A8`, runs the same RTPT / backface / `jal FUN_80044798` reject as its sibling banks, and ends in `j 0x80045E54` rather than `jr ra` - which is why the gap census reads its middle as two interior runs. Its address is the twelfth and last word of the **bank-3 handler table at `0x8007668C`** (kinds 8..19), whose other eleven slots are `0x8004409C`..`0x800453BC`; that table is what makes it reachable, since no `jal` names it. `see ghidra/scripts/funcs/80045bb4.txt`. |
+
+## Function details
+
+### The overlay-mode handler table is based at `0x801F8968`
+
+`FUN_80043390` forms the table pointer with `lui s4,0x8020` /
+`addiu s4,s4,-0x7698` at `0x800435F4..0x800435F8` - that is `0x801F8968`, and it
+adds the *same* index it would have added to the SCUS table: `s5 = (s7 >> 0x11)
+<< 2`, i.e. the group header's `flags >> 1` word index times four. The SCUS row
+`0x8007657C` has the identical shape - words `0..7` zero, `8..11` the four
+shared emitters, `12..19` the per-bank leaves - so a kind-12 prim reads word 12
+of whichever base is selected and both tables answer.
+
+Naming the first **non-zero** word (`0x801F8988`) as "the table" therefore
+re-bases the index by eight and contradicts the instruction that loads it. The
+only real difference between the two paths is the alpha-bank offset: the SCUS
+arm adds `s2` (`lw s2,-0x2EC(t2)`) to the base at `0x800435E4` and the overlay
+arm does not, which is why the overlay variant decodes as one row of twenty and
+the SCUS variant as twenty slots per alpha bank.
+
+### The PROT 0901 draw-leaf band, split
+
+`0x801F7644..0x801F8968` is a **tail-call family**, not one routine. It carries
+no `addiu sp, sp, -N` prologue and not one `jr ra`; every leaf finishes with
+`j 0x80043580`, the SCUS packet emitter, and the next leaf starts at that
+jump's delay slot plus four. Twenty `j` sites sit in the band and only eight of
+them leave it - the other twelve are each leaf's own forward branch to its
+tail - so cutting at every `j` over-splits by nine, and neither the frame
+partition nor a cut-at-`jr ra` walk cuts it at all. The out-of-band `j` is the
+boundary, and `scripts/ghidra-analysis/split-tail-call-band.py` reads it off the
+image.
+
+| Leaf | Bytes | `jal 0x80044798` |
+|---|---:|---:|
+| `801F7644` | 500 | 0 |
+| `801F7838` | 620 | 0 |
+| `801F7AA4` | 552 | 1 |
+| `801F7CCC` | 684 | 1 |
+| `801F7F78` | 544 | 1 |
+| `801F8198` | 700 | 1 |
+| `801F8454` | 572 | 1 |
+| `801F8690` | 728 | 1 |
+
+Dumps are `overlay_world_map_render_0901_<addr>.txt`, one per leaf, from PROT
+0901's own image at its own base. The pre-existing `overlay_world_map_top_ext_*`
+dumps print the same eight addresses out of a RAM capture; byte attribution
+places them in this image, which is what the leaf table above is checked
+against.
+
+
+Full write-ups for the rows above whose detail outgrew a table cell. Linked from each section table by **[details ↓]**.
+
+### `FUN_801D9E1C` (world_map overlay)
+
+World-map encounter handler. 349 instructions / 1396 bytes. `(entity_ptr, resolver_result)`. Invoked from `FUN_801DA51C` state-0 when the encounter countdown drains and the per-entity gate is open. Early-outs when the encounter-records table head `**(char**)(DAT_801c6ea4 + 0x20)` is empty or when `_DAT_1f800394 & 0x8000` (dialog-active flag) is set. Otherwise resyncs `entity[+0x8e..+0x8f]` against the player's tile coords at `_DAT_8007c364 + 0x14/+0x18` and gates on the player being within `±1` tile of the prior cached position. On match, walks the encounter-records table at `(DAT_801c6ea4 + 0x20/+0x24/+0x28)` using stride `*(byte*)(DAT_801c6ea4 + 0x5e)` and `func_0x8003CE9C` to decode each record's BGM/scene id; per-record `func_0x8003CE64()` gates the fight trigger.
+
+Maps to [`WorldMapEntityHost::on_encounter`] in `crates/engine-field/src/world_map_entity.rs`.
+
+With `a1 = 0` it is the **region re-read** that field op `0x3E`'s scripted-battle arm runs (`jal` at `0x801E0710`): it re-derives the player's region and re-seats its battle setup - `_DAT_8007BD60 = region[+8] & 0x1F`, scratchpad `0x1F800394 |= 0x300000`, and on the `ctrl[+0x5F] >= 0xC` layout `_DAT_8007B64B` and the `0x800845xx` triple from `region[+9..+11]` - then returns at `beqz fp` (`0x801DA16C`) before the step roll. The roll itself is an inlined copy of `FUN_801DDF48` (`0x801DA2D4..0x801DA35C`) storing `_DAT_8007B5FC`. The port models neither half of the region re-read.
+
+### `FUN_801D7EA0` (world_map overlay, 832 bytes)
+
+Parametric POLY_FT4 emitter. Gated by one-shot self-clearing flag `_DAT_801F351C`. 224-iter outer loop emitting 2× POLY_FT4 (literal `0x2C808080` GP0 cmd, chain tag `0x9000000`) + 1 small prim (chain tag `0x3000000`) per iter using cos-rotation projection from the LUT at `0x8007B81C`. ~670 prims per call. Horizon / sky / animated background. The bulk continent (~4300 POLY_FT4 prims per kingdom) is **not** emitted here - it flows through ordinary case-5 TMD rendering via `FUN_80043390`'s overlay-mode dispatch table at `0x801F8968` (eight per-prim fog-enabled leaves at `0x801F7644..0x801F8690`, each a SCUS-side sibling body plus a GTE `dpcs`/`dpct` distance-cue post-process).
+
+See [world-map subsystem § bulk continent terrain emit mechanism (pinned)](../../subsystems/world-map.md#top-view-bulk-terrain-render-path-overlay-replaced-per-prim-renderers).
+
+### `801F89B8` draws terrain cells
+
+The ninth routine of the draw band is not a per-prim leaf like its eight
+neighbours. It is a nested loop that emits the ground itself, and every input
+it reads is a documented one, which is what makes it identifiable without a
+caller-side trace.
+
+**Extents.** It reads the four signed bytes at scratchpad `0x1F8003E8..EB` -
+the camera's visible tile window, primed per scene by `FUN_801DE37C` and
+overwritten by field-VM op `0x46` - and takes `max - min` on each axis as its
+two loop counts (`0x801F89FC..0x801F8A28`). The window is therefore not a fog
+or culling hint: it is literally how many cells get drawn.
+
+**Height.** Per cell corner it reads a byte from the map's `+0x4000`
+floor-nibble grid at `*(0x1F8003EC) + 0x4000 + z*0x80 + x`, masks the low
+nibble, and indexes the 16-entry halfword LUT at scratchpad `0x1F80035C` -
+the LUT the fishing bring-up seeds with `-0x20 * n`. Corners `(x, z)` and
+`(x, z+1)` open each column strip and `+0x1` / `+0x81` close it, so adjacent
+cells share corner heights and the surface is continuous.
+
+**Texture.** The cell's `u16` at `+0x8000` masks to `& 0x1FF` and indexes a
+`0x20`-byte object record; the record's `+0x14` word supplies all three
+texture selectors at once - tile id `& 0x3F` (`u = (id % 8) * 32`,
+`v = (id / 8) * 32`), `tpage` `(w >> 8) & 0x1F`, and the CLUT in the high
+half. That is the terrain-type-keyed multi-page atlas
+[`field-map.md`](../../formats/field-map.md) describes, read here off the
+consumer rather than off the data.
+
+**Rejection.** Four corners through `RTPT`, an off-screen test against the
+`0xF0` / `0x140` framebuffer window, `NCLIP` for backfacing, and a `0x28`-byte
+packet linked into the OT. The engine covers all of it with
+`legaia_scene_formats::field_objects::build_walk_heightfield` plus
+`Placement::world_y` and its own wgpu renderer, so the row sits in
+`[prim_builder]` in `scripts/ci/port-catalog-ignore.toml`.

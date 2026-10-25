@@ -1,0 +1,1003 @@
+//! `LegaiaArts` WASM bindings for site/arts.html - the interactive Tactical
+//! Arts viewer: click an art, watch the character perform it.
+//!
+//! The load path is the retail battle loader's own asset chain, the same one
+//! the play-window's `--player-battle` drives natively:
+//!
+//! * **mesh** - assembled per character from the player battle file's
+//!   equipment-id sections (extraction PROT `863 + char`,
+//!   `legaia_actor_formats::battle_char_assembly::assemble_character`), relocated into
+//!   runtime VRAM band 0 (`relocate_tsb_cba`, the `FUN_800513F0`
+//!   registration-time TSB/CBA pass);
+//! * **texture** - the equipped sections' texture pools + record[0] image
+//!   blocks at the pinned `FUN_80052FA0` placement
+//!   (`character_texture_uploads`), with the character's decoded battle
+//!   palette overlaid on the CLUT rows the mesh samples
+//!   (`legaia_actor_formats::battle_char_palette`);
+//! * **idle** - the character's own record[0] action-slot-0 keyframe stream
+//!   (`idle_battle_animation`), the loop retail holds between commands;
+//! * **arts** - the art-animation bank at record[0] `+0x58`
+//!   (`art_animation_bank`), each record's keyframe stream resolved through
+//!   the character's `readef.DAT` `"ME"` archive (PROT 894, slots
+//!   `3*char + 1` / `3*char + 2` - `art_me_archive` / `art_animation`,
+//!   the `FUN_8004AD80` staged-anim materialization).
+//!
+//! Every animation is pre-expanded per assembled TMD object
+//! (`expand_animation_for_objects` over the assembly's `anm_bones`), so the
+//! JS pose loop can apply channel `i` to object `i` directly - the same flat
+//! `[tx, ty, tz, rx, ry, rz]` per (frame, part) layout the monsters page
+//! consumes. Everything decodes from the visitor's own disc in the browser;
+//! no Sony bytes ship with the site.
+
+use super::*;
+
+use legaia_actor_formats::battle_char_assembly as bca;
+use legaia_actor_formats::monster_archive::MonsterAnimation;
+use legaia_art::arts_voice::ArtsVoiceTable;
+use legaia_art::hyper_fanfare;
+
+/// Log a decode degradation. Browser console on wasm; stderr natively (the
+/// disc-gated tests drive this module natively).
+fn arts_log(s: &str) {
+    #[cfg(target_arch = "wasm32")]
+    console_log(s);
+    #[cfg(not(target_arch = "wasm32"))]
+    eprintln!("{s}");
+}
+
+/// Player battle files (`data\battle\PLAYER1..4`) start at extraction PROT
+/// entry 863 (Vahn), one per character slot.
+const PLAYER_FILE_BASE: u32 = 863;
+/// The Tactical-Arts VOICE banks - the per-character arts **shout** files, as
+/// selected by the retail arts-voice cue `FUN_8004C140` (the RE'd linkage, not
+/// a guess): when the staged-anim materialiser runs a party art, it fires
+/// `FUN_8003D53C(clip_slot = (char)*2 + 1, channel, dur)`, and clip slot `i` =
+/// file `XA<i+1>.XA`. So Vahn = `XA2.XA` (slot 1), Noa = `XA4.XA` (slot 3),
+/// Gala = `XA6.XA` (slot 5) - all 16-channel short-mono shout banks; Terra has
+/// no arts. Capture-verified live: Vahn's Tri-Somersault fires
+/// `FUN_8003D53C(0x01=XA2, ...)`, Noa's Miracle fires `(0x03=XA4, ...)`.
+///
+/// The per-art **channel** is not fixed: retail picks a random member of the
+/// art's candidate pool (keyed by the art's action constant) from the SCUS
+/// tables parsed by [`legaia_art::arts_voice`]. This page plays the
+/// **capture-witnessed** channel where one is pinned
+/// (`arts_voice::CAPTURED_ART_CHANNELS` - live recomp-runtime battle fires
+/// captured off the `FUN_8003D53C` cue globals), and a stable member of the
+/// art's decoded pool otherwise - both via `ArtsVoiceTable::pick_channel`.
+/// `XA30.XA` is the ordinary directional-attack grunt (different cue).
+///
+/// A **Hyper** art has no pool row at all (its action constant sits below the
+/// range table's `lo`): retail plays the character's stereo **fanfare** bank
+/// instead - `XA1.XA` / `XA3.XA` / `XA5.XA`, selected per art by the
+/// `FUN_8004AD80` anim-`0x1A` block through the `FUN_8004FCC8` jingle queue
+/// (`legaia_art::hyper_fanfare`); Super and Miracle expansions play the same
+/// bank's generic channel 1. See `docs/subsystems/battle-action.md`.
+const VOICE_XA_FILE: [Option<&str>; 4] = [Some("XA2.XA"), Some("XA4.XA"), Some("XA6.XA"), None];
+/// `readef.DAT` (extraction PROT 894) - the battle side-band file carrying
+/// the per-character art `"ME"` stream archives.
+const READEF_PROT_INDEX: u32 = 894;
+/// Character labels in player-file order.
+const CHARACTER_LABELS: [&str; 4] = ["Vahn", "Noa", "Gala", "Terra"];
+
+/// One art-bank record and (when it decoded) its expanded keyframe clip.
+struct ArtSlot {
+    anim_id: u8,
+    name: String,
+    combo: Vec<u8>,
+    rate: u8,
+    uses_base_archive: bool,
+    /// Clip expanded per assembled object (channel `i` drives object `i`).
+    anim: Option<MonsterAnimation>,
+    /// Present when the record's stream failed to resolve/decode.
+    why: Option<String>,
+    /// The arts-voice XA channel this art plays: the capture-witnessed pick
+    /// where one is pinned, else a stable member of the art's real
+    /// `FUN_8004C140` candidate pool (keyed on the record's `anim_id` =
+    /// action constant; `ArtsVoiceTable::pick_channel`). `None` when the disc
+    /// has no voice bank or the art has no arts-voice entry (retail plays it
+    /// silent).
+    voice_channel: Option<u8>,
+    /// The **fanfare** XA channel this art plays (in the character's
+    /// `XA1`/`XA3`/`XA5` fanfare bank): a Hyper art's capture-witnessed
+    /// coin-flip pair member (`legaia_art::hyper_fanfare`), or the generic
+    /// channel 1 for a Super / Miracle constant. `None` for regular arts
+    /// (those play the pool shout instead).
+    fanfare_channel: Option<u8>,
+}
+
+/// The fanfare channel the retail selector assigns to a bank record's action
+/// constant, when it assigns one. Per-art for the nine Hyper constants; the
+/// generic channel 1 for the constants only a Super (`0x2B..=0x32`) or
+/// Miracle (`0x1B` trigger, `0x2A` finisher) expansion stages - both paths
+/// fire inside the materialiser's anim-`0x1A` block, which regular arts never
+/// enter (their pool shout comes from `FUN_8004C140` instead).
+fn fanfare_channel_for(cslot: usize, anim_id: u8) -> Option<u8> {
+    if cslot >= 3 {
+        return None; // Terra has no fanfare bank.
+    }
+    hyper_fanfare::pick_fanfare_channel(cslot, anim_id).or_else(|| {
+        (anim_id == 0x1B || (0x2A..=0x32).contains(&anim_id))
+            .then_some(hyper_fanfare::GENERIC_FANFARE_CHANNEL)
+    })
+}
+
+/// One character's fully-decoded view bundle, cached on the host so the
+/// per-buffer accessors don't re-run the assembly.
+struct LoadedCharacter {
+    cslot: usize,
+    /// Assembled TMD object count = pose rig width (`anm_bones.len()`).
+    part_count: usize,
+    mesh: legaia_tmd::mesh::VramMesh,
+    object_ids: Vec<u32>,
+    vram: legaia_tim::Vram,
+    /// Idle loop (record[0] slot 0), expanded per object.
+    idle: Option<MonsterAnimation>,
+    /// The full battle action bank (record[0] slots incl. the idle) plus the
+    /// four equipment-spliced weapon swings, each labeled
+    /// (`battle_char_assembly::action_slot_label`) and expanded per object.
+    /// Feeds the `.glb` export; the canvas keeps using `idle` + `arts`.
+    actions: Vec<(String, MonsterAnimation)>,
+    arts: Vec<ArtSlot>,
+    /// The character's decoded arts-voice channels (every decoded channel of
+    /// its [`VOICE_XA_FILE`], keyed by `DecodedXa::ch_no`), each trimmed of its
+    /// trailing silence. Empty on a raw `PROT.DAT` load (no XA files to read),
+    /// for Terra, or when the file didn't demux. An art plays the channel in
+    /// its [`ArtSlot::voice_channel`].
+    voice: Vec<audio::DecodedXa>,
+    /// The character's decoded **fanfare** bank
+    /// (`legaia_art::hyper_fanfare::FANFARE_XA_FILE` = `XA1`/`XA3`/`XA5`,
+    /// 8-channel stereo), same keying and trimming as `voice`. A Hyper /
+    /// Super / Miracle art plays the channel in its
+    /// [`ArtSlot::fanfare_channel`].
+    fanfare: Vec<audio::DecodedXa>,
+}
+
+impl LoadedCharacter {
+    /// The decoded voice clip for XA channel `ch`, if it demuxed.
+    fn voice_clip(&self, ch: u8) -> Option<&audio::DecodedXa> {
+        self.voice.iter().find(|v| v.ch_no == ch)
+    }
+
+    /// The decoded fanfare clip for XA channel `ch`, if it demuxed.
+    fn fanfare_clip(&self, ch: u8) -> Option<&audio::DecodedXa> {
+        self.fanfare.iter().find(|v| v.ch_no == ch)
+    }
+}
+
+/// The site's Tactical-Arts animation host: a disc, plus one character's
+/// assembled battle mesh + art-clip bank at a time.
+#[wasm_bindgen]
+pub struct LegaiaArts {
+    /// Extracted `PROT.DAT` bytes.
+    prot: Vec<u8>,
+    /// PROT TOC.
+    entries: Vec<legaia_prot::toc_index::EntryMeta>,
+    /// Raw 2352-byte sectors of each distinct arts-voice file ([`VOICE_XA_FILE`]
+    /// = `XA2.XA` / `XA4.XA` / `XA6.XA`), keyed by upper-case file name. The XA demuxer
+    /// needs the CD-XA subheaders, which a 2048-byte ISO file view drops. Empty
+    /// when the page was fed a raw `PROT.DAT` instead of a full disc image.
+    voice_files: Vec<(String, Vec<u8>)>,
+    /// The decoded arts-voice cue tables (`FUN_8004C140`, parsed from
+    /// `SCUS_942.54`): art action constant -> candidate voice channel. `None`
+    /// on a raw `PROT.DAT` load (no SCUS to read).
+    voice_table: Option<ArtsVoiceTable>,
+    /// The character currently on the canvas.
+    current: Option<LoadedCharacter>,
+}
+
+impl Default for LegaiaArts {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Read one PROT entry's raw on-disc bytes (the web `parse_prot_toc` already
+/// honours the extended footprint window).
+fn entry_bytes<'a>(
+    prot: &'a [u8],
+    entries: &[legaia_prot::toc_index::EntryMeta],
+    prot_index: u32,
+) -> Option<&'a [u8]> {
+    let meta = entries.iter().find(|e| e.index == prot_index)?;
+    let off = meta.byte_offset as usize;
+    let end = off.checked_add(meta.size_bytes as usize)?;
+    prot.get(off..end.min(prot.len()))
+}
+
+/// Flatten a clip to the site animators' pose layout: six `i32` per part per
+/// frame, `[tx, ty, tz, rx, ry, rz]`, frame `f` / part `p` / component `c` at
+/// `(f * part_count + p) * 6 + c`. Rotations are unsigned 12-bit angles
+/// (`4096` = a full turn).
+fn flatten_pose_frames(anim: &MonsterAnimation) -> Vec<i32> {
+    let mut out = Vec::with_capacity(anim.frame_count * anim.part_count * 6);
+    for frame in &anim.frames {
+        for p in frame {
+            out.extend_from_slice(&[
+                p.tx as i32,
+                p.ty as i32,
+                p.tz as i32,
+                p.rx as i32,
+                p.ry as i32,
+                p.rz as i32,
+            ]);
+        }
+    }
+    out
+}
+
+/// Frames of an art clip on which the page fires the strike cue.
+///
+/// **This is a fit, not a traced timing.** Retail times an art's sound from
+/// the art record's *Hit Effect Cue* words (`[u16 frame][u16 kind]`, see
+/// `docs/formats/art-data.md`) - a field whose offset inside the `0xD0`-stride
+/// record is not pinned, and the move-power table's per-move `+0x0d` cue covers
+/// enemy specials only (a party art's move id is unmapped - see
+/// `docs/formats/move-power.md`). So the page derives the impact frames from
+/// the clip itself: the local maxima of the rig's **extension** - the largest
+/// per-part translation distance from the rest pose - which is where a swing,
+/// kick or lunge reaches full reach. A multi-hit art therefore fires once per
+/// swing, and a single-strike art once.
+///
+/// Frames are returned ascending, at most four (the art record carries four
+/// power bytes, so retail lands at most four hits per art).
+fn strike_frames(anim: &MonsterAnimation) -> Vec<u32> {
+    if anim.frame_count < 3 || anim.part_count == 0 {
+        return Vec::new();
+    }
+    let rest = &anim.frames[0];
+    // Per-frame extension: how far the furthest-displaced part has travelled
+    // from its rest position.
+    let extension: Vec<f32> = anim
+        .frames
+        .iter()
+        .map(|frame| {
+            frame
+                .iter()
+                .zip(rest.iter())
+                .map(|(p, r)| {
+                    let dx = f32::from(p.tx) - f32::from(r.tx);
+                    let dy = f32::from(p.ty) - f32::from(r.ty);
+                    let dz = f32::from(p.tz) - f32::from(r.tz);
+                    (dx * dx + dy * dy + dz * dz).sqrt()
+                })
+                .fold(0.0f32, f32::max)
+        })
+        .collect();
+    let peak = extension.iter().copied().fold(0.0f32, f32::max);
+    if peak <= 0.0 {
+        return Vec::new();
+    }
+    // Only peaks in the top half of the clip's reach count as a strike; that
+    // filters the wind-up and recovery wobble.
+    let floor = peak * 0.5;
+    let mut hits: Vec<u32> = (1..extension.len() - 1)
+        .filter(|&f| {
+            extension[f] >= floor
+                && extension[f] >= extension[f - 1]
+                && extension[f] > extension[f + 1]
+        })
+        .map(|f| f as u32)
+        .collect();
+    if hits.is_empty() {
+        // Monotone clip (a lunge that ends at full reach): the final frame is
+        // the impact.
+        let best = extension
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(f, _)| f as u32)
+            .unwrap_or(0);
+        hits.push(best);
+    }
+    if hits.len() > 4 {
+        // Keep the four biggest, back in frame order.
+        hits.sort_by(|a, b| extension[*b as usize].total_cmp(&extension[*a as usize]));
+        hits.truncate(4);
+        hits.sort_unstable();
+    }
+    hits
+}
+
+/// Slice the raw 2352-byte sectors of the named XA file out of a full
+/// Mode2/2352 disc image, so the arts-voice channels can demux after the
+/// disc bytes are dropped.
+fn extract_named_xa_raw(disc_bytes: &[u8], file_name: &str) -> Option<Vec<u8>> {
+    let f = audio::enumerate_xa_files(disc_bytes)
+        .into_iter()
+        .find(|f| {
+            let name = f.path.rsplit(['/', '\\']).next().unwrap_or(&f.path);
+            let name = name.split(';').next().unwrap_or(name);
+            name.eq_ignore_ascii_case(file_name)
+        })?;
+    // ISO9660 reports the Form-1 (2048-byte) size; the on-disc footprint is
+    // the same sector count of raw 2352-byte sectors.
+    let sectors = f.size.div_ceil(2048) as usize;
+    let start = f.lba as usize * 2352;
+    let end = start.checked_add(sectors * 2352)?.min(disc_bytes.len());
+    (start < end).then(|| disc_bytes[start..end].to_vec())
+}
+
+/// Slice out every distinct arts-voice file referenced by [`VOICE_XA_FILE`]
+/// (`XA2.XA`, `XA4.XA`, `XA6.XA`) **and** every fanfare bank
+/// (`hyper_fanfare::FANFARE_XA_FILE` = `XA1.XA`, `XA3.XA`, `XA5.XA`), keyed
+/// by upper-case name for [`decode_xa_bank`].
+fn extract_voice_files(disc_bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    let names = VOICE_XA_FILE
+        .into_iter()
+        .flatten()
+        .chain(hyper_fanfare::FANFARE_XA_FILE);
+    for name in names {
+        let key = name.to_ascii_uppercase();
+        if out.iter().any(|(k, _)| *k == key) {
+            continue;
+        }
+        if let Some(raw) = extract_named_xa_raw(disc_bytes, name) {
+            out.push((key, raw));
+        }
+    }
+    out
+}
+
+/// Trim a decoded voice clip to its audible span: `decode_xa_in_memory`
+/// concatenates the channel's whole run of audio sectors, and the arts-voice
+/// channels carry a single short shout followed by up to ~2 s of digital
+/// silence. Drop everything past the last sample above 3 % of the clip's peak
+/// (plus a short tail pad), so the shout plays tight without the trailing gap.
+/// (Unlike the retail-timed XA30 grunt, XA2/XA4 have no `dur` read span to
+/// window to, so the trim is derived from the audio itself.)
+fn trim_trailing_silence(pcm: &mut Vec<i16>) {
+    let Some(peak) = pcm.iter().map(|s| s.unsigned_abs()).max() else {
+        return;
+    };
+    if peak == 0 {
+        return;
+    }
+    let thr = (u32::from(peak) * 3 / 100) as u16;
+    let last = pcm
+        .iter()
+        .rposition(|s| s.unsigned_abs() > thr)
+        .unwrap_or(0);
+    // ~64 ms of pad after the last audible sample (37 800 Hz mono).
+    let keep = (last + 2400).min(pcm.len());
+    pcm.truncate(keep);
+}
+
+/// Demux + decode every channel of one named XA bank out of the pre-sliced
+/// voice/fanfare files. Each clip is trimmed of its trailing silence and
+/// keyed by its own `ch_no`, so an art can address the exact channel its
+/// selector picks (`FUN_8004C140` pool for shouts, `FUN_8004AD80` fanfare
+/// pair / generic channel for Hyper/Super/Miracle).
+fn decode_xa_bank(voice_files: &[(String, Vec<u8>)], file_name: &str) -> Vec<audio::DecodedXa> {
+    let key = file_name.to_ascii_uppercase();
+    let Some((_, raw)) = voice_files.iter().find(|(k, _)| *k == key) else {
+        return Vec::new();
+    };
+    let sectors = (raw.len() / 2352) as u32;
+    let mut decoded: Vec<audio::DecodedXa> = audio::decode_xa_in_memory(raw, 0, sectors * 2048)
+        .into_iter()
+        .filter(|s| !s.pcm.is_empty())
+        .collect();
+    decoded.sort_by_key(|s| s.ch_no);
+    for s in &mut decoded {
+        trim_trailing_silence(&mut s.pcm);
+    }
+    decoded
+}
+
+/// Build one character's full bundle off the PROT bytes. `Err(reason)` names
+/// the first stage that failed; per-art stream failures degrade to
+/// `ArtSlot::why` instead (the page falls that art back to the idle pose).
+fn build_character(
+    prot: &[u8],
+    entries: &[legaia_prot::toc_index::EntryMeta],
+    voice_files: &[(String, Vec<u8>)],
+    voice_table: Option<&ArtsVoiceTable>,
+    cslot: usize,
+) -> Result<LoadedCharacter, String> {
+    let prot_index = PLAYER_FILE_BASE + cslot as u32;
+    let raw = entry_bytes(prot, entries, prot_index)
+        .ok_or_else(|| format!("player file (PROT {prot_index}) not present"))?;
+    let pack = legaia_actor_formats::battle_data_pack::parse(raw)
+        .map_err(|e| format!("player-file pack: {e}"))?;
+    // All-default (unequipped) sections: the arts showcase has no roster, and
+    // every section id 0 is the section's default variant.
+    let equipped = [0u8; 5];
+    let mut asm = bca::assemble_character(raw, &pack, &equipped)
+        .map_err(|e| format!("battle-mesh assembly: {e}"))?;
+    // Band 0: texpages (512, 256)/(576, 256), CLUT row 481.
+    bca::relocate_tsb_cba(&mut asm.tmd, 0).map_err(|e| format!("TSB/CBA relocation: {e}"))?;
+    let tmd = legaia_tmd::parse(&asm.tmd).map_err(|e| format!("assembled TMD parse: {e}"))?;
+    let (mesh, object_ids) = legaia_tmd::mesh::tmd_to_vram_mesh_with_object_ids(&tmd, &asm.tmd);
+    if mesh.indices.is_empty() {
+        return Err("assembled mesh has no textured primitives".to_string());
+    }
+
+    // ---- VRAM: band-0 pixels + the character's decoded battle palette ----
+    let mut vram = legaia_tim::Vram::new();
+    match bca::character_texture_uploads(raw, &pack, &equipped, 0) {
+        Ok(uploads) => {
+            for u in &uploads {
+                vram.write_block(u.fb_x(), u.fb_y(), u.rect.w, u.rect.h, &u.pixels);
+                if !u.clut.is_empty() {
+                    vram.write_clut_row(u.clut_x, u.clut_row(), &u.clut_bytes());
+                }
+            }
+        }
+        Err(e) => arts_log(&format!("arts: char {cslot} texture-pool decode: {e}")),
+    }
+    // CLUT rows / columns the relocated mesh actually samples.
+    let mut rows: Vec<u16> = mesh.cba_tsb.iter().map(|c| (c[0] >> 6) & 0x1FF).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    let mut cols: Vec<u16> = mesh.cba_tsb.iter().map(|c| (c[0] & 0x3F) * 16).collect();
+    cols.sort_unstable();
+    cols.dedup();
+    // Vahn (863) = the byte-exact fixed-stride record parse; the others
+    // (864..866, incl. Terra) = the equipment-robust collector.
+    let pal = if cslot == 0 {
+        legaia_actor_formats::battle_char_palette::find_record0(raw).and_then(|rec0| {
+            legaia_actor_formats::battle_char_palette::parse_record(raw, rec0).ok()
+        })
+    } else {
+        legaia_actor_formats::battle_char_palette::collect_palette(raw, 0, &cols).ok()
+    };
+    if let Some(pal) = pal {
+        for &row in &rows {
+            for band in &pal.bands {
+                let bytes: Vec<u8> = band
+                    .vram_words()
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect();
+                vram.write_clut_row(band.base, row, &bytes);
+            }
+        }
+    }
+
+    // ---- Idle loop (rest pose source), expanded per object ----
+    let idle = match bca::idle_battle_animation(raw) {
+        Ok(Some(anim)) => Some(bca::expand_animation_for_objects(&anim, &asm.anm_bones)),
+        Ok(None) => None,
+        Err(e) => {
+            arts_log(&format!("arts: char {cslot} idle-stream decode: {e}"));
+            None
+        }
+    };
+
+    // ---- Full battle action bank + weapon swings (for the .glb export) ----
+    let mut actions: Vec<(String, MonsterAnimation)> = Vec::new();
+    match bca::battle_animations(raw) {
+        Ok(anims) => {
+            for a in &anims {
+                actions.push((
+                    bca::action_slot_label_or_hex(a.action_id as usize),
+                    bca::expand_animation_for_objects(a, &asm.anm_bones),
+                ));
+            }
+        }
+        Err(e) => arts_log(&format!("arts: char {cslot} action-bank decode: {e}")),
+    }
+    match bca::swing_battle_animations(raw, &pack, &equipped) {
+        Ok(swings) => {
+            for s in &swings {
+                actions.push((
+                    bca::action_slot_label_or_hex(s.slot as usize),
+                    bca::expand_animation_for_objects(&s.anim, &asm.anm_bones),
+                ));
+            }
+        }
+        Err(e) => arts_log(&format!("arts: char {cslot} swing decode: {e}")),
+    }
+
+    // ---- Art-animation bank through the readef "ME" archives ----
+    let mut arts = Vec::new();
+    match bca::decode_record0(raw).and_then(|r0| bca::art_animation_bank(&r0)) {
+        Ok(records) => {
+            let readef = entry_bytes(prot, entries, READEF_PROT_INDEX);
+            let main = readef.and_then(|r| bca::art_me_archive(r, cslot, false).ok());
+            let base = readef.and_then(|r| bca::art_me_archive(r, cslot, true).ok());
+            for rec in &records {
+                let archive = if rec.uses_base_archive() {
+                    base.as_ref()
+                } else {
+                    main.as_ref()
+                };
+                let (anim, why) = match archive {
+                    Some(a) => match bca::art_animation(rec, a) {
+                        Ok(anim) => (
+                            Some(bca::expand_animation_for_objects(&anim, &asm.anm_bones)),
+                            None,
+                        ),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    },
+                    None => (None, Some("ME archive did not decode".to_string())),
+                };
+                let voice_channel = voice_table.and_then(|t| t.pick_channel(cslot, rec.anim_id));
+                let fanfare_channel = fanfare_channel_for(cslot, rec.anim_id);
+                arts.push(ArtSlot {
+                    anim_id: rec.anim_id,
+                    name: rec.name.clone(),
+                    combo: rec.combo.clone(),
+                    rate: rec.rate,
+                    uses_base_archive: rec.uses_base_archive(),
+                    anim,
+                    why,
+                    voice_channel,
+                    fanfare_channel,
+                });
+            }
+        }
+        Err(e) => return Err(format!("art-animation bank: {e}")),
+    }
+
+    Ok(LoadedCharacter {
+        cslot,
+        part_count: asm.anm_bones.len(),
+        mesh,
+        object_ids,
+        vram,
+        idle,
+        actions,
+        arts,
+        voice: match VOICE_XA_FILE.get(cslot) {
+            Some(Some(name)) => decode_xa_bank(voice_files, name),
+            _ => Vec::new(),
+        },
+        fanfare: match hyper_fanfare::fanfare_file(cslot) {
+            Some(name) => decode_xa_bank(voice_files, name),
+            None => Vec::new(),
+        },
+    })
+}
+
+#[wasm_bindgen]
+impl LegaiaArts {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        #[cfg(target_arch = "wasm32")]
+        console_error_panic_hook::set_once();
+        Self {
+            prot: Vec::new(),
+            entries: Vec::new(),
+            voice_files: Vec::new(),
+            voice_table: None,
+            current: None,
+        }
+    }
+
+    /// Load a full Mode2/2352 disc image (or a raw `PROT.DAT`) and parse the
+    /// TOC. Returns `{"entries": N}` JSON; errors throw. On a full disc the
+    /// arts-voice banks ([`VOICE_XA_FILE`] = `XA2.XA` / `XA4.XA` / `XA6.XA`) are sliced out
+    /// alongside `PROT.DAT`; a raw `PROT.DAT` load simply has no voice audio.
+    pub fn load_disc(&mut self, bytes: Vec<u8>) -> Result<String, JsValue> {
+        let mut voice_files = Vec::new();
+        let mut voice_table = None;
+        let prot = if legaia_iso::image::is_mode2_2352_disc(&bytes) {
+            voice_files = extract_voice_files(&bytes);
+            // Arts-voice cue tables (art action constant -> voice channel) live
+            // in SCUS_942.54; parse them so each art maps to its real channel.
+            voice_table = legaia_iso::image::extract_scus(&bytes)
+                .as_deref()
+                .and_then(ArtsVoiceTable::parse_from_scus);
+            legaia_iso::image::extract_prot_dat(&bytes)
+                .ok_or_else(|| JsValue::from_str("arts: PROT.DAT not found in this disc image"))?
+        } else {
+            bytes
+        };
+        let entries = legaia_prot::toc_index::parse_prot_toc(&prot)
+            .ok_or_else(|| JsValue::from_str("arts: PROT.DAT TOC parse failed"))?;
+        #[cfg(target_arch = "wasm32")]
+        console_log(&format!(
+            "Arts: PROT.DAT loaded ({} entries)",
+            entries.len()
+        ));
+        self.prot = prot;
+        self.entries = entries;
+        self.voice_files = voice_files;
+        self.voice_table = voice_table;
+        self.current = None;
+        Ok(format!("{{\"entries\":{}}}", self.entries.len()))
+    }
+
+    /// Assemble character `cslot` (0=Vahn, 1=Noa, 2=Gala, 3=Terra) and decode
+    /// its art-clip bank. Returns a JSON summary the page keys everything on:
+    ///
+    /// ```json
+    /// { "ok": true, "character": "Vahn", "part_count": 17,
+    ///   "idle": { "frames": 24, "rate": 2 },
+    ///   "arts": [ { "index": 0, "anim_id": 16, "name": "", "combo": [3,3],
+    ///               "rate": 4, "base": true, "ok": true, "frames": 20,
+    ///               "why": null }, ... ] }
+    /// ```
+    ///
+    /// `name` is the record's inline HUD art-name string (empty on the
+    /// un-named base records); `combo` the arts-matcher direction bytes
+    /// (`1=L 2=R 3=D 4=U`) - the page matches its curated art cards against
+    /// both. `{"ok":false,"why":...}` when the character doesn't assemble.
+    pub fn set_character(&mut self, cslot: u32) -> String {
+        let cslot = cslot as usize;
+        if cslot >= CHARACTER_LABELS.len() {
+            self.current = None;
+            return r#"{"ok":false,"why":"character slot out of range"}"#.to_string();
+        }
+        match build_character(
+            &self.prot,
+            &self.entries,
+            &self.voice_files,
+            self.voice_table.as_ref(),
+            cslot,
+        ) {
+            Ok(c) => {
+                let arts: Vec<serde_json::Value> = c
+                    .arts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| {
+                        serde_json::json!({
+                            "index": i,
+                            "anim_id": a.anim_id,
+                            "name": a.name,
+                            "combo": a.combo,
+                            "rate": a.rate,
+                            "base": a.uses_base_archive,
+                            "ok": a.anim.is_some(),
+                            "frames": a.anim.as_ref().map(|x| x.frame_count).unwrap_or(0),
+                            "why": a.why,
+                            // The arts-voice XA channel this art plays (its
+                            // real FUN_8004C140 pool member), or null.
+                            "voice_channel": a.voice_channel,
+                            // The fanfare XA channel (in the character's
+                            // XA1/XA3/XA5 stereo bank) this art plays: a
+                            // Hyper's witnessed coin-flip pair member, the
+                            // generic channel 1 for a Super/Miracle constant,
+                            // or null (regular arts - pool shout instead).
+                            "fanfare_channel": a.fanfare_channel,
+                        })
+                    })
+                    .collect();
+                let actions: Vec<serde_json::Value> = c
+                    .actions
+                    .iter()
+                    .map(|(label, a)| {
+                        serde_json::json!({
+                            "label": label,
+                            "frames": a.frame_count,
+                            "rate": a.rate,
+                        })
+                    })
+                    .collect();
+                let json = serde_json::json!({
+                    "ok": true,
+                    "character": CHARACTER_LABELS[c.cslot],
+                    "part_count": c.part_count,
+                    "idle": c.idle.as_ref().map(|i| serde_json::json!({
+                        "frames": i.frame_count,
+                        "rate": i.rate,
+                    })),
+                    // The labeled battle action set (record[0] slots +
+                    // weapon swings) the .glb export bakes alongside the
+                    // arts - see `export_character_glb`.
+                    "actions": actions,
+                    "arts": arts,
+                    // The character's arts-voice bank (null on a raw PROT.DAT
+                    // load, for Terra, or if the file didn't demux): its XA
+                    // file + every decoded channel's metadata, keyed by the
+                    // real XA `channel`. Each art's channel is in its `arts[]`
+                    // entry's `voice_channel` (see `art_voice_pcm_i16`).
+                    "voice": (!c.voice.is_empty()).then(|| serde_json::json!({
+                        "file": VOICE_XA_FILE[c.cslot],
+                        "count": c.voice.len(),
+                        "channels": c.voice.iter().map(|v| serde_json::json!({
+                            "channel": v.ch_no,
+                            "rate": v.sample_rate,
+                            "stereo": v.stereo,
+                            "samples": v.pcm.len(),
+                        })).collect::<Vec<_>>(),
+                    })),
+                    // The character's Hyper/Super/Miracle fanfare bank (the
+                    // stereo XA1/XA3/XA5 sibling of the shout bank), same
+                    // shape as `voice`. Null when the disc slice or demux is
+                    // missing. Each art's channel is in its `arts[]` entry's
+                    // `fanfare_channel` (see `art_fanfare_pcm_i16`).
+                    "fanfare": (!c.fanfare.is_empty()).then(|| serde_json::json!({
+                        "file": hyper_fanfare::fanfare_file(c.cslot),
+                        "count": c.fanfare.len(),
+                        "channels": c.fanfare.iter().map(|v| serde_json::json!({
+                            "channel": v.ch_no,
+                            "rate": v.sample_rate,
+                            "stereo": v.stereo,
+                            "samples": v.pcm.len(),
+                        })).collect::<Vec<_>>(),
+                    })),
+                })
+                .to_string();
+                self.current = Some(c);
+                json
+            }
+            Err(why) => {
+                self.current = None;
+                serde_json::json!({ "ok": false, "why": why }).to_string()
+            }
+        }
+    }
+
+    /// Per-vertex positions of the current character's assembled battle mesh
+    /// (flat `f32`, 3 per vertex). Empty until [`Self::set_character`].
+    pub fn mesh_positions(&self) -> Vec<f32> {
+        let Some(c) = &self.current else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(c.mesh.positions.len() * 3);
+        for p in &c.mesh.positions {
+            out.extend_from_slice(&[p[0], p[1], p[2]]);
+        }
+        out
+    }
+
+    /// Per-vertex `[u, v]` integer texel coords, parallel to the positions.
+    pub fn mesh_uvs(&self) -> Vec<i32> {
+        let Some(c) = &self.current else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(c.mesh.uvs.len() * 2);
+        for uv in &c.mesh.uvs {
+            out.extend_from_slice(&[uv[0] as i32, uv[1] as i32]);
+        }
+        out
+    }
+
+    /// Per-vertex `[r, g, b, 255]` packet colours - the modulation half of
+    /// retail's `texel * colour / 128`, parallel to the positions.
+    pub fn mesh_flat_rgba(&self) -> Vec<u8> {
+        let Some(c) = &self.current else {
+            return Vec::new();
+        };
+        crate::packet_color::textured(&c.mesh)
+    }
+
+    /// Per-vertex `[cba, tsb]`, parallel to the positions.
+    pub fn mesh_cba_tsb(&self) -> Vec<u32> {
+        let Some(c) = &self.current else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(c.mesh.cba_tsb.len() * 2);
+        for ct in &c.mesh.cba_tsb {
+            out.extend_from_slice(&[ct[0] as u32, ct[1] as u32]);
+        }
+        out
+    }
+
+    /// Triangle indices (`u32`, multiple of 3).
+    pub fn mesh_indices(&self) -> Vec<u32> {
+        self.current
+            .as_ref()
+            .map(|c| c.mesh.indices.clone())
+            .unwrap_or_default()
+    }
+
+    /// Per-vertex TMD object index (the bone a vertex hangs from), parallel
+    /// to the positions.
+    pub fn mesh_object_ids(&self) -> Vec<u32> {
+        self.current
+            .as_ref()
+            .map(|c| c.object_ids.clone())
+            .unwrap_or_default()
+    }
+
+    /// Bounding sphere `[cx, cy, cz, r]` (vertex centroid + max distance),
+    /// so the page can frame the model before the first pose lands.
+    pub fn mesh_bounds(&self) -> Vec<f32> {
+        let Some(c) = &self.current else {
+            return vec![0.0; 4];
+        };
+        if c.mesh.positions.is_empty() {
+            return vec![0.0; 4];
+        }
+        centroid_bounds(&c.mesh.positions)
+    }
+
+    /// The 1 MB PSX VRAM for the current character: band-0 texture pixels at
+    /// the pinned retail placement + the character's decoded battle palette.
+    pub fn vram_bytes(&self) -> Vec<u8> {
+        self.current
+            .as_ref()
+            .map(|c| c.vram.as_bytes().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// The idle loop's pose frames (see [`flatten_pose_frames`] layout).
+    /// Empty when the character has no decodable idle stream.
+    pub fn idle_pose_frames(&self) -> Vec<i32> {
+        self.current
+            .as_ref()
+            .and_then(|c| c.idle.as_ref())
+            .map(flatten_pose_frames)
+            .unwrap_or_default()
+    }
+
+    /// Battle-action clip `index`'s pose frames (the position in
+    /// `set_character`'s `actions` array - the labeled record[0] slot bank
+    /// plus the four weapon swings). Same layout as
+    /// [`Self::idle_pose_frames`]; empty when the index is out of range.
+    pub fn action_pose_frames(&self, index: u32) -> Vec<i32> {
+        self.current
+            .as_ref()
+            .and_then(|c| c.actions.get(index as usize))
+            .map(|(_, anim)| flatten_pose_frames(anim))
+            .unwrap_or_default()
+    }
+
+    /// Art clip `index`'s pose frames (the position in `set_character`'s
+    /// `arts` array). Empty when the index is out of range or that record's
+    /// stream did not decode - the page falls back to the idle pose.
+    pub fn art_pose_frames(&self, index: u32) -> Vec<i32> {
+        self.current
+            .as_ref()
+            .and_then(|c| c.arts.get(index as usize))
+            .and_then(|a| a.anim.as_ref())
+            .map(flatten_pose_frames)
+            .unwrap_or_default()
+    }
+
+    /// Frames of art clip `index` on which the page should fire the strike
+    /// sound cue ([`Self::art_strike_cue`]), ascending. See [`strike_frames`]
+    /// for what they are and why they are a fit rather than a traced timing.
+    /// Empty when the clip didn't decode.
+    pub fn art_strike_frames(&self, index: u32) -> Vec<u32> {
+        self.current
+            .as_ref()
+            .and_then(|c| c.arts.get(index as usize))
+            .and_then(|a| a.anim.as_ref())
+            .map(strike_frames)
+            .unwrap_or_default()
+    }
+
+    /// The SFX cue id an art strike fires: the art record's documented generic
+    /// "play sound" Hit Effect Cue kind. Resolve it to audio through
+    /// [`crate::sfx_view::LegaiaSfx`].
+    pub fn art_strike_cue(&self) -> u32 {
+        crate::sfx_view::CUE_ART_STRIKE as u32
+    }
+
+    /// The arts-voice PCM for the art at bank index `art_index`: mono i16 at
+    /// the rate reported in `set_character`'s `voice.channels[..].rate`
+    /// (37 800 Hz). The clip is the XA channel the art's `FUN_8004C140`
+    /// candidate pool selects (the art's `voice_channel`), trimmed of its
+    /// trailing silence. Empty when the character has no voice bank (raw
+    /// `PROT.DAT` load, Terra, demux failure) or the art has no voice entry.
+    /// Also exposed by-channel via [`Self::voice_channel_pcm_i16`].
+    pub fn art_voice_pcm_i16(&self, art_index: u32) -> Vec<i16> {
+        self.current
+            .as_ref()
+            .and_then(|c| {
+                let a = c.arts.get(art_index as usize)?;
+                let ch = a.voice_channel?;
+                Some(c.voice_clip(ch)?.pcm.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Bake the current character's assembled battle mesh **plus its whole
+    /// battle-animation bank** into a binary glTF (`.glb`) for download:
+    /// one node per rigid TMD object (the engine's `R . v + T` pose model
+    /// expressed as native TRS keyframe channels), textured from the same
+    /// runtime VRAM the canvas renders (every sampled `(cba, tsb-page)` pair
+    /// baked into one RGBA atlas).
+    ///
+    /// The clip list is the **complete battle action set**: every populated
+    /// `record[0]` action slot under its pinned label (Idle, Walk / Approach,
+    /// the flinches, Knockdown, Get Up, Ready / Recover / Defeat, Block -
+    /// `battle_char_assembly::action_slot_label`), the four equipment-spliced
+    /// weapon swings (Swing L/R/D/U), and then every art-bank record whose
+    /// keyframe stream decoded, named by its inline HUD art name where the
+    /// record carries one, else by its `anim_id` in hex (duplicated names get
+    /// the hex id appended). Each clip's timeline runs at its retail rate
+    /// byte (`7.5 * rate`).
+    ///
+    /// Everything is baked client-side off the visitor's own disc; nothing
+    /// is uploaded. Empty until [`Self::set_character`] (or if the mesh has
+    /// nothing to export).
+    pub fn export_character_glb(&self) -> Vec<u8> {
+        let Some(c) = &self.current else {
+            return Vec::new();
+        };
+        let fps_for_rate = |rate: u8| {
+            if rate > 0 {
+                7.5 * f32::from(rate)
+            } else {
+                15.0
+            }
+        };
+        let mut clips: Vec<legaia_actor_formats::character_gltf::CharacterClip<'_>> = Vec::new();
+        for (label, anim) in &c.actions {
+            clips.push(legaia_actor_formats::character_gltf::CharacterClip {
+                name: label.clone(),
+                fps: fps_for_rate(anim.rate),
+                anim,
+            });
+        }
+        if clips.is_empty()
+            && let Some(idle) = &c.idle
+        {
+            // Action bank failed to decode: fall back to the idle alone so
+            // the export still carries the rest pose.
+            clips.push(legaia_actor_formats::character_gltf::CharacterClip {
+                name: "Idle".to_string(),
+                fps: fps_for_rate(idle.rate),
+                anim: idle,
+            });
+        }
+        let mut used_names: Vec<String> = clips.iter().map(|c| c.name.clone()).collect();
+        for a in &c.arts {
+            let Some(anim) = &a.anim else { continue };
+            let mut name = if a.name.is_empty() {
+                format!("0x{:02X}", a.anim_id)
+            } else {
+                a.name.clone()
+            };
+            if used_names.iter().any(|n| n == &name) {
+                name = format!("{name} (0x{:02X})", a.anim_id);
+            }
+            used_names.push(name.clone());
+            clips.push(legaia_actor_formats::character_gltf::CharacterClip {
+                name,
+                fps: fps_for_rate(a.rate),
+                anim,
+            });
+        }
+        legaia_actor_formats::character_gltf::build_character_glb(
+            CHARACTER_LABELS[c.cslot],
+            &c.mesh,
+            &c.object_ids,
+            &c.vram,
+            &clips,
+        )
+        .unwrap_or_default()
+    }
+
+    /// The arts-voice PCM of the current character's XA channel `channel`,
+    /// regardless of any art mapping. Lets the page (and the listening aid)
+    /// address a specific voice clip directly. Empty when out of range or the
+    /// character has no voice bank.
+    pub fn voice_channel_pcm_i16(&self, channel: u32) -> Vec<i16> {
+        self.current
+            .as_ref()
+            .and_then(|c| c.voice_clip(channel as u8))
+            .map(|v| v.pcm.clone())
+            .unwrap_or_default()
+    }
+
+    /// The **fanfare** PCM for the art at bank index `art_index`: the XA
+    /// channel of the character's `XA1`/`XA3`/`XA5` fanfare bank that the
+    /// `FUN_8004AD80` selector assigns the art (the art's `fanfare_channel`:
+    /// a Hyper's witnessed coin-flip pair member, or the generic channel 1
+    /// for a Super/Miracle), trimmed of its trailing silence. Interleaved
+    /// stereo at the rate reported in `set_character`'s
+    /// `fanfare.channels[..]`. Empty when the character has no fanfare bank
+    /// (raw `PROT.DAT` load, Terra, demux failure) or the art has no fanfare
+    /// cue (regular arts). Also exposed by-channel via
+    /// [`Self::fanfare_channel_pcm_i16`].
+    pub fn art_fanfare_pcm_i16(&self, art_index: u32) -> Vec<i16> {
+        self.current
+            .as_ref()
+            .and_then(|c| {
+                let a = c.arts.get(art_index as usize)?;
+                let ch = a.fanfare_channel?;
+                Some(c.fanfare_clip(ch)?.pcm.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    /// The fanfare PCM of the current character's XA channel `channel`,
+    /// regardless of any art mapping (the by-channel sibling of
+    /// [`Self::art_fanfare_pcm_i16`]). Empty when out of range or the
+    /// character has no fanfare bank.
+    pub fn fanfare_channel_pcm_i16(&self, channel: u32) -> Vec<i16> {
+        self.current
+            .as_ref()
+            .and_then(|c| c.fanfare_clip(channel as u8))
+            .map(|v| v.pcm.clone())
+            .unwrap_or_default()
+    }
+}

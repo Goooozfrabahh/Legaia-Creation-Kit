@@ -1,0 +1,1611 @@
+//! The battle camera's per-step state machine (`impl BattleCamera`).
+
+use super::*;
+
+/// The magic-exit state (`0x2E`) whose exit pass carries the camera snap.
+const MAGIC_EXIT_STATE: u8 = 0x2E;
+/// The pitch at or above which the magic exit snaps (`slti v0,v0,0x191` at
+/// `0x801E4964`).
+const MAGIC_EXIT_PITCH_SNAP_AT: f32 = 401.0;
+/// The absolute eye Y the snap stores (`li v0,0x500` / `sw v0,0x40bc(v1)`).
+const MAGIC_EXIT_EYE_Y: f32 = 1280.0;
+/// The run band's wait state (`0x65`).
+const RUN_WAIT_STATE: u8 = 0x65;
+/// Eye-Z back-off per vsync of frame step on a granted flee's wait
+/// (`sll v1,v1,0x5` at `0x801E59B4`).
+const ESCAPE_EYE_Z_BACK_PER_VSYNC: f32 = 32.0;
+
+/// [`BattleCamera::align_glide_origin`]'s endpoint agreement, per component
+/// family: angles in 12-bit units, the eye translation in its prescaled
+/// units (the depth prescale truncates), the focus in world units (retail's
+/// focus trio is read off live actor pairs that a replay lands within a few
+/// units of).
+pub(super) const ALIGN_ANGLE_TOLERANCE: f32 = 2.0;
+/// The yaw endpoint band inside which [`BattleCamera::align_glide_origin`]
+/// carries retail's remaining distance over to the engine's own endpoint:
+/// under the `0x80` the yaw ladder's nearest rungs stand apart, so a wrong
+/// rung or side still reads as one.
+const ALIGN_YAW_EASE_BAND: f32 = 64.0;
+/// ... and how far apart the two focus endpoints may stand (X and Z summed,
+/// world units) for that to be the same framing of the same bodies: a yaw
+/// that agrees over a body standing somewhere else agrees by accident (the
+/// parked Gaza of `battle_gaza2_park_0x19_target_vahn`, whose engine twin
+/// is still walking in from 1800 units off).
+const ALIGN_FOCUS_EASE_BAND: f32 = 256.0;
+/// How far [`BattleCamera::align_close_up_accum`] moves the close-up
+/// accumulator: one three-vsync pass, `8` a vsync.
+const CLOSE_UP_ALIGN_TOLERANCE: u32 = 24;
+pub(super) const ALIGN_TR_TOLERANCE: f32 = 2.0;
+pub(super) const ALIGN_FOCUS_TOLERANCE: f32 = 8.0;
+
+impl BattleCamera {
+    /// New camera snapped to the entry phase's framing (a battle that opens
+    /// on tutorial dialogue starts in the held close-up; any other battle
+    /// starts at the far menu framing sized to no formation - see
+    /// [`BattleCamera::new_with_formation`] for the live-formation entry).
+    pub fn new(phase: BattleCamPhase, frames_now: u64) -> Self {
+        Self::new_with_formation(phase, None, 0.0, frames_now)
+    }
+
+    /// [`BattleCamera::new`] with the live formation available at entry, so
+    /// a battle opening on the far menu framing snaps to the case-9
+    /// formation-sized depth + centre instead of the degenerate minimum
+    /// (retail's case 9 runs against the live actor table).
+    /// `entry_yaw` is the live `_DAT_8007B792` the fight inherits - see
+    /// [`BattleCamInputs::entry_yaw`] for why a battle never starts at `0`.
+    pub fn new_with_formation(
+        phase: BattleCamPhase,
+        formation: Option<FormationBox>,
+        entry_yaw: f32,
+        frames_now: u64,
+    ) -> Self {
+        let actor = BattleCamActor::default();
+        let action = ActionFraming::default();
+        let yaw = entry_yaw.rem_euclid(4096.0);
+        let pose = match phase {
+            BattleCamPhase::Dialogue => dialogue_pose(formation),
+            BattleCamPhase::Submenu | BattleCamPhase::TargetEnemy => actor.submenu_pose(),
+            BattleCamPhase::TargetAlly => target_ally_pose(actor),
+            BattleCamPhase::Action => action_framing(actor, action),
+            BattleCamPhase::Recover => recover_framing(actor, None, action, yaw, false),
+            BattleCamPhase::ActionEnd => action_end_framing(actor, None, action, yaw),
+            BattleCamPhase::Menu => menu_framing(formation, yaw),
+        };
+        BattleCamera {
+            phase,
+            pose,
+            glides: std::collections::VecDeque::new(),
+            last_frames: frames_now,
+            frame_accum: 0,
+            yaw_frac: 0,
+            frame_step: DEFAULT_CAMERA_FRAME_STEP,
+            pass_granular: false,
+            actor,
+            formation,
+            target: None,
+            action,
+            action_yaw: 0,
+            last_action_state: 0,
+            acting_body: None,
+            spell_cam: None,
+            last_active_commits: None,
+            last_active_installs: None,
+            clip_age: 0,
+            steps_in_state: 0,
+            last_swing_seeds: None,
+            option: CAMERA_OPTION_CLOSE,
+            shake: ShakeState::default(),
+            attack: AttackChannel::default(),
+            rand_state: STANDALONE_RAND_SEED,
+            module_glide: None,
+            escape_shot: false,
+            cursor: None,
+            entry_sweep: None,
+        }
+    }
+
+    /// Install the per-art attack camera's per-actor channels and (once) the
+    /// disc track table. Hosts call this every frame through [`drive`].
+    pub fn set_attack_channels(
+        &mut self,
+        channels: Option<AttackCamChannels>,
+        tracks: Option<&legaia_game_tables::battle_attack_camera_table::AttackCameraTracks>,
+    ) {
+        self.attack.actor = channels;
+        if self.attack.tracks.is_none()
+            && let Some(t) = tracks
+        {
+            self.attack.tracks = Some(t.clone());
+        }
+    }
+
+    /// The per-art framing for this frame, or `None` when no arm fires - in
+    /// which case retail leaves the case-6 framing standing and so does the
+    /// port. Mutates the ramp latch exactly as the arms do.
+    pub(super) fn attack_framing(
+        &mut self,
+    ) -> Option<crate::battle_attack_camera::AttackCamFraming> {
+        use crate::battle_attack_camera::{AttackCamActor, attack_camera_framing};
+        let c = self.attack.actor?;
+        let tracks = self.attack.tracks.as_ref()?;
+        let a = self.actor;
+        let world = |v: f32| (v as i32) as u16;
+        attack_camera_framing(
+            AttackCamActor {
+                character: c.character,
+                art_id: c.art_id,
+                arm_select: c.arm_select,
+                anim_frame: c.anim_frame,
+                pos: [world(a.world[0]), world(a.world[1]), world(a.world[2])],
+                facing: a.facing as u16,
+            },
+            &mut self.attack.ctx,
+            tracks,
+        )
+    }
+
+    /// Install the case-6 context inputs the [`BattleCamPhase::Action`]
+    /// framing reads. Hosts call this every frame; an already-armed glide is
+    /// left alone (retail re-arms the whole framing on the state change, not
+    /// mid-tween).
+    pub fn set_action_framing(&mut self, action: ActionFraming) {
+        self.action = action;
+    }
+
+    /// Observe the live action-SM state and apply the yaw counter's
+    /// per-action seeds on its edges - the `ctx[+0x6DA]` ladder in the module
+    /// doc:
+    ///
+    /// - `0x00` (round begin, `0x801E2B40`): `0`.
+    /// - The `0x0C` seed pass: `0x800` for every category (`0x801E2CF8`),
+    ///   and the Attack branch stores `0x200` **in the same pass** as it
+    ///   sets `ctx[7] = 0x14` (`0x801E2F18..0x801E2F20`). So the edge is
+    ///   "an action band was entered from the setup / done bands", not "the
+    ///   SM sat in `0x0C`" - a host's SM may run the seed pass and the band
+    ///   entry inside one tick (the engine's does: `0x0A -> 0x14` for a party
+    ///   attack, `0x00 -> 0x15` for a monster's), and the camera only sees
+    ///   the state at the tick boundary.
+    /// - A party swing's clip commit re-seeds it to `(rand() % 2) * 0x800 +
+    ///   0x280` - `FUN_8004E13C`'s value-2 arm, which this observer does not
+    ///   see; [`Self::observe_swing_reseed`] applies it. Captures show the
+    ///   re-seed is not tied to the strike loop's entry:
+    ///   `player_steal_skeleton_pre` reads the Attack base `0x218` eight
+    ///   frames into `0x1E`.
+    ///
+    /// A monster's attack therefore frames from the `0x200` base and a party
+    /// attack from `0x280` / `0xA80`, both drifting at the SM's rate
+    /// ([`Self::advance_to`]). Other categories keep the seed's `0x800`; an
+    /// attack-band entry from another action band (no seed pass between)
+    /// stores nothing, as retail's does not. The coin comes from the same
+    /// PsyQ `rand()` stream as the attack camera's column flip; retail draws
+    /// both from the process-wide generator, so no particular sequence is
+    /// being reproduced.
+    /// The staged-animation commit's counter reset: when the active actor
+    /// commits a clip, `FUN_8004AD80` zeroes `ctx[+0x26E]` (the ramp),
+    /// `ctx[+0x87C]` (the accumulator) and `ctx[+0x26F]` (the latch)
+    /// (`0x8004BF50..0x8004BF78`). `ctx[+0x270]` (the death ramp) is not
+    /// touched.
+    ///
+    /// REF: FUN_8004AD80
+    pub fn observe_active_commits(&mut self, commits: u32) {
+        let prev = self.last_active_commits.replace(commits);
+        if prev.is_some_and(|p| p != commits) {
+            let c = &mut self.attack.ctx;
+            c.ramp = 0;
+            c.accum = 0;
+            c.latch = 0;
+        }
+    }
+
+    /// Zero [`Self::clip_age`] when the active actor installs a clip.
+    pub fn observe_active_installs(&mut self, installs: u32) {
+        let prev = self.last_active_installs.replace(installs);
+        if prev.is_some_and(|p| p != installs) {
+            self.clip_age = 0;
+        }
+    }
+
+    pub fn observe_action_state(&mut self, state: u8) {
+        let prev = self.last_action_state;
+        if state == prev {
+            return;
+        }
+        self.last_action_state = state;
+        self.steps_in_state = 0;
+        self.release_module_shot(state);
+        // The magic exit's camera write, on the pass that leaves `0x2E` for
+        // `0x50` (`0x801E4958..0x801E497C`): a pitch at or above `0x191`
+        // snaps to `0` and eye Y to the absolute `0x500`; below it the
+        // framing is left alone.
+        if prev == MAGIC_EXIT_STATE
+            && state == ACTION_DONE_STATE
+            && self.pose.pitch >= MAGIC_EXIT_PITCH_SNAP_AT
+        {
+            self.pose.pitch = 0.0;
+            self.pose.tr[1] = MAGIC_EXIT_EYE_Y;
+        }
+        if state == 0x00 {
+            self.action_yaw = 0;
+            return;
+        }
+        // The seed pass `0x0C` opens every category's band; `0x50` (Done)
+        // closes them. The Attack band is `0x14..=0x20`.
+        let in_action = |s: u8| (ACTION_SEED_STATE..ACTION_DONE_STATE).contains(&s);
+        let in_attack = |s: u8| (ATTACK_BAND_FIRST..=ATTACK_BAND_LAST).contains(&s);
+        // Came through the seed pass: from outside the action bands, or from
+        // the seed states themselves (`0x0C..0x14`).
+        let via_seed = !in_action(prev) || prev < ATTACK_BAND_FIRST;
+        if in_attack(state) && via_seed {
+            self.action_yaw = 0x200;
+        } else if in_action(state) && !in_action(prev) {
+            self.action_yaw = 0x800;
+        }
+    }
+
+    /// `FUN_8004E13C`'s value-2 re-seed (`0x8004E288..0x8004E2B4`): a clip
+    /// commit whose `+0x87` byte is `2`, after one that was not, with a party
+    /// seat acting, sets the yaw counter to `(rand() % 2) * 0x800 + 0x280`.
+    /// The world draws the coin at the commit and counts the re-seeds; the
+    /// camera applies one whenever the count moves. (The same arm's
+    /// `ctx[+0xD] = 0` is the world's own write to the live style byte.)
+    /// Install the options screen's Battle Camera word `_DAT_800846C0`
+    /// (Close `0` / Normal `1` / Far `2`). Retail reads it in four places,
+    /// all of them making the action shots calmer as it rises:
+    ///
+    /// - the action SM's prologue (`0x801E29D4..0x801E29DC`) skips the
+    ///   per-frame `ctx[+0x6DA]` drift - and its idle-orbit store - on Far;
+    /// - case 7's pull-in (`0x801D6724..0x801D6730`) needs Close;
+    /// - case 8 (`0x801D6958..0x801D69EC`) holds the live yaw on Far and,
+    ///   on Normal or Far, skips its dead- and live-target arms for an
+    ///   ordinary fight (the `_DAT_8007BD2C` / `ctx[+0x287]` exception that
+    ///   keeps them in a scripted one is not carried);
+    /// - the per-art attack camera's call (`0x801D7138..0x801D7144`) is
+    ///   skipped on Far.
+    pub fn set_camera_option(&mut self, option: u8) {
+        self.option = option;
+    }
+
+    pub fn observe_swing_reseed(&mut self, (count, coin): (u32, u8)) {
+        let prev = self.last_swing_seeds.replace(count);
+        if prev.is_some_and(|p| p != count) {
+            self.action_yaw = i32::from(coin & 1) * 0x800 + 0x280;
+        }
+    }
+
+    /// The live yaw counter `ctx[+0x6DA]` the in-fight framings subtract the
+    /// actor facing from (16-bit, free-running).
+    pub fn action_yaw_base(&self) -> i32 {
+        self.action_yaw
+    }
+
+    /// Store `ctx[+0x6DA]` from outside the action SM: the paged summon /
+    /// capture modules write the same word (PROT 0903's `sh 0x200` at
+    /// `0x801F738C` and its per-pass swing, PROT 0966's `0x780`), and the
+    /// Done band's case 6 reads whatever they left there.
+    pub fn set_action_yaw_base(&mut self, yaw: i32) {
+        self.action_yaw = yaw & 0xFFFF;
+    }
+
+    /// Put the yaw counter on the half-turn nearer `yaw`: keep it, or flip
+    /// its `0x800` bit, whichever lands closer (mod `0x1000`). The strike
+    /// loop's seed `(rand() % 2) * 0x800 + 0x280` is a coin on the shared
+    /// `rand()` stream; an instrument replaying a capture on another stream
+    /// aligns the coin with this, the way it aligns the idle orbit
+    /// ([`Self::align_orbit_yaw`]). The drift below the half-turn is left
+    /// to the engine.
+    pub fn align_action_yaw_half(&mut self, yaw: i32) {
+        let dist = |a: i32| {
+            let d = (a - yaw).rem_euclid(0x1000);
+            d.min(0x1000 - d)
+        };
+        let flipped = self.action_yaw ^ 0x800;
+        if dist(flipped) < dist(self.action_yaw) {
+            self.action_yaw = flipped;
+        }
+    }
+
+    /// The per-action track coin `ctx[+0x26D]`
+    /// ([`crate::battle_attack_camera::AttackCamCtx::phase_cursor`]).
+    pub fn phase_cursor(&self) -> u8 {
+        self.attack.ctx.phase_cursor
+    }
+
+    /// Put the track coin `ctx[+0x26D]` on `coin`. Retail's one writer is
+    /// `FUN_8004E13C` (`sb v0,0x26d(a0)` at `0x8004E2DC`), storing `rand() %
+    /// 2` on every clip commit whose header byte `+0x87` is non-zero; the
+    /// port rolls it on entry into the Action phase. Like the yaw counter's
+    /// half-turn ([`Self::align_action_yaw_half`]) it is a draw on the shared
+    /// `rand()` stream, so an instrument replaying a capture on another
+    /// stream aligns it with this. It picks the per-art track column and the
+    /// case-8 dead-target yaw's `0x200` offset ([`dead_target_yaw`]).
+    pub fn align_phase_cursor(&mut self, coin: u8) {
+        self.attack.ctx.phase_cursor = coin & 1;
+    }
+
+    /// Install `_DAT_8007B630`, the screen-shake amplitude.
+    ///
+    /// The **only** retail writer of that global is the field-VM opcode
+    /// `0x4C` outer-nibble `8` sub-`4` (`[4C, 84, amplitude]`, dispatcher arm
+    /// `0x801E2134`, jump-table slot `0x801CEF58`), and the only callers of
+    /// `FUN_801D9D30` are the field-family overlay's per-frame camera
+    /// updaters (`0x801D1344` and siblings). Both ends are therefore field
+    /// side: in retail the battle-action overlay occupies the same slot-A
+    /// base, so no shake caller is resident during a fight. The engine drives
+    /// it from the same camera because the translation pair the routine
+    /// jitters, `0x800840B8/BC`, *is* this pose's `tr` - one global, one
+    /// owner - and a script that raised the amplitude before a battle would
+    /// otherwise leave it stranded.
+    ///
+    /// REF: FUN_801D9D30 (the kernel is
+    /// [`legaia_engine_camera::battle_camera::apply_shake`])
+    pub fn set_shake_amplitude(&mut self, amplitude: u8) {
+        self.shake.amplitude = u32::from(amplitude);
+    }
+
+    /// Install the formation the far menu framing sizes itself to (retail's
+    /// per-frame `min`/`max` walk over the present actors). Hosts call this
+    /// as the battle formation changes; an already-armed glide is left alone.
+    pub fn set_formation(&mut self, formation: Option<FormationBox>) {
+        self.formation = formation;
+    }
+
+    /// The far menu framing for the live formation, at the current yaw (the
+    /// idle orbit owns yaw across this transition - retail passes
+    /// `_DAT_8007B792` straight through).
+    pub(super) fn menu_pose(&self) -> BattleCamPose {
+        menu_framing(self.formation, self.pose.yaw)
+    }
+
+    /// Point the submenu close-up at the acting battle actor. Retail
+    /// rebuilds the framing from the actor record on every submenu open
+    /// (`FUN_801D5854` case `0`), so hosts should call this as the active
+    /// seat changes.
+    ///
+    /// While the close-up is up, a **different** actor re-arms it. The
+    /// command flow hands the ring straight from one member to the next -
+    /// every commit ends on the ring (`0x28`) for the next member owing a
+    /// command or on the commit confirm (`0x6E`) - with no far framing in
+    /// between, and the menu driver `FUN_801D388C` re-arms case `0` with
+    /// `a0 = ctx[+0x13]`, the member now commanding (`0x801D4758..0x801D4760`,
+    /// `0x801D53B4..0x801D53BC`). So the close-up glides over to the new
+    /// member on the case's own `a3 = 0xC` (6 camera steps). Without the
+    /// re-arm the phase never changes (`Submenu` to `Submenu`) and the camera
+    /// stays on the first member for the whole command phase.
+    pub fn set_actor(&mut self, actor: BattleCamActor) {
+        let changed = actor != self.actor;
+        self.actor = actor;
+        if changed && self.phase == BattleCamPhase::Submenu {
+            let mut from = self.pose;
+            self.glides.clear();
+            self.glides.push_back(Glide::linear(
+                &mut from,
+                self.actor.submenu_pose(),
+                SUBMENU_TR_Z_RAW,
+                self.steps_of(SUBMENU_ENTER_STEPS),
+                true,
+            ));
+            self.pose = from;
+        }
+    }
+
+    /// Install what the target cursor rests on. Every cursor move re-arms
+    /// the framing case in retail (the menu driver's cursor steps call
+    /// `FUN_801D5854` again with the new `+0x1DD`), so a change while a
+    /// cursor framing is live glides to the new pose over the case's own
+    /// `a3 = 0xC` - 6 camera steps.
+    pub fn set_cursor(&mut self, cursor: Option<CursorFraming>) {
+        let changed = cursor != self.cursor;
+        self.cursor = cursor;
+        if changed
+            && matches!(
+                self.phase,
+                BattleCamPhase::TargetEnemy | BattleCamPhase::TargetAlly
+            )
+            && let Some((target, raw_z)) = self.cursor_pose()
+        {
+            let mut from = self.pose;
+            self.glides.clear();
+            self.glides.push_back(Glide::linear(
+                &mut from,
+                target,
+                raw_z,
+                self.steps_of(CURSOR_STEPS),
+                true,
+            ));
+            self.pose = from;
+        }
+    }
+
+    /// The cursor framing's target pose and raw depth, off the live pose's
+    /// focus (case 1's bearing reads the camera's current focus word).
+    fn cursor_pose(&self) -> Option<(BattleCamPose, i32)> {
+        match self.cursor? {
+            CursorFraming::Enemy { target } => Some((
+                target_enemy_pose(self.actor, target, self.pose.focus),
+                SWING_TR_Z_RAW,
+            )),
+            CursorFraming::Ally(ally) => Some((target_ally_pose(ally), SUBMENU_TR_Z_RAW)),
+        }
+    }
+
+    /// Install the acting actor's target, which cases `7` and `8` frame
+    /// against ([`PostActionTarget`]). Hosts call this every frame through
+    /// [`drive`].
+    pub fn set_post_action_target(&mut self, target: Option<PostActionTarget>) {
+        self.target = target;
+    }
+
+    /// Case 7's framing for the live actor / target pair, on the live yaw
+    /// counter and the live camera yaw (which its one-way unwrap reads).
+    ///
+    /// The "pull in" tweak (`0x801D6724..0x801D67BC`) is gated on
+    /// `_DAT_800846C0 == 0` and then, for a party seat, on the acting
+    /// actor's **live** anim id `+0x1D9` being `0x11` - the dynamic art-bank
+    /// slot the commit ladder materialises a staged id `>= 0x1A` into for a
+    /// party actor (`FUN_8004AD80` `0x8004B6E8..0x8004B76C`; the
+    /// `battle_melee_hit_spark` capture reads `+0x1D9 = 0x11` under the
+    /// latched `+0x1DB = 0x27`, mid-way into the pulled-in pose). The port's
+    /// actor keeps the raw staged id, so the same test is "the latched id is
+    /// the SpecialStarter or an art constant". A monster seat pulls in on
+    /// `ctx[+0x243] != 0` - the last committed clip's header byte - which the
+    /// engine does not carry, so a monster's two-shot never pulls in here.
+    /// The acting actor as cases 7 and 8 read it: X / Z from the body pair
+    /// `+0x3C` / `+0x40` (`lh v0,0x3c(s2)` at `0x801D661C`, `lhu v0,0x3c(s2)`
+    /// at `0x801D6870`), Y the live `+0x36`. Case 6 reads the live pair
+    /// `+0x34` / `+0x38` instead, which is [`Self::actor`] as the host
+    /// hands it.
+    pub(super) fn body_actor(&self) -> BattleCamActor {
+        let mut a = self.actor;
+        if let Some([x, z]) = self.acting_body {
+            a.world[0] = x;
+            a.world[2] = z;
+        }
+        a
+    }
+
+    pub(super) fn recover_pose(&self) -> BattleCamPose {
+        let pull_in = self.option == CAMERA_OPTION_CLOSE
+            && self.action.party_slot
+            && self
+                .attack
+                .actor
+                .is_some_and(|c| c.art_id >= crate::battle_attack_camera::FIRST_ART);
+        recover_framing(
+            self.body_actor(),
+            self.target,
+            self.live_action_framing(),
+            self.pose.yaw,
+            pull_in,
+        )
+    }
+
+    /// Case 8's framing for the live pair, plus the eye-space Z **in world
+    /// units** the glide has to converge on - the death re-frame moves TR.z
+    /// by `4 * ctx[+0x270]` in that space, so a caller that re-derived the
+    /// depth from [`ActionFraming::depth_raw`] would walk to the wrong place.
+    ///
+    /// Retail's dead-target arm (`0x801D6A20`, taken when the framed target's
+    /// live-HP halfword is zero) is reached here through
+    /// [`PostActionTarget::live`]. The port conflates retail's two separate
+    /// tests - the node test `actor_table[target][+4] != 0` that picks the
+    /// focus, and `target[+0x14C] == 0` that opens this arm - into that one
+    /// flag, which is the same conflation the focus fork already documents.
+    pub(super) fn action_end_pose(&mut self) -> (BattleCamPose, i32) {
+        let f = self.live_action_framing();
+        let actor = self.body_actor();
+        let mut pose = action_end_framing(actor, self.target, f, self.pose.yaw);
+        if self.option == CAMERA_OPTION_FAR {
+            // `sh a0,0x12(sp)` with the live `_DAT_8007B792` (`0x801D696C`).
+            pose.yaw = self.pose.yaw;
+        }
+        if self.option != CAMERA_OPTION_CLOSE {
+            return (pose, f.depth_raw);
+        }
+        let Some(t) = self.target.filter(|t| !t.live) else {
+            // A standing target takes the live-target arm. Only a real
+            // target slot reaches it (`actor[+0x1DD] < 8`, `0x801D6BFC`).
+            if let Some(t) = self.target {
+                let raw_z = apply_live_target_reframe(&mut pose, t, f.depth_raw, self.pose);
+                return (pose, raw_z);
+            }
+            return (pose, f.depth_raw);
+        };
+        // Both dead-target arms start from the target-facing yaw.
+        let yaw = dead_target_yaw(t.facing, self.attack.ctx.phase_cursor, f);
+        if t.node_gone || t.lone_defeat {
+            // The stand-off arm adds the live ladder rather than zeroing it.
+            let yaw = yaw + self.action_yaw;
+            let raw_z = apply_node_gone_reframe(&mut pose, actor, yaw, f.body_radius);
+            return (pose, raw_z);
+        }
+        // Stored straight over the unwrapped base (`sh v1,0x12(sp)`); the
+        // tween builder's shortest-arc adjust takes it from there.
+        pose.yaw = yaw.rem_euclid(4096) as f32;
+        // The death re-frame owns the yaw ladder too: `sh zero,0x4(t0)` with
+        // `t0 = ctx + 0x6D6` zeroes `ctx[+0x6DA]` before the fork.
+        self.action_yaw = 0;
+        let ramp = self.attack.ctx.death_ramp;
+        if apply_death_reframe(&mut pose, f.depth_raw, ramp, t.world[1]) {
+            self.attack.ctx.death_ramp = 0;
+            return (pose, f.depth_raw);
+        }
+        (pose, f.depth_raw - 4 * i32::from(ramp))
+    }
+
+    /// Which framing owns the camera this frame. Hosts export it so what the
+    /// camera is *doing* is observable - a pose alone cannot distinguish "far
+    /// framing, mid-glide" from "action close-up, settled".
+    pub fn phase(&self) -> BattleCamPhase {
+        self.phase
+    }
+
+    /// Whether a glide is still carrying the camera toward its framing - the
+    /// capture harness's "settled" test, since a retail capture of a menu is
+    /// taken on a camera that has long arrived.
+    pub fn is_gliding(&self) -> bool {
+        !self.glides.is_empty()
+    }
+
+    /// The pose the glide in flight is heading for (the current pose when
+    /// none is) - what the retail comparison corpus sets against a
+    /// capture's tween-table endpoints.
+    pub fn glide_target(&self) -> BattleCamPose {
+        self.glides.front().map_or(self.pose, |g| g.target)
+    }
+
+    /// Phase-align the idle orbit's clock: set the free-running azimuth to
+    /// `yaw` (12-bit units). Applies only where the orbit owns yaw - the
+    /// [`BattleCamPhase::Menu`] far framing with no yaw glide in flight - and
+    /// returns whether it did.
+    ///
+    /// The orbit is a clock (`-4` per camera step from whatever azimuth the
+    /// field left), so a comparison against one retail instant reads the
+    /// capture's timing unless the two clocks are aligned; this is the
+    /// capture harness's handle for that, the camera twin of the field HUD
+    /// countdown hold. Nothing in play calls it.
+    pub fn align_orbit_yaw(&mut self, yaw: f32) -> bool {
+        let yaw_gliding = self.glides.front().is_some_and(|g| g.yaw_glides);
+        if self.phase != BattleCamPhase::Menu || yaw_gliding {
+            return false;
+        }
+        self.pose.yaw = yaw.rem_euclid(4096.0);
+        true
+    }
+
+    /// Whether the glide in flight heads for retail's framing on every
+    /// component: its endpoint agrees with `end` (retail's tween-table
+    /// endpoints) within [`Self::align_glide_origin`]'s per-component
+    /// tolerances. A glide that does walks retail's own step table, so a pose
+    /// read off that table at another instant (the frame the display showed)
+    /// is one the engine's glide passes through too. Never in the far
+    /// framing's [`BattleCamPhase::Menu`] phase. Nothing in play calls it.
+    pub fn glide_endpoint_matches(&self, end: BattleCamPose) -> bool {
+        self.glide_endpoint_matches_to(end, self.glide_target())
+    }
+
+    /// [`Self::glide_endpoint_matches`] against an explicit framing
+    /// `target` rather than the glide in flight - the framing the camera
+    /// would arm on the ground as it now stands
+    /// (`World::battle_camera_framing_now`).
+    pub fn glide_endpoint_matches_to(&self, end: BattleCamPose, target: BattleCamPose) -> bool {
+        if self.phase == BattleCamPhase::Menu {
+            return false;
+        }
+        let ang = |a: f32, b: f32| ((a - b).rem_euclid(4096.0)).min((b - a).rem_euclid(4096.0));
+        ang(target.pitch, end.pitch) <= ALIGN_ANGLE_TOLERANCE
+            && ang(target.yaw, end.yaw) <= ALIGN_ANGLE_TOLERANCE
+            && (0..3).all(|k| {
+                (target.tr[k] - end.tr[k]).abs() <= ALIGN_TR_TOLERANCE
+                    && (target.focus[k] - end.focus[k]).abs() <= ALIGN_FOCUS_TOLERANCE
+            })
+    }
+
+    /// Phase-align the glide's **origin** to a retail instant: every driven
+    /// component whose framing endpoint agrees with retail's (`end`, the
+    /// endpoints of retail's tween table `ctx[+0x118C]`) takes retail's live
+    /// value (`live`), and keeps stepping toward its own endpoint from
+    /// there. Components whose endpoints disagree are left alone, so a wrong
+    /// framing still reads as one. Applies outside the far framing's
+    /// [`BattleCamPhase::Menu`] phase only (the orbit has its own clock,
+    /// [`Self::align_orbit_yaw`]); returns the aligned components as a mask
+    /// in [`BattleCamPose`] order (`pitch, yaw, tr.x/y/z, focus.x/y/z`).
+    ///
+    /// Where a glide starts is the previous framing's leftover: the side and
+    /// tilt an earlier action's `rand()` coin chose, the orbit's clock at the
+    /// commit, how far the last re-arm got. A replay reaches a capture's
+    /// action on its own stream, so its glide sets out from somewhere else
+    /// even when it is heading to retail's framing; this is the capture
+    /// harness's handle for scoring the framing rather than that history,
+    /// the in-action twin of the orbit alignment. Nothing in play calls it.
+    pub fn align_glide_origin(&mut self, live: BattleCamPose, end: BattleCamPose) -> u8 {
+        let target = self.glide_target();
+        self.align_glide_origin_to(live, end, target)
+    }
+
+    /// [`Self::align_glide_origin`] against an explicit framing `target`:
+    /// the endpoint the camera's framing law arms on the ground as it now
+    /// stands, which a caller that has just moved the combatants supplies
+    /// (`World::battle_camera_framing_now`). The pose still takes retail's
+    /// live value only on the components whose endpoint agrees.
+    pub fn align_glide_origin_to(
+        &mut self,
+        live: BattleCamPose,
+        end: BattleCamPose,
+        target: BattleCamPose,
+    ) -> u8 {
+        if self.phase == BattleCamPhase::Menu {
+            return 0;
+        }
+        let ang = |a: f32, b: f32| ((a - b).rem_euclid(4096.0)).min((b - a).rem_euclid(4096.0));
+        let mut mask = 0u8;
+        // Both angles keep the engine's own unwrap: each lands on the live
+        // angle's representative nearest its current value (retail's words
+        // are masked to 12 bits; the summon close-up's pitch runs negative).
+        let nearest = |from: f32, to: f32| {
+            let d = (to - from).rem_euclid(4096.0);
+            from + if d > 2048.0 { d - 4096.0 } else { d }
+        };
+        if ang(target.pitch, end.pitch) <= ALIGN_ANGLE_TOLERANCE {
+            self.pose.pitch = nearest(self.pose.pitch, live.pitch);
+            mask |= 1;
+        }
+        let yaw_exact = ang(target.yaw, end.yaw) <= ALIGN_ANGLE_TOLERANCE;
+        if yaw_exact {
+            self.pose.yaw = nearest(self.pose.yaw, live.yaw);
+            mask |= 2;
+        } else if ang(target.yaw, end.yaw) <= ALIGN_YAW_EASE_BAND
+            && (target.focus[0] - end.focus[0]).abs() + (target.focus[2] - end.focus[2]).abs()
+                <= ALIGN_FOCUS_EASE_BAND
+        {
+            // The same framing of the same bodies on ground a few units off:
+            // the yaw endpoint carries a heading, which a replay lands within
+            // a band of, not on. When the two eases close on their endpoints
+            // from **opposite** sides the live yaws differ by where each
+            // glide set out from, not by the framing, so the engine's is
+            // put as far short of its own endpoint as retail's live yaw
+            // still stood from its - the channel then reads the endpoints'
+            // difference. Eases on the same side, or an engine glide that
+            // has landed, keep the engine's own yaw.
+            let signed = |a: f32, b: f32| (a - b + 2048.0).rem_euclid(4096.0) - 2048.0;
+            let own = signed(self.pose.yaw, target.yaw);
+            let left = signed(live.yaw, end.yaw);
+            if own.abs() > ALIGN_ANGLE_TOLERANCE && own * left < 0.0 {
+                self.pose.yaw = nearest(self.pose.yaw, target.yaw + left);
+                mask |= 2;
+            }
+        }
+        // A yaw whose endpoint agrees to the unit has just taken retail's
+        // live value - retail's point in its ease. The focus endpoint is a
+        // midpoint of body pairs, which a replay lands within a few steps of
+        // and not on; left on the engine's own glide it would draw the
+        // focus at another point of the ease than the yaw. Over the same
+        // bodies (the yaw tier's focus band) retail's live focus still stood
+        // `live - end` short of its endpoint - how far its ease had come from
+        // a start no word records - so the engine's is put that far short of
+        // its own, and the channel reads the endpoints' difference
+        // (`player_steal_skeleton_pre`: yaw `3239` four passes into its ease
+        // onto `2358`, the case-7 focus `110` / `122` short of an endpoint
+        // the engine's lands `16` off, where the engine's own glide had
+        // closed to `20` short).
+        let same_framing = yaw_exact
+            && (target.focus[0] - end.focus[0]).abs() + (target.focus[2] - end.focus[2]).abs()
+                <= ALIGN_FOCUS_EASE_BAND;
+        for k in 0..3 {
+            if (target.tr[k] - end.tr[k]).abs() <= ALIGN_TR_TOLERANCE {
+                self.pose.tr[k] = live.tr[k];
+                mask |= 4 << k;
+            }
+            if (target.focus[k] - end.focus[k]).abs() <= ALIGN_FOCUS_TOLERANCE {
+                self.pose.focus[k] = live.focus[k];
+                mask |= 32 << k;
+            } else if same_framing && self.is_gliding() {
+                self.pose.focus[k] = target.focus[k] + (live.focus[k] - end.focus[k]);
+                mask |= 32 << k;
+            }
+        }
+        mask
+    }
+
+    /// Phase-align the close-up accumulator `ctx[+0x87C]` to a retail
+    /// instant while the summon close-up ([`SUMMON_CAST_STATES`]) owns the
+    /// camera, and carry the pose with it; returns whether anything moved.
+    ///
+    /// Two clocks part between a capture and its replay there:
+    ///
+    /// - **The accumulator at the flash.** The flash that dates a `0x34`
+    ///   capture is spawned by the invoke clip's first effect record, so the
+    ///   accumulator at a given flash age is the accumulator at the spawn
+    ///   plus `8` a vsync. Retail's stands on `248`, `256` or `264` at Vahn's
+    ///   spawn across the captures - its passes are two or three vsyncs
+    ///   long frame by frame, and both clocks move a whole pass at a time -
+    ///   where the port's vsync-paced clip spawns on `264` every time. Which
+    ///   of those a capture holds is its frame-step history, recorded
+    ///   nowhere.
+    /// - **The pass boundary.** A retail capture is the state after a whole
+    ///   pass: the accumulator and the walker have both just stepped. The
+    ///   port adds `8` every display frame and steps the camera every
+    ///   [`Self::frame_step`] of them, so a gate that holds between two
+    ///   camera steps reads a pose up to two frames of accumulator old (at
+    ///   step `3`, where the three-frame tween lands every pass, that is the
+    ///   whole of the difference).
+    ///
+    /// The close-up is linear in the accumulator and re-armed every pass, so
+    /// the eased pose trails its target by a constant and moves by the
+    /// target's own difference: the pose is carried from the accumulator of
+    /// the last camera step to retail's - with the pitch ramp, while it has
+    /// not reached its cap - and the pass restarts here. An
+    /// accumulator further than [`CLOSE_UP_ALIGN_TOLERANCE`] from retail's
+    /// is left alone: that is a cue on another frame, not a pass boundary.
+    /// The capture harness's handle, the accumulator twin of
+    /// [`Self::align_orbit_yaw`]; nothing in play calls it.
+    pub fn align_close_up_accum(&mut self, accum: u32) -> bool {
+        let have = self.attack.ctx.accum;
+        // The accumulator the pose was last stepped on.
+        let stepped = have.saturating_sub(
+            self.frame_accum as u32 * crate::battle_attack_camera::AttackCamCtx::RAMP_SCALE,
+        );
+        if self.phase != BattleCamPhase::Action
+            || !SUMMON_CAST_STATES.contains(&self.last_action_state)
+            || have.abs_diff(accum) > CLOSE_UP_ALIGN_TOLERANCE
+            || (have == accum && stepped == accum)
+        {
+            return false;
+        }
+        // The pitch ramp `ctx[+0x26E]` runs beside the accumulator from the
+        // same commit until its cap, so while the two still agree it is
+        // carried too (an early `0x33` capture is pitched by it).
+        use crate::battle_attack_camera::AttackCamCtx;
+        let cap = u32::from(AttackCamCtx::RAMP_CAP);
+        let ramp = self.attack.ctx.ramp;
+        let tracks = u32::from(ramp) == have.min(cap);
+        let ramp_at = |a: u32| if tracks { a.min(cap) as u8 } else { ramp };
+        let (old, _) = summon_cast_framing(self.actor, self.acting_body, stepped, ramp_at(stepped));
+        let (new, _) = summon_cast_framing(self.actor, self.acting_body, accum, ramp_at(accum));
+        let turn = (new.yaw - old.yaw + 2048.0).rem_euclid(4096.0) - 2048.0;
+        self.pose.yaw = (self.pose.yaw + turn).rem_euclid(4096.0);
+        self.pose.pitch += new.pitch - old.pitch;
+        self.pose.tr[1] += new.tr[1] - old.tr[1];
+        self.pose.tr[2] += new.tr[2] - old.tr[2];
+        self.attack.ctx.accum = accum;
+        self.attack.ctx.ramp = ramp_at(accum);
+        self.frame_accum = 0;
+        true
+    }
+
+    /// Retail's `ctx[+0x87C]` - the close-up accumulator the framing
+    /// prologues advance by `8` a display frame and the active actor's clip
+    /// commit zeroes ([`Self::observe_active_commits`]).
+    pub fn close_up_accum(&self) -> u32 {
+        self.attack.ctx.accum
+    }
+
+    /// [`Self::close_up_accum`] as it runs without the natural-end
+    /// re-commits of a looping clip: zeroed by the action's start and by
+    /// each clip the active actor installs, advanced `8` a display frame
+    /// beside the accumulator. Port-only - retail's accumulator restarts on
+    /// those re-commits too, so this is an upper bound on it while the
+    /// engine plays retail's clip, and it keeps counting through a loop the
+    /// engine plays where retail held another (the retail comparison
+    /// corpus dates its action phases by it).
+    pub fn clip_age(&self) -> u32 {
+        self.clip_age
+    }
+
+    /// Camera steps taken since the action-SM state last changed
+    /// ([`Self::observe_action_state`]). Port-only: retail's framing call and
+    /// its walker run inside one pass, so a capture of a state is always at
+    /// least one pass in; the engine changes state on a tick and steps its
+    /// camera on every [`Self::frame_step`]-th, so the tick that enters a
+    /// state may not have stepped in it yet.
+    pub fn steps_in_state(&self) -> u32 {
+        self.steps_in_state
+    }
+
+    /// Current camera pose (12-bit angle units + eye-space TR), **with** the
+    /// live screen-shake offset folded into the translation pair - which is
+    /// where retail's `FUN_801D9D30` puts it.
+    pub fn pose(&self) -> BattleCamPose {
+        let mut p = self.pose;
+        p.tr[0] += self.shake.accum[0] as f32;
+        p.tr[1] += self.shake.accum[1] as f32;
+        p
+    }
+
+    /// The framing pose without the shake - the value the phase script's
+    /// glides converge on, and the one a test asserts a framing against.
+    pub fn framing_pose(&self) -> BattleCamPose {
+        self.pose
+    }
+
+    /// The live shake offset (retail `DAT_801C6EA4 + 0x18/+0x1C`).
+    pub fn shake_offset(&self) -> [i32; 2] {
+        self.shake.offset
+    }
+
+    /// The action framing for the acting actor, as case 6 would build it
+    /// now - on the live `ctx[+0x6DA]` counter.
+    pub(super) fn action_pose(&self) -> BattleCamPose {
+        action_framing(self.actor, self.live_action_framing())
+    }
+
+    /// [`Self::action`] with the live yaw counter and close-up counters
+    /// substituted in, and the swing-clip commit's `ctx[+0xD] = 0` applied
+    /// while it is latched.
+    pub(super) fn live_action_framing(&self) -> ActionFraming {
+        ActionFraming {
+            yaw_base: self.action_yaw,
+            accum: self.attack.ctx.accum,
+            ramp: self.attack.ctx.ramp,
+            style: self.action.style,
+            ..self.action
+        }
+    }
+
+    /// Take the camera back from a battle-stage module that owned the camera
+    /// globals (the Cort arrival, PROT 0968), at the pose it left them in.
+    ///
+    /// The module hands the fight back to flow state `0x0B`, and the round it
+    /// opens re-arms case `9` - the far framing - over case 9's own `a3 = 0xE`
+    /// (7 camera steps), tweening from wherever the module left the
+    /// registers. Yaw passes straight through to the idle orbit, as in every
+    /// case-9 re-arm.
+    ///
+    /// REF: FUN_801D5854 (case 9), FUN_801D829C
+    pub fn hand_back_from(&mut self, pose: BattleCamPose) {
+        let mut from = pose;
+        self.entry_sweep = None;
+        self.glides.clear();
+        self.glides.push_back(Glide::linear(
+            &mut from,
+            self.menu_pose(),
+            menu_raw_z(self.formation),
+            self.steps_of(SWING_RETURN_STEPS),
+            false,
+        ));
+        self.pose = from;
+        self.phase = BattleCamPhase::Menu;
+    }
+
+    /// Observe the live battle phase; a change arms the measured glide.
+    pub fn set_phase(&mut self, phase: BattleCamPhase) {
+        if phase == self.phase {
+            return;
+        }
+        // `Glide::linear` may unwrap the CURRENT yaw a full turn (retail's
+        // wrap-adjust moves whichever side is behind), so the live pose has to
+        // see the adjustment.
+        let mut from = self.pose;
+        self.glides.clear();
+        match phase {
+            BattleCamPhase::Action => {
+                // A new action: retail's `FUN_8004E13C` re-rolls the per-art
+                // track column (`ctx[+0x26D] = rand() % 2`) and the ramps
+                // restart from zero, so the swing frames from one of the
+                // table's two columns.
+                let coin = legaia_engine_system::rand::world_rand(&mut self.rand_state) & 1 != 0;
+                self.attack.ctx.begin_action(coin);
+                self.clip_age = 0;
+                // Retail re-arms case 6 on the state change and tweens over
+                // its own `a3 = 0xC` (6 camera steps), yaw included.
+                self.glides.push_back(Glide::linear(
+                    &mut from,
+                    self.action_pose(),
+                    self.live_action_framing().raw_z(),
+                    self.steps_of(ACTION_STEPS),
+                    true,
+                ));
+            }
+            BattleCamPhase::Recover => {
+                // Case 7 hands `FUN_801D829C` `a3 = 0xC` (`0x801D67C8`), the
+                // same 6 camera steps case 6 uses.
+                let target = self.recover_pose();
+                let raw_z = self.live_action_framing().depth_raw;
+                self.glides.push_back(Glide::linear(
+                    &mut from,
+                    target,
+                    raw_z,
+                    self.steps_of(POST_ACTION_STEPS),
+                    true,
+                ));
+            }
+            BattleCamPhase::ActionEnd => {
+                // Case 8's own `a3 = 0xC` (`0x801D6EEC`).
+                let (target, raw_z) = self.action_end_pose();
+                self.glides.push_back(Glide::linear(
+                    &mut from,
+                    target,
+                    raw_z,
+                    self.steps_of(POST_ACTION_STEPS),
+                    true,
+                ));
+            }
+            BattleCamPhase::TargetEnemy | BattleCamPhase::TargetAlly => {
+                // Cases 1 and 3 both hand `FUN_801D829C` `a3 = 0xC`
+                // (`0x801D5AF8`, `0x801D5C48`): 6 camera steps, yaw included.
+                if let Some((target, raw_z)) = self.cursor_pose() {
+                    self.glides.push_back(Glide::linear(
+                        &mut from,
+                        target,
+                        raw_z,
+                        self.steps_of(CURSOR_STEPS),
+                        true,
+                    ));
+                }
+            }
+            BattleCamPhase::Menu
+                if matches!(
+                    self.phase,
+                    BattleCamPhase::Action
+                        | BattleCamPhase::Recover
+                        | BattleCamPhase::ActionEnd
+                        | BattleCamPhase::TargetEnemy
+                        | BattleCamPhase::TargetAlly
+                ) =>
+            {
+                // End of action: case 9 re-arms the far framing over its own
+                // `a3 = 0xE` (7 steps) and passes yaw straight through, so
+                // the idle orbit owns it again immediately.
+                self.glides.push_back(Glide::linear(
+                    &mut from,
+                    self.menu_pose(),
+                    menu_raw_z(self.formation),
+                    self.steps_of(SWING_RETURN_STEPS),
+                    false,
+                ));
+            }
+            BattleCamPhase::Menu => {
+                if self.phase == BattleCamPhase::Dialogue {
+                    // Dialogue dismiss: rate-clamped pitch/TR glide while
+                    // the idle orbit resumes immediately (yaw not glided).
+                    self.glides.push_back(Glide {
+                        target: self.menu_pose(),
+                        rate: [
+                            DIALOGUE_EXIT_PITCH_RATE,
+                            0.0,
+                            f32::INFINITY,
+                            f32::INFINITY,
+                            DIALOGUE_EXIT_Z_RATE,
+                            f32::INFINITY,
+                            f32::INFINITY,
+                            f32::INFINITY,
+                        ],
+                        yaw_glides: false,
+                        steps_left: None,
+                        per_vsync: false,
+                    });
+                } else {
+                    // Submenu exit: swing up over the shoulder, then ease
+                    // back down to the menu framing (orbit resumes for the
+                    // return segment - retail re-enters at yaw 0). The swing
+                    // stays on the acting actor (retail case 1); only the
+                    // return pulls the focus out to the formation centre.
+                    let swing = Glide::linear(
+                        &mut from,
+                        BattleCamPose {
+                            focus: self.actor.world,
+                            ..SWING_POSE
+                        },
+                        SWING_TR_Z_RAW,
+                        SUBMENU_SWING_STEPS,
+                        true,
+                    );
+                    let mut swing_end = swing.target;
+                    let back = Glide::linear(
+                        &mut swing_end,
+                        self.menu_pose(),
+                        menu_raw_z(self.formation),
+                        self.steps_of(SWING_RETURN_STEPS),
+                        false,
+                    );
+                    self.glides.push_back(swing);
+                    self.glides.push_back(back);
+                }
+            }
+            BattleCamPhase::Submenu => {
+                self.glides.push_back(Glide::linear(
+                    &mut from,
+                    self.actor.submenu_pose(),
+                    SUBMENU_TR_Z_RAW,
+                    self.steps_of(SUBMENU_ENTER_STEPS),
+                    true,
+                ));
+            }
+            BattleCamPhase::Dialogue => {
+                // Retail never re-enters the dialogue close-up mid-battle;
+                // snap defensively.
+                self.pose = dialogue_pose(self.formation);
+                from = self.pose;
+            }
+        }
+        self.pose = from;
+        self.phase = phase;
+    }
+
+    /// Advance to the world's retail-frame counter, stepping the camera once
+    /// per 2 display frames (the measured cadence: every trace entry is an
+    /// even frame apart).
+    pub fn advance_to(&mut self, frames_now: u64) {
+        let elapsed = frames_now.saturating_sub(self.last_frames);
+        self.last_frames = frames_now;
+        let step = u64::from(self.frame_step.max(1));
+        if self.pass_granular {
+            // Retail's cadence: the counters move on the pass, a frame's
+            // worth at once, and hold between passes.
+            self.frame_accum += elapsed;
+            while self.frame_accum >= step {
+                self.frame_accum -= step;
+                self.advance_pass_counters(step);
+                self.step_once();
+            }
+            return;
+        }
+        self.advance_pass_counters(elapsed);
+        self.frame_accum += elapsed;
+        while self.frame_accum >= step {
+            self.frame_accum -= step;
+            self.step_once();
+        }
+    }
+
+    /// The counters the action SM's pass advances by the frame step, here
+    /// over `vsyncs` display frames.
+    fn advance_pass_counters(&mut self, vsyncs: u64) {
+        // The action SM advances `ctx[+0x6DA]` once a pass, outside its
+        // state switch, so the counter runs whether or not an action is
+        // executing: by `DAT_1F800393 * 4 / 3`, or `1` when that is zero
+        // (`0x801E29E4..0x801E2A24`, a `mult` by `0x55555556`). On retail's
+        // cadence the port adds the pass's own increment, which at step `3`
+        // is `4`, not `3`. Per vsync it spreads the pass's increment over its vsyncs, carrying the
+        // remainder, so the counter keeps retail's rate on either cadence:
+        // a vsync apiece at step `2`, four in three at step `3`.
+        if self.option != CAMERA_OPTION_FAR {
+            let d = if self.pass_granular {
+                i32::from(action_yaw_pass_increment(vsyncs as u8))
+            } else {
+                let step = u32::from(self.frame_step.max(1));
+                let inc = u32::from(action_yaw_pass_increment(self.frame_step.max(1)));
+                self.yaw_frac += vsyncs as u32 * inc;
+                let d = self.yaw_frac / step;
+                self.yaw_frac %= step;
+                d as i32
+            };
+            self.action_yaw = self.action_yaw.wrapping_add(d) & 0xFFFF;
+        }
+        // `FUN_801D5854`'s prologue ramps `ctx[+0x26E]` / `ctx[+0x87C]` by
+        // `8 * frame_step` on EVERY call (`lbu v0,0x7f(a2)` off `0x1F800314`,
+        // the step byte `0x1F800393`, then `sll v0,v0,0x3` at
+        // `0x801D5900..0x801D5914`), so they advance per display frame for
+        // as long as any framing case is being re-armed - not per camera
+        // step.
+        self.attack.ctx.advance(vsyncs as u32);
+        self.clip_age = self.clip_age.wrapping_add(
+            (vsyncs as u32).wrapping_mul(crate::battle_attack_camera::AttackCamCtx::RAMP_SCALE),
+        );
+    }
+
+    /// Advance the per-pass counters on the camera step that runs the
+    /// action SM's pass, a whole frame step at once, instead of a vsync at a
+    /// time. Retail's framing prologue adds `8 * DAT_1F800393` once a pass
+    /// (`0x801D5900..0x801D5914`), so on retail's cadence a frame between
+    /// two passes holds the accumulator the last pass left: the commit pass
+    /// of a clip reads `8 * step` beside a cursor advanced one pass, never
+    /// a value between.
+    pub fn set_pass_granular(&mut self, on: bool) {
+        self.pass_granular = on;
+    }
+
+    /// Put the camera's next step on the tick `ticks_into_frame` display
+    /// frames into the current battle frame says opens the next frame: a
+    /// step then fires on every tick that opens a battle frame, the tick the
+    /// action SM's pass runs on. Retail's walker and the framing arms run in
+    /// the same frame as the pass, so a camera stepping half a frame out of
+    /// phase framed every pass's arm one step late.
+    pub fn sync_step_phase(&mut self, ticks_into_frame: u64) {
+        let step = u64::from(self.frame_step.max(1));
+        self.frame_accum = (ticks_into_frame + step - 1) % step;
+    }
+
+    /// Run the camera on a frame step of `vsyncs` from here on: a step every
+    /// `vsyncs` display frames, each walker increment scaled by it, as
+    /// retail's walker scales by `DAT_1F800393`. Retail measures that step
+    /// per frame from the frame's own cost (`FUN_80016B6C`), so the engine's
+    /// play runs the default; a replay that knows the step retail ran at
+    /// (the retail-compare drive, off a capture's frame-time ring) sets it.
+    pub fn set_frame_step(&mut self, vsyncs: u8) {
+        self.frame_step = vsyncs.max(1);
+    }
+
+    /// A glide authored as `steps_at_two` camera steps at the default step
+    /// (`2 * steps_at_two` display frames), in steps of the current
+    /// [`Self::frame_step`]: the same frames over fewer, larger steps.
+    pub(super) fn steps_of(&self, steps_at_two: u32) -> u32 {
+        self.frames_to_steps(steps_at_two * 2)
+    }
+
+    /// `frames` display frames in camera steps of [`Self::frame_step`]
+    /// vsyncs (at least one).
+    pub(super) fn frames_to_steps(&self, frames: u32) -> u32 {
+        (frames / u32::from(self.frame_step.max(1))).max(1)
+    }
+
+    /// The camera's frame step in vsyncs ([`Self::set_frame_step`]).
+    pub fn frame_step(&self) -> u8 {
+        self.frame_step
+    }
+
+    /// One step of the walker toward the per-art pose.
+    ///
+    /// Retail rebuilds its whole nine-component step table every display
+    /// frame (`FUN_801D71B8` calls `FUN_801D829C` on each pass) and the walker
+    /// then applies one step of it, so the effective law is "move toward the
+    /// live target at `ceil(|delta| / duration)` per frame" - a chase with the
+    /// arm's own time constant, not a fixed glide toward a frozen target. That
+    /// is what this does, on the same builder ([`Glide::chase`]: the arm's
+    /// per-frame increment times the camera step's two frames - a 3-frame arm
+    /// covers two thirds of the gap a step rather than all of it).
+    pub(super) fn step_toward_attack_pose(
+        &mut self,
+        f: crate::battle_attack_camera::AttackCamFraming,
+    ) {
+        let target = BattleCamPose {
+            pitch: f32::from(f.pose.rot[0]),
+            yaw: f32::from(f.pose.rot[1]),
+            tr: [
+                f32::from(f.pose.dist[0]),
+                f32::from(f.pose.dist[1]),
+                f32::from(f.pose.dist[2]),
+            ],
+            // The arms build the look-at as the NEGATED actor position; the
+            // engine holds the focus un-negated (see `BattleCamPose::focus`).
+            focus: [
+                -f32::from(f.pose.look_at[0]),
+                -f32::from(f.pose.look_at[1]),
+                -f32::from(f.pose.look_at[2]),
+            ],
+        };
+        let mut from = self.pose;
+        let g = Glide::chase(
+            &mut from,
+            target,
+            i32::from(f.pose.dist[2]),
+            u32::from(f.duration_frames),
+            f32::from(self.frame_step),
+        );
+        self.pose = from;
+        self.step_components(&g);
+    }
+
+    /// Re-arm case 6's tween on the **live** acting actor.
+    ///
+    /// The action SM reaches `FUN_801D5854(actor, 6)` from every one of its
+    /// action states on every pass - `0x0C`, `0x14`, `0x1F`, `0x20`, `0x32`,
+    /// `0x37`, `0x3C`..`0x40`, `0x46`, `0x47` all call it before they do
+    /// anything else - so case 6 rebuilds its three tween-target vectors out
+    /// of the live actor record each display frame and hands them to
+    /// `FUN_801D829C`, which re-emits the step table. The framing therefore
+    /// *chases* the actor rather than gliding to a target frozen at the state
+    /// change, which matters because the attack states move the actor:
+    /// `0x14` stages the approach walk and `0x19` runs it, so a party member
+    /// crosses most of the gap to its target before the swing. A focus pinned
+    /// to the seat it left frames an empty patch of ground - at the traced
+    /// close-up depth (`prescale(0x500)` = 2048 against 4x-scaled stage
+    /// coordinates) the whole formation ends up outside the frustum, several
+    /// combatants behind the eye.
+    ///
+    /// Because the step table is rebuilt every pass, the motion is not a
+    /// linear glide that lands after [`ACTION_STEPS`]: each pass covers
+    /// `frame_step * ceil(rem / 0xC)` of what remains, an ease-out that
+    /// keeps closing in on the target well past the twelfth frame
+    /// ([`Glide::chase`]). Two captures pin the law in retail's own step
+    /// table at `ctx[+0x118C]`: `nivora_duel_mid_blazing_slash` reads yaw /
+    /// TR z increments `59` / `55` with `589` / `547` still to go, and
+    /// `battle_noa_miracle_art_combo` `66` / `86` with `587` / `772` - each
+    /// exactly `ceil((rem + frame_step * step) / 0xC)`, the table one pass
+    /// old with one walk applied.
+    ///
+    /// REF: FUN_801D5854 (case 6), FUN_801D829C (the step-table builder)
+    pub(super) fn retarget_action_glide(&mut self) {
+        let live = self.action_pose();
+        let raw_z = self.live_action_framing().raw_z();
+        let mut from = self.pose;
+        let g = Glide::chase(
+            &mut from,
+            live,
+            raw_z,
+            ACTION_STEPS * 2,
+            f32::from(self.frame_step),
+        );
+        self.pose = from;
+        self.glides.clear();
+        self.glides.push_back(g);
+    }
+
+    /// Re-derive the **far** framing against the live formation.
+    ///
+    /// Case 9 is not armed once and left: `FUN_801D0748`'s own battle tick
+    /// calls `FUN_801D5854(0, 9)` at `0x801D0E98`, and the menu driver
+    /// `FUN_801D388C` re-arms it at `0x801D4908` / `0x801D5688`, so retail
+    /// rebuilds `max(span * 3, 0x800)` and the bbox centre out of the live
+    /// actor table every pass - exactly like case 6.
+    ///
+    /// This matters because the formation *moves*: an attacker walks most of
+    /// the way to its target during the approach, collapsing the span to the
+    /// `0x800` floor. A depth frozen at the moment the far framing was armed
+    /// then survives the actor walking back to its seat, leaving the eye at
+    /// the minimum depth against a full-width formation - one combatant
+    /// filling the frame and the other **behind the eye**. That is what the
+    /// port shipped: entering the resting framing mid-approach pinned the
+    /// depth at `prescale(0x800)` for the rest of the fight.
+    ///
+    /// The dialogue-dismiss segment is skipped: it is the one rate-clamped
+    /// glide (`steps_left == None`), whose per-component rates are the traced
+    /// dismiss law rather than an arrive-together tween.
+    ///
+    /// REF: FUN_801D5854 (case 9)
+    pub(super) fn retarget_menu_glide(&mut self) {
+        // Skipped for the two segments that are not "walk to the far framing":
+        // the rate-clamped dialogue dismiss (`steps_left == None`) and the
+        // submenu-exit swing, which is a scripted two-segment chain through
+        // case 1's over-the-shoulder pose before it reaches this framing.
+        if self.glides.len() > 1 {
+            return;
+        }
+        if self
+            .glides
+            .front()
+            .is_some_and(|g| g.steps_left.is_none() || g.yaw_glides)
+        {
+            return;
+        }
+        let live = self.menu_pose();
+        // Settled on the live formation with nothing armed: the idle orbit
+        // owns the frame, so leave it alone rather than re-arming every step.
+        if self.glides.is_empty() && self.pose.tr == live.tr && self.pose.focus == live.focus {
+            return;
+        }
+        let steps = self
+            .glides
+            .front()
+            .and_then(|g| g.steps_left)
+            .unwrap_or(self.steps_of(SWING_RETURN_STEPS));
+        let mut from = self.pose;
+        // `yaw = false`: case 9 passes `_DAT_8007B792` straight through, so
+        // the idle orbit keeps owning the azimuth across the re-derive.
+        let g = Glide::linear(&mut from, live, menu_raw_z(self.formation), steps, false);
+        self.pose = from;
+        self.glides.clear();
+        self.glides.push_back(g);
+    }
+
+    /// [`Self::retarget_action_glide`]'s sibling for cases `7` and `8`: rebuild
+    /// the step table against the live pose every pass on the cases' own
+    /// `a3 = 0xC`, the same ease-out chase ([`Glide::chase`]).
+    ///
+    /// `raw_z` is the framing's own depth in world units: case 8's death and
+    /// stand-off arms move it off `ctx[+0x6D0]`, and the chase has to
+    /// converge on the depth the pose took, not on the unmoved one.
+    pub(super) fn retarget_post_action_glide(&mut self, live: BattleCamPose, raw_z: i32) {
+        let mut from = self.pose;
+        let g = Glide::chase(
+            &mut from,
+            live,
+            raw_z,
+            POST_ACTION_STEPS * 2,
+            f32::from(self.frame_step),
+        );
+        self.pose = from;
+        self.glides.clear();
+        self.glides.push_back(g);
+    }
+
+    /// One rate-limited step of every driven component (all but yaw, which
+    /// only moves when the segment owns it - otherwise the idle orbit does).
+    pub(super) fn step_components(&mut self, g: &Glide) {
+        self.pose.pitch = step_toward(self.pose.pitch, g.target.pitch, g.rate[0]);
+        for k in 0..3 {
+            self.pose.tr[k] = step_toward(self.pose.tr[k], g.target.tr[k], g.rate[2 + k]);
+            self.pose.focus[k] = step_toward(self.pose.focus[k], g.target.focus[k], g.rate[5 + k]);
+        }
+        if g.yaw_glides {
+            self.pose.yaw = step_toward(self.pose.yaw, g.target.yaw, g.rate[1]);
+        }
+    }
+
+    pub(super) fn step_once(&mut self) {
+        self.steps_in_state = self.steps_in_state.saturating_add(1);
+        // Re-roll the jitter first, on retail's own kernel. `amplitude == 0`
+        // is the resting state and backs the previous offset straight out, so
+        // an un-shaken camera returns to its framing pose on the next step
+        // rather than holding the last kick.
+        legaia_engine_camera::battle_camera::apply_shake(
+            &mut self.shake.accum,
+            &mut self.shake.offset,
+            self.shake.amplitude,
+            &mut self.rand_state,
+        );
+        // The frame driver's entry sweep runs before the battle tick does.
+        if self.step_entry_sweep() {
+            return;
+        }
+        // A granted flee's shot owns the camera to the battle's end: the run
+        // band and the escape teardown frame nothing of their own.
+        if self.escape_shot {
+            self.glides.clear();
+            self.step_module_shot();
+            // `0x65`'s escape arm backs the eye away, `-= 32 * step` on the
+            // eye-Z word `0x800840C0` a pass (`0x801E59A4..0x801E59BC`).
+            if self.last_action_state == RUN_WAIT_STATE {
+                self.pose.tr[2] -= ESCAPE_EYE_Z_BACK_PER_VSYNC * f32::from(self.frame_step);
+            }
+            return;
+        }
+        // Yaw: the idle orbit owns it in the Menu phase unless the active
+        // glide segment glides it (submenu enter / the exit swing).
+        let yaw_gliding = self.glides.front().is_some_and(|g| g.yaw_glides);
+        if !yaw_gliding && self.phase == BattleCamPhase::Menu {
+            // `yaw -= step * 2` a pass ([`ORBIT_STEP`] at the default step).
+            let orbit = ORBIT_STEP / 2.0 * f32::from(self.frame_step);
+            self.pose.yaw = (self.pose.yaw - orbit).rem_euclid(4096.0);
+        }
+        // The per-art attack camera runs AFTER `FUN_801D5854` has armed its
+        // own tween (`0x801D7180`), builds a pose of its own and calls the
+        // same tween builder again - so whenever an arm fires it is the
+        // per-art target the walker steps toward this frame, not case 6's.
+        // An art with no arm returns `None` and case 6's glide stands.
+        if self.phase == BattleCamPhase::Action {
+            // The summon band's `0x33` / `0x34` call `FUN_801DC0A0(caster,
+            // 0x12)` every pass, which arms its own close-up; neither state
+            // calls `FUN_801D5854`, so case 6 does not run.
+            if SUMMON_CAST_STATES.contains(&self.last_action_state) {
+                let c = self.attack.ctx;
+                let (target, raw_z) =
+                    summon_cast_framing(self.actor, self.acting_body, c.accum, c.ramp);
+                let mut from = self.pose;
+                let g = Glide::chase(
+                    &mut from,
+                    target,
+                    raw_z,
+                    SUMMON_CAST_TWEEN_FRAMES,
+                    f32::from(self.frame_step),
+                );
+                self.pose = from;
+                self.glides.clear();
+                self.step_components(&g);
+                return;
+            }
+            // `0x35` / `0x36` frame nothing of their own: the camera is the
+            // summon module's ([`Self::step_module_shot`]). A module whose
+            // camera arms are not ported arms no shot, and keeps case 6.
+            if SUMMON_MODULE_STATES.contains(&self.last_action_state) && self.module_shot_armed() {
+                self.glides.clear();
+                self.step_module_shot();
+                return;
+            }
+            // The magic band's `0x2A..=0x2E` call no `FUN_801D5854` case: the
+            // cast-effect driver's shot is the camera, re-armed on every pass
+            // that calls it, and a pass that does not leaves the last tween
+            // to land.
+            if SPELL_CAM_STATES.contains(&self.last_action_state) {
+                if let Some(mut si) = self.spell_cam.take() {
+                    si.accum = self.attack.ctx.accum;
+                    si.live_yaw = self.pose.yaw;
+                    si.frame_step = self.frame_step;
+                    if let Some(shot) = spell_cam_case(&si).shot {
+                        let mut from = self.pose;
+                        let steps = self.frames_to_steps(shot.frames);
+                        let g = Glide::linear(&mut from, shot.pose, shot.raw_z, steps, true);
+                        self.pose = from;
+                        self.glides.clear();
+                        self.glides.push_back(g);
+                    }
+                }
+                self.step_front_glide();
+                return;
+            }
+            // `0x70` re-arms no framing: hold, or walk the module's shot.
+            if self.last_action_state == CAPTURE_MODULE_STATE {
+                self.glides.clear();
+                self.step_module_shot();
+                return;
+            }
+        }
+        // `FUN_801D71B8` hangs off `FUN_801D5854`'s **shared** tail, so it
+        // runs after cases 7 and 8 exactly as after case 6: the strike loop
+        // `0x1E`, which arms case 7, is where most art swings are filmed.
+        // Its own first test is the target's live HP (`0x801D7200`), so a
+        // case-8 death re-frame is never overridden.
+        if self.option != CAMERA_OPTION_FAR
+            && matches!(
+                self.phase,
+                BattleCamPhase::Action | BattleCamPhase::Recover | BattleCamPhase::ActionEnd
+            )
+            && let Some(f) = self.attack_framing()
+        {
+            self.glides.clear();
+            self.step_toward_attack_pose(f);
+            return;
+        }
+        if self.phase == BattleCamPhase::Action {
+            self.retarget_action_glide();
+        }
+        // Cases 7 and 8 are re-armed by their own action-SM states on every
+        // pass exactly like case 6, and both frame on positions that move
+        // (case 7 on the *midpoint*, which walks as the pair separates), so
+        // they chase the live pair rather than gliding to a target frozen at
+        // the state change.
+        match self.phase {
+            BattleCamPhase::Recover => {
+                let target = self.recover_pose();
+                let raw_z = self.live_action_framing().depth_raw;
+                self.retarget_post_action_glide(target, raw_z);
+            }
+            BattleCamPhase::ActionEnd => {
+                let (target, raw_z) = self.action_end_pose();
+                self.retarget_post_action_glide(target, raw_z);
+            }
+            BattleCamPhase::Menu => self.retarget_menu_glide(),
+            _ => {}
+        }
+        self.step_front_glide();
+    }
+
+    /// Step the front glide segment once, popping it when it lands.
+    pub(super) fn step_front_glide(&mut self) {
+        let Some(g) = self.glides.front().copied() else {
+            return;
+        };
+        let done = match g.steps_left {
+            // Arrive-together glide: the final step lands ON the target
+            // (no float residue from the per-step rate division).
+            Some(1) => {
+                self.pose.pitch = g.target.pitch;
+                self.pose.tr = g.target.tr;
+                self.pose.focus = g.target.focus;
+                if g.yaw_glides {
+                    self.pose.yaw = g.target.yaw;
+                }
+                true
+            }
+            Some(n) => {
+                if let Some(front) = self.glides.front_mut() {
+                    front.steps_left = Some(n - 1);
+                }
+                self.step_components(&g);
+                false
+            }
+            // Rate-clamped glide: each component clamps independently.
+            None => {
+                self.step_components(&g);
+                self.pose.pitch == g.target.pitch
+                    && self.pose.tr == g.target.tr
+                    && self.pose.focus == g.target.focus
+                    && (!g.yaw_glides || self.pose.yaw == g.target.yaw)
+            }
+        };
+        if done {
+            self.glides.pop_front();
+            if g.yaw_glides {
+                // Re-enter the wrapped orbit domain (the exit swing lands
+                // on 4096 = 0, where the idle orbit resumes).
+                self.pose.yaw = self.pose.yaw.rem_euclid(4096.0);
+            }
+        }
+    }
+}
+
+/// The action SM's per-pass `ctx[+0x6DA]` increment at frame step `step`:
+/// `step * 4 / 3`, or `1` when that truncates to zero
+/// (`0x801E29E4..0x801E2A24`).
+pub fn action_yaw_pass_increment(step: u8) -> u16 {
+    let d = u16::from(step) * 4 / 3;
+    if d == 0 { 1 } else { d }
+}
+
+/// The framing a display-lag retake aligns its glide against: the retake
+/// tick's own (`armed`), with each pitch, yaw and eye component that misses
+/// retail's RAM endpoint (`end`) taken from the gate tick's framing (`gate`)
+/// when that one agrees.
+///
+/// The retake draws two game frames before the RAM's instant, and the
+/// camera's own drift between them - the yaw counter's
+/// [`action_yaw_pass_increment`] a pass, a `0x6F` depth ramp - can put the
+/// retake's endpoint a step off the RAM's on a framing the gate tick agrees
+/// with. The focus keeps the retake's: it is a midpoint of the body pairs the
+/// retake draws, not a clock.
+pub fn retake_align_target(
+    armed: BattleCamPose,
+    gate: BattleCamPose,
+    end: BattleCamPose,
+) -> BattleCamPose {
+    let ang = |a: f32, b: f32| ((a - b).rem_euclid(4096.0)).min((b - a).rem_euclid(4096.0));
+    let mut t = armed;
+    if ang(armed.pitch, end.pitch) > ALIGN_ANGLE_TOLERANCE
+        && ang(gate.pitch, end.pitch) <= ALIGN_ANGLE_TOLERANCE
+    {
+        t.pitch = gate.pitch;
+    }
+    if ang(armed.yaw, end.yaw) > ALIGN_ANGLE_TOLERANCE
+        && ang(gate.yaw, end.yaw) <= ALIGN_ANGLE_TOLERANCE
+    {
+        t.yaw = gate.yaw;
+    }
+    for k in 0..3 {
+        if (armed.tr[k] - end.tr[k]).abs() > ALIGN_TR_TOLERANCE
+            && (gate.tr[k] - end.tr[k]).abs() <= ALIGN_TR_TOLERANCE
+        {
+            t.tr[k] = gate.tr[k];
+        }
+    }
+    t
+}
+
+#[cfg(test)]
+mod retake_target_tests {
+    use super::*;
+
+    fn pose(yaw: f32, z: f32, fz: f32) -> BattleCamPose {
+        BattleCamPose {
+            pitch: 0.0,
+            yaw,
+            tr: [0.0, 1280.0, z],
+            focus: [649.0, 0.0, fz],
+        }
+    }
+
+    /// `zora_glare_petrify_pre`: the retake's case-6 framing stands a pass of
+    /// yaw drift and a step of depth ramp short of the RAM's endpoint, which
+    /// the gate tick's framing meets.
+    #[test]
+    fn a_retake_short_of_the_ram_endpoint_takes_the_gate_framing() {
+        let t = retake_align_target(
+            pose(2914.0, 4761.0, -47.0),
+            pose(2919.0, 4608.0, -47.0),
+            pose(2919.0, 4608.0, -47.0),
+        );
+        assert_eq!((t.yaw, t.tr[2]), (2919.0, 4608.0));
+    }
+
+    /// A retake that already agrees keeps its own framing, and the focus is
+    /// always the retake's (`nivora_duel_mid_blazing_slash`,
+    /// `battle_vahn_tri_somersault_super`).
+    #[test]
+    fn an_agreeing_retake_and_every_focus_stay_the_retakes() {
+        let t = retake_align_target(
+            pose(4051.0, 4915.0, -700.0),
+            pose(4055.0, 4915.0, -630.0),
+            pose(4051.0, 4915.0, -630.0),
+        );
+        assert_eq!((t.yaw, t.focus[2]), (4051.0, -700.0));
+    }
+}
+
+#[cfg(test)]
+mod pass_increment_tests {
+    use super::action_yaw_pass_increment;
+
+    /// `step * 4 / 3` through the `0x55555556` multiply, `1` when it
+    /// truncates to zero.
+    #[test]
+    fn the_action_yaw_gains_four_thirds_of_the_step_a_pass() {
+        assert_eq!(
+            [0u8, 1, 2, 3, 4].map(action_yaw_pass_increment),
+            [1, 1, 2, 4, 5]
+        );
+    }
+
+    /// On the per-vsync cadence the counter keeps retail's rate: four units
+    /// over a step-`3` pass's three vsyncs, two over a step-`2` pass's two.
+    #[test]
+    fn the_per_vsync_counter_runs_at_the_pass_rate() {
+        use super::super::{BattleCamPhase, BattleCamera};
+        for (step, per_pass) in [(3u8, 4i32), (2, 2)] {
+            let mut cam = BattleCamera::new(BattleCamPhase::Menu, 0);
+            cam.set_frame_step(step);
+            let start = cam.action_yaw_base();
+            for v in 1..=u64::from(step) * 6 {
+                cam.advance_to(v);
+            }
+            assert_eq!(cam.action_yaw_base() - start, per_pass * 6, "step {step}");
+        }
+    }
+}

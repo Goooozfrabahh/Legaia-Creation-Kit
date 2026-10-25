@@ -1,0 +1,235 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">tooling</a> &middot; byte accounting</div>
+  <h1>Byte accounting</h1>
+  <p class="lede"><a href="disc-coverage.html">Disc coverage</a> says what format an entry <em>is</em>. This says how many of that entry's bytes any parser in the tree actually consumes - and classifies the leftover by shape, so an unwalked format is a run at the top of a list rather than a feeling.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance" data-doc="-">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Tool</dt><dd><code>asset account &lt;entry&gt;</code>; whole-TOC sweep <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/scripts/asset-investigation/byte-account-sweep.py"><code>scripts/asset-investigation/byte-account-sweep.py</code></a></dd>
+    <dt>Module</dt><dd><code>legaia_disc_audit::byte_account</code></dd>
+    <dt>Question</dt><dd>Not "what is this entry" but "which of its bytes does anything here consume, and what is the rest"</dd>
+    <dt>Two figures</dt><dd><code>structural</code> (a walker followed the container's own layout) and <code>accounted</code> (that, plus what a magic sweep found in the residue)</dd>
+    <dt>Output</dt><dd>Per-owner claims, per-shape residue, and the largest unclaimed runs - a worklist</dd>
+    <dt>Sibling</dt><dd><a href="disc-coverage.html">Disc coverage</a> - format <em>recognition</em>, weighted by entry size, and an upper bound by construction</dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="running-it" data-doc="running-it,method">
+  <h2>Running it</h2>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Command</th><th>Does</th></tr></thead>
+    <tbody>
+      <tr><td><code>asset account extracted/PROT/0867_battle_data.BIN</code></td><td>One extracted entry by path</td></tr>
+      <tr><td><code>asset account 893 --prot-dir extracted/PROT</code></td><td>Bare extraction index</td></tr>
+      <tr><td><code>asset account 898 --funcs ghidra/scripts/funcs</code></td><td>An overlay code image</td></tr>
+      <tr><td><code>asset account 0086 --depth 2 --json &gt; kingdom.json</code></td><td>Two levels of nested accounting, as JSON</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The method is four steps. Classify the buffer with <code>asset categorize</code> and pick a walker; run the walker, which emits <strong>claims</strong> - half-open <code>[start, end)</code> ranges each tagged with an owner; merge the claims and take the complement, so every maximal uncovered run is one <strong>residue</strong>; and where a claim covers a compressed span, decode it and account the payload in a nested pass. Two walker selections are keyed on the extraction index rather than on the class, because no detector fires on their heads: the monster archive, and any entry with a row in the <a href="static-overlay-pipeline.html">static overlay map</a>.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 860 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="One PROT entry as a byte strip. Row one: the walker's claims, half-open ranges tagged with an owner, overlapping and out of order; one claim comes from a scan sweep rather than the container's own layout. Row two: the merged claims and their complement; each uncovered run is one residue, classified by shape. Row three: a claim over an LZS span is decoded and its payload accounted in a nested pass. accounted counts every claim; structural leaves out the scan claim.">
+      <defs><marker id="ba-ah" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <text x="16" y="24" class="dg-sub dg-start">1. walker claims</text>
+      <rect x="150" y="10" width="690" height="28" rx="2" class="dg-group"/>
+      <rect x="150" y="10" width="120" height="28" rx="2" class="dg-node-accent"/><text x="210" y="28" class="dg-sub">header</text>
+      <rect x="250" y="10" width="190" height="28" rx="2" class="dg-node-accent"/><text x="345" y="28" class="dg-sub">table (overlaps)</text>
+      <rect x="520" y="10" width="170" height="28" rx="2" class="dg-node-accent"/><text x="605" y="28" class="dg-sub">LZS stream</text>
+      <rect x="740" y="10" width="60" height="28" rx="2" class="dg-node-warn"/><text x="770" y="28" class="dg-sub">scan</text>
+
+      <path d="M495 44 L495 70" class="dg-edge" marker-end="url(#ba-ah)"/>
+      <text x="505" y="62" class="dg-edge-label">merge, take the complement</text>
+
+      <text x="16" y="96" class="dg-sub dg-start">2. merged + residue</text>
+      <rect x="150" y="82" width="290" height="28" rx="2" class="dg-node-accent"/><text x="295" y="100" class="dg-sub">claimed</text>
+      <rect x="440" y="82" width="80" height="28" rx="2" class="dg-node"/><text x="480" y="100" class="dg-label">residue</text>
+      <rect x="520" y="82" width="170" height="28" rx="2" class="dg-node-accent"/><text x="605" y="100" class="dg-sub">claimed</text>
+      <rect x="690" y="82" width="50" height="28" rx="2" class="dg-node"/><text x="715" y="100" class="dg-label">res.</text>
+      <rect x="740" y="82" width="60" height="28" rx="2" class="dg-node-warn"/><text x="770" y="100" class="dg-sub">scan</text>
+      <rect x="800" y="82" width="40" height="28" rx="2" class="dg-node"/><text x="820" y="100" class="dg-label">res.</text>
+      <text x="480" y="128" class="dg-sub">each maximal uncovered run: one residue, classed by shape</text>
+
+      <path d="M605 136 L605 162" class="dg-edge" marker-end="url(#ba-ah)"/>
+      <text x="595" y="154" class="dg-edge-label" text-anchor="end">decode, account the payload (nested pass)</text>
+
+      <text x="16" y="188" class="dg-sub dg-start">3. nested pass</text>
+      <rect x="430" y="174" width="410" height="28" rx="2" class="dg-group"/>
+      <rect x="430" y="174" width="250" height="28" rx="2" class="dg-node-accent"/><text x="555" y="192" class="dg-sub">decoded bytes a parser walks</text>
+      <rect x="680" y="174" width="160" height="28" rx="2" class="dg-node"/><text x="760" y="192" class="dg-label">decoded residue</text>
+
+      <rect x="150" y="218" width="14" height="12" class="dg-node-accent"/><text x="170" y="228" class="dg-sub dg-start">structural claim (counts in both figures)</text>
+      <rect x="470" y="218" width="14" height="12" class="dg-node-warn"/><text x="490" y="228" class="dg-sub dg-start">scan claim (accounted only, not structural)</text>
+    </svg>
+    <figcaption>The account of one entry. An LZS stream is 100% accounted on the outer pass by construction; the figure worth reading is what its decoded side accounts to. Widths are illustrative.</figcaption>
+  </figure>
+  <h3>What the number means</h3>
+  <p><code>accounted</code> is the share of an entry's bytes some parser consumes. It is <strong>not</strong> the share whose meaning is understood: a fixed-region file accounts to 100% the moment its region constants are written down, while the semantics of those regions can be only partly pinned. Read it as an upper bound on understanding and a lower bound on structure.</p>
+  <p>Claims are tiered so the figure cannot be inflated by guessing. An owner of <code>scan</code> means a magic sweep found the sub-asset in the residue - evidence that it is <em>there</em>, not that anything walked to it. That is why the report prints <code>structural</code> beside <code>accounted</code>, and why a large gap between them is a warning rather than a result.</p>
+</section>
+
+<section class="doc-section" id="owners" data-doc="owner-vocabulary">
+  <h2>Owner vocabulary</h2>
+  <p>An owner says what <em>kind</em> of thing consumes the bytes, not which module claimed them; each claim's free-form detail names the instance.</p>
+  <table>
+    <thead><tr><th>Owner</th><th>Bytes it names</th></tr></thead>
+    <tbody>
+      <tr><td><code>header</code> / <code>toc</code></td><td>a container's fixed head words; the offset or descriptor table its reader walks</td></tr>
+      <tr><td><code>lzs</code></td><td>a compressed span - the decoded side is accounted in a nested pass</td></tr>
+      <tr><td><code>tim</code> / <code>tmd</code> / <code>vab</code> / <code>seq</code> / <code>anm</code></td><td>a sub-asset of that format, header through end</td></tr>
+      <tr><td><code>record</code> / <code>grid</code></td><td>a fixed-stride data record; a dense per-tile grid</td></tr>
+      <tr><td><code>script</code> / <code>code</code></td><td>a bytecode body; MIPS instructions inside a dumped function's extent</td></tr>
+      <tr><td><code>texture</code> / <code>clut</code> / <code>string</code></td><td>a raw texture page with no TIM header; a palette region; a resolved string</td></tr>
+      <tr><td><code>pad</code></td><td>declared slack inside a fixed-stride slot the container's own size math covers</td></tr>
+      <tr><td><code>scan</code></td><td>found by a magic sweep over the residue, <strong>not</strong> by a structural walk</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="doc-section" id="shapes" data-doc="residue-shapes">
+  <h2>Residue shapes</h2>
+  <p>Each uncovered run gets exactly one shape, and the tests run in a fixed order that is load-bearing.</p>
+  <table>
+    <thead><tr><th>Shape</th><th>Test</th></tr></thead>
+    <tbody>
+      <tr><td><code>zero_pad</code></td><td>every byte is <code>0x00</code></td></tr>
+      <tr><td><code>alignment</code></td><td>shorter than 16 bytes and not all zero</td></tr>
+      <tr><td><code>repeated_fill</code></td><td>one short pattern (period 1, 2, 4, 8 or 16) repeated - dev fill</td></tr>
+      <tr><td><code>ascii_text</code></td><td>at least 80% printable ASCII or NUL - a string pool</td></tr>
+      <tr><td><code>pointer_dense</code></td><td>at least 20% of words land in <code>0x80000000..0x80200000</code></td></tr>
+      <tr><td><code>bgr555</code></td><td>nearly every halfword below <code>0x8000</code>, wide high-entropy spread - PSX 15-bit colour</td></tr>
+      <tr><td><code>plausible_mips</code></td><td>plausible opcodes over at least four of them, almost no pointers, no SPECIAL landslide</td></tr>
+      <tr><td><code>low_entropy</code> / <code>high_entropy</code> / <code>mixed</code></td><td>below 4.0 bits/byte; at or above 7.2; none of the above</td></tr>
+    </tbody>
+  </table>
+  <h3>Three ways a naive classifier calls data "code"</h3>
+  <ul class="bullets">
+    <li><strong>A pointer table decodes as code.</strong> A word like <code>0x801C1234</code> has primary opcode <code>0x20</code> - a plausible <code>lb</code> - so a table of overlay pointers scores perfectly on opcode plausibility. <code>pointer_dense</code> is tested first.</li>
+    <li><strong>A small-value table decodes as code.</strong> A sparse 16-bit table is SPECIAL in every word, which is also plausible. So <code>plausible_mips</code> additionally demands a spread across four primary opcodes and keeps SPECIAL under 60%: real code mixes loads, stores, immediates and branches; a table does not.</li>
+    <li><strong>A colour page decodes as code too.</strong> A BGR555 halfword pair forms a plausible word and colour spreads across enough opcodes to clear the distinct-opcode floor, so <code>bgr555</code> is tested first - and it discriminates the other way, because real MIPS puts a halfword at or above <code>0x8000</code> in every load, store and <code>lui</code> pair.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="overlays" data-doc="overlay-code-images">
+  <h2>Overlay code images</h2>
+  <p>For an entry that is a runtime overlay, the "parser" is the <a href="ghidra.html">Ghidra dump corpus</a>: a dump header states an extent, and that extent maps to file offsets through the overlay's load base. The header parse is re-implemented in Rust, so the instrument needs a checkout and a dump directory and never invokes Ghidra.</p>
+  <p>The hard part is not the header. Every slot-A overlay loads at <code>0x801CE818</code>, so a printed address cannot say which image a dump belongs to. This instrument resolves it <strong>from the bytes</strong>: it re-encodes the dump's first printed instructions and compares them against the image at the mapped offset. A printed instruction that re-encodes to the image's word is <em>confirmed</em> and credited; one that re-encodes to a different word is <em>refuted</em> and dropped; a dump whose head is outside the small encodable grammar is <em>unverifiable</em> and is credited only when its filename label names this entry. The grammar is deliberately small, so the instrument's silence never reads as a refutation.</p>
+  <h3>The slot-B images</h3>
+  <p>An image walks this way when its map row is <strong>linked at the slot-B base</strong> - not when its index falls in a range, and not on a class. The three regions the walk recovers are each resolved by comparing a word against that base, so the base is what makes the walk apply, and it runs with or without a dump directory because those regions come out of the image itself. The walker claims the head jump table as <code>toc</code> and each spawn record as <code>record</code>.</p>
+  <p>Seventy mapped images sit at that base. Sixty-four are the cast / summon band <code>0903..0966</code> - the per-spell summon stagers and capture-class cast modules the battle overlay's three entry tables reach. The other six are the two render occupants, the battle tutorial and its two stage-module siblings, and the staged texture loader. Selecting on the index band had left all six measured as if they had no head table.</p>
+  <p>A record's extent is named by an <strong>instruction</strong>, not by a statistic: the module materialises the address with a <code>lui</code>/<code>addiu</code> pair and hands it to <code>FUN_80021B04</code> / <code>FUN_80050ED4</code> in <code>$a2</code>, and the next record's pointer is the current one's end. The image's highest record has nothing above it to bound it, so its own move-VM program's terminator does - a <code>HALT</code>, an armed idle loop, or, only where neither turns up, the last maximal <code>WAIT</code> the walk stepped over. On retail every image that has a highest record bounds it; where a walk does not terminate the record stays residue and the walker's note names its offset. Full layout: <a href="../formats/slot-b-module-layout.html">slot-B module layout</a>.</p>
+  <p>That makes the set the cleanest class on the disc, and the numbers say why in a way no other class can match. All 70 images select this walker over 653312 bytes, and <em>every</em> claim is structural - not one byte of the accounted share comes from a magic guess. The residue is 11216 bytes, of which 2618 are zero padding. Per entry the accounted share runs 69.2% to 100.0% with a median of 99.1%; the floor is the battle tutorial, whose own content above its code is a string pool no consumer has been traced to yet.</p>
+</section>
+
+<section class="doc-section" id="reading" data-doc="interpreting-a-report">
+  <h2>Reading a report</h2>
+  <ul class="bullets">
+    <li>A large <code>high_entropy</code> run nothing claims is a compressed or sample-data region with no walker. Top of the worklist.</li>
+    <li>A large <code>plausible_mips</code> run in a non-overlay entry is either an un-dumped routine or a walker that stopped early.</li>
+    <li>A <code>low_entropy</code> or <code>mixed</code> run next to a claimed table is usually that table's body: the walker found the header and stopped.</li>
+    <li><code>zero_pad</code> and <code>repeated_fill</code> are not work - sector padding and dev fill are the disc's own slack.</li>
+    <li>A high <code>structural</code> with a small gap to <code>accounted</code> is the healthy case. The reverse means most of what was found was found by guessing at magics, and the container's layout is still unwalked.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="ranked" data-doc="ranked-residue-across-the-whole-toc">
+  <h2>Ranked residue across the whole TOC</h2>
+  <p>One entry at a time is the right shape for a hunt and the wrong shape for a worklist: the entries whose residue is worth walking are not the ones anybody thought to run the tool on. The sweep runs every PROT entry and rolls the result up by entry class and by residue shape, so what lands at the top is a property of the disc rather than of what somebody sampled. It writes a CSV of numbers only - the per-run head hex is disc bytes and is dropped - under <code>target/</code>, and nothing about that file is committed.</p>
+  <table>
+    <thead><tr><th>Class</th><th>What its unclaimed bytes are</th><th>Verdict</th></tr></thead>
+    <tbody>
+      <tr><td>the fixed-stride streaming slots</td><td>nothing - each slot's fill is claimed out to the stride the loader transfers</td><td>closed</td></tr>
+      <tr><td>the multi-bank VAB</td><td>nothing - the bank index, each bank's two chunks and each bank's sector slack are all claimed from lengths the container states</td><td>closed</td></tr>
+      <tr><td><code>overlay_data_blob</code></td><td>almost all <code>zero_pad</code>; the rest is one entry whose whole extent reads <code>plausible_mips</code> although its head is a length-prefixed Japanese label table</td><td>a Japanese-build menu image the USA disc never loads</td></tr>
+      <tr><td><code>lzs_container</code></td><td>one member that is a code image rather than a container; the per-entry tails past the last descriptor's stream were the packer's buffer and are claimed</td><td>one mis-classed entry</td></tr>
+      <tr><td><code>overlay_ptr_table</code>, <code>mips_overlay</code></td><td><code>low_entropy</code> with a <code>plausible_mips</code> minority</td><td>dump worklist - and it agrees with <a href="disc-coverage.html">disc coverage</a>'s gap list</td></tr>
+      <tr><td>scene streams, battle data</td><td>nothing - the chunk walk reaches the terminator and what is left of the entry's last sector is claimed as slack, the same thing the multi-bank VAB's per-bank slack is</td><td>closed</td></tr>
+      <tr><td>scene asset tables, packs</td><td>nothing but <code>zero_pad</code> - what follows the last descriptor's stream is an earlier entry's bytes at the same file offsets</td><td>closed: the walker reaches the end of the content</td></tr>
+      <tr><td>filler, zero entries, trigger sidecars</td><td><code>ascii_text</code> and <code>zero_pad</code></td><td>the disc's own slack</td></tr>
+      <tr><td>field maps</td><td>nothing - every entry accounts fully</td><td>closed</td></tr>
+    </tbody>
+  </table>
+  <h3>Two ways the headline number lies</h3>
+  <p><strong>A low percentage that is finished.</strong> Every walk-on trigger sidecar accounts in the single digits and every unclaimed byte in all of them is <code>zero_pad</code>: the format is one sector whose records occupy a small head and whose rest is padding it declares. Ranking a worklist by accounted share alone would put all of them near the top. Rank by <em>non-slack</em> residue instead.</p>
+  <p><strong>A high percentage that walked nothing.</strong> The multi-bank VAB used to account for almost all of its bytes and structurally for none of them - every claim came from the magic sweep, which is evidence that sample bodies are <em>there</em> and nothing more. That is what the <code>scan</code> tier exists to expose, and it was the largest instance on the disc: 206 banks' worth of samples found by hunting a magic while the 206-entry sector index in the entry's own head went unread. It is walked now, so read the lesson off the tier rather than off that entry - quote <code>structural</code>, or carry the scan figure beside the accounted share, because the two can differ by five points of the whole disc without the headline saying so. With that entry, the menu overlay's two pinned atlases and the standalone BGM sequence bound, no byte of the disc's accounted share now rests on a magic guess.</p>
+  <p><strong>A low percentage that is the disc's own padding.</strong> The largest unwalked region on the whole disc was the monster archive, at well under two thirds accounted - and every unclaimed byte of it was zero, in one run per slot, ending exactly on a slot boundary. The battle loader seeks by a fixed stride and then reads a literal forty sectors, so a slot arrives whole however little of it the compressed block uses, and the file's extent is an exact multiple of that stride. The tail is declared slack, and the two battle side-band streaming files are the same shape at their own stride. Claiming it moves the structural share by more than five points of the whole disc and moves the worklist by nothing, which is the honest reading: the largest thing left was never a format.</p>
+  <p><strong>A code image can be mostly fill, and a dump can agree with fill.</strong> <code>nop</code> encodes to a word of zeros, so a dump whose head is <code>nop</code> agrees with zero fill in any image at any base - and the dump corpus holds such dumps, taken over an image's own zero region. One confirmed a 20 KB extent inside a 131 KB hole in the cutscene overlay and carried most of that entry's reported code share. A confirmation now needs a non-zero word, and an all-zero extent is never claimed as code. A residue run is also cut wherever a sector or more of fill sits inside it, so the fill is reported as padding instead of being glued to the content beside it and counted as work.</p>
+  <p><strong>An <code>ascii_text</code> run is not necessarily a string pool.</strong> The shape test counts NUL as printable, because a string pool is short strings separated by terminators - but so is a mostly-empty region with a few strings in it, and the all-zero test will not take it because one non-zero byte disqualifies the run. Read such a run by its zero fraction before treating it as unwalked format, and do not widen the all-zero test to absorb it: that moves bytes out of the worklist by redefining the instrument rather than by understanding them.</p>
+  <p>The sweep also corroborates a format page from the other direction: every <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/formats/pochi.md">pochi filler</a> slot is exactly one 2048-byte sector, and the fill classifies as <code>ascii_text</code> while <code>repeated_fill</code> is tested first - so the sector is text-shaped rather than one short pattern repeated. A second, independent reason none of those slots carries a parseable asset.</p>
+  <h3>Three families that read as unwalked format and were not</h3>
+  <p>Each of these headed the ranking at some point and none of them was an unrecognised format. All three were <em>bindings</em>: the bytes were already understood somewhere and nothing connected that understanding to the walker. That is the shape to expect at the top of this ranking.</p>
+  <table>
+    <thead><tr><th>Family</th><th>What the bytes are</th><th>What was missing</th></tr></thead>
+    <tbody>
+      <tr><td>18 <code>lzs_container</code> entries</td><td>the ordinary scene-bundle descriptor table, at descriptor counts the <em>detector's</em> window excludes - retail bounds the count nowhere</td><td>a walker bound to the class</td></tr>
+      <tr><td>266 filler slots</td><td>one 1927-byte dev fill file plus 121 bytes of the mastering buffer's previous contents</td><td>a shape rule - the fill's line is 52 bytes long, so the period-1/2/4/8/16 test never fires and 266 sectors of filler ranked as work</td></tr>
+      <tr><td>2 headerless stills</td><td>four <code>320x64</code> 16bpp band uploads to VRAM <code>(384, 0)</code></td><td>a walker - the rectangle was already recovered from the consumer's immediates</td></tr>
+      <tr><td>the multi-bank VAB</td><td>206 banks on a sector index the entry's own head carries, each one a two-chunk stream</td><td>a walker - the detector already read the count and the sector table, it just never claimed anything with them</td></tr>
+      <tr><td>the boot logo pack</td><td>four publisher-logo images at offsets the parser already knew</td><td>nothing about the format: the entry is a runtime overlay <em>and</em> a container, and the overlay override silently replaced the container's walker whenever a dump directory was supplied - which is exactly when the sweep runs</td></tr>
+      <tr><td>the menu overlay's two atlases</td><td>the save-menu UI atlas and the save-slot icon sheet, both at named constants in this workspace</td><td>a binding again: the dump corpus is the parser for a code image's <em>code</em>, so anything in its data segment fell to the magic sweep and read as "found by guessing" for assets already pinned. When the sweep finds something, check whether a constant for it exists.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>An overlay's uninitialised data region travels with its code</h3>
+  <p>The largest zero runs in the overlay images are the disc's own <code>.bss</code>, and the loader is what puts them there: it asks for the entry's sector count - the gap to the next entry, the same expression the TOC reader uses - and hands that straight to the transfer. So a linked image's uninitialised data rides into RAM with its code as zero fill. Those bytes are not a format nobody has walked; they are the buffers the image writes at runtime.</p>
+  <p>Shape cannot establish that, because zero fill looks the same whoever wrote it, so the claim rests on the image's own code. A claim is exactly one maximal all-zero run of at least 256 bytes - one non-zero byte splits it in two - and the image must address that run from two distinct addresses, or one address formed at four separate sites. A lone <code>lui</code> pair landing somewhere in a multi-kilobyte window is a coincidence an image with thousands of pairs produces. The pair scan walks <em>forward</em> from each <code>lui</code>, because the STR overlay hands its VLC unpacker the destination in a <code>jal</code> <strong>delay slot</strong>, which a backward-only scan never sees.</p>
+  <p>The worked case is the disc's largest single unclaimed run: 131172 zero bytes in the STR/MDEC cutscene overlay, between its initialised data and the unpacker at the top of the image. Six regions sum to it exactly, and every boundary is an address the overlay forms: four bytes of alignment, the play loop's <code>0x50</code>-byte decode context (the <code>ctx</code> the cutscene page tabulates), its two <code>0x7800</code> slice staging buffers, four globals, and the <code>0x11000</code>-byte STRv2 VLC lookup table - which the entry's own second residue run, a 3597-byte compressed blob, is unpacked into at load time. Two other zero runs in the same entry are refused for carrying no formed address, which is the answer the rule is supposed to give.</p>
+
+  <h3>A bundle's last sector is the packer's buffer</h3>
+  <p>Every scene bundle carried exactly one residue run, up to about 2 KB, and together they were the largest class on the worklist. Each starts where the last descriptor's LZS stream stops being consumed and runs to the entry's end, inside its last sector; no consumer reads it. The bytes are an earlier entry's: the packer used one buffer for the whole of <code>PROT.DAT</code>, in TOC order, and never cleared it, so offset <code>k</code> of an entry's slack holds the byte the <strong>nearest earlier entry whose extent reaches <code>k</code></strong> holds there. That prediction has no free parameter and reproduces every byte of the slack in all 90 bundles; the first bundle, with no earlier entry that long, has zero slack - the buffer as first allocated. The same test, asked of a mapped overlay's last sector, finds the battle overlay's last 1604 bytes (above the slot-B base) to be the side-band stream <code>0894</code>'s, a donor the overlay-only comparison cannot see.</p>
+  <h3>The battle overlay's head is twenty-two jump tables</h3>
+  <p>The battle overlay's first 3.5 KB used to read as <em>nine</em> jump tables, counted as runs of in-image code addresses - and adjacent tables with no padding between them merge into one run. Every consumer bounds its index with <code>sltiu</code> before a <code>jr</code>, so each table's extent is that immediate times four, read off the dispatch: twenty-two consumers, twenty-two bases, tiling the region. They are claimed from named constants that are re-derived from the image's own instructions, and every one of the 850 arms lands inside the dumped function that holds its own <code>jr</code>.</p>
+  <h3>A string is claimed by the address its image forms</h3>
+  <p>An overlay's string pool has no header and no count. What makes a byte run a string <em>of this image</em> is that its code computes the address with a <code>lui</code> pair, and what bounds it is its own NUL - the same pointer-forming test the uninitialised-data claim uses, plus one level of indirection for a pointer table of such strings. It closed the battle tutorial's prompt pool (its consumer is the module's own code after all), the menu overlay's option strings, and the name tables of two dev modules.</p>
+
+  <h3>A record is sized by the call that receives it</h3>
+  <p>Four callees fix the extent of the record they are handed: the spawn routine and its pool wrapper take a spawn record in <code>$a2</code> (header plus a move-VM program, bounded by its terminator), and the actor allocator takes a 24-byte static template in <code>$a0</code> - as does the positioned actor spawn in <code>$a1</code>, which hands it straight on. Every mapped image now has those records claimed off the call itself - including pointers staged in a saved register and copied over (<code>move a2,s3</code>) even across an intervening call, which a saved register survives, pointers loaded in the delay slots of <code>switch</code> arms that jump to one shared call, and image-local wrappers that forward their own argument. The slot-B band's own walk now follows the same shapes (and a pair completed in the call's delay slot). A loop that counts <code>i</code> from zero to a constant over a formed base states its array's length the same way, off the <code>slti</code> bound.</p>
+  <h3>A runtime index states its stride, and a consumer its count</h3>
+  <p>Most retail data is indexed by runtime values, but the index arithmetic still states the element size: the operand summed with a formed base is evaluated backwards as <code>k * i + c</code> through shifts, adds and copies - the compiler's <code>((i &lt;&lt; 3) - i) &lt;&lt; 2</code> is <code>i * 28</code> - and each access through the element address names a field. The count comes from a bound check on the same index when the consumer has one, and otherwise from the next address the image forms that is not one of the array's own fields, kept only when that closes a whole number of elements. That sizes the field overlay's 27-record window table and its 73 sound-test rows. A loop that bumps a pointer instead of scaling an index states its length too: the Baka Fighter image walks seventeen per-fighter blocks of nine <code>0x60</code>-byte move records through a pointer table, the 14 KB an earlier reading left as a "sparse table nobody addresses".</p>
+  <p>Some tables need their consumers read by hand. The battle overlay's last non-slack run was six small tables in a row - two five-byte per-command scalars, the Miracle Art trigger rows, the Super Art replace strings, the monster casts' opening-shot bytes and the four status-guard masks - each already read by a port or a parser and none of them bound. Their counts come from three places: an index domain (<code>(cmd - 0x0C) mod 5</code>, computed with a reciprocal divide by five), the next address the image forms, and a loop that runs <code>0x0C</code> to <code>0x10</code> and subtracts its start back off before addressing. With them claimed the battle overlay's residue is all slack. Directly after the affinity matrix sits a second 8x8 block of much stronger percentages that nothing addresses; the PAL and Japanese battle overlays carry the same block after the same matrix, and their readers form only the matrix base too.</p>
+  <p>Two more claims close records nothing points at directly. A run between spawn records is read as a chain of <code>[header][program]</code> records and claimed only when it lands <em>exactly</em> on a pointer-credited record or on padding - both ends pinned. And the menu and field overlays each carry a window-program interpreter; the programs they are handed, most of them from <code>switch</code> arms, are claimed off those calls.</p>
+  <p>The formed-address test under all of this follows the <code>lui</code> register through copies, one indexing <code>addu</code> and branches, and drops it at any other write, the walk the <a href="address-reference-scan.html">reference scans</a> share. And a label-credited dump that opens on eight <code>nop</code>s is no longer counted as code: two such dumps, in the fishing and Baka Fighter images, had credited about 22 KB of data as code, which is why those two entries' residue went <em>up</em> when the account got more honest. Nor is an extent whose words mostly write <code>$zero</code> or decode to no instruction at all - compilers emit neither.</p>
+
+  <h3>Two more residue runs that were not formats</h3>
+  <p><strong>A dev module's roster.</strong> The <code>OTHER3</code> dev module read as 10904 bytes of <code>ascii_text</code> in two runs, which invites "a text blob nobody claims" and is wrong about the shape: three quarters of the entry is a fixed-stride table, and the stride is in the drawing loop's index arithmetic rather than in the bytes - <code>(i &lt;&lt; 5) + i</code> then <code>&lt;&lt; 2</code> is <code>i * 0x84</code>, and a reciprocal divide wraps the cursor <code>mod 81</code>, which is the record count. The labels are Japanese, stored as little-endian Shift-JIS code units, and that is <em>not</em> evidence of a foreign build: 34 of the entry's 37 distinct calls into the executable land on a real function head, where the one image that really is from another build scores 0 of 42. The dev modules were simply never localised.</p>
+  <p><strong>Another image's code.</strong> The slot-machine overlay's 1760-byte <code>plausible_mips</code> run has no prologue, no <code>jr ra</code> and no caller, and runs to the last byte of the entry. None of the three readings that invites - a jump-table body, data, or the interior of a neighbouring function - is right: those bytes are the fishing overlay's, byte-identical at the same file offset, an <a href="disc-coverage.html">inherited tail</a> from a buffer the packer did not clear. Both instruments cut such a tail now, by the same measurement, and the claim carries the donor's own name - so a <code>plausible_mips</code> residue run that survives here is this entry's own bytes rather than a neighbour's. On the slot-B images the cut also feeds back into the walk: a spawn record at or above it belongs to the donor, and four band images report slightly more residue once the record chain stops there.</p>
+</section>
+
+<section class="doc-section" id="ratchet" data-doc="ratcheting-the-figure">
+  <h2>Ratcheting the figure</h2>
+  <p>A sweep nobody compares is a number in a terminal. A checker reads the sweep's CSV and ratchets it against a committed baseline, the way the <a href="disc-coverage.html">disc-coverage</a> gate ratchets the code figure. It is the third denominator, and it exists because the other two cannot ask this question: the port catalog measures the addresses this project has cited, and disc coverage's data half measures format <em>recognition</em> - a claim an entry satisfies fully while most of its bytes have never been walked.</p>
+  <table>
+    <thead><tr><th>Figure</th><th>Direction</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>structural share</td><td>up only</td><td>bytes a parser walked to, from a header or a table</td></tr>
+      <tr><td>accounted share</td><td>up only</td><td>structural plus magic-sweep hits - always the larger number, and never the headline</td></tr>
+      <tr><td>non-slack residue</td><td>down only</td><td>unconsumed runs whose shape is not padding</td></tr>
+    </tbody>
+  </table>
+  <p>Every figure is re-weighted by <em>bytes</em> rather than averaged over entries, and each is carried per format class as well as whole-disc. The per-class row is what makes a regression attributable: one class losing its walker moves the whole-disc figure by a rounding error, and a falling total does not say which parser to open.</p>
+  <p>The gate consumes the sweep's CSV rather than running it, so it skips where the disc is not - and a CSV swept on an older tree reports that tree's parsers through a passing gate, which is why re-running the sweep is part of taking a baseline rather than a separate habit.</p>
+</section>
+
+<section class="doc-section" id="tests" data-doc="tests">
+  <h2>Tests</h2>
+  <p>A fixed set of entries is accounted off <code>extracted/PROT</code> with a floor asserted on each one's accounted share, plus the invariants that make the figure mean anything: claims stay inside the buffer, residue plus accounted equals the size, and <code>structural</code> never exceeds <code>accounted</code>. It skips and passes without disc data, like every other disc-dependent test here. The range algebra and the residue classifier are unit-tested on synthetic buffers, including the ordering traps above.</p>
+</section>
+
+<section class="doc-section" id="see-also" data-doc="-">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Tooling</span>
+    <a href="disc-coverage.html">Disc coverage</a>
+    <a href="port-catalog.html">Port catalog</a>
+    <a href="static-overlay-pipeline.html">Static overlay pipeline</a>
+    <a href="ghidra.html">Ghidra in Docker</a>
+    <a href="extraction.html">Asset extraction</a>
+  </div>
+  <div class="see-also">
+    <span class="see-also-label">Formats</span>
+    <a href="../formats/prot.html">PROT.DAT TOC</a>
+    <a href="../formats/index.html">Format index</a>
+  </div>
+</section>

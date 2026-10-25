@@ -1,0 +1,174 @@
+# Getting started with the release tools
+
+This guide is for someone who downloaded a release archive from the project's
+GitHub Releases page: a directory of prebuilt binaries (the command-line
+tools, the engine and Legaia Studio), the two license files,
+`README-PLAY.txt` and a short `README.txt`. No Rust toolchain, no source
+checkout.
+
+Pick your path:
+
+| You want to | Do this |
+|---|---|
+| **Play the game** | Start `legaia-engine` with no arguments - double-click it (`Legend of Legaia.exe` on Windows, `Legend of Legaia.app` on macOS). It asks for your disc image once and remembers it; the launcher also sets the display options, then *Play* opens the title screen. [Playing and viewing](playing-and-viewing.md#0-the-launcher) has the controls. |
+| **Play without installing anything** | Open the project site's play page and pick your disc image there; it runs the same engine in the browser. |
+| **Get the assets out** | Follow sections 1-3 below, then [extracting-assets.md](extracting-assets.md). |
+| **Randomize, mod or translate** | Sections 1-2 below, then [modding-and-translation.md](modding-and-translation.md) or [translating.md](translating.md). |
+
+The rest of this guide covers the archive, the disc check and the one-shot
+extraction, and ends with a table of every tool.
+
+One rule shapes everything here: **the project ships no Sony-owned bytes.**
+The archive contains only the project's own compiled tools. Every tool operates
+on a disc image *you* supply - a raw Mode 2/2352 `.bin` dump of your own
+*Legend of Legaia* (USA) disc, `SCUS-94254`. A `.cue` sheet is accepted
+anywhere a disc image is: the referenced `BINARY` track is resolved
+automatically.
+
+Commands below use the bare `./tool` form, as run from inside the unpacked
+archive directory. If you build from source instead, the same binaries land in
+`target/release/` (`cargo build --release`), so substitute
+`./target/release/tool`.
+
+## 1. Download and verify the archive
+
+Each tagged release publishes one archive per platform plus a `SHA256SUMS`
+manifest (see [releases.md](../tooling/releases.md) for how they are built):
+
+- `legaia-tools-<version>-x86_64-unknown-linux-gnu.tar.gz` (Linux, glibc 2.28+)
+- `legaia-tools-<version>-aarch64-unknown-linux-gnu.tar.gz` (Linux on ARM)
+- `legaia-tools-<version>-x86_64-pc-windows-gnu.zip` (Windows)
+- `legaia-tools-<version>-universal-apple-darwin.tar.gz` (macOS 11+, Apple
+  silicon and Intel in one binary; on a Mac verify with
+  `shasum -a 256 -c SHA256SUMS --ignore-missing`)
+
+Verify and unpack:
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing
+tar -xzf legaia-tools-<version>-x86_64-unknown-linux-gnu.tar.gz
+cd legaia-tools-<version>-x86_64-unknown-linux-gnu
+./legaia-extract --version
+```
+
+Every binary answers `--version` and `--help`; subcommand help
+(`./asset monster-archive --help`) states where each input comes from.
+
+## 2. Check your disc image
+
+```bash
+./disc-extract verify "/path/to/Legend of Legaia (USA).bin"
+```
+
+A good USA dump prints:
+
+```
+[ok] matches: Legend of Legaia (USA) - SCUS-94254 - Mode2/2352 .bin
+```
+
+An unrecognized dump (a PAL disc, a re-track, a bad rip) prints an `[unknown]`
+line with the computed SHA-256 instead of failing - the extraction tools still
+run on it, but the fingerprints, offsets, and the randomizer's patches all
+target the USA build. A file that is not a Mode 2/2352 image at all is
+rejected up front with `not a Mode2/2352 disc image: <path>`.
+
+## 3. Extract everything in one shot
+
+```bash
+./legaia-extract "/path/to/Legend of Legaia (USA).bin" --out extracted
+```
+
+On a modern machine this takes about five seconds and writes roughly 1.1 GB.
+A disc-fingerprint check runs first, then eight numbered steps, each logged
+as `step N/8`:
+
+1. ISO9660 walk - the disc's 45 files.
+2. `PROT.DAT` split - 1233 entries, named via `CDNAME.TXT`.
+3. Per-entry format categorization.
+4. Streaming sub-asset extraction.
+5. Streaming-container TIMs → PNG.
+6. CD-XA demux → per-channel WAVs (316 of them).
+7. The TIM-catalog TSVs.
+8. The dialog-font artifacts.
+
+Skip flags exist for the verify pass and for each slow or optional step:
+`--skip-verify`, `--skip-png`, `--skip-xa`, `--skip-catalog`, `--skip-font`.
+
+What lands where:
+
+```
+extracted/
+├── PROT.DAT                 - the game's main archive, raw copy
+├── CDNAME.TXT               - entry name map
+├── SCUS_942.54              - the game executable (data-table source)
+├── MOV/                     - FMV movies (MV1.STR ...)
+├── PROT/                    - one file per PROT entry, plus categorize.json
+├── streaming/               - sub-assets unpacked from streaming containers
+├── XA_WAV/                  - streamed audio, one WAV per channel
+├── font/                    - dialog-font atlas + widths (engine + viewer read this)
+├── prot_tim_catalog.tsv     - texture inventory (raw TIMs)
+└── prot_tim_deep_catalog.tsv - texture inventory (TIMs inside LZS)
+```
+
+Bulk texture export is not one of the eight steps: `--all-textures` adds it
+as a ninth (every TIM, raw and LZS-compressed, as `.tim` + `.png` under
+`tim_scan/`), and without it the final summary points at the equivalent
+two-command step (`asset tim-scan` + `tim convert-dir`) covered in
+[extracting-assets.md](extracting-assets.md).
+
+Everything downstream - the [asset scenarios](extracting-assets.md), the
+[engine and viewers](playing-and-viewing.md), the
+[modding tools](modding-and-translation.md) - reads either this `extracted/`
+tree or the disc image directly.
+
+## 4. The tools at a glance
+
+Pipeline and per-format extractors:
+
+| Binary | What it's for |
+|---|---|
+| `legaia-extract` | The one-shot pipeline: disc image → the whole `extracted/` tree. Start here. |
+| `disc-extract` | Verify a dump's fingerprint; list / extract the raw ISO9660 files. |
+| `prot-extract` | Split `PROT.DAT` into its numbered entries with CDNAME-derived names. |
+| `lzs-decode` | Decompress Legaia's LZS streams and `.lzs` containers. |
+| `asset` | The format tool: categorize entries, extract sub-assets, dump readable game-data tables, export monsters to glTF. |
+| `tim` | TIM textures → PNG. |
+| `tmd` | Legaia TMD meshes → Wavefront OBJ. |
+| `vab` | VAB sound banks → VAG samples / WAV. |
+| `seq` | SEQ music inspector: headers, event disassembly, `find` for wrapped BGM. |
+| `xa` | Streamed CD-XA audio → correctly-paced per-channel WAVs. |
+| `mdec` | FMV decoder: STR movie data → per-frame PNGs. |
+| `font-extract` | Dialog-font atlas + width table, straight from the disc. |
+
+Game-data, playing, and modding:
+
+| Binary | What it's for |
+|---|---|
+| `legaia-engine` | The from-scratch engine: play scenes, FMVs, record/replay, export scenes to `.glb` - straight from your disc. |
+| `legaia-studio` | Desktop app (no terminal): open the disc, browse it by scene, preview and export textures, models, audio, dialog and movies, run the full extraction. |
+| `asset-viewer` | Windowed browser for textures, meshes, audio banks, and scene demos. |
+| `legaia-patcher` | Disc patcher: randomizer, translation toolchain, and manual record edits; emits shareable PPF patches. |
+| `save-tool` | PSX memory-card / save inspector: character records, save-block diffs. |
+| `gamedata-tool` | Curated game-data lookups (arts, items, shops, enemies, ...); needs no disc at all. |
+| `cheat-tool` | GameShark cheat-database parser with the Legaia NTSC-U databases built in. |
+
+Reverse-engineering aids (useful once you go deeper):
+
+| Binary | What it's for |
+|---|---|
+| `asset field-disasm` | Field/event-VM script disassembler over `PROT.DAT` (a subcommand of `asset`). |
+| `mes` | MES dialog-container inspector (for readable game text, use `legaia-patcher translate export` instead). |
+| `anm` | ANM animation-container inspector. |
+| `mdt` | Layout classifier for retail's "MOVE" buffer (the scene's animation clip bank). |
+| `art` | Tactical Arts tables: action constants, arts names, Super/Miracle Art triggers. |
+| `mednafen-state` | Mednafen save-state inspector: RAM diffs, VRAM dumps, SPU snapshots. |
+| `pcsxr-state` | PCSX-Redux save-state reader: scene, game mode and player position; RAM windows; VRAM. Source build only - not in the release archive. |
+
+## Related docs
+
+- [extracting-assets.md](extracting-assets.md) - step-by-step asset scenarios.
+- [playing-and-viewing.md](playing-and-viewing.md) - the engine and viewers.
+- [modding-and-translation.md](modding-and-translation.md) - randomizer, translation, saves.
+- [translating.md](translating.md) - translate the game into your language, step by step.
+- [docs/formats/overview.md](../formats/overview.md) - byte-level format specs behind every parser.
+- [docs/tooling/extraction.md](../tooling/extraction.md) - per-stage pipeline reference.

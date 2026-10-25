@@ -1,0 +1,201 @@
+# Equipment stat-bonus table
+
+A static `SCUS_942.54` table giving every equippable item (weapon / body armor /
+head accessory / footwear) its passive stat bonuses, the characters that can
+equip it, and its slot. It is the equipment analogue of the
+[item-effect descriptor table](item-effect-table.md): both hang off the shared
+[item property table](item-table.md) (`DAT_80074368`) and are reached through
+the item's `+1` byte, which is overloaded per `kind` (effect subtype for
+consumables, bonus-table index for equipment).
+
+## Indexing
+
+From the equip-effect aggregator `FUN_801CF650` (menu overlay, PROT 0899),
+which walks a character's first five equipment slots and sums their bonuses
+into the equip-screen preview:
+
+```text
+// FUN_801CF650
+0x801CF6A4  id = char[+0x196 + slot]              // 0x80084140 + idx*0x414 + 0x75E; slot 0..4
+0x801CF6AC  id == 0 -> next slot
+0x801CF6C0  kind = item_table[id].byte(+0)        // 0x80074368 + id*0xC
+0x801CF6C8  kind != 1 -> next slot
+0x801CF6D0  record = 0x80074F68 + item_table[id].byte(+1) * 8
+0x801CF6E0  record[+0..+4] add into the accumulators at 0x801EF09C / 08C / 090 / 094 / 098
+0x801CF744  slti a2,5 -> loop
+```
+
+The three accessory slots (`+0x19B..+0x19D`) are not summed here: a
+`kind == 1` item in one would not reach the preview. Retail accessories carry
+`kind == 2`, so nothing is lost.
+
+## Record layout (8 bytes, stride `0x8`)
+
+| | |
+|---|---|
+| Record base | `DAT_80074F68` (file `0x65768`) |
+| Stride | `0x8` bytes |
+| Index | item property `+1` byte (per equippable id) |
+
+| Offset | Type | Field |
+|---|---|---|
+| `+0` | u8 | **intelligence** (`INT`) bonus (head accessories set it) |
+| `+1` | u8 | **attack** bonus (weapons' only field; boots also add a small amount) |
+| `+2` | u8 | **defense-up** (`UDF`) bonus (body armor + head accessories) |
+| `+3` | u8 | **defense-down** (`LDF`) bonus (body armor + boots) |
+| `+4` | u8 | **speed** (`SPD`) bonus (only boots/shoes set it) |
+| `+5` | u8 | **passive-effect index** slot - `0x40` (the no-passive sentinel) on every retail row; the `kind == 1` arm of the passive aggregator `FUN_80042558` reads it (see [accessory-passive-table.md](accessory-passive-table.md)) |
+| `+6` | u8 | **equip character mask**: bit `1` Vahn/Meta, `2` Noa/Terra, `4` Gala/Ozma; `7` = any |
+| `+7` | u8 | **slot type** (`& 0x60`: `0x00` body, `0x20` head, `0x40` weapon, `0x60` footwear) + bit `0x01` = Ra-Seru |
+
+### Which stat each `+0..+4` byte targets
+
+The five accumulators the aggregator sums into are pre-loaded from the active
+character record by `FUN_801CF5D0`
+(`ghidra/scripts/funcs/overlay_shop_save_801cf5d0.txt`) before the equipment
+bytes are added. Reading those record load offsets pins each byte's stat target.
+The aggregator's record base is `0x80084140 + idx*0x414`; the live character
+record is `0x80084708 + idx*0x414` (i.e. `+0x5C8` further), whose live-stat
+block is `(AGL, ATK, UDF, LDF, SPD, INT)` at `+0x110..+0x11B` (pinned in
+`legaia_save` by the "Max AGL / Max ATK / ..." GameShark cheats):
+
+```text
+equip +0  ->  DAT_801EF09C  <- record +0x6E2  =  char +0x11A  =  INT
+equip +1  ->  DAT_801EF08C  <- record +0x6DA  =  char +0x112  =  ATK
+equip +2  ->  DAT_801EF090  <- record +0x6DC  =  char +0x114  =  UDF
+equip +3  ->  DAT_801EF094  <- record +0x6DE  =  char +0x116  =  LDF
+equip +4  ->  DAT_801EF098  <- record +0x6E0  =  char +0x118  =  SPD
+```
+
+So equipment modifies ATK / UDF / LDF / SPD / INT and **never** AGL (the AGL
+accumulator `DAT_801EF088` takes no equipment add). `+0`/`+4` are not an
+"agility / speed pair": `+0` is the INT bonus (head gear), `+4` is the SPD
+bonus (footwear).
+
+### The five adds, in instruction order
+
+`FUN_801CF650` walks five equipment slots (`a2 = 0..4`, bounded by
+`slti v0,a2,0x5`), gates each on the item-table kind byte being `1`, and then
+performs exactly five `lbu` / `lw` / `addu` / `sw` add-backs. Taken straight from
+the instruction stream (`overlay_menu_801cf650.txt`; `overlay_shop_save_*` is
+byte-identical, which is what rules out a VA-aliasing mix-up):
+
+```text
+801cf6c0  lbu v1,0x0(a0)   ->  sw 0x1c(a1)    equip +0  ->  record +0x6E2  INT
+801cf6f0  lbu v1,0x1(a0)   ->  sw 0x0c(a1)    equip +1  ->  record +0x6DA  ATK
+801cf704  lbu v1,0x2(a0)   ->  sw 0x10(a1)    equip +2  ->  record +0x6DC  UDF
+801cf718  lbu v1,0x3(a0)   ->  sw 0x14(a1)    equip +3  ->  record +0x6DE  LDF
+801cf72c  lbu v1,0x4(a0)   ->  sw 0x18(a1)    equip +4  ->  record +0x6E0  SPD
+```
+
+**`equip +0` lands on the *last* accumulator**, out of sequence with `+1..+4`,
+which march in step. That asymmetry is the load-bearing detail: it is present in
+the instructions and would not survive a reading lifted from linearised
+decompiled C, where the five adds render as a uniform run. It is also why the
+INT target is easy to lose - anyone who assumes the five bytes map to the five
+accumulators in order gets every stat wrong by one.
+
+There is **no** store to `0x8(a1)` anywhere in the function's 68 instructions,
+which is the positive form of the "never AGL" claim above rather than an
+absence-of-evidence argument.
+
+### What is pinned vs. best-effort
+
+All five `+0..+4` stat *targets* are **pinned** from the accumulator ->
+record-offset mapping above. The `+1` / `+2` / `+3` magnitudes are additionally
+**byte-exact** against the curated gamedata (every weapon's `+1` equals its
+`attack`, every body armor's `+2`/`+3` equal its `udf`/`ldf`). The `+6` mask
+matches each item's `equip_best` / `equip_others`, and the `+7` slot byte cleanly
+partitions weapons / body / head / footwear with the Ra-Seru upgrade flag. The
+curated tables don't carry per-item SPD/INT bonuses, so the `+0`/`+4` magnitudes
+aren't cross-checked against an external source, but their stat targets are fixed
+and the disc-gated test asserts the slot invariant (INT only on head gear, SPD
+only on footwear).
+
+Note that boots/shoes spread bonuses across `+1` (a small attack bump), `+3`
+(`LDF`), and `+4`, so a walkthrough that lists only "two defense numbers" for a
+boot is reading `+1` and `+3`, not `+2`/`+3` - the byte positions here are the
+ground truth.
+
+## Provenance + parser
+
+`legaia_game_tables::equip_stats::EquipStatTable::from_scus` resolves the property +
+bonus tables from a `SCUS_942.54` image at runtime (`t_addr -> file-offset` map,
+identical to the [item-name table](item-table.md) resolver). The disc-gated
+`equip_stats_real` test pins the attack / defense bytes, equip masks, and slot
+types against the real executable and the curated gamedata.
+
+`EquipBonus::equips_party_slot(party_slot)` maps a party slot (`0` Vahn, `1`
+Noa, `2` Gala) to the mask bit `1 << party_slot`, matching the retail
+equip-screen gate (`a3 = 1 << char_index`).
+
+## Engine consumption
+
+`legaia_engine_menus::equipment::DiscEquipInfo` lifts the `+6` character mask and
+the `+7` slot category off the parsed table, keyed by real item ids:
+`can_equip(id, party_slot)` answers the per-character equip gate, `category(id)`
+returns the disc slot category. The equip session
+(`legaia_engine_menus::equip_session::EquipSession::new_with_restrictions`)
+filters each character's per-slot item list on it - a Vahn-only weapon no longer
+appears in Noa's weapon picker. For the four UI slots the `+7` byte resolves
+cleanly (weapon / body armor / helmet / boots) the list is also category-gated;
+the helmet/ring/accessory/hand-guard slots collapse to the disc "head" category
+(see below), so they are mask-gated only. The disc-gated
+`equip_modifiers_disc::disc_equip_restrictions_gate_equip_session_item_list`
+test drives the whole chain on the real executable.
+
+**Slot model (resolved):** the four `+7` categories *are* Legaia's four
+armour/weapon equip slots - there is no missing "8-slot" disambiguation. Cross-
+referencing the parsed table against the curated [gamedata](../reference/gamedata.md)
+by item name pins it exactly:
+
+| `+7` category | gamedata slot | count (disc = gamedata) | example items |
+|---|---|---|---|
+| `0x40` Weapon | weapon | 50 (incl. Ra-Seru tiers) ≥ 27 curated | Survival Knife, Mace |
+| `0x00` Body | armor | **20 = 20** | (every body armour) |
+| `0x20` Head | helmet | **15 = 15** | Warrior Seal, Royal Crown, Ra-Seru Helmet |
+| `0x60` Footwear | shoes | **16 = 16** | (every greave / shoe) |
+
+The disc "Head" bucket is *exactly* the 15 gamedata helmets (Legaia's
+seals / clips / crowns / bands / earring / helmet / plume), not a helmet +
+accessory mix - so there is no "helmet vs. ring vs. accessory" collision to
+resolve. (Weapon is the only non-1:1 category, because the disc enumerates the
+upgradeable Ra-Seru weapon as ~24 per-tier entries that the curated table
+collapses; every disc Weapon-slot item is still a weapon.) **None of the 77
+accessories ("Goods") appear in this table at all** - they are a separate
+system, so the `+7` byte was never meant to classify them. The accessory
+system is resolved in [accessory-passive-table.md](accessory-passive-table.md):
+accessories are `kind == 2` items whose descriptor `+3` byte indexes the
+64-slot passive-effect space. Pinned by the disc-gated `legaia-gamedata`
+test `equip_slots_vs_disc`.
+
+## The `+5` byte has two readers, and both find the sentinel
+
+Besides the passive aggregator, the menu overlay's item-detail renderer
+`FUN_801D5AE8` (shop window 39, the sell list's panel) reads the byte directly:
+at `0x801D5C90..0x801D5CA0` it takes the item property record's `+0` class byte,
+and on class `1` does `sll v0,a0,0x3; addu v0,v0,v1; lbu a0,0x5(v0)` with
+`v1 = 0x80074F68` - the same stride-8 record the item's `+1` bonus index
+selects - then bounds the result with `slti ...,0x40` at `0x801D5CC4` before
+indexing the passive name / description table at `0x8007625C`. Class `2` takes
+the item-effect record's `+3` instead.
+
+Two things follow. The byte is **row**-keyed, not item-id-keyed: several item
+ids resolve to one bonus row, so a per-id view of this column is a coarser map
+than the renderer's. And because every retail row carries `0x40`, the class-`1`
+arm of that chain never produces a passive on an unmodified disc - every passive
+line window 39 prints comes from the class-`2` arm. A reader who finds the chain
+and not the data will go looking for equipment passives that are not missing.
+The disc-gated `equip_stats_real` pins the column at the sentinel across all
+parsed rows so the premise stays measured rather than assumed.
+
+Parser side: `legaia_game_tables::equip_stats::EquipBonus::passive_index` /
+`has_passive`, mirrored row-keyed at
+`legaia_engine_menus::equipment::DiscEquipInfo::row_passive_index`.
+
+## See also
+
+- [Item property / name table](item-table.md) - the shared table this indexes through.
+- [Item-effect descriptor table](item-effect-table.md) - the consumable sibling reached through the same `+1` byte.
+- [Accessory passive-effect table](accessory-passive-table.md) - the passive index space the `+5` byte feeds (sentinel-only in retail).
+- [`reference/gamedata.md`](../reference/gamedata.md) - curated weapon/armor/accessory stat tables.

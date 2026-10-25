@@ -1,0 +1,451 @@
+//! Disc-gated: **an inn stay is reachable in-game**, end to end, through the
+//! ported field VM - no engine-side inn routine on the path.
+//!
+//! Retail has no inn overlay, no inn opcode and no cost table
+//! ([`docs/subsystems/inn.md`]): a stay is an ordinary field-VM interaction
+//! record - prompt text, a 2-option picker, an op-`0x4E` sub-3 gold gate, an
+//! op-`0x3A` `ADD_MONEY` debit, the rest fade, and one op-`0x4C` `0x82 <slot>`
+//! HP/MP restore per party slot. This test walks that whole record on the real
+//! disc bytes through the production interaction path:
+//!
+//! `World::trigger_field_interact` (what the walk-up probe calls) -> `World::drive_inline_dialogue` ->
+//! `World::step_inline_dialogue` -> `legaia_engine_vm::field::step`
+//!
+//! and asserts the two observable outcomes a player gets: the gold leaves the
+//! purse, and every scripted slot comes back at full HP/MP. The **No** branch
+//! is the non-vacuity control on the same record - same record, same driver,
+//! one cursor step apart, and nothing may change.
+//!
+//! Anchored on `retock`'s innkeeper (the 240 G stay - the single paired charge
+//! in that scene's script, shared ground truth with
+//! `crates/asset/tests/inn_costs_disc.rs` and `inn_cost_scene_disc.rs`). The
+//! innkeeper's placement slot is *derived* from the scanned charge offset
+//! rather than hard-coded, so a re-extraction that moves the record cannot
+//! quietly turn this into a test of some other NPC.
+//!
+//! No Sony text is asserted - only the gold delta, the HP/MP pools and the
+//! structural slot derivation. Skips (passes) without `LEGAIA_DISC_BIN` /
+//! `extracted/` (CLAUDE.md convention).
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use legaia_engine_core::world::World;
+use legaia_engine_scene::scene::{ProtIndex, Scene};
+use legaia_engine_system::input::PadButton;
+use legaia_scene_formats::man_section::parse as parse_man;
+
+/// Damaged pools the stay has to repair, so a "restore" that never ran is
+/// visible as an unchanged value rather than as an accidental full bar.
+const HURT_HP: u16 = 7;
+const HURT_MP: u16 = 3;
+const FULL_HP: u16 = 100;
+const FULL_MP: u16 = 40;
+/// Purse before the stay - comfortably over the scripted charge, so the gate's
+/// can't-afford branch is not what the test is measuring.
+const PURSE: i32 = 1000;
+/// Party slots the retock script restores (`4C 82 00` / `01` / `02`).
+const PARTY_SLOTS: usize = 3;
+
+fn extracted_dir() -> Option<PathBuf> {
+    for c in ["extracted", "../extracted", "../../extracted"] {
+        let d = PathBuf::from(c);
+        if d.join("PROT.DAT").exists() && d.join("CDNAME.TXT").exists() {
+            return Some(d);
+        }
+    }
+    None
+}
+
+/// The scene's scripted inn charge plus the placement slot whose interaction
+/// record carries it: `(cost, slot)`. The slot is the last placement whose
+/// record starts at or before the gate, which is the record the gate is in.
+fn innkeeper_site(man: &[u8]) -> Option<(u32, u8)> {
+    let mf = parse_man(man).ok()?;
+    let charge = legaia_scene_formats::inn_costs::scan(man)
+        .into_iter()
+        .find(|c| c.sub_op == 3)?;
+    let slot = mf
+        .actor_placements(man)
+        .into_iter()
+        .filter(|p| p.record_offset <= charge.compare_off)
+        .max_by_key(|p| p.record_offset)?;
+    Some((charge.cost, u8::try_from(slot.index).ok()?))
+}
+
+/// A world with `retock` installed, a hurt three-member party and a full
+/// purse, plus the scene's `(cost, innkeeper slot)`.
+fn retock_world() -> Option<(World, u32, u8)> {
+    if std::env::var_os("LEGAIA_DISC_BIN").is_none() {
+        eprintln!("[skip] LEGAIA_DISC_BIN unset (disc-gated convention)");
+        return None;
+    }
+    let extracted = extracted_dir().or_else(|| {
+        eprintln!("[skip] extracted/ missing - run `legaia-extract` first");
+        None
+    })?;
+    let index = Arc::new(ProtIndex::open_extracted(&extracted).expect("open ProtIndex"));
+    let scene = Scene::load(&index, "retock").expect("load retock");
+    let man = scene
+        .field_man_payload(&index)
+        .expect("read MAN")
+        .expect("retock has a MAN payload");
+    let mf = parse_man(&man).expect("parse MAN");
+    let (cost, slot) = innkeeper_site(&man).expect("retock carries a scripted inn charge");
+
+    let mut world = World::new();
+    world.install_field_carriers_from_man(&mf, &man);
+    // The faithful dialogue path - the shell's default and the browser play
+    // page's only mode. The simplified typewriter never executes the record's
+    // bytecode, so it cannot reach a gate or a restore at all.
+    world.toggles.use_vm_dialogue = true;
+    world.party.money = PURSE;
+    world.party.roster = legaia_save::Party::zeroed(PARTY_SLOTS);
+    for m in world.party.roster.members.iter_mut() {
+        let mut h = m.hp_mp_sp();
+        h.hp_max = FULL_HP;
+        h.hp_cur = HURT_HP;
+        h.mp_max = FULL_MP;
+        h.mp_cur = HURT_MP;
+        m.set_hp_mp_sp(h);
+    }
+    world.party.party_count = PARTY_SLOTS as u8;
+    // The party actors mirror the records, as a seeded party's do.
+    for a in world.actors.iter_mut().take(PARTY_SLOTS) {
+        a.battle.hp = HURT_HP;
+        a.battle.max_hp = FULL_HP;
+        a.battle.mp = HURT_MP;
+    }
+    Some((world, cost, slot))
+}
+
+/// Talk to the innkeeper and run the conversation to its end, answering its
+/// first picker with `option` (0 = Yes, 1 = No) and confirming every box.
+/// Returns the number of frames the conversation took.
+fn stay_at_the_inn(world: &mut World, slot: u8, option: usize) -> u32 {
+    // The production entry: the same call the field-VM interact op and the
+    // walk-up interaction probe make.
+    world.trigger_field_interact(0xFF, slot);
+
+    let mut answered = false;
+    let mut pressed_last = false;
+    let mut frames = 0u32;
+    // Generous: the record's rest tail parks on two `4A` frame waits (76 and
+    // 90 display frames) plus the clip-end spins. The runner is started by the
+    // first `drive_inline_dialogue` call, so the liveness test only applies
+    // from the second frame on.
+    while frames < 4000 && (frames == 0 || world.dialog.inline.is_some()) {
+        let menu = world
+            .dialog
+            .inline
+            .as_ref()
+            .and_then(|d| d.panel.as_ref())
+            .is_some_and(|p| p.picker_takes_input());
+        let waiting = world
+            .dialog
+            .inline
+            .as_ref()
+            .and_then(|d| d.panel.as_ref())
+            .is_some_and(|p| p.is_waiting_for_input() || p.is_done());
+        let cursor = world
+            .dialog
+            .inline
+            .as_ref()
+            .and_then(|d| d.panel.as_ref())
+            .map(|p| p.picker_cursor())
+            .unwrap_or(0);
+
+        // Every press needs a released frame in front of it: `just_pressed`
+        // is a real edge detector, not a level read.
+        let mask = if pressed_last {
+            0
+        } else if menu && !answered && cursor != option {
+            PadButton::Down.mask()
+        } else if menu && !answered {
+            answered = true;
+            PadButton::Cross.mask()
+        } else if menu || waiting {
+            PadButton::Cross.mask()
+        } else {
+            0
+        };
+        world.input.set_pad(mask);
+        world.drive_inline_dialogue();
+        pressed_last = mask != 0;
+        frames += 1;
+    }
+    assert!(answered, "the innkeeper's picker never opened");
+    frames
+}
+
+fn pools(world: &World) -> Vec<(u16, u16)> {
+    world
+        .party
+        .roster
+        .members
+        .iter()
+        .map(|m| {
+            let h = m.hp_mp_sp();
+            (h.hp_cur, h.mp_cur)
+        })
+        .collect()
+}
+
+#[test]
+fn inn_stay_charges_the_scripted_gold_and_restores_the_party() {
+    let Some((mut world, cost, slot)) = retock_world() else {
+        return;
+    };
+    assert_eq!(cost, 240, "retock's scripted stay is 240 G");
+
+    let frames = stay_at_the_inn(&mut world, slot, 0);
+    eprintln!("[inn] retock slot {slot}: stay resolved in {frames} frames");
+
+    // The debit is the record's own op-`0x3A` `ADD_MONEY` with the negative
+    // charge, reached only because the op-`0x4E` sub-3 gate read a real purse.
+    assert_eq!(
+        world.party.money,
+        PURSE - cost as i32,
+        "the stay's scripted gold gate + debit did not run"
+    );
+    // The restore is the record's own `4C 82 <slot>` ops, one per party slot.
+    assert_eq!(
+        pools(&world),
+        vec![(FULL_HP, FULL_MP); PARTY_SLOTS],
+        "the stay's scripted HP/MP restore did not run"
+    );
+    // ... and reaches the party actors' mirrors, which a battle seats from
+    // and `save_party` writes back over the records: a rest that left them
+    // stale was undone by the next fight or save.
+    let mirrors: Vec<(u16, u16)> = world
+        .actors
+        .iter()
+        .take(PARTY_SLOTS)
+        .map(|a| (a.battle.hp, a.battle.mp))
+        .collect();
+    assert_eq!(
+        mirrors,
+        vec![(FULL_HP, FULL_MP); PARTY_SLOTS],
+        "the restore wrote the records but left the party actors' HP/MP stale"
+    );
+    let saved = world.save_party();
+    assert!(
+        saved
+            .members
+            .iter()
+            .all(|m| (m.hp_mp_sp().hp_cur, m.hp_mp_sp().mp_cur) == (FULL_HP, FULL_MP)),
+        "save_party wrote the stale mirrors back over the rested records"
+    );
+}
+
+#[test]
+fn declining_the_inn_leaves_gold_and_pools_untouched() {
+    let Some((mut world, cost, slot)) = retock_world() else {
+        return;
+    };
+    let before = pools(&world);
+
+    stay_at_the_inn(&mut world, slot, 1);
+
+    assert_eq!(
+        world.party.money, PURSE,
+        "declining charged {cost} G anyway - the No branch reached the debit"
+    );
+    assert_eq!(
+        pools(&world),
+        before,
+        "declining restored the party - the No branch reached the rest tail"
+    );
+}
+
+#[test]
+fn a_broke_party_is_turned_away_and_keeps_its_last_coin() {
+    let Some((mut world, cost, slot)) = retock_world() else {
+        return;
+    };
+    // One gold short: the gate's own compare (`gold < literal`) is what
+    // decides, so this exercises the read the whole flow hangs on.
+    world.party.money = cost as i32 - 1;
+    let before = pools(&world);
+
+    stay_at_the_inn(&mut world, slot, 0);
+
+    assert_eq!(
+        world.party.money,
+        cost as i32 - 1,
+        "the can't-afford branch still charged"
+    );
+    assert_eq!(
+        pools(&world),
+        before,
+        "the can't-afford branch still restored the party"
+    );
+}
+
+/// The first box a freshly triggered talk opens: the lead pc of its first row,
+/// plus the runner's executed-pc map at that point. Steps the conversation
+/// without input until a box is up.
+fn first_box_of_next_talk(world: &mut World, slot: u8) -> (usize, Vec<bool>) {
+    world.trigger_field_interact(0xFF, slot);
+    for _ in 0..600 {
+        world.input.set_pad(0);
+        world.drive_inline_dialogue();
+        if let Some(lead) = world
+            .dialog
+            .inline
+            .as_ref()
+            .and_then(|d| d.panel.as_ref())
+            .and_then(|p| p.row_leads().first().copied())
+        {
+            let visited = world
+                .dialog
+                .inline
+                .as_ref()
+                .map(|d| d.visited.clone())
+                .unwrap_or_default();
+            return (lead, visited);
+        }
+    }
+    panic!("the talk never opened a box");
+}
+
+/// Retail ends a talk at the last page's dismiss when the byte after the box
+/// does not continue the conversation (`FUN_80038050` returns `0`), leaving the
+/// actor's cursor `+0x9E` **on** that byte; the next talk resumes there. The
+/// innkeeper's stay ends on its `26` loop-back, and the next talk executes the
+/// loop-back, the selectors and the `CC F8 85` acquire - which succeeds - and
+/// opens at the same first box. Captured on `retock_innkeeper_talk_open`
+/// (retail SCUS): parked at `+0x18A`, reopened at `+0x36`.
+#[test]
+fn two_talks_in_a_row_both_open_the_innkeepers_greeting() {
+    let Some((mut world, cost, slot)) = retock_world() else {
+        return;
+    };
+    let rec = world.npcs.dialog_prologue[&slot].clone();
+    let (first_lead, _) = first_box_of_next_talk(&mut world, slot);
+    assert_eq!(
+        first_lead, rec.first_segment,
+        "talk 1 opens at the greeting"
+    );
+    // Run the stay to its end (the talk above is still open: finish it).
+    world.dialog.inline = None;
+    world.dialog.current = None;
+    stay_at_the_inn(&mut world, slot, 0);
+    assert_eq!(world.party.money, PURSE - cost as i32, "the stay ran");
+
+    let parked = world.npcs.dialog_prologue[&slot].entry_pc;
+    assert!(
+        parked > rec.first_segment,
+        "the talk parked the cursor past its greeting (entry {:#x} -> {parked:#x})",
+        rec.entry_pc
+    );
+    assert_eq!(
+        rec.body[parked], 0x26,
+        "the cursor parks on the post-box loop-back, not executed"
+    );
+    let back = i16::from_le_bytes([rec.body[parked + 1], rec.body[parked + 2]]);
+    assert_eq!(
+        (parked as i32 + 1 + i32::from(back)) as usize,
+        rec.entry_pc,
+        "the loop-back returns to the interaction entry"
+    );
+    eprintln!(
+        "[inn] talk 1 parked at {parked:#x} (entry {:#x}, greeting {:#x})",
+        rec.entry_pc, rec.first_segment
+    );
+
+    // Talk 2 resumes at the parked jump and opens at the same greeting: the
+    // acquire it runs again does not end it.
+    let (lead, ran) = first_box_of_next_talk(&mut world, slot);
+    assert!(ran[parked], "talk 2 executes the parked loop-back");
+    assert!(ran[rec.entry_pc], "and lands on the interaction entry");
+    assert_eq!(lead, rec.first_segment, "talk 2 opens at the greeting too");
+    world.dialog.inline = None;
+    world.dialog.current = None;
+    // And it plays to its end like the first (decline this time).
+    stay_at_the_inn(&mut world, slot, 1);
+    assert_eq!(
+        world.party.money,
+        PURSE - cost as i32,
+        "declining charges nothing"
+    );
+}
+
+/// The acquire's halt is a **window**, and what closes it is the player's
+/// face-the-speaker turn. `CC F8 85 14 00 33` is also a walk-kernel leg:
+/// `FUN_8003BC08` visits `FUN_8003774C` on the `0x400` the acquire raised,
+/// the kernel reads the same bytes as a `0x4C` FaceTarget on the player
+/// (budget `0x14`, face bind `0x33`), and its terminal frame clears both
+/// bits (`0x80038004` player, `0x80038028` innkeeper). Captured on
+/// `retock_innkeeper_talk_open` (retail SCUS, PCSX-Redux write watch on both
+/// `+0x10` words): set at the acquire frame, cleared by those two stores 18
+/// vsyncs later, the player's `+0x54` cursor stepping 2 a game tick to 18.
+/// The port credits one frame a sim tick, so the same budget closes on the
+/// twentieth visit, the first of which is the acquire's own frame.
+#[test]
+fn the_acquire_turns_the_player_to_the_innkeeper_and_then_releases() {
+    use legaia_engine_mode::mode::SceneMode;
+    let Some((mut world, _cost, slot)) = retock_world() else {
+        return;
+    };
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    let (nx, nz) = world.npcs.positions[&slot];
+    // West of the innkeeper (the capture's approach side), facing +Z: a
+    // quarter turn to make.
+    world.actors[0].move_state.world_x = nx - 160;
+    world.actors[0].move_state.world_z = nz;
+    world.actors[0].move_state.render_26 = 0;
+
+    // Talk 1 runs the stay and parks on the loop-back; talk 2 re-runs the
+    // acquire from there.
+    let _ = first_box_of_next_talk(&mut world, slot);
+    world.dialog.inline = None;
+    world.dialog.current = None;
+    stay_at_the_inn(&mut world, slot, 1);
+    world.actors[0].move_state.render_26 = 0;
+
+    world.trigger_field_interact(0xFF, slot);
+    let mut window = 0u32;
+    let mut opened = false;
+    let mut headings = Vec::new();
+    for _ in 0..200 {
+        world.input.set_pad(0);
+        world.drive_inline_dialogue();
+        let live = world
+            .dialog
+            .inline
+            .as_ref()
+            .is_some_and(|d| d.face_ramp.is_some());
+        headings.push(world.actors[0].move_state.render_26);
+        if live {
+            opened = true;
+            window += 1;
+        } else if opened {
+            break;
+        }
+    }
+    eprintln!("[inn] halt window {window} frames; headings {headings:?}");
+    assert!(opened, "talk 2's `CC F8 85` acquire opened no halt window");
+    assert_eq!(
+        window, 19,
+        "the window stays open until the leg's terminal (20th) visit"
+    );
+    assert_eq!(
+        *headings.last().unwrap() & 0x0FFF,
+        0x400,
+        "the terminal frame snaps the player onto the innkeeper's bearing (+X)"
+    );
+    assert!(
+        headings.windows(2).all(|w| w[0] <= w[1]),
+        "the turn is a monotone ramp, not a snap"
+    );
+    assert!(
+        world
+            .dialog
+            .inline
+            .as_ref()
+            .is_some_and(|d| d.panel.is_some()),
+        "the conversation is still open when the window closes"
+    );
+}

@@ -1,0 +1,1439 @@
+# Per-actor motion VMs
+
+How field actors move on their own. **Two** small bytecode VMs run under the
+per-actor field tick `FUN_8003BC08`, both in `SCUS_942.54`:
+
+- the **pursue / patrol / face-target VM** `FUN_8003774C` - NPC walks along a
+  compass direction or toward a target, turning to face something, and
+  pre-baked camera paths;
+- the **scripted-motion VM** `FUN_80038158` - a villager's ambient wander and
+  scripted choreography (steps, facing ramps, tweens, teleports, waits), which
+  also sets and clears story flags.
+
+Both are ported and live on both play hosts: villagers wander, turn and are
+solid in the port as they are in retail.
+
+## At a glance
+
+| | Pursue / patrol VM | Scripted-motion VM |
+|---|---|---|
+| Interpreter | `FUN_8003774C` | `FUN_80038158` |
+| Runs when | actor `+0x10 & 0x400` (the halt bit) | actor `+0x10 & 0x80` |
+| Dispatch | 22-slot jump table `0x80010EE0`, index `(op & 0x7F) - 0x37` | 32-slot jump table `0x80010FE8`, ops `0x01..=0x20` |
+| Bytecode source | the payload pointer a field-VM halt-acquire writes to `+0x94` | MAN tail-section 1, read at `*(actor+0x80) + *(u16*)(actor+0x84)` |
+| Opcode table | [Opcodes](#opcodes) | [The op table](#the-op-table) |
+| Port | [`legaia_engine_motion_vm::motion_vm`](../../crates/engine-motion-vm/src/motion_vm.rs) | [`ambient_motion`](../../crates/engine-motion-vm/src/ambient_motion.rs) + [`ambient_motion_ops`](../../crates/engine-motion-vm/src/ambient_motion_ops.rs) |
+
+```mermaid
+flowchart TD
+    T["field actor tick FUN_8003BC08<br/>(once per game tick, per actor)"] --> PRE["pre-update FUN_801D79E8:<br/>visibility cull bit"]
+    PRE --> HA["height arm:<br/>Y from the sampled floor"]
+    HA --> G1{"+0x10 & 0x400?"}
+    G1 -->|yes| V1["FUN_8003774C<br/>pursue / patrol / face-target"]
+    HA --> G2{"+0x10 & 0x80?"}
+    G2 -->|yes| V2["FUN_80038158<br/>scripted motion + story flags"]
+    V1 --> Y1{"op result"}
+    Y1 -->|"0: leg running"| NEXT["next tick"]
+    Y1 -->|"1: done"| CL["clear halt bit 0x400,<br/>zero +0x54 cursor"]
+    V2 --> NEXT
+```
+
+The diagram is the orientation; [the driver section](#the-driver-fun_8003bc08)
+has the exact gates.
+
+Three things that catch people out:
+
+- **Talking to an NPC does not turn it through this VM.** That write is a
+  single `sh` in the dialog state machine `FUN_80039B7C` - see
+  [Talk-time facing is not this VM](#talk-time-facing-is-not-this-vm).
+- **The scripted VM has a static decoder beside its interpreter.** Because its
+  bytecode is MAN tail-section data, the same bytes can be decoded without
+  running them:
+  [`man_field_scripts::npc_motion`](../../crates/engine-field/src/man_field_scripts/npc_motion.rs)
+  answers which stream binds to which placement, at what wander pace, with
+  what default-move harvest. The scene loader uses it to seed the channels the
+  interpreter then ticks. It is not a second port.
+- **These are not the [actor VM](actor-vm.md), the [move VM](move-vm.md) or
+  the [field VM](script-vm.md).** See
+  [the runtime VM family](move-vm.md#the-runtime-vm-family) and the
+  [VM inventory](vm-inventory.md).
+
+## The driver: `FUN_8003BC08`
+
+The per-actor tick that gates and dispatches both VMs is itself two
+independently-gated halves (see `ghidra/scripts/funcs/8003bc08.txt`; ported
+as `field_actor_plan` in
+[`legaia_engine_motion_vm::motion_vm`](../../crates/engine-motion-vm/src/motion_vm.rs)).
+
+**Height arm** - runs only when the actor is live (`+0x5C >= 0`, which also
+gates the `FUN_801D79E8` pre-update) and not culled (`+0x10 & 2` clear).
+It picks one law for the actor's **Y position** `+0x16` from the flag word
+`+0x10`: bit `0x20000000` writes `-(+0x8E)` outright and skips the rest; else
+if neither a target bit (`0x20200`) nor the ambient enable `_DAT_8007B6A8` is
+set, `+0x16` holds; else bit `0x2000` selects a per-tick clamped step toward
+the sampled ground height (`rate = _DAT_1F800393 * 6`, the frame-step scalar
+read at `0x8003BCAC` - `rotate_toward_clamped`, a raw signed-difference clamp
+distinct from the frame-budget ramp `rotate_step`), and its absence snaps
+straight to that sample (`FUN_80019278`).
+
+Bit `1` is not a freeze an actor sets on itself. The pre-update
+`FUN_801D79E8` (PROT 0897) rewrites it on every call: unless
+`_DAT_8007BAF4` forces every actor visible, it tests the actor's tile
+against the region box `0x1F800384..0x1F800387` and against the camera's
+visible tile window `0x1F8003E8..0x1F8003EB` widened by the actor's
+`+0x58` radius, sets bit `1` outside (`0x801D7B08..0x801D7B18`) and clears
+it inside (`0x801D7B1C..0x801D7B30`), then snaps `+0x16` to the floor when
+`+0x52 & 0x40`. It is a visibility cull, and it runs before the arm reads
+the word, so an off-window actor holds its Y. A write-watch over the
+`town01` actor pool sees both stores fire for every placement, through
+both of the routine's callers (`FUN_8003BC08` and the field VM).
+
+The two tests measure different things. The region box compares the
+actor's raw `+0x14` / `+0x18` against `box << 7` - **world** tiles, `x_lo`
+/ `z_lo` inclusive and `x_hi` / `z_hi` exclusive. The window compares the
+**focus-relative** tile `(X + _DAT_80089118) >> 7` (the focus pair is stored
+negated) against the signed window bytes, open on every edge, widened by
+the signed radius, and with two more tiles on the near-Z edge alone:
+`win[0] - r < tx < win[2] + r`, `win[1] - r - 2 < tz < win[3] + r`
+(`0x801D7AA0..0x801D7B00`). `scripts/pcsx-redux/autorun_field_actor_cull.lua`
+logs every call's inputs and exit on `first_town_interactive` with a held
+DOWN; all 600 distinct rows it saw (547 culled, 53 visible) reproduce
+through the engine kernel `legaia_engine_core::world::field_npc_cull::field_actor_culled`,
+and every town01 placement (`+0x50` `0x25..0x58`) read `+0x58 = 0`. No culled
+actor's `+0x16` changed while it stayed culled.
+
+The engine culls its placement NPCs with that kernel in
+`World::tick_field_npc_heights`, against the focus, region box and window
+the follow camera publishes each frame (`Camera::route_camera_events` ->
+`FieldNpcState::cull_view`, both play hosts): a culled glider keeps its Y.
+The engine still draws the whole scene, so the hold shows only on a glider
+the player walks back into view of.
+
+The bit is also a **draw** gate. The actor draw walk `FUN_8001ADA4` skips
+any actor whose `+0x10 & 0xA` is set (`andi v0,v0,0xa` / `bne` at
+`0x8001AE54..0x8001AE58`), and every `.MAP` placed object is an actor on
+this tick, carrying its record's `+0x1E` byte as `+0x58` (`FUN_80020F88`,
+`0x80020FC0..0x80020FC8`). Fed each capture's focus, box and window, the
+kernel reproduces bit `1` for all 84 placed-object actors of both
+`rikuroa` Caruban captures and all 83 of `rim_elm_queen_bee_battle`. So
+under retail's visible-tile crop both hosts skip a culled placed object
+through `field_view_window::placed_actor_visible` (the native placed,
+colour and posed-prop passes; the play page's `field_placement_culled`
+mask): the moss spires on the slopes below the `rikuroa` summit, which the
+port drew floating over the mist, are culled there. The crop runs under a
+cutscene shot too - a staging record sets the window for its shot with op
+`0x46` (`town0c` `P1[21]`'s `46 24 FD EC 18 03` before the Queen Bee shot,
+the window that capture holds) - and the published view is taken after the
+frame's op-`0x46` events land, since retail's op writes the scratchpad
+outright.
+
+Every partition-1 placement passes the `0x20200` test on its own class bit
+`0x20000` (the seater `FUN_8003A1E4` ORs it in at `0x8003A3A4..0x8003A3B4`),
+so retail rewrites every visible placement's Y on every actor tick.
+
+This arm was documented as a **facing** arm, and it is not one.
+`FUN_80019278` is the bilinear ground-height sampler - it reads `+0x14` /
+`+0x18` as X / Z, shifts each right by six to index the `.MAP` `+0x4000`
+collision grid, looks four corner nibbles up in the sixteen-rung scratchpad
+ramp at `0x1F80035C` and averages them (`0x800193DC..0x80019438`) - so what
+lands in `+0x16` is a floor elevation, and `+0x16` between the two horizontal
+axes is Y. Every other page here already reads it that way
+([`field-map.md`](../formats/field-map.md),
+[`field-locomotion.md`](field-locomotion.md)); this section was the outlier,
+and the port's `FieldActorFacing` enum inherited the error before it was
+renamed `FieldActorHeight`. The section below settles it from the other side
+too: every heading write in this VM lands at `+0x26`, not `+0x16`.
+
+For the player, the three arms line up one-to-one with what the engine runs:
+the `0x20000000` override is `World::locomotion.eased_mirror_y` (an eased
+move publishes `-Y` into `+0x8E` and the arm writes it back), the snap is
+`World::locomotion.follow_terrain_height`, and the clamped step is
+`World::locomotion.vertical_settle`. For a placement NPC the snap is
+`World::field_npc_render_y`, which samples the floor under the NPC each time
+a host places it, and the glide is `World::tick_field_npc_heights`, which
+steps `rotate_toward_clamped` per actor tick for a slot whose flag word
+carries `0x2000` - on the disc that is almost only a partition-2 cutscene's
+cross-context `0x31` poke. The engine runs that pass over **every**
+placement context, not only the ones it tracks a live position for (the
+talk NPCs and whatever a script has moved): `rayman`'s plank bridges
+(`P1[70..=83]`, `31 1D` + `4C 42 40 01`) never move, and outside the pass
+they fell to the floor sample 64 units above the ledges they span instead of
+the `-320` their prologue holds. The cull is ported too
+(`World::field_npc_culled`, `field_actor_culled` in
+`engine-core::world::field_npc_cull`): the glide runs behind it over the
+camera view the hosts publish, so an off-window glider keeps the Y it had, and
+under the visible-tile crop both hosts skip the culled NPC's draw
+([renderer](renderer.md)).
+
+**Dispatch arm** - skipped whole when the global suppress bit
+`_DAT_1F800394 & 0x400` is set. Otherwise four routines fire on their own
+guards: `FUN_80039B7C` (`+0x10 & 0x100` and path target `+0x90` present),
+the pursue VM `FUN_8003774C` (`+0x10 & 0x400`), the scripted VM
+`FUN_80038158` (the scene record's bracket guard `*(u16 *)(_DAT_801C6EA4 + 8)`
+clear, bytecode `+0x80` present, `+0x10 & 8` clear), and the move-table consumer `FUN_800204F8`
+(`+0x5C > 0` or `+0x10 & 0x1000`).
+
+The `+8` word is not a dialogue or modal-window flag, which is how it was
+first read. Its writers are two brackets that set it to `1` before a call and
+clear it after: the scene-init bind sweep `FUN_8003AEB0` (`0x8003B73C` /
+`0x8003B928`) and the field VM around its script-context spawn calls
+(`0x801E2820` / `0x801E282C` around `FUN_8003CF7C`, `0x801E2BBC` /
+`0x801E2BD8` around `FUN_8003A1E4`, PROT 0897). None is held across a frame,
+so between frames the scripted VM's gate is open; the engine's ambient tick
+runs every actor game tick with no dialogue gate, which is the same answer.
+
+### The cutscene event-script arm - `FUN_80039B7C`
+
+The driver's first dispatch (fired on `+0x10 & 0x100` with a script pointer at
+`+0x90`) is not a motion VM at all - it is a **per-actor pump that steps a
+field/event-VM script in lock-step with a global cutscene phase**
+(`_DAT_801F2734`), so a scripted actor's choreography advances one authored
+beat per phase tick rather than freely (see
+`ghidra/scripts/funcs/80039b7c.txt`). The script bytes live at
+`*(actor+0x90) + *(actor+0x9E)` - the same `0x21`-terminated event-script
+format the field VM `FUN_801DE840` reads - and the arm is a three-state machine
+on `actor+0x9E` (PC) / `actor+0x9C` (state):
+
+| state | phase gate `_DAT_801F2734` | behaviour |
+|---|---|---|
+| 0 | any | bumps the modal-window depth `_DAT_801C6EA4+0xA`, sets player flag `0x80000`, then runs `FUN_801DE840` over the script until it yields (op `< 0x20`) or terminates (op `0x21`). On terminate it tears the actor down (clear flag `0x100`, set `0x8` if `+0x5C == -1`, snap facing `+0x26 = +0x5A`, decrement the modal depth). Otherwise it advances to state 1 and, when `+0x10 & 0x420000 == 0x20000`, snaps `+0x26` to the player bearing via `FUN_80019B28`. |
+| 1 | `1`/`4`/`7` | latches `_DAT_801F3538 = script + +0x9E`, raises `DAT_80073F02`, bumps the phase, advances to state 2. |
+| 2 | `0`/`3`/`6`/`9` | skip-scans forward over the current op through `FUN_80038050` (the `0xC0`-family entries are 2-byte), commits the new PC, resets to state 0, bumps the phase, and re-arms the field control block (`+0x62 = 0x20`). |
+
+`FUN_80038050` is the arm's **structural-op advance helper**
+(`ghidra/scripts/funcs/80038050.txt`): given the op at `script + +0x9E`, it
+consumes the event-script's non-yielding structural ops and reports whether the
+pump should keep stepping (`1`) or stop (`0`). It knows `0x21` (terminator, stop),
+`0x24`/`0x25`/`0x48` (advance one byte, keep going), `0x27..0x2A` (multi-way jump -
+indexes the branch offset by the live modal-window depth `_DAT_801C6EA4+0xC`), and
+`0x4C` (byte-1 `0xFF` = +2, `0xFE` = +3 and latches `_DAT_801F273C`). Every other
+op ends the scan. This is the arm that plays a partition-2 cutscene timeline's
+event script; the motion of any actor it walks is issued by the field VM ops the
+script contains, not by this function.
+
+## Bytecode layout
+
+Each script entry is `1 + N` bytes:
+
+```text
++0  u8 op_byte         ; bit 0x7F = opcode, bit 0x80 = "select target"
++1  u8 target_id       ; only present if bit 0x80 set in op_byte;
+                       ;   special ids: 0xF8 (self), 0xFB (linked)
++N  u8 operand[...]    ; opcode-specific operands
+```
+
+When the high bit is set, the VM resolves a target actor before applying the body. `0xF8` resolves to "this actor" (the retail engine reads `_DAT_8007c364` - current player ptr), `0xFB` follows a linked list at `_DAT_8007c34c` looking for a matching record-class signature, and any other id linearly scans the actor list at `_DAT_8007c354` matching against the actor's **placement bind index** at `+0x50` (`lhu v0,0x50(v1)` at `0x80037E88`; `+0x14` is the actor's world X, not an id).
+
+## Opcodes
+
+Dispatch is a 22-entry jump table at `0x80010EE0` indexed by `(op & 0x7F) -
+0x37`; opcodes outside `0x37..=0x4C`, and the sixteen table slots pointing at
+`0x80037FEC`, all take the default arm.
+
+| byte | case body  | name             | semantics                                |
+|------|------------|------------------|------------------------------------------|
+| 0x37 | 0x8003789C | CompassWalkFast  | walk X/Z along a compass direction, rate `0x80` a tile count (see [the compass walk](#the-compass-walk-0x37--0x41)) |
+| 0x38 | 0x800379FC | RotateToAngle    | yaw ramps to a compass-LUT entry over a frame budget; shortest-path (`body0 & 0x80`) or forced-direction (`body1 & 0x80`), 12-bit fixed-point |
+| 0x41 | 0x8003789C | CompassWalkSlow  | the same arm at rate `0x40`              |
+| 0x43 | 0x80037FF0 | NoOp             | tick budget consumed, no actor mutation  |
+| 0x47 | 0x80037B84 | MoveTowardTarget | step actor XZ toward `(tx, tz)`, snapping facing to the compass once per leg / step-direction change |
+| 0x4C | 0x80037DE0 | FaceTarget       | yaw ramps to the target's live bearing over a frame budget; sub-mode bytes `0x85` / `0x8E` / `0x8F` are the three retail accepts, and `0x8F` alone forces the decreasing direction instead of the shortest arc |
+|      | 0x80037FEC | (default arm)    | terminate with `Done`                    |
+
+The return value carries the outcome: the yield arm at `0x80037FF0` returns
+`0` (leg still running), the default arm at `0x80037FEC` increments the flag
+first and returns `1`, clearing the actor's HALT bit `0x400` and zeroing the
+`+0x54` progress cursor on the way out.
+
+## The compass walk (`0x37` / `0x41`)
+
+Both opcodes land on one case body, `0x8003789C..0x800379F8` in `FUN_8003774C` (see `ghidra/scripts/funcs/8003774c.txt`); the only difference between them is the rate picked at `0x80037904` - `0x80` for `0x37`, `0x40` for anything else. They move the actor along a compass direction on the X/Z plane; neither touches Y, and neither is a single-axis translate (an earlier reading named them `TranslateY` / `TranslateX`, which the arm's own axis table contradicts).
+
+| operand bits | meaning |
+|---|---|
+| `b0 & 7` | direction: index into the 8-byte axis-sign table at `0x80073F14` (`1` = `+Z`, `2` = `-Z`, `4` = `+X`, `8` = `-X`, combined for the diagonals) |
+| `b1 & 0x3F` | distance count: the leg moves `rate * count` world units in total (one tile per count for `0x37`, half a tile for `0x41`) |
+| `(b1 >> 6) \| ((b0 >> 5) & 4)` | duration selector `sel`: the leg's budget is `count * (4 << sel)` progress units |
+
+Each tick the arm spends `DAT_1F800393` progress units (clamped to what is left of the budget) and moves `rate * spent / (4 << sel)` along each axis bit set in the direction byte (X at actor `+0x14`, Z at `+0x18`). Progress accumulates in `+0x54`; the leg finishes when it reaches the budget. `B7 F8 00 81` is therefore one tile along `-Z` over 16 progress units. The port is `motion_vm::CompassWalkFast` / `CompassWalkSlow` with the table as `COMPASS_AXIS_SIGNS`.
+
+A `.MAP` placed object walks the same way. `FUN_8003A55C` runs a bound object's spawn prologue through the field VM at scene load, a `37` there parks the object's own context, and the object actor's tick `FUN_8003BC08` hands the op to this arm until it lands. `conc`'s glass-tube floor disc (`P0[17]`, `.MAP` record 365, cell `(31, 31)`) and its twin `P0[14]` both open `37 02 01`, one tile along `-X`: the `conc_field_card_boot` retail state holds them at `X = 3872` and `11168`, one tile west of their `.MAP` seats, which centres the disc in the tube. The engine arms the leg in its object-prologue pre-run and steps it in the object actor tick (`World::tick_object_actor_heights`); the draw follows through `World::object_draw_displacements`.
+
+## How an actor's facing changes
+
+Three opcodes write the actor's 12-bit heading at `+0x26`, under **two
+distinct laws** - the distinction that decides whether a turn is instant or
+animated.
+
+**Snap - the walk-direction-implied facing.** The tail of the `0x47` case
+(`0x80037D4C..0x80037DDC`) reduces the step to its axis signs, maps them to
+an index in the heading LUT at `0x80073F04`, and writes the entry outright:
+
+| index | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| direction | -Z | -X -Z | -X | -X +Z | +Z | +X +Z | +X | +X -Z |
+
+Which axes a step moves is the **approach mode**, the mode byte's high
+nibble (`srl a1,a1,0x4` at `0x80037BEC`), consulted while both axes are still
+open. Mode `0` closes the dominant axis alone, its step clamped to the
+difference, until the two deltas are equal, then cuts the diagonal
+(`0x80037C4C..0x80037C98`). Any other mode masks the open axes at the full
+step (`and a3,v1,a1` at `0x80037C48`): `3` walks the diagonal from the first
+frame and finishes on the longer axis alone, `1` closes X first, `2` Z first.
+The two laws face opposite ways at the end of an uneven leg: mode `3` lands
+facing along the longer axis, mode `0` on the diagonal. Cutscene walks carry
+`3` (`C7 <id> <tx> <tz> 33`) - `kor5` P2[5] returns its three cast members
+to tile column `18` that way, facing `-X`.
+
+Entry `i` is `i * 0x200` in the retail heading space (`0` = -Z), so a walking
+actor's facing is always one of eight compass points and **never an
+in-between angle** - there is no walk-turn interpolation anywhere in retail.
+The written heading holds **one value per walk leg**: a frame-exact trace of
+the town01 Mei dinner walk-on (per-frame `+0x26` off the static recomp)
+shows every leg - the straight `-Z` runs and the `+X +Z` diagonal walk-off
+alike - carrying a single heading for its whole run, so the port issues the
+write at the leg's first moving frame and on a step-direction change (the
+dominant-axis → diagonal cut) rather than re-writing per frame. The ops
+index the LUT `& 0xF`, but only the first eight slots are direction entries;
+the upper half is unrelated SCUS data.
+
+**Ramp - the two dedicated rotate ops.** `0x38` and `0x4C` interpolate toward
+a target angle over a frame budget carried in their own operands. Both run the
+same arithmetic each tick:
+
+```text
+remaining = budget - cursor                  ; cursor at actor +0x54
+if remaining - speed <= 0:                   ; terminal frame
+    heading = target                         ; exact snap, leg is Done
+else:
+    cursor += speed
+    arc  = (target - heading) mod 0x1000     ; or (heading - target) when decreasing
+    heading += arc * speed / remaining       ; or -=
+```
+
+`speed` is `_DAT_1F800393`, the per-frame scalar. Because the arc is measured
+from the *live* heading every tick, the step is a linear ease that lands
+exactly on the target, and the terminal frame snaps rather than steps so
+rounding can never leave the actor short. Three properties of that loop are
+runtime-pinned frame-exact (the Mei dinner beat's seven authored `0x38`
+turns, replayed tick-for-tick by the port including the floor-divide
+increment pattern - oracle
+`crates/engine-core/tests/recomp_facing_trace.rs`, gated on
+`LEGAIA_RECOMP_TRACE_DIR`):
+
+- **The ramp is linear at `arc / budget`** - the per-op turn *rate* is op
+  data, not an engine constant. The authored spectrum in one beat alone
+  spans ~16 to ~85 units/frame (a deliberate slow 32-frame quarter-turn sits
+  beside 18-frame near-half-turns), so a port that hardcodes one turn speed
+  is wrong.
+- **The heading write-back is raw u16 wrapping - never normalised into
+  `0..0xFFF` per tick.** Only the *arc* is measured mod `0x1000`; a
+  decreasing ramp through zero holds `0xFFxx` raw headings frame after
+  frame, and only the terminal snap lands back in range. Renderers consume
+  the angle mod `0x1000`, so the raw hold is invisible on screen, but a port
+  that masks every tick diverges from the traced `+0x26` on any
+  wrap-crossing turn.
+- **The `0x38` endpoint is always a compass entry** (the LUT snap); the
+  `0x4C` endpoint is the live arctan bearing and is generally NOT
+  compass-aligned - a bearing write lands on values like `1075`, and nothing
+  re-snaps it. (The measured `1075` is the *talk-time* write, which belongs to
+  `FUN_80039B7C`; the point about non-compass endpoints holds for both, because
+  both call the same bearing resolver.)
+
+The two ops differ only in what they aim at and how they choose a direction:
+
+| | `0x38` RotateToAngle | `0x4C` FaceTarget |
+|---|---|---|
+| target | heading-LUT index `body0 & 0xF` | live bearing to the resolved target actor, `FUN_80019B28(self.z, self.x, tgt.z, tgt.x) + 0x800` |
+| budget | `body1 & 0x7F` (7-bit) | `body1 \| body2 << 8` (16-bit), target id in `body3` |
+| direction | `body1 & 0x80` forces it, unless `body0 & 0x80` opts into shortest-path (decrease when the increasing arc exceeds `0x800`) | always the shortest arc, unless sub-mode `0x8F` forces decreasing |
+
+Because `0x4C` re-reads the bearing each tick, a FaceTarget leg tracks a
+target that is itself moving.
+
+The `+0x800` on the bearing is the convention shift, not a fudge:
+`FUN_80019B28` returns `0` = +Z (quadrant-decomposed against the arctangent
+table at `0x8006F4C8`, indexed by `min << 11 / max`), while the actor heading
+space has `0` = -Z. The engine's `render_26` space matches the bearing's, so
+the port carries the half-turn on the LUT instead.
+
+### Talk-time facing is not this VM
+
+The NPC turning to look at you when you press the action button is the
+easiest write in the game to attribute to `0x4C` FaceTarget, and it is not
+that op. It is one `sh` in the per-actor dialog SM, and the difference is
+observable: `0x4C` ramps over a frame budget, the talk write does not ramp at
+all.
+
+The chain is a save / snap / restore triple, none of it in `FUN_8003774C`:
+
+| step | site | what it does |
+|---|---|---|
+| save | `FUN_801D5B5C` `0x801D5BE4` | `lhu a0,0x26(a2)` then `sh a0,0x5a(a2)` in the delay slot - the addressed actor's heading is copied to `+0x5A`. |
+| snap | `FUN_80039B7C` `0x80039F48..0x80039F80` | class test, `FUN_80019B28`, `sh v0,0x26(s2)`. One instruction, one frame. |
+| restore | `FUN_80039B7C` `0x80039CE8` / `0x80039EBC` | `lhu v0,0x5a` / `sh v0,0x26` on the SM's exit paths. |
+
+The snap arm runs when the SM moves the context to state 1 - the script has
+yielded and the box is about to open - and only for a **moving-class** actor:
+`flags & 0x420000 == 0x20000` (`lui v1,0x42` / `and` / `lui v1,0x2` / `bne`).
+Static props never turn. There is no `+0x54` ramp cursor and no budget word
+anywhere in the arm.
+
+Its argument order is the load-bearing detail. `0x4C` calls
+`FUN_80019B28(self.z, self.x, tgt.z, tgt.x)` and adds `0x800`; this arm calls
+it `(player.z, player.x, self.z, self.x)` and stores the result with **no**
+`0x800`. Swapping the endpoints *is* the half-turn, so the two agree - a port
+that copies the `0x4C` convention here and keeps the `0x800` faces the NPC
+exactly backwards.
+
+Engine side: `World::face_field_npc_at_player` writes the snap and stashes the
+previous heading in `World::npcs.facing_save`;
+`World::release_talk_facing` writes it back once no dialogue channel owns the
+frame. Both are called from the field tick, so the walk-up talk and the
+scripted `0x3E` interact get the same behaviour.
+
+## Per-frame speed
+
+`DAT_1f800393` is the per-frame speed scalar (also drives the [move VM](move-vm.md) frame-time scratchpad). The motion VM consumes it as the budget for incremental motion - engines update once per frame, the VM consumes per opcode.
+
+## From-scratch port
+
+[`legaia_engine_motion_vm::motion_vm`](../../crates/engine-motion-vm/src/motion_vm.rs) is the from-scratch port. All six opcodes are implemented: `0x37` `CompassWalkFast`, `0x38` `RotateToAngle`, `0x41` `CompassWalkSlow`, `0x43` `NoOp`, `0x47` `MoveTowardTarget`, `0x4C` `FaceTarget`. Each step returns `StepResult::Yield` (budget consumed, resume next tick) or `StepResult::Done` (terminal op / default arm); there is no fallback path.
+
+The facing law above is `heading_lut_engine` (the eight compass entries, carried in the engine's `0` = +Z space), `walk_facing_index` / `walk_facing_yaw` (the `0x47` sign-to-index table), and `rotate_step` (the shared ramp arithmetic, widened to 32-bit so a large speed cannot overflow the increment, raw wrapping write-back). `engine-core`'s `facing_index_to_engine_heading` delegates to the same LUT, so the spawn-prologue facings and the runtime ones cannot drift apart. `MotionState` carries the once-per-leg walk-facing latch (`walk_facing`) and a per-step `yaw_written` signal; engine hosts gate their render-heading mirror on the latter, so a heading another writer posed (the interact bearing) is not clobbered by an idle leg's stale VM yaw.
+
+Two deliberate departures: LUT indices `8..=15` are treated as no-ops rather than reproducing retail's overread into adjacent SCUS data, and an unrecognised `0x4C` sub-mode terminates the leg instead of yielding forever the way retail's inert arm does.
+
+## Engine consumers
+
+The runtime [`Camera`](../../crates/engine-field/src/camera.rs) in `engine-core` consumes:
+
+- The field-VM op-`0x45` event stream (`CameraConfigure` / `CameraSave` / `CameraLoad` / `CameraApply`) for the high-level camera state.
+- The motion VM (optional) for cinematic pre-baked camera paths via `Camera::tick_script`.
+
+The default mode follows a target actor slot at a configured distance + height.
+
+### Field-NPC walking
+
+**Initial seats come from the spawn-prologue pre-run, not the placement header.**
+Retail's placement installer (`FUN_8003A1E4`) runs each partition-1 record's
+story-flag-tested opening ops through the field VM at scene load: a `0x23 MoveTo`
+to the parked-sentinel tile `(0x7F,0x7F)` despawns the actor for the current story
+state, and cross-scene `MoveTo`s seat an actor away from its MAN header tile.
+Runtime-pinned against the retail `town01` field-actor list (`_DAT_8007C354`
+class; a large share of the placements stand parked or relocated from frame one).
+The engine mirror is `World::pre_run_field_channel_prologues` (scene entry, after
+the carrier/channel install): one field-VM frame slice per placement channel, run
+unconditionally - load-time behaviour, not the opt-in free-roam liveliness - with
+position write-through, and no heading derivation (facings come from
+`seed_field_npc_facings`). Disc + save-library oracle:
+`crates/parity/tests/field_npc_entry_positions_disc.rs`.
+
+`World::tick_field_npc_motions` (`engine-core`) drives MAN-placed field NPCs through the `0x47` `MoveTowardTarget` pursue step, one motion-VM step per field tick, writing the live position back into `World::npcs.positions` so the moving NPC's ±40-unit collision box and its interact box follow it (retail probes the live `+0x14`/`+0x18`, not the spawn anchor). Every leg it steps is scripted and ends where it lands; the start paths are listed below.
+
+**A placement's own `0x4C 0x51` ops are not a route.** Each is an instant seat (the op writes `+0x14`/`+0x18` outright), and a record carries one per story-flag branch, so the entry pre-run's executed branch is the whole of their effect.
+Looping the seats as a patrol walks an NPC between story stations retail never connects: town01's gate guards (placements 32 and 33, beside the exit to the world map) stand on their seats in every catalogued town01 field-run state, across both emulators and the whole chapter, while the ambient-stream wanderers beside them move.
+A villager's free-roam movement is its [tail-section-1 stream](#the-walk-half---the-directional-steps-and-the-aabb-wander) and nothing else. `man_field_scripts::placement_motion_route` still decodes the seats, but nothing in the live path reads it (only its tests do); glide pace comes from `placement_glide_speed` below. Disc oracle: [`field_npc_motion_disc.rs`](../../crates/engine-scene-host/tests/field_npc_motion_disc.rs) (town01's guards hold still; across every field scene, nothing without a walking ambient stream moves in free roam).
+
+- **Not interaction-prologue `0x4C 0x51`s.** When the field-VM dialogue runner executes an NPC's record and the prologue hits a `0x4C 0x51` with the NPC arm, the host hook (`vm_hosts::FieldHostImpl::run_to_tile`) seats the actor on the tile, exactly as the entry pre-run and a spawned-record poke do: the case-5 sub-1 body stores the tile into `+0x14` / `+0x18` (`0x801E1880`, `0x801E1898`) and the LUT heading into `+0x26` (`0x801E1900`) and arms no walk kernel.
+- **Window-script VM `slide_to`** (ops `0x01` / `0x02`, retail `FUN_800357fc`): on the field-actor demo host, `World::start_actor_motion` records the glide target and steps the actor's sprite position toward it through the same pursue kernel (`World::tick_actor_motions`). The snap ops (`0x09` / `0x0A`, `FUN_800358c0`) write the position directly.
+- **Cutscene-timeline cross-context walks** (`C7 <id> <tx> <tz> <mode>`, the targeted `0x47` yield): a spawned partition-2 record walking a cast member. The timeline arms the leg with the op's own speed (`0x80 >> (2 + (mode & 7))`) into `CutsceneTimeline::npc_walks` and the record runs on (`li s7,4` in the delay slot at `0x801DF030`) - the retail shape where the yield-op pointer lands in the target's `+0x94` and the walk kernel moves it in place, the record's next op on that actor waiting at the halted-target refusal. Only the player-anchor form (`C7 F8 …`) parks the record, on `CutsceneTimeline::walk_wait`, stepping the player actor directly. Scripted legs keep stepping while a timeline is active.
+- **Cutscene-timeline cross-context turns** (`B8 <id> <dir|flags> <budget|dir>`, the targeted `0x38` yield - the field-VM CAM_CFG halt-acquire arm): the same shape for the rotate op. The timeline arms a `0x38` RotateToAngle leg on the NPC into `CutsceneTimeline::npc_facings` and the record runs on (`li s7,3` in the delay slot at `0x801DEEFC`), stepping the leg once per tick into `World::npcs.headings` until the terminal compass snap - one tick per budget frame, the 1:1 retail duration. Only a player target parks the record, on `CutsceneTimeline::facing_wait`. The simple path (`op1 & 0x7F == 0`) is an instant compass write, no park.
+
+- **Cutscene-timeline cross-context face-ats** (`CC <id> 85|8E|8F <lo> <hi> <bind>`, the field-VM halt-acquire on a placement): the acquire hands the target this VM's `0x4C` FaceTarget leg, which turns it toward the bind (`0xF8` = the player) over the `u16` budget and snaps onto the live bearing on its terminal frame. The record runs on (only a player target parks it); the timeline steps the leg once per tick (`CutsceneTimeline::npc_faces`, `World::step_npc_face_leg`) and holds the actor's next op until the snap. In the opening (`opdeene` `P2[18]`) the vignette actors land on retail's own bearings to within a unit.
+
+  Outside a timeline - the scene's entry script, a talk record - a `B8 <id> ..` or `CC <id> 85 ..` aimed at another placement turns that placement, not the context running it (`World::run_placement_facing_op`), its legs free-standing and stepped on the field tick (`FieldNpcState::face_legs` / `rotate_legs`); `rikuroa`'s entry script stands two chests this way. The own-context form `4C 85 <lo> <hi> <bind>` (five bytes, the target the executing actor) turns the placement whose spawn section runs it - `rikuroa` `P1[3]` faces Noa toward the placement she is seated beside.
+
+  In a talk record the talker turns the same way, and the record waits for the turn. Retail's arm raises the talker's own `0x400` and advances; the dispatcher's prologue (`0x801DE90C..0x801DE944`) then refuses every op of a context carrying `0x400` - text leads included - unless the scene word `*(_DAT_801C6EA4) + 8` is non-zero (it is `0` in a talk) or the caller's `+0x50` is `0xFB`, so the record holds at its PC until the leg's terminal frame clears the bit (`0x80038004`). The port carries that hold as `InlineDialogue::own_turn`. `rayman` `P1[6]` (Kina) turns this way (`4C 85 10 00 F8`, then `B3 13 0A`) before her "Follow me!" beat walks her to (31, 19) and clears global bit 16.
+
+  The finished beat arms `rayman`'s guide rail: the P2[4] / P2[5] / P2[6] walk-ons return a player who strays to (31, 20), and after three strays Kina gives up and raises `0x1EC..0x1EE`. The way on to `tunnelb` is Hari's permission chain: talks P1[44..46] raise `0x1FD..0x1FF`, the P2[18] walk-on then raises `0x200`, P2[19] raises `0x1FC`, and only then does the gate guard's P2[16] open the door. A P2[18] stepped on before the three talks runs and gains nothing; it takes a second visit.
+
+  The player (`B8 F8 ..`) takes both paths on its own heading (`move_state.render_26`, `TimelineFacing::slot = None`); the story beats turn the hero this way well over a thousand times across the disc. Outside the timeline, a simple-path `0x38` reaches the actor through `FieldActorHost::face_compass`: the player for `0xF8`, the stepping placement channel, or the NPC whose talk record is running.
+
+The start kernel (`World::start_field_npc_motion`) mirrors the `FUN_800358c0` shape - write the target, reset the glide cursor - and the per-frame consumer is this VM.
+
+`World::face_field_npc_toward` is the engine's entry into this op for a
+scripted pose: it runs the `0x4C` FaceTarget leg for one step, rotating the
+NPC's heading toward a point and settling it into `World::npcs.headings` (which
+the renderer reads). The **talk-time** pose does not go through it - see the
+section below. Separately, the interacted
+`0x4C 0x51` op's byte-+4 move-anim id (retail actor `+0x5C`, consumed by the
+anim-stream stepper `FUN_800204F8`) is carried onto the started glide leg as a
+`World::npcs.anim_cues` entry (`carry_npc_run_anim`) instead of being dropped.
+The retail speed encoding is pinned: the ops carry their own base-step selector (`(op0>>5 & 4)|(op1>>6)` for 0x37/0x41, `b2 & 7` for 0x47; numerator `0x80`, or `0x40` for 0x41)
+and are the field-VM record's yield-class bytes interpreted in place from the pointer parked at actor `+0x94` -
+see [field-locomotion.md](field-locomotion.md#npc-glide-speed) + [script-vm.md](script-vm.md) § 0x37-0x42.
+Per-placement field-VM channels are modelled (`executing_channel`); no decoded waypoint list is driven. Each placement's glide is paced by its **real decoded walk-kernel step**
+(`man_field_scripts::placement_glide_speed`: the bound tail-section-1 stream's wander/step ops first, then the record's own yield ops,
+then the facing-nibble heuristic only for placements with no walk-kernel op at all).
+
+## The second motion VM - `FUN_80038158`
+
+A separate per-actor bytecode interpreter (dispatched by `FUN_8003BC08` when
+actor `+0x10 & 0x80`), reading its stream at `*(u32*)(actor+0x80) +
+*(u16*)(actor+0x84)`. It choreographs scripted actor motion (directional
+steps, facing ramps, tweens, teleports, waits) AND writes the system
+story-flag bank `DAT_80085758` directly: op-`7` `[07, lo, hi]` **sets** flag
+`lo | hi << 8`, op-`8` **clears** (byte `= idx >> 3`, bit `= 0x80 >> (idx &
+7)`, matching `FUN_8003CE08`).
+
+### Disc carrier - MAN tail-section 1
+
+The only disc source of this bytecode is **MAN tail-section 1** (parser
+`legaia_scene_formats::man_motion`):
+
+- `FUN_8003AEB0` (scene-entry map-init) computes `tail_base = MAN + 0x2B +
+  3*(N0+N1+N2) + u24_at_0x28`, walks the u24-length-prefixed section chain,
+  and installs section 1's body at the field control block
+  (`*_DAT_801C6EA4` `+0x00`).
+- `FUN_8003A9D4` walks the body as a record chain `[u8 count][s16
+  next_delta][count x (u8 actor_id, u8 enable)][motion stream]`, terminated
+  by `count == 0`. Per binding it installs `actor+0x80 = record + 3 +
+  2*count` and the second byte of the pair at `+0x8A`
+  ([what bit 0 actually gates](#the-0x8a-byte-is-a-suppression-mask-not-an-enable)).
+  Actor
+  resolution: `0xF8` = player (`_DAT_8007C364`), `0xFB` = first
+  `_DAT_8007C34C` node ticking the world-map entity SM `0x801DA51C`, else
+  the `_DAT_8007C354` field actor whose `+0x50` equals the binding byte.
+  The placement spawner `FUN_8003A1E4` writes `+0x50 = N0 +
+  placement_index` (`N0` = the MAN's partition-0 record count, passed down
+  from the `FUN_8003AEB0` header decode), so a binding resolves to
+  partition-1 placement `actor_id - N0` - the id space is offset by the
+  object records, NOT the raw partition-1 index (town01: `N0 = 36`, binding
+  `0x30` = placement 12). Engine decoders:
+  `man_field_scripts::placement_wander_step` /
+  `motion_default_move_writes`.
+- The stream opens with a **variant header table** `[u16 selector][s16
+  delta]...`: the interpreter preamble picks the first variant whose
+  `DAT_80085758` flag is set (`0xFFFF` = default/terminator); bytecode starts
+  at `header + 4` and is re-selected every tick (live flag-driven variant
+  swap). The flag test uses the full u16 selector; the change-detect compares
+  `& 0xFFF`.
+- All other `actor+0x80` writers are eliminated: `FUN_8003A55C` /
+  `FUN_8003A1E4` / `FUN_8003AB2C` / `FUN_8003BDE0` zero it; `FUN_8003C6A4`
+  and `overlay_0896_801cd520` write `_DAT_8007C34C`-list nodes with different
+  layouts; the field VM `FUN_801DE840` never writes it.
+
+### The op table
+
+Dispatch is the 32-entry jump table at `0x80010FE8` indexed `op - 1`; the
+head rejects anything outside `0x01..=0x20` with `sltiu v1, 0x20`, and slots
+`0x1A..=0x1F` point at the loop test `0x80039B44` itself, which advances
+nothing - so those six bytes re-dispatch forever, exactly as a rejected byte
+does. Twenty-six op bytes are defined, across twenty-four case bodies: `0x19`
+and `0x20` share `0x03`'s.
+
+**Yields** is the column that decides how a stream reads. The interpreter is
+a `while (!did_work)` loop: the head at `0x800382F0` re-reads `actor+0x84`,
+jumps through the table, and the epilogue at `0x80039B44` loops back unless
+the arm executed `addiu s8, s8, 1`. An op that does not yield advances the PC
+and the **next op runs in the same frame**, which is why a stream can raise a
+story flag, swap a model and start three tweens between two frames.
+
+| op | width | yields | effect |
+|---|---|---|---|
+| `0x01` | 1 | no | jump back to the variant's first op, cursor cleared |
+| `0x02` | 3 | no | write the requested-move / anim pair `+0x88`/`+0x5C`, **only while the `0x801C6470` record is unset** |
+| `0x03` / `0x19` / `0x20` | 3 | yes | [directional step](#ops-0x03--0x19--0x20-op-b1-b2---the-directional-step) |
+| `0x04` | 3 | all but the terminal tick | [in-VM facing ramp](#op-0x04-04-b1-b2---the-in-vm-ramp) |
+| `0x05` | 2 | yes | wait, interruptible by [the touch post](#the-touch-post---fun_8003d038) |
+| `0x06` | 5 | yes | [one random full-tile step in a home-relative box](#op-0x06-06-b1-b2-b3-b4---the-home-relative-step) |
+| `0x07` | 3 | no | **set** system flag `(s16)(b1 \| b2 << 8)` in `DAT_80085758` |
+| `0x08` | 3 | no | **clear** the same |
+| `0x09` | 3 | no | `FUN_80035B50` - queue an **SFX cue** id in the four-slot `DAT_8007B6D8` ring ([`functions/audio.md`](../reference/functions/audio.md)) |
+| `0x0A` / `0x0B` | 3 | no | raise / drop the translucent-draw bit `0x0100_0000`, then the `0x02` tail; same unset-record gate |
+| `0x0C` | 8 | no | [tint + draw-mode fade](#op-0x0c---the-tint--draw-mode-fade) |
+| `0x0D` | 4 | all but the terminal tick | [pre-unwrap + tween](#op-0x0d-0d-b1-b2-b3---pre-unwrap--tween) |
+| `0x0E` | 3 | no | [model swap](#op-0x0e---the-model-swap) through `FUN_80024E08` ([`functions/renderer.md`](../reference/functions/renderer.md)) |
+| `0x0F` | 3 | no | [tile teleport + re-anchor](#op-0x0f---the-tile-teleport) |
+| `0x10` / `0x11` | 2 | no | [set / clear one bit of a selectable halfword](#ops-0x10--0x11--0x12---the-bit-ops) |
+| `0x12` | 2 | **always** | wait for that bit to **change** |
+| `0x13` | 13 | no | `FUN_80058490` - a libgpu `MoveImage` VRAM blit |
+| `0x14` / `0x15` / `0x16` | 5 | no | [tween `+0x72` / `+0x24` / `+0x28`](#ops-0x14--0x15--0x16---the-three-scalar-tweens) |
+| `0x17` | 3 | no | [per-actor default-move write](#op-0x17---the-per-actor-default-move-table) |
+| `0x18` | 5 | yes | [AABB wander](#op-0x18-18-b1-b2-b3-b4---the-aabb-wander) |
+
+### The `0x8A` byte is a suppression mask, not an enable
+
+The interpreter opens by testing `actor+0x8A & 1`, and the branch at
+`0x80038194` is `beq` - taken when the bit is **clear**, to `0x800381F8`,
+which is inside the variant preamble. So a zero byte runs the VM
+unconditionally. What the bit gates is the three suppression tests between
+`0x8003819C` and `0x800381F4`, every one of which returns without executing
+anything:
+
+- the player context `_DAT_8007C364` carries the engaged flag `+0x10 & 0x80000`
+  (the player is in a conversation, a menu or a scripted beat);
+- this actor's own `+0x10 & 0x500` is set (cutscene-script or pursue-VM busy);
+- the actor sits at the off-map park - **both** `+0x14` and `+0x18` at or above
+  `0x3F81`.
+
+So the byte reads "this stream defers to the player", not "this stream is
+switched on", and a binding that authors it zero keeps choreographing through
+a cutscene.
+
+The port carries the bit as `FieldNpcAmbient::defers` and makes the same three
+tests before the variant preamble. The engaged bit is read through the
+engine's script-context predicate; an ordinary conversation holds only the
+talker's own stream (its record running is retail's `+0x10 & 0x100`), not
+every deferring stream in the scene. That is narrower than retail, where a
+talk freezes them all: with the full rule, villagers frozen beside a talk
+stood in the full-game ladder's walk routes and kept re-opening their touch
+talks. `rikuroa` `P1[3]` is the
+case a player sees: Noa's stream (bound with the bit set) ramps her to the
+compass point `LUT[7]` and back, and without the gate it ran through her own
+pre-battle beat and turned her away from the creature her spawn prologue's
+`4C 85 00 00 16` had faced her toward.
+
+### Walk-op speed encoding
+
+Every walk op steps on the same `0x80 >> (2 + bits)` per-tick ladder as the
+`FUN_8003774C` yield ops, with the base-step selector carried in its own
+operands. The directional steps `0x03`/`0x19`/`0x20` hold `bits` in operand
+byte 1's low nibble; the home-relative step `0x06` and the AABB wander `0x18`
+scatter the same 4-bit selector over their four operand bytes' high bits
+(`(b1&0x80)>>4 | (b2&0x80)>>5 | (b3&0x80)>>6 | b4>>7`), leaving the low seven
+bits for the home-box tile deltas / wander-box tiles.
+
+This is the disc source of a town NPC's ambient wander pace. The static
+decode is `man_field_scripts::placement_wander_step` →
+`World::npcs.glide_speeds` (default variant first, then the gated
+variants in table order); the runtime semantics are [below](#the-walk-half---the-directional-steps-and-the-aabb-wander).
+
+### The walk half - the directional steps and the AABB wander
+
+These are what a fresh town villager actually runs, and the reason "why does
+nobody move" is a walk question rather than a facing one. Dispatch for all of
+them is the same `0x80010FE8` table: `0x03`, `0x19` and `0x20` share one case
+body at `0x800383F8`, and `0x18` has its own at `0x80038B90`.
+
+Two tables sit back to back at `0x80073F04` and drive every walk op. The
+first is the eight-entry compass LUT the facing ops also use; the second,
+starting sixteen bytes later at `0x80073F14`, is the **axis bitmask** table
+(`1` = `+Z`, `2` = `-Z`, `4` = `+X`, `8` = `-X`) that every walk op reduces
+its heading index through before touching a coordinate. Entry `i` of the
+bitmask table is exactly entry `i` of the compass in bit form, which is why
+diagonal indices move both axes by the same per-tick step. The two tables
+being adjacent is also what a `& 0xF` index overreads into.
+
+#### Ops `0x03` / `0x19` / `0x20` `[op, b1, b2]` - the directional step
+
+```text
+lut    = b1 >> 4                  ; heading-LUT index
+bits   = b1 & 0x0F                ; pace selector
+shift  = bits + 2
+budget = (b2 & 0x3F) << shift     ; ticks - 0x20 halves it
+step   = 0x80 >> shift            ; units per tick
+```
+
+The product `budget * step` is `(b2 & 0x3F) * 0x80` whatever `bits` is, so
+**`b2 & 0x3F` is the leg's length in 128-unit tiles and `bits` only sets the
+pace**. The three ops differ in exactly two flags: `0x03` additionally snaps
+the heading to `LUT[lut]` on every tick, and `0x20` halves the budget (so it
+walks half the authored distance). `0x19` moves without touching the facing.
+Only `0x03` and `0x19` appear in the disc corpus; `0x20` is authored nowhere.
+
+The cursor at `+0x8B` is `+1` per tick, **not** `_DAT_1F800393`-scaled - the
+same asymmetry op `0x04` has against the `FUN_8003774C` ramps, so a leg is
+the same number of ticks and covers the same distance at any frame scalar.
+The cursor is a `u8` compared `& 0xFF`, so a budget of 256 or more could
+never retire; no authored operand reaches it.
+
+#### Op `0x18` `[18, b1, b2, b3, b4]` - the AABB wander
+
+The four operand bytes carry a tile-space box in their low seven bits
+(`min_x`, `min_z`, `max_x`, `max_z`, each read as `tile << 7 | 0x40` - a tile
+*centre*), and the 4-bit pace selector scattered over their high bits. On the
+op's first tick an actor seated outside its own box retires the op
+untouched, so a story-relocated placement simply never wanders.
+
+Inside the box a three-phase machine runs, its phase byte living in the
+actor's default-move record (`0x801C6470[slot]` byte 2) rather than on the
+actor - which is why a `0x17` write and a wander share a record:
+
+1. **Pick.** Draw `rand() & 6` - a cardinal only, never a diagonal - and
+   reject it if a half-tile probe that way would leave the box. A rejected
+   draw **retires the op** rather than redrawing.
+2. **Turn.** Rotate to the picked compass point at `0x1000 >> (bits + 2)`
+   per tick. Skipped outright when the actor already faces that way.
+3. **Walk.** Step `0x80 >> (bits + 2)` units for `2 << bits` ticks - 64
+   units, half a tile, whatever the pace - then flip a coin: half the time
+   the op retires, half the time it drops back to phase 1 and keeps going.
+
+Two things separate the wander's turn from the ambient facing ops. It takes
+the **shortest arc** (measuring the increasing arc against `0x800` and going
+the other way when it is wider), where `0x04` and `0x0D` take the authored
+direction with no override. And it **masks the heading into `0..0xFFF` on
+every tick**, where those two deliberately hold raw out-of-range values
+mid-ramp. A port that generalises either property from the facing ops to the
+wander is wrong.
+
+#### What the walk ops collide with
+
+Both walk ops probe through `FUN_801cf8ac`, and its only subject is the
+**player actor** - not the walkability grid, and not other NPCs. The
+directional steps probe the single `DAT_801F2254` compass point for their
+heading index; the wander probes the three-point fan of `DAT_801F21B4` row
+`dir` through `FUN_801d5a68`, which reads the row's `+0x00 / +0x04 / +0x08`
+pairs (the row is `0x10` bytes wide and its fourth pair is never read), calls
+`FUN_801cf8ac` on each and returns the bitwise **or** of the three - so any one
+point hitting the player refuses the step. That fan is the engine's
+`AmbientPlayerProbe::wander_blocked`. Both
+apply the shared `(x + dx, z - dz)` convention around the walking actor and
+accept a hit inside the ±40 moving-actor box. These are the same two tables
+the player's own locomotion reads (see
+[field-locomotion.md](field-locomotion.md)).
+
+The box is the routine's **class arm** (`+0x10 & 0x01020000`), and every
+ambient walker takes it: the MAN spawner `FUN_8003A1E4` ORs `0x20000` into
+each placement it seats (`0x8003A3A8..0x8003A3B4`), and `0x01000000` too for a
+`>= 0xF0` party model. The no-class arm - `±80` plus a model-bbox offset from
+the 32-byte `.MAP` object record at `*(0x1F8003EC) + actor[+0x60] * 32` - is
+unreachable for a placement: it leaves the class arm only if bit 17 is
+cleared, and no disc script clears it. It would not matter if it were - its
+result class is `4`, and all three callers test `result & 1` (`0x800384C0`,
+`0x80038A78`, `0x80038F3C`).
+
+The routine opens with a **collision-exempt early-out**: `+0x10 & 3` non-zero
+returns `0` before any box test (`0x801CF8B8`), and the directional caller
+skips the call outright under `+0x10 & 1` (`0x80038484..0x80038490`). Scripts
+raise those bits with op `0x31` (`31 00` / `31 01`) - own-context in many
+placement records (`vell`, `bylon`) and as cross-context pokes from
+partition-2 beats - so a walker a script has made exempt walks through the
+player. The port reads the bits off the placement channel's live flag word
+(`World::field_channel_flags`) and applies the same early-out
+(`AmbientPlayerProbe::exempt`).
+
+On a hit the routine links the pair through `+0x98` both ways and returns
+class `1` for these walkers. The port keeps no link: the player-side readers
+(`0x801D0750`, `0x801D0868`) run only on a hit of the player's own probe,
+which rewrites `+0x98` first, so the walker's write is never read.
+
+So an ambient walker's containment is the AABB its op authored, and the only
+thing that can stop a step is the player standing in it. A blocked
+directional step re-runs its op next tick without advancing the cursor or the
+PC; a blocked wander drops back to the pick phase.
+
+#### From-scratch port + wiring
+
+[`legaia_engine_motion_vm::ambient_motion`](../../crates/engine-motion-vm/src/ambient_motion.rs)
+executes all four walk ops alongside the facing ones, plus `0x17`. The
+collision service is the `AmbientBlocking` trait the host supplies, and
+`engine-core`'s implementation is the player box test above.
+
+The engine's liveliness gate (`World::npcs.animate`, on by default in
+`play-window`; `--no-live-npcs` clears it) gates the **mirror**, not the interpreter: with it
+off the stream still runs its walk ops at their authored cadence, but neither
+the position nor the walk-implied facing is published, so nothing on screen
+moves. Suppressing the ops instead would stall a stream on its first walking
+op - a blocked directional step re-runs forever without advancing its PC -
+and a `0x07`/`0x08` story-flag write further down it would then never fire.
+
+That gate distinguishes the two facings this VM writes, which is why the VM
+reports them separately (`AmbientMotion::walk_yaw`). The `0x04` / `0x0D`
+ramps are ambient turning in their own right and mirror either way; a walk
+op's heading write is *walk-direction-implied* facing and means nothing apart
+from the step it accompanies. Publishing it while suppressing the step makes
+an NPC pivot on the spot through a motion it never performs - and in the
+scene where it matters most the fresh-game variants author no turning at all,
+so that pivot would be pure artefact rather than retail behaviour.
+
+`World::tick_field_npc_ambient` writes the VM's live position back into
+`World::npcs.positions` on any tick that moved it, so the wandering
+NPC's own collision box and its interact box follow it. Because retail
+dispatches the two motion VMs off *different* actor flag bits (`+0x10 & 0x80`
+here, `& 0x400` for `FUN_8003774C`), no actor is ever walked by both.
+
+One ordering trap the wander's absolute box makes fatal: the ambient
+channels install with the scene carriers, *before* the spawn-prologue pre-run
+relocates the story-parked and story-moved placements. `World::pre_run_field_channel_prologues`
+therefore re-seats every not-yet-started channel
+(`resync_ambient_start_positions`, the position sibling of
+`resync_ambient_start_headings`) - a channel left holding the raw MAN header
+tile retires its wander on the first tick and the villager silently never
+moves.
+
+Disc oracle:
+[`crates/engine-scene-host/tests/field_npc_ambient_wander_disc.rs`](../../crates/engine-scene-host/tests/field_npc_ambient_wander_disc.rs).
+
+### The ambient VM's own facing ops
+
+`FUN_80038158` writes `+0x26` from the same `0x80073F04` compass, under the
+same two laws. Dispatch for both ramp ops is the 32-entry jump table at
+`0x80010FE8` indexed by `op - 1`.
+
+- **Snap.** The directional steps `0x03`/`0x19`/`0x20` and the wander/home-step
+  ops set the heading from their operand's LUT index as they move.
+- **Ramp.** Ops `0x04` and `0x0D`, below. Both aim at `LUT[b1 & 7]` and both
+  read the direction from `b1 & 0x80` (set = decreasing). Neither has a
+  shortest-arc override, so an authored turn can deliberately take the long
+  way round - unlike the `FUN_8003774C` `0x38` sibling, which opts into
+  shortest-path on `body0 & 0x80`. Because the LUT index is masked `& 7`,
+  these ops cannot reach the adjacent SCUS data that the sibling VM's
+  `& 0xF` index can.
+
+#### Op `0x04` `[04, b1, b2]` - the in-VM ramp
+
+Case body `0x8003859C`, arithmetic at `0x800385D0..0x800386A0`. Per tick:
+
+```text
+frames    = b2 & 0x7F                        ; frame budget
+remaining = frames - cursor                  ; cursor at actor +0x8B, u8
+target    = LUT[b1 & 7]
+cursor   += 1                                ; unit-per-tick
+if remaining == 0:                           ; terminal
+    heading = target                         ; exact snap
+    cursor  = 0 ; pc += 3 ; next op runs THIS tick
+else:
+    arc      = (target - heading) mod 0x1000 ; or (heading - target)
+    heading += arc / remaining               ; or -=, raw u16 wrapping
+    yield
+```
+
+The **cursor is unit-per-tick** (`addiu a0, a0, 1`), *not*
+`_DAT_1F800393`-scaled the way the `FUN_8003774C` ramps are, so a budget of
+24 is 24 stepping ticks at any frame scalar. The leg therefore always runs
+`(b2 & 0x7F) + 1` ticks: the budget in stepping ticks plus one terminal
+tick, and that terminal tick does **not** consume the frame (retail never
+increments the did-work counter `s8` on that arm), so the snap and the
+following op execute together.
+
+The requested move / anim pair (`+0x88`/`+0x5C`) is restamped twice, from
+two different bytes of the per-actor default-move record (the `0x801C6470`
+table op `0x17` writes), and only while its move byte is not the `0x8C`
+sentinel. The case head `0x8003859C..0x800385C8` stores the record's
+**anim** byte (`+1`) on every tick, stepping or terminal. The terminal arm
+then leaves through the shared epilogue `0x800390A8` (`j` at `0x80038610`),
+which stores the **move** byte (`+0`) - so a turn plays the record's turning
+clip and hands back to its idle move on the tick it snaps. The port is
+`AmbientMotion::step_facing_ramp`.
+
+#### Op `0x0D` `[0D, b1, b2, b3]` - pre-unwrap + tween
+
+Case body `0x800386A4..0x80038828`. This op never moves the heading itself.
+On its first tick it pre-unwraps the live heading past the `0x1000` boundary
+so that a plain linear interpolation travels the authored way, then hands
+`&actor+0x26` to the generic ramp scheduler (an inlined `FUN_8003C5F0`):
+
+```text
+cursor16 = actor+0x8B | actor+0xB7 << 8
+if cursor16 == 0:                                     ; install tick, once
+    target = LUT[b1 & 7]
+    if b1 & 0x80:  if heading < target: heading += 0x1000   ; go decreasing
+    else:          if target < heading: heading -= 0x1000   ; go increasing
+    install ramp { dest=&heading, start=heading, end=target,
+                   total=(s16)(b2 | b3 << 8), kind=2 }
+if cursor16 >= (s16)(b2 | b3 << 8):                   ; terminal
+    cursor16 = 0 ; pc += 4 ; next op runs THIS tick
+else:
+    cursor16 += _DAT_1F800393 ; yield
+```
+
+`0x0D`'s wait cursor **is** frame-scalar-driven - the opposite of `0x04`'s -
+and that is what keeps it in lockstep with the scheduler, which decrements
+its own countdown by the same scalar. Op and ramp retire together; the op
+outlives its ramp by exactly one tick, so the leg runs
+`ceil(duration / speed) + 1` ticks. A `duration` of `0` is an instant
+compass write.
+
+#### Masking
+
+Neither op normalises the heading per tick. `0x04`'s write-back is raw `u16`
+wrapping, so a decreasing ramp through zero holds `0xFFxx` for its whole run.
+`0x0D` goes further: the pre-unwrap deliberately parks the heading *outside*
+`0..0xFFF` (up to `0x1FFF`, or negative stored as `0xFxxx`) and the scheduler
+interpolates on that raw value, so raw headings above `0x1000` are observable
+live mid-turn. Only the endpoint lands back in range, written as the LUT
+entry verbatim. Renderers consume `+0x26 & 0xFFF`, so none of this shows on
+screen - but a port that masks per tick diverges from the traced `+0x26` on
+every wrap-crossing turn. The arc measurement inside `0x04` *is* taken mod
+`0x1000`, which is why a raw out-of-range heading still feeds back correctly.
+
+#### The generic ramp scheduler
+
+`FUN_80036D80` walks the 64-slot pool at `0x801C66A0` (stride `0x20`; slot 0
+is the intrusive list header, leaving 63 allocatable) once per frame:
+
+```text
+remaining -= _DAT_1F800393
+if remaining <= 0:  value = end ; free the slot
+else:               value = end + (start - end) * remaining / total
+store value to *dest, width per kind (1=u8, 2=u16, 3=packed RGB, 4=u32)
+```
+
+The divide truncates toward zero (MIPS `div`) and `total` is never
+rewritten, so this is a straight lerp off the install-time endpoints rather
+than an incremental accumulation. The heading channel is `kind == 2` (`sh`).
+A slot whose owning actor has `+0x10 & 8` set is freed unticked; an install
+with no free slot bumps the `DAT_80073ED0` overflow counter and is dropped.
+Installers are `FUN_8003C5F0` and this op's inlined copy. `FUN_8003CDA8`
+resets the pool, but nothing on the disc calls it: an address-reference scan
+over SCUS and every PROT entry finds no `jal`, jump, branch, word or `lui`
+pair naming `0x8003CDA8`, so "scene-entry reset" describes the body, not a
+caller. The port runs it on the player's scale-ramp scheduler at
+`World::install_field_player`, the one scheduler that outlives a scene.
+
+The reset is worth reading for one asymmetric store. It zeroes the busy word
+`+0x1E` of all **64** raw slots and clears slot 0's `+0x1A` / `+0x1C`, then
+writes `_DAT_801C66BE = 1` - slot 0's own `+0x1E` - so the list header comes
+back marked occupied and only slots 1..63 are handed out. That single store
+is where the pool's usable count of 63 comes from; a reset that clears all 64
+and stops will allocate the header. It closes with an actor sweep
+(`actor_free(&DAT_800742EC, _DAT_8007C34C)`) retiring the pool's driver
+actor, which the port has no counterpart for because the host ticks the
+scheduler directly.
+
+#### `FUN_80037018` is not a slot of this pool
+
+The routine at `0x80037018` lerps two `i32` endpoints into a destination
+pointer at a selectable width, and is otherwise a different subsystem:
+
+| | `FUN_80036D80` slot | `FUN_80037018` |
+|---|---|---|
+| Record | `0x20`-byte pool slot | a full actor, fields at `+0x80..+0xCA` |
+| Reached by | the per-frame pool walk | actor `+0x0C` handler dispatch |
+| Ramp parameter | the slot's own countdown | **the player's Z position** |
+| `kind == 3` | packed-RGB three-lane lerp | plain `sw`, same arm as `kind 4` |
+
+It gates on the player context `_DAT_8007C364`: the engaged flag
+`+0x10 & 0x80000`, the scratch system lock `_DAT_1F800394 & 0x400`, then an
+AABB over the player's X (`+0x14`, against actor `+0x88` / `+0xC8`) and Z
+(`+0x18`, against `+0x8A` / `+0xCA`). Inside the box it stores
+`start + (end - start) * (player.z - z_lo) / (z_hi - z_lo)` through the
+pointer at `+0x94`, at the width `+0x8C` selects (`1` = `sb`, `2` = `sh`,
+`3` or `4` = `sw`); any other width sets the actor's own `+0x10 |= 8` yield
+bit instead. Nothing counts down, so the value tracks the player and runs
+backwards when he walks back; the actor never finishes. What clears these is
+the scene MAN loader's second inlined retire sweep (`FUN_8003AEB0` at
+`0x8003B414`), which is keyed on this VA - see
+[`script-vm.md`](script-vm.md). Ported as
+`legaia_engine_motion_vm::ambient_motion::zone_ramp_tick`.
+
+Its **spawner** is `FUN_8003C6A4`, i.e. field-VM op `0x43` sub-3..6
+([`script-vm.md`](script-vm.md#0x43-sub-36---the-camera-register-zone-ramp)):
+the descriptor at `&DAT_80074304` carries this VA in its `+8` word, and the
+op fills in exactly the `+0x80..+0xCA` fields read above. So the
+"destination pointer" is never arbitrary - it is one of four named field
+camera-configuration registers, and the routine is the mechanism behind a
+camera parameter that tracks the player across an authored zone. The engine's
+spawn side is `legaia_engine_field::register_ramp`; `World::tick_register_ramps`
+runs this tick per frame and `Camera::tick_globals` consumes the result.
+
+#### From-scratch port
+
+[`legaia_engine_motion_vm::ambient_motion`](../../crates/engine-motion-vm/src/ambient_motion.rs)
+executes both ops plus the `0x05` wait, the `0x01` restart, the `0x17`
+default-move write and the four [walk ops](#the-walk-half---the-directional-steps-and-the-aabb-wander),
+and carries the scheduler as `RampScheduler`; the other seventeen case bodies are in
+its `ambient_motion_ops` sibling
+([below](#the-whole-table-has-one-executing-home)). The pool is ticked in slot
+order rather than through retail's linked list - observable only if two live
+ramps shared a destination, which one actor's heading channel cannot do.
+
+#### Engine wiring
+
+The host keeps one channel per placement slot (`World::npcs.ambient`),
+seeded at scene load by `World::seed_field_npc_ambient` from the MAN's
+tail-section-1 streams through the installer's binding law
+(`actor_id = N0 + placement_index`). The whole variant table is carried, not
+just the fresh-game one, because the interpreter preamble re-selects the live
+variant **every tick** against `DAT_80085758`; a swap reseeds the cursor
+rather than resuming the old variant's offset into new bytecode.
+
+The overworld runs it as well: the kingdom maps are mode-3 field-run
+scenes whose scripted actors the same driver `FUN_8003BC08` steps (`jal
+0x80038158` at `0x8003BD98`), and their streams write story flags - the
+Karisto cart's `map02` / `map03` streams move it between the stations and
+raise `0x467` / `0x466` ([`full-game-ladder.md`](../tooling/full-game-ladder.md)).
+The engine ticks the channels in both the field and the world-map arm.
+
+`World::tick_field_npc_ambient` steps each channel on the **actor game tick**
+(see [`actor-vm.md`](actor-vm.md#tick-cadence-dat_1f800393)), not per rendered
+frame - that is what keeps `0x0D` in lockstep with the ramp scheduler, since
+both advance by the same `DAT_1F800393`. Op `0x04`'s unit-per-tick cursor is
+unaffected by the same scalar, which is the retail asymmetry, not a port
+artefact.
+
+Where the facing ops sit in the corpus is worth knowing before debugging a
+"nobody turns" report. In `town01` the **default** (fresh-game) variants carry
+no facing op at all - they are `0x17` default-move, `0x05` wait, `0x18` AABB
+wander - so a fresh Rim Elm villager's ambient behaviour is *wandering*, and
+the `0x04` ramps live in **flag-gated** variants, i.e. later story states. A
+fresh save showing no turning NPCs is therefore the authored behaviour, not
+broken wiring: the thing to check on that report is the
+[walk half](#the-walk-half---the-directional-steps-and-the-aabb-wander)
+instead. The gated turning path is exercised in
+[`crates/engine-core/tests/field_npc_ambient_idle_disc.rs`](../../crates/engine-core/tests/field_npc_ambient_idle_disc.rs).
+
+The channel's `render_heading()` is mirrored into `World::npcs.headings`
+- converted out of retail heading space into the engine's `render_26` space
+(`+0x800`) - **only on a tick that actually moved the heading**. That gate is
+the ambient sibling of `MotionState::yaw_written`: an NPC parked in a `0x05`
+wait must not re-stamp its stale heading over a pose another writer set (the
+interact face-the-speaker bearing being the case that regressed before).
+
+Disc oracle:
+[`crates/engine-motion-vm/tests/ambient_motion_disc_oracle.rs`](../../crates/engine-motion-vm/tests/ambient_motion_disc_oracle.rs)
+re-derives the disc-wide census (every scene bundle's MAN → tail-section 1 →
+every record → every gated variant → every `0x04`/`0x0D` site) and replays
+each site from four start headings at three frame scalars, asserting the
+compass endpoint, the scalar-invariant `0x04` cadence, the scalar-driven
+`0x0D` cadence, the swept arc equalling the authored (not complementary)
+arc, and the raw out-of-range hold on every wrap-crossing leg.
+
+### Op `0x17` - the per-actor default-move table
+
+`[0x17, move_id, anim_id]` writes `0x801C6470[actor(+0x50) * 4] = move_id`
+/ `+1 = anim_id`, guarded `+0x50 < 0x8C` (the table's 0x8C-record arena;
+`0x8C` is also the "unset" sentinel the variant-swap preamble reseeds a
+record to). The walk/anim ops (`0x02`, `0x03`/`0x19`/`0x20`, `0x18` phase
+1/3) reload the actor's requested-move pair `+0x88`/`+0x5C` from the
+record while it is set, and the motion-pause kick `FUN_8003C9AC` (ported at
+`legaia_engine_field::motion_pause`) sweeps the same table - see
+[the motion-pause kick](#the-motion-pause-kick). The engine statically harvests each
+stream's first `0x17` per bound placement
+(`man_field_scripts::motion_default_move_writes` →
+`World::npcs.default_moves`), keyed by placement slot (`actor_id -
+N0`).
+
+### The motion-pause kick
+
+The kick `FUN_8003C9AC` (see `ghidra/scripts/funcs/8003c9ac.txt`) walks the
+scene actor list and, for every actor with
+`+0x10 & 0x20000` and a bound stream (`+0x80 != 0`), copies byte `0` of its
+`0x801C6470` record into both `+0x88` and `+0x5C` unless it is `0x8C`. Two
+routines end with it, both by `jal`: the touch post `FUN_801D5B5C`
+(`0x801D5BF0`, PROT 0897) and the partition-2 record dispatcher
+`FUN_8003BDE0` (`0x8003C0D4`), whose `jal` sites are the walk-on trigger
+`FUN_801D1EC4` (three), the field VM's op `0x44` arm (`0x801DF090`) and one
+more field-overlay site (`0x801D2C78`).
+
+Byte `0` is the standing move and byte `1` the walking anim: the walk ops'
+prologue requests byte `1` and their epilogue byte `0`. So the kick asks
+every walker for its standing clip at the moment an interaction engages. It
+is not a pause and nothing counts down: the motion VM keeps running, and
+the driver `FUN_8003BC08` runs the scripted VM before the move-table
+consumer, so a walker whose ops send it on to another step overwrites the
+request with its walk anim before the consumer reads `+0x5C`. The consumer
+`FUN_800204F8` restarts a clip only when `+0x5C` differs from the playing
+`+0x5E` (`0x80020570..0x800205A8`), so that overwrite leaves the walk cycle
+running; a walker parked in a wait keeps the request and stands.
+
+**The gate bit.** Two writers put `0x20000` into `+0x10`, both read from the
+disassembly and both seen firing in a write-watch over the field actor pool
+across a `town01` entry (`scripts/pcsx-redux/autorun_moving_class_writer.lua`):
+the placement seater `FUN_8003A1E4`, unconditionally for every partition-1
+placement (`0x8003A3A4..0x8003A3B4`, every seat in the capture), and field-VM
+op `0x31` operand `0x11` (`0x801DED9C..0x801DEDB0`), which the disc authors
+only in partition-0 object prologues - `town01` P0[8] is the one the capture
+catches, pre-run through the object spawn iterator `FUN_8003A55C`. The disc
+carries no `0x32` with operand `0x11` and the capture saw no clearing store.
+A `town01` free-roam state shows the bit on every actor whose `+0x50` is a
+placement id (`N0 + index`) and, among the partition-0 objects below `N0`,
+only on P0[8].
+
+The engine seeds the bit on each ambient channel
+(`World::seed_field_npc_ambient`), runs the kick from
+`World::trigger_field_interact` and from the partition-2 record installs,
+and plays the request through `World::tick_field_npc_ambient`, which is the
+move-table consumer for these channels: it raises a clip cue for the
+channel's requested move on every actor tick, and `World::carry_npc_run_anim`
+drops a cue for the move already playing. That test is also what keeps a
+walk cycle running: the walk ops request the walk anim on every step, and a
+cue per step restarted the clip at frame `0` on both hosts.
+
+No op writes `DAT_8007B7FC`-class globals - op-`9` only posts to the 4-slot
+`DAT_8007B6D8` ring, so the battle-id write has no motion-VM analogue.
+
+### The touch post - `FUN_8003D038`
+
+The field collision probe `FUN_801CFC40` calls `func_0x8003d038` with the
+touched actor's bind-record index (`other[+0x50]`) whenever two actors
+overlap. The body is one guarded store into `DAT_80073F1C`, the one-slot
+mailbox the motion VM's wait-for-touch arm (`0x8003882C`, inside
+`FUN_80038158`) consumes and resets.
+
+The guard reads the record's **class byte** - the first byte of the
+4-byte record at `DAT_801C6470 + index*4`, the same table op `0x17`
+writes - and drops the post when it is `0x8C`. Since `0x8C` is the
+"unset" sentinel the variant-swap preamble reseeds a record to, the
+filter means a placement with **no move assigned** can be walked into
+without ever waking a script waiting on a touch. The mailbox keeps its
+previous contents in that case; the post is dropped, not cleared.
+
+Retail does no bounds check on the index. The port
+(`legaia_engine_motion_vm::motion_vm::post_touch`) returns "no post" for an
+out-of-range index rather than reading past the table, which is the safe
+reading of the same outcome.
+
+**`0x8003882C` is one op with two halves, and the port has both.**
+The block is a *wait-until-touched-or-elapsed*: it opens on the mailbox
+(`lw v1, 0x3f1c(a1)`, the `0xFF` empty test, then the `+0x50` match and the
+`0x8C` class test), and only when that fails does it fall to `0x80038864`,
+where it rewrites the op's own cursor to `duration - DAT_1F800393` so the
+countdown immediately below (`0x80038880`) lands exactly on the duration and
+expires the wait on that frame, then stores the `0xFF` sentinel back
+(`sw a0,0x3f1c(a1)` at `0x8003887C`).
+
+Both halves are wired. `AmbientMotion::take_touch_wake`
+(`legaia_engine_motion_vm::ambient_motion`) is the head, replaying retail's three
+gates in retail's order, and `AmbientMotion::pending_touch` is the mailbox -
+a per-channel `Option` rather than one global word, which carries the same
+information because every actor's arm tests the word against its own `+0x50`
+and at most one can ever match. The producer is
+`World::post_ambient_motion_touch`, run from the locomotion step alongside
+`World::check_field_walk_touch`; it assembles the `0x801C6470` class-byte
+arena from the **live** channels' op-`0x17` records rather than from the
+static harvest `World::npcs.default_moves`, because a stream that has
+not run its `0x17` yet still holds the `0x8C` sentinel there and retail's
+guard reads the live arena. End-to-end anchor:
+`crates/engine-core/tests/ambient_touch_wake.rs`, whose two cases differ only
+in where the NPC stands.
+
+Provenance: `ghidra/scripts/funcs/8003d038.txt`; the consumer at
+`0x8003882C` is inside `ghidra/scripts/funcs/80038158.txt`.
+
+### Op `0x06` `[06, b1, b2, b3, b4]` - the home-relative step
+
+Case body `0x800388C4`. One random cardinal step of a **full tile**, bounded
+by a box measured from the actor's own anchor pair `+0x8C` / `+0x8D` - the
+tiles the `0x0F` teleport and the spawner write.
+
+The four operand bytes carry the box in their low seven bits as **signed tile
+deltas from that anchor**, and the 4-bit pace selector scattered over their
+high bits exactly as `0x18` scatters it:
+
+```text
+bits  = (b1&0x80)>>4 | (b2&0x80)>>5 | (b3&0x80)>>6 | b4>>7
+x_lo  = ((b1 + home_x    ) & 0x7F) << 7
+z_lo  = ((b2 + home_z    ) & 0x7F) << 7
+x_hi  = ((b3 + home_x + 1) & 0x7F) << 7
+z_hi  = ((b4 + home_z + 1) & 0x7F) << 7
+```
+
+On the op's first tick (cursor zero) it draws `rand() & 6` - a cardinal,
+never a diagonal - and rejects the draw when the **whole-tile** destination
+(`±0x80`, not the wander's half tile) would leave that box, in which case the
+op retires. Otherwise the direction is stashed in `+0x86` bits 12-13, the same
+two bits the wander uses, and the op walks `0x80 >> (bits + 2)` units for
+`4 << bits` ticks - 128 units, a full tile, at any pace - and then retires.
+There is no turn phase and no continue-or-stop coin flip: the heading is
+snapped to the compass point every tick and the op runs exactly one leg.
+
+Collision is the wander's three-point fan `FUN_801D5A68`, not the directional
+step's single point. A blocked tick advances neither cursor nor PC, so a block
+on the first tick redraws next frame while a block mid-leg retries the same
+direction. Every path through the arm consumes the tick (`0x80038A1C` on the
+rejected draw, `0x80038A3C` on all the rest).
+
+The "pad-echo / bounded chase step" reading this op carried is **falsified**:
+no pad word is read anywhere in the arm, and the direction comes from the BIOS
+`rand()` at `0x80056798`.
+
+### Op `0x0C` - the tint / draw-mode fade
+
+`[0C, r, g, b, m_lo, m_hi, d_lo, d_hi]`, case body `0x8003918C`. Fades the
+actor's **packed RGB tint** `+0x74` and its companion draw-mode word `+0x78`
+over one shared duration. Both are arguments of the mesh submit
+`FUN_80043390` - the colour word in `a1` (bytes 0-2 are R/G/B and byte 3 ORs
+a bit into the mode) and the mode word in `a2` - and the actor spawn init
+`FUN_80020E3C` seeds them `0x00808080` (PSX-neutral) and `0`.
+
+Four branch shapes, at `0x800391BC` / `0x800391F4` / `0x80039220`:
+
+| duration | live `+0x78` | mode operand | behaviour |
+|---|---|---|---|
+| `0` | any | any | both written outright |
+| non-zero | `0` | any | tint written outright, mode ramped `0` -> operand |
+| non-zero | non-zero | `0` | tint untouched, mode ramped live -> `0` |
+| non-zero | non-zero | non-zero | both ramped |
+
+which is a fade-**in** that snaps the colour and opens the mode, and a
+fade-**out** that closes the mode and leaves the colour standing. The tint
+ramp is the scheduler's `kind 3` - the only caller of its three-lane packed-RGB
+lerp - and the mode ramp is `kind 4`, a `sw` over a field retail itself reads
+back with `lhu`.
+
+The "glide-channel install" reading is **falsified**: nothing in the arm
+touches a coordinate.
+
+### Op `0x0E` - the model swap
+
+`[0E, lo, hi]`, case body `0x800393A0`. Re-binds the actor's mesh through
+`FUN_80024E08`, which zeroes the anim cursor `+0x5C`, stores the resolved id
+at `+0x64` and reloads. The operand is compared **unsigned** against `0xF0`
+(`sltiu`), which splits the id space in two:
+
+- below `0xF0`: clear the translucent-draw bit `+0x10 & 0x0100_0000` and
+  resolve against `*(u16*)0x8007B6F8`, the scene's own model-bank base - the
+  same word the placement spawner `FUN_8003A1E4` adds a placement's model byte
+  to at `0x8003A2F0`;
+- `0xF0` and above, a negative operand included: raise that bit and resolve
+  `operand - 0xF0` against the second base `*(u16*)0x8007B824`.
+
+The two `sltiu ...,0xf0` are at `0x800393B8` (this op, on the sign-extended
+halfword the arm assembles from operand bytes `+1`/`+2`) and `0x8003A2DC` (the
+placement spawner, on a plain `lbu` of the record's model byte). Neither
+`sltiu` is inside `FUN_80024E08`: that routine only receives the already
+resolved pool index in `a1`.
+
+`0xF0` naming **Vahn** is one step further out than the split is. What the
+bytes give is that player-bank index `0` is *party slot* `0`: `FUN_8001E890`'s
+epilogue walks exactly three entries from the base
+(`slti v0,s0,0x3` at `0x8001EBA8`) capping each TMD's `+0x08`, and
+`FUN_8001EBEC` indexes `pool[*(0x8007B824) + i]` with the same `i` it uses to
+reach the per-character equipment bytes off the live save window
+(`lw v0,-0x47dc(v0)` / `addu v0,v0,a2` at `0x8001EC54`, `lbu v0,0x75e(v1)`).
+Which character *is* party slot `0` comes from the §0 pack's slot order
+([`character-mesh.md`](../formats/character-mesh.md#on-disc-layout)), not from
+the compare.
+
+Both bases index one array, and it is not a per-scene pack - see the next
+section.
+
+A stream need not be bound to a partition-1 placement. `FUN_8003A9D4` matches
+a record's `actor_id` against `+0x50`, and a `.MAP` placed object's actor
+carries its bind record there, so an `actor_id` below the partition-0 count
+binds a **placed object**. `koin3` binds four such streams to `P0[5..=8]`,
+the dance hall's video-wall panels: the default variant swaps the panel's
+mesh through scene-bank ids `0x14`..`0x1E` every twelve ticks, and the
+contest variant (system flag `0x4F3`) holds it on `0x1B`. Only the first
+actor with that `+0x50` takes the stream - the retail
+`minigame_dance_pcsx` state holds `P0[8]`'s first placement on a cycled model
+and its second, a frame under it, on its own mesh. Engine:
+`FieldNpcState::object_ambient` / `World::object_live_models`, drawn on the
+record's first placement (`field_env::stream_bound_draws`) by both hosts.
+
+### The model pool both bases index
+
+`DAT_8007C018` is a flat array of registered TMD pointers, and `FUN_80026B4C`
+(`tmd_register`) is its only **registrar**: it validates the magic
+`0x80000002`, stores the pointer at `DAT_8007C018 + n*4` (`sw a0,0x0(v1)` at
+`0x80026BA8`), publishes `n` to `0x8007BB38` and returns `n` as the model's
+id. `n` lives at `DAT_8007B774`, and the stage
+initialiser `FUN_8001E1B4` resets it to `*(u32*)0x8007B824` in its epilogue
+(`sw v1,-0x488c(at)` at `0x8001E3AC`), so ids below that watermark survive a
+scene change and ids at or above it are reissued per stage.
+
+"Only registrar" is not "only writer". Both reference scanners
+(`find-address-word-refs.py`, `find-gp-relative-refs.py`) return ten
+base-forming sites for `0x8007C018` across `SCUS_942.54` and every extracted
+overlay, and exactly two of them store: `0x80026BA8` above, and
+`0x801CF1E0` in PROT 0976 (Baka Fighter), which reads the counter
+(`lw v1,-0x488c(v0)` at `0x801CF1B8`), mirrors it into two of its own globals
+and then does `sw zero,0x0(v0)` into `DAT_8007C018 + n*4` - it blanks the slot
+at the current top of the pool rather than registering anything. Every other
+site loads.
+
+| pool range | content | registrar |
+|---|---|---|
+| `[0, *0x8007B824)` | nothing in retail - the watermark is `0` | `FUN_8001F05C`'s `s7 != 0` arm, which never runs |
+| `[*0x8007B824, *0x8007B6F8)` | the five PROT 0874 §0 player meshes | `FUN_8001E890`'s pack loop `0x8001EB34..0x8001EB70` (its `jal 0x80026B4C` is at `0x8001EB4C`) |
+| `[*0x8007B6F8, ...)` | the scene's own models | `FUN_8001F05C`'s type-`0x02` / type-`0x09` arms |
+
+`FUN_8001E890` sets `0x8007B6F8 = pack_count + *(u32*)0x8007B824`
+(`0x8001EB10..0x8001EB20`) - one past the player pack it has just registered.
+The store is a **word** (`sw v0,-0x4908(at)` at `0x8001EB20`); every consumer
+reads only the low halfword back, with `lhu`, which is why the base is written
+`*(u16*)0x8007B6F8` everywhere it is read. `pack_count` is the pack's own
+`+0x00` word (`lw v0,0x0(a0)` at `0x8001EB10`, `a0 = *(gp+0x6BC)`), and the
+registration loop re-reads it every iteration (`0x8001EB5C..0x8001EB6C`)
+against no clamp at all - a `beq v0,zero` skip and an `sltu` bound, nothing
+else. That whole tail is also **un-gated**: the container-reload block above it
+runs only for `*(gp+0x6AC) in {0, 2}` (`beq v1,zero` / `bne v1,v0` at
+`0x8001EA4C`/`0x8001EA54`), and `0x8001EAFC` - where the bank base and the
+registration loop begin - is that `bne`'s own target, so it is reached on both
+sides of the test.
+The scene bank is then registration order and nothing else: the bundle's
+descriptors in table order (each type-`0x02` contributing its whole pack, each
+type-`0x09` one model), then any type-`0x02` / type-`0x09` DATA_FIELD chunk in
+the block's streaming entries. `scene_tmd_stream` entries contribute nothing.
+
+Measured on three field save states: `*0x8007B824 = 0`, `*0x8007B6F8 = 5`, and
+`DAT_8007C018[0..=4]` identical across all three and equal to
+`*(gp+0x6BC) + 0x18` - the PROT 0874 §0 pack's five members past its
+`4 + 5*4` header. `DAT_8007B774 - 5` is then the scene's own model count, and
+it equals its bundle pack's member count exactly in every case
+(`town01` 114, `koin1` 159, `izumi` 50). The same three states show the field
+MAIN INIT binding the player actor from the same base
+(`lhu v0,-0x47dc(v0)` into `actor+0x64` at `0x801D6F88..0x801D6F90`), which is
+the cross-check that `0x8007B824` is a player quantity.
+
+Over the 90 `scene_asset_table` bundles on the disc (618 descriptors), **no**
+descriptor's `data_offset` falls outside its own PROT entry, 80 carry a
+type-`0x02` pack, none carries a type-`0x09` single, every one of those 80
+packs LZS-decodes and every member's first word is `0x80000002`. The ten
+bundles with no type-`0x02` descriptor take their models from a type-`0x02`
+DATA_FIELD chunk instead (`bubu1` 173 members, `edbubu` 160).
+
+Parser: `legaia_engine_scene::model_bank` (`SceneModelBank::build` walks a
+scene the way the loader registers it; `resolve_model_id` applies the `0xF0`
+split). `SceneHost` holds one per loaded scene, rebuilt on every field entry,
+and it is what both hosts resolve a live op-`0x0E` re-bind through -
+`World::field_npc_live_model` for the id, `SceneModelBank::tmd_bytes` for the
+bytes. Disc-gated oracles:
+[`model_bank_disc.rs`](../../crates/engine-scene/tests/model_bank_disc.rs) for
+the bank against the `DAT_8007B774` counter, and
+[`model_rebind_live_disc.rs`](../../crates/engine-scene-host/tests/model_rebind_live_disc.rs)
+for every authored operand in `koin3` resolving to a parseable mesh.
+
+### Op `0x0F` - the tile teleport
+
+`[0F, b1, b2]`, case body `0x8003944C`. The grid decode is the field VM's
+`MoveTo` decode verbatim - `(b & 0x7F) * 0x80 + 0x40`, plus a further `0x40`
+when the byte's high bit is set - and the tile numbers are **also** written to
+the anchor pair `+0x8C` / `+0x8D`, which is what makes a following `0x06`
+measure its box from where the teleport landed. The footing is then re-sampled
+through the bilinear ground sampler `FUN_80019278` into `+0x16`, unless the
+actor carries the Y-override bit `+0x10 & 0x2000_0000`.
+
+### Ops `0x10` / `0x11` / `0x12` - the bit ops
+
+Three verbatim copies of one selector decode (`0x80039500`, `0x80039590`,
+`0x80039624`) on the single operand byte. `b1 & 0xC0` picks the word and
+`b1 & 0x30` picks which half of it, in the same sense both times: **non-zero
+selects the low halfword**.
+
+| `b1 & 0xC0` | `b1 & 0x30` | address | field |
+|---|---|---|---|
+| `0x00` | non-zero | `actor+0x10` | low half of the actor flag word |
+| `0x00` | zero | `actor+0x12` | high half of the same word |
+| `0x40` | any | `actor+0x62` | the motion-clip control word |
+| `0x80` | non-zero | `0x1F800394` | low half of the scratchpad global word |
+| `0x80` | zero | `0x1F800396` | high half of the same word |
+| `0xC0` | any | *(none)* | the assert arm - see below |
+
+The bit index is `b1 & 0x0F` in every case, so only bits `0..=15` of the
+selected halfword are reachable, which is what the high-half selectors are
+for: `0x80 | n` is how a stream reaches global bits `16..=31`. The
+`0xC0` arm stores the assert code `0x3039` at `0x8007B828` and leaves the
+pointer **null**, then reads and writes through it; no authored operand
+selects it.
+
+`0x12` is not a wait-for-set. On its first tick the cursor is seeded from the
+bit's *current* value at `0x800396B4` - `1` when already set, `2` when clear -
+and the op then waits for the **opposite** state, so the same authored byte
+means "wait for release" or "wait for signal" depending on what the flag holds
+when the stream arrives. It consumes the tick unconditionally: the
+`addiu s8, s8, 1` sits in the branch delay slot at `0x80039634`, ahead of the
+selector decode, so even the frame the wait retires costs a tick.
+
+### Ops `0x14` / `0x15` / `0x16` - the three scalar tweens
+
+`[op, v_lo, v_hi, d_lo, d_hi]` - three verbatim copies of one arm
+(`0x800397EC`, `0x800398F0`, `0x800399F4`) differing only in the destination
+halfword:
+
+| op | field | what it is |
+|---|---|---|
+| `0x14` | `actor+0x72` | uniform render scale, `0x1000` = 1.0 |
+| `0x15` | `actor+0x24` | the X Euler angle (pitch) |
+| `0x16` | `actor+0x28` | the Z Euler angle (roll) |
+
+A zero duration stores the value outright; otherwise a `kind 2` scheduler slot
+lerps the field from its live value over that many frame-scalar units. None of
+the three consumes the tick, so a stream can stack all three in one frame.
+
+`+0x72` is the field the animated renderer `FUN_8001B964` skips the draw on
+when it is zero (`0x8001B9A0`) and feeds to `ScaleMatrix` when it is anything
+but `0x1000` (`0x8001BA6C..0x8001BAA4`). The field locomotion controller reads
+the *same* halfword as its per-actor speed multiplier
+([`field-locomotion.md`](field-locomotion.md)), so the two readings of `+0x72`
+in this repo's docs are both right about one field with two consumers.
+
+### The whole table has one executing home
+
+[`legaia_engine_motion_vm::ambient_motion`](../../crates/engine-motion-vm/src/ambient_motion.rs)
+runs all twenty-four case bodies. They are split across two files for length
+only - the facing ramps, the walk ops, the waits, the restart and the ramp
+scheduler in `ambient_motion.rs`; `0x02`, `0x06`..`0x0C` and `0x0E`..`0x16` in
+[`ambient_motion_ops.rs`](../../crates/engine-motion-vm/src/ambient_motion_ops.rs) as
+further `impl AmbientMotion` blocks. Nothing is stepped over by width.
+
+The per-tick op budget (`MAX_OPS_PER_TICK`) stays, but its job has changed:
+retail has no budget and none is needed for the ops themselves, since every
+stream's yielding op now executes. What it guards is a stream of only
+non-yielding ops closed by a `0x01` restart, which hangs retail too.
+
+### What the host does with each op
+
+Several arms write state the engine does not consume yet. That is a *consumer*
+gap, not a port gap - the ops run, and their writes are observable on the
+channel - but it is the thing to check before filing "op X does nothing".
+
+| op | engine mechanism |
+|---|---|
+| `0x07` / `0x08` | `World::system_flag_set` / `system_flag_clear` - the same bank the variant preamble re-selects against, so a stream can swap its own variant |
+| `0x0F` | `World::npcs.positions`, ungated by the liveliness toggle |
+| `0x10` / `0x11` / `0x12` | the actor flag word and clip-control word on the channel; the global halves are seeded from and written back to `World::flags.story_flags` each tick |
+| `0x14` | published into the field-VM channel's `+0x72` so `World::field_npc_render_scale` - the accessor both hosts consult before drawing an NPC - sees it |
+| `0x02` / `0x0A` / `0x0B` | the requested-move pair reaches `carry_npc_run_anim`; the translucency bit has no consumer |
+| `0x09` | runs the same enqueue the field VM's op `0x36` sub-`0` runs - `World::audio.sfx_cue_cursor` / `sfx_parked_slot` / `sfx_cue_delays` - so a following delay write lands on the slot this op parked; the cue **id** crosses to the hosts as `SfxRingOp::Push`, which both replay into their SFX ring and play |
+| `0x0C` | tint and draw-mode ramp on the channel; no NPC tint reaches either host's draw list |
+| `0x0E` | `World::npcs.models`, keyed by placement slot, read back through `World::field_npc_live_model`; each host resolves the bytes through `SceneHost::model_bank` (`model_bank::SceneModelBank::tmd_bytes`, all 215 authored sites) and re-uploads that slot's mesh |
+| `0x13` | no VRAM blit is reachable from a field-actor tick; `engine-render` owns the only VRAM |
+| `0x15` / `0x16` | `World::field_npc_tilt`, published per slot beside the heading; both hosts compose the full `Rx * Ry * Rz` when it is non-zero ([`host-drift.md`](../tooling/host-drift.md#per-actor-pitch-and-roll)) |
+
+### Flag census
+
+`legaia-engine man-scripts --motion-flag-census` sweeps every scene MAN
+(including v12-embedded MANs) and reports all op-7/op-8 sites (sibling of
+`--system-flag-census`, which covers the MAN field-VM ops `0x50/0x60/0x70`).
+Disc-wide the op-7/op-8 surface is overworld walking-band choreography
+(`map02`/`map03`: `0x466`/`0x467` toggles, the `0x56D..0x570` self-advancing
+4-phase cycle, `0x5A2..0x5A7` one-shot latches) plus one `town0b` clear of
+`0x23F`. The spine gate flags appear in **no** motion stream - their writers
+are field-VM script bytes in the streaming variant MAN carriers
+(`0x142`/`0x482`/`0x1BE`; see
+[`script-vm.md`](script-vm.md#a-second-script-byte-carrier-the-streaming-variant-man))
+or, for the town01 opening one-shot `549`, a direct code path (see
+[`world-map.md`](world-map.md), "Gate-flag setters beyond a scene's bundle MAN").
+Disc-gated anchor test: `crates/engine-scene/tests/motion_flag_census_disc.rs`.
+
+## Provenance
+
+- `ghidra/scripts/funcs/8003774c.txt` - full disassembly + decompilation.
+- `ghidra/scripts/funcs/80038158.txt` - the second VM's interpreter.
+- `ghidra/scripts/funcs/80039b7c.txt` - the driver's cutscene event-script arm.
+- `ghidra/scripts/funcs/80038050.txt` - its structural-op advance helper.
+- `ghidra/scripts/funcs/8003a9d4.txt` - motion-script installer (record chain + actor binding).
+- `ghidra/scripts/funcs/8003c5f0.txt` - the ramp-scheduler installer op `0x0D` inlines.
+- `ghidra/scripts/funcs/overlay_cutscene_dialogue_801cf8ac.txt` - the walk
+  ops' player box test (field overlay; the `801cf8ac.txt` SCUS-space dump is
+  a different function at an aliased address).
+- `ghidra/scripts/funcs/overlay_cutscene_dialogue_801d5a68.txt` - the
+  wander's three-point fan over the same test.
+- `ghidra/scripts/funcs/80035b50.txt` - op `0x09`'s SFX-cue enqueue.
+- `ghidra/scripts/funcs/80024e08.txt` - op `0x0E`'s model re-bind.
+- `ghidra/scripts/funcs/80026b4c.txt` - `tmd_register`, the pool's only writer.
+- `ghidra/scripts/funcs/8001e890.txt` - the PROT 0874 player-pack load that
+  sets `0x8007B6F8`.
+- `ghidra/scripts/funcs/8001e1b4.txt` - the stage init that resets the
+  registration counter to `0x8007B824`.
+- `ghidra/scripts/funcs/8001f05c.txt` - the asset dispatcher whose type-`0x02`
+  and type-`0x09` arms register a scene's models.
+- `ghidra/scripts/funcs/80020f88.txt` - the mesh reload, and the bound check
+  against `0x8007BB38` that proves the id is a pool index.
+- `ghidra/scripts/funcs/80058490.txt` - op `0x13`'s `MoveImage`.
+- `ghidra/scripts/funcs/80019278.txt` - op `0x0F`'s ground resample.
+- `ghidra/scripts/funcs/8001698c.txt` - the per-frame sweep that ages the
+  cue ring op `0x09` posts into.
+- `ghidra/scripts/funcs/80043390.txt` - the mesh submit that consumes the
+  `+0x74` / `+0x78` pair op `0x0C` fades.
+- `ghidra/scripts/funcs/8001b964.txt` - the animated renderer that consumes
+  the `+0x72` op `0x14` tweens.
+- `ghidra/scripts/funcs/80036d80.txt` - the scheduler tick.
+- `ghidra/scripts/funcs/8003cda8.txt` - the scene-entry pool reset.
+- `ghidra/scripts/funcs/80037018.txt` - the player-zone ramp actor. The
+  disassembly in that dump stops eleven instructions in while its C carries
+  the whole body; the offsets above are read off `SCUS_942.54` at file
+  `+0x27818` instead.
+- The two walk LUTs at `0x80073F04` / `0x80073F14` are plain `SCUS_942.54`
+  rodata.
+
+## See also
+
+**Reference** -
+[Move-table VM](move-vm.md) ·
+[Actor VM](actor-vm.md) ·
+[World-map controller](world-map.md)

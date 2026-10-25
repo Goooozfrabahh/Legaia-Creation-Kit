@@ -1,0 +1,338 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">reference</a> &middot; functions</div>
+  <h1>Key functions</h1>
+  <p class="lede">While Legaia runs, a few thousand small routines do the work: load a scene off the disc, step the NPC scripts, draw the party, resolve a hit. This is the who's-who of the ones the reverse-engineering has mapped, grouped by subsystem with a one-line job each. It is the orientation; the full per-address directory lives in the repo's per-subsystem pages, which you grep for an address.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Naming</dt><dd><code>FUN_8003E4E8</code> = the function whose first instruction sits at RAM <code>0x8003E4E8</code>; <code>DAT_</code> / <code>PTR_</code> mark data and pointer tables the same way. "JT" is a jump table.</dd>
+    <dt>Resident code</dt><dd><code>0x80010000..0x8007B800</code> - the executable <code>SCUS_942.54</code>, always loaded</dd>
+    <dt>Overlay code</dt><dd>Two RAM windows: slot A based at <code>0x801CE818</code> (one game-mode overlay at a time - field, battle, menu, title, minigame) and slot B at <code>0x801F69D8</code> (per-cast Seru-magic and summon modules, boss-stage modules). No overlay function lives below <code>0x801CE818</code>.</dd>
+    <dt>Dumps</dt><dd><code>ghidra/scripts/funcs/&lt;addr&gt;.txt</code>, overlays as <code>overlay_&lt;label&gt;_&lt;addr&gt;.txt</code> (gitignored: Sony-derived; regenerable via <a href="../tooling/ghidra.html">Ghidra tooling</a>)</dd>
+    <dt>Full directory</dt><dd>One Markdown page per subsystem under <code>docs/reference/functions/</code> - <a href="#full-reference">list below</a></dd>
+  </dl>
+  <nav class="see-also" aria-label="Subsystems on this page">
+    <span class="see-also-label">Jump to</span>
+    <a href="#fn-boot">Boot + asset loader</a>
+    <a href="#fn-vms">Game VMs</a>
+    <a href="#fn-cutscene">Cutscene + camera</a>
+    <a href="#fn-renderer">Renderer + GTE</a>
+    <a href="#fn-battle">Battle</a>
+    <a href="#fn-menu">Menu + title</a>
+    <a href="#fn-audio">Audio</a>
+    <a href="#fn-worldmap">World map</a>
+    <a href="#fn-bios">BIOS + libapi</a>
+    <a href="#full-reference">Full directory</a>
+  </nav>
+</section>
+
+<section class="doc-section" id="how-to-read">
+  <h2>How to read an entry</h2>
+  <p>The game shipped with no symbol names, so the address <em>is</em> the name and it is stable across every doc and probe in this project. Four things catch people out:</p>
+  <figure class="diagram">
+    <div class="byte-map" role="img" aria-label="Three code regions: the always-resident SCUS executable from 0x80010000, overlay slot A based at 0x801CE818 holding one game-mode overlay at a time, and overlay slot B based at 0x801F69D8 holding one cast or stage module">
+      <div class="bm-cell bm-dim" style="--w:3"><span class="bm-off">from 0x80010000</span><span class="bm-name">SCUS_942.54</span><span class="bm-size">always loaded</span></div>
+      <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">base 0x801CE818</span><span class="bm-name">overlay slot A</span><span class="bm-size">one game mode at a time</span></div>
+      <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">base 0x801F69D8</span><span class="bm-name">overlay slot B</span><span class="bm-size">one cast / stage module</span></div>
+    </div>
+    <figcaption>One address inside an overlay slot can name a <em>different</em> function depending on which image was resident when the dump was taken.</figcaption>
+  </figure>
+  <table>
+    <thead><tr><th>Trap</th><th>What to do</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Overlay addresses collide.</strong> Several images share each overlay slot.</td><td>If an entry does not match the code you are reading, check which overlay you have first - <a href="../tooling/overlay-capture.html">overlay capture</a>, <a href="memory-map.html#overlays">overlay window</a>.</td></tr>
+      <tr><td><strong>"No static caller in SCUS" does not mean dead.</strong> Most game logic lives in overlays.</td><td>Zero callers in the executable means "needs an overlay sweep", not "unused".</td></tr>
+      <tr><td><strong>Some printed addresses are phantoms.</strong> A dump can show a real body beside a VA no runtime image ever used.</td><td>Before treating an unfamiliar <code>0x801E&hellip;</code> / <code>0x8020&hellip;</code> as new, check <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/reference/overlay-va-aliases.md" target="_blank" rel="noopener">overlay VA aliases</a>.</td></tr>
+      <tr><td><strong>Decompiled C is a rendering.</strong> Ghidra promotes intra-function labels to fake <code>FUN_</code> calls, drops register arguments, reorders stores.</td><td>Read the disassembly; the artifact catalogue is on the <a href="../tooling/ghidra.html">Ghidra page</a>.</td></tr>
+    </tbody>
+  </table>
+  <p>Not finding an address here does not mean it is unknown - this page covers the functions that anchor an explanation somewhere on the site.</p>
+</section>
+
+<section class="doc-section" id="by-subsystem">
+  <h2>Highlights by subsystem</h2>
+
+  <h3 id="fn-boot">Boot + asset loader</h3>
+  <p>How the disc's single big archive (<code>PROT.DAT</code>) gets found, indexed and streamed into RAM.</p>
+  <table class="layout">
+    <thead><tr><th>Function</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td>FUN_8003E4E8</td><td>Boot-time TOC loader: first 3 sectors of PROT.DAT into <code>0x801C70F0</code></td></tr>
+      <tr><td>FUN_8003E8A8</td><td>PROT TOC index resolver: returns the entry's <strong>sector count</strong> (the gap to the next entry); the start LBA is a side effect</td></tr>
+      <tr><td>FUN_8003E6BC</td><td>Path-based file opener (<code>data\battle\efect.dat</code> etc.)</td></tr>
+      <tr><td>FUN_8003EBE4 / FUN_8003EC70</td><td>Overlay loaders A / B; two overlays resident at once. B pages in the per-summon Seru-magic overlays</td></tr>
+      <tr><td>FUN_8001F05C</td><td>Asset-type dispatcher (type byte &rarr; handler)</td></tr>
+      <tr><td>FUN_80020224</td><td>Descriptor-pair walker</td></tr>
+      <tr><td>FUN_8002541C</td><td>Streaming-asset driver</td></tr>
+      <tr><td>FUN_80021934</td><td>Scene-transition streaming actor: streams the destination scene bundle, then hands off to MAIN INIT</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure">
+    <summary>Deep dive: overlay loader indexing and the scene-transition actor</summary>
+    <div class="disclosure-body">
+      <ul class="bullets">
+        <li>Loader argument <code>param + 0x381</code> is a raw TOC index = extraction entry <code>param + 0x37F</code> (the resolver indexes the raw in-RAM PROT head, two above extraction numbering). A player Seru-magic cast (spell id <code>0x81..0x8B</code>) calls <code>FUN_8003EC70(id - 0x79)</code> &rarr; extraction PROT 903..913; the summon's models live in those overlays plus the extraction-0871 <code>etmd.dat</code> library, not in <code>befect_data</code>.</li>
+        <li><code>FUN_80021934</code> is a 5-state machine over <code>actor+0x1A</code> (jump table <code>0x80010760</code>); its real entry is 3 instructions before the <code>0x80021940</code> prologue. Spawned by <code>FUN_8001FD44</code> via <code>FUN_80020DE0</code> from the descriptor at <code>0x80070734</code> (the phase-misaligned family <code>0x800705FC..0x80070763</code>, not a mode-table row). Streams <code>DATA_FIELD\&lt;scene&gt;.LZS</code> (raw <code>scene_base+3</code>) into <code>_DAT_8007B85C</code> - by PROT index in dev (state 2), by filename in retail (state 4) - then sets <code>_DAT_8007B83C = 2</code>. Dump <code>funcs/80021940.txt</code>.</li>
+      </ul>
+    </div>
+  </details>
+  <div class="see-also"><span class="see-also-label">Reference</span><a href="../subsystems/boot.html">Boot</a><a href="../subsystems/asset-loader.html">Asset loader</a><a href="../formats/prot.html">PROT.DAT</a></div>
+
+  <h3 id="fn-vms">Game VMs</h3>
+  <p>The bytecode interpreters that run scenes, menus, moves and actor motion - most of the game's logic is script, not native code.</p>
+  <table class="layout">
+    <thead><tr><th>Function</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td>FUN_801DE840</td><td>Field / event script VM (43 ops, switch at <code>0x801E00F4</code>)</td></tr>
+      <tr><td>FUN_801E0C3C</td><td>Field-VM op <code>0x4C</code> second-stage dispatcher (16-entry JT <code>0x801CEE60</code>)</td></tr>
+      <tr><td>FUN_801E3040</td><td>Op <code>0x4C</code> nibble-<code>0xE</code> sub-dispatcher (15-entry JT <code>0x801CF008</code>)</td></tr>
+      <tr><td>FUN_801E30E4</td><td>Op <code>0x4C 0xE2</code> FMV trigger: FMV index &rarr; <code>_DAT_8007BA78</code>, mode <code>0x1A</code> &rarr; <code>_DAT_8007B83C</code></td></tr>
+      <tr><td>FUN_8003CE9C</td><td>Field-VM context resolver (sign-extended u16 read)</td></tr>
+      <tr><td>FUN_80023070</td><td>Move-table VM (71 ops, JT <code>0x80010778</code>)</td></tr>
+      <tr><td>FUN_801D362C</td><td>Move-VM extension (61 sub-ops via op <code>0x2F</code>); one copy, in the field overlay - the world-map, dialog and cutscene modes run on that overlay, not on copies of their own. Its one outward call is the scanline strip emitter <code>FUN_801D31B0</code></td></tr>
+      <tr><td>FUN_801D6628</td><td>Window-widget ("actor") VM of the menu overlay (13 ops, JT <code>0x801CED70</code>)</td></tr>
+      <tr><td>FUN_80038158</td><td>Per-actor motion / bytecode VM; ops 7 / 8 set / clear story flags in <code>DAT_80085758</code></td></tr>
+      <tr><td>FUN_8002519C</td><td>Per-frame actor-list tick iterator (5&times; per frame from <code>FUN_80016444</code>)</td></tr>
+      <tr><td>FUN_80021DF4</td><td>Per-frame actor tick</td></tr>
+      <tr><td>FUN_800204F8</td><td>Move-buffer setup (Tactical Arts)</td></tr>
+      <tr><td>FUN_8003A1E4</td><td>Field-NPC placement installer; its tail pre-runs the script prologue, which is where a never-walked NPC's initial facing comes from</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure">
+    <summary>Deep dive: motion-VM flag writes and NPC initial facing</summary>
+    <div class="disclosure-body">
+      <ul class="bullets">
+        <li><code>FUN_80038158</code> is dispatched by <code>FUN_8003BC08</code> when actor <code>+0x10 &amp; 0x80</code>. Its bytecode is MAN tail-section 1 (installer <code>FUN_8003A9D4</code>, parser <code>legaia_scene_formats::man_motion</code>). The chapter-spine gates <code>0x142</code> / <code>0x482</code> / <code>0x1BE</code> and the town01 one-shot <code>549</code> appear in no motion stream: the first three are field-VM script bytes, <code>549</code> is a direct code path.</li>
+        <li><code>FUN_8003A1E4</code> reads <code>[model, anim, tile_x, tile_z]</code> - no facing byte. Its tail (<code>0x8003A474..0x8003A4F8</code>) executes a script's leading ops through <code>FUN_801DE840</code> when the script opens with op <code>0x24</code> / <code>0x25</code>, until a <code>0x21</code> NOP or a sub-<code>0x20</code> byte; ops <code>0x4C 0x51</code> sub-1 and <code>0x38</code> write <code>actor+0x26</code> from the 8-direction heading LUT at <code>0x80073F04</code>. Port <code>man_field_scripts::placement_initial_facing</code> + <code>World::seed_field_npc_facings</code>; see <a href="../subsystems/field-locomotion.html#npc-initial-facing">field locomotion</a>.</li>
+      </ul>
+    </div>
+  </details>
+  <div class="see-also"><span class="see-also-label">Reference</span><a href="../subsystems/script-vm.html">Field / event VM</a><a href="../subsystems/move-vm.html">Move VM</a><a href="../subsystems/motion-vm.html">Motion VMs</a><a href="../subsystems/actor-vm.html">Window-widget VM</a></div>
+
+  <h3 id="fn-cutscene">Cutscene, FMV and camera</h3>
+  <p>The movie player, the CD-XA voice streamer, and the field camera the story scenes drive.</p>
+  <table class="layout">
+    <thead><tr><th>Function</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td>FUN_801CEA3C</td><td>STR / MDEC master dispatch (cutscene overlay 0970, modes 26 / 27): decoder select, letterbox, play loop, return-scene hand-off</td></tr>
+      <tr><td>FUN_801CF098</td><td>FMV main play loop; pad-abort honoured only for <code>fmv_id 0</code></td></tr>
+      <tr><td>FUN_8005F024</td><td>STR frame-demux state machine (St library; ring API <code>FUN_8005BBF8</code> / <code>FUN_8005EF40</code> / <code>FUN_8005EE4C</code>)</td></tr>
+      <tr><td>FUN_8003D764</td><td>XA-clip drive sequencer / channel selector, armed off the 34-slot <code>XA1..XA34</code> table at <code>0x801C6ED8</code></td></tr>
+      <tr><td>FUN_8003BDE0</td><td>Partition-record &rarr; VM-context dispatcher: named record + 3 story-flag gates, then script entry</td></tr>
+      <tr><td>FUN_80037174</td><td>Narration crawl roller (the <code>[CC F8 80 N]</code> op), spawned as a child context so the timeline keeps running</td></tr>
+      <tr><td>FUN_8003C764</td><td>On-screen text-balloon spawner (op <code>4C E1</code>); centred, <code>Y=180</code>, 120-frame pages - not the opening crawl</td></tr>
+      <tr><td>FUN_8003C83C</td><td>Field-VM cross-context resolver (<code>0xF8</code> player / camera anchor, <code>0xFB</code> system)</td></tr>
+      <tr><td>FUN_801DB8EC</td><td>Camera focus + projection setter (ops <code>0x4C 0x39</code> / <code>0x3E</code>) - focus and FOV, not eye position</td></tr>
+      <tr><td>FUN_801DBC20</td><td>Camera-zone config loader: splits the 18-byte camera-region record into the camera globals</td></tr>
+      <tr><td>0x801D0A6C (data)</td><td>FMV dispatch table, 23 &times; 32 B (<code>legaia_game_tables::fmv_dispatch</code>)</td></tr>
+      <tr><td>0x801CAE08 (data)</td><td>libcd <code>CdlFILE</code> directory cache</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure">
+    <summary>Deep dive: gate math and the camera cluster</summary>
+    <div class="disclosure-body">
+      <ul class="bullets">
+        <li><code>FUN_8003BDE0(x, z, record, gate)</code>: gate C1 blocks if <em>any</em> flag set in <code>DAT_80085758</code>, C2 requires <em>all</em>; script entry at <code>1 + name_len*2 + (1+C0) + (1+C1*2) + (1+C2*2)</code>. Callers: field-VM op <code>0x44</code> (ra <code>0x801DF098</code>) and the walk-on trigger <code>FUN_801D1EC4</code> &rarr; <code>FUN_801D5630</code> (ra <code>0x801D218C</code>).</li>
+        <li><code>FUN_8003D764</code> sequence: <code>CdlSeekL</code> &rarr; Setmode <code>0xC8</code> &rarr; <code>CdlSetloc</code> &rarr; <code>CdlSetfilter {file 1, chan}</code> &rarr; <code>CdlReadS</code> &rarr; <code>CdlGetlocP</code> poll; armed by <code>FUN_8003D53C</code> / <code>FUN_8003EAE4</code>.</li>
+        <li><code>FUN_801DB8EC</code> calls <code>FUN_801DAB90(transform, 0x801F3580)</code>, sets GTE <code>H</code> from <code>_DAT_8007B6F4</code>, and writes focus globals <code>_DAT_80089118</code> / <code>_DAT_80089120</code>: tile-derived when camera-mode nibble <code>DAT_8007B607&gt;&gt;4 == 5</code>, else anchor-follow. Eye-back depth lives in the op-<code>0x45</code> translation trio's slot 5 (<code>_DAT_800840C0</code>).</li>
+        <li><code>FUN_801DBC20</code> keys on mode nibble <code>byte[5] &gt;&gt; 4</code> (3 look-at-anchor, 5 fixed-shot, 6 no-op, else position-sweep) into globals <code>0x8007B607..0x8007B627</code>; consumers <code>FUN_801DAB90</code> + <code>FUN_801DB510</code>, defaults in <code>FUN_801DBE9C</code>. Byte split: <a href="../formats/encounter.html#camera-region-table">camera-region table</a>.</li>
+        <li><code>FUN_801CEA3C</code>'s return hand-off: label table <code>0x801CE8AC</code> &rarr; scene-name global <code>0x80084548</code> + spawn word <code>0x80084540</code>.</li>
+      </ul>
+    </div>
+  </details>
+  <div class="see-also"><span class="see-also-label">Reference</span><a href="../subsystems/cutscene.html">Cutscene</a><a href="../formats/str-fmv-table.html">FMV dispatch table</a><a href="../formats/xa.html">CD-XA</a></div>
+
+  <h3 id="fn-renderer">Renderer + GTE</h3>
+  <p>From an actor's mesh chain to GPU primitives: the per-actor render dispatcher, the TMD emit leaves and the animated-mesh poser.</p>
+  <table class="layout">
+    <thead><tr><th>Function</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td>FUN_8001ADA4</td><td>Per-actor render dispatcher (switch on <code>actor[+0x56]</code>); case 5 walks the mesh chain, case <code>0xB</code> is the ocean CLUT-walk emitter</td></tr>
+      <tr><td>FUN_8001D140</td><td>Stack-swap wrapper around the dispatcher; 6&times; per frame from <code>FUN_80016444</code> (render pass)</td></tr>
+      <tr><td>FUN_80043390</td><td>Per-prim emit selector: SCUS table <code>0x8007657C</code> or the world-map overlay's fog-enabled table <code>0x801F8968</code></td></tr>
+      <tr><td>FUN_8002735C</td><td>The 60-GTE-op table-driven TMD renderer; gated on actor <code>+0x42</code>, and unentered in every sampled mode</td></tr>
+      <tr><td>FUN_8001B964</td><td>Animated-mesh renderer: poses TMD object <em>i</em> with ANM bone <em>i</em> (<code>R&middot;v + T</code>); skips unless object count = bone count</td></tr>
+      <tr><td>FUN_8001BE80</td><td>ANM per-(bone, frame) entry decoder</td></tr>
+      <tr><td>FUN_80024D78</td><td>Actor object-table fill from the pool TMD</td></tr>
+      <tr><td>FUN_80024E80</td><td>Screen-fade primitive spawn</td></tr>
+      <tr><td>FUN_80026B4C / FUN_800268DC</td><td>TMD validate + register into <code>DAT_8007C018</code>; group-descriptor fixup</td></tr>
+      <tr><td>FUN_8002C69C</td><td>HUD / menu / dialog sprite-batch POLY_FT4 emitter</td></tr>
+      <tr><td>FUN_801F69D8</td><td>World-map decoration cell sweep: the per-cell mesh emitter (PROT 0901)</td></tr>
+      <tr><td>FUN_801D8280</td><td><code>DAT_8007C018</code> table walker (overlay)</td></tr>
+      <tr><td>0x8007C018 (data)</td><td>Global TMD pointer table; counters <code>0x8007B774</code> / <code>0x8007BB38</code> (<a href="../formats/world-map-overlay.html#dat-8007c018">world-map overlay</a>)</td></tr>
+      <tr><td>DAT_8007326C (data)</td><td>Per-mode primitive descriptor table</td></tr>
+      <tr><td>0x800EB654 (data)</td><td>Battle context struct (via <code>_DAT_8007BD24</code>)</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure">
+    <summary>Deep dive: dispatch details</summary>
+    <div class="disclosure-body">
+      <ul class="bullets">
+        <li>Case 5 of <code>FUN_8001ADA4</code> dispatches each TMD to <code>FUN_8002735C</code> when actor <code>+0x42</code> is non-zero, <code>FUN_80029888</code> (the shatter renderer) when only <code>+0x7A</code> is, else <code>FUN_80043390</code> (textured) - the measured leaf. Case <code>0xB</code> banks <code>acc += DAT_1F800393</code> and fires a 16&times;1 <code>MoveImage</code> per kingdom slot-5 table entry when <code>acc &gt;= hold</code>.</li>
+        <li><code>FUN_80043390</code> picks its table on <code>_DAT_1F800394 &amp; 1</code>; the overlay variant routes every prim through the fog leaves at <code>0x801F7644..0x801F8690</code> - the bulk continent emit path.</li>
+        <li><code>FUN_80024E80(fade_template, mode)</code> allocates from pool <code>&amp;DAT_80070674</code> via <code>FUN_80020DE0</code>, stores <code>mode</code> at <code>actor[+0x18]</code>, loads the ramp via <code>FUN_80020B00</code>. The battle-action SM uses it for the summon backdrop fade (state <code>0x33</code>) and the escape white-out (state <code>0x66</code>).</li>
+        <li><code>FUN_80026B4C</code> stores at <code>DAT_8007C018[DAT_8007B774++]</code>; reached from <code>FUN_8001F05C</code> cases 2 and 9. <code>FUN_800268DC</code> builds the <code>+0xC</code> descriptor array (0x1C stride).</li>
+        <li><code>FUN_801F69D8</code> lives in <code>overlay_world_map_top_ext.bin</code>; in warp-transition captures it is the live caller (ra <code>0x801F725C</code>). <code>FUN_801D8280</code> iterates <code>0..DAT_8007BB38</code> calling <code>FUN_801D5E20</code> per sub-record.</li>
+      </ul>
+    </div>
+  </details>
+  <div class="see-also"><span class="see-also-label">Reference</span><a href="../subsystems/renderer.html">Renderer</a><a href="../formats/tmd.html">Legaia TMD</a><a href="../formats/anm.html">ANM</a><a href="../subsystems/world-map.html">World map</a></div>
+
+  <h3 id="fn-battle">Battle</h3>
+  <p>The battle overlay's action state machine, HUD, loaders and the resident stat kernels.</p>
+  <table class="layout">
+    <thead><tr><th>Function</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td>FUN_801E295C</td><td>Battle action state machine (16 KB)</td></tr>
+      <tr><td>FUN_801D0748</td><td>Battle round driver: the round state machine every battle runs, Muscle Dome included - its one call site is the SCUS battle frame driver; sub-states <code>0x1E</code> / <code>0x32</code> / <code>0x6E</code> / <code>0xFE</code></td></tr>
+      <tr><td>FUN_801D388C</td><td>Battle presentation-step driver: HUD sprite layout + the per-step sub-draw script (switch on step)</td></tr>
+      <tr><td>FUN_801D5854</td><td>Per-pose camera / presentation driver (the anim system is <code>FUN_80047430</code> &rarr; <code>FUN_8004AD80</code> &rarr; <code>FUN_8004998C</code>)</td></tr>
+      <tr><td>FUN_801D8DE8</td><td>HUD element renderer, 80-entry element table; shared with Muscle Dome</td></tr>
+      <tr><td>FUN_801DA6B4</td><td>Actor display-state controller (opacity, pose flags)</td></tr>
+      <tr><td>FUN_801DB81C</td><td>Next-valid-target scan (<code>actor[+0x14C] != 0</code>, no death / stone)</td></tr>
+      <tr><td>FUN_801ED710</td><td>Records / stats screen renderer</td></tr>
+      <tr><td>FUN_800520F0</td><td>Battle scene loader: the <code>befect_data</code> cluster + effect-model library into <code>DAT_8007C018[3..32]</code></td></tr>
+      <tr><td>FUN_80020050</td><td>Flame / effect-texture atlas loader (PROT 870 into VRAM) - separate from the bundle loader</td></tr>
+      <tr><td>FUN_8004E2F0</td><td>Range / line-of-sight</td></tr>
+      <tr><td>FUN_80054CB0</td><td>Monster init (applies the battle-load stat boost)</td></tr>
+      <tr><td>FUN_80042558</td><td>Stat aggregator + accessory-passive assembler (event-driven, not per-frame)</td></tr>
+      <tr><td>FUN_8003FB10 / FUN_800431D0</td><td>Action validator / ability-bitmask read</td></tr>
+      <tr><td>FUN_8002CDD0 / FUN_8002C2E4 / FUN_8002C488</td><td>Status-HUD panel / per-member row / icon drawer; <code>FUN_8002C2E4</code> pins the status bitfield at record <code>+0x12E</code></td></tr>
+      <tr><td>0x801C9370 (data)</td><td>8-actor pointer table (party 0-2, monsters 3-7); HP at <code>+0x14C</code></td></tr>
+      <tr><td>PROT 0967</td><td>Sparring-tutorial overlay, co-resident at <code>0x801F69D8</code> during the Tetsu fight</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure">
+    <summary>Deep dive: loaders and the records screen</summary>
+    <div class="disclosure-body">
+      <ul class="bullets">
+        <li><code>FUN_80020050</code> uploads PROT entry <code>0x366</code> (extraction 870) twice via <code>FUN_8001FC00</code> &rarr; <code>FUN_8003E8A8</code>; VRAM region set up by <code>FUN_80017888</code> / <code>FUN_8001E54C</code> (arg <code>0xF000</code>); gated on <code>_DAT_8007B868 == 0</code>. <code>FUN_800520F0</code> pulls <code>0x367..0x36D</code> instead.</li>
+        <li><code>FUN_801ED710</code> draws nine rows: battles + escapes (cap 99999), play time, six per-character categories over the record at <code>0x80084140 + n*0x414</code> (<code>+0x6B4 / +0x6B0</code>, <code>+0x660 / +0x664</code>, <code>+0x74D / +0x704</code>), and averages over the <code>0x801C6460</code> counters.</li>
+      </ul>
+    </div>
+  </details>
+  <div class="see-also"><span class="see-also-label">Reference</span><a href="../subsystems/battle.html">Battle</a><a href="../subsystems/battle-action.html">Battle action SM</a><a href="../subsystems/battle-formulas.html">Battle formulas</a></div>
+
+  <h3 id="fn-menu">Menu + title overlay</h3>
+  <p>The pause menu's window table and panel renderers, and the title screen's attract timer.</p>
+  <table class="layout">
+    <thead><tr><th>Function</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td>FUN_801DD35C</td><td>Title-overlay per-frame tick; attract countdown underflow starts <code>MV1.STR</code></td></tr>
+      <tr><td>FUN_801D33D8</td><td>Per-character status / party panel renderer (Status / Magic / Moves / Skills), window descriptor 28</td></tr>
+      <tr><td>0x801E4738 (data)</td><td>Window descriptor table: 52 &times; 16 B <code>[content_id][park_edge][class][x,y,w,h][renderer]</code> (parser <code>legaia_game_tables::menu_windows</code>)</td></tr>
+      <tr><td>FUN_801E1C1C</td><td>Shared menu-element renderer</td></tr>
+      <tr><td>FUN_801CF650</td><td>Equipment stat aggregator: 5 slots at <code>+0x196</code> &rarr; <code>DAT_801EF08C..09C</code></td></tr>
+      <tr><td>FUN_801DD0C0</td><td>Item category / slot validity check</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure">
+    <summary>Deep dive: attract timer and window renderers by id</summary>
+    <div class="disclosure-body">
+      <ul class="bullets">
+        <li><code>FUN_801DD35C</code> decrements the countdown at <code>0x801DDCCC</code> by <code>_DAT_1F800393</code> each frame; on underflow writes <code>_DAT_8007B83C = 0x1A</code> and zeroes <code>_DAT_8007BA78</code> - the same fall-through as the field-VM FMV trigger. Dump <code>funcs/overlay_title_801ddccc.txt</code>.</li>
+        <li>Window renderers by id: 50 <code>FUN_801CFD68</code> (command list), 49 <code>FUN_801D0148</code> (money / play time), 51 <code>FUN_801D030C</code> (party panel), 26 / 21 <code>FUN_801D2094</code> (party list), 27 <code>FUN_801D30A4</code> (Condition pager), 30 <code>FUN_801D31EC</code> (summary), 22 <code>FUN_801D21C0</code> (equip), 48 <code>FUN_801DCEF0</code> (options), 0..4 title tabs. Live windows are 0x5C-stride linked structs with the animated rect at <code>+0xA</code>.</li>
+        <li><code>FUN_801D33D8</code> draws into a caller-supplied rect (<code>WX = *(i16*)(a0+0xA)</code>, <code>WY = *(i16*)(a0+0xC)</code>), content only; submenu id <code>DAT_801E46C0 &amp; 0xFFF</code> folded to 0..5. Pixel layout: <a href="../subsystems/field-menu.html">field menu</a>.</li>
+      </ul>
+    </div>
+  </details>
+  <div class="see-also"><span class="see-also-label">Reference</span><a href="../subsystems/field-menu.html">Field menu</a><a href="../formats/window-script.html">Window scripts</a><a href="../subsystems/save-screen.html">Save screen</a></div>
+
+  <h3 id="fn-audio">Audio (PsyQ)</h3>
+  <p>Sony's libsnd / libspu stack as linked into the executable, plus the game's own bank loaders.</p>
+  <table class="layout">
+    <thead><tr><th>Function</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td>FUN_8001FA88</td><td>Sound init / <code>.dpk</code> loader</td></tr>
+      <tr><td>FUN_8001FC00</td><td>Streaming-asset loader (<code>sound\</code>)</td></tr>
+      <tr><td>FUN_800243F0</td><td>BGM lookup (PROT-relative)</td></tr>
+      <tr><td>FUN_8003E104</td><td><code>monster.snd</code> loader</td></tr>
+      <tr><td>0x80061000..0x80067FFF</td><td>libsnd SsAPI sequencer cluster</td></tr>
+      <tr><td>FUN_80068D94</td><td><code>SsVabOpenHead</code> core: validates <code>pBAV</code>, builds the program &rarr; tone-page rank map, allocates SPU memory</td></tr>
+      <tr><td>0x80068000..0x8006DFFF</td><td>libspu SPU control cluster</td></tr>
+      <tr><td>FUN_80069B18</td><td>SPU DMA transfer state machine</td></tr>
+      <tr><td>FUN_8001EBEC</td><td>Equipment-conditional per-character TMD group patch (objects 10 / 11 swap)</td></tr>
+    </tbody>
+  </table>
+  <div class="see-also"><span class="see-also-label">Reference</span><a href="../subsystems/audio.html">Audio</a><a href="../formats/vab.html">VAB</a><a href="../formats/seq.html">SEQ</a></div>
+
+  <h3 id="fn-worldmap">World map + field debug tools</h3>
+  <p>The overworld controller, its developer menu, and the field overlay's debug editors the menu reaches into.</p>
+  <table class="layout">
+    <thead><tr><th>Function</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td>FUN_801E76D4</td><td>World-map controller: top-view debug toggle, camera scroll / azimuth / zoom</td></tr>
+      <tr><td>FUN_801EAD98</td><td>Developer menu renderer, 24-entry list (display only)</td></tr>
+      <tr><td>FUN_801EE094 / FUN_801EE328 (0897)</td><td>The travel arts Riremito / Rula (subsystem handlers <code>0x29</code> / <code>0x2B</code>): what the Door of Light / Door of Wind items run through the pause-menu session <code>FUN_801ED308</code>; each scans the resident CDNAME define table <code>0x80088758</code> for its destination. The developer menu reaches them too</td></tr>
+      <tr><td>FUN_801DBD04 (0897)</td><td>Dev-menu EVENT FLAG editor over ids <code>0..0xFFF</code>; can set any story flag including the spine gates</td></tr>
+      <tr><td>FUN_801EF014 (0897)</td><td>Flag-window picker widget (op-<code>0x49</code>-installed); only genuine disc use is the Uru Mais warp-pad memory</td></tr>
+      <tr><td>FUN_801F159C (0897)</td><td>Subsystem actor handler: <code>jalr</code> by value through the 52-entry id table <code>0x801F33B4</code> - <code>7</code> the state pick <code>FUN_801F1F4C</code>, <code>0x30</code> the pause-menu session, <code>0x29</code> / <code>0x2B</code> the travel arts. Reached by value, so no address reference names a slot</td></tr>
+      <tr><td>FUN_801ED308 (0897)</td><td>Pause-menu session (handler <code>0x30</code>): brightness ramp, menu spawn, parks on the exit code <code>_DAT_8007B43C</code>; its phases 6 / 7 hand a Door of Light / Door of Wind use to Riremito / Rula. Not a fade/flash</td></tr>
+      <tr><td>FUN_801D2EBC (0897)</td><td>Timed-flag scheduler consumer (installer op <code>0x4C 0xD3</code>); retail use: <code>chitei2</code> escape timer, flag <code>0x4C7</code></td></tr>
+      <tr><td>FUN_801DA51C</td><td>Per-entity tick; 5-state SM on <code>entity[+0x8A]</code></td></tr>
+      <tr><td>FUN_801CFC40</td><td>Top-view sprite batcher</td></tr>
+      <tr><td>FUN_80016444</td><td>Per-frame render tick (SCUS); <code>jal 0x801D7EA0</code> gated by <code>_DAT_8007BC3C == 2</code></td></tr>
+      <tr><td>FUN_801D7EA0 / FUN_801D8258</td><td>POLY_FT4 batch emitter, one-shot gated by <code>_DAT_801F351C</code>; its gate setter</td></tr>
+      <tr><td>FUN_801D1344</td><td>Gate-arm wrapper (field overlay 0897's player master frame handler); <code>0x801C2B2C</code> is the same body printed <code>0xE818</code> low, not a relocated copy</td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure">
+    <summary>Deep dive: the field-overlay debug editors</summary>
+    <div class="disclosure-body">
+      <ul class="bullets">
+        <li>Warp appliers walk the map table at <code>_DAT_80084628</code>, load the scene via <code>FUN_8001FD44</code>, then teleport the player.</li>
+        <li>The EVENT FLAG editor keeps its cursor at <code>DAT_801F2AA0</code>; SET / CLEAR appliers at <code>0x801EA4F8 / 52C</code>. It is also the register-pointer editor that produced the FMV trigger corpus.</li>
+        <li><code>FUN_801EF014</code>: descriptor via <code>_DAT_8007B450</code>, <code>+2</code> first visible row, <code>+3</code> visible count; confirming a <em>different</em> row sets <code>base + selection</code>, re-picking the current row or cancelling sets nothing. Disc census (<code>man-scripts --op49-window-census</code>, 209 sites): the only flag-window family is kor / kor3 / kor4 sub-4 <code>base=0x138 count=8</code>; no window contains a spine flag.</li>
+      </ul>
+    </div>
+  </details>
+  <div class="see-also"><span class="see-also-label">Reference</span><a href="../subsystems/world-map.html">World map</a><a href="../formats/world-map-overlay.html">World-map overlay</a></div>
+
+  <h3 id="fn-bios">BIOS + libapi</h3>
+  <p>PlayStation kernel entry points and C-library routines the executable links in - PsyQ infrastructure, not game logic.</p>
+  <table class="layout">
+    <thead><tr><th>Address</th><th>Routine</th></tr></thead>
+    <tbody>
+      <tr><td>0x80056678 / 0x80056688</td><td><code>EnterCriticalSection</code> / <code>ExitCriticalSection</code></td></tr>
+      <tr><td>0x80056658 / 0x8006B844</td><td><code>TestEvent</code> / <code>WaitEvent</code></td></tr>
+      <tr><td>0x80057024 / 0x8005ACAC / 0x8005E540</td><td><code>memmove</code> / <code>memset</code> / <code>memcpy</code></td></tr>
+      <tr><td>0x80056698+, stride 0x10</td><td>BIOS B-vector thunk cluster</td></tr>
+    </tbody>
+  </table>
+  <div class="see-also"><span class="see-also-label">Reference</span><a href="../subsystems/boot.html">Boot</a></div>
+</section>
+
+<section class="doc-section" id="full-reference">
+  <h2>Full directory</h2>
+  <p>The complete lookup table is one Markdown page per subsystem in the repo. Grep them for your address, read the row, then open the dump or the linked subsystem page.</p>
+  <table>
+    <thead><tr><th>Directory page</th><th>Covers</th><th>Site page</th></tr></thead>
+    <tbody>
+      <tr><td><a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/reference/functions/asset-loading.md" target="_blank" rel="noopener"><code>asset-loading.md</code></a></td><td>Asset loading + dispatch, per-stage asset tables, disc / loader chain, scene init</td><td><a href="../subsystems/asset-loader.html">Asset loader</a></td></tr>
+      <tr><td><a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/reference/functions/runtime-libs.md" target="_blank" rel="noopener"><code>runtime-libs.md</code></a></td><td>PSX runtime libraries, CD / file-system, helpers, static actor templates</td><td><a href="../subsystems/boot.html">Boot</a></td></tr>
+      <tr><td><a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/reference/functions/game-modes.md" target="_blank" rel="noopener"><code>game-modes.md</code></a></td><td>Input + debug, move / animation, the game-mode state machine, the title overlay</td><td><a href="../subsystems/boot.html">Boot</a>, <a href="../subsystems/move-vm.html">Move VM</a></td></tr>
+      <tr><td><a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/reference/functions/battle.md" target="_blank" rel="noopener"><code>battle.md</code></a></td><td>Battle, HUD + 2D effects, per-frame draw, sparring tutorial (0967), command persistence (0898), field&rarr;battle transition</td><td><a href="../subsystems/battle.html">Battle</a>, <a href="../subsystems/battle-action.html">Battle action SM</a></td></tr>
+      <tr><td><a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/reference/functions/cast-modules.md" target="_blank" rel="noopener"><code>cast-modules.md</code></a></td><td>Slot-B cast / summon module band (PROT 0903..0966) - the addresses that are <strong>not</strong> entries: each image's own data tail, and the neighbour's bytes every image ends in</td><td><a href="../subsystems/battle.html">Battle</a></td></tr>
+      <tr><td><a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/reference/functions/script-vms.md" target="_blank" rel="noopener"><code>script-vms.md</code></a></td><td>Script VMs, field-locomotion math helpers</td><td><a href="../subsystems/script-vm.html">Field VM</a>, <a href="../subsystems/field-locomotion.html">Locomotion</a></td></tr>
+      <tr><td><a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/reference/functions/renderer.md" target="_blank" rel="noopener"><code>renderer.md</code></a></td><td>Renderer, GPU primitives, ANM, MES / dialog text interpreter</td><td><a href="../subsystems/renderer.html">Renderer</a></td></tr>
+      <tr><td><a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/reference/functions/audio.md" target="_blank" rel="noopener"><code>audio.md</code></a></td><td>libsnd / libspu stack, SsAPI sequencer, SPU transfer engine, XA streaming</td><td><a href="../subsystems/audio.html">Audio</a></td></tr>
+      <tr><td><a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/reference/functions/menus.md" target="_blank" rel="noopener"><code>menus.md</code></a></td><td>Records screen, status / equip panels (0897), inventory / spell list, shop panels, menu-overlay callees (0899)</td><td><a href="../subsystems/field-menu.html">Field menu</a>, <a href="../subsystems/shop.html">Shop</a></td></tr>
+      <tr><td><a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/reference/functions/world-map.md" target="_blank" rel="noopener"><code>world-map.md</code></a></td><td>World map controller, dev menu, render pipeline</td><td><a href="../subsystems/world-map.html">World map</a></td></tr>
+      <tr><td><a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/reference/functions/minigames-debug.md" target="_blank" rel="noopener"><code>minigames-debug.md</code></a></td><td>Minigames, debug-menu overlay (0971), other-game minigame overlay (0977)</td><td><a href="../minigames.html">Minigames</a></td></tr>
+    </tbody>
+  </table>
+  <p><a class="cta" href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/reference/functions.md" target="_blank" rel="noopener">docs/reference/functions.md &rarr;</a></p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../subsystems/script-vm.html">Field/event VM</a>
+    <a href="../subsystems/battle-action.html">Battle action SM</a>
+    <a href="memory-map.html">Memory map</a>
+    <a href="../tooling/ghidra.html">Ghidra tooling</a>
+  </div>
+</section>

@@ -1,0 +1,43 @@
+[package]
+name = "legaia-extract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "legaia_extract"
+path = "src/lib.rs"
+
+[[bin]]
+name = "legaia-extract"
+path = "src/bin/legaia-extract.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# The command-line binary and its argument parser. On by default so
+# `cargo build` still builds every binary; library dependents (legaia-studio)
+# take this crate through [workspace.dependencies] with default features off.
+cli = ["dep:clap", "dep:libc"]
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, optional = true }
+rayon.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+legaia-iso.workspace = true
+legaia-prot.workspace = true
+legaia-container-formats.workspace = true
+legaia-disc-audit.workspace = true
+legaia-tim.workspace = true
+legaia-xa.workspace = true
+legaia-font.workspace = true
+
+[dev-dependencies]
+legaia-scene-formats.workspace = true
+legaia-lzs.workspace = true
+legaia-tmd.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true, optional = true }

@@ -1,0 +1,595 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook: runs the same gates CI runs.
+#
+# Install (once per clone):
+#     scripts/ci/install-hooks.sh
+#
+# Then every `git commit` runs the same `cargo fmt --check` and
+# `cargo clippy -D warnings` that .github/workflows/main-ci.yml runs, so a
+# CI break should never reach `main` unless someone explicitly bypasses with
+# `--no-verify`.
+#
+# Format drift is auto-fixed: if `cargo fmt --check` fails, the hook runs
+# `cargo fmt --all` and re-stages any previously-staged .rs files that were
+# reformatted. Files with both staged AND unstaged changes are NOT auto-fixed
+# (re-staging would silently fold the unstaged diff into the commit) -- the
+# hook aborts and asks you to resolve the working-tree state first.
+#
+# Skip (in emergencies only) by exporting `LEGAIA_SKIP_PRECOMMIT=1` for one
+# command, e.g. `LEGAIA_SKIP_PRECOMMIT=1 git commit -m "..."`.
+#
+# Tests are intentionally NOT in the hook -- they take long enough that the
+# usual workflow is to run `cargo test --workspace` manually before pushing.
+
+set -euo pipefail
+
+if [[ "${LEGAIA_SKIP_PRECOMMIT:-0}" == "1" ]]; then
+    printf '[pre-commit] LEGAIA_SKIP_PRECOMMIT=1 -- skipping checks\n' >&2
+    exit 0
+fi
+
+# Resolve the repo root so the hook works from worktrees and submodules.
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# Doc legibility-density gate. Fails the commit on over-800-char lines or
+# over-150-word markdown table cells in staged docs / crate READMEs, so density
+# creep can't land. Runs before the Rust-only early-exit so docs-only commits
+# are covered too. Bypass with LEGAIA_SKIP_PRECOMMIT=1 (handled above); run
+# scripts/ci/check-doc-density.py for a full-corpus audit.
+if command -v python3 >/dev/null 2>&1 && [[ -f "scripts/ci/check-doc-density.py" ]]; then
+    printf '[pre-commit] doc legibility-density check\n'
+    if ! python3 scripts/ci/check-doc-density.py --staged --quiet; then
+        printf '[pre-commit] doc density violations above -- reflow long lines or move over-budget table cells into sections (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# Markdown link + heading-anchor gate, the docs-side sibling of the site's
+# check-site-links.py. A dead `#fragment` renders as a jump to the top of the
+# page rather than an error, so broken anchors survive review indefinitely --
+# only a checker catches them. When a link and a heading disagree, fix the LINK:
+# the heading is an anchor target other pages already point at.
+if command -v python3 >/dev/null 2>&1 && [[ -f "scripts/ci/check-md-links.py" ]]; then
+    printf '[pre-commit] doc link + anchor check\n'
+    if ! python3 scripts/ci/check-md-links.py --staged --quiet; then
+        printf '[pre-commit] broken doc links above -- fix the link target (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# Baseline-loosening gate. The ratchets below accept a new baseline in the same
+# commit as the code that moved it, and most of them skip on a runner, so a
+# baselined value that got worse is otherwise only as visible as the diff it
+# rides in. This reads the baseline files alone: a value that moved the wrong
+# way against the merge-base with main needs an entry in
+# scripts/ci/baseline-loosenings.toml that says why.
+if command -v python3 >/dev/null 2>&1 && [[ -f "scripts/ci/check-baseline-loosening.py" ]]; then
+    printf '[pre-commit] baseline loosening check\n'
+    if ! python3 scripts/ci/check-baseline-loosening.py; then
+        printf '[pre-commit] a ratchet baseline loosened with no ledger entry -- see above (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# VRChat-diorama register-protocol codegen drift gate. When staged changes touch
+# scripts/vrc-diorama/, the generated Lua/C# register files must match the schema
+# (PRD: hand-editing the generated side is a build error). Bypass via the global
+# LEGAIA_SKIP_PRECOMMIT=1 handled above.
+VRC_TOUCHED=0
+while IFS= read -r path; do
+    case "$path" in
+        scripts/vrc-diorama/*) VRC_TOUCHED=1; break ;;
+    esac
+done < <(git diff --cached --name-only --diff-filter=ACMR)
+if [[ "$VRC_TOUCHED" == "1" ]] && command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/vrc-diorama/codegen.py" ]]; then
+    printf '[pre-commit] vrc-diorama register codegen drift check\n'
+    if ! python3 scripts/vrc-diorama/codegen.py --check; then
+        printf '[pre-commit] generated register files are stale -- run scripts/vrc-diorama/codegen.py and stage the result (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# Site internal-link gate. When staged changes touch site/, regenerate-free
+# check of the existing generated pages' relative hrefs + anchors. (The full
+# regenerate-then-check runs inside site/_gen.py; this catches fragment edits
+# whose generated mirror is stale or missing.)
+SITE_TOUCHED=0
+while IFS= read -r path; do
+    case "$path" in
+        site/*)
+            SITE_TOUCHED=1
+            break
+            ;;
+    esac
+done < <(git diff --cached --name-only --diff-filter=ACMR)
+if [[ "$SITE_TOUCHED" == "1" ]] && command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ci/check-site-links.py" ]]; then
+    printf '[pre-commit] site internal-link check\n'
+    if ! python3 scripts/ci/check-site-links.py --quiet; then
+        printf '[pre-commit] broken site links above -- run python3 site/_gen.py and fix the _content hrefs (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# CSS cascade order. A @media block contributes no specificity, so a breakpoint
+# written above the rule it overrides loses at every viewport width while still
+# reading like a working feature. The mobile icon rail shipped that way: it
+# never hid, and the content column laid out full-width underneath it.
+if [[ "$SITE_TOUCHED" == "1" ]] && command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ci/check-css-cascade-order.py" ]]; then
+    printf '[pre-commit] css cascade order\n'
+    if ! python3 scripts/ci/check-css-cascade-order.py --quiet; then
+        printf '[pre-commit] shadowed @media rule(s) above -- move the block below the rules it overrides (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# Split case folds. `.toLowerCase()` binds to the operand it is written on, so
+# `a + `b`.toLowerCase()` folds only `b` while reading like it folds the pair.
+# The texture filter's haystack shipped that way: its label half kept the disc's
+# capitals, the query arrived lowercased, and typing `ra-seru` found nothing
+# while "Gala - Ra-Seru Ozma $1" sat in the grid.
+if [[ "$SITE_TOUCHED" == "1" ]] && command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ci/check-js-case-fold-chains.py" ]]; then
+    printf '[pre-commit] js split case folds\n'
+    if ! python3 scripts/ci/check-js-case-fold-chains.py --quiet; then
+        printf '[pre-commit] split case fold(s) above -- parenthesise the whole concatenation before folding (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# Module-only syntax in a classic script. `import.meta` (or a static
+# import/export declaration) in a <script src=...> without type="module" is a
+# parse error for the WHOLE file: nothing in it runs, the page degrades to its
+# static HTML, and no gate but a browser sees it. The world-overview viewer
+# shipped dead that way - one pasted `import.meta.url` in its wasm loader.
+if [[ "$SITE_TOUCHED" == "1" ]] && command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ci/check-js-classic-module-syntax.py" ]]; then
+    printf '[pre-commit] js module syntax in classic scripts\n'
+    if ! python3 scripts/ci/check-js-classic-module-syntax.py --quiet; then
+        printf '[pre-commit] module-only syntax above -- resolve against document.baseURI or load the page with type="module" (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# A private copy of a shared site helper. site/js/site-util.js carries the
+# escaper, the RGBA-canvas wrapper, the download helper and the minigame poser
+# for every page; copies of each once lived in up to nine scripts and drifted.
+if [[ "$SITE_TOUCHED" == "1" ]] && command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ci/check-site-shared-helpers.py" ]]; then
+    printf '[pre-commit] site shared helpers\n'
+    if ! python3 scripts/ci/check-site-shared-helpers.py --quiet; then
+        printf '[pre-commit] private helper copy above -- call window.escapeHtml / window.LegaiaUtil instead (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# Sticky renderer state staged on one draw branch. The play page draws its
+# field, battle and minigame frames through ONE renderer; a setter that stores
+# a value (NCLIP cull, colour grade, overworld curvature) called inside one
+# branch leaks into the others. Every overworld fight drew under the
+# overworld's screen-Y bend that way. See docs/tooling/host-drift.md.
+if [[ "$SITE_TOUCHED" == "1" ]] && command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ci/check-js-sticky-frame-state.py" ]]; then
+    printf '[pre-commit] play page sticky frame state\n'
+    if ! python3 scripts/ci/check-js-sticky-frame-state.py --quiet; then
+        printf '[pre-commit] stage the setter in _stageFrameState, or classify it in BRANCH_OWNED (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# Depth space of the page's fragment shaders. The play page's scene writes
+# log2(w) to gl_FragDepth; a depth-tested program that keeps the rasterised
+# depth fails LEQUAL almost everywhere - the lamp halos vanished that way.
+# See docs/tooling/host-drift.md.
+if [[ "$SITE_TOUCHED" == "1" ]] && command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ci/check-js-depth-space.py" ]]; then
+    printf '[pre-commit] play page fragment depth space\n'
+    if ! python3 scripts/ci/check-js-depth-space.py --quiet; then
+        printf '[pre-commit] write gl_FragDepth through logDepthOfW, or waive the shader in WAIVED (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# Generated-page staleness. The link gate above proves every reference RESOLVES;
+# it cannot see a reference that is absent. Editing a _content fragment to pull
+# in a new asset and not re-running site/_gen.py leaves the served page loading
+# the new consumer without its dependency -- which took out keyboard input, the
+# pause menu and the scene picker at once, with no console error naming a cause.
+if [[ "$SITE_TOUCHED" == "1" ]] && command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ci/check-site-generated-freshness.py" ]]; then
+    printf '[pre-commit] generated site page freshness\n'
+    if ! python3 scripts/ci/check-site-generated-freshness.py; then
+        printf '[pre-commit] stale generated page(s) above -- run python3 site/_gen.py (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# Shell observer-trap gate. Three defect shapes -- a pipeline whose exit status
+# is read off the wrong stage, a pkill/pgrep pattern that matches the caller's
+# own command line, and an unguarded grep whose no-match exit-1 is the clean
+# result -- have each produced a false result in this project's workflow more
+# than once, in every case after the author had read a warning naming that exact
+# trap. A committed script carrying one of them runs in CI and on users'
+# machines, so this is a hard gate. The checker self-tests its own detectors on
+# every run and refuses to report a pass if a positive control fails.
+if command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ci/check-shell-observer-traps.py" ]]; then
+    printf '[pre-commit] shell observer-trap check\n'
+    if ! python3 scripts/ci/check-shell-observer-traps.py --quiet; then
+        printf '[pre-commit] shell observer traps above -- see scripts/lib/proc.sh for the safe forms (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# Integration-test declarations. A crate's tests/*.rs build as one binary
+# (`autotests = false`), so a test file missing from tests/integration.rs is
+# never compiled or run, silently.
+if command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ci/check-integration-tests.py" ]]; then
+    printf '[pre-commit] integration-test declarations\n'
+    if ! python3 scripts/ci/check-integration-tests.py; then
+        exit 1
+    fi
+fi
+
+# Crate layering. The edges among the engine's kernel crates are a committed
+# table; an edge added for one symbol looks to the compiler exactly like one a
+# crate's role calls for, so nothing else reads the difference.
+if command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ci/check-crate-layering.py" ]]; then
+    printf '[pre-commit] crate layering\n'
+    if ! python3 scripts/ci/check-crate-layering.py; then
+        printf '[pre-commit] see scripts/ci/crate-layering.toml (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# --- lane A2 ---
+# Crate map freshness. site/crate-map.json, the README's crate and pipeline
+# SVGs and its generated layer list are build outputs of the workspace itself
+# (manifests, lib.rs modules, CLAUDE.md's crate tables, the layering table).
+# Pure Python over committed files, milliseconds, no disc data - so it fails.
+if command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ci/gen-crate-map.py" ]]; then
+    printf '[pre-commit] crate map freshness\n'
+    if ! python3 scripts/ci/gen-crate-map.py --check; then
+        printf '[pre-commit] run python3 scripts/ci/gen-crate-map.py and stage the result (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# Disc-denominated coverage ratchet. Unlike the port catalog, whose denominator
+# is the set of addresses this project cites, this measures against the game's
+# own bytes -- so it can notice a subsystem nobody has cited. It is a RATCHET:
+# coverage may go up freely and may not drop more than half a point without an
+# explicit --update-baseline.
+#
+# Both of its inputs (the Ghidra dump corpus and extracted/) are gitignored, so
+# on a clone without disc data the script exits 0 and reports SKIPPED. That
+# keeps CI green without disc data and gives the ratchet teeth only where the
+# bytes actually are. Runs in ~2s.
+if command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ci/disc-coverage.py" ]]; then
+    printf '[pre-commit] disc coverage ratchet\n'
+    # --quiet, not >/dev/null. The redirect swallowed the "NOT MEASURED THIS
+    # RUN" / "NOT RATCHETED" lines along with the rollup, and those are exactly
+    # the lines that distinguish a pass from a comparison that never happened.
+    if ! python3 scripts/ci/disc-coverage.py --check --quiet; then
+        printf '[pre-commit] disc coverage regressed -- if a dump was legitimately removed, re-run with --update-baseline and say why in the commit message (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# Byte-accounting ratchet: the sibling of the ratchet above, one level finer.
+# disc-coverage's DATA figure is format RECOGNITION ("this entry is a
+# scene_vab_stream"), which says nothing about how many of that entry's bytes
+# any parser consumed - an entry can sit at 100% recognised with most of its
+# bytes never walked. This ratchets the structural share and the non-slack
+# residue from `asset account`'s own numbers.
+#
+# Its input is a sweep CSV under target/ that nothing here regenerates, so it
+# reports SKIPPED on a clone (and on a tree where the sweep was never run).
+# Re-run scripts/asset-investigation/byte-account-sweep.py after a parser
+# change, or the figure it compares is the one from the tree you swept.
+if command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ci/byte-account-coverage.py" ]]; then
+    printf '[pre-commit] byte-accounting ratchet\n'
+    if ! python3 scripts/ci/byte-account-coverage.py --check --quiet; then
+        printf '[pre-commit] byte-accounting ratchet failed -- a STALE line means re-sweep; a REGRESSION means a parser stopped consuming bytes it used to (if a walker was deliberately narrowed, re-run with --update-baseline and say why in the commit message; or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# Ghidra dump-corpus integrity. Three axes of one failure: a dump that reads
+# as authoritative and is wrong about where its bytes live, or a committed
+# sentence that is wrong about the dump.
+#
+#   stat drift      committed prose quotes a `size=` / instruction count the
+#                   dump no longer reports. Worst when the stale sentence is a
+#                   caveat: "the dump is empty, do not port this" suppresses
+#                   work silently and leaves no trace that it did.
+#   base integrity  a dump whose printed addresses are a constant delta off
+#                   because Ghidra was given the wrong load base. Ratchets the
+#                   SHIFTED set, so a new mis-based dump fails and importing
+#                   another copy of an already-catalogued window does not.
+#   jal targets     a decoded call target landing on no function entry, which
+#                   localises a byte window whose link base is unrecovered.
+#                   Ratchets the set of already-known targets.
+#
+# These live here and NOT in .github/workflows/main-ci.yml for the same reason
+# the disc-coverage ratchet above does: their input is ghidra/scripts/funcs/,
+# which is gitignored and absent on the runner. The hook is the only place the
+# corpus exists, so "it cannot run in CI" is the argument for wiring it here,
+# not an excuse for wiring it nowhere. Each self-skips when its inputs are
+# missing, so a clone without dumps passes.
+#
+# Cost: together they read the whole corpus and index the extracted images, so
+# budget a handful of seconds on top of the ratchet above.
+if command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ghidra-analysis/check-dump-stat-drift.py" ]]; then
+    printf '[pre-commit] dump-statistic drift check (committed prose vs the dumps)\n'
+    if ! python3 scripts/ghidra-analysis/check-dump-stat-drift.py --quiet; then
+        printf '[pre-commit] committed prose quotes a dump statistic that dump no longer reports -- update the sentence, and re-read whatever it concluded (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+if command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ghidra-analysis/check-dump-base-integrity.py" ]]; then
+    printf '[pre-commit] dump base-integrity ratchet\n'
+    if ! python3 scripts/ghidra-analysis/check-dump-base-integrity.py --check; then
+        printf '[pre-commit] a dump prints addresses its bytes do not occupy -- re-dump at the resolved base, or --update-baseline and say why (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+if command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ghidra-analysis/check-jal-target-integrity.py" ]]; then
+    printf '[pre-commit] call-target integrity ratchet\n'
+    if ! python3 scripts/ghidra-analysis/check-jal-target-integrity.py --check; then
+        printf '[pre-commit] a new call target resolves to no function entry -- see docs/tooling/call-target-integrity.md (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# Port-catalog ratchet. The catalog feeds scripts/ci/progress-metrics.json and
+# the site's landing page, and until now it could not fail: no --check, no
+# baseline, in no hook and no workflow. So a wave that widened a worklist, or
+# dropped a `// PORT:` tag, moved the published number and reported nothing.
+#
+# Ratchets only figures that are properties of the tags, docs and dump corpus.
+# The catalog builds two call graphs and the receiver-gated one exists solely
+# for the stale-`NOT WIRED` test, so nothing read off it is baselined.
+#
+# `live/disclosure_gap` needs the reachability pass, and this hook is the ONLY
+# place it can ever be compared: the catalog's `dumped` column reads the
+# gitignored Ghidra corpus, so the CI step self-skips and has no teeth at all.
+# The pass costs ~20s against ~3s for the default run, so it is spent only when
+# the commit could have moved the figure - the disclosure gap is a property of
+# the Rust call graph and the `NOT WIRED:` tags, both of which live under
+# crates/, so a docs-only commit cannot change it.
+#
+# When it is not spent, `--allow-uncompared` says so at the call site. Without
+# that flag `--check` now FAILS on a baselined figure it did not compute, which
+# is the fix for what happened here: `disclosure_gap` was baselined at 0, the
+# default path never computed it, the run printed one line and exited 0, and it
+# sat at 1 undetected.
+#
+# Reads the gitignored dump corpus for its `dumped` column, so it self-skips
+# without it - the same exemption as the three checks above.
+CRATES_TOUCHED=0
+while IFS= read -r path; do
+    case "$path" in
+        crates/*) CRATES_TOUCHED=1; break ;;
+    esac
+done < <(git diff --cached --name-only --diff-filter=ACMRD)
+if command -v python3 >/dev/null 2>&1 && [[ -f "scripts/ci/port-catalog.py" ]]; then
+    if [[ "$CRATES_TOUCHED" == "1" ]]; then
+        printf '[pre-commit] port-catalog ratchet (full pass, ~20s: crates/ staged)\n'
+        PORT_CATALOG_ARGS=(--check --live)
+    else
+        printf '[pre-commit] port-catalog ratchet (fast pass: no crates/ staged)\n'
+        PORT_CATALOG_ARGS=(--check --allow-uncompared)
+    fi
+    if ! python3 scripts/ci/port-catalog.py "${PORT_CATALOG_ARGS[@]}"; then
+        printf '[pre-commit] port catalog regressed -- check the per-row pages (--missing-ports / --live-audit), never the count alone; if intended, --update-baseline and say why (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# Landing-page metric freshness (warn-only). scripts/ci/progress-metrics.json is
+# a committed BUILD INPUT: the site builds without disc data, so the homepage
+# tiles render whatever was last committed and nothing compares it to the tree.
+# A stale file is invisible -- well-formed JSON, plausible numbers -- and the
+# tiles once showed 840 ported / 0 on the worklist while the ratchet baseline
+# beside them said 847 / 93.
+#
+# Warn, never fail: refreshing the JSON needs the disc and the dump corpus, so a
+# contributor without them could not clear a failure, and a hook that rewrote it
+# would put an unreviewed number on the public site. The comparison itself is
+# between two COMMITTED files, so it costs milliseconds and runs the same with
+# or without disc data -- which is why it is not gated on the corpus the way the
+# ratchets above are.
+if command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ci/check-progress-metrics-freshness.py" ]]; then
+    python3 scripts/ci/check-progress-metrics-freshness.py || true
+fi
+
+# Shipped-bundle freshness (warn-only, and only when the commit could have
+# invalidated the bundle). site/wasm/ is untracked build output that CI rebuilds
+# at deploy, so a stale local bundle is not a repository defect and must not
+# block a commit - but the whole point of the checker is that mtime and
+# `git log` both answer "in sync" for a bundle built from other sources, so the
+# moment to say so is right after the edit that staled it. Its 27-crate source
+# closure means an engine-only commit is exactly the case that looks safe and
+# is not. Skips silently with no bundle built. CI runs the same script,
+# likewise advisory.
+BUNDLE_SOURCE_TOUCHED=0
+while IFS= read -r path; do
+    case "$path" in
+        crates/*|site/*|Cargo.toml|Cargo.lock) BUNDLE_SOURCE_TOUCHED=1; break ;;
+    esac
+done < <(git diff --cached --name-only --diff-filter=ACMR)
+if [[ "$BUNDLE_SOURCE_TOUCHED" == "1" ]] && command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ci/check-wasm-freshness.py" ]] \
+    && [[ -f "site/wasm/legaia_web_viewer_bg.wasm" ]]; then
+    printf '[pre-commit] shipped wasm bundle freshness (advisory)\n'
+    python3 scripts/ci/check-wasm-freshness.py --quiet || true
+fi
+
+# If the commit only touches files outside the Rust workspace (e.g. docs,
+# site/, ghidra/scripts/), skip the cargo gates -- they're slow and would
+# add nothing.
+RUST_TOUCHED=0
+while IFS= read -r path; do
+    case "$path" in
+        Cargo.toml|Cargo.lock|crates/*|rust-toolchain*|.cargo/*)
+            RUST_TOUCHED=1
+            break
+            ;;
+    esac
+done < <(git diff --cached --name-only --diff-filter=ACMR)
+
+if [[ "$RUST_TOUCHED" -eq 0 ]]; then
+    printf '[pre-commit] no Rust files staged; skipping cargo gates\n'
+    exit 0
+fi
+
+printf '[pre-commit] cargo fmt --all -- --check\n'
+if ! cargo fmt --all -- --check; then
+    printf '[pre-commit] format drift detected -- attempting auto-fix\n'
+
+    # Collect staged .rs files (added/copied/modified/renamed).
+    staged_rs=()
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        staged_rs+=("$path")
+    done < <(git diff --cached --name-only --diff-filter=ACMR -- '*.rs')
+
+    # Refuse to auto-fix files that also have unstaged changes -- re-staging
+    # them would silently include the unstaged diff in the commit.
+    #
+    # The `(( ${#staged_rs[@]} > 0 ))` guard is load-bearing, not defensive
+    # noise. Under `set -u` the idiomatic-looking `"${staged_rs[@]:-}"` expands
+    # an EMPTY array to one empty-string element, so the loop body runs once
+    # with f="", `git diff --quiet -- ""` fails with "empty string is not a
+    # valid pathspec", and `dirty` gains a bogus entry -- aborting the commit
+    # with a blank filename in the error list. Reachable whenever fmt drift
+    # exists but no .rs file is staged (a docs-only or Cargo.lock-only commit).
+    # A failing observer must not be read as an observation.
+    dirty=()
+    if (( ${#staged_rs[@]} > 0 )); then
+        for f in "${staged_rs[@]}"; do
+            if ! git diff --quiet -- "$f"; then
+                dirty+=("$f")
+            fi
+        done
+    fi
+    if (( ${#dirty[@]} > 0 )); then
+        printf '[pre-commit] cannot auto-fix; these staged files have unstaged changes:\n' >&2
+        printf '             %s\n' "${dirty[@]}" >&2
+        printf '[pre-commit] run `cargo fmt --all`, review the diff, and re-stage\n' >&2
+        exit 1
+    fi
+
+    cargo fmt --all
+
+    # Re-stage the originally-staged .rs files that fmt may have rewritten.
+    # `git add` is a no-op for files fmt didn't touch, so this is safe to
+    # apply to the full set.
+    if (( ${#staged_rs[@]} > 0 )); then
+        git add -- "${staged_rs[@]}"
+    fi
+
+    # Confirm fmt is clean now. If not, something is wrong (e.g. fmt
+    # disagrees with itself, or non-staged files block the check).
+    if ! cargo fmt --all -- --check; then
+        printf '[pre-commit] cargo fmt still reports drift after auto-fix\n' >&2
+        exit 1
+    fi
+    printf '[pre-commit] auto-formatted and re-staged: %d file(s)\n' "${#staged_rs[@]}"
+fi
+
+printf '[pre-commit] cargo clippy --all-targets --workspace -- -D warnings\n'
+cargo clippy --all-targets --workspace -- -D warnings
+
+# Port-tag drift check (warn-only). Surfaces newly-added `FUN_<addr>` citations
+# in engine-crate Rust files that lack a matching `// PORT:` or `// REF:` tag.
+# Non-fatal by design - the catalog stays in sync incrementally rather than
+# blocking unrelated PRs. Run scripts/ci/check-port-tags.py --strict in CI when
+# you want to enforce.
+if command -v python3 >/dev/null 2>&1 && [[ -f "scripts/ci/check-port-tags.py" ]]; then
+    printf '[pre-commit] port-tag drift check (warn-only)\n'
+    python3 scripts/ci/check-port-tags.py --staged --quiet || true
+fi
+
+# UI host-drift check. The browser play page and the native play-window are two
+# framebuffers over one engine; a screen wired into only one of them is invisible
+# in a diff. This derives the shared feature surface from the engine-ui draw
+# builders and fails when a builder reaches one host and not the other without a
+# recorded reason. Hard gate: it has no false positives that a waiver cannot
+# express, and the whole point is that it cannot be ignored.
+#
+# It is also cheap, but that is a property of the implementation rather than of
+# the idea: the reachability pass tokenises each host source once and intersects
+# the name set, where it used to run one anchored regex search per (name, file)
+# pair. Under the old shape this line said "cheap" about a gate costing tens of
+# seconds of CPU - more than every other gate in this hook put together. If you
+# reintroduce a per-name scan, delete the word.
+if command -v python3 >/dev/null 2>&1 && [[ -f "scripts/ci/check-ui-host-drift.py" ]]; then
+    printf '[pre-commit] UI host-drift check (engine-ui builders vs both hosts)\n'
+    if ! python3 scripts/ci/check-ui-host-drift.py --quiet; then
+        printf '[pre-commit] UI drifted between the native window and the browser play page (see above).\n' >&2
+        printf '[pre-commit] Wire the screen into crates/web-viewer, or record why not in scripts/ci/ui-host-drift-waivers.toml (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# wasm32 type-check. Every cargo gate above builds for the HOST triple, so a
+# `#[cfg(target_arch = "wasm32")]` block - which is most of the browser play
+# page's own code - is never compiled by fmt, clippy, test or build. A page
+# feature written inside one has shipped with a private-field error past all
+# four; the first thing that compiled it was a wasm build. CI does build the
+# wasm target, but its `ci` job carries `if: github.event_name != 'pull_request'`,
+# so that build lands AFTER merge - this hook is the only pre-merge compiler
+# the browser host has.
+#
+# Spent only when a staged file belongs to a crate that carries such a block,
+# and it is a `cargo check`, not a build: warm, it costs about one crate's
+# type-check.
+WASM_CFG_TOUCHED=0
+while IFS= read -r path; do
+    case "$path" in
+        crates/web-play/*|crates/web-minigames/*|crates/web-patcher/*|crates/web-viewer/*|crates/engine-core/*|crates/engine-audio/*|crates/save/*|crates/engine-shell/*)
+            WASM_CFG_TOUCHED=1; break ;;
+    esac
+done < <(git diff --cached --name-only --diff-filter=ACMR)
+if [[ "$WASM_CFG_TOUCHED" == "1" ]] && [[ -x "scripts/ci/check-wasm-target.sh" ]]; then
+    printf '[pre-commit] wasm32 type-check (the browser host no native gate compiles)\n'
+    if ! scripts/ci/check-wasm-target.sh; then
+        printf '[pre-commit] the wasm32 target does not type-check (see above).\n' >&2
+        printf '[pre-commit] A cfg(target_arch = "wasm32") block is invisible to every other cargo gate here (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+# Trait-override symmetry. The sibling of the drift check, for the half of the
+# host surface that is a trait rather than a draw builder: engine-core traits
+# whose methods all carry default bodies let a host forget a hook with no
+# compile error and no diff. Hard gate for the same reasons - cheap, and every
+# false positive a waiver can express.
+if command -v python3 >/dev/null 2>&1 \
+    && [[ -f "scripts/ci/check-trait-override-symmetry.py" ]]; then
+    printf '[pre-commit] trait-override symmetry check (engine-core hooks vs every host impl)\n'
+    if ! python3 scripts/ci/check-trait-override-symmetry.py --quiet; then
+        printf '[pre-commit] a host implements fewer trait hooks than its peers (see above).\n' >&2
+        printf '[pre-commit] Implement the hook, or record why not in scripts/ci/trait-override-waivers.toml (or LEGAIA_SKIP_PRECOMMIT=1 to bypass)\n' >&2
+        exit 1
+    fi
+fi
+
+printf '[pre-commit] OK\n'

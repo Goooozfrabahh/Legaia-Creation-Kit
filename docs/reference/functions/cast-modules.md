@@ -1,0 +1,203 @@
+# Key functions: slot-B cast / summon modules - the addresses that are not entries
+
+Part of the [key function directory](../functions.md) - the conventions for
+reading these tables (bare hex = function entry, `0x`-prefixed = data /
+instruction, overlay-VA caveats) are on the
+[index page](../functions.md#how-to-use-this-page).
+
+The band's **real** entry rows are on
+[`battle.md`](battle.md#slot-b-summon--cast-modules-prot-09030966): the two
+PROT 0898 dispatchers, the two entry tables, and the per-module routine table
+with its DATA / PORT verdicts. The mechanism behind them is
+[`cast-module.md`](../../subsystems/cast-module.md).
+
+This page is the **negative** half of the same directory, and it exists because
+the grep lands here either way. Most of the addresses a byte-denominated
+instrument reports in this band are not function entries of the image they are
+reported under - and the answer to "what is at slot-B VA X in image Y" is
+usually "nothing of Y's". A reader who finds no row on `battle.md` needs a row
+somewhere saying so, rather than concluding the address is undocumented.
+
+**The split is by class, not by band, and the entry rows stay where they are.**
+`battle.md` holds every slot-B address that *is* an entry - the two 0898
+dispatchers, the two entry tables, the 21 trampolines, the twelve
+trampoline-reached tick bodies and the per-module `Tick` / `Stager` table -
+because they are battle behaviour and a reader looking for a routine looks
+under the subsystem. This page holds only addresses that are not entries of the
+image they are reported under. Moving the entry rows here would put the band's
+behaviour on a page whose whole subject is that an address means nothing, and
+would break the one property that makes the pair usable: exactly one of the two
+pages answers any given address.
+
+## The three-way test
+
+Every slot-B address falls into exactly one of three classes, and the test is
+mechanical - no judgement, no dump filename ([why a filename is not evidence:
+`dump-corpus-integrity.md`](../../tooling/dump-corpus-integrity.md)):
+
+1. **A real entry of this image.** Its `addiu sp, sp, -F` prologue is inside
+   the image's code region, and one of PROT 0898's two tables, or the module's
+   own trampoline, names it. These are `battle.md`'s rows.
+2. **The image's own data tail.** Force-disassembled it decodes 9-34%
+   implausible opcodes (`tge`, `jalx`, `movf`, `j` outside RAM); a real body in
+   the same band decodes 0%. Read as 4-byte units it is two little-endian
+   halfwords - GTE-shaped constants (`0x1000` = 1.0 in 12-bit fixed point,
+   `0x00FF` / `0x00C0` / `0x0080` colour bytes), signed deltas, and a recurring
+   `0x00000000` / `0x10001000` / `0xFF89000C` separator triple. This is the
+   **spawn-record band** - `[i16 model_sel][u16 reserved][move-VM bytecode]`
+   records the module hands to `FUN_80050ED4` / `FUN_80021B04` in `$a2`,
+   addressed by the consumer's own `lui`/`addiu` pair. 62 of the 64 images
+   carry one, and the `+0x02` halfword is zero in every record with no
+   reader. Layout, recovery and the one span it cannot bound:
+   [`slot-b-module-layout.md`](../../formats/slot-b-module-layout.md). The
+   band does sit past an image's last function; the "records interleave with
+   bodies" reading of PROT 0943 and 0961 was
+   [the donor's residue](../re-do-not-re-walk.md#measurement-readings).
+3. **Another image's bytes.** Every image in the band ends in a byte-identical,
+   **same-file-offset** run of another extracted image, ending exactly at the
+   shorter image's own length - build residue, not shared library code. Nine
+   images end in PROT 0899's (the menu overlay, slot A, a different base),
+   which is what settles the direction. Full argument:
+   [`cast-module.md`](../../subsystems/cast-module.md#a-module-image-ends-in-another-images-bytes).
+
+## Worklist runs that own no dump
+
+Each row is a run `disc-coverage.py` reports as un-dumped **code** in the image
+named. All but one are not - the exception is PROT 0949's `0x801F7630`, seven
+frameless jump-table arms that are code and are now dumped
+([below](#prot-0949s-seven-frameless-ramp-arms---entries-after-all)). `tail from` is the first byte the run's inherited half starts
+at - everything below it in the run is that image's own data - and the last
+column says how much of that half a dump of the **source** image already
+covers, the balance in every partial case being the source image's own data
+tail rather than a missing dump.
+
+| Run (slot-B VA) | image | tail from | inherited from | covered at the source |
+|---|---|---|---|---|
+| `0x801F74BC`..`0x801F7CBC` | 939 `cast_spore_gas` | `0x801F7B08` | 938 `cast_chaos_breath` | 192 of 436 B, `801F7AB8` |
+| `0x801F7630`..`0x801F7B30` | 949 `cast_water_crystals` | - | - (its own **code** below `0x801F76BC`, then its own record band) | - |
+| `0x801F7770`..`0x801F7D34` | 943 `cast_curse` | `0x801F7A0F` | 942 `cast_power_up` | all 805 B, `801F69F4` |
+| `0x801F7AB4`..`0x801F8638` | 961 `cast_dead_end_crisis` | `0x801F82F0` | 960 `cast_plasma_strike` | all 840 B, `801F74E4` |
+| `0x801F7BA8`..`0x801F816C` | 952 `cast_bloody_horns` | `0x801F7BC0` | 951 `cast_chaos_flare` | all 1452 B, `801F77E8` |
+| `0x801F7EE4`..`0x801F8078` | 906 `summon_gizam` | `0x801F7FD8` | 905 `summon_stager_x83` | all 160 B, `801F69D8` |
+| `0x801F80C8`..`0x801F816C` | 953 `cast_terio_punch` | `0x801F80C8` | 951 `cast_chaos_flare` (via 952) | all 164 B, `801F77E8` |
+| `0x801F8130`..`0x801F8504` | 949 `cast_water_crystals` | `0x801F8250` | 948 `cast_cross_beam` | all 692 B, `801F726C` |
+| `0x801F8318`..`0x801F8618` | 909 `summon_viguro` | `0x801F8364` | 908 `summon_zenoir` | 448 of 692 B, `801F8310` |
+| `0x801F842C`..`0x801F88EC` | 965 `cast_doomsday` | `0x801F842C` | 964 `cast_element_change` | all 1216 B, `801F69D8` |
+| `0x801F864C`..`0x801F89D8` | 911 `summon_orb` | `0x801F864C` | 910 `summon_swordie` | all 908 B, `801F81DC` + `801F89D4` |
+| `0x801F8A24`..`0x801F8EAC` | 908 `summon_zenoir` | `0x801F8BB0` | 904 `summon_theeder` | all 764 B, `801F8B84` |
+| `0x801F8A80`..`0x801F8EAC` | 910 `summon_swordie` | `0x801F8DB4` | 904 `summon_theeder` | all 248 B, `801F8B84` |
+| `0x801F8D2C`..`0x801F99D8` | 912 `summon_freed` | `0x801F92E0` | 899 `menu` (slot A) | all 1784 B, `0x801D0F1C` + `0x801D1290` |
+| `0x801F91E4`..`0x801F99D8` | 904 `summon_theeder` | `0x801F9208` | 899 `menu` (slot A) | all 2000 B, `0x801D0F1C` + `0x801D1290` |
+| `0x801F92B8`..`0x801F99D8` | 917 `summon_barra` | `0x801F92F9` | 918 `summon_kemaro`, then 899 `menu` | its last 1650 B, `0x801D1290` |
+| `0x801F9388`..`0x801F99D8` | 918 `summon_kemaro` | `0x801F9388` | 899 `menu` (slot A) | all 1616 B, `0x801D0F1C` + `0x801D1290` |
+| `0x801F9AB8`..`0x801F9BA8` | 964 `cast_element_change` | `0x801F9B80` | 957 `summon_effect_table` | all 40 B, `801F99F4` |
+
+The menu rows are named by their **menu** VA, because that is where the bytes
+are code: file offset `+0x2A80` is slot-B `0x801F9458` but menu `0x801D1298`,
+and only at the menu base do its branches stay inside the image. Its operands
+are menu tables - the live game-state window `0x80084140`, the equipment
+bonus table `0x80074F68`, the item-effect table `0x800752C0`, the passive
+name/description table `0x8007625C`, the menu overlay's own `0x801E46B0`.
+
+## Prologues that belong to the neighbour
+
+A prologue scan over these images finds five `addiu sp, sp, -F` words outside
+the frame-matched partition. All five sit **inside** an inherited tail, so each
+is a function head of the image the tail came from and names nothing in the
+image it was found in. Read them at the owner.
+
+| Prologue (slot-B VA) | found in | is the entry of |
+|---|---|---|
+| `0x801F8078` | 906 `summon_gizam` | 905 `summon_stager_x83` spawn stager |
+| `0x801F816C` | 952, 953 | 951 `cast_chaos_flare` (a trampoline; see [`battle.md`](battle.md#slot-b-summon--cast-modules-prot-09030966)) |
+| `0x801F88EC` | 965 `cast_doomsday` | 964 `cast_element_change` |
+| `0x801F89D4` | 911 `summon_orb` | 910 `summon_swordie` spawn stager |
+| `0x801F9458` | 904, 912, 917, 918 | 899 `menu`, at its own VA `0x801D1298` |
+
+## Why the runs keep coming back
+
+`disc-coverage.py`'s classifier is a heuristic over bytes and cannot see any of
+the above, so it re-reports these runs on every regeneration. The record that
+keeps a reader from re-walking them is the `NOT_CODE` block in
+[`ghidra/scripts/dump/dump_static_overlay.py`](../../../ghidra/scripts/dump/dump_static_overlay.py),
+which now carries the band; the worklist row itself is not a defect. See
+[`disc-coverage.md`](../../tooling/disc-coverage.md) for what the worklist is
+and is not.
+
+## PROT 0949's seven frameless ramp arms - entries after all
+
+These are the counter-example to this page: seven addresses a byte-denominated
+instrument reported in the band that **are** entries of the image they were
+reported under. They are frameless leaves, so the frame-matched partition names
+none of them, and the 140-byte run they occupy was filed under "the module's own
+data region". Their only reference is the jump table PROT 0949's stager
+`FUN_801F75BC` dispatches through - and a routine reached only through a table
+is still a routine.
+
+The table is not the one at the image head. The stager is itself frameless -
+`0x801F75BC` has no `addiu sp, sp, -F` at all - and it forms its base with
+`lui v0, 0x801F; addiu v0, v0, 0x69F0`, bounds the operand with
+`sltiu v1, a1, 0x8` and `jr`s through the word it loads (`0x801F7614`). The
+table is eight words, `0x801F69F0..0x801F6A0C` **inclusive**: `0x801F6A10` is
+the tick's own `addiu sp, sp, -0x50`, not a ninth arm. Arm 0 is the
+fall-through body at `0x801F761C`, immediately past the `jr`; arms 1..7 are the
+seven leaves. Together they are one eight-step ramp on the victim actor. `see
+ghidra/scripts/funcs/overlay_cast_water_crystals_0949_801f7630.txt` and
+siblings.
+
+Seven of the eight are 20 bytes and end in `jr ra` with the `sb` in its delay
+slot. Arm 7 is the exception: `0x801F76A8` is twelve bytes - tint, then
+`sb zero, 0x21D(a0)` - with **no** `jr ra` of its own, falling into the shared
+`jr ra` at `0x801F76B4` that the out-of-range `beqz` also targets. An extent
+census that assumes a uniform stride reports eight 20-byte leaves and runs four
+bytes past the last one.
+
+| Entry | Arm | `+0x0C` (tint blend) | `+0x21D` (anim rate) |
+|---|---:|---:|---:|
+| `0x801F761C` (interior of `801F75BC`) | 0 | `0x200` | 7 |
+| `801F7630` | 1 | `0x400` | 6 |
+| `801F7644` | 2 | `0x600` | 5 |
+| `801F7658` | 3 | `0x800` | 4 |
+| `801F766C` | 4 | `0xA00` | 3 |
+| `801F7680` | 5 | `0xC00` | 2 |
+| `801F7694` | 6 | `0xE00` | 1 |
+| `801F76A8` (12 B, shared exit) | 7 | `0x1000` | 0 |
+
+`0x801F8504` in the same image is the opposite case and belongs in the table
+above: PROT 0949's own content ends at file `+0x1828` (VA `0x801F8200`), and the
+body at `0x801F8504` is PROT 0948's move-VM stager in 0949's inherited tail. It
+frame-matches there, which is why a dump row once named it under 0949.
+
+## The band's entry rows live on `battle.md`
+
+The eleven player-Seru tick bodies (PROT 0903..0913), PROT 0910's applier
+`0x801F81DC` and the fourteen trampoline-reached arms of PROT 0940..0962 are
+**class 1** by the [three-way test](#the-three-way-test), so they live on
+[`battle.md`](battle.md#slot-b-summon--cast-modules-prot-09030966) with the
+band's other entries: [the eleven](battle.md#the-eleven-player-seru-tick-bodies)
+and [the fourteen](battle.md#the-fourteen-trampoline-reached-arms). What stays
+here is the reason a grep for one of those VAs lands on this page anyway.
+
+### The same VA, read in another image
+
+The eleven ticks wear only **five** distinct VAs, and every one of the five
+also has a class-2 or class-3 reading in some other image. `0x801F69D8` is the
+extreme case: it is a tick body in six modules
+of this band, a capture-class body in six more, PROT 0901's world-map terrain
+dispatcher, PROT 0900's minigame tile rasteriser, and data in a save-state
+capture of the slot-B buffer. The row that answers a question is the one whose
+image matches the image you are reading.
+
+`0x801F69D8` and `0x801F69EC` carry `va_aliased_overlay_local` rows in
+[`scripts/ci/port-catalog-ignore.toml`](../../../scripts/ci/port-catalog-ignore.toml):
+an address claim that the bare VA is no one port site, naming the world-map,
+field-render and module residents. The modules' own routines at those VAs are
+ported per image, each tag naming its PROT entry, and
+[`image-scoped-verdicts.toml`](../../../scripts/ci/image-scoped-verdicts.toml)
+classifies the non-module residents image by image. A band address is only
+meaningful as an `(image, VA)` pair, which is the same reason the trampoline
+map is keyed on `(entry, body)`.
+
+`0x801F69F4` is the sharpest single case: in PROT 0909 it is the Viguro tick,
+and in PROT 0968 it is the boss stage-module tick - two unrelated routines, one
+VA, both real ([`battle.md`](battle.md#801f69f4-hosts)).

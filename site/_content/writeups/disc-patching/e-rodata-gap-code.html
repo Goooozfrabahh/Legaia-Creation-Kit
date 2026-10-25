@@ -1,0 +1,207 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../../index.html">home</a> &middot; <a href="../index.html">write-ups</a> &middot; <a href="index.html">disc patching</a> &middot; Tier E</div>
+  <h1>Tier E - code injection via the rodata gap</h1>
+  <p class="lede">A monster drops a second piece of gear. Running away banks a slice of the EXP. An enemy turns on its own side. A captured Seru keeps a permanent +35% for the rest of the game. None of those is a value that exists on the disc to be changed - they are <em>behaviour</em>, and behaviour needs instructions. This tier parks hand-assembled MIPS in bytes the executable never uses and detours the game into it.</p>
+</header>
+
+<div class="notice">
+  <div class="notice-title">The technique in one box</div>
+  Find a run of bytes that no instruction ever reads, find the exact moment in an existing routine where the new behaviour belongs, and overwrite two instructions there with a jump into the new code. The new code does its work, replays the two instructions it displaced, and jumps back. The hard part is the first step: a run of zeros is not the same as a run nobody reads.
+</div>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Host</dt><dd>A 1028-byte all-zero run in <code>SCUS_942.54</code> rodata at <code>0x8007AB38</code> (always resident), plus four smaller read-watch-verified dead regions totalling 652 bytes</dd>
+    <dt>Detour</dt><dd>Two instructions at the hook site become <code>j routine</code> + <code>nop</code>; the routine replays them and jumps back</dd>
+    <dt>Edit class</dt><dd>In place, same size; consumes reclaimed rodata - a finite, shared resource</dd>
+    <dt>Mods</dt><dd><code>--equipment-drops</code> &middot; <code>--flee-exp</code> &middot; <code>--enemy-ally</code> &middot; <code>--shiny-seru</code></dd>
+    <dt>Guards</dt><dd>Hook-site words must match the USA build; every target must be all-zero; no target may overlap a catalogued table; routine VAs must be word-aligned</dd>
+    <dt>Confidence</dt><dd><span class="tag tag-done">Confirmed</span> - byte/disassembly oracles plus emulator playtests; no engine runtime oracle (the from-scratch engine cannot execute injected MIPS)</dd>
+    <dt>Oracles</dt><dd><code>equipment_drops_real.rs</code> &middot; <code>flee_exp_real.rs</code> &middot; <code>enemy_ally_real.rs</code> &middot; <code>shiny_seru_real.rs</code></dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="detour">
+  <h2>The detour</h2>
+  <figure class="overlay-strip">
+    <svg viewBox="0 0 880 200" width="100%" style="max-width:880px" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three boxes: the retail routine with two instructions replaced by a jump; the injected routine in the gap which does its work and replays the displaced pair; a jump back to the instruction after the hook">
+      <title>A two-instruction detour into the rodata gap and back</title>
+      <style>
+        .dt-box { fill: var(--bg-raised); stroke: var(--border); stroke-width: 1.3; }
+        .dt-hot { fill: var(--bg-raised); stroke: var(--accent); stroke-width: 1.5; }
+        .dt-t   { font: 12px var(--font-mono), monospace; fill: currentColor; text-anchor: middle; dominant-baseline: middle; }
+        .dt-h   { font: 700 12px var(--font-body), sans-serif; fill: currentColor; text-anchor: middle; dominant-baseline: middle; }
+        .dt-lab { font: 11px var(--font-body), sans-serif; fill: var(--text-muted); text-anchor: middle; }
+        .dt-ar  { fill: none; stroke: var(--accent); stroke-width: 1.5; }
+      </style>
+      <defs>
+        <marker id="dt-head" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="var(--accent)"/></marker>
+      </defs>
+      <rect x="20" y="30" width="250" height="130" class="dt-box"/>
+      <text x="145" y="50" class="dt-h">retail routine</text>
+      <text x="145" y="78" class="dt-t">&hellip;</text>
+      <rect x="40" y="92" width="210" height="44" class="dt-hot"/>
+      <text x="145" y="106" class="dt-t">j routine</text>
+      <text x="145" y="124" class="dt-t">nop</text>
+      <text x="145" y="150" class="dt-t">next instruction</text>
+
+      <rect x="330" y="30" width="250" height="130" class="dt-hot"/>
+      <text x="455" y="50" class="dt-h">injected routine (gap)</text>
+      <text x="455" y="78" class="dt-t">do the new work</text>
+      <text x="455" y="104" class="dt-t">replay displaced pair</text>
+      <text x="455" y="130" class="dt-t">j next instruction</text>
+
+      <path d="M270 114 L326 114" class="dt-ar" marker-end="url(#dt-head)"/>
+      <path d="M580 130 C 640 130, 640 150, 250 150" class="dt-ar" marker-end="url(#dt-head)"/>
+
+      <rect x="640" y="30" width="220" height="130" class="dt-box"/>
+      <text x="750" y="50" class="dt-h">guards</text>
+      <text x="750" y="78" class="dt-lab">hook words match USA build</text>
+      <text x="750" y="100" class="dt-lab">target bytes all zero</text>
+      <text x="750" y="122" class="dt-lab">outside every known table</text>
+      <text x="750" y="144" class="dt-lab">routine VA word-aligned</text>
+
+      <text x="440" y="188" class="dt-lab">the two displaced instructions live inside the routine, so the original semantics survive</text>
+    </svg>
+    <figcaption>The hook site is chosen where the new behaviour belongs and no live register is clobbered across the jump. The guards refuse a differently-laid-out image rather than corrupt it.</figcaption>
+  </figure>
+</section>
+
+<section class="doc-section" id="hooks">
+  <h2>The four hooks</h2>
+  <table class="layout">
+    <thead><tr><th>Mod</th><th>Hook site</th><th>Routine</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td><code>--equipment-drops</code></td><td><code>0x8004F610</code> in the reward tally <code>FUN_8004E568</code> (SCUS)</td><td><code>0x8007AB80</code> + id table</td><td>Rolls a per-battle chance; grants one random equipment id through the game's own add-item helper, on top of the normal drop.</td></tr>
+      <tr><td><code>--flee-exp</code></td><td><code>0x801E5A10</code>, escape teardown state <code>0x66</code> of <code>FUN_801E295C</code> (battle overlay, PROT 0898)</td><td><code>0x8007AD00</code></td><td>Sums the fled formation's EXP, scales by <code>--flee-exp-pct</code>, banks it into every member's cumulative-XP cell.</td></tr>
+      <tr><td><code>--enemy-ally</code></td><td><code>0x80051990</code>, after the monster-setup loop (SCUS)</td><td><code>0x8007ACA0</code></td><td>Rolls a chance and sets the Confuse/Charm bits (<code>0x380</code> in <code>+0x16E</code>) on the frontmost enemy, so it attacks its own side. One companion edit widens the victory check's mask to <code>0x384</code> so a charmed enemy counts as down.</td></tr>
+      <tr><td><code>--shiny-seru</code></td><td>nine detours across battle setup, capture, damage and the menus</td><td>four verified-dead regions (below)</td><td>A capturable enemy spawns with stats &times;1.35; once captured, its per-Seru flag grants a permanent +35% damage.</td></tr>
+    </tbody>
+  </table>
+  <p>Two design points are worth the read. Flee-EXP's <em>hook</em> is in the battle overlay (reloaded each battle) but its <em>routine</em> is in the executable, so it survives every overlay swap. Enemy ally never adds a fourth combatant - retail is hard-wired to three party slots - it reuses the state a confused party member already has.</p>
+</section>
+
+<section class="doc-section" id="zero-not-dead">
+  <h2>"Zero is not dead"</h2>
+  <p>The obvious test for a home - "find a run of zero bytes" - is wrong. A region can be solid zero in the file and still be <strong>read at runtime</strong>, because it is the unused padding of a table the game indexes by id: ask for an entry past the real end and the reader walks straight into the injected bytes.</p>
+  <figure class="overlay-strip">
+    <svg viewBox="0 0 880 250" width="100%" style="max-width:880px" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Top strip: three real table entries followed by a zero region holding the injected routine; an index arrow past the table's end reads the routine as data. Bottom strip: a region no instruction reads, the only safe home">
+      <title>A zero run that passes an all-zero check but is still read as table padding</title>
+      <style>
+        .zd-lab  { font: 11px var(--font-body), sans-serif; fill: var(--text-muted); }
+        .zd-real { fill: var(--bg-raised); stroke: var(--border); stroke-width: 1.2; }
+        .zd-bad  { fill: var(--bg-raised); stroke: var(--warn); stroke-width: 1.4; }
+        .zd-ok   { fill: var(--bg-raised); stroke: var(--accent); stroke-width: 1.4; }
+        .zd-cell { font: 11px var(--font-mono), monospace; fill: currentColor; text-anchor: middle; dominant-baseline: middle; }
+        .zd-warn { font: 600 11px var(--font-body), sans-serif; fill: var(--warn); }
+        .zd-good { font: 600 11px var(--font-body), sans-serif; fill: var(--accent); }
+        .zd-ar   { fill: none; stroke: var(--warn); stroke-width: 1.6; }
+      </style>
+      <defs>
+        <marker id="zd-head" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="var(--warn)"/></marker>
+      </defs>
+      <text x="20" y="30" class="zd-lab">looks dead: every byte is zero</text>
+      <rect x="20"  y="44" width="120" height="40" class="zd-real"/><text x="80"  y="64" class="zd-cell">entry 0</text>
+      <rect x="140" y="44" width="120" height="40" class="zd-real"/><text x="200" y="64" class="zd-cell">entry 1</text>
+      <rect x="260" y="44" width="120" height="40" class="zd-real"/><text x="320" y="64" class="zd-cell">entry 2</text>
+      <rect x="380" y="44" width="300" height="40" class="zd-bad"/><text x="530" y="64" class="zd-cell">injected routine</text>
+      <text x="20"  y="104" class="zd-lab">live table, indexed by id</text>
+      <text x="380" y="104" class="zd-lab">past the table's real end</text>
+      <path d="M560 146 L560 90" class="zd-ar" marker-end="url(#zd-head)"/>
+      <text x="572" y="150" class="zd-warn">table[id] for a large id reads the code as data</text>
+
+      <text x="20" y="196" class="zd-lab">actually dead: read-watch verified</text>
+      <rect x="20" y="206" width="660" height="40" class="zd-ok"/><text x="350" y="226" class="zd-cell">injected routine</text>
+      <text x="700" y="230" class="zd-good">no instruction ever reads it</text>
+    </svg>
+    <figcaption>An all-zero check is satisfied either way. The only safe home is one a read-watchpoint in a live emulator never fires on.</figcaption>
+  </figure>
+  <p>The authoritative test is not "is this in a table I know about?" but <strong>"does any instruction read this at runtime?"</strong> The final homes are chosen by arming a read-watchpoint on each candidate under PCSX-Redux and exercising the worst cases - an item use, a victory pose, a summon cast - and keeping only the runs nothing touches. The structural table-overlap guard stays as a first filter; the watchpoint is the proof.</p>
+</section>
+
+<section class="doc-section" id="gap-map">
+  <h2>The contended resource</h2>
+  <p>Every code-hook feature and two data blobs share one 1028-byte run, and four small verified-dead regions hold the rest. Each tenant guards its slot as all-zero, so they compose - but the space is finite, and that ceiling is why a whole interactive screen goes elsewhere (<a href="f-overlay-dead-region.html">tier F</a>).</p>
+  <table class="layout">
+    <thead><tr><th>VA</th><th>Tenant</th><th>Size</th><th>Kind</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x8007AB40</code></td><td>Seru Bell name string (<code>--unused-items</code>, the string variant)</td><td>10 B</td><td>data</td></tr>
+      <tr><td><code>0x8007AB80</code></td><td>bonus-equipment routine + id table (<code>--equipment-drops</code>)</td><td>~128 B</td><td>code</td></tr>
+      <tr><td><code>0x8007ACA0</code></td><td>enemy-ally charm routine (<code>--enemy-ally</code>)</td><td>~76 B</td><td>code</td></tr>
+      <tr><td><code>0x8007AD00</code></td><td>run-away-EXP routine (<code>--flee-exp</code>)</td><td>~237 B</td><td>code</td></tr>
+      <tr><td><code>0x8007AE00</code></td><td>arena 1: shiny Seru / Super-Art menu / arts-AP hooks (mutually exclusive)</td><td>256 B</td><td>code</td></tr>
+      <tr><td><code>0x8007AF00</code></td><td>Seru-trade config blob (<code>--seru-trade</code>, the config variant) - engine-facing, inert on hardware</td><td>24 B</td><td>data</td></tr>
+      <tr><td><code>0x80077728</code></td><td>gap 1: shiny-Seru setup, capture, bitmap, banner string</td><td>256 B</td><td>code + data</td></tr>
+      <tr><td><code>0x8007AFF8</code></td><td>arena 2: a dead pocket between two sound tables</td><td>72 B</td><td>code</td></tr>
+      <tr><td><code>0x80078A88</code></td><td>slot 6: padding between the <code>0x80078xxx</code> tables</td><td>68 B</td><td>code</td></tr>
+    </tbody>
+  </table>
+  <p>Shiny Seru alone occupies 618 of the 652 bytes across the four verified-dead regions, which is why it is mutually exclusive with the features that need the same arenas.</p>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <table>
+    <thead><tr><th>Claim</th><th>Evidence</th><th>Reference</th></tr></thead>
+    <tbody>
+      <tr><td>Reward tally runs once per battle</td><td><code>FUN_8004E568</code> gates on <code>actor+0x6CE == 0</code>; normal drop granted through <code>FUN_800421D4</code> at <code>0x8004F608</code></td><td><a href="../../subsystems/level-up.html">level-up</a></td></tr>
+      <tr><td>Escape teardown is state <code>0x66</code></td><td>Battle-action machine <code>FUN_801E295C</code>; a failed run goes <code>0x65 &rarr; 0x50</code> instead</td><td><a href="../../subsystems/battle-action.html">battle-action</a></td></tr>
+      <tr><td>Cumulative XP at record <code>+0x5C8</code></td><td>Written by the tally, read by the level processor <code>FUN_801E9504</code></td><td><a href="../../formats/save-record.html">save-record</a></td></tr>
+      <tr><td>Charm bits <code>0x380</code> flip a target's side</td><td>Action-machine target selection on <code>actor+0x16E</code>; victory check <code>andi v0,v0,0x4</code> at <code>0x801E6638</code></td><td><a href="../../subsystems/battle-action.html">battle-action</a></td></tr>
+      <tr><td>Party is hard-wired to three slots</td><td>Setup loop <code>FUN_800513F0</code> bounded <code>&lt; 3</code>; meshes and HUD exist for slots 0-2 only</td><td><a href="../../subsystems/battle.html">battle</a></td></tr>
+      <tr><td>The four dead regions are unread</td><td>PCSX-Redux read-watchpoints across item use, victory pose and summon cast</td><td><a href="../../tooling/pcsx-redux-automation.html">pcsx-redux-automation</a></td></tr>
+      <tr><td>Hand-assembled bytes are what the oracle expects</td><td>Disc oracles decode the detour + routine + table and check every touched sector</td><td><a href="../../tooling/randomizer.html">randomizer</a></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<details class="disclosure">
+  <summary>History: the three tables that read the injected bytes</summary>
+  <div class="disclosure-body">
+    <p>Three earlier homes passed the all-zero check and were still read at runtime as table padding: the victory mouth-override table at <code>0x80077E80</code> (a garbled mouth during the victory pose), the battle-overlay move-power table at <code>0x801F4F5C</code> (six attack ids read code as power and texture values), and the SsAPI sound tables around <code>0x800794F0</code> (an item-use sound never reported done, so the tutorial fight froze on a Healing Leaf). The first two were caught by the table-overlap guard; the third table was not yet catalogued. Read-watch verification replaced "is it in a known table" as the acceptance test.</p>
+  </div>
+</details>
+
+<details class="disclosure">
+  <summary>History: the shiny flag in the level byte</summary>
+  <div class="disclosure-body">
+    <p>Retail keeps a captured Seru as an <code>(id, level)</code> pair with no spare field. An early design hid the shiny flag in the unused high bit of the level byte; one shared routine (<code>FUN_800402F4</code>, spell level-up + display) read the level unmasked and rendered the "grew to level N" box blank. The flag moved to a parallel per-Seru byte array in a reclaimed run of the character record, with a small hook mirroring the game's insert-at-front spell-list shift. A free bit in a live field is free only if you control every reader - and on a sealed disc you usually do not.</p>
+  </div>
+</details>
+
+<details class="disclosure">
+  <summary>Details: the R3000 traps</summary>
+  <div class="disclosure-body">
+    <ul>
+      <li><strong>Load-delay slot.</strong> A value loaded by <code>lw</code> is not usable in the very next instruction; a replayed displaced pair that depended on that spacing must keep it.</li>
+      <li><strong>Jump alignment.</strong> <code>j</code> drops the target's low two bits, so a routine placed at an unaligned zero-run start jumps into the middle of a word. Every routine VA is rounded up to a word boundary; only byte-addressed data may sit unaligned.</li>
+      <li><strong>Capturable set at patch time.</strong> No retail field says "this enemy is a Seru", so the shiny allowlist is built from the disc's own monster names - every enemy named after a player Seru-magic - and baked into a bitmap the setup routine indexes by id.</li>
+    </ul>
+    <p>The from-scratch engine pays none of this: there the same feature is a set of <code>(character, spell)</code> pairs and a <code>&times;1.35</code> in the damage kernel.</p>
+  </div>
+</details>
+
+<details class="disclosure">
+  <summary>Details: adding a tier-E mod</summary>
+  <div class="disclosure-body">
+    <ol>
+      <li>Find a hook site at the right control-flow moment; record the two words it displaces.</li>
+      <li>Choose a home: all-zero, outside every catalogued table, read-watch-verified, word-aligned, and sized for the routine.</li>
+      <li>Replay the displaced pair inside the routine; guard every write as dead space.</li>
+      <li>Add a disc-gated oracle. If the routine is screen-sized, it has outgrown the gap - go to <a href="f-overlay-dead-region.html">tier F</a>.</li>
+    </ol>
+  </div>
+</details>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="index.html">Series index &middot; the ladder</a>
+    <a href="f-overlay-dead-region.html">Tier F &middot; overlay dead-region</a>
+    <a href="../../subsystems/battle-action.html">Battle action state machine</a>
+    <a href="../../formats/mips-overlay.html">MIPS overlay</a>
+    <a href="../../tooling/static-overlay-pipeline.html">Static overlay pipeline</a>
+  </div>
+</section>

@@ -1,0 +1,244 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">subsystems</a> &middot; shop</div>
+  <h1>Shop</h1>
+  <p class="lede">Talk to a merchant, pick Buy or Sell, choose an item and a quantity, confirm, and the gold moves. The surprise is where the data lives: a merchant&rsquo;s stock list is not a table anywhere on the disc - it sits inline in the town&rsquo;s own event script - while every price comes from one item table in the main executable. Only the screens are shared code, hosted by the same menu overlay that draws the pause and save screens.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Stock</dt><dd>Inline in each scene&rsquo;s MAN script: field-VM op <code>0x49</code> sub-0 = <code>[count][item ids][name]</code></dd>
+    <dt>Prices</dt><dd><code>SCUS_942.54</code> item table, halfword at record <code>+2</code>; price 0 = never sold</dd>
+    <dt>Screens</dt><dd>Menu overlay (PROT 0899) window-descriptor table; no separate shop overlay</dd>
+    <dt>Purses</dt><dd>Gold <code>_DAT_8008459C</code>; Point Card <code>_DAT_800845B4</code>; casino coins <code>_DAT_800845A4</code> - all capped at 9,999,999</dd>
+    <dt>Stack cap</dt><dd>99 per item id, enforced by the list ink and the quantity clamp</dd>
+    <dt>In the port</dt><dd><code>engine-menus::shop</code>, <code>engine-screens</code>, <code>legaia_scene_formats::shop_stock</code></dd>
+    <dt>Confidence</dt><dd>Confirmed - stock scan validated disc-wide; every screen traced in the menu overlay</dd>
+    <dt>Used by</dt><dd><a href="../shops.html">Shops browser</a>, <a href="../tooling/rom-patcher.html">ROM patcher</a> shop shuffle, <a href="inventory.html">inventory</a></dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="flow">
+  <h2>Flow</h2>
+  <figure class="diagram">
+    <svg viewBox="0 0 860 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Shop flow. Talking to a merchant runs field-VM op 0x49, which hands the stock to the menu overlay's mode panel: Buy, Sell or Quit. Buy opens the stock list priced from the item table, Sell the bag. Either list leads to the quantity stepper; buying equipment first asks who it is for. Committing moves the gold and returns to the list. Quit, or Triangle from a list, ends the shop and the script resumes past the merchant.">
+      <defs><marker id="sh-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="dg-node" x="20" y="110" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="95" y="134">Merchant</text><text class="dg-sub" x="95" y="152">field-VM op 0x49</text>
+      <rect class="dg-node-accent" x="200" y="110" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="275" y="134">Buy / Sell / Quit</text><text class="dg-sub" x="275" y="152">mode panel</text>
+      <rect class="dg-node" x="390" y="30" width="160" height="56" rx="5"/>
+      <text class="dg-label" x="470" y="54">Buy list</text><text class="dg-sub" x="470" y="72">stock x item prices</text>
+      <rect class="dg-node" x="390" y="190" width="160" height="56" rx="5"/>
+      <text class="dg-label" x="470" y="214">Sell list</text><text class="dg-sub" x="470" y="232">the bag, half price</text>
+      <rect class="dg-node" x="590" y="30" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="665" y="54">Who is it for?</text><text class="dg-sub" x="665" y="72">equipment only</text>
+      <rect class="dg-node-accent" x="590" y="130" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="665" y="154">Quantity</text><text class="dg-sub" x="665" y="172">stepper, commits</text>
+      <rect class="dg-node-ok" x="770" y="130" width="80" height="56" rx="5"/>
+      <text class="dg-label" x="810" y="154">Gold</text><text class="dg-sub" x="810" y="172">moves</text>
+      <rect class="dg-node" x="200" y="230" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="275" y="254">Exit</text><text class="dg-sub" x="275" y="272">script resumes</text>
+      <path class="dg-edge" d="M170 138 L198 138" marker-end="url(#sh-arrow)"/>
+      <path class="dg-edge" d="M350 130 L370 130 L370 58 L388 58" marker-end="url(#sh-arrow)"/>
+      <path class="dg-edge" d="M350 146 L370 146 L370 218 L388 218" marker-end="url(#sh-arrow)"/>
+      <path class="dg-edge" d="M550 58 L588 58" marker-end="url(#sh-arrow)"/>
+      <path class="dg-edge" d="M520 86 L520 150 L588 150" marker-end="url(#sh-arrow)"/>
+      <path class="dg-edge" d="M550 218 L570 218 L570 166 L588 166" marker-end="url(#sh-arrow)"/>
+      <path class="dg-edge-dim" d="M665 86 L665 128" marker-end="url(#sh-arrow)"/>
+      <path class="dg-edge" d="M740 158 L768 158" marker-end="url(#sh-arrow)"/>
+      <path class="dg-edge-dim" d="M810 130 L810 12 L470 12 L470 28" marker-end="url(#sh-arrow)"/>
+      <text class="dg-edge-label" x="640" y="24" text-anchor="middle">back to the list - keep shopping</text>
+      <path class="dg-edge" d="M275 166 L275 228" marker-end="url(#sh-arrow)"/>
+      <text class="dg-edge-label" x="267" y="204" text-anchor="end">Quit / Triangle</text>
+    </svg>
+    <figcaption>Every commit returns to the list so the player keeps shopping; the only way out is Quit on the mode panel or Triangle from a list. Sell and Quit grey out together when the bag is empty.</figcaption>
+  </figure>
+  <ol class="steps">
+    <li><b>Talk to the merchant</b><span>the script reaches op <code>0x49</code> sub-0; the field VM parks and hands the stock bytes to the menu</span></li>
+    <li><b>Pick a list</b><span>buy = the stock, priced from the item table; sell = the bag. Rows grey when unaffordable or at 99</span></li>
+    <li><b>Quantity</b><span>buy max = min(gold / price, 99, 99 &minus; held); sell max = held. Equipment asks who it is for and equips on the spot</span></li>
+    <li><b>Commit</b><span>gold moves, the bag updates, a Point Card accrues 5%</span></li>
+    <li><b>Quit</b><span>the op&rsquo;s tristate flips to Done and the script resumes past the merchant</span></li>
+  </ol>
+</section>
+
+<section class="doc-section" id="stock-source">
+  <h2>Where the stock comes from</h2>
+  <p>The MAN is each scene&rsquo;s script-and-data bundle. Inside it, a merchant is one field-VM instruction carrying a count, a run of item ids and the vendor&rsquo;s name. The count over-counts: it includes a trailing run of unsellable, price-0 placeholder ids that the on-screen shop skips. The price table therefore doubles as a <strong>sellable mask</strong>: a record must lead with a priced item, and the unpriced tail is trimmed. Every shop on the disc partitions cleanly this way.</p>
+  <table class="data-table">
+    <thead><tr><th>Trap</th><th>Rule that avoids it</th></tr></thead>
+    <tbody>
+      <tr><td>Requiring every id to be sellable</td><td>rejects nearly every shop - most records carry the placeholder tail. Trim, do not reject.</td></tr>
+      <tr><td>Walking opcodes linearly</td><td>desyncs on a dialogue picker&rsquo;s jump table and silently misses shops (Biron Monastery). Byte-scan for the op signature instead.</td></tr>
+      <tr><td>Trusting the CDNAME label</td><td>a <code>#define name N</code> names extraction entry <code>N &minus; 2</code>; resolve the scene through <code>block_for_extraction_index</code>.</td></tr>
+    </tbody>
+  </table>
+  <p>Read a town&rsquo;s stock off a disc with <code>asset shop-stock --prot PROT.DAT --scus SCUS_942.54 --cdname CDNAME.TXT --scene bylon</code>; it prints &ldquo;decodes 10 ids, sells 7&rdquo; rather than truncating. The casino prize counter is a different system: its table lives in the menu overlay and debits the coin bank, not gold.</p>
+  <details class="disclosure">
+    <summary>Details: the prize counter&rsquo;s sound cues</summary>
+    <div class="disclosure-body">
+      <p>The counter session (<code>FUN_801DC1CC</code>) never picks a cue for a plain step: the list kernel <code>FUN_801D688C</code> pushes step <code>0x21</code>, confirm <code>0x36</code> or cancel <code>0x37</code> itself, and the session overwrites it where it disagrees. A redeem the coin bank or the 99 cap refuses becomes the buzz <code>0x23</code> (<code>0x801DC3F8</code>). A confirm on the Yes / No prompt becomes cue <code>0</code>, which plays nothing, so No is silent and Yes is heard as the coin jingle <code>0x25</code> the commit state pushes on the next frame (<code>0x801DC4C0</code>). In the port, <code>PrizeEvent::cue</code> reaches both hosts on the same channel the shop&rsquo;s own screens use.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="session">
+  <h2>Prices, purses and the Point Card</h2>
+  <ul class="bullets">
+    <li><strong>Buy price</strong> is the item table halfword; there is no per-shop price anywhere.</li>
+    <li><strong>Sell price</strong> is half the item table's price times the quantity, rounded down. A zero-priced item shows &ldquo;Cannot sell&rdquo;.</li>
+    <li><strong>Stack cap 99.</strong> A row greys once the held count reaches 99, and the quantity picker clamps to <code>99 &minus; held</code>.</li>
+    <li><strong>Point Card</strong> (item <code>0xFE</code>) is a third purse, passive while held. Each purchase credits <code>price / 20</code> per unit - 5% - before the gold debit; sales never accrue. A one-line toast (window 31) shows the balance after each buy.</li>
+    <li><strong>Buying equipment</strong> first asks who it is for: a party row checks the equip mask and, on a match, equips immediately and returns the replaced piece to the bag. The picker&rsquo;s rows are the <em>present party</em>, not the four character records: the cursor gets party-size rows (<code>0x801DB434</code>) and a confirmed row resolves to its character through the party list (<code>0x801DB554</code>), so a lone Noa is row 1 and a member who has not joined has no row.</li>
+  </ul>
+  <details class="disclosure">
+    <summary>Details: what spends the Point Card</summary>
+    <div class="disclosure-body">
+      <p>The bank&rsquo;s only debit is a <em>battle</em> effect arm: entry 14 of the effect jump table takes <code>min(bank, 9999)</code>, subtracts it from the bank and applies it as damage to the target - the Point Card strike. No item descriptor on the disc selects arm 14; the battle-action caller passes the actor&rsquo;s <code>+0x1E8</code> byte as the selector. The card&rsquo;s descriptor carries flag bit <code>0x40</code>, shared only with the summon flutes: that bit is the descriptor&rsquo;s <strong>target side</strong> (set = the enemy party), read at <code>0x801D18E0</code> in <code>FUN_801D0748</code> and forked with <code>0x20</code> into four target modes - so the five carriers are exactly the enemy-directed consumables.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="render">
+  <h2>Screens and row ink</h2>
+  <p>Each shop window is a record in the menu overlay&rsquo;s window-descriptor table (<a href="field-menu.html">field menu</a>); the 9-slice frame is caller-drawn and each renderer only paints content from its window origin. Text indents 20 px, lines are 14 px apart.</p>
+  <table class="data-table">
+    <thead><tr><th>Window</th><th>Rect</th><th>Content</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x2A</code> mode panel</td><td>(42, 46, 80&times;38)</td><td>Buy / Sell / Quit rows; bobbing cursor on the selected row</td></tr>
+      <tr><td>buy list</td><td>list window</td><td>content-builder list (case <code>0x0B</code>), priced against gold; the row words are <code>[class][0x800 dim][item id]</code> and the record&rsquo;s last entries are hoisted to the top</td></tr>
+      <tr><td>35 quantity</td><td>(138, 100, 168&times;50)</td><td>&ldquo;Have N&rdquo;, &ldquo;How many will you buy?&rdquo;, then <em>quantity / bound</em> at +34 px; the price appears once, in the running total, whose digit-field width comes from the <em>unit</em> price</td></tr>
+      <tr><td>39 sell detail</td><td>(14, 95, 144&times;53)</td><td>name, description, price row (5-digit, half price), accessory passive name + description</td></tr>
+      <tr><td>31 Point Card toast</td><td>-</td><td>8-digit balance between a heading and a &ldquo;point(s)&rdquo; label; the quantity commit closes the stepper first, so the toast rides over the name, gold, detail and compare windows alone</td></tr>
+    </tbody>
+  </table>
+  <p><strong>The last rows come first - for Platinum Card holders.</strong> The buy list is built by the SCUS content builder&rsquo;s case <code>0x0B</code>, which splits the record at <code>count &minus; 3</code>: entries at or past the split go into the row buffer first, drawn in the teal pen even when the player cannot afford them, and the rest follow. Those last three record slots are walked only when the party carries or wears item <code>0xFF</code>, the <strong>Platinum Card</strong>; otherwise the builder stops three entries short. Every shop record reserves the three slots and pads the unused ones with unsellable template ids, so the card&rsquo;s exclusive strip is 0, 2 or 3 rows wide - and it lines up one-for-one with the <code>*</code> markers the walkthrough tables carry. Those markers were read as &ldquo;new in this town&rdquo;, but the same item is starred in more than one town. A retail capture confirms the gate: Retock&rsquo;s Items Shop builds thirteen rows, the last three first, while the party carries the card, and ten rows in record order once the card is taken out of the bag.</p>
+  <p><strong>Row ink is last-rule-wins.</strong> Three tests run in order and each overwrites the last: a full stack greys the row; the record&rsquo;s &ldquo;owned / restricted&rdquo; marker re-inks it to the accent pen even so; an unaffordable price greys it again even so. On the mode panel, an empty bag dims Sell - and Quit with it, because nothing restores the ink between the two draws.</p>
+  <details class="disclosure">
+    <summary>Details: cursor word bits and the window choreography</summary>
+    <div class="disclosure-body">
+      <p>The picker cursor word (<code>DAT_801E46BC</code>): low 12 bits = selected row; bit <code>0x1000</code> = blink phase; bit <code>0x2000</code> = parked presentation (every row drawn, keyed to blink); bit <code>0x4000</code> = cursor suppressed. The stock list re-runs the same decode against <code>_DAT_8007BB98</code>; shared kernel <code>engine-menus::shop::shop_cursor_mode</code>.</p>
+      <p>Opening and closing slide the windows through <a href="../formats/window-script.html">widget scripts</a>: the open script (<code>DAT_801E4E38</code>) brings in vendor name <code>0x21</code>, mode panel <code>0x2A</code>, gold <code>0x20</code>, <code>0x28</code> and <code>0x22</code>; the Sell transition (<code>DAT_801E4E54</code>) slides away <code>0x28</code> / <code>0x2A</code> / <code>0x22</code> and keeps the gold and name plates. The randomizer&rsquo;s Seru-trading vendor patches exactly these seams to grow the panel to four rows.</p>
+      <p><strong>Leaving</strong> runs the same machinery backwards. Quit, or a cancel on the mode panel, selects sub-screen <code>0</code> (<code>FUN_801DD12C</code>): its first frame hands the widget VM the close-all script <code>0x801E4A78</code>, every window slides back to its park edge, and only once the widget VM is idle does the fade start. The exit draws no text of its own - the next line is the merchant&rsquo;s script resuming past op <code>0x49</code>. The port&rsquo;s <code>ShopExit</code> beat is that sub-screen: the windows keep their content while they slide out, and the session is dropped on the way out of the beat.</p>
+      <p>The opening slides start on the tick after the fade lands, so the first window frame is already one step in from the park edge. Retail then holds black for about fifty frames while the overlay loads; the port does not reproduce that wait.</p>
+      <p>Every equipment bonus record on the disc carries the <code>0x40</code> no-passive sentinel, so the sell panel&rsquo;s passive lines always come from the item-effect table arm.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="window-text">
+  <h2>Window text and the compare panels</h2>
+  <p>No shop label is computed. Every string a window prints sits in the menu overlay&rsquo;s own string pool and is loaded by address by that window&rsquo;s renderer. The port reads the same strings out of your disc&rsquo;s PROT 0899 at boot (<code>engine-menus::shop::ShopLabels</code>); a session without the overlay draws those windows with no label text rather than with invented text.</p>
+  <table class="data-table">
+    <thead><tr><th>Window</th><th>Renderer</th><th>What it prints</th></tr></thead>
+    <tbody>
+      <tr><td>42 picker</td><td><code>FUN_801D4868</code></td><td>the three mode rows</td></tr>
+      <tr><td>41 party compare</td><td><code>FUN_801D4C28</code></td><td>per-member stat block, or one of two notes</td></tr>
+      <tr><td>35 buy quantity</td><td><code>FUN_801D5510</code></td><td>held count, prompt</td></tr>
+      <tr><td>36 recipient</td><td><code>FUN_801D56FC</code></td><td>bag row, then one row per present member</td></tr>
+      <tr><td>37 sell quantity</td><td><code>FUN_801D5944</code></td><td>prompt</td></tr>
+      <tr><td>39 sell detail</td><td><code>FUN_801D5AE8</code></td><td>price, or the unsellable note</td></tr>
+      <tr><td>31 Point Card toast</td><td><code>FUN_801DCE20</code></td><td>heading, balance, unit</td></tr>
+    </tbody>
+  </table>
+  <p>Three of the labels carry the string primitive&rsquo;s two-byte <strong>name escapes</strong>, expanded at draw time (<code>FUN_80036888</code>): each recipient row opens with <code>0xC1 n</code>, character <code>n</code>&rsquo;s name, so a row reads as that character&rsquo;s own sentence; the toast heading opens with <code>0xC2 0xFE</code>, the Point Card&rsquo;s item name. An escape&rsquo;s operand can be <code>0</code>, so a plain C-string read stops inside the label - the port keeps escapes whole and resolves them off the live roster.</p>
+
+  <h3>The party compare (window 41)</h3>
+  <p>One block per <strong>present</strong> party member, walked through the party list; a member who has not joined has no block. Each block takes the first rule that applies:</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 860 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The party compare decision for one member. If any of the member's eight equip bytes equals the staged item, print the equipped note. Otherwise, if the item is not equipment, print current ATK, UDF and LDF with no arrows. Otherwise, if the equip mask excludes the member, print the cannot-equip note. Otherwise do a trial equip: write the piece into its slot byte, recompute the stats, restore the byte, and print each stat with a rise or fall arrow and the trial value where it changed.">
+      <defs><marker id="shc-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="dg-node" x="10" y="20" width="180" height="56" rx="5"/>
+      <text class="dg-label" x="100" y="44">Already equipped?</text><text class="dg-sub" x="100" y="62">8 equip bytes vs item</text>
+      <rect class="dg-node" x="230" y="20" width="180" height="56" rx="5"/>
+      <text class="dg-label" x="320" y="44">Not equipment?</text><text class="dg-sub" x="320" y="62">item record +0 != 1</text>
+      <rect class="dg-node" x="450" y="20" width="180" height="56" rx="5"/>
+      <text class="dg-label" x="540" y="44">Mask excludes?</text><text class="dg-sub" x="540" y="62">equip record +6</text>
+      <rect class="dg-node-accent" x="670" y="20" width="180" height="56" rx="5"/>
+      <text class="dg-label" x="760" y="44">Trial equip</text><text class="dg-sub" x="760" y="62">write, recompute, restore</text>
+      <path class="dg-edge" d="M190 48 L228 48" marker-end="url(#shc-arrow)"/>
+      <path class="dg-edge" d="M410 48 L448 48" marker-end="url(#shc-arrow)"/>
+      <path class="dg-edge" d="M630 48 L668 48" marker-end="url(#shc-arrow)"/>
+      <text class="dg-edge-label" x="209" y="40" text-anchor="middle">no</text>
+      <text class="dg-edge-label" x="429" y="40" text-anchor="middle">no</text>
+      <text class="dg-edge-label" x="649" y="40" text-anchor="middle">no</text>
+      <rect class="dg-node-ok" x="10" y="150" width="180" height="56" rx="5"/>
+      <text class="dg-label" x="100" y="174">Equipped note</text><text class="dg-sub" x="100" y="192">nothing else</text>
+      <rect class="dg-node-ok" x="230" y="150" width="180" height="56" rx="5"/>
+      <text class="dg-label" x="320" y="174">Current stats</text><text class="dg-sub" x="320" y="192">ATK / UDF / LDF, no arrows</text>
+      <rect class="dg-node-warn" x="450" y="150" width="180" height="56" rx="5"/>
+      <text class="dg-label" x="540" y="174">Cannot-equip note</text><text class="dg-sub" x="540" y="192">characters 0..=2 tested</text>
+      <rect class="dg-node-ok" x="670" y="150" width="180" height="56" rx="5"/>
+      <text class="dg-label" x="760" y="174">Current, arrow, trial</text><text class="dg-sub" x="760" y="192">arrow only where it changes</text>
+      <path class="dg-edge" d="M100 76 L100 148" marker-end="url(#shc-arrow)"/>
+      <path class="dg-edge" d="M320 76 L320 148" marker-end="url(#shc-arrow)"/>
+      <path class="dg-edge" d="M540 76 L540 148" marker-end="url(#shc-arrow)"/>
+      <path class="dg-edge" d="M760 76 L760 148" marker-end="url(#shc-arrow)"/>
+      <text class="dg-edge-label" x="108" y="116">yes</text>
+      <text class="dg-edge-label" x="328" y="116">yes</text>
+      <text class="dg-edge-label" x="548" y="116">yes</text>
+    </svg>
+    <figcaption>The trial equip writes the staged piece into the slot byte its class names, recomputes the stats (<code>FUN_801CF650</code> around <code>FUN_80042558</code>) and restores the byte. The class is not the byte index: the weapon goes to a per-character slot, and head, body and legs map through a small remap table.</figcaption>
+  </figure>
+  <p>The rise and fall arrows are not font characters but cells of the menu-glyph page, the row right after the numerals (<code>FUN_8003C1F8</code>, glyphs <code>4</code> and <code>5</code>, in the rise and fall inks). The port attaches those cells to the font with the numerals, so every separator glyph - the compare arrows here and on the Equip screen, the quantity windows&rsquo; slash - draws from the same page.</p>
+
+  <h3>The recipient rows and the item detail line</h3>
+  <ul class="bullets">
+    <li><strong>Recipient (window 36).</strong> The bag row first, then one row per present member. A member the item&rsquo;s mask excludes keeps the row in the dim ink; the hand still lands on it, and a confirm there buzzes.</li>
+    <li><strong>Item detail (window 34).</strong> The item name and held count, then the executable&rsquo;s detail printer (<code>FUN_800337B0</code>): an accessory with a passive prints the passive&rsquo;s description; anything else prints its description. Equipment without one prints a slot template naming who can wear it, followed by one or two label / value pairs taken from the equipment record&rsquo;s own bonus bytes - ATK for a weapon, UDF and INT for headgear, UDF and LDF for armour, ATK and LDF for footwear.</li>
+  </ul>
+  <p>All of this is capture-confirmed on Retock&rsquo;s Arms Shop and Items Shop. The shops are interiors of the same scene reached only through their doors: a position poke straight into a shop leaves its room inactive, its merchant neither drawn nor talkable, so the probe pokes the door tile instead and talks to the merchant from there.</p>
+</section>
+
+<section class="doc-section" id="engine-port">
+  <h2>In the port</h2>
+  <p>The stock scan is <code>legaia_scene_formats::shop_stock</code>; the session, quantity stepper, recipient picker, Point Card bank and row-ink rules live in <code>engine-menus::shop</code>; <code>engine-menu-runtime</code>&rsquo;s <code>MenuRuntime</code> runs the session over a live world; and the screens - every window above, the prize exchange and the coin counter - are composed once in <code>engine-screens</code> and drawn by both play hosts. The grant kernel refuses a buy past 99, as the retail clamp does.</p>
+  <p>A merchant&rsquo;s record reaches op <code>0x49</code> through a <strong>talk</strong>, so what parks on the op is the inline dialogue runner, not the field script. The runner holds the conversation on the op while the shop is armed and takes the Done edge on the frame after the screen closes, which is what clears the arm; a talk that ended at the op instead would leave a stale Done edge, and the next shop talk would spend it and open nothing. The casino prize counter parks the same way: retail&rsquo;s op <code>0x49</code> ignores the sub-op while the park word <code>_DAT_8007B450</code> is up, taking the Done arm on <code>1</code> and otherwise returning the unchanged PC (<code>0x801E097C</code>), so every screen the op opens holds its record until it closes.</p>
+  <p>The literal restore amounts of consumables stay curated, because they live in overlay code rather than in the item-effect table.</p>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <table class="data-table">
+    <thead><tr><th>Function</th><th>Address</th><th>What it proves</th><th>Dump</th></tr></thead>
+    <tbody>
+      <tr><td>buy quantity + commit</td><td><code>FUN_801DB7F4</code></td><td>max clamp literals <code>0x63</code>; Point Card <code>price / 20</code> before the gold debit</td><td><code>overlay_menu_801db7f4.txt</code></td></tr>
+      <tr><td>recipient picker</td><td><code>FUN_801DB380</code></td><td>equip-mask check, equip-on-buy, same accrual; reads price at item record <code>+2</code></td><td>-</td></tr>
+      <tr><td>sell quantity</td><td><code>FUN_801DBD94</code></td><td>credits <code>(price &times; qty) &gt;&gt; 1</code>; scroll fix-up</td><td>-</td></tr>
+      <tr><td>buy-list confirm route</td><td><code>FUN_801DB21C</code></td><td>affordability refusal + item-kind switch</td><td>-</td></tr>
+      <tr><td>mode panel</td><td><code>FUN_801D4868</code></td><td>row geometry, empty-bag dim, cursor word bits</td><td><code>overlay_shop_save_801d4868.txt</code></td></tr>
+      <tr><td>picker input</td><td><code>FUN_801DAFD4</code></td><td>row clamp <code>li a1,0x3</code> at <code>0x801DB098</code>; Quit at <code>0x801DB0D0</code></td><td>-</td></tr>
+      <tr><td>quantity panel</td><td><code>FUN_801D5510</code></td><td>window 35 layout; digit-field width from unit price</td><td>-</td></tr>
+      <tr><td>sell detail panel</td><td><code>FUN_801D5AE8</code></td><td>window 39 layout; passive index re-derived per draw</td><td>-</td></tr>
+      <tr><td>shop buy-list row</td><td><code>FUN_80030628</code> case <code>0x0B</code></td><td>row greys at <code>sltiu v0,v0,0x63</code> (<code>0x80030F0C</code>); reads gold vs item price</td><td><code>funcs/80030628.txt</code></td></tr>
+      <tr><td>Point Card toast</td><td><code>FUN_801DCE20</code></td><td>window 31 renderer</td><td>-</td></tr>
+      <tr><td>Point Card strike</td><td>jump table <code>0x80014FA0</code> entry 14 (<code>0x8004209C</code>)</td><td>the bank&rsquo;s only debit</td><td>-</td></tr>
+      <tr><td>casino prize list</td><td><code>FUN_801D5DE0</code></td><td>window 44; indexes <code>0x801E4518</code>, gates on the coin bank - not the shop</td><td><code>overlay_shop_save_801d5de0.txt</code></td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure">
+    <summary>History: the casino list filed as the shop list</summary>
+    <div class="disclosure-body"><p>The 8-row, 14 px layout of <code>FUN_801D5DE0</code> was once filed as the shop buy list on the strength of its dump filename, <code>overlay_shop_save.bin</code>. That name identifies the image the routine came from, which carries casino code too; the routine itself never reads the gold purse. The shop&rsquo;s own row layout is the content builder&rsquo;s (case <code>0x0B</code>), traced separately above.</p></div>
+  </details>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="inn.html">Inn</a>
+    <a href="level-up.html">Level-up</a>
+    <a href="save-screen.html">Save screen</a>
+    <a href="../reference/gamedata.html">Game-data tables</a>
+    <a href="inventory.html">Inventory</a>
+    <a href="script-vm.html">Field / event VM</a>
+    <a href="field-menu.html">Field menu</a>
+    <a href="../formats/item-table.html">Item table (prices)</a>
+    <a href="../formats/item-effect-table.html">Item effects</a>
+    <a href="../formats/window-script.html">Window scripts</a>
+    <a href="../shops.html">Shops browser</a>
+    <a href="../tooling/rom-patcher.html">ROM patcher (shop shuffle)</a>
+    <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/subsystems/shop.md" target="_blank" rel="noopener">Full doc</a>
+  </div>
+</section>

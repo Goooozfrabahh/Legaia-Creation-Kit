@@ -1,0 +1,157 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../../index.html">home</a> &middot; <a href="../index.html">write-ups</a> &middot; <a href="index.html">disc patching</a> &middot; Tier F</div>
+  <h1>Tier F - overlay dead-region injection</h1>
+  <p class="lede">On a <code>--seru-trade</code> seed every shop in the game has a fourth line: <strong>Buy / Sell / Trade / Quit</strong>. Pick Trade and a window slides in offering to swap one of your party's learned Seru for a different one at a stated level, rotating as play time passes. Retail has no such screen. It runs on a real PlayStation because its whole code lives in bytes the shop menu already loads and never reads.</p>
+</header>
+
+<div class="notice">
+  <div class="notice-title">The technique in one box</div>
+  The game's menus are <em>overlays</em> - code paged into RAM per mode. The shop menu's overlay contains a ~3.8&nbsp;KB run of bytes that no instruction or pointer references. A new screen parked there is present exactly when a shop is open, reloads with the overlay, costs nothing from the executable's contended gap, and composes with every tier-E feature. The rest is reversing the shop picker well enough to give it a fourth row.
+</div>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Host</dt><dd>Menu overlay, PROT 0899, load base <code>0x801CE818</code>; dead region <code>0x801EA440</code>&ndash;<code>0x801EB340</code></dd>
+    <dt>Picker edits</dt><dd>Row clamp 3&rarr;4, box height <code>0x26</code>&rarr;<code>0x34</code>, a label-draw detour, a confirm-dispatch detour, a per-frame entry detour</dd>
+    <dt>The swap</dt><dd>Character record Seru id at <code>+0x13D</code>, level at <code>+0x161</code>; records at <code>0x80084708</code>, stride <code>0x414</code>; count never changes</dd>
+    <dt>Offers</dt><dd>64-bucket schedule, a pure function of the seed; kernel <code>legaia_game_tables::seru_trade</code> shared with the from-scratch engine</dd>
+    <dt>Edit class</dt><dd>In place, same size, entirely inside 0899 plus a 24-byte engine-facing config blob</dd>
+    <dt>Confidence</dt><dd><span class="tag tag-done">Confirmed</span> - hardware-confirmed render &rarr; slide &rarr; cursor &rarr; confirm &rarr; swap</dd>
+    <dt>Oracle</dt><dd><code>seru_trade_real.rs</code></dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="overlays">
+  <h2>Where the shop menu lives</h2>
+  <p>Almost no gameplay code sits in the executable. Menus, battle, field scripts and minigames are overlays paged into the <code>0x801C0000+</code> window, and several overlays share the same address range at different times: the field overlay (0897) and the menu overlay (0899) both load at <code>0x801CE818</code>, so one address is a string in one and a stat aggregator in the other. The <a href="../../tooling/static-overlay-pipeline.html">static overlay pipeline</a> separates them structurally and verifies 0899's disc bytes against live RAM, so the on-disc entry can be reasoned about as the loaded code.</p>
+</section>
+
+<section class="doc-section" id="picker">
+  <h2>Three facts about the picker</h2>
+  <p>The Buy / Sell / Quit chooser is what gets extended, so it is what gets reversed. A fourth row needs exactly three load-bearing facts, each read from the overlay's disassembly at its recovered base and checked against the live menu.</p>
+  <table class="layout">
+    <thead><tr><th>Fact</th><th>Where</th><th>Edit</th></tr></thead>
+    <tbody>
+      <tr><td>The row count is a literal immediate</td><td><code>addiu a1, zero, 3</code> at <code>0x801DB098</code></td><td>3 &rarr; 4, so the cursor can reach a fourth line</td></tr>
+      <tr><td>The window is a sprite definition with a height byte</td><td><code>+0xA</code> of the def, at <code>0x801E49E2</code></td><td><code>0x26</code> &rarr; <code>0x34</code> (one row of 14 px), or the new row draws outside its box</td></tr>
+      <tr><td>Draw order is text first, box last</td><td>renderer <code>FUN_801D4868</code></td><td>the fourth label must be drawn before the box or it vanishes behind it</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="doc-section" id="dead-region">
+  <h2>The dead region</h2>
+  <figure class="overlay-strip">
+    <svg viewBox="0 0 880 210" width="100%" style="max-width:880px" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The menu overlay as a strip: live code and data from the load base, then the dead region from 0x801EA440 to 0x801EB340 holding the trade handler, three stubs, strings, the active flag and the offer table">
+      <title>The Seru-trade screen inside PROT 0899's reference-free dead region</title>
+      <style>
+        .dr-live { fill: var(--bg-raised); stroke: var(--border); stroke-width: 1.2; }
+        .dr-dead { fill: var(--bg-raised); stroke: var(--accent); stroke-width: 1.5; }
+        .dr-seg  { fill: none; stroke: var(--accent); stroke-width: 1; }
+        .dr-t    { font: 11px var(--font-body), sans-serif; fill: currentColor; text-anchor: middle; dominant-baseline: middle; }
+        .dr-lab  { font: 11px var(--font-body), sans-serif; fill: var(--text-muted); }
+        .dr-addr { font: 11px var(--font-mono), monospace; fill: var(--accent); }
+      </style>
+      <text x="20" y="28" class="dr-lab">menu overlay, PROT 0899, as loaded</text>
+      <rect x="20"  y="40" width="380" height="44" class="dr-live"/>
+      <text x="210" y="62" class="dr-t">live code + data (picker, renderer, tables)</text>
+      <rect x="400" y="40" width="460" height="44" class="dr-dead"/>
+      <text x="630" y="62" class="dr-t">dead region - referenced by nothing</text>
+      <text x="20"  y="104" class="dr-addr">0x801CE818</text>
+      <text x="400" y="104" class="dr-addr">0x801EA440</text>
+      <text x="860" y="104" class="dr-addr" text-anchor="end">0x801EB340</text>
+
+      <rect x="400" y="130" width="150" height="40" class="dr-seg"/><text x="475" y="150" class="dr-t">trade handler</text>
+      <rect x="550" y="130" width="110" height="40" class="dr-seg"/><text x="605" y="150" class="dr-t">3 stubs</text>
+      <rect x="660" y="130" width="70"  height="40" class="dr-seg"/><text x="695" y="150" class="dr-t">strings</text>
+      <rect x="730" y="130" width="130" height="40" class="dr-seg"/><text x="795" y="150" class="dr-t">offer table</text>
+      <text x="400" y="196" class="dr-lab">a compile-time assertion proves the pieces never overlap and end below the region ceiling</text>
+    </svg>
+    <figcaption>Nothing lands in the executable's rodata gap, so the vendor composes with every gap-based feature.</figcaption>
+  </figure>
+  <p>The region is the blank lower band of the save-menu picture the overlay carries (rows 162 and up of a 256&times;256 atlas nothing ever draws from). Zero bytes alone were not enough: the save screen reuses the start of that picture as two 8&nbsp;KB memory-card buffers, and a save from the pause menu fills them and goes back to the menu without reloading the overlay. An earlier layout sat inside those buffers; the patcher's space ledger now lists them and refuses any region that overlaps one.</p>
+  <table class="layout">
+    <thead><tr><th>VA</th><th>Contents</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x801EA440</code></td><td>trade-screen handler: render, input, slide, swap</td></tr>
+      <tr><td><code>0x801EAB80</code></td><td>row-4 label-draw stub (text first, per the native order)</td></tr>
+      <tr><td><code>0x801EAC80</code></td><td>"Trade" / "SERU TRADE" / "Trade?" / "Yes" / "No"</td></tr>
+      <tr><td><code>0x801EACC0</code></td><td>seed-derived offer schedule: 64 buckets &times; 3 bytes</td></tr>
+      <tr><td><code>0x801EAD80</code></td><td>trade-active flag and the screen's runtime cells</td></tr>
+      <tr><td><code>0x801EADB0</code></td><td>entry-detour stub - per-frame gate on the active flag</td></tr>
+      <tr><td><code>0x801EAE10</code></td><td>dispatch-detour stub - routes the Trade row to its sub-mode</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="doc-section" id="injection">
+  <h2>Splicing it in</h2>
+  <div class="flow">
+    <div class="num">1</div><div class="layer">Four rows</div><div class="desc">Clamp 3&rarr;4, box height <code>0x26</code>&rarr;<code>0x34</code>, one detour in the renderer body to the row-4 label stub.</div><div class="crate">picker</div>
+    <div class="num">2</div><div class="layer">Route Trade</div><div class="desc">A detour at the confirm dispatch (<code>0x801DB0C8</code>) sends row 2 into the trade sub-mode and sets the active flag.</div><div class="crate">dispatch stub</div>
+    <div class="num">3</div><div class="layer">Enter each frame</div><div class="desc">The entry detour (<code>0x801DAFD4</code>) checks the flag and jumps to the handler - a sub-mode of the shop, no scene warp, no overlay reload.</div><div class="crate">entry stub</div>
+    <div class="num">4</div><div class="layer">Run the screen</div><div class="desc">Re-poll the pad, slide the window in over 10 frames, move a line cursor over one row per owner of the wanted Seru, draw with the game's own text / number / box / cursor primitives. Cross confirms via a real "Trade?" Yes/No; Circle backs out.</div><div class="crate">handler</div>
+    <div class="num">5</div><div class="layer">Swap</div><div class="desc">Rewrite the owner's spell list in place: id at <code>+0x13D</code>, level at <code>+0x161</code>. One-for-one, never a duplicate.</div><div class="crate">handler</div>
+  </div>
+  <p>Every piece is written into 0899 through <code>patch_prot_entry(899, &hellip;)</code>, each target guarded as all-zero dead space, so an already-patched or unexpected disc is rejected rather than corrupted.</p>
+</section>
+
+<section class="doc-section" id="offers">
+  <h2>Deterministic offers</h2>
+  <ul>
+    <li>Each of 64 buckets holds one <code>(want, give, give_level)</code> triple; the level is rolled on a curve - 1-3 common (70%), 4-6 rare (25%), 7-9 very rare (5%) - so a high-level Seru is a jackpot.</li>
+    <li>The bucket is <code>(play_time / period + vendor_offset) &amp; 63</code>. The play counter advances about once per frame, so the period is frame-denominated (~9 minutes) and the full cycle takes ~9.6 hours.</li>
+    <li><code>vendor_offset</code> is derived from the armed shop record (stock count + ids + name bytes, mod 64), so every merchant shows its own offer while sharing one on-disc schedule.</li>
+    <li>The bucket expands to one line per member who owns the wanted Seru, excluding anyone who already owns the give-back. Ids are the player Seru-magic block <code>0x81..=0x95</code>.</li>
+  </ul>
+  <p>The same kernel feeds the from-scratch engine through a 24-byte <code>SeruTradeConfig</code> blob in the executable (the config variant) - the bridge from the disc patcher to the <a href="../../subsystems/engine.html">reimplementation</a>, and inert on real hardware.</p>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <table>
+    <thead><tr><th>Claim</th><th>Evidence</th><th>Reference</th></tr></thead>
+    <tbody>
+      <tr><td>0899 is the menu overlay at <code>0x801CE818</code></td><td>Static <code>jal</code> base recovery; RAM byte-match of a <code>0x15E8C</code>-byte clean prefix across six menu-open save states</td><td><a href="../../tooling/static-overlay-pipeline.html">static-overlay-pipeline</a></td></tr>
+      <tr><td>Picker clamp, box height, draw order</td><td>Renderer <code>FUN_801D4868</code> and its dispatcher <code>FUN_801DAFD4</code>, disassembled at the recovered base</td><td><a href="../../subsystems/shop.html">shop</a></td></tr>
+      <tr><td>The dead region is unreferenced</td><td>Address-reference scan over the based image (no literal, <code>lui</code>/<code>addiu</code>, <code>jal</code>, <code>j</code> or branch reaches it); above both save-screen card buffers; all-zero in every library capture with the overlay resident</td><td><a href="../../tooling/address-reference-scan.html">address-reference-scan</a></td></tr>
+      <tr><td>Spell list layout <code>+0x13C</code> / <code>+0x13D</code> / <code>+0x161</code></td><td>Typed save-record accessors; the engine's <code>apply_trade</code> mirrors the same offsets</td><td><a href="../../formats/save-record.html">save-record</a></td></tr>
+      <tr><td>Play counter at <code>0x80084570</code> ticks per frame</td><td>Runtime capture</td><td><a href="../../reference/memory-map.html">memory-map</a></td></tr>
+      <tr><td>The screen works end to end</td><td>Hardware playtest; disc oracle decodes the embedded schedule back to the kernel's offers and checks the rodata gap is untouched</td><td><code>seru_trade_real.rs</code></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<details class="disclosure">
+  <summary>Details: the handler's primitives</summary>
+  <div class="disclosure-body">
+    <p>The handler uses only the game's own routines: pad poll <code>FUN_8001822C</code>, text <code>FUN_80036888</code>, number formatter <code>FUN_80034B78</code>, window box <code>FUN_8002C69C</code>, animated cursor <code>FUN_8002B994</code>. The slide is a signed offset stepping <code>0x18</code> px per frame from <code>-0xF0</code> to <code>0</code> - exactly ten frames. The screen names both sides of the offer in its header and shows a "No &lt;want&gt; available" line when nobody qualifies.</p>
+  </div>
+</details>
+
+<details class="disclosure">
+  <summary>Details: roadmap features on this rung</summary>
+  <div class="disclosure-body">
+    <ul>
+      <li><strong>Enemy battle assist</strong> - a defeated enemy joins as a non-controllable ally actor.</li>
+      <li><strong>Seru racing</strong> - a race state machine, odds and betting hosted in a minigame overlay's dead space.</li>
+      <li><strong>Muscle Dome spectate + betting</strong> - watch two NPCs fight and wager beforehand.</li>
+      <li><strong>Blood Moon</strong> - a periodic overworld event (red tint, stronger enemies, better loot).</li>
+    </ul>
+    <p>Adding a tier-F mod: find a reference-free dead region in the resident host overlay (all-zero in live RAM), keep routine + data under the ceiling with a compile-time disjointness assertion, guard every write as dead space, add a disc-gated oracle.</p>
+  </div>
+</details>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="index.html">Series index &middot; the ladder</a>
+    <a href="../../tooling/static-overlay-pipeline.html">Static overlay pipeline</a>
+    <a href="../../subsystems/shop.html">Shop subsystem</a>
+    <a href="../../subsystems/save-screen.html">Save / menu overlay</a>
+    <a href="../../formats/mips-overlay.html">MIPS overlay</a>
+    <a href="../../tooling/rom-patcher.html">Try it: in-browser ROM patcher</a>
+  </div>
+</section>

@@ -1,0 +1,410 @@
+# Stale `NOT WIRED` triage
+
+[`port-catalog.py --live-audit`](port-catalog.md) opens with a section titled
+*Tagged `NOT WIRED` / `REPLACED-BY` but analysed live*. Every row in it is a
+defect, and the two possible defects point opposite ways. Either the port was
+wired and nobody removed the disclosure, which inflates the wiring worklist. Or
+the reachability pass invented the edge that made it read live, which hides a
+real gap. This page says how to tell which, lists the name-resolution
+mechanisms that invent edges, and gives the fix each one takes.
+
+## At a glance
+
+| | |
+|---|---|
+| Command | `python3 scripts/ci/port-catalog.py --live-audit` (first section of `target/port-catalog/live-audit.md`) |
+| Healthy state | the section is empty |
+| A row means | a stale tag (remove it) or a false edge (rename or re-anchor in source) |
+| Decide by | looking for a real non-test **caller** first; a name collision can always be found, a caller cannot |
+| After any edit | re-run the audit and compare both this section and the *undisclosed inert* section |
+
+```mermaid
+flowchart TD
+    row["row: tagged NOT WIRED, analysed live"] --> caller{"real non-test caller from a host root?"}
+    caller -->|"yes, body runs"| stale["STALE-TAG: remove the disclosure"]
+    caller -->|"yes, but a runtime gate never opens"| inert["wired, inert at runtime: reword without the token"]
+    caller -->|"no"| mech{"which name collides?"}
+    mech --> rename["rename the in-tree symbol"]
+    mech --> anchor["move the tag to the item that ports the address"]
+```
+
+## Verdicts
+
+- **STALE-TAG** - a real, non-test caller reaches the tagged symbol. The tag
+  comes off; the evidence column names the caller chain.
+- **FALSE-EDGE** - the port is not reachable. The tag stays. The evidence names
+  the colliding symbol the graph resolved through.
+- **Wired, inert at runtime** - the call chain is real and production-only, but
+  a runtime condition means the body is never entered: a gate that is never
+  armed, a table never populated, a handler never installed. The disclosure
+  token comes off, because the audit measures static reachability and would keep
+  reporting it stale; what replaces it states the runtime fact and names the
+  missing *data*. `emit_horizon` is the worked example.
+- **UNCERTAIN** - neither could be established.
+
+A host root is `fn main` in a `[[bin]]` target, a `#[wasm_bindgen]` export, or a
+method of an `impl <ExternalDispatchTrait>` block - so **a CLI subcommand is a
+host root**. A preservation-track port reached only from `asset boot-overlay` or
+`mdec str-plan` is wired, and "no *engine* consumer" is a different claim that
+has to be written as one.
+
+## What the false edges are
+
+Six mechanisms produce every FALSE-EDGE row recorded here, and only the first
+is what `--live-audit` warns about. All six are name resolution
+without type inference; they differ in *which* name space collides, and that is
+what decides the fix.
+
+**A generic method or constructor name.** `build_rust_graph` resolves `.name(`
+against every in-tree method called `name` and never infers a receiver type, so
+one `session.tick(...)` in the browser title driver links to all in-tree `tick`
+methods, and one `new(` links to every in-tree `new`. This is the documented
+over-approximation, and it is what makes `--not-live` a floor - but it means a
+`NOT WIRED` port whose entry point is called `new`, `tick`, `add`, `len`,
+`is_empty`, `default`, `normalize`, `from_byte` or `to_le_bytes` reads live no
+matter how inert it is. Two of these edges can chain: the browser's
+`session.tick(...)` reaches `BattleTutorial::tick`, whose own `dispatch(...)`
+call then reaches `SaveScreenMachine::dispatch`, and from there every `tick_*`
+sub-screen handler in `save_subscreen.rs`.
+
+**A method name that is unique in-tree but ubiquitous in `std`.** The receiver
+gate fires only where the name is ambiguous, so a name with exactly one in-tree
+definition is never gated - and if `std` also defines it on a common type, every
+call site in the workspace becomes an in-edge. `Rect12::to_le_bytes` in
+`crates/engine-title/src/title_prim.rs` was the case: it was the only in-tree
+`fn to_le_bytes`, so each `x.to_le_bytes()` on an integer anywhere in a
+reachable function linked to it. Uniqueness reads like precision here and is the
+opposite.
+
+**A method name that is unique in-tree but shadowed by a callable local.** The
+same uniqueness escape, with the shadow coming from *inside* the workspace
+rather than from `std`. `BARE_CALL_RE` matches any `name(` not preceded by a
+dot, and a **closure parameter** invoked as `flag(..)` reads exactly like a free
+call - so `FieldNpcAmbient::select_variant`'s `flag: impl Fn(u16) -> bool`
+parameter resolved onto `SlideDir::flag`, the only in-tree `fn flag`, and
+reported the whole of `crates/engine-audio/src/seq_calc.rs` live. Predicate and
+emitter parameters (`flag`, `pred`, `emit`, `push`) are where this recurs,
+because they are the names a small `impl` block also wants.
+
+**A duplicate free-function name.** The receiver gate is defined over
+`impl_type`, and a free function has none, so free-function edges are never
+gated however many definitions share the name. `countdown_frame` existed twice -
+in `crates/engine-minigames/src/baka_fighter_chrome.rs`, called every frame by the
+Baka round chrome, and in `crates/engine-minigames/src/dance_tutorial.rs`, called by
+nothing - and the one bare call linked to both.
+
+**A bare identifier matching a free function.** The `IDENT_RE` pass links a bare
+identifier to any free function of that name, which is how a function value
+reaches `map` / `sort_by_key`. It does not distinguish a function value from a
+**struct field** of the same name: the field `stat_deltas` in
+`crates/engine-battle/src/seru_stats.rs` links to the free `stat_deltas` in
+`crates/engine-dev-menu/src/dev_menu_leaves.rs`. Nor from a **local binding**: a
+free function called `gate` collects an in-edge from every reachable function
+that merely names a local `gate`, which is why the whole of
+`battle_attack_camera.rs` read live from six unrelated callers. A short,
+English-word free-function name is the worst case for this pass, because the
+name is short precisely where it is also common.
+
+**An anchor covering more than the tag.** A `//! PORT:` tag makes the anchor the
+whole file, and the file is live if any non-test `fn` in it is reachable. A
+`PORT:` tag on a plain data struct behaves the same way, because a type anchor
+with no `impl` block in its file falls back to module scope. Neither the tag nor
+the edge is wrong - the anchor is too coarse to tell them apart.
+
+A **`PORT:` tag on a `const`** is the same shape and the easiest to miss,
+because the tag looks precise in source. `collect_port_anchors` recognises a
+`fn`, a `struct` / `enum` / `union` / `impl` / `trait`, or an enclosing function
+body; a `const` is none of those, so resolution falls through to module scope
+and the tag silently claims the whole file. The audit prints these as
+`anchor = module` with symbol `(module)` on the *const's* line number, which
+reads like a precise anchor unless the line is opened.
+
+## The fix each mechanism takes
+
+Some are analysis defects and are fixed in the tool - those rows read
+*Implemented*. The rest are properties of the *names and anchors in source*, and
+the fix belongs there. Sharpening the shared permissive graph is the wrong move:
+its over-approximation is what makes `--not-live` a floor.
+
+| Mechanism | Fix |
+|---|---|
+| Generic method / constructor name | The receiver gate, in the strict graph. Implemented. |
+| Struct field read as a function value | Field-colon exclusion, in the strict graph. Implemented. |
+| Unique in-tree name shadowing a `std` method | Rename the in-tree method so no `std` call site spells it. |
+| Unique in-tree name shadowed by a callable local | Rename the in-tree method so no closure parameter spells it. |
+| Duplicate free-function name | Rename the copy that has no caller. |
+| Free-function name that is also a common local / field name | Rename it to something the rest of the tree does not spell. |
+| Coarse anchor (module tag, or a tag on a data struct) | Move the anchor to the item that ports the address. |
+| Tag on a `const` | No longer coarse: the resolver anchors it to the `const` itself, strict-live only on an attributable reference (same file, or `module::NAME` / `Type::NAME` spelling). See [`port-catalog.md`](port-catalog.md#anchors). |
+
+### Writing the fix: the disclosure token is matched as text
+
+`NOT_WIRED_RE` is `NOT\s+WIRED` against the **whole comment block**, with no
+anchoring. So a tag that explains *why* an item is not an inert port -
+"deliberately not `NOT WIRED:`", "this is not a `NOT WIRED` case" - re-arms the
+very disclosure it is disclaiming, and the row survives the edit looking
+untouched. Say it without the token: "carries no inert-port disclosure", "not an
+inert port", "wired, but inert at runtime". Re-run `--live-audit` after the edit
+rather than trusting the prose, because this failure is invisible in review.
+
+### Removing a false edge can expose ports it was masking
+
+A spurious in-edge onto a function also makes everything that function calls
+read live. Renaming the colliding symbol therefore *adds* rows to the
+**undisclosed inert ports** section - its callees, which were live only through
+it. That is the fix working, not a regression, but the disclosures those callees
+now need are part of the same edit; leaving them turns one false claim into
+several silent gaps. Check both section counts before and after.
+
+The rename and anchor-move rows are source edits, and each wants a comment
+saying why the name or the tag placement is the way it is - otherwise the next
+refactor undoes it and the false accusation returns. `footstep.rs`,
+`anim_cue.rs`, `seq_calc.rs`, `dance_tutorial.rs`, `title_prim.rs`,
+`vram_rect_copy.rs` and `world_map_overlay.rs` each carry that note.
+
+### The two-graph split (implemented)
+
+Sharpening the single shared graph would be wrong. The over-approximation is
+load-bearing for `--not-live`:
+biasing every ambiguity toward "reachable" is what makes the not-live list a
+hard floor. It is only *this* question - is a disclosure stale - where a
+spurious edge does damage, by manufacturing a false accusation against a correct
+tag.
+
+So `build_rust_graph(strict=True)` builds a **second** graph and only the
+stale-tag test reads it. Every `live` / `--not-live` / `--live-only` verdict
+stays on the permissive graph, unchanged. Nothing is traded: each question
+consults the graph whose error mode is safe for it.
+
+1. **Struct fields are excluded from the bare-identifier edge.** An identifier
+   immediately followed by `:` - and not `::` - is a field declaration or a
+   struct-literal key, so it is not a function value reaching `map`.
+2. **Ambiguous method edges take a receiver gate.** A `.name(...)` or
+   `name(...)` edge onto an `impl Type` method survives only if the calling file
+   names `Type`, or defines the method itself.
+
+   The gate fires **only where the name is ambiguous** (more than one candidate
+   definition). That qualifier is not cosmetic: a receiver is routinely a local
+   binding whose type the calling file never spells, as in
+   `ctrl.run_horizon_emitter(..)`. Gating an already-unambiguous name on the
+   spelling drops a real edge - which silently removes a correct row from this
+   audit, the one failure mode the strict graph must not have.
+
+   The qualifier has a cost, recorded above as its own mechanism: an
+   unambiguous in-tree name is never gated even when `std` spells it too. A
+   crate-root re-export is the other soft spot - `pub use footstep::{..,
+   FootstepCadence}` makes `lib.rs` a file that "names the type", so any
+   `.tick(` in `lib.rs` passes the gate onto `FootstepCadence::tick`.
+
+### Anchor granularity
+
+**Read a module anchor at the granularity the tag claims.** When a `//! PORT:`
+tag names specific addresses and specific items in the file are inert, the live
+verdict should be read off those items, not off any function in the file.
+
+The tool still reads a `//!` module tag as the whole file, and a type tag with
+no `impl` block as the whole file too. A tag in a `///` doc block, by contrast,
+always anchors to the item the block documents - `fn`, type, or `const` /
+`static` / `type` alias - so those no longer degrade to file scope. What
+remains coarse is coarse because the *tag* is written coarse, and the practical
+fix is to write it at item level:
+
+- A `//! PORT:` line moves onto the function that implements the address. Every
+  address the module tag listed keeps an anchor, and the anchor is now precise.
+- A `PORT:` tag on a plain data struct - a return type or an input record, with
+  the computation in a free function beside it - becomes a `REF:` tag naming the
+  function that carries the `PORT:`. The address loses nothing: it is still
+  tagged, on the item that ports it.
+- Dropping a blanket `//! NOT WIRED` heading un-discloses every item anchor in
+  the file, so each genuinely inert item needs its own `NOT WIRED:` line in the
+  same edit. Doing only half of this converts a granularity row into a
+  disclosure gap, which is the worse of the two.
+- Converting a blanket to `//! REPLACED-BY:` has the mirror-image hazard: the
+  new blanket covers only anchors whose own block stays silent about its class,
+  so an item that is still a genuine wiring gap needs its own `NOT WIRED:` line
+  or it silently leaves the worklist. `fishing_actors` is the worked case: one
+  wired item made a module blanket assert something false about it, and the
+  file now carries a line per genuinely inert item instead.
+  [`port-catalog.md`](port-catalog.md#replaced-by) has the precedence rules.
+
+A blanket module disclosure is safe while *nothing* in the file has a caller,
+and it can be narrowed the moment one item acquires one: an anchor whose own
+doc block opens a line with `WIRED:` opts that single item out of the module
+blanket, leaving the blanket true for the rest of the file. The worked example
+is `save_screen_spawn::save_screen_spawn`, one live spawn under a
+blanket its three sibling element handlers still need. An own-block
+`NOT WIRED` beats an own-block `WIRED:`; the token rules and the control suite
+are in [`port-catalog.md`](port-catalog.md#per-item-wired-against-a-module-blanket).
+
+## What the stale tags are
+
+The FALSE-EDGE mechanisms above are properties of *names*. A STALE-TAG has its
+own recurring shape, and it is worth stating separately because the fix is not
+a rename.
+
+**A disclosure that delegates to a sibling's tag.** A leaf kernel called from
+exactly one place often discloses by pointing at that caller - "called only by
+`X`, which is itself inert, see the tag there". The sentence is true when it is
+written and becomes false the moment `X` is wired, silently: nothing in `X`'s
+edit touches the leaf, and the leaf's own text still reads as a careful,
+sourced disclosure. Five of the battle-intro anchors were exactly this. When a
+tag's reason is *another tag*, wiring the cited item is an edit to both.
+
+The transferable rule is the same one the anchor-granularity section states from
+the other side: **wiring a caller is not done until every disclosure that named
+it has been re-read.** Grep the file set for the wired symbol's name before
+closing that work, not after the next audit.
+
+**A sentence that opens with the marker while talking about something else.**
+The module blanket is matched on any `//!` line whose text opens with
+`NOT WIRED` (leading `#`, `*` and whitespace allowed), so an indented bullet
+deep in a module doc counts exactly as much as a heading does.
+`engine-motion-vm::ambient_motion` had one: a bullet reading `NOT WIRED: the
+stepped-over set, by op number, is ...`, which is a statement about which
+retail *opcodes* the port declines to execute, not about whether anything calls
+the module. The module is live - it is the idle-turn VM, ticked per frame from
+`World`'s field actor pass - and that one sentence declared every anchor in the
+file inert, putting four rows in the stale section at once. The fix is to
+reword the prose, not to touch the tags; the marker cannot appear in a doc
+block that does not mean it.
+
+The generalisation is worth more than the row: **the disclosure markers are
+matched as text over a whole comment block, so writing about a marker is
+indistinguishable from using one.** That applies to a fix as much as to the
+original: a corrected tag that quotes the marker to explain why it was wrong
+re-discloses the anchor it just wired. Paraphrase the marker instead.
+
+**A leaf whose only caller is a sibling in the same file, reached from a CLI.**
+`legaia_actor_formats::monster_archive::reaction_map` disclosed "no engine caller ...
+its only consumers are the unit tests and the disc-gated archive oracles". Its
+sibling `light_flinch_window`, twenty lines above it in the same file, calls it
+in non-test code, and `legaia-patcher`'s `monster-block` command calls *that* -
+and a CLI subcommand is a host root, as the verdict vocabulary above says. So
+the port is wired and the tag was wrong twice over. What was still true is a
+narrower claim the tag never made: no `engine-core` / `engine-vm` path queues a
+monster hit reaction from the map. Write the narrow claim as the narrow claim;
+"no engine consumer" and "no consumer" are different sentences and only one of
+them was checkable.
+
+## What a correct disclosure still does not tell you
+
+Both triage pages ask one question - *is this tag right?* - and a `NOT WIRED`
+tag can be perfectly right about an **inert port that is also a wrong port**.
+Nothing in either audit looks at whether the body under the tag matches the
+instruction stream, and nothing ever will: reachability and fidelity are
+independent properties.
+
+`exec_sprite_descriptor` (`800198e0`, `crates/engine-title/src/title_prim.rs`) is
+the worked example. Its disclosure held exactly as written - no host implements
+`PrimHost`, every `exec_*` in the file is test-only - and re-reading
+`FUN_800198E0` against the disassembly turned up three divergences in the port
+beneath it:
+
+| The port did | `FUN_800198E0` does |
+|---|---|
+| suppress the whole strip emit when `_DAT_8007B998` is clear | gate only the STP-OR loop; `0x80019998` branches *to* the emit at `0x800199EC` |
+| pick a width divisor from `flags & 3`, and skip the sprite on `== 3` | reload the **raw** extents at `0x80019AAC` two instructions before the call, so all four arms emit identically and `== 3` is not a skip |
+| draw the main sprite from the descriptor's own rect | re-base onto `desc + ((u32 @ +0x08 & !3) + 8)` when `flags & 8` is set (`0x800199F8..0x80019A10`) |
+
+Three properties of the shape are worth carrying forward.
+
+**A dead computation is the easiest thing to port as live behaviour.** The four
+`flags & 3` arms are real branches with real arithmetic; only the store that
+follows them is dead. A port written from the arms outward reproduces all of it
+faithfully and still gets the behaviour wrong, because the fact that decides the
+question is an *overwrite* one basic block later. Read forward to the consuming
+instruction before modelling a computed value - the same "the consumer can tell
+you" lesson `live-audit-triage.md` records for `build_camera_angle_tween`.
+
+**An invented enum arm outlives the reading that produced it.** `SkipMainSprite`
+existed because the `== 3` arm stores no width, which is true; "therefore it
+skips the emit" was the inference, and once it was a named variant with a test
+asserting it, it read like a finding. The tests asserted the defect, which is
+why they all passed. Keep such a decode as provenance if it is real, but keep it
+*out* of the call it does not control.
+
+**The tests move with the fix.** Six of the file's sprite tests encoded the
+wrong behaviour, so the suite was green throughout and stayed green by
+asserting the divergence. A test written from the same reading as the port
+cannot falsify it; only the instruction stream can. Treat a green suite over a
+port nobody has diffed against the disassembly as untested, not as verified.
+
+None of this changes an audit count - the anchors were inert before and after -
+which is the point. A drained disclosure worklist is not a statement about
+fidelity, and a re-read of an already-disclosed block is worth doing on its own
+terms.
+
+## How the recorded rows were closed
+
+Every row this section of the audit has shown, with the resolution it took.
+All are closed. They are keyed by address and site so a recurrence is
+recognisable: match the mechanism, apply the same fix.
+
+| addr | site | verdict | resolution |
+|---|---|---|---|
+| `801da6b4` | `engine-battle-vm/src/battle_action/target_cursor.rs` | FALSE-EDGE | Module `PORT:` / `REPLACED-BY:` pair moved onto `target_cursor_highlight`; the module was live through the cursor constants and `cursor_cue`, which both battle hosts use and which are not the port. The replacement verdict stands. |
+| `80018db0` | `engine-audio/src/footstep.rs` | FALSE-EDGE | `FootstepCadence::tick` renamed `tick_cadence`; the crate's own `lib.rs` re-exports the type and calls `spu.tick()`, so the gate passed. |
+| `801e0080` | `engine-vm/src/battle_scatter.rs` (since deleted - the routine is the effect-VM walker) | FALSE-EDGE | `rotate_offset` renamed `scatter_rotate_offset`; the live `rotate_offset` is `engine-effects::action_effect_script`'s same-named free function, which gained its first host caller when the effect-script walk was wired into the battle tick. |
+| `800198e0`, `80058298`, `80058490` | `engine-title/src/title_prim.rs` | FALSE-EDGE | Module tag moved onto `exec_sprite_descriptor` / `exec_clear_image` / `exec_move_image`; the file was live through `Rect12::to_le_bytes`. |
+| `800468a4`, `80057914` | `engine-vm/src/vram_rect_copy.rs` | FALSE-EDGE | Module tag moved onto `enqueue` / `build_packet`, each with its own tag; the file was live through `op43_sub12_calls`, which no tag covered. Both helpers have a host now (`World::apply_vram_rect_copies`), so the split no longer hides an unwired half. |
+| `80053cb8` | `engine-battle-vm/src/battle_formulas/stat_init.rs` | STALE-TAG | `LegaiaMinigames::muscle_player_fighter`, under a `#[wasm_bindgen]` root, calls `init_party_battle_stats`, which calls `equip_stat_bonuses`. |
+| `801d0750` | `engine-minigames/src/dance_tutorial.rs` | FALSE-EDGE | `countdown_frame` renamed `tutorial_countdown_frame`; the live `countdown_frame` is the Baka chrome's same-named free function. |
+| `801e5b4c` | `engine-dev-menu/src/dev_menu_leaves.rs` | RESOLVED | `resolve_equip_slot` was already reached through `dev_equip_commit::commit_equip`. The rest of the address is now reached too: `equip_stat_panel` is the whole sub-draw and `submode_hub_actors::entry_list` calls it where retail's only `jal` sits. |
+| `801ead98` | `engine-dev-menu/src/dev_menu_leaves.rs` | FALSE-EDGE | Module tags and the impl-less type tags dropped for per-item anchors. |
+| `801eca08` | `engine-dev-menu/src/dev_menu_leaves.rs` | FALSE-EDGE | `cursor_step` renamed `dev_menu_cursor_step`; the live `cursor_step` is `engine-minigames/src/baka_cabinet.rs`'s same-named free function. |
+| `801ed710` | `engine-dev-menu/src/dev_menu_leaves.rs` | STALE-TAG | `records_screen` / `decompose_play_time` are reached from `dev_records_model` in `engine-shell/src/window/dev_menu.rs` -> `PlayWindowApp::build_dev_records_draws` -> `tick_dev_menu`. |
+| `8001fa68`, `800203ec`, `80020424`, `80020454`, `800204a4` | `engine-vm/src/actor_node_pool.rs`, `u16_list_append.rs` | FALSE-EDGE | Cleared by the receiver gate; the collisions were `ActorNodePool::new` / `::default`. |
+| `800421d4`, `80042310`, `800423e0`, `80042ee0`, `80042f4c`, `80043048`, `8004313c` | `save/src/retail_inventory.rs` | FALSE-EDGE | Cleared by the receiver gate; the collisions were `RetailInventory` / `ItemWindow` methods reached through the crate's `lib.rs` re-export. |
+| `80046870` | `engine-system/src/incense_window.rs` | FALSE-EDGE | Cleared by the receiver gate; the collision was `ScreenOrient::from_byte`. |
+| `801d71b8` | `engine-battle-vm/src/battle_attack_camera.rs` | FALSE-EDGE | `gate` renamed `attack_camera_gate`; a free function named `gate` is reached by the bare-identifier edge from every function that merely *mentions* one. |
+| `801d2ebc` | `engine-dev-menu/src/dev_menu_leaves.rs` | FALSE-EDGE | Cleared when the countdown scheduler moved to `escape_timer.rs`, which has a caller; the collision was `EscapeTimer::tick`. |
+| `801d6d38`, `801d8a58`, `801d98f0`, `801dae24`, `801daef4`, `801dafd4`, `801dbc5c`, `801dc6b4`, `801dd12c`, `801dd1b8`, `801dd26c`, `801e4f40` | `engine-menus/src/save_subscreen.rs` | FALSE-EDGE | Cleared by the receiver gate; the chain was `session.tick(` -> `BattleTutorial::tick` -> `dispatch(` -> `SaveScreenMachine::dispatch`. |
+| `801db380`, `801db7f4`, `801dbd94` | `engine-menus/src/shop.rs` | FALSE-EDGE | Cleared by the receiver gate; the collision was the session constructors' `new(`. |
+| `800508dc` | `engine-battle/src/anim_cue.rs` | FALSE-EDGE, then wired | `AnimCueState::tick` is named `tick_cues`: in `engine-audio`, whose `lib.rs` re-exported the type and called `spu.tick()`, the receiver gate passed - the shape of `footstep.rs` above. The module is in `engine-core` and `World::step_actor_anim_cues` calls it per animation frame. |
+| `80062f98`, `8006320c`, `8006352c`, `80063aa8`, `800649b0` | `engine-audio/src/seq_calc.rs` | FALSE-EDGE, then wired | `SlideDir::flag` renamed `flag_bit`; the only in-tree `fn flag`, reached from the `flag(..)` closure parameter of `FieldNpcAmbient::select_variant`. The module blanket then came off for a different reason: `note-trace --seq-calc` gives the tier a real host. |
+| `8001eef0`, `80025ba0`, `8003e360` | `overlay-images/src/boot_overlay.rs` | STALE-TAG | The `asset boot-overlay` subcommand made each one a real callee of a `[[bin]]` `main`. Each tag already named the CLI as its consumer while still heading itself as inert. |
+| `8002574c` | `overlay-images/src/boot_overlay.rs` | STALE-TAG | Same subcommand reads `CARD_TIM_EXTRACTION_INDEX`. Also the `const` coarse-anchor shape: the tag reports as `anchor = module`. |
+| `801cfff0`, `801d069c`, `801d0fa8`, `801d3230` | `minigame-formats/src/minigame_slot_scene.rs` | STALE-TAG | `asset slot-scene` drives the reel kernels, the composer, the clear path and the placement blit. The remaining gap is a *renderer*, not a caller, and now says so. |
+| `801cf56c`, `801cf740` | `mdec/src/str_player.rs` | STALE-TAG | `mdec str-plan` calls both on `DecodeEnv`. The real gaps (the ring drops per-frame dimensions; the port decodes whole frames) are unchanged and kept as prose. |
+| `801d26cc` | `engine-fishing/src/fishing_actors.rs` | STALE-TAG | `bite_interval` / `bite_credit_override` / `roll_hit_type` reached from the frame tick's `SceneMode::Fishing` arm -> `World::tick_fishing` -> `PondSession::tick` -> `BandCheck::tick` (`roll_hit_type` through `fishing::band_roll`). The file's blanket `# NOT WIRED` heading came off and ten still-inert items each took their own line. The chain this row first named ran through a second session type that has since been deleted; every host now runs `PondSession`. |
+| `801cf00c`, `801d6704` | `engine-system/src/mode_entry_init.rs` | FALSE-EDGE | Coarse anchors: `DuelOverlayInit` is a struct with no `impl`, `FIELD_INIT_STEPS` is a `const`. Both became `REF:`; the `PORT:` stays on `duel_overlay_init` and the file's fn anchors. The file is live through `field_spawn`. |
+| `801d84b4` | `engine-field/src/field_submode.rs` | FALSE-EDGE | Same shape: `CardRequest` is a struct and the file declares no `impl` at all, so the type anchor widened to a module live through `open_submode`. Now a `REF:`; `request_card_mode` keeps the `PORT:`. |
+| `801d4a60` | `engine-field/src/field_actor_program.rs` | FALSE-EDGE | `step` renamed `step_scene_program`. A free `fn step` is never receiver-gated and collected edges from the live `motion_vm::step` and from every reachable function naming a local `step` (`fishing_advance_cast(&mut self, step: i32)` fired it). Exposed `entry_successor` / `lift_step`, which then needed their own disclosures. |
+| `801dd0c0` | `engine-menus/src/menu_item_category.rs` | RESOLVED | Was wired-but-inert: reached via `best_equipment_now`'s scoring closure with a table nothing filled. `World::install_menu_overlay_tables` now parses `DAT_801E4B88` off PROT 0899 and `build_equip_session` installs it with the edited party slot, so the check scores real disc data on both hosts. |
+| `801ddc20` | `engine-field/src/actor_colour_tween.rs` | Wired, inert at runtime | `World::tick_handler_actors` dispatches it every tick, but no host installs `ActorHandler::ColourTween`, so the `a.colour_tween` guard is always `None`. The tag said as much already; only the token had to go. |
+| `801cf1b0` | `render-kernels/src/battle_intro_transition.rs` | STALE-TAG | `build_intro_quad`'s only caller `tick_curtain` draws end to end. Its reason - the PROT 0979 descriptor table "which the engine never loads" - was falsified by `IntroQuadTable::parse_overlay`, which the caller's own tag already recorded. |
+| `801cfbb4`, `801d0164` | `render-kernels/src/battle_intro_particles.rs` | STALE-TAG | `BattleIntro::new` seeds the grid on every particle-style transition. The module blanket came off; the file is wholly wired, so nothing in it needed a per-item line. What survives as prose is the two real gaps: no packet consumer, and computed trig standing in for the overlay's height tables. |
+| `801cfda0`, `801d0370` | `render-kernels/src/battle_intro_styles.rs` | STALE-TAG | `step_particle` is reached from `tick_particle_field`, whose own tag had already been rewritten to `NOT DRAWN`. The sibling-delegation shape above. |
+| `801d0e54` | `render-kernels/src/battle_intro_tiles.rs` | STALE-TAG | Same shape: `step_tile` cited `tick_tile_grid`, which by then read `WIRED, without a draw`. |
+| `801d1a20` | `render-kernels/src/battle_intro_swirl.rs` | STALE-TAG | Same shape: `swirl_band_draw` cited `tick_swirl`, likewise already `WIRED, without a draw`. |
+| `801e1934` | `engine-menus/src/card_flow.rs` | FALSE-EDGE | `save_title_digits` renamed `block_title_digits`; the live copy is `legaia_save::card::save_title_digits`, which the browser card rack writes through. A duplicate free-function name across two crates, never receiver-gated. Its own caller `save_block_summary` has no non-test call site. |
+| `8003cda8` | `engine-motion-vm/src/ambient_motion.rs` | STALE-TAG | `reset_pool` carried `REPLACED-BY:` ("a fresh scheduler per scene") after `World::install_field_player` started resetting the world-owned `player_scale_ramps`, the one scheduler that outlives a scene. The tag came off for a plain note. Retail has no reference to `0x8003CDA8` in SCUS or any PROT entry, so the engine's seat is its own and the note says so. |
+
+The `world_map_overlay.rs` rows are the worked example of the whole granularity
+shape: a genuinely wired item made a module blanket false, and through the
+module scope it also lifted four data-struct type anchors to live.
+
+They are also the worked example of the **opposite** failure, and that is the
+more expensive one. Splitting the module tag into per-item anchors and giving
+each inert item its own `NOT WIRED:` line is only correct for the items that
+are actually inert - and the `801ed710` pair was not. `records_screen` and
+`decompose_play_time` had a real, non-test caller in the native window's
+developer-menu Records page the whole time, so writing them a per-item
+disclosure turned one coarse-anchor row into two false statements in source,
+each reading as a declared wiring gap. A FALSE-EDGE verdict says the port is
+unreachable; before acting on one, look for the caller rather than for the
+collision, because a collision can always be found and a caller cannot.
+
+<a id="superseded-rows"></a>
+## Wired but inert at runtime: `emit_horizon`
+
+`801d7ea0` (`emit_horizon`, `crates/engine-field/src/world_map_horizon.rs`) is the
+worked example of *wired, inert at runtime*: its tag needed a rewrite rather
+than a deletion. `emit_horizon` is statically reachable through three unambiguous
+non-test hops, so a tag clause reading "reached only from tests" is false - but
+the port is still inert, because the gate `run_horizon_emitter` consults is
+never armed: `EmitterGate::arm` has no non-test caller. That is a runtime fact
+the reachability pass does not model and cannot be expressed by the tag as the
+audit reads it. See
+[`live-audit-triage.md`](live-audit-triage.md#disclose-texts) for the `arm`
+disclosure that pins the other half.

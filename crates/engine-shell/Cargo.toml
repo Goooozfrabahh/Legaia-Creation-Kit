@@ -1,0 +1,120 @@
+[package]
+name = "legaia-engine-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# tests/integration.rs gathers every tests/*.rs into one binary.
+autotests = false
+
+[[bin]]
+name = "legaia-engine"
+path = "src/bin/legaia-engine.rs"
+
+# Windows double-click entry (shipped as "Legend of Legaia.exe"): a
+# GUI-subsystem stub that starts legaia-engine without a console window.
+[[bin]]
+name = "legaia-launch"
+path = "src/bin/legaia-launch.rs"
+
+[dependencies]
+legaia-app-theme.workspace = true
+legaia-engine-camera.workspace = true
+legaia-engine-battle-menus.workspace = true
+legaia-engine-menus.workspace = true
+legaia-engine-title.workspace = true
+legaia-engine-field.workspace = true
+legaia-render-kernels.workspace = true
+legaia-engine-battle-vm.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+log.workspace = true
+env_logger.workspace = true
+legaia-art.workspace = true
+legaia-engine-capture.workspace = true
+legaia-engine-core.workspace = true
+legaia-engine-save-state.workspace = true
+legaia-engine-world-views.workspace = true
+legaia-engine-battle-hud.workspace = true
+legaia-engine-cheats.workspace = true
+legaia-engine-scene-host.workspace = true
+legaia-engine-menu-runtime.workspace = true
+legaia-engine-export.workspace = true
+legaia-engine-scene.workspace = true
+legaia-engine-audio.workspace = true
+legaia-engine-session.workspace = true
+legaia-engine-screens.workspace = true
+legaia-parity.workspace = true
+legaia-engine-render.workspace = true
+legaia-prot.workspace = true
+legaia-save.workspace = true
+legaia-seq.workspace = true
+legaia-vab.workspace = true
+legaia-tim.workspace = true
+legaia-tmd.workspace = true
+legaia-font.workspace = true
+legaia-mdec.workspace = true
+legaia-mednafen.workspace = true
+legaia-iso.workspace = true
+legaia-xa.workspace = true
+legaia-actor-formats.workspace = true
+legaia-container-formats.workspace = true
+legaia-engine-battle.workspace = true
+legaia-engine-dialog.workspace = true
+legaia-engine-effects.workspace = true
+legaia-engine-fishing.workspace = true
+legaia-engine-minigame-scenes.workspace = true
+legaia-engine-minigames.workspace = true
+legaia-engine-mode.workspace = true
+legaia-engine-system.workspace = true
+legaia-engine-ui.workspace = true
+legaia-game-tables.workspace = true
+legaia-minigame-formats.workspace = true
+legaia-overlay-images.workspace = true
+legaia-ram-image.workspace = true
+legaia-scene-formats.workspace = true
+legaia-ui-formats.workspace = true
+glam.workspace = true
+png.workspace = true
+winit.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml = { workspace = true, features = ["display"] }
+sha2.workspace = true
+# First-run launcher (`legaia-engine` with no subcommand): the platform config
+# dir for the remembered disc path, and a native file picker. rfd's Linux
+# backend here is the xdg-desktop-portal (D-Bus, no GTK link), which keeps the
+# zig-cross x86_64 Linux release build free of a GTK sysroot.
+dirs.workspace = true
+rfd.workspace = true
+
+# Controller input for the play window (`window::gamepad`): gilrs reads every
+# connected gamepad, and the shared `legaia_engine_system::gamepad` layout folds
+# it into the PSX pad word - the layout the browser pages fold the Gamepad API
+# through. Linux links libudev (the release sysroot carries an amd64 copy, see
+# setup-cross-toolchain.sh); `--no-default-features` builds a keyboard-only
+# window.
+gilrs = { workspace = true, optional = true }
+
+[features]
+default = ["gamepad"]
+gamepad = ["dep:gilrs"]
+
+# SIGPIPE reset in the bin's main() so piping stdout into `head` exits
+# quietly instead of panicking on a broken pipe.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# chapter1_spine_oracle Part A reads pcsx-redux .sstate anchors (scene / mode /
+# player position) off the save library.
+legaia-pcsx-redux.workspace = true
+# `mode_seat_host_parity` drives the BROWSER host beside this one, so the two
+# mode traces are compared by running both rather than by transcribing one.
+# `legaia-web-play` never depends on this crate, so the edge is acyclic, and
+# it is dev-only: the shipped `legaia-engine` binary links none of it.
+legaia-web-play.workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

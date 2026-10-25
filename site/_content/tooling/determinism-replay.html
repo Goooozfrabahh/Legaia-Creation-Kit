@@ -1,0 +1,146 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">tooling</a> &middot; determinism + replay</div>
+  <h1>Engine determinism + scripted-input replay</h1>
+  <p class="lede">Play the engine with the recorder armed and every button press lands in a small, human-readable <code>.toml</code> text file. Hand that file back to <code>legaia-engine replay</code> and the engine re-runs the session frame for frame - the same inputs always produce exactly the same game, down to the last random number. That guarantee makes bug reports reproducible and regressions catchable: a disc-free test replays a canned input file twice and asserts the two state traces are bit-identical, so any change that sneaks in non-determinism fails CI.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Format</dt><dd><code>j-replay-v1</code> TOML - sparse pad-mask events + optional <code>[[expected]]</code> checkpoints; parser/writer in <code>legaia_engine_shell::replay</code></dd>
+    <dt>Record</dt><dd><code>legaia-engine record</code> - a <code>play-window</code> session with a pad-capture hook armed</dd>
+    <dt>Replay</dt><dd><code>legaia-engine replay</code> - headless, disc-free; emits the per-frame mode trace as JSONL</dd>
+    <dt>Gate</dt><dd><code>crates/engine-shell/tests/determinism_j2.rs</code> - runs in CI without <code>LEGAIA_DISC_BIN</code></dd>
+    <dt>Ladders</dt><dd>Critical-path replay + chapter-1 scene frontier, each against a ratcheted baseline in <code>scripts/replays/</code></dd>
+    <dt>Key drift signal</dt><dd><code>rng_state</code> - the PsyQ PRNG's running state, digested every frame</dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="when">
+  <h2>What this solves</h2>
+  <ul class="bullets">
+    <li><strong>Reproduce a bug</strong> - record the session that shows it, attach the <code>.toml</code>, and anyone can replay it.</li>
+    <li><strong>Turn a session into a regression fixture</strong> - add <code>[[expected]]</code> rows and <code>replay --strict</code> fails the moment the engine stops reaching the same scene on the same frame.</li>
+    <li><strong>Measure how far the engine can be played</strong> with the pad as the only actuator - the two ladders below score chapter 1 that way.</li>
+  </ul>
+  <ol class="steps">
+    <li><b>Record</b><span>play in the window; every pad-mask change is logged, Escape flushes the file <code>legaia-engine record</code></span></li>
+    <li><b>Replay file</b><span><code>j-replay-v1</code> TOML: meta + sparse pad events + optional checkpoints <code>replay.rs</code></span></li>
+    <li><b>Replay</b><span>a synthetic <code>World</code> ticks once per frame; per-frame mode trace out as JSONL <code>legaia-engine replay</code></span></li>
+    <li><b>Assert</b><span><code>--strict</code> vs <code>[[expected]]</code>; running the file twice must give identical traces</span></li>
+  </ol>
+</section>
+
+<section class="doc-section" id="quick-start">
+  <h2>Quick start</h2>
+  <div class="cli"><code>legaia-engine record --out my.replay.toml --disc "Legend of Legaia (USA).bin" --scene town01</code></div>
+  <div class="cli"><code>legaia-engine replay --input my.replay.toml --out trace.jsonl</code></div>
+  <div class="cli"><code>legaia-engine replay --input my.replay.toml --strict</code></div>
+  <p>Play in the window; Escape or closing the window flushes the file - a mid-session close still produces a usable replay. <code>--strict</code> exits non-zero on the first divergence from the file's <code>[[expected]]</code> rows; no disc is needed for replay.</p>
+</section>
+
+<section class="doc-section" id="format">
+  <h2>File format (<code>j-replay-v1</code>)</h2>
+  <p>A replay is plain TOML: a <code>[meta]</code> header, a sparse list of controller events (the PSX pad's buttons packed into one 16-bit mask; only frames where the mask changes are stored), and optional expected checkpoints.</p>
+<pre><code>[meta]
+schema = "j-replay-v1"
+scenario = "title_attract"    # optional; resolves into scripts/scenarios.toml
+rng_seed = 0xDEADC0DE          # initial RNG seed (battle_formulas PsyQ PRNG)
+frames = 600
+
+[[event]]
+frame = 42
+pad = 0x4000                   # Cross pressed
+
+[[event]]
+frame = 44
+pad = 0x0000                   # released
+
+[[expected]]                   # optional regression fixture; compared by
+frame = 600                    # frame value, not slice index
+scene_mode = "Field"
+active_scene = "town01"</code></pre>
+  <table>
+    <thead><tr><th>Button</th><th>Mask</th><th>Button</th><th>Mask</th></tr></thead>
+    <tbody>
+      <tr><td>Cross</td><td><code>0x4000</code></td><td>Up</td><td><code>0x0010</code></td></tr>
+      <tr><td>Circle</td><td><code>0x2000</code></td><td>Down</td><td><code>0x0040</code></td></tr>
+      <tr><td></td><td></td><td>Left</td><td><code>0x0080</code></td></tr>
+      <tr><td></td><td></td><td>Right</td><td><code>0x0020</code></td></tr>
+    </tbody>
+  </table>
+  <p>Pad bits match <code>legaia_engine_system::input::PadButton::mask</code>, stored as a plain <code>u16</code> so the on-disk form stays byte-readable. The dense per-frame stream is reconstructed by <code>ReplayFile::expand_pad_stream</code> - the mask in slot N is the mask in force on frame N. <code>ReplayFile::validate</code> rejects schema mismatches, out-of-order events, and frame indices past <code>meta.frames</code>; writers emit events in frame-ascending order, readers don't sort.</p>
+</section>
+
+<section class="doc-section" id="subcommands">
+  <h2>The two subcommands</h2>
+  <p><strong><code>replay</code></strong> drives a synthetic <code>World</code> from the file and emits the per-frame mode trace as JSONL (same shape as <code>legaia-engine mode-trace</code>). Every argument is a flag - <code>--input</code> is not positional - and <code>--out</code> defaults to stdout. The driver mirrors the determinism-gate harness: <code>World::new</code> + an 8-slot actor pool, RNG seeded from <code>meta.rng_seed</code>, ticked once per replay frame.</p>
+  <p><strong><code>record</code></strong> is a thin wrapper over <code>play-window</code>: assets come from <code>--extracted-root</code> (default <code>extracted</code>) unless <code>--disc</code> supersedes it; <code>--no-audio</code>, <code>--world-map</code> and <code>--save-dir</code> behave as on the host it wraps. Every keyboard transition that changes the pad mask is appended to a <code>RecordLog</code>; auto-repeat deduplication collapses identical-mask press streams; <code>meta.frames</code> reflects the actual session duration.</p>
+  <p class="hint"><strong>Interactive-toggle caveat.</strong> <code>j-replay-v1</code> captures the pad stream only - the camera distance preset, left-mouse drag-orbit and the precise-movement toggle are not recorded. The defaults are safe: distance and orbit are pure render framing, and replays run with <code>precise_movement</code> off. A session recorded with precise movement ON, or a non-zero drag-orbit compass, is not replay-stable; keep the toggles at their defaults when capturing fixtures.</p>
+</section>
+
+<section class="doc-section" id="gate">
+  <h2>Determinism gate</h2>
+  <p><code>determinism_j2.rs</code> drives a synthetic <code>World</code> twice through the same <code>ReplayFile</code> and asserts the per-frame state-trace bytes are bit-identical. The digest covers <code>frame</code>, <code>scene_mode</code>, <code>pad</code>, <code>rng_state</code> (the single most important drift signal), <code>money</code>, <code>party_hp_total</code> and <code>dialog_active</code>. Three companion tests double-lock it: a different pad stream produces a different trace, a different RNG seed produces a different trace, and an <code>[[expected]]</code> fixture round-trips through <code>ReplayFile::diff</code>.</p>
+  <p>The replay format is a peer to the parity oracles: <code>vram_oracle_e1</code> compares engine VRAM against retail captures, <code>mode_trace_e3</code> compares engine <code>(scene_mode, active_scene)</code> per frame against retail snapshots, and <code>determinism_j2</code> compares engine traces against <em>themselves</em> - the disc-free side of the stack. Recorded replays bind a scenario label in <code>meta.scenario</code>, pairing a session back to its retail starting state via <code>scripts/scenarios.toml</code>; the <code>v0_1_playthrough</code> oracle composes a disc-free determinism check with a disc-gated convergence check over a cold boot into a live field scene.</p>
+</section>
+
+<section class="doc-section" id="critical-path">
+  <h2>Critical-path replay: the game-denominated sibling</h2>
+  <p>Every other progression oracle moves the player with <code>seat_player_at_tile</code> - a teleport that synthesises the tile crossing. That answers <em>does the scene graph connect</em>, and is structurally blind to locomotion speed, the collision probe, the walkability grid, and the camera-relative pad remap. <code>crates/engine-shell/tests/critical_path_replay.rs</code> drives the chapter-1 spine with the <strong>pad as the only actuator</strong> and scores how far it gets, against <code>scripts/replays/critical_path_baseline.toml</code>. Nothing is seated.</p>
+  <table>
+    <thead><tr><th>Design rule</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Waypoints from a BFS over the walkability grid, edges certified by <code>field_dir_blocked</code>, lattice pitch 32</td><td>The probe reaches only ~47 units ahead, and a tile centre is <code>128t + 64</code>, so the pitch must divide 64 or the planner can never stand on a doorway's centreline.</td></tr>
+      <tr><td>The goal is best-effort: route to the closest reachable node, press from there</td><td>A scene exit is a door, and a door tile reads as a wall. A leg succeeds on the transition firing, not on arrival.</td></tr>
+      <tr><td>Hazard tiles are unsafe to <em>enter</em>, never unsafe to <em>occupy</em></td><td>Retail's dispatcher fires on a tile <em>change</em>; a planner that tests only the destination refuses every step out of the tile it starts inside.</td></tr>
+      <tr><td>A dungeon leg is scored by <em>door</em>, not by event</td><td>Every <code>keikoku</code> exit returns to <code>map01</code>; only the arrival coordinate (from the <code>.MAP</code> gate-1 triggers joined to partition-2 records) names which door fired.</td></tr>
+      <tr><td>Scripted sequences are drained by <em>pulsing</em> Cross (press 2, release 14)</td><td>The advance is edge-triggered - a held button pages once; a neutral pad drains a timeline but not a pager.</td></tr>
+      <tr><td>A stall is self-describing: tile, position, next waypoint, both wall arms separately</td><td>"The player stopped here" and "the engine says every direction is a wall" are different findings.</td></tr>
+    </tbody>
+  </table>
+  <p>The pad-inversion arithmetic, the door-identity clause and the baseline parser are covered by disc-free unit tests, so the file stays non-vacuous in CI where the ladder skips.</p>
+  <p class="hint">A stall that describes itself (parked op, failing gates, unset flags) is the point of the ladder: guesses about why a walk stopped are usually wrong, and a planner that avoids too many trigger tiles can seal itself out of a dungeon.</p>
+</section>
+
+<section class="doc-section" id="frontier">
+  <h2>Scene-frontier ladder: the breadth-denominated sibling</h2>
+  <p>The critical-path ladder walks one route well; <code>crates/parity/tests/chapter1_frontier_ladder.rs</code> enumerates the whole chapter-1 reachable scene set and gives every member a verdict, against <code>scripts/replays/chapter1_frontier_baseline.toml</code> - because "the engine cannot get past the Ravine" and "no fixture drives past the Ravine" read identically until something scores the scenes one at a time. The set is the BFS closure of <code>town01</code> over each scene's decoded <code>0x3F</code> destinations, stopped at the kingdom boundary; scenes reached by the sibling <code>0x3E</code> door warp are outside it. Six rungs per scene, ordered and cumulative:</p>
+  <table>
+    <thead><tr><th>Rung</th><th>Verdict</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>the assets resolve</td></tr>
+      <tr><td>2</td><td>the MAN parses</td></tr>
+      <tr><td>3</td><td><code>SceneHost</code> enters it</td></tr>
+      <tr><td>4</td><td>the entry script settles and hands control back</td></tr>
+      <tr><td>5</td><td>pad-only input displaces the player (scored against a released-pad control run)</td></tr>
+      <tr><td>6</td><td>an exit record fires and lands in the scene it names</td></tr>
+    </tbody>
+  </table>
+  <p>A scene whose script leaves on its own is marked not-applicable on the last two rather than failed. Failures are self-describing: a script park reports <code>(pc, opcode)</code> off the live field VM, a locomotion stall reports the tile. Two guards decide what the numbers mean: "control released" waits for spawned first-visit records too, not only cutscene timelines; and the locomotion rung needs a released-pad control, because without one "the player walked" and "a script moved the player" are the same measurement.</p>
+  <details class="disclosure">
+    <summary>Where the frontier stops: the one-way scenes</summary>
+    <div class="disclosure-body">
+      <p>Every scene in the closure loads, enters and settles; the remaining stops are all about <strong>doors</strong>. The five that once read as sealed (<code>uru</code>, <code>urudre1..3</code>, <code>jouine</code>) were the ladder measuring its own caps: the tile sweep stopped at 48 deduplicated tiles while <code>uru</code>'s exit band is the 64th of its 118, the post-step budget was 24 ticks while one record alone waits 360 frames before its <code>0x3F</code>, and watching only for a scene change could never see an FMV tail. With the caps removed the ladder now drives all five out through their <code>.PCH</code>-carried bands, each to the destination the disc names: <code>uru</code> to <code>map03</code>, <code>urudre1</code> and <code>urudre3</code> back to <code>uru</code>, <code>urudre2</code> to <code>map01</code>, and <code>jouine</code> to <code>town0e</code> by way of movie 8. <code>urudre2</code> was the last to fall, and what held it was not a cap: its exit is the tail of a 4703-byte dream cutscene, and about <code>0x670</code> bytes before that tail the record carries a camera-apply op the port read as an absolute jump to its operand. Retail's arm is a four-byte fall-through and the operand is the apply trigger, so a trigger of zero restarted the record and the conversation replayed forever. See <a href="../subsystems/world-map.html#entrances">the world-map page</a>.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Tooling</span>
+    <a href="recomp-differential.html">Recomp differential oracle</a>
+    <a href="pcsx-redux-automation.html">PCSX-Redux automation</a>
+    <a href="mednafen-automation.html">Mednafen automation</a>
+    <a href="port-catalog.html">Port catalog</a>
+  </div>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../subsystems/engine.html">Engine architecture</a>
+    <a href="../subsystems/script-vm.html">Field/event VM</a>
+    <a href="../subsystems/field-locomotion.html">Field locomotion</a>
+    <a href="../reference/open-rev-eng-threads.html">Open RE threads</a>
+    <a href="../reference/re-settled-threads.html">Settled RE threads</a>
+  </div>
+</section>

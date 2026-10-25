@@ -1,0 +1,832 @@
+//! The [`Renderer`] struct field definitions plus its small state
+//! accessors (PSX-mode toggle, texture-window register, resize, surface
+//! size).
+
+use super::*;
+
+/// One frame's camera-occlusion fade focus, as staged by the host - see
+/// [`Renderer::set_occlusion_focus`] and [`crate::occlusion_fade`].
+///
+/// A named struct rather than a tuple because two of the three fields are
+/// bare `f32`s that a caller could silently transpose.
+#[derive(Clone, Copy)]
+pub(super) struct OcclFocus {
+    /// The player's clip-space position under the frame's scene camera.
+    pub(super) clip: [f32; 4],
+    /// The floor point under the player (their feet), same camera - the
+    /// feet-line rule's anchor ([`crate::occlusion_fade::lift_axis`]).
+    pub(super) feet_clip: [f32; 4],
+    /// The host's eased visibility-gate output, 0..1.
+    pub(super) strength: f32,
+    /// That camera's vertical projection scale `P[1][1]`, which turns the
+    /// world-space fade radius into pixels at the focus depth.
+    pub(super) proj_scale_y: f32,
+}
+
+pub struct Renderer {
+    /// The volumetric ground-fog enhancement pass, built on the first frame
+    /// a host stages a bank ([`Renderer::set_fog_volume`]); `None` until
+    /// then, so a renderer that never sees one builds nothing.
+    pub(super) fog_volume_pass: std::cell::RefCell<Option<fog_volume::FogVolumePass>>,
+    /// Whether this frame has a bank staged.
+    pub(super) fog_volume_active: std::cell::Cell<bool>,
+    // --- lane L ---
+    /// The bloom enhancement's passes and targets, built on the first
+    /// bloomed frame ([`Renderer::set_bloom`]).
+    pub(super) bloom_pass: std::cell::RefCell<Option<bloom::BloomPass>>,
+    /// Whether bloom is on (default off).
+    pub(super) bloom_on: std::cell::Cell<bool>,
+    pub(super) surface: wgpu::Surface<'static>,
+    pub(super) device: wgpu::Device,
+    pub(super) queue: wgpu::Queue,
+    pub(super) config: wgpu::SurfaceConfiguration,
+    /// Format every colour attachment is rendered through - the UNORM twin of
+    /// [`Self::config`]'s format (see `choose_surface_format`). The shaders
+    /// emit PSX framebuffer bytes, so the attachment must never re-encode
+    /// them to sRGB.
+    pub(super) view_format: wgpu::TextureFormat,
+    /// Quad pipeline (Phase 1 TIM viewer).
+    pub(super) pipeline: wgpu::RenderPipeline,
+    pub(super) sampler: wgpu::Sampler,
+    pub(super) bind_group_layout: wgpu::BindGroupLayout,
+    pub(super) uniforms_buf: wgpu::Buffer,
+    pub(super) uniforms_bg: wgpu::BindGroup,
+    /// Mesh pipeline (Phase 1 TMD viewer).
+    pub(super) mesh_pipeline: wgpu::RenderPipeline,
+    pub(super) mesh_uniforms_buf: wgpu::Buffer,
+    pub(super) mesh_uniforms_bg: wgpu::BindGroup,
+    /// Textured-mesh pipeline (Phase 1 TMD viewer with paired TIM).
+    /// Reuses [`Self::bind_group_layout`] for the per-mesh texture binding.
+    pub(super) textured_mesh_pipeline: wgpu::RenderPipeline,
+    /// VRAM-mesh pipeline: per-vertex CBA/TSB + R16Uint VRAM texture lookup.
+    pub(super) vram_mesh_pipeline: wgpu::RenderPipeline,
+    /// PSX semi-transparency blend pipelines for [`Self::vram_mesh_pipeline`],
+    /// one per ABR mode 0..=3 (see [`psx_blend`]). Drawn as a second pass
+    /// over each mesh's semi-transparent index tail when PSX-faithful mode
+    /// is on ([`Self::set_psx_mode`]).
+    pub(super) vram_mesh_blend_pipelines: [wgpu::RenderPipeline; 4],
+    pub(super) vram_bgl: wgpu::BindGroupLayout,
+    /// Multi-actor "scene" VRAM-mesh pipeline. Identical to
+    /// [`Self::vram_mesh_pipeline`] but binds [`Self::scene_uniforms_bgl`]
+    /// at group 0 (with `has_dynamic_offset = true`) so a single render
+    /// pass can draw N actors with one bind group + N dynamic offsets.
+    pub(super) scene_vram_mesh_pipeline: wgpu::RenderPipeline,
+    /// Scene-layout twins of [`Self::vram_mesh_blend_pipelines`].
+    pub(super) scene_vram_mesh_blend_pipelines: [wgpu::RenderPipeline; 4],
+    /// Lines pipeline shadowing the scene path (uses the scene-uniforms
+    /// dynamic-offset layout). Used by [`Self::render`] when a `Scene`
+    /// carries `overlay_lines`.
+    pub(super) scene_lines_pipeline: wgpu::RenderPipeline,
+    /// Untextured vertex-colour mesh pipeline shadowing the scene path (same
+    /// scene-uniforms dynamic-offset layout, no VRAM group). Draws a `Scene`'s
+    /// `color_draws` (`F*`/`G*` props).
+    pub(super) scene_color_mesh_pipeline: wgpu::RenderPipeline,
+    /// PSX semi-transparency blend pipelines for
+    /// [`Self::scene_color_mesh_pipeline`], one per ABR mode 0..=3 (see
+    /// [`psx_blend`]). Unlike the textured blend pass there is no per-texel
+    /// STP gate: an untextured ABE prim blends *all* its pixels, so the
+    /// fragment entries just emit the interpolated vertex colour (mode 3
+    /// pre-scaled by 0.25) and the fixed-function blend state does the rest.
+    pub(super) scene_color_mesh_blend_pipelines: [wgpu::RenderPipeline; 4],
+    pub(super) scene_uniforms_bgl: wgpu::BindGroupLayout,
+    pub(super) scene_uniforms_bg: std::cell::RefCell<wgpu::BindGroup>,
+    pub(super) scene_uniforms_buf: std::cell::RefCell<wgpu::Buffer>,
+    /// Capacity (in `MeshUniforms` slots) of [`Self::scene_uniforms_buf`].
+    pub(super) scene_uniforms_capacity: std::cell::Cell<usize>,
+    /// `min_uniform_buffer_offset_alignment` reported by the adapter.
+    /// Per-actor uniform writes are padded up to this stride.
+    pub(super) uniform_offset_alignment: u32,
+    /// Lines pipeline: LineList topology, per-vertex color, depth-tested.
+    /// Used for wireframe rendering of stage geometry.
+    pub(super) lines_pipeline: wgpu::RenderPipeline,
+    /// Text pipeline: 2D textured quads, alpha-blended, no depth. Group 0
+    /// binds a sampled font atlas. Used for HUD / debug / dialog overlays.
+    /// Indexed by [`Self::ui_psx_tint`] (`[smooth, retail]`).
+    pub(super) text_pipeline: [wgpu::RenderPipeline; 2],
+    /// The text pipeline's quads through each PSX ABR equation, indexed by
+    /// [`Self::ui_psx_tint`] then mode (`OverlayBlendSpan`).
+    pub(super) text_blend_pipelines: [[wgpu::RenderPipeline; 4]; 2],
+    /// Bind-group layout for the font-atlas texture binding (group 0 of
+    /// [`Self::text_pipeline`]). Reused when uploading new atlases.
+    pub(super) text_atlas_bgl: wgpu::BindGroupLayout,
+    /// Sampler used by the text pipeline. Nearest-neighbour to keep PSX
+    /// pixel-art glyphs crisp.
+    pub(super) text_sampler: wgpu::Sampler,
+    /// Per-frame text vertex / index buffers (RefCell-borrowed from the
+    /// non-mut `render` API; resized geometrically on demand).
+    pub(super) text_vbuf: std::cell::RefCell<wgpu::Buffer>,
+    pub(super) text_ibuf: std::cell::RefCell<wgpu::Buffer>,
+    /// Capacity of [`Self::text_vbuf`] in vertex slots and
+    /// [`Self::text_ibuf`] in index slots. Both grow together - one quad
+    /// per `TextDraw` is 4 vertices and 6 indices.
+    pub(super) text_vertex_capacity: std::cell::Cell<u32>,
+    pub(super) text_index_capacity: std::cell::Cell<u32>,
+    /// Per-overlay quad ranges from the most recent staging call -
+    /// `[(base_quad, count), ...]` in the same order overlays were passed.
+    /// Drained by the in-pass draw to issue one `draw_indexed` per overlay
+    /// with the matching atlas bound.
+    pub(super) scene_quad_ranges: std::cell::RefCell<Vec<(u32, u32)>>,
+    /// Per-frame blend-pass ordering list (see
+    /// [`psx_blend::BlendListEntry`]). RefCell-borrowed from the non-mut
+    /// `render` API; cleared and refilled each frame, capacity persists so
+    /// the per-prim sort allocates nothing in steady state.
+    pub(super) blend_list: std::cell::RefCell<Vec<psx_blend::BlendListEntry>>,
+    /// Depth target - recreated on resize.
+    pub(super) depth_view: wgpu::TextureView,
+    /// PSX-faithful rendering mode. When `true`, the VRAM-mesh shader uses
+    /// affine (linear-in-screen-space) UV interpolation instead of
+    /// perspective-correct, and snaps clip-space x/y to integer pixel
+    /// positions to reproduce the GTE's per-vertex sub-pixel-truncation
+    /// "vertex jitter." Default `false` for clean smooth rendering.
+    pub(super) psx_mode: std::cell::Cell<bool>,
+    /// Retail's 5-bit texture modulation on the 2D overlay
+    /// ([`Self::set_ui_psx_tint`]). Default `true`.
+    pub(super) ui_psx_tint: std::cell::Cell<bool>,
+    /// Count of [`Self::upload_vram`] calls; stamps each [`UploadedVram`]
+    /// with a strictly-increasing generation (see
+    /// [`UploadedVram::generation`]).
+    pub(super) vram_upload_counter: std::cell::Cell<u64>,
+    /// GP0(0xE2) "Texture Window setting" - `(mask_x, mask_y, off_x, off_y)`
+    /// each in 8-pixel steps (0..=31). Applied per-fragment in the
+    /// VRAM-mesh shader. Defaults to all-zero (no-op), which matches
+    /// retail Legaia's typical state - the register only gets non-zero
+    /// values from a handful of effect / scene-init scripts.
+    pub(super) tex_window: std::cell::Cell<[u32; 4]>,
+    /// Per-draw object-effect clips for the next scene render, parallel to
+    /// the scene's `draws` and `color_draws` ([`Renderer::set_draw_clips`]).
+    /// Held until the next [`Renderer::set_draw_clips`]; a host that stages
+    /// clips restages them (possibly empty) on every scene frame.
+    pub(super) draw_clips: std::cell::RefCell<DrawClipLists>,
+    /// Per-draw NCLIP overrides for the next scene render, parallel to the
+    /// scene's textured `draws` ([`Renderer::set_draw_nclip`]). A `Some`
+    /// entry replaces the frame's [`Renderer::set_backface_cull`] word for
+    /// that draw; held until the next call.
+    pub(super) draw_nclip: std::cell::RefCell<Vec<Option<u32>>>,
+    /// Full-scene colour grade `(gold_r, gold_g, gold_b, strength)` staged
+    /// into every field `MeshUniforms` (see [`super::uploaded::MeshUniforms`]).
+    /// Defaults to `(1, 1, 1, 0)` = identity (no grade). Set with
+    /// [`Renderer::set_color_grade`]; drives the opening prologue sepia.
+    pub(super) color_grade: std::cell::Cell<[f32; 4]>,
+    /// GTE depth cue `(far_r, far_g, far_b, ir0)` staged into every field
+    /// `MeshUniforms`. Defaults to all-zero = `ir0 = 0` = identity, which is
+    /// what the field passes for an unfogged scene. Set with
+    /// [`Renderer::set_depth_cue`].
+    pub(super) depth_cue: std::cell::Cell<[f32; 4]>,
+    /// View-depth IR0 ramp `(near_z, inv_range, max_ir0, enable)` staged into
+    /// every field `MeshUniforms` (see [`super::uploaded::MeshUniforms`]).
+    /// Defaults to all-zero = disabled (constant-`IR0` fallback). Set with
+    /// [`Renderer::set_depth_cue_ramp`] / cleared with
+    /// [`Renderer::clear_depth_cue_ramp`]; drives the opening prologue's
+    /// per-render-node far-colour crush.
+    pub(super) cue_ramp: std::cell::Cell<[f32; 4]>,
+    /// Prologue palette-collapse grade `(tint_r, tint_g, tint_b, enable)`
+    /// staged into every field `MeshUniforms.palette`. Defaults to all-zero =
+    /// disabled (the bit-identical multiply-grade path). Set with
+    /// [`Renderer::set_palette_grade`]; drives the opening prologue's gold
+    /// look at the retail mechanism's true altitude (CLUT/texel law + packet
+    /// collapse), superseding the view-depth cue-ramp approximation while
+    /// active.
+    pub(super) palette_grade: std::cell::Cell<[f32; 4]>,
+    /// Backface-cull mode staged into `MeshUniforms.flags[0]` (see there).
+    /// `0.0` (default) = draw both sides; `1.0` / `2.0` = discard back /
+    /// front-facing fragments. Set with [`Renderer::set_backface_cull`].
+    pub(super) backface_cull: std::cell::Cell<f32>,
+    /// The kingdom overworld's per-vertex screen-Y curvature, staged into
+    /// `MeshUniforms.flags[3]`: the `clip.w`-to-`SZ` factor, `0.0` (the
+    /// default) = identity. Set with [`Renderer::set_overworld_curvature`].
+    pub(super) overworld_curve: std::cell::Cell<f32>,
+    /// The curvature table's build offset in screen rows, folded into every
+    /// scene draw's clip matrix (`depth::fold_screen_rows`). `0.0` (the
+    /// default) = identity. Set with [`Renderer::set_overworld_curve_bias`].
+    pub(super) overworld_curve_bias: std::cell::Cell<f32>,
+    /// Retail's per-primitive near reject, staged into the scene-lights
+    /// block's `prim_near` word (see [`Renderer::set_prim_near_reject`]).
+    pub(super) prim_near: std::cell::Cell<[f32; 4]>,
+    /// PSX semi-transparency (ABE) blending, staged into `MeshUniforms.flags[1]`.
+    /// When `true` (the default), a semi-transparent prim's blended fragments
+    /// are deferred out of the opaque pass and re-drawn by the per-ABR-mode
+    /// blend pass, so water / glass / additive effects composite with the
+    /// framebuffer as they do on retail. When `false` those prims draw fully
+    /// opaque. This is decoupled from [`Self::psx_mode`] on purpose: the
+    /// modulation-correct blend is retail behaviour worth having in the clean
+    /// "enhanced" render too, whereas the GTE vertex jitter / affine UVs /
+    /// 15-bit dither that `psx_mode` also enables are strict-PS1 artefacts.
+    /// Set with [`Renderer::set_semi_blend`].
+    pub(super) semi_blend: std::cell::Cell<bool>,
+    /// Where the 3D pass and the screen-primitive overlay draw inside the
+    /// target, as `(x, y, w, h)` in target pixels; `None` = the whole target.
+    /// Set with [`Renderer::set_scene_viewport`].
+    pub(super) scene_viewport: std::cell::Cell<Option<(u32, u32, u32, u32)>>,
+    /// Opt-in dynamic-lighting enhancement, staged into
+    /// `MeshUniforms.light_dir[3]`. `false` (the default) keeps every mesh
+    /// path pixel-identical to the faithful baked-shading render - retail's
+    /// field path has NO light source (see [`crate::psx_light`]), so this is
+    /// explicitly a non-retail enhancement. When `true` the VRAM / colour
+    /// mesh shaders layer a soft warm directional light (off the smoothed
+    /// per-vertex normals) + a screen-space light pool over the baked
+    /// colours, capped at ~1.3x. Set with [`Renderer::set_dynamic_lighting`].
+    pub(super) dyn_lighting: std::cell::Cell<bool>,
+    /// Shadow sub-toggle of the dynamic-lighting enhancement: when `true`
+    /// (the default) AND [`Self::dyn_lighting`] is on AND the host staged
+    /// scene lights ([`Self::set_scene_lights`]), the derived per-scene
+    /// point lights shade with per-light PCF shadow maps. `false` drops
+    /// the whole point-light layer (lights + shadows), leaving the global
+    /// gain only. Irrelevant while dynamic lighting is off.
+    pub(super) dyn_shadows: std::cell::Cell<bool>,
+    /// The mood the enhancement lights the frame under (ambient, key light,
+    /// lamp strength, emissive gain, glow) - see
+    /// [`legaia_render_kernels::scene_lighting::LightingMood`]. Staged by the host per scene
+    /// / time-of-day change via [`Self::set_lighting_mood`]; defaults to
+    /// daylight. Irrelevant while dynamic lighting is off.
+    pub(super) lighting_mood: std::cell::Cell<legaia_render_kernels::scene_lighting::LightingMood>,
+    /// This frame's glow sprites (halos + light shafts) in world space,
+    /// expanded to camera-facing quads at stage time. Empty unless dynamic
+    /// lighting is on and the host staged sprites.
+    pub(super) glow_sprites:
+        std::cell::RefCell<Vec<legaia_render_kernels::scene_lighting::GlowSprite>>,
+    /// Camera-occlusion fade master toggle (the opt-in see-through-walls
+    /// enhancement, NON-RETAIL - see [`crate::occlusion_fade`]). `false`
+    /// (the default) keeps every mesh path bit-identical to the faithful
+    /// render; the host's play window enables it. Set with
+    /// [`Self::set_occlusion_fade`]. Only bites while a focus is staged
+    /// ([`Self::set_occlusion_focus`]).
+    pub(super) occl_fade: std::cell::Cell<bool>,
+    /// This frame's camera-occlusion focus, staged per field frame via
+    /// [`Self::set_occlusion_focus`]; `None` (cleared on non-field modes /
+    /// cutscenes / a disarmed visibility gate) leaves the fade inert
+    /// regardless of the toggle.
+    pub(super) occl_focus: std::cell::Cell<Option<OcclFocus>>,
+    /// Occlusion-fade draw watermark `(textured, colour)`: scene draw slots
+    /// BELOW these counts are environment geometry (fadeable); slots at or
+    /// past them are actors (the player, NPCs), which the fade must never
+    /// dissolve. Staged per frame by the host via
+    /// [`Self::set_occlusion_env_draws`]; defaults to "everything fadeable"
+    /// for hosts that stage a focus without counts.
+    pub(super) occl_env_counts: std::cell::Cell<(usize, usize)>,
+    /// Derived per-scene point lights (world space), staged by the host
+    /// via [`Self::set_scene_lights`]. Cleared on scene change.
+    pub(super) scene_lights:
+        std::cell::RefCell<Vec<legaia_render_kernels::scene_lighting::ScenePointLight>>,
+    /// The scene camera's view-projection registered with the lights -
+    /// inverted per frame to recover each draw's model matrix from its MVP
+    /// (`model = view_proj^-1 * mvp`).
+    pub(super) scene_view_proj: std::cell::Cell<Option<Mat4>>,
+    /// Per-frame scene-lights uniform buffer (one [`SceneLightsUniform`]).
+    pub(super) scene_lights_buf: wgpu::Buffer,
+    /// Group-2 bind group of the scene pipelines: lights uniform + shadow
+    /// depth array + comparison sampler.
+    pub(super) scene_lights_bg: wgpu::BindGroup,
+    /// Per-layer render-target views of the shadow-map depth array (one
+    /// layer per possible light).
+    pub(super) shadow_layer_views: Vec<wgpu::TextureView>,
+    /// Depth-only shadow pipelines: VRAM-mesh vertex layout and colour-mesh
+    /// vertex layout (position attribute only).
+    pub(super) shadow_vram_pipeline: wgpu::RenderPipeline,
+    pub(super) shadow_color_pipeline: wgpu::RenderPipeline,
+    /// Enhanced lighting's glow-sprite pipeline (additive camera-facing
+    /// halos + shafts, [`legaia_render_kernels::scene_lighting::glow_vertices`]) and its
+    /// view-projection uniform.
+    pub(super) glow_pipeline: wgpu::RenderPipeline,
+    pub(super) glow_uniforms_buf: wgpu::Buffer,
+    pub(super) glow_uniforms_bg: wgpu::BindGroup,
+    /// Dynamic-offset uniform buffer for the shadow passes: one
+    /// [`ShadowUniforms`] slot per (light, draw), grown on demand.
+    pub(super) shadow_uniforms_bgl: wgpu::BindGroupLayout,
+    pub(super) shadow_uniforms_buf: std::cell::RefCell<wgpu::Buffer>,
+    pub(super) shadow_uniforms_bg: std::cell::RefCell<wgpu::BindGroup>,
+    pub(super) shadow_uniforms_capacity: std::cell::Cell<usize>,
+    /// Screen-space 2D overlay pass (see [`crate::screen_overlay`]): PSX
+    /// `POLY_FT4` textured quads + flat quads in NDC, ordering-table order,
+    /// per-ABR semi-transparency. Opaque pipeline (replace).
+    pub(super) screen_overlay_pipeline: wgpu::RenderPipeline,
+    /// The opaque half of a semi-transparent screen-overlay run: its textured
+    /// prims' STP-clear texels (`fs_semi_opaque`).
+    pub(super) screen_overlay_semi_opaque_pipeline: wgpu::RenderPipeline,
+    /// Per-ABR-mode blend pipelines for the screen-overlay pass (mode 0..=3).
+    pub(super) screen_overlay_blend_pipelines: [wgpu::RenderPipeline; 4],
+    /// Per-frame screen-overlay vertex/index buffers, grown geometrically on
+    /// demand (RefCell-borrowed from the non-mut `render` API, like the text
+    /// path).
+    pub(super) screen_overlay_vbuf: std::cell::RefCell<wgpu::Buffer>,
+    pub(super) screen_overlay_ibuf: std::cell::RefCell<wgpu::Buffer>,
+    /// Capacity of [`Self::screen_overlay_vbuf`] in vertices and
+    /// [`Self::screen_overlay_ibuf`] in indices.
+    pub(super) screen_overlay_vcap: std::cell::Cell<u32>,
+    pub(super) screen_overlay_icap: std::cell::Cell<u32>,
+    /// Draw runs staged for the current frame's screen overlay (one indexed
+    /// draw per run; see [`legaia_render_kernels::screen_prim::DrawRun`]).
+    pub(super) screen_overlay_runs:
+        std::cell::RefCell<Vec<legaia_render_kernels::screen_prim::DrawRun>>,
+    /// How many of [`Self::screen_overlay_runs`] belong to the list drawn
+    /// under the 2D overlays (`SceneWithScreenPrims::under_overlay`),
+    /// backdrops included.
+    pub(super) screen_overlay_under_runs: std::cell::Cell<usize>,
+    /// How many of [`Self::screen_overlay_runs`] - the first ones - are the
+    /// under list's backdrops (`ScreenPrim::is_backdrop`), which the scene
+    /// pass draws before any 3D draw.
+    pub(super) screen_overlay_backdrop_runs: std::cell::Cell<usize>,
+    /// One flat quad covering the scene viewport, drawn first in a scene pass
+    /// in the frame's clear colour when a [`Self::scene_viewport`] is set.
+    /// Separate from the screen-overlay buffers because those hold the
+    /// composited ordering-table tail of the same frame.
+    pub(super) viewport_fill_vbuf: wgpu::Buffer,
+    pub(super) viewport_fill_ibuf: wgpu::Buffer,
+}
+
+impl Renderer {
+    /// Toggle PSX-style rendering on the 3D mesh pipelines. With
+    /// `psx_mode = true` the pipeline mimics the retail GTE/GPU: UVs
+    /// interpolate linearly in screen space (no perspective correction → the
+    /// characteristic surface-warp on slanted surfaces), clip-space X/Y are
+    /// snapped to integer pixels (the GTE's per-vertex jitter), and the
+    /// shaded colour is ordered-dithered down to 15-bit BGR555 (the PSX
+    /// framebuffer depth - see `PSX_DITHER_WGSL` / [`psx_dither`]). Default
+    /// `false` (smooth, full-precision modern rendering).
+    pub fn set_psx_mode(&self, enable: bool) {
+        self.psx_mode.set(enable);
+    }
+
+    /// Read current PSX-mode flag.
+    pub fn psx_mode(&self) -> bool {
+        self.psx_mode.get()
+    }
+
+    /// Tint the 2D overlay (menus, HUD, dialogue, every text and sprite
+    /// quad) the way retail's GPU does: the tinted texel truncated to the
+    /// 5-bit grid (`legaia_render_kernels::ui_tint::modulate5`). Default
+    /// `true` - it is retail behaviour; `false` keeps the plain 8-bit
+    /// multiply, up to a grid step brighter. The font CLUTs' own shadow
+    /// colours apply either way.
+    pub fn set_ui_psx_tint(&self, enable: bool) {
+        self.ui_psx_tint.set(enable);
+    }
+
+    /// Read the overlay tint mode ([`Self::set_ui_psx_tint`]).
+    pub fn ui_psx_tint(&self) -> bool {
+        self.ui_psx_tint.get()
+    }
+
+    /// Toggle PSX semi-transparency (ABE) blending on the VRAM / colour mesh
+    /// passes. When `true` (the default) a semi-transparent prim's blended
+    /// texels are deferred out of the opaque pass and composited by the
+    /// per-ABR-mode blend pass, so field water (e.g. the Hunter's Spring
+    /// fountain), glass and additive effects show the framebuffer through
+    /// them the way retail's GPU blend does. When `false` those prims draw
+    /// fully opaque (the harsh-edged "solid water" look). Independent of
+    /// [`Self::set_psx_mode`]: blending is correct in the clean render, so it
+    /// is on regardless of the strict-PS1 jitter / dither knobs.
+    pub fn set_semi_blend(&self, enable: bool) {
+        self.semi_blend.set(enable);
+    }
+
+    /// Confine the **3D scene pass** and the **screen-primitive overlay** to a
+    /// sub-rectangle of the target (`(x, y, w, h)` in target pixels), or give
+    /// them the whole target again with `None`.
+    ///
+    /// The play window passes its 2D stage rect here: every stage-anchored
+    /// draw (text, menu sprites, the field party HUD, the naming screen's
+    /// windows) sits in the integer-scaled, centred 320x240 stage, and the 3D
+    /// that has to line up with it (the naming screen's actor, the HUD's
+    /// projected-player row) must use the same rect. The text and sprite
+    /// overlays keep the whole target - they are already in surface pixels.
+    /// A caller that sets a rect also composes its projection at the rect's
+    /// aspect, not the target's.
+    pub fn set_scene_viewport(&self, rect: Option<(u32, u32, u32, u32)>) {
+        self.scene_viewport.set(rect);
+    }
+
+    /// Read the current semi-transparency-blend flag.
+    pub fn semi_blend(&self) -> bool {
+        self.semi_blend.get()
+    }
+
+    /// Toggle the opt-in **dynamic-lighting enhancement** on the VRAM /
+    /// colour mesh passes. Off by default, and OFF IS RETAIL: the field
+    /// path has no runtime light source (shading is baked into the TMD
+    /// colour words - see [`crate::psx_light`]), so the disabled path is
+    /// pixel-identical to the faithful render and the parity oracles are
+    /// unaffected.
+    ///
+    /// Toggle the **enhanced-lighting** enhancement (NON-RETAIL; default
+    /// off, and off is the faithful baked-shading render, pixel-identical).
+    /// When on, the VRAM / colour mesh shaders shade the baked colours under
+    /// the staged [`legaia_render_kernels::scene_lighting::LightingMood`] (ambient floor +
+    /// soft key light off the smoothed normals + a screen-centred pool),
+    /// add the per-scene point lights ([`Self::set_scene_lights`]), draw
+    /// emissive-tagged prims at the mood's emissive gain, and composite the
+    /// staged glow sprites ([`Self::set_glow_sprites`]).
+    pub fn set_dynamic_lighting(&self, enable: bool) {
+        self.dyn_lighting.set(enable);
+    }
+
+    /// Read the current dynamic-lighting flag.
+    pub fn dynamic_lighting(&self) -> bool {
+        self.dyn_lighting.get()
+    }
+
+    /// Stage the mood the enhancement lights frames under (see
+    /// [`legaia_render_kernels::scene_lighting::LightingMood`] / `TimeOfDay`).
+    pub fn set_lighting_mood(&self, mood: legaia_render_kernels::scene_lighting::LightingMood) {
+        self.lighting_mood.set(mood);
+    }
+
+    /// The staged lighting mood.
+    pub fn lighting_mood(&self) -> legaia_render_kernels::scene_lighting::LightingMood {
+        self.lighting_mood.get()
+    }
+
+    /// Stage this frame's glow sprites (halos + light shafts, world space -
+    /// [`legaia_render_kernels::scene_lighting::glow_sprites`]). Drawn additively, depth
+    /// tested, after the scene's blend pass, and only while dynamic
+    /// lighting is on and a scene camera is registered
+    /// ([`Self::set_scene_lights`]). Pass an empty slice to clear.
+    pub fn set_glow_sprites(&self, sprites: &[legaia_render_kernels::scene_lighting::GlowSprite]) {
+        let mut cur = self.glow_sprites.borrow_mut();
+        cur.clear();
+        cur.extend_from_slice(sprites);
+    }
+
+    /// Toggle the **point lights' shadows** (default on). Shadows only: with
+    /// this off the dynamic-lighting enhancement's point lights still shade
+    /// the scene, unshadowed, and no shadow-map pass runs - the same meaning
+    /// as the browser play page's "Lamp shadows" box. Effective only while
+    /// [`Self::set_dynamic_lighting`] is on and the host has staged scene
+    /// lights via [`Self::set_scene_lights`]; without both the point-light
+    /// uniform stages a zero count, so the faithful path stays
+    /// pixel-identical and pays nothing.
+    pub fn set_dyn_shadows(&self, enable: bool) {
+        self.dyn_shadows.set(enable);
+    }
+
+    /// Read the current shadow sub-toggle.
+    pub fn dyn_shadows(&self) -> bool {
+        self.dyn_shadows.get()
+    }
+
+    /// Toggle the **camera-occlusion fade enhancement** (see-through
+    /// walls; see [`crate::occlusion_fade`] for the model). Off by
+    /// default, and OFF IS RETAIL: scene fragments render exactly as the
+    /// faithful path does. When on AND a focus is staged
+    /// ([`Self::set_occlusion_focus`]), scene fragments that sit between
+    /// the camera and the player - nearer by more than
+    /// [`crate::occlusion_fade::OCCL_DEPTH_MARGIN`], within the
+    /// screen-space fade circle around the player's projected centre and
+    /// above the player's projected feet -
+    /// dissolve to a 4x4-Bayer screen-door at
+    /// [`crate::occlusion_fade::OCCL_MIN_KEEP`] density, so the character
+    /// stays visible behind walls / roofs / props. Pure presentation:
+    /// depth writes, the blend pass and the simulation are untouched.
+    pub fn set_occlusion_fade(&self, enable: bool) {
+        self.occl_fade.set(enable);
+    }
+
+    /// Read the current camera-occlusion fade toggle.
+    pub fn occlusion_fade(&self) -> bool {
+        self.occl_fade.get()
+    }
+
+    /// Stage the player's **clip-space position** under this frame's scene
+    /// camera (`view_proj * world_pos`, the same matrix the scene draw
+    /// MVPs compose against - pre reversed-Z, which only remaps `z` and
+    /// leaves the `x/y/w` this consumer reads untouched) together with the
+    /// host's **fade strength** (0..1: the eased output of the visibility
+    /// gate - the shaders blend the screen-door keep toward the identity by
+    /// it, so the fade dissolves in/out instead of popping) and that
+    /// camera's **vertical projection scale**
+    /// ([`crate::occlusion_fade::view_proj_scale_y`] of the same matrix).
+    ///
+    /// The scale is what lets the renderer size the fade circle in world
+    /// units instead of in screen space, so the opening tracks the
+    /// character as the camera pushes in - see
+    /// [`crate::occlusion_fade::radius_px`]. The renderer projects the focus
+    /// to framebuffer pixels + view depth when staging the per-frame scene
+    /// uniform. Call every field frame; stale foci would fade the wrong
+    /// screen region, so clear on mode changes
+    /// ([`Self::clear_occlusion_focus`]).
+    ///
+    /// `feet_clip` is the floor point under the character under the same
+    /// camera: the fade only reaches fragments above the line through it
+    /// (the character's projected feet), so the ground in front of them and
+    /// the foot of a wall never dissolve - see
+    /// [`crate::occlusion_fade::lift_factor`].
+    pub fn set_occlusion_focus(
+        &self,
+        clip_pos: [f32; 4],
+        feet_clip: [f32; 4],
+        strength: f32,
+        proj_scale_y: f32,
+    ) {
+        self.occl_focus.set(Some(OcclFocus {
+            clip: clip_pos,
+            feet_clip,
+            strength: strength.clamp(0.0, 1.0),
+            proj_scale_y,
+        }));
+    }
+
+    /// Drop the staged occlusion-fade focus: the fade goes inert (every
+    /// fragment keeps) until the next [`Self::set_occlusion_focus`].
+    pub fn clear_occlusion_focus(&self) {
+        self.occl_focus.set(None);
+    }
+
+    /// Stage the occlusion-fade draw watermark for the current frame: the
+    /// first `textured` scene draws and the first `color` colour draws are
+    /// environment geometry the fade may dissolve; every later slot is an
+    /// actor (the player's own halves, NPCs, spawned meshes) and keeps
+    /// every fragment. This is what lets [`crate::occlusion_fade::
+    /// OCCL_DEPTH_MARGIN`] stay small enough that a wall hugging the
+    /// character still opens up - the player mesh is protected by the
+    /// watermark, not by depth slack.
+    pub fn set_occlusion_env_draws(&self, textured: usize, color: usize) {
+        self.occl_env_counts.set((textured, color));
+    }
+
+    /// Stage the derived per-scene point lights (see
+    /// [`crate::scene_lights`]) together with the scene camera's
+    /// view-projection for the current frame. The renderer recovers each
+    /// scene draw's model matrix as `view_proj^-1 * mvp`, renders one
+    /// shadow-map layer per light over the scene's opaque geometry, and
+    /// the scene fragment shaders add the shadowed point-light gain on
+    /// top of the global dynamic light. At most
+    /// [`legaia_render_kernels::scene_lighting::MAX_SCENE_LIGHTS`] lights are consumed.
+    ///
+    /// Call every frame the lights should apply (the camera moves);
+    /// [`Self::clear_scene_lights`] drops them (scene change / non-field
+    /// modes).
+    pub fn set_scene_lights(
+        &self,
+        lights: &[legaia_render_kernels::scene_lighting::ScenePointLight],
+        view_proj: Mat4,
+    ) {
+        let mut cur = self.scene_lights.borrow_mut();
+        cur.clear();
+        cur.extend_from_slice(
+            &lights[..lights
+                .len()
+                .min(legaia_render_kernels::scene_lighting::MAX_SCENE_LIGHTS)],
+        );
+        self.scene_view_proj.set(Some(view_proj));
+    }
+
+    /// Drop the staged scene lights (and the registered camera): the
+    /// point-light layer goes inert until the next
+    /// [`Self::set_scene_lights`].
+    pub fn clear_scene_lights(&self) {
+        self.scene_lights.borrow_mut().clear();
+        self.scene_view_proj.set(None);
+    }
+
+    /// Number of currently staged scene lights (for HUD / logs).
+    pub fn scene_light_count(&self) -> usize {
+        self.scene_lights.borrow().len()
+    }
+
+    /// The `MeshUniforms.light_dir` word for the current frame:
+    /// `[key_x, key_y, key_z, enable]` of the staged mood. Zero `w` = the
+    /// identity (default off) path.
+    pub(super) fn dyn_light_dir_uniform(&self) -> [f32; 4] {
+        self.lighting_mood.get().uniforms(self.dyn_lighting.get())[0]
+    }
+
+    /// The `MeshUniforms.light_color` word: `[key_r, key_g, key_b, pool]`
+    /// of the staged mood. Only read by the shader when the enable is set.
+    pub(super) fn dyn_light_color_uniform(&self) -> [f32; 4] {
+        self.lighting_mood.get().uniforms(true)[1]
+    }
+
+    /// Set the GP0(0xE2) "Texture Window setting" register state used by
+    /// the VRAM-mesh fragment shader. Values are in 8-pixel steps
+    /// (0..=31): `mask` selects which texel-coordinate bits get forced
+    /// from `offset` (the standard PSX wrap-window mechanic). All-zero
+    /// (the default) is a no-op - texel coords pass through unchanged.
+    ///
+    /// Retail Legaia leaves this register at zero almost everywhere; a
+    /// handful of effect / scene-init scripts in the move-VM extension
+    /// table touch it. Exposed primarily so that future work driving the
+    /// runtime LoadImage / DMA-to-VRAM trace can replay the register
+    /// state faithfully.
+    pub fn set_texture_window(&self, mask_x: u8, mask_y: u8, off_x: u8, off_y: u8) {
+        self.tex_window.set([
+            (mask_x as u32) & 0x1F,
+            (mask_y as u32) & 0x1F,
+            (off_x as u32) & 0x1F,
+            (off_y as u32) & 0x1F,
+        ]);
+    }
+
+    /// Stage the object-effect clip ([`DrawClip`]) of each draw of the next
+    /// scene render: `textured[i]` for `Scene::draws[i]`, `color[i]` for
+    /// `Scene::color_draws[i]`; a missing or `None` entry draws unclipped.
+    /// Held until the next call.
+    pub fn set_draw_clips(&self, textured: Vec<Option<DrawClip>>, color: Vec<Option<DrawClip>>) {
+        *self.draw_clips.borrow_mut() = (textured, color);
+    }
+
+    /// Stage a per-draw NCLIP word for the next scene render: `textured[i]`
+    /// for `Scene::draws[i]`, in [`Renderer::set_backface_cull`]'s encoding.
+    /// A missing or `None` entry keeps the frame's word. Battle bodies use
+    /// it: retail's prim dispatcher culls a body's back faces unless its
+    /// colour word carries the double-sided bit, while the battle pass as a
+    /// whole stays both-sided. Held until the next call.
+    pub fn set_draw_nclip(&self, textured: Vec<Option<u32>>) {
+        *self.draw_nclip.borrow_mut() = textured;
+    }
+
+    /// Read the current `(mask_x, mask_y, off_x, off_y)` texture window
+    /// register state, in 8-pixel steps (0..=31). All zero means no-op.
+    pub fn texture_window(&self) -> [u32; 4] {
+        self.tex_window.get()
+    }
+
+    /// Set the full-scene colour grade applied by the field mesh shaders:
+    /// each shaded pixel is cross-faded toward the per-channel multiply
+    /// `rgb * (gold_r, gold_g, gold_b)` by `strength`. `strength = 0.0`
+    /// (the default) leaves the scene untouched; `1.0` is the full tint.
+    /// Reproduces the opening prologue's gold/amber grade (the `opdeene`
+    /// "It was the Seru." cutscene), which renders the whole 3D scene in
+    /// warm amber while the narration text stays white.
+    ///
+    /// A multiply matches the retail mechanism: the amber is baked into the
+    /// drawn gouraud / texture-modulation colour words (measured on-geometry
+    /// ratio ≈ `255:240:110`), while backdrop textures draw at neutral
+    /// modulation and keep their pre-baked warm texel chroma - which a
+    /// multiply preserves and a luminance collapse would flatten.
+    pub fn set_color_grade(&self, gold: [f32; 3], strength: f32) {
+        self.color_grade
+            .set([gold[0], gold[1], gold[2], strength.clamp(0.0, 1.0)]);
+    }
+
+    /// Set the GTE **depth cue** the field mesh shaders apply after the
+    /// texture-modulation pass - a port of `DPCS` (`cop2 0x780010`), the only
+    /// colour op either retail TMD renderer (`FUN_8002735c`, `FUN_80029888`)
+    /// executes.
+    ///
+    /// `far` is the GTE far colour (cr21-23) in `0..1`; `ir0` is the blend
+    /// factor (`IR0`, hardware `0..0x1000`) in `0..1`. Each shaded pixel
+    /// becomes `c + (far - c) * ir0`, so `ir0 = 0` (the default) is the
+    /// identity. Retail sets both per drawn object; an unfogged field scene
+    /// passes `ir0 = 0`, which is why a town0c capture shows the baked prim
+    /// colours emerging from the GTE's RGB FIFO byte-unchanged.
+    pub fn set_depth_cue(&self, far: [f32; 3], ir0: f32) {
+        self.depth_cue.set([
+            far[0].clamp(0.0, 1.0),
+            far[1].clamp(0.0, 1.0),
+            far[2].clamp(0.0, 1.0),
+            ir0.clamp(0.0, 1.0),
+        ]);
+    }
+
+    /// Read the current depth cue `(far_r, far_g, far_b, ir0)`.
+    pub fn depth_cue(&self) -> [f32; 4] {
+        self.depth_cue.get()
+    }
+
+    /// Stage the **per-render-node depth-cue pull** as a view-depth `IR0`
+    /// ramp: far colour `far` (display `0..1`, written into the
+    /// [`Self::set_depth_cue`] far slot) plus a linear ramp that takes each
+    /// fragment's projected view depth to
+    /// `ir0 = clamp((z - near_z) / (far_z - near_z), 0, 1) * max_ir0`.
+    ///
+    /// Retail stages the DPCS far colour and `IR0` per render node (`+0x74` /
+    /// `+0x78` into GTE cr21-23 / `IR0`, `FUN_8002735C`); the cutscene host
+    /// sets a gold far colour with depth-graded `IR0`s across the opening
+    /// prologue so far scenery crushes toward gold while near ground keeps
+    /// the modulation tint. The ramp reproduces that depth dependence
+    /// per-fragment. The constant-`IR0` fog path ([`Self::set_depth_cue`]) is
+    /// unaffected when the ramp is cleared.
+    pub fn set_depth_cue_ramp(&self, far: [f32; 3], near_z: f32, far_z: f32, max_ir0: f32) {
+        let cur = self.depth_cue.get();
+        self.depth_cue.set([
+            far[0].clamp(0.0, 1.0),
+            far[1].clamp(0.0, 1.0),
+            far[2].clamp(0.0, 1.0),
+            cur[3],
+        ]);
+        let inv_range = if far_z > near_z {
+            1.0 / (far_z - near_z)
+        } else {
+            0.0
+        };
+        self.cue_ramp
+            .set([near_z, inv_range, max_ir0.clamp(0.0, 1.0), 1.0]);
+    }
+
+    /// Disable the view-depth `IR0` ramp (the default): the shaders fall back
+    /// to the constant `IR0` staged by [`Self::set_depth_cue`], which is `0`
+    /// (identity) unless a fog op set it.
+    pub fn clear_depth_cue_ramp(&self) {
+        self.cue_ramp.set([0.0, 0.0, 0.0, 0.0]);
+    }
+
+    /// Read the current cue ramp `(near_z, inv_range, max_ir0, enable)`.
+    pub fn depth_cue_ramp(&self) -> [f32; 4] {
+        self.cue_ramp.get()
+    }
+
+    /// Enable/disable the prologue **palette-collapse grade** - the retail
+    /// gold-prologue mechanism at its true altitude. A live capture of the
+    /// retail opening (recomp VRAM peek vs the disc TIMs) shows the scene's
+    /// uploaded CLUT rows rewritten entry-for-entry to
+    /// `L = max(r, g, b) -> (L, max(L-1, 0), L >> 1)` (5-bit, STP kept, zero
+    /// mismatches across the graded rows), every resident TMD colour word
+    /// rewritten by the prologue's two `4C E6` HSV ops to
+    /// `(V, V*246 >> 8, V*112 >> 8)`, `V = min(max, 0xF8) - 30` (a retail
+    /// `opdeene` state holds every resident word on that curve), with
+    /// runtime-emitted neutral `0x80` words untouched, and **no** render node
+    /// carrying a DPCS `IR0` (node `+0x78` holds `0` all prologue). When
+    /// `enable` is on the mesh shaders apply exactly that: the texel law +
+    /// packet collapse (the `4C E6` sepia rewrite,
+    /// `psx_light::prologue_sepia_word`),
+    /// a global screen `tint` multiply (the op `0x4C 0x12` fade), and an
+    /// inert view-depth cue ramp. When off (the default) every path is
+    /// bit-identical to the multiply-grade render.
+    pub fn set_palette_grade(&self, tint: [f32; 3], enable: bool) {
+        self.palette_grade.set([
+            tint[0].max(0.0),
+            tint[1].max(0.0),
+            tint[2].max(0.0),
+            if enable { 1.0 } else { 0.0 },
+        ]);
+    }
+
+    /// Read the current palette grade `(tint_r, tint_g, tint_b, enable)`.
+    pub fn palette_grade(&self) -> [f32; 4] {
+        self.palette_grade.get()
+    }
+
+    /// Enable/disable the shader-side backface cull on the VRAM / colour
+    /// mesh passes - the port of retail's GTE **NCLIP** screen-winding
+    /// rejection (`FUN_8002735c` skips a prim whose projected winding is
+    /// negative). The engine's rasterizer pipelines draw both sides
+    /// (`cull_mode: None`) because winding parity differs per render frame
+    /// (battle composes a per-model Y-flip, field a camera-side one), so
+    /// this is a per-fragment discard keyed off `front_facing` instead:
+    /// mode `1` discards back-facing fragments, `2` front-facing (pick the
+    /// one that matches the active frame's parity), `0` (default) draws
+    /// both sides.
+    ///
+    /// Without it a camera placed *inside* a closed mesh shell renders the
+    /// shell's near wall over the whole scene - the opdeene prologue's
+    /// crater-rim tableau shot sits inside the cave-wall backdrop mesh, and
+    /// retail's NCLIP is what makes the near wall invisible.
+    pub fn set_backface_cull(&self, mode: u32) {
+        self.backface_cull.set(mode.min(2) as f32);
+    }
+
+    /// Bend every scene draw's vertices down the screen by the overworld
+    /// curvature table (`FUN_800271A8`, `OVERWORLD_CURVE_WGSL`): retail's
+    /// overworld prim leaves add the depth-indexed entry to each vertex's
+    /// `SY`, so the continent falls away over the horizon. `sz_scale` is the
+    /// frame's `clip.w`-to-`SZ` factor
+    /// (`legaia_engine_field::camera_frame::frame_curve_scale`); `0.0`
+    /// (the default) is the identity, which every scene but the kingdom
+    /// overworld (retail's overworld bit `_DAT_1F800394 & 1`) keeps.
+    pub fn set_overworld_curvature(&self, sz_scale: f32) {
+        self.overworld_curve.set(sz_scale.max(0.0));
+    }
+
+    /// Offset every scene draw by the curvature table's build offset, in
+    /// PSX stage rows (negative is up the screen). Retail's table carries
+    /// the `OFY` it was built under less `120` on every entry: `0` from a
+    /// scene load, `-6` once the map display has rebuilt it
+    /// (`legaia_engine_core::world::World::overworld_curve_bias`). It
+    /// applies whatever the curvature scale is - the map display's flat
+    /// table is the offset alone. `0.0` (the default) is the identity.
+    pub fn set_overworld_curve_bias(&self, rows: f32) {
+        self.overworld_curve_bias.set(rows);
+    }
+
+    /// Arm retail's per-primitive near reject for the scene pass
+    /// ([`legaia_render_kernels::prim_near_reject`]): `Some((sz_per_w,
+    /// ot_shift))` drops every textured / colour mesh primitive whose mean
+    /// corner `SZ` (the frame's clip `w` times `sz_per_w`) falls under
+    /// `0x10 << ot_shift`; `None` (the default) never rejects. Hosts arm it
+    /// under the retail field and battle cameras and leave it off for
+    /// cameras retail never had (the debug orbit) and for the viewers.
+    ///
+    /// `span_h` arms the GPU's polygon-size limit on top
+    /// ([`legaia_render_kernels::prim_near_reject::gpu_span_rejected`]).
+    pub fn set_prim_near_reject(&self, cut: Option<(f32, u32)>, span_h: Option<f32>) {
+        self.prim_near
+            .set(legaia_render_kernels::prim_near_reject::shader_params(
+                cut, span_h,
+            ));
+    }
+
+    /// Read the current colour grade `(gold_r, gold_g, gold_b, strength)`.
+    pub fn color_grade(&self) -> [f32; 4] {
+        self.color_grade.get()
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.config.width = width.max(1);
+        self.config.height = height.max(1);
+        self.surface.configure(&self.device, &self.config);
+        self.depth_view = create_depth_view(&self.device, self.config.width, self.config.height);
+    }
+
+    pub fn surface_size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
+    }
+}

@@ -1,0 +1,351 @@
+use super::*;
+use legaia_engine_mode::mode::SceneMode;
+
+#[test]
+fn field_vm_extra_flags_op42_reads_world() {
+    // Op 0x42 mode=0 - host.extra_flags() & (1 << (op1 & 0x1F)) test.
+    // Set bit 5 in extra_flags; op_42 with op1=5 should take the jump.
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.flags.extra_flags = 1 << 5;
+    // [0x42, mode=0, op1=5, lo=4, hi=0] - header_size + 4 = 5 byte total
+    // for skip path; jump path = pc + header_size + 2 + delta.
+    world.load_field_script(vec![0x42, 0, 5, 4, 0]);
+    let _ = world.tick();
+    // With extra_flags bit 5 set, predicate is true → jump.
+    // Jump target = 0 + 1 (header) + 2 + 4 = 7.
+    assert_eq!(world.field_pc, 7, "extra_flags-true 0x42 should take jump");
+}
+
+#[test]
+fn move_vm_ext_set_8007b9d8_writes_world_field() {
+    let mut world = World::new();
+    world.actors[0].active = true;
+    // 0x2F sub-op 0x2F - `_DAT_8007B9D8 = (i32) op[1]`. Note: op[1] in
+    // sub-op space = sub-op selector 0x2F itself, op[2] = the value.
+    // Per the move_vm port, ext sub-op 0x2F passes op[1] (the sub-op
+    // word's "next slot" in the operand stream).
+    let bc = vec![0x002F, 0x002F, 0xCAFE];
+    world.set_move_bytecode(0, Some(bc.clone()));
+    let _ = world.step_move_vm(0, &bc);
+    // Whatever the sub-op handler writes, world.move_dat_8007b9d8 should
+    // pick up a non-zero value.
+    assert_ne!(world.move_vm.dat_8007b9d8, 0);
+}
+
+#[test]
+fn ext_compute_angle_matches_quadrant_when_player_set() {
+    // Place actor at origin, player due-east; angle should be ~0 mod 4096
+    // (positive X direction = angle 0 in the dz.atan2(dx) convention).
+    let mut world = World::new();
+    world.actors[0].active = true;
+    world.actors[0].move_state.world_x = 0;
+    world.actors[0].move_state.world_z = 0;
+    world.actors[1].active = true;
+    world.actors[1].move_state.world_x = 100;
+    world.actors[1].move_state.world_z = 0;
+    world.player_actor_slot = Some(1);
+    // Drive ext sub-op 0x3A: VM writes the angle into bytecode at
+    // `state.pc + op_w(2) + 3`. With pc=0 and op_w(2)=0, dst = u16[3].
+    let bc = vec![0x002F, 0x003A, 0, 0xFFFF, 0xFFFF];
+    world.set_move_bytecode(0, Some(bc.clone()));
+    let _ = world.step_move_vm(0, &bc);
+    // angle 0 (player due-east) should produce ~0 in the dst slot.
+    assert_eq!(
+        world.move_vm.bytecode[0][3], 0,
+        "angle to due-east player should be 0"
+    );
+}
+
+#[test]
+fn ext_compute_angle_returns_zero_when_no_player() {
+    // No player slot designated → ext_compute_angle returns 0.
+    let mut world = World::new();
+    world.actors[0].active = true;
+    let bc = vec![0x002F, 0x003A, 0, 0xFFFF];
+    world.set_move_bytecode(0, Some(bc.clone()));
+    let _ = world.step_move_vm(0, &bc);
+    assert_eq!(world.move_vm.bytecode[0][3], 0);
+}
+
+#[test]
+fn ext_party_member_lookup_returns_table_position() {
+    let mut world = World::new();
+    world.actors[0].active = true;
+    // Party member at index 1 = world actor slot 5 with a known position.
+    world.actors[5].active = true;
+    world.actors[5].move_state.world_x = 100;
+    world.actors[5].move_state.world_y = 50;
+    world.actors[5].move_state.world_z = 200;
+    world.party.party_actor_slots = vec![None, Some(5), None];
+    // Sub-op 0x3B: dst = pc + op_w(3) + 4. We use op_w(2)=1 (party slot 1)
+    // and op_w(3)=0 so dst = u16[4..7].
+    let bc = vec![
+        0x002F, 0x003B, 0x0001, 0x0000, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA,
+    ];
+    world.set_move_bytecode(0, Some(bc.clone()));
+    let _ = world.step_move_vm(0, &bc);
+    assert_eq!(world.move_vm.bytecode[0][4], 100u16);
+    assert_eq!(world.move_vm.bytecode[0][5], 50u16);
+    assert_eq!(world.move_vm.bytecode[0][6], 200u16);
+}
+
+#[test]
+fn ext_party_member_lookup_skips_when_none() {
+    // No party table entry → 0x3B returns size-4 (skip), pre-clears dst.
+    let mut world = World::new();
+    world.actors[0].active = true;
+    let bc = vec![0x002F, 0x003B, 0x0000, 0x0000, 0xAAAA, 0xAAAA, 0xAAAA];
+    world.set_move_bytecode(0, Some(bc.clone()));
+    let _ = world.step_move_vm(0, &bc);
+    // Dst slots pre-cleared even when lookup returns None.
+    assert_eq!(world.move_vm.bytecode[0][4], 0);
+    assert_eq!(world.move_vm.bytecode[0][5], 0);
+    assert_eq!(world.move_vm.bytecode[0][6], 0);
+}
+
+#[test]
+fn ext_fade_color_records_pending_request() {
+    let mut world = World::new();
+    world.actors[0].active = true;
+    // Sub-op 0x3C: r=0xAB, g=0xCD, b=0xEF, ticks=4 (ramp).
+    let bc = vec![0x002F, 0x003C, 0x00AB, 0x00CD, 0x00EF, 0x0004];
+    world.set_move_bytecode(0, Some(bc.clone()));
+    let _ = world.step_move_vm(0, &bc);
+    assert_eq!(
+        world.presentation.pending_fade,
+        Some(FadeRequest {
+            rgb: [0xAB, 0xCD, 0xEF],
+            ticks: 4
+        })
+    );
+}
+
+#[test]
+fn move_player_world_xyz_reads_designated_player_slot() {
+    let mut world = World::new();
+    world.actors[2].active = true;
+    world.actors[2].move_state.world_x = 100;
+    world.actors[2].move_state.world_y = 200;
+    world.actors[2].move_state.world_z = 300;
+    world.player_actor_slot = Some(2);
+    // No direct API to read move_player_world_xyz; verify by stepping
+    // sub-op 0x39 (squared-distance "inside radius" predicate). With
+    // actor 0 at origin and player at (100, _, 300), dist_sq = 100²+300² =
+    // 100000 - predicate fails for r=10 (r² = 100), passes for r=400
+    // (r² = 160000).
+    //
+    // 0x39 is a 4-halfword conditional branch (`[2F][39][radius][delta]`,
+    // the 0x801D4830 tail): the predicate selects `4 + op[3]` over a plain
+    // 4, so the delta word has to be non-zero for the two outcomes to be
+    // distinguishable at all.
+    world.actors[0].active = true;
+    // Predicate fail → fall through the 4-word op.
+    let bc = vec![0x002F, 0x0039, 10, 3, 0, 0];
+    world.set_move_bytecode(0, Some(bc.clone()));
+    let _ = world.step_move_vm(0, &bc);
+    assert_eq!(
+        world.actors[0].move_state.pc, 4,
+        "small-radius 0x39 should fail"
+    );
+    // Predicate pass → PC += 4 + delta(3).
+    world.actors[0].move_state.pc = 0;
+    let bc2 = vec![0x002F, 0x0039, 400, 3, 0, 0];
+    world.set_move_bytecode(0, Some(bc2.clone()));
+    let _ = world.step_move_vm(0, &bc2);
+    assert_eq!(
+        world.actors[0].move_state.pc, 7,
+        "large-radius 0x39 should pass"
+    );
+}
+
+// --- Field-event emission ---------------------------------------------
+
+/// Op 0x35 sub-1 (start BGM) emits `FieldEvent::Bgm` and pins
+/// `current_bgm`. Encoding: `[0x35, lo, hi, sub_op]`.
+#[test]
+fn field_op_35_sub1_emits_bgm_event_and_pins_current() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    // text_id = 0x42 (LE), sub_op = 1 (start field BGM).
+    let bytecode = vec![0x35, 0x42, 0x00, 0x01];
+    world.load_field_script(bytecode);
+    let _ = world.tick();
+    let evs = world.drain_field_events();
+    assert!(
+        evs.iter().any(|e| matches!(
+            e,
+            FieldEvent::Bgm {
+                sub_op: 1,
+                text_id: 0x42
+            }
+        )),
+        "expected Bgm event, got {evs:?}"
+    );
+    assert_eq!(world.audio.current_bgm, Some(0x42));
+}
+
+/// Op 0x3F is the **named scene-change** (not dialog): it stages a pending
+/// named scene transition from the inline destination name. Encoding:
+/// `[0x3F, idx_lo, idx_hi, name_len, <name bytes>, entry_x, entry_z, dir]`.
+#[test]
+fn field_op_3f_stages_named_scene_transition() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    // idx = 60, name_len = 4 ("dolk"), entry_x = 0x01, entry_z = 0x02, dir = 0x03.
+    let mut bytecode = vec![0x3F, 60, 0x00, 4];
+    bytecode.extend_from_slice(b"dolk");
+    bytecode.extend_from_slice(&[0x01, 0x02, 0x03]);
+    world.load_field_script(bytecode);
+    let _ = world.tick();
+    assert_eq!(
+        world.pending_named_scene_transition,
+        Some(("dolk".to_string(), 0x01, 0x02, 0x03)),
+        "0x3F must stage a named scene transition to the inline destination"
+    );
+    // It is NOT a dialog opener.
+    assert!(
+        world.dialog.current.is_none(),
+        "0x3F must not open a dialog box"
+    );
+}
+
+/// A 0x3F whose inline "name" is a text-desync phantom (non-CDNAME bytes)
+/// stages no transition but still advances the PC.
+#[test]
+fn field_op_3f_rejects_phantom_name() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    let mut bytecode = vec![0x3F, 0x00, 0x00, 4];
+    bytecode.extend_from_slice(b"Hi! ");
+    bytecode.extend_from_slice(&[0x00, 0x00, 0x00]);
+    world.load_field_script(bytecode);
+    let _ = world.tick();
+    assert!(world.pending_named_scene_transition.is_none());
+}
+
+#[test]
+fn ext_sub_op_2c_captures_a_strip_request_for_the_draw() {
+    // `0x2F 0x2C` + five unread operand words: the extension calls the
+    // scanline strip emitter `FUN_801D31B0`, which the world captures for
+    // the host's render pass.
+    let mut world = World::new();
+    world.actors[0].active = true;
+    world.actors[0].move_state.world_x = 12;
+    world.actors[0].move_state.world_z = -40;
+    world.actors[0].move_state.render_28 = 0x0400;
+    world.actors[0].move_state.anim_block_u16_set(8, 24);
+    let bc = vec![0x002F, 0x002C, 0, 0, 0, 0, 0];
+    world.set_move_bytecode(0, Some(bc.clone()));
+    let _ = world.step_move_vm(0, &bc);
+    assert_eq!(
+        world.actors[0].move_state.pc, 7,
+        "the instruction is seven halfwords"
+    );
+    let reqs = world.move_vm.take_strip_requests();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].pos, [12, 0, -40]);
+    assert_eq!(reqs[0].scroll.v_phase, 0x0400);
+    assert_eq!(reqs[0].slab.half_w, 24);
+    assert!(world.move_vm.take_strip_requests().is_empty(), "drained");
+    // The queue is capped for a host that never draws.
+    for _ in 0..(legaia_engine_field::move_vm_globals::MOVE_STRIP_REQUEST_CAP + 8) {
+        world.actors[0].move_state.pc = 0;
+        let _ = world.step_move_vm(0, &bc);
+    }
+    assert_eq!(
+        world.move_vm.strip_requests.len(),
+        legaia_engine_field::move_vm_globals::MOVE_STRIP_REQUEST_CAP
+    );
+}
+
+/// The strip set on screen is one tick's: reading it does not drain it (an
+/// idle redraw draws it again), and the next world tick starts it over.
+#[test]
+fn the_strip_frame_holds_until_the_next_tick() {
+    let mut world = World::new();
+    world.actors[0].active = true;
+    let bc = vec![0x002F, 0x002C, 0, 0, 0, 0, 0];
+    world.set_move_bytecode(0, Some(bc.clone()));
+    let _ = world.step_move_vm(0, &bc);
+    assert_eq!(world.move_vm.strip_frame().len(), 1);
+    assert_eq!(
+        world.move_vm.strip_frame().len(),
+        1,
+        "a read is not a drain"
+    );
+    world.move_vm.begin_strip_tick();
+    assert!(
+        world.move_vm.strip_frame().is_empty(),
+        "a new tick starts over"
+    );
+    let _ = world.step_move_vm(0, &bc);
+    // Park the actor so the tick itself emits nothing.
+    world.actors[0].active = false;
+    world.tick();
+    assert!(
+        world.move_vm.strip_frame().is_empty(),
+        "World::tick begins its own strip set"
+    );
+}
+
+/// Sub-op `0x2F`'s word is the frame-step floor `DAT_8007B9D8`: the resolver
+/// `FUN_80016B6C` raises the cadence to its low byte. With the adaptive arm
+/// off (the engine's), the cadence *is* the floor.
+#[test]
+fn move_vm_ext_0x2f_raises_the_frame_step_floor() {
+    let mut world = World::new();
+    world.actors[0].active = true;
+    assert_eq!(world.clock.frame_step_floor, 2);
+    let bc = vec![0x002F, 0x002F, 0x0003];
+    world.set_move_bytecode(0, Some(bc.clone()));
+    let _ = world.step_move_vm(0, &bc);
+    assert_eq!(world.move_vm.dat_8007b9d8, 3);
+    assert_eq!(world.clock.frame_step_floor, 3);
+    assert_eq!(world.clock.frame_step, 3);
+}
+
+/// Ext sub-op `0x30` (RAND_PICK) is a coin flip on `rand() & 1` through
+/// `jal 0x80056798`. A raw LCG state's low bit strictly alternates, so a
+/// raw draw makes the pick a fixed alternation; the shaped draw does not.
+#[test]
+fn ext_rand_pick_draws_the_shaped_bios_rand() {
+    let mut world = World::new();
+    world.actors[0].active = true;
+    world.rng_state = 0x1234_5678;
+    let mut expect = World::new();
+    expect.rng_state = 0x1234_5678;
+    let mut picks = Vec::new();
+    let mut want = Vec::new();
+    for _ in 0..32 {
+        // [2F][30][a=1][b=2][dst=0] -> written to pc + 0 + 5 = word 5.
+        let bc = vec![0x002F, 0x0030, 1, 2, 0, 0xFFFF];
+        world.actors[0].move_state = Default::default();
+        world.set_move_bytecode(0, Some(bc.clone()));
+        let _ = world.step_move_vm(0, &bc);
+        picks.push(world.move_vm.bytecode[0][5]);
+        want.push(if expect.next_rand() & 1 != 0 { 1 } else { 2 });
+    }
+    assert_eq!(picks, want, "0x30 must pick on the shaped draw's low bit");
+    let alternating = picks.windows(2).all(|w| w[0] != w[1]);
+    assert!(!alternating, "a raw LCG low bit would strictly alternate");
+}
+
+/// Ext sub-op `0x05` (RAND_ADD) divides signed: `rand % |op_w(3)|`.
+#[test]
+fn ext_rand_add_divides_by_the_signed_operand() {
+    let mut world = World::new();
+    world.actors[0].active = true;
+    world.rng_state = 0xC0FF_EE01;
+    let mut expect = World::new();
+    expect.rng_state = 0xC0FF_EE01;
+    for _ in 0..16 {
+        // [2F][05][base=100][div=-7][dst=0] -> word 5.
+        let bc = vec![0x002F, 0x0005, 100, (-7i16) as u16, 0, 0];
+        world.actors[0].move_state = Default::default();
+        world.set_move_bytecode(0, Some(bc.clone()));
+        let _ = world.step_move_vm(0, &bc);
+        let want = 100 + (expect.next_rand() % 7) as u16;
+        assert_eq!(world.move_vm.bytecode[0][5], want);
+    }
+}

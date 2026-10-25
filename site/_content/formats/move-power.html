@@ -1,0 +1,271 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">formats</a> &middot; move-power table</div>
+  <h1>Move-power / parameter table <span class="tag tag-done">Confirmed</span></h1>
+  <p class="lede">When an enemy uses a named special attack - Fire Breath, Tail Fire - how hard it hits, how it homes in on its target, what sound plays and which effects burst on contact all come from one 26-byte record in this table. It is the <em>enemy special-attack</em> table: a party member's Tactical Art takes its power from the <a href="art-data.html">art record</a> instead, and plain physical attacks never look here. One record survives for an attack no enemy can cast - the dummied-out &ldquo;Freeze Thunder&rdquo;.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>In the game</dt><dd>Every named monster special attack's damage roll, approach motion, hit reaction, sound cue and effect bursts</dd>
+    <dt>Lives in</dt><dd>Battle-action overlay, PROT entry <strong>0898</strong>: table at runtime VA <code>0x801F4F5C</code> (file <code>0x26744</code>); id&rarr;index map at <code>0x801F4E63</code> (file <code>0x2664B</code>)</dd>
+    <dt>Size / stride</dt><dd>44 records &times; 26 bytes; map is 128 bytes (move ids <code>0x00..=0x7F</code>)</dd>
+    <dt>Indexed by</dt><dd><code>table[map[move_id]]</code> - the move id is the same id space as the <a href="spell-table.html">spell-name table</a></dd>
+    <dt>Parser</dt><dd><code>legaia_game_tables::move_power</code>; CLI <code>asset move-power</code>; engine <code>engine-battle::move_power::MovePowerCatalog</code></dd>
+    <dt>Confidence</dt><dd>Confirmed - the raw PROT bytes byte-match the in-RAM table across unrelated battle states, and every field read is pinned in the instruction stream (<a href="#how-we-know">how we know</a>)</dd>
+    <dt>Used by</dt><dd><a href="../subsystems/battle-formulas.html">Battle formulas</a>, <a href="../subsystems/battle-action.html">Battle action SM</a>, <a href="../subsystems/move-vm.html">Move VM</a>, <a href="../tooling/randomizer.html">Randomizer</a> (move-power slider)</dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="record-layout">
+  <h2>Record layout (26 bytes)</h2>
+  <div class="byte-map" role="img" aria-label="Move-power record bytes 0x00 to 0x0D: power, strike Y offset, move counter, phase duration, homing, tracking, impact, trail page, tag, sound cue">
+    <div class="bm-cell bm-accent" style="--w:3"><span class="bm-off">+0x00</span><span class="bm-name">power</span><span class="bm-size">i16</span></div>
+    <div class="bm-cell" style="--w:3"><span class="bm-off">+0x02</span><span class="bm-name">strike Y offset</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell" style="--w:3"><span class="bm-off">+0x04</span><span class="bm-name">move counter</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell" style="--w:3"><span class="bm-off">+0x06</span><span class="bm-name">phase length</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell" style="--w:2.6"><span class="bm-off">+0x08</span><span class="bm-name">homing</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell" style="--w:2.6"><span class="bm-off">+0x09</span><span class="bm-name">tracking</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell" style="--w:2.6"><span class="bm-off">+0x0A</span><span class="bm-name">impact</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell" style="--w:2.6"><span class="bm-off">+0x0B</span><span class="bm-name">trail page</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell bm-pad" style="--w:2.6"><span class="bm-off">+0x0C</span><span class="bm-name">tag</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell" style="--w:2.6"><span class="bm-off">+0x0D</span><span class="bm-name">sound cue</span><span class="bm-size">u8</span></div>
+  </div>
+  <div class="byte-map" role="img" aria-label="Move-power record bytes 0x0E to 0x19: effect-list head, contact effects, launch effects">
+    <div class="bm-cell" style="--w:4"><span class="bm-off">+0x0E</span><span class="bm-name">effect-list head</span><span class="bm-size">u8 &times; 4</span></div>
+    <div class="bm-cell bm-accent" style="--w:4"><span class="bm-off">+0x12</span><span class="bm-name">contact effects</span><span class="bm-size">u8 &times; 4</span></div>
+    <div class="bm-cell bm-accent" style="--w:4"><span class="bm-off">+0x16</span><span class="bm-name">launch effects</span><span class="bm-size">u8 &times; 4</span></div>
+  </div>
+  <p>Two rows of one 26-byte record; hatched = no runtime reader. Three overlay functions read it, and only the damage kernel touches <code>+0x00</code>.</p>
+  <p>The damage kernel reads <strong>only <code>+0x00</code></strong>. The action setup computes the record address once and caches it in the battle context; the per-frame tick reads the rest off that pointer. No consumer ever touches <code>+0x0c</code>.</p>
+  <table class="layout">
+    <thead><tr><th>Offset</th><th>Size</th><th>Field</th><th>Meaning</th><th>Confidence</th></tr></thead>
+    <tbody>
+      <tr><td><code>+0x00</code></td><td>2 (<code>i16</code>)</td><td>power</td><td>Damage magnitude. A signed <strong>halfword</strong> - a byte-wide reading truncates most of the table. Four derived shifts feed the roll (<a href="#power-shifts">details</a>).</td><td>Confirmed</td></tr>
+      <tr><td><code>+0x02</code></td><td>2 (<code>u16</code>)</td><td>strike Y offset</td><td>Subtracted from the per-arm Y lane when the hit point is seeded from the target.</td><td>Inferred (read confirmed)</td></tr>
+      <tr><td><code>+0x04</code></td><td>2 (<code>u16</code>)</td><td>move counter</td><td>Whole-move timing counter, decremented each frame.</td><td>Confirmed</td></tr>
+      <tr><td><code>+0x06</code></td><td>2 (<code>u16</code>)</td><td>phase duration</td><td>Per-arm phase length written at the strike / re-arm transitions.</td><td>Inferred (read confirmed)</td></tr>
+      <tr><td><code>+0x08</code></td><td>1</td><td>homing speed</td><td>Scales the per-frame XY step toward the target; <code>0x40 - speed</code> reseeds the approach counter.</td><td>Inferred (read confirmed)</td></tr>
+      <tr><td><code>+0x09</code></td><td>1</td><td>tracking flag</td><td>Non-zero: the live XY is copied into the spawned effect each frame, so the effect follows the strike.</td><td>Confirmed (read); semantic Inferred</td></tr>
+      <tr><td><code>+0x0a</code></td><td>1</td><td>impact-effect selector</td><td>Enum 1..5 (<code>0</code> = none) into a 5-entry packed-config table; 3/4/5 branch to extra status-proc rolls.</td><td>Confirmed (read); naming Inferred</td></tr>
+      <tr><td><code>+0x0b</code></td><td>1</td><td>trail texpage</td><td>Afterimage sprite-page id; becomes the GP0 texpage word <code>0x7700 + id</code>.</td><td>Confirmed</td></tr>
+      <tr><td><code>+0x0c</code></td><td>1</td><td>designer tag</td><td><code>'C'/'E'/'G'/0</code> annotation on the internal-tier records only; <strong>no runtime reader</strong> (<a href="#no-reader-sweep">the sweep</a>).</td><td>Unknown (no reader)</td></tr>
+      <tr><td><code>+0x0d</code></td><td>1</td><td>sound cue id</td><td>Handed to the cue dispatcher, which queues the <a href="sfx-table.html">SFX ring</a>.</td><td>Confirmed</td></tr>
+      <tr><td><code>+0x0e</code></td><td>1</td><td>effect-list head</td><td><code>0xFF</code> broadcasts the trail to all four arms; otherwise the head of the effect-id list (<a href="#effect-list-framing">two consumers frame it differently</a>).</td><td>Confirmed (read)</td></tr>
+      <tr><td><code>+0x12</code></td><td>4</td><td>on-contact effects</td><td>Effect-id list dispatched on the hit branch, terminator-ended.</td><td>Confirmed</td></tr>
+      <tr><td><code>+0x16</code></td><td>4</td><td>launch effects</td><td>Effect-id list dispatched at the initial strike; same dispatch as <code>+0x12</code>.</td><td>Confirmed</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Worked example.</strong> Record 3 (move id <code>0x06</code>, the third internal-tier attack) decodes as a homing physical strike: power 1500, approach speed <code>0x20</code>, a 480-frame strike phase, Y offset 250, impact effect 1, cue <code>0x4d</code>, designer tag <code>C</code>, one effect list on launch and a different one on contact.</p>
+</section>
+
+<section class="doc-section" id="indexing">
+  <h2>What indexes it - <code>table[map[move_id]]</code></h2>
+  <p>The record index is <strong>not</strong> the move id. Setup reads the actor's move id (<code>actor[+0x1df]</code>), looks it up in the 128-byte map, and indexes the table with the result; a map byte of <code>0x00</code> or <code>0xFF</code> means &ldquo;no record&rdquo;. Joining the map with the spell table labels every record:</p>
+  <ul class="bullets">
+    <li>records <code>0x10..=0x2b</code> (move ids <code>0x25..=0x74</code>) - the <strong>named monster special attacks</strong>;</li>
+    <li>records <code>0x01..=0x0f</code> (move ids <code>0x04..=0x1f</code>) - the spell table's unnamed <strong>internal enemy-attack tiers</strong> (escalating-power triplets);</li>
+    <li>record 0 - an all-zero unused slot.</li>
+  </ul>
+  <figure class="diagram">
+    <svg viewBox="0 0 880 370" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The move id at actor+0x1DF indexes the 128-byte map at 0x801F4E63; the map byte is the record index into the 26-byte records at 0x801F4F5C. The record's +0x00 power feeds the damage kernel FUN_801DD0AC, +0x0d the sound cue FUN_8004FCC8, +0x0a the impact-config table 0x801F53D4, and the +0x12 and +0x16 effect-id lists bit 7 picks the space: clear spawns the 3D prototype from 0x801F6324 through FUN_80021B04, set spawns an efect.dat pack1 billboard.">
+      <defs><marker id="mp-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="dg-node" x="20" y="120" width="130" height="50" rx="4"/><text class="dg-label" x="85" y="142">move id</text><text class="dg-sub" x="85" y="158">actor+0x1DF</text>
+      <rect class="dg-node" x="190" y="120" width="140" height="50" rx="4"/><text class="dg-label" x="260" y="142">id &#8594; index map</text><text class="dg-sub" x="260" y="158">0x801F4E63</text>
+      <rect class="dg-node-accent" x="420" y="120" width="150" height="50" rx="4"/><text class="dg-label" x="495" y="142">record, 26 bytes</text><text class="dg-sub" x="495" y="158">table 0x801F4F5C</text>
+      <path class="dg-edge" d="M150 145 L188 145" marker-end="url(#mp-arrow)"/>
+      <path class="dg-edge" d="M330 145 L418 145" marker-end="url(#mp-arrow)"/>
+      <text class="dg-edge-label" x="375" y="137" text-anchor="middle">record index</text>
+      <rect class="dg-node" x="700" y="20" width="170" height="50" rx="4"/><text class="dg-label" x="785" y="42">damage kernel</text><text class="dg-sub" x="785" y="58">FUN_801DD0AC</text>
+      <rect class="dg-node" x="700" y="85" width="170" height="50" rx="4"/><text class="dg-label" x="785" y="107">sound cue</text><text class="dg-sub" x="785" y="123">FUN_8004FCC8</text>
+      <rect class="dg-node" x="700" y="150" width="170" height="50" rx="4"/><text class="dg-label" x="785" y="172">impact config</text><text class="dg-sub" x="785" y="188">0x801F53D4</text>
+      <rect class="dg-node" x="700" y="215" width="170" height="50" rx="4"/><text class="dg-label" x="785" y="237">effect-id lists</text><text class="dg-sub" x="785" y="253">bit 7 picks the space</text>
+      <path class="dg-edge" d="M570 135 L585 135 L585 45 L698 45" marker-end="url(#mp-arrow)"/>
+      <text class="dg-edge-label" x="592" y="39">+0x00 power</text>
+      <path class="dg-edge" d="M585 110 L698 110" marker-end="url(#mp-arrow)"/>
+      <text class="dg-edge-label" x="592" y="104">+0x0d cue</text>
+      <path class="dg-edge" d="M570 155 L585 155 L585 175 L698 175" marker-end="url(#mp-arrow)"/>
+      <text class="dg-edge-label" x="592" y="169">+0x0a</text>
+      <path class="dg-edge" d="M585 175 L585 240 L698 240" marker-end="url(#mp-arrow)"/>
+      <text class="dg-edge-label" x="592" y="234">+0x12 / +0x16</text>
+      <rect class="dg-node" x="460" y="310" width="210" height="50" rx="4"/><text class="dg-label" x="565" y="332">3D prototype</text><text class="dg-sub" x="565" y="348">0x801F6324 &#8594; FUN_80021B04</text>
+      <rect class="dg-node" x="700" y="310" width="170" height="50" rx="4"/><text class="dg-label" x="785" y="332">efect.dat billboard</text><text class="dg-sub" x="785" y="348">pack1 pool</text>
+      <path class="dg-edge" d="M740 265 L740 288 L565 288 L565 308" marker-end="url(#mp-arrow)"/>
+      <text class="dg-edge-label" x="590" y="282">bit 7 clear</text>
+      <path class="dg-edge" d="M800 265 L800 308" marker-end="url(#mp-arrow)"/>
+      <text class="dg-edge-label" x="808" y="292">bit 7 set</text>
+    </svg>
+    <figcaption><code>table[map[move_id]]</code> and what each field feeds. Only the damage kernel reads the power halfword; the per-frame tick reads the rest off the record pointer the setup caches.</figcaption>
+  </figure>
+  <h3 id="special-attack-only">Special-attack-only</h3>
+  <p>The map covers exactly 44 ids. The basic-attack and Tactical-Art bands (<code>0x08..=0x11</code>, <code>0x16..=0x18</code>) are unmapped - a queued Somersault or a Gobu Gobu basic attack both resolve to record 0. Damage sources split cleanly:</p>
+  <table>
+    <thead><tr><th>Attack</th><th>Power source</th></tr></thead>
+    <tbody>
+      <tr><td>Enemy special attack</td><td>This table, <code>+0x00</code></td></tr>
+      <tr><td>Party Tactical Art</td><td>Art-record power byte at <code>record0 +0x24</code> (<a href="art-data.html">art data</a>)</td></tr>
+      <tr><td>Basic physical attack</td><td>Generic physical path (<a href="../subsystems/battle-formulas.html#physical-damage">battle formulas</a>)</td></tr>
+      <tr><td>Seru summon</td><td>Caster / summon state - the kernel's summon arm never reads the table</td></tr>
+    </tbody>
+  </table>
+  <p>Of the 29 mapped named ids, 28 are attacks enemies cast. The table is a <em>subset</em> of the enemy roster's attack ids: the 18 ids missing from it are the magic / elemental casts, whose damage is caster-derived. The one mapped record with no caster (move id <code>0x2C</code>) is the unused <strong>Freeze Thunder</strong>: power 37, cue <code>0x4A</code>, empty effect lists; forcing it crashes on a missing asset (<a href="#roster-cross-check">roster numbers</a>).</p>
+</section>
+
+<section class="doc-section" id="effect-lists">
+  <h2>Effect-id lists (<code>+0x12</code> / <code>+0x16</code>)</h2>
+  <p>Both lists hold up to four ids and are dispatched identically - the only difference is <em>when</em> they fire (contact vs launch). Each byte multiplexes two id spaces by bit 7:</p>
+  <table>
+    <thead><tr><th>Entry</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x00</code></td><td>Terminator</td></tr>
+      <tr><td><code>0x01..=0x63</code></td><td><strong>Move-FX space</strong>: spawn the 3D prototype record the effect-prototype table points at, and copy the effect's CLUT row from the sibling table when non-zero</td></tr>
+      <tr><td><code>0x64</code> (100)</td><td>Fixed screen flash, no table lookup</td></tr>
+      <tr><td>bit 7 set, <code>!= 0xFF</code></td><td><strong>2D-sprite space</strong>: <code>id &amp; 0x7F</code> into the <a href="effect.html"><code>efect.dat</code></a> <code>pack1</code> billboard pool</td></tr>
+      <tr><td><code>0xFF</code>, unused <code>0x65..=0x7F</code></td><td>No effect, scan continues</td></tr>
+    </tbody>
+  </table>
+  <p>Both lists index the same two side tables, which sit after the power table in the same overlay (parser <code>move_power::EffectAuxTables</code>):</p>
+  <table class="layout">
+    <thead><tr><th>VA</th><th>File</th><th>Table</th><th>Contents</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x801f6324</code></td><td><code>0x27B0C</code></td><td>effect-prototype pointers</td><td>61 &times; <code>u32</code> overlay VAs, each a variable-length move-VM scene-graph record; packed, not a fixed stride</td></tr>
+      <tr><td><code>0x801f6418</code></td><td><code>0x27C00</code></td><td>per-effect CLUT source x</td><td>61 &times; <code>u8</code>, <code>0</code> = no palette copy. <strong>Not a sound id</strong></td></tr>
+      <tr><td><code>0x801F6470</code></td><td><code>0x27C58</code></td><td>cue-group table</td><td>13 records &times; 5 bytes, indexed by group id (<a href="#cue-groups">details</a>)</td></tr>
+    </tbody>
+  </table>
+  <p>A <code>0x01..=0x63</code> byte spawns a record that is <strong>byte-identical to a summon part record</strong> (<code>i16 model_sel</code>, <code>u16 reserved</code>, then move-VM bytecode) through the same stager and <a href="../subsystems/move-vm.html">move VM</a> the summon renderer uses (<a href="#spawn-path">spawn path</a>). The join from effect back to triggering move is disc-derivable: <code>asset move-power --effect-index</code> emits it.</p>
+</section>
+
+<section class="doc-section" id="runtime-resolution">
+  <h2>In the port</h2>
+  <p><code>legaia_game_tables::move_power</code> parses the table, the map and the side tables; <code>engine-battle::move_power::MovePowerCatalog</code> resolves a move id to a full <code>MoveFx</code> descriptor (every behavioural field, the impact-config join, each list byte classified as a 3D spawn, a 2D pool effect or a flash). A cast of a non-summon move stages its spawn records through the same move VM the summon renderer uses (<code>World::spawn_move_fx</code>); the cue groups are placed by <code>engine-battle-vm::battle_cue_group</code> from the battle-action applier. The exact per-part transform composition of a spawned scene-graph is the piece still shared-open with the summon renderer.</p>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <details class="disclosure">
+    <summary>Readers of every field, and the byte-identity check</summary>
+    <div class="disclosure-body">
+  <table>
+    <thead><tr><th>Function</th><th>Address</th><th>What it proves</th><th>Dump</th></tr></thead>
+    <tbody>
+      <tr><td>Damage kernel</td><td><code>FUN_801dd0ac</code></td><td>Reads <code>+0x00</code> only (<code>lhu</code>, sign-extended); stride built as <code>13a &lt;&lt; 1</code>; map base materialised at <code>0x801dd1a0</code> and <code>0x801dd36c</code>; summon arm (<code>bne a1,0x7</code> at <code>0x801dd104</code>) skips the table.</td><td><code>funcs/801dd0ac.txt</code></td></tr>
+      <tr><td>Action setup</td><td><code>FUN_801dea50</code></td><td>Computes <code>table[map[actor+0x1df]]</code> (map base at <code>0x801df27c</code>) and caches it at <code>ctx+0x1014</code> (<code>sw</code> at <code>0x801df284</code>); walks the effect list from <code>+0x0e</code>.</td><td><code>funcs/801dea50.txt</code></td></tr>
+      <tr><td>Per-frame tick</td><td><code>FUN_801e09f8</code></td><td>Dereferences the cached pointer ~25 times for every field except <code>+0x00</code> / <code>+0x0c</code>; dispatches both effect lists; calls the streak draw <code>FUN_801e1ab0</code> and the cue dispatcher <code>FUN_8004fcc8</code>.</td><td><code>funcs/801e09f8.txt</code></td></tr>
+      <tr><td>Streak draw</td><td><code>FUN_801e1ab0</code></td><td><code>+0x0b</code> becomes the texpage word <code>0x7700 + id</code> at <code>0x801e1d54</code>.</td><td><code>funcs/801e1ab0.txt</code></td></tr>
+      <tr><td>Spawn allocator + stager</td><td><code>FUN_80050ed4</code> &rarr; <code>FUN_80021B04</code></td><td>Move-FX spawn chain, pinned live by an exec breakpoint with the prototype base and list id in registers.</td><td><code>funcs/80050ed4.txt</code>, <code>80021b04.txt</code></td></tr>
+      <tr><td>Cue expander</td><td><code>FUN_801E22C8</code></td><td>Sole reader of the cue-group table (<code>addiu v1, v0, 0x6470</code> at <code>0x801E2374</code>); called from <code>FUN_800402F4</code>.</td><td><code>funcs/801e22c8.txt</code></td></tr>
+      <tr><td>Table extent</td><td>-</td><td><code>0x801F4F5C + 44*26 = 0x801F53D4</code>, exactly where the impact-config table begins; the record count is pinned by the next referenced address.</td><td>overlay image</td></tr>
+      <tr><td>Byte identity</td><td>-</td><td>The <code>0x801F4F5C..0x801F69D8</code> window is byte-identical across unrelated battle saves and matches the raw PROT 0898 bytes at file <code>0x26744</code>; the overlay loads at slot-A base <code>0x801CE818</code> (file <code>0x25178</code>).</td><td>battle save states</td></tr>
+    </tbody>
+  </table>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="details">
+  <h2>Details</h2>
+
+  <details class="disclosure" id="power-shifts">
+    <summary>The four power shifts in the damage kernel</summary>
+    <div class="disclosure-body">
+      <p>The kernel reads <code>+0x00</code> at three load sites and derives four shifts. They are not a full / half / quarter ladder: two bound a random roll, two are summed straight into the damage accumulator.</p>
+      <table>
+        <thead><tr><th>Load</th><th>Shift</th><th>Site</th><th>Role</th></tr></thead>
+        <tbody>
+          <tr><td><code>0x801dd1c0</code></td><td><code>&gt;&gt; 2</code></td><td><code>0x801dd1cc</code></td><td>roll modulus, <code>div</code> at <code>0x801dd1d4</code></td></tr>
+          <tr><td><code>0x801dd1c0</code></td><td><code>&gt;&gt; 0</code></td><td><code>0x801dd240</code></td><td>additive damage term</td></tr>
+          <tr><td><code>0x801dd38c</code></td><td><code>&gt;&gt; 1</code></td><td><code>0x801dd39c</code></td><td>additive threshold term</td></tr>
+          <tr><td><code>0x801dd3cc</code></td><td><code>&gt;&gt; 3</code></td><td><code>0x801dd3d8</code></td><td>roll modulus, <code>div</code> at <code>0x801dd3e0</code></td></tr>
+          <tr><td><code>0x801dd3cc</code></td><td><code>&gt;&gt; 1</code></td><td><code>0x801dd448</code></td><td>additive damage term</td></tr>
+        </tbody>
+      </table>
+      <p>Both moduli are used as <code>rand % (x + 1)</code>, so power <code>&lt; 4</code> rolls a constant 0 on the <code>&gt;&gt; 2</code> branch and <code>&lt; 8</code> on <code>&gt;&gt; 3</code>. The half and eighth scales appear only in the retry arm, which re-floors a too-low attacker score. The roll is then scaled by the element-affinity matrix <code>FUN_801dd864</code>, a sibling table in the same overlay.</p>
+      <p>So the kernel takes the <strong>whole</strong> halfword and does every shift itself; the unshifted word is the biggest term of the attack roll. The power figures on this page (record 3's 1500 from raw <code>0x1770</code>, Freeze Thunder's 37) and the <code>asset move-power</code> column are the <code>&gt;&gt; 2</code> modulus base. Fed that quarter instead, the roll shifts twice: Tail Fire (raw <code>0x1E</code>) on a Spirit-guarding Vahn reads 16 on retail's damage ring, where the quartered roll lands on 6 or 7.</p>
+    </div>
+  </details>
+
+  <details class="disclosure" id="index-instructions">
+    <summary>Indexing in instructions - the odd map base and the delay-slot <code>lui</code></summary>
+    <div class="disclosure-body">
+      <p>The map lookup in the tick materialises <code>0x801F4E64</code> and reads <code>lbu a0,-0x1(v1)</code>; the <code>0x801F4E63</code> base is that <code>addiu 0x4e64</code> / <code>lbu -0x1</code> pair, so the constant <code>0x4e63</code> appears nowhere in the code. The stride is built as <code>13a &lt;&lt; 1</code>, never a literal, so a search for <code>0x1a</code> finds nothing either.</p>
+      <p>Of the three sites that materialise the base, the one at <code>0x801dd36c</code> defeats a linear <code>lui</code>+<code>addiu</code> matcher: its <code>lui a0,0x801f</code> sits in the branch delay slot at <code>0x801dd2f8</code> and the <code>addiu</code> is the branch target, <code>0x74</code> bytes later with <code>a0</code> clobbered in between. A sweep folding pairs must follow branch targets, not adjacency.</p>
+      <p>Per-field load sites: <code>+0x02</code> at <code>0x801e0dc4</code>, <code>0x801e13b8</code>; <code>+0x04</code> at <code>0x801df288</code>; <code>+0x06</code> at <code>0x801e0d70</code>, <code>0x801e1360</code>; <code>+0x08</code> at <code>0x801e1018</code>, <code>0x801e1074</code>, <code>0x801e1274</code>; <code>+0x09</code> at <code>0x801e10d4</code>; <code>+0x0a</code> stored at <code>actor+0x21f</code>, indexing <code>0x801f53d4</code> (<code>(v-1)*4</code>, packed <code>u32</code> words with <code>0x3FF</code>-masked lanes, not pointers) into <code>actor+0x04</code>; <code>+0x0b</code> at <code>0x801e0ca0</code>, <code>0x801e0cd0</code>; <code>+0x0d</code> at <code>0x801e184c</code>; <code>+0x0e</code> at <code>0x801e0c54</code>, <code>0x801df408</code>, <code>0x801df4fc</code>; <code>+0x12</code> at <code>0x801e0d00</code>, <code>0x801e114c</code>, <code>0x801e1250</code>, <code>0x801e12ac</code>; <code>+0x16</code> at <code>0x801e0ddc</code>, <code>0x801e0f54</code>, <code>0x801e13d0</code>, <code>0x801e1550</code>, <code>0x801e1800</code>.</p>
+    </div>
+  </details>
+
+  <details class="disclosure" id="no-reader-sweep">
+    <summary>The <code>+0x0c</code> no-reader sweep - what the negative covers</summary>
+    <div class="disclosure-body">
+      <p>Swept over <strong>bytes, not dumps</strong>: <code>SCUS_942.54</code> plus every overlay image in <code>static-overlays.toml</code>, every 4-byte word decoded independently, for every valid R3000 load / store and <code>j</code> / <code>jal</code> target (not COP2, which cannot address a record). Access shapes modelled: absolute constants (<code>lui</code>+<code>addiu</code>/<code>ori</code> pairs folded and tested against <code>[table, table + 44*26)</code>), base-folded displacements, <code>&times;26</code>-indexed registers, pointer-relative reads through <code>lw rD, 0x1014(rB)</code>, straddling loads, and data-resident pointers. No reference lands at a shifted offset, no data word holds an in-table address, and PROT 0898's five byte-width <em>loads</em> at literal displacement <code>0xc</code> all sit on unrelated RAM structs (the image has 134 memory operations at that displacement; the other 38 byte-width ones are stores). The one form an absolute scan cannot see is impossible here: <code>$gp</code> is <code>0x8007B318</code>, so a signed-16 displacement off it reaches <code>0x80073318..0x80083317</code> and the table sits about 1.5 MB outside that window. PROT 0896 is closed by bytes, producing zero hits in either base-independent encoding. <code>+0x0d</code>, by contrast, <em>is</em> read - once, as a byte, at <code>0x801E184C</code>, feeding the cue dispatcher.</p>
+    </div>
+  </details>
+
+  <details class="disclosure" id="effect-list-framing">
+    <summary>Effect-list framing - the two consumers disagree</summary>
+    <div class="disclosure-body">
+      <ul class="bullets">
+        <li><strong>Setup</strong> walks one contiguous run from <code>+0x0E</code>, stopping only on a zero byte. <code>0xFF</code> is <em>not</em> a terminator there: it has bit 7 set and routes to the 2D path with id <code>0x7F</code>.</li>
+        <li><strong>Tick</strong> reads <code>+0x12</code> and <code>+0x16</code> as two separate 4-byte lists and treats <code>+0x0E == 0xFF</code> as a broadcast to all four arms.</li>
+      </ul>
+      <p>Ids <code>0x0A</code>, <code>0x2D</code> and <code>0x2E</code> additionally latch the spawned handle into <code>ctx+0x1028</code> and seed the per-frame delta triple at <code>ctx+0x1184</code>, which is what makes their effect follow the actor. The 2D path (<code>FUN_801dfdf0</code> &rarr; <code>FUN_801DFDF8</code>) special-cases pack1 <code>0x04</code> &rarr; <code>0x801F5D90</code> and <code>0x13</code> &rarr; <code>0x801F5CF8</code>, the two burst-arm move-VM trigger programs. The 61-entry space bounds both side tables; the runtime's <code>&lt; 100</code> spawn guard is a loose safety check.</p>
+    </div>
+  </details>
+
+  <details class="disclosure" id="cue-groups">
+    <summary>The cue-group table <code>0x801F6470</code></summary>
+    <div class="disclosure-body">
+      <p>Indexed by <strong>group id</strong> rather than effect id; the cue expander reads one 5-byte record per call:</p>
+      <table class="layout">
+        <thead><tr><th>Offset</th><th>Size</th><th>Field</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>+0x00</code></td><td>1</td><td>cue count</td><td><code>0..=4</code>; zero spawns nothing</td></tr>
+          <tr><td><code>+0x01</code></td><td>4</td><td>cue ids</td><td>Only the first <code>count</code> are read. Bit <code>0x80</code> = an <strong>actor</strong> cue (<code>FUN_801DFDF0(id &amp; 0x7F, pos, yaw)</code>, the strike pose); any other id indexes <em>both</em> effect side tables</td></tr>
+        </tbody>
+      </table>
+      <p>13 records fill <code>0x801F6470..0x801F64B5</code>, followed by padding and the <code>summon.DAT</code> path literal; callers never index past <code>0xC</code>. The table has exactly one consumer - a reference scan of SCUS plus every base-mapped overlay finds the address materialised once - while its two sibling tables are reached from five sites each, always in pairs. The caller is the damage-application primitive <code>FUN_800402F4</code> (eleven branches, group ids <code>5..0xC</code> literal or computed). The port carries the kernel, both tables and the per-branch dispatch (<code>legaia_engine_battle_vm::battle_cue_group</code>).</p>
+    </div>
+  </details>
+
+  <details class="disclosure" id="spawn-path">
+    <summary>Effect-prototype records - the spawn path and <code>model_sel</code></summary>
+    <div class="disclosure-body">
+      <p>The tick calls <code>FUN_80050ed4(world_pos, src_pos, 0x801f6324[id], 0x1000)</code>, a 0x60-slot allocator that tail-calls the shared stager <code>FUN_80021B04</code> (the disassembly preserves <code>a0..a3</code>; the C decomp drops them), which reads the record's <code>+0x00 model_sel</code> (<code>&lt; 0</code> / <code>0x4000</code> / <code>0x4001</code> are transform-node / render-mode sentinels, else the mesh is <code>DAT_8007C018[model_sel + gp[0x754]]</code>), allocates an actor (<code>FUN_80020de0</code>), stores the record as the actor's move-VM buffer (<code>+0x48</code>), forces the PC to u16-index 2 (bytecode at <code>record+4</code>) and drives it through the move VM (<code>FUN_80023070</code>). <code>move_power::parse_effect_proto_records</code> decodes the whole table (ids <code>0x27</code> / <code>0x28</code> &rarr; <code>0x801F5BBC</code> / <code>0x801F5BDC</code>); a live Gimard &ldquo;Fire Tail&rdquo; mid-cast holds a part-actor whose <code>+0x48</code> is <code>0x801F5484</code>.</p>
+      <p><code>gp[0x754]</code> (global <code>0x8007BA6C</code>) is <strong><code>party_count + 2</code> in battle</strong>: <code>0</code> when no effect-model library is resident, <code>3</code> for the 1-member training party, <code>5</code> for the full party. The two fixed pool slots plus the live party meshes precede the effect-model library (PROT 0871, engine <code>global_tmd_pool[3..=32]</code>), so <code>model_sel</code> is library-relative and there is no per-summon base.</p>
+    </div>
+  </details>
+
+  <details class="disclosure" id="roster-cross-check">
+    <summary>Roster cross-check numbers</summary>
+    <div class="disclosure-body">
+      <p>Across 186 monsters, 46 distinct attack ids appear in the monster record's special-attack bytes (<code>+0x21..=+0x23</code>); 28 are in this table. The other 18 (<code>0x2E</code> / <code>0x2F</code> / <code>0x3C</code> / <code>0x4A..=0x6E</code>, plus <code>0xA7</code> / <code>0xB8</code> beyond the map) are the magic / elemental casts. 95 of 186 monsters carry no magic attack at all. Freeze Thunder is record 22.</p>
+    </div>
+  </details>
+
+</section>
+
+<section class="doc-section" id="cli">
+  <h2>CLI</h2>
+<pre><code>asset move-power &lt;raw PROT 0898 entry&gt;                  # dump every record (power, counters, effects, ...)
+asset move-power &lt;raw PROT 0898 entry&gt; --effect-index   # effect id -&gt; triggering moves</code></pre>
+  <p>The <a href="../tooling/randomizer.html">randomizer</a>'s move-power slider rewrites <code>+0x00</code> in place through the same parser. Full reference: <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/formats/move-power.md"><code>docs/formats/move-power.md</code></a>.</p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="spell-table.html">Spell table</a>
+    <a href="art-data.html">Art records</a>
+    <a href="mdt.html">MDT move tables</a>
+    <a href="sfx-table.html">SFX descriptor table</a>
+    <a href="effect.html">Effect bundles</a>
+    <a href="../subsystems/battle-formulas.html">Battle formulas</a>
+    <a href="../subsystems/battle-action.html">Battle action SM</a>
+    <a href="../subsystems/move-vm.html">Move VM</a>
+    <a href="../arts.html">Arts</a>
+    <a href="../magic.html">Magic</a>
+    <a href="../tooling/randomizer.html">Randomizer</a>
+    <a href="../reference/re-do-not-re-walk.html">Do not re-walk</a>
+  </div>
+</section>

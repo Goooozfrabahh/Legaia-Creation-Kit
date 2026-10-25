@@ -1,0 +1,1239 @@
+#!/usr/bin/env python3
+"""Summarise a `state_poll.csv` capture into a progression timeline.
+
+The community poll probe (`autorun_state_poll.lua`) writes one CSV per run with
+the schema:
+
+    tick,kind,idx,value,delta,mode,scene,note
+
+`kind` is one of: flagset / flagclr (story-flag bank 0x80085758, `idx` == bit
+number; a flag row noted `bulkload` is a save-load/init dump, not a beat), item
+(0x80084648 inventory; `idx` == item id, `value` == count), gold (0x8008459C),
+party (0x80084594 count + 0x80084598 ids), level / spell (per-roster-slot
+char-record 0x80084708+slot*0x414: displayed-level byte +0x130 and the
+Seru-magic list +0x13C; `idx` == roster slot), scene / mode (0x8007050C name +
+0x8007B83C game-mode transitions), pos (P1: player tile `idx`==tileX
+`value`==tileZ, emitted on a crossing), bgm (P5: global BGM id), fmv (FMV
+trigger id 0x8007BA78 - live-confirms the disc-mined per-scene trigger
+corpus), input / pick
+(P4: pad edges + picker cursor at a confirm), snap (P2: an auto-dumped save
+state), xp / equip (per-roster-slot cumulative XP +0x0 and equipment bytes
++0x196; `idx` == slot / slot*8+eq_slot), counter (fishing points / casino
+coins / Point Card on change), status / hp (battle-detail stream: per-battle-
+actor +0x16E status word and +0x14C current HP; `idx` == actor slot, 0..2
+party / 3..7 monsters), aq (party action-parameter queue +0x1DF..+0x1F2 on
+change; `idx` == party slot, note == the 20-byte window hex - arts inputs are
+raw direction bytes 0x0C..0x0F, a commit rewrites to 0x19/0x1A starter form),
+wmcam (world-map walk-view camera tuple: `idx` == pitch, `value` == H,
+note == yaw/roll/TR-trio/view - the zoom-dynamics trajectory), dt (scratchpad
+frame-step byte 0x1F800393, baseline + stabilized changes).
+See the probe header for the exact source addresses.
+
+This tool turns that raw event log into the things a reverse-engineer actually
+wants out of a playthrough capture:
+
+  * a **scene timeline** (contiguous occupancy windows),
+  * **battle windows** (game-mode dips into the battle-orbit modes),
+  * a **story-flag census** that separates one-off story beats from the bulk
+    flag dumps that a save-load / scene-init writes in a single frame, and
+  * **item / gold / party** change lists.
+
+Pure analysis lives in importable functions (`parse_rows`, `scene_timeline`,
+`battle_windows`, `flag_census`, ...) so `test_analyze_state_poll.py` can drive
+them on synthetic rows with no capture on disk. The CLI is a thin wrapper.
+
+No Sony bytes are involved: this reads only the derived CSV event log.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# game-mode byte (0x8007B83C) values that mean "in the battle orbit". 0x14/0x15
+# are the battle-scene load + active-battle modes; the surrounding 0x08/0x09 and
+# 0x16/0x17 are field<->battle transition shims, not the fight itself.
+BATTLE_MODES = {0x14, 0x15}
+# a single tick that flips at least this many story flags is a bulk write (a
+# save-file load or scene-init flag dump), not a story beat. Real beats move a
+# handful of flags; a load moves 100+.
+DEFAULT_BULK_THRESHOLD = 20
+# scene label the probe emits before a real save/new-game is resolved.
+BOOT_SCENE = "?"
+# note the probe stamps on flag rows it classified as a bulk load/init dump (P3).
+BULK_NOTE = "bulkload"
+# note newer probes stamp on flag rows of a SUB-threshold save-state load frame
+# (mixed flagset+flagclr with >= 3 flips). Older CSVs predate the tag, so the
+# analyzer also detects the signature itself (see LOAD_ITEM_BURST).
+LOAD_NOTE = "loadish"
+# a save-state load that flips FEWER flags than the bulk threshold still
+# re-keys the whole inventory in the same tick (the poll re-baselines every
+# item slot on a load), so a tick carrying BOTH flagset and flagclr rows plus
+# an item-row burst is a load frame, not a story beat. Genuine multi-flag
+# cutscene commits do not rewrite inventory in the same tick (observed maximum
+# across the capture corpus: 3 item rows; loads carry 48+).
+LOAD_ITEM_BURST = 10
+
+# P6: known story-flag labels. A `flagset` beat whose idx is here is annotated;
+# a sticky beat with NO label is surfaced as a NEW LEAD (an unmapped gate worth
+# a name). Seed set = the pinned spine/story gates (extend via --labels FILE).
+KNOWN_FLAGS = {
+    # chapter-1 spine gates
+    0x142: "Caruban victory gate (Mt.Rikuroa -> dolk2 entrance)",
+    0x1BE: "geremi Jeremi-arrival one-shot",
+    0x225: "Rim Elm opening one-shot (flag 549)",
+    0x482: "Drake mist-wall gate (writer OPEN - capture target, report a set!)",
+    0x63A: "rikuroa/retockin carrier flag",
+    # 0x370's writer is statically pinned (doman P1[15], the Usha briefing
+    # latch - man_variant_carrier_census_disc.rs); a live set confirms it.
+    0x370: "Nivora successor gate (SET = doman P1[15] Usha latch; live confirm wanted)",
+    # writer-less gates the static path exhausted on (backlog Track A): a
+    # non-bulk SET of either is exactly the bracket the code-path writer
+    # hunts need (the probe auto-snapshots them).
+    0x50A: "koin1 toggle gate (writer OPEN - capture target, report a set!)",
+    0x5D6: "koin4 gate (writer OPEN - capture target, report a set!)",
+    # chapter-2 Sebucus gate families (man_variant_carrier_census_disc.rs,
+    # PR #313; live-confirmed play-order + tiles from a poll traversal).
+    0x1D5: "balden arc-reached flag",
+    0x1C0: "balden P2[9] pair (set in geremi; cross-scene)",
+    0x1CB: "balden P2[9] pair",
+    0x346: "balden cross-scene successor (P2[14])",
+    0x5B3: "balden 0x5B3 self-latch (Sebucus spine)",
+    0x1EB: "rayman arc-reached one-shot (P2[7])",
+    0x1EC: "rayman arc-reached C2 group",
+    0x201: "rayman linear sub-chain head",
+    0x1FB: "rayman sub-chain -> P2[12]",
+    0x200: "rayman sub-chain -> P2[18]",
+    0x1FC: "rayman sub-chain -> P2[19] (tail)",
+    # rayman "three Haris" oracle hub: one flag per oracle (past/present/
+    # future), each SET by its own NPC script (P1[44/45/46]); AND-gated
+    # together (P1[42/43/47], cutscene P2[18]). Self-contained; no cross-scene
+    # payoff. man_variant_carrier_census_disc.rs::chapter2_rayman_three_haris_hub_flags.
+    0x1FD: "rayman Hari oracle A consulted",
+    0x1FE: "rayman Hari oracle B consulted",
+    0x1FF: "rayman Hari oracle C consulted",
+    # tunnela: seven treasure-chest "opened" flags (P1[1..7], each TEST->give
+    # ->SET; edlast P2[1] tests all seven as a completion battery). Not spine.
+    0x96: "tunnela treasure chest 1/7 (opened)",
+    0x97: "tunnela treasure chest 2/7 (opened)",
+    0x98: "tunnela treasure chest 3/7 (opened)",
+    0x99: "tunnela treasure chest 4/7 (opened)",
+    0x9A: "tunnela treasure chest 5/7 (opened)",
+    0x9B: "tunnela treasure chest 6/7 (opened)",
+    0x9C: "tunnela treasure chest 7/7 (opened)",
+    # stone: the "Gate of Shadows" symbol-code puzzle. 0x1D8..0x1E7 = 16 state
+    # flags (4 directional keys x 4 elemental symbols), one mutually-exclusive
+    # group of 4 per key; * = the disc-encoded solution (SET twice).
+    0x1D8: "stone puzzle: key A symbol 0",
+    0x1D9: "stone puzzle: key A symbol 1 * SOLUTION",
+    0x1DA: "stone puzzle: key A symbol 2",
+    0x1DB: "stone puzzle: key A symbol 3",
+    0x1DC: "stone puzzle: key B symbol 0",
+    0x1DD: "stone puzzle: key B symbol 1",
+    0x1DE: "stone puzzle: key B symbol 2 * SOLUTION",
+    0x1DF: "stone puzzle: key B symbol 3",
+    0x1E0: "stone puzzle: key C symbol 0",
+    0x1E1: "stone puzzle: key C symbol 1",
+    0x1E2: "stone puzzle: key C symbol 2",
+    0x1E3: "stone puzzle: key C symbol 3 * SOLUTION",
+    0x1E4: "stone puzzle: key D symbol 0 * SOLUTION",
+    0x1E5: "stone puzzle: key D symbol 1",
+    0x1E6: "stone puzzle: key D symbol 2",
+    0x1E7: "stone puzzle: key D symbol 3",
+    0x1E8: "stone puzzle SOLVED (Gate of Shadows open; read in map02)",
+    0x1E9: "stone puzzle solved follow-on/sub-state",
+    0x492: "Sebucus region-progress (shared stone/map02)",
+    # 0x527..0x52E = an eight-bit SCRATCH-register bank, bulk-CLEARed as one run
+    # (`65 27..65 2E`) in ~70-90 scenes' entry/setup scripts. NOT story
+    # progression - this is the churn a scene transition produces. 0x528 IS
+    # field-VM-tested (balden init-guard, runtime-confirmed reader = the op-0x70
+    # handler ra 0x801E35E8) though the static census misses that TEST via
+    # desync; still a housekeeping bit, not a gate.
+    # man_variant_carrier_census_disc.rs::flag_0x528_is_scratch_bank_tested_only_as_an_init_guard.
+    0x527: "scratch-bank bit (0x527..0x52E; VM-tested)",
+    0x528: "scratch-bank bit (0x527..0x52E; balden init-guard, not a story gate)",
+    0x529: "scratch-bank bit (0x527..0x52E)",
+    0x52A: "scratch-bank bit (0x527..0x52E)",
+    0x52B: "scratch-bank bit (0x527..0x52E)",
+    0x52C: "scratch-bank bit (0x527..0x52E; VM-tested)",
+    0x52D: "scratch-bank bit (0x527..0x52E)",
+    0x52E: "scratch-bank bit (0x527..0x52E; VM-tested)",
+    # 0x5A0/0x5A1 = a write-only flip-flop PAIR (mutually-exclusive toggle) held
+    # inside rayman's Hari cutscene records; not a gate. 0x6C3 = a write-only
+    # toggle in stone's SOLVED cutscene (its multi-scene census list is C3-CC
+    # data-table desync). All three are zero-TEST cutscene toggles = churn noise.
+    # man_variant_carrier_census_disc.rs::flags_0x5a1_and_0x6c3_are_write_only_cutscene_toggles.
+    0x5A0: "rayman cutscene flip-flop (write-only, with 0x5A1)",
+    0x5A1: "rayman cutscene flip-flop (write-only, with 0x5A0)",
+    0x6C3: "stone SOLVED-cutscene toggle (write-only, not a gate)",
+    # 0x32A/0x590 = REAL stone-local progress gates (SET + TESTed), unlike the
+    # write-only toggles above. 0x32A = the "code clue" marker; 0x590 = a
+    # scene-entry progress gate. Both stone-local (0x590's other7 census TEST is
+    # Shift-JIS desync, not cross-scene).
+    # man_variant_carrier_census_disc.rs::stone_0x32a_and_0x590_are_real_local_progress_gates.
+    0x32A: "stone: code-clue discovered (SET+TEST gate)",
+    0x590: "stone: scene-entry progress gate (local)",
+    # --- Labels grounded in the disc-static system-flag census
+    # (`legaia-engine man-scripts --system-flag-census`, incl. VARIANT-MAN
+    # streaming carriers) + the settled-page gate families
+    # (docs/reference/re-settled-threads.md) + the chapter-1 oracles
+    # (crates/engine-shell/tests/chapter1_*.rs). Labels state the pinned
+    # writer/reader sites; no semantics beyond that are claimed. NB geremi
+    # P1[1] is a dev flag-toggle record (sets/clears many flags) and is never
+    # cited as a writer.
+    # low system flags
+    0x7: "low chapter/variant-state global (gates rayman2/retockin/town0d renditions; ch3 soldier-group C1)",
+    0xA: "low record-busy bit (beat records SET then CLEAR it corpus-wide; census shape, not a story gate)",
+    0x10: "party-recompose low flag (0x10..0x12 written beside PartyAdd; 0x11/0x12 pinned in uru P2[30])",
+    0x11: "party-presence low flag (char 1; set beside PartyAdd - uru P2[30])",
+    0x12: "party-presence low flag (char 2; set beside PartyAdd - uru P2[30])",
+    0x1F: "entry-script housekeeping bit (scene P1[0] SET+CLEAR corpus-wide; not a story gate)",
+    0x35: "battle-victory low flag (SET at battle end FUN_8004E568, cleared by the entity SM; churns per fight)",
+    # entry-script scratch-shape band (P1[0] SET+CLEAR corpus-wide; churns on
+    # scene transitions, not story gates)
+    0x19D: "entry-script scratch-shape bit (P1[0] SET+CLEAR corpus-wide)",
+    0x19E: "entry-script scratch-shape bit (P1[0] SET+CLEAR corpus-wide)",
+    0x19F: "entry-script scratch-shape bit (P1[0] SET+CLEAR corpus-wide)",
+    0x1A4: "entry-script scratch-shape bit (P1[0] SET+CLEAR corpus-wide)",
+    0x59E: "entry-script scratch-shape bit (jiji/kor-cluster P1[0] SET+CLEAR)",
+    # treasure chests outside tunnela (same TEST-own-flag chest shape; all in
+    # the edlast P2[1] completion battery; chest SET is census-desync-blind)
+    0x41: "keikoku treasure chest (TEST keikoku P1[7] + edlast battery; tunnela-chest shape)",
+    0x42: "keikoku treasure chest (TEST keikoku P1[8] + edlast battery)",
+    0x4B: "bylon treasure chest (TEST bylon P1[51] + edlast battery)",
+    0xA7: "tunnelc treasure chest (TEST tunnelc P1[10]/P1[11] + edlast battery)",
+    0xA8: "tunnelc treasure chest (TEST tunnelc P1[12]/P1[13] + edlast battery)",
+    0xBB: "retona treasure chest (TEST retona P1[17] + edlast battery)",
+    # 0x48x scene-visited entry-script band (each carrier's P1[0] SETs its
+    # own; map02 P2[13] bulk-sets the band)
+    0x484: "scene-visited latch (0x48x band; SET by town01/map01 P1[0])",
+    0x487: "scene-visited latch (0x48x band; SET by dolk2 variant P1[0] + suimon P1[0])",
+    0x488: "scene-visited latch (0x48x band; SET by bylon P1[0])",
+    0x48E: "scene-visited latch (0x48x band; SET by jiji P1[0])",
+    # chapter-1 opening / Rim Elm
+    0x20: "town01 opening-record latch (SET in P2[3], TEST P1[51]; ASCII-space operand - census reads aliased)",
+    0x226: "Rim Elm opening chain step (549 -> 0x226 -> 0x227; SET by town01 P2[4])",
+    0x234: "Rim Elm opening latch (SET by town01 P2[3] + P1[40])",
+    0x235: "Rim Elm opening latch (SET by town01 P2[3]; read by P1[40])",
+    0x566: "opdeene entry-script one-shot (Test+Set in opdeene P1[0]; cleared by retock P1[1])",
+    # rikuroa (streaming VARIANT-MAN, PROT 0157)
+    0x287: "rikuroa scene-state band 0x281..0x287 (mirrored Set/Clear pairs P1[10..12]; SET by P2[49])",
+    0x288: "rikuroa Caruban-stager co-latch (SET by variant P1[3] beside the 0x289 staged marker)",
+    0x28A: "rikuroa variant P2[53] beat latch (read by P0[2] + P1[17]/[18])",
+    # dolk / dolk2 / suimon / map01
+    0x178: "dolk2 castle-state latch (SET dolk2 variant P1[1]/P2[7]; TESTed by dolk P0 walk-ons; cleared by dolk P1[26])",
+    0x179: "dolk2 variant P2[7] co-latch (0x178 group; ASCII-alias-prone census reads)",
+    0x26A: "dolk2 variant P2[7] co-latch, read by izumi P1 records (cross-scene)",
+    0x26F: "dolk2 variant P2[7] co-latch (0x178/0x179/0x26A group; alias-prone reads)",
+    0x27C: "dolk2 market-swap one-shot (P2[11] C1 latch, SET at body +0x14 with 0x27D; script-vm.md)",
+    0x27E: "dolk2 castle-state band member (cleared by dolk P1[26] reset + dolk2 variant P1[1]; SET census-blind)",
+    0x2FE: "dolk2 P1[2] SpawnRecord-ladder latch (44 72/73/74 follow-up chain; with 0x2FF)",
+    0x2FF: "dolk2 P1[2] SpawnRecord-ladder latch (with 0x2FE; cleared by geremi P1[28])",
+    0x27B: "suimon entry-script latch (SET by suimon P1[0]; cleared by dolk P1[26])",
+    0x23: "map01 overworld beat group (each of map01 P2[10..12] SETs it)",
+    0x24: "map01 overworld beat group (each of map01 P2[10..12] SETs it)",
+    0x25: "map01 overworld beat group (each of map01 P2[10..12] SETs it)",
+    0x2FA: "map01 overworld beat latch (SET by map01 P2[31]/P2[32])",
+    0x308: "map01 overworld beat latch (SET by map01 P2[29]/P2[33])",
+    # bylon
+    0x17F: "bylon scene-state flag (writers bylon P0[5]/P2[3] + map01 P2[10]/[12])",
+    0x180: "bylon scene-state flag (writers bylon P0[12]/[19] + map01 P2[11]/[12])",
+    0x181: "bylon scene-state flag (writers bylon P0[13] + map01 P2[10]/[11])",
+    0x183: "bylon P2[3] beat latch (co-set with 0x28C; wide cross-scene NPC TEST family)",
+    0x28C: "bylon P2[3] beat latch (co-set with 0x183)",
+    0x293: "bylon P2[8] beat latch",
+    0x294: "bylon beat latch (SET by bylon P2[9]/P2[10])",
+    0x2A8: "bylon P2[16] beat latch (read by vozz P1[2]/P1[3]; cross-scene)",
+    0x2AB: "bylon P2[17] beat latch (read by map01 P1[0])",
+    # vozz / keikoku / garmel / jiji (chapter-1 hub spokes)
+    0x193: "keikoku Ravine portal gate (map01 C1; only SET = vozz P1[7] - chapter1_hub_depth_oracle)",
+    0x2AC: "vozz P1[7] one-shot guard (companion SET beside the 0x193 Ravine SET; C1 of vozz P2[18])",
+    0x2B3: "vozz arrival one-shot (P2[12] self-latch; 0x2B2..0x2B4 group)",
+    0x2B4: "vozz arrival one-shot (P2[13] self-latch; 0x2B2..0x2B4 group)",
+    0x2B6: "vozz P2[14] beat latch (read by vozz P1[2]/[3]/[7])",
+    0x2B9: "keikoku beat latch (SET by keikoku P2[5]/P2[8])",
+    0x2BE: "keikoku P2[7] beat latch (with 0x2BF)",
+    0x2BF: "keikoku P2[7] beat latch (with 0x2BE)",
+    0x195: "garmel Songi-beat latch (SET by P2[11], the Songi stager record)",
+    0x198: "garmel Zeto-stager walk-on one-shot (P2[12] C1 latch)",
+    0x19A: "garmel/map01 post-boss latch (SET garmel P2[15] + map01 P2[32]; read by both entry scripts)",
+    0x28D: "garmel P2[15] beat latch (wide cross-scene NPC TEST family; cleared by izumi P1[11])",
+    0x2AD: "garmel P2[15] beat latch (co-set with 0x28D)",
+    0x301: "jiji P1[1] latch (co-written with 0x305)",
+    0x305: "jiji one-shot beat (P2[2] C1 gate; SET by jiji P1[1])",
+    0x30A: "jiji walk-on latch (SET by jiji P0[1])",
+    0x207: "jiji P0[4] walk-on one-shot pair (with 0x208; Set site DESYNC-tagged in census)",
+    0x208: "jiji P0[4] walk-on one-shot pair (with 0x207)",
+    # chapter-2 Sebucus additions
+    0x1C8: "teien arc step 1 (SET by teien P2[1]; Sebucus spine 0x1C8 -> 0x1C9 -> 0x332)",
+    0x1C9: "teien arc step 2 (SET by teien P2[2]; gates tower P2[2])",
+    0x332: "teien arc completion (SET by teien P2[5]; mirrored by map02 P2[9])",
+    0x1C7: "tower clear flag (tower P2[2] beat, C2 on teien 0x1C9; read by geremi P2[1])",
+    0x1BF: "geremi post-tower beat latch (SET by geremi P2[1], the C2=[0x1C7] record)",
+    0x1D4: "Sebucus arc flag (SET by dohaty P2[13]; balden P2[0] C1 member; very wide TEST family)",
+    0x51A: "map02 P2[9] teien-mirror co-latch (set beside 0x332)",
+    0x51C: "map02 P2[10] retock-mirror co-latch (set beside 0x357)",
+    0x51D: "map02 P2[11] co-latch (set beside 0x320; read by stone P2[4] + rayman2 P2[15])",
+    0x320: "map02 hub beat latch (SET by map02 P2[11]; ASCII-space operand - census reads aliased)",
+    0x5D2: "balden NPC-record latch (SET by balden P1[24]/P1[25])",
+    0x34A: "tunnelc P2[6] one-shot latch (tunnels family)",
+    0x34B: "tunnelc P2[5] one-shot latch (sibling of 0x34A)",
+    0x35F: "tunnelc P2[14] beat latch",
+    0x3DE: "tunnelc local latch (SET tunnelc P1[4]/P2[29]; cleared by P2[30])",
+    # retona / dohaty / retock / retockin
+    0x354: "retona ladder step (0x353..0x357; SET by retona P2[10], read by rugi)",
+    0x355: "retona ladder step (C1 self-latch of P2[15]; 0x353..0x357)",
+    0x356: "retona ladder step (C2 of P2[17]/P2[18]; 0x353..0x357)",
+    0x357: "retona ladder tail = Jeremi-arc cross-scene gate (SET by retona P2[18] + P1[0] backstop; read retock/retockin/map02/geremi/edretoin)",
+    0x3AD: "retona pre-arc marker (SET by retona P2[17]; C2 of map02 P2[10]; P1[0] normalization reads it)",
+    0x3C2: "retona P2[5] beat latch (cleared by P2[4])",
+    0x343: "dohaty P2[9] beat latch (co-set with 0x63D)",
+    0x344: "dohaty P2[10] one-shot (C1 latch)",
+    0x39F: "dohaty P2[10] beat latch (co-set with 0x344)",
+    0x345: "dohaty latch (SET by dohaty P1[0] + P2[12])",
+    0x65A: "dohaty P2[12] beat latch (co-set with 0x345)",
+    0x63D: "dohaty self-latch pair (P2[14] sets / P2[15] consumes)",
+    0x340: "retockin per-NPC one-shot head (Test+Set in P1[30]/P1[31])",
+    0x341: "retockin per-NPC one-shot head (Test+Set in P1[28]/P1[29])",
+    0x567: "retockin P2[43] beat latch (cleared widely by cutscene records)",
+    0x5AF: "retock P1[22] NPC-record latch",
+    0x63C: "retock P2[16] beat latch (read by retock P1[31]/[32])",
+    0x6B0: "retock P2[16] + retockin P0[14] co-latch (cleared by retockin P0[15..17] + map02 P1[0])",
+    # chapter-3 Karisto additions
+    0x378: "map03 P2[15] hub latch (read by doman + map03)",
+    0x38F: "taiku area-progress self-latch (P2[10] C1; gates station P2[24] + station3 P2[2])",
+    0x380: "taiku P2[16] beat pair (with 0x382)",
+    0x382: "taiku P2[16] cross-chapter gate (read by son P1[14]; census spans doman/retockin/ropeway/map03/koin2/korout)",
+    0x395: "taiku variant P2[17] beat latch (cleared by P1[29])",
+    0x517: "taiku variant P2[24] one-shot (0x505..0x519 dungeon-local band)",
+    0x519: "taiku variant P2[12] latch (read by taiku P0[5] + entry; 0x505..0x519 band tail)",
+    0x520: "map03 P2[9] hub one-shot (ASCII-space operand - census reads aliased)",
+    0x526: "scene-transition scratch band bit (0x522..0x531 one-hot exit selector; script-vm.md)",
+    0x51E: "map03 P2[11] co-latch (set beside 0x403)",
+    0x403: "korb3 collection 'all done' latch (C1 of korb3 P2[5..13]; SET by map03 P2[11])",
+    0x41D: "korb3 P2[2] one-shot (C2=[0x41B,0x41C,0x436] requires-all cluster)",
+    0x41E: "korb3 entry-script latch (SET by korb3 P1[0])",
+    0x41F: "korb3 P2[14] beat latch",
+    0x43E: "korb3 collection flag (P2[5..13] C2 member; SET by walk-on P0[3]; 0x403 family)",
+    0x43F: "korb3 collection flag (P2[5..13] C2 member; SET by walk-on P0[4]; 0x403 family)",
+    0x440: "korb3 collection flag (P2[5..13] C2 member; SET by walk-on P0[5]; 0x403 family)",
+    0x441: "korb3 collection flag (P2[5..13] C2 member; SET by walk-on P0[6]; 0x403 family)",
+    0x442: "korb3 collection flag (P2[5..13] C2 member; SET by walk-on P0[7]; 0x403 family)",
+    0x443: "korb3 collection flag (P2[5..13] C2 member; SET by walk-on P0[8]; 0x403 family)",
+    0x444: "korb3 collection flag (P2[5..13] C2 member; SET by walk-on P0[9]; 0x403 family)",
+    0x459: "korb3 collection flag (P2[5..13] C2 member; SET by walk-on P0[24]; 0x403 family)",
+    0x45C: "korb3 collection flag (P2[5..13] C2 member; SET by walk-on P0[23]; 0x403 family)",
+    0x43A: "kor5 chain step 1 (P2[3] self-latch; 0x43A -> 0x436 -> 0x6C4)",
+    0x436: "kor5 chain step 2 (P2[5] self-latch; also in korb3 P2[2] C2)",
+    0x6C4: "kor5 chain tail (P2[8] self-latch, C2=[0x436])",
+    0x619: "kor5 local set/clear toggle (SET P1[2]/P2[3]/P2[8]; CLEAR P1[9]/P2[3]/P2[4])",
+    0x428: "koin3 P2[10] / other7 P2[6] co-latch (castle beat family with 0x430)",
+    0x42F: "koin3 P1[2] latch",
+    0x430: "koin3 P2[8] / other7 P2[5] co-latch, read by edlast (epilogue-visible castle beat)",
+    0x56E: "map03 P1[1] latch (ASCII-alias-prone census reads)",
+    0x56F: "map03 P1[1] co-latch (with 0x56E)",
+    # nilboa (Nivora Ravine)
+    0xD: "low nilboa entry-group gate (C1 of nilboa P2[0] with 0x456; C2 of P2[4]; cleared by P2[7]/P2[28])",
+    0x472: "nilboa 0x47x puzzle-cluster member (Test/Set/Clear in P2[17]; non-nilboa census reads are dialogue aliases)",
+    0x452: "nilboa beat latch (SET by nilboa P2[2]/[3]/[28]; cleared by P2[0])",
+    0x453: "nilboa beat latch (SET by nilboa P2[2]/[3]/[28]; cleared by P2[0])",
+    0x456: "nilboa entry-group shared flag (P2[11] SETs+CLEARs it; entry records' C1)",
+    0x474: "nilboa 0x47x puzzle-cluster member (SET by P2[17])",
+    0x480: "nilboa beat latch (SET by nilboa P2[2]/[3])",
+    0x50C: "nilboa P2[1] latch (cleared by P2[0]; read by P2[40])",
+    0x50D: "nilboa P2[2] latch (cleared by P2[0]; read by P2[39])",
+    0x50E: "nilboa P2[3] latch (cleared by P2[0]; read by P2[38])",
+}
+
+
+# Battle-actor +0x16E mechanical-status bits (docs/subsystems/
+# battle-formulas.md section "status appliers" + battle-action.md +0x16E).
+# 0x400 is the OPEN guard-disable applier thread: a status row that raises it
+# names the exact tick/fight the hunt needs.
+STATUS_BITS = [
+    (0x0001, "Venom"),
+    (0x0002, "Toxic"),
+    (0x0004, "Stone"),
+    (0x0008, "Rot-L"),
+    (0x0010, "Rot-R"),
+    (0x0020, "Rot-UD"),
+    (0x0380, "AI-delegated"),
+    (0x0400, "guard-disable[OPEN]"),
+    (0x1000, "Curse"),
+]
+
+
+def decode_status(word: int) -> str:
+    """Render a +0x16E status word as its known-bit names (+ any residue)."""
+    names = []
+    matched = 0
+    for mask, name in STATUS_BITS:
+        if (word & mask) == mask:
+            names.append(name)
+            matched |= mask
+    residue = word & ~matched
+    if residue:
+        names.append(f"0x{residue:X}?")
+    return "|".join(names) if names else "clear"
+
+
+@dataclass
+class Row:
+    tick: int
+    kind: str
+    idx: int
+    value: int
+    delta: int
+    mode: int  # game-mode byte at the time of the row
+    scene: str
+    note: str
+
+
+@dataclass
+class SceneWindow:
+    scene: str
+    enter_tick: int
+    exit_tick: int  # tick of the row that ended the window (or last tick seen)
+
+    @property
+    def duration(self) -> int:
+        return self.exit_tick - self.enter_tick
+
+
+@dataclass
+class BattleWindow:
+    enter_tick: int
+    exit_tick: int
+    scene: str
+
+    @property
+    def duration(self) -> int:
+        return self.exit_tick - self.enter_tick
+
+
+@dataclass
+class BattleStart:
+    tick: int
+    scene: str
+    staging_id: int  # best-effort 0x8007B7FC (often 0; consumed sub-vsync)
+    formation: list[int]  # DAT_8007BD0C[0..3] first-monster ids
+    enter_mode: int
+
+    @property
+    def is_lone(self) -> bool:
+        """A single non-zero formation slot = a solo enemy = almost always a
+        scripted boss (or a solo-strong random)."""
+        return self.formation[0] != 0 and all(f == 0 for f in self.formation[1:])
+
+
+@dataclass
+class FlagBeat:
+    idx: int
+    set_tick: int
+    scene: str
+    churn: int  # total set+clr events for this flag across the gameplay window
+    sticky: bool  # last event was a set (flag ends up set)
+    tile: tuple[int, int] | None = None  # P1: player tile (x,z) when it fired
+    label: str | None = None  # P6: known-flag label, None => a new lead
+
+
+@dataclass
+class FlagCensus:
+    beats: list[FlagBeat] = field(default_factory=list)
+    bulk_ticks: list[tuple[int, str, int]] = field(default_factory=list)  # (tick, scene, n_flags)
+    # subset of bulk_ticks screened as sub-threshold save-state LOAD frames
+    # (note=loadish from the probe, or the flagset+flagclr+item-burst signature)
+    load_ticks: list[int] = field(default_factory=list)
+
+
+def parse_rows(lines) -> list[Row]:
+    """Parse CSV lines (any iterable of strings, incl. an open file) into Rows.
+
+    Tolerates the header line and blank/short lines. `idx`/`value`/`delta` are
+    signed decimal; `mode` is a `0x..` hex byte.
+    """
+    out: list[Row] = []
+    reader = csv.reader(lines)
+    for parts in reader:
+        if len(parts) < 7:
+            continue
+        if parts[0] == "tick":  # header
+            continue
+        try:
+            tick = int(parts[0])
+        except ValueError:
+            continue
+        kind = parts[1]
+        try:
+            idx = int(parts[2])
+            value = int(parts[3])
+            delta = int(parts[4])
+        except ValueError:
+            idx = value = delta = 0
+        mode_s = parts[5]
+        try:
+            mode = int(mode_s, 16) if mode_s.lower().startswith("0x") else int(mode_s)
+        except ValueError:
+            mode = -1
+        scene = parts[6]
+        note = parts[7] if len(parts) > 7 else ""
+        out.append(Row(tick, kind, idx, value, delta, mode, scene, note))
+    return out
+
+
+def load_csv(path: Path) -> list[Row]:
+    with open(path, newline="") as fh:
+        return parse_rows(fh)
+
+
+def scene_timeline(rows: list[Row]) -> list[SceneWindow]:
+    """Contiguous scene-occupancy windows.
+
+    The `scene` column is present on every row, so we collapse runs of equal
+    scene into windows. Boot-noise scene ('?') windows are kept but are easy to
+    filter downstream.
+    """
+    windows: list[SceneWindow] = []
+    cur: SceneWindow | None = None
+    for r in rows:
+        if cur is None or r.scene != cur.scene:
+            if cur is not None:
+                cur.exit_tick = r.tick
+                windows.append(cur)
+            cur = SceneWindow(scene=r.scene, enter_tick=r.tick, exit_tick=r.tick)
+        else:
+            cur.exit_tick = r.tick
+    if cur is not None:
+        windows.append(cur)
+    return windows
+
+
+def battle_windows(rows: list[Row]) -> list[BattleWindow]:
+    """Windows where the game-mode byte was in a battle-orbit mode.
+
+    Reads the `mode` column (stamped on every row) rather than only `kind==mode`
+    rows, so a battle that spans many flag/item rows is still bracketed.
+    """
+    windows: list[BattleWindow] = []
+    cur: BattleWindow | None = None
+    for r in rows:
+        in_battle = r.mode in BATTLE_MODES
+        if in_battle and cur is None:
+            cur = BattleWindow(enter_tick=r.tick, exit_tick=r.tick, scene=r.scene)
+        elif in_battle and cur is not None:
+            cur.exit_tick = r.tick
+        elif not in_battle and cur is not None:
+            cur.exit_tick = r.tick
+            windows.append(cur)
+            cur = None
+    if cur is not None:
+        windows.append(cur)
+    return windows
+
+
+def _parse_battle_note(note: str) -> tuple[list[int], int]:
+    """Parse a `battle` row note `form=XXYYZZWW enter=0xMM` into (formation, mode).
+
+    Tolerant of missing fields: returns ([0,0,0,0], -1) when unparseable.
+    """
+    formation = [0, 0, 0, 0]
+    enter_mode = -1
+    for tok in note.split():
+        if tok.startswith("form=") and len(tok) >= 5 + 8:
+            hexs = tok[5 : 5 + 8]
+            try:
+                formation = [int(hexs[i : i + 2], 16) for i in range(0, 8, 2)]
+            except ValueError:
+                pass
+        elif tok.startswith("enter="):
+            v = tok[len("enter=") :]
+            try:
+                enter_mode = int(v, 16) if v.lower().startswith("0x") else int(v)
+            except ValueError:
+                pass
+    return formation, enter_mode
+
+
+def battle_starts(rows: list[Row]) -> list[BattleStart]:
+    """One `BattleStart` per `battle` row (the per-fight identity row).
+
+    `idx` carries the best-effort staging id, `value` the first formation slot,
+    and the note the full 4-id formation + enter mode.
+    """
+    out: list[BattleStart] = []
+    for r in rows:
+        if r.kind != "battle":
+            continue
+        formation, enter_mode = _parse_battle_note(r.note)
+        # value column duplicates formation[0]; prefer the note-parsed one but
+        # fall back to value if the note was malformed.
+        if formation[0] == 0 and r.value != 0:
+            formation[0] = r.value
+        out.append(
+            BattleStart(
+                tick=r.tick,
+                scene=r.scene,
+                staging_id=r.idx,
+                formation=formation,
+                enter_mode=enter_mode,
+            )
+        )
+    return out
+
+
+@dataclass
+class PosSample:
+    tick: int
+    scene: str
+    tile_x: int
+    tile_z: int
+
+
+def player_track(rows: list[Row]) -> list[PosSample]:
+    """P1: the player tile-crossing track (one sample per `pos` row).
+
+    `idx` == tile X, `value` == tile Z. Rows are already in tick order.
+    """
+    return [
+        PosSample(tick=r.tick, scene=r.scene, tile_x=r.idx, tile_z=r.value)
+        for r in rows
+        if r.kind == "pos"
+    ]
+
+
+def tile_at(track: list[PosSample], tick: int, scene: str) -> tuple[int, int] | None:
+    """The last player tile at or before `tick` within the same `scene`.
+
+    Scene-scoped so a beat is never attributed to the previous area's tile
+    across a warp (the probe drops the tile baseline on a scene change).
+    """
+    best: PosSample | None = None
+    for s in track:
+        if s.tick > tick:
+            break
+        if s.scene == scene:
+            best = s
+    return (best.tile_x, best.tile_z) if best is not None else None
+
+
+def flag_census(rows: list[Row], bulk_threshold: int = DEFAULT_BULK_THRESHOLD) -> FlagCensus:
+    """Separate one-off story-flag beats from bulk (load/init) flag dumps.
+
+    A tick is treated as a bulk write (save-load / scene-init / new-game zero)
+    when it flips >= bulk_threshold flags OR the probe already tagged its flag
+    rows note=bulkload (P3). A SUB-threshold tick is additionally screened as a
+    save-state LOAD frame when the probe tagged it note=loadish, or (older
+    CSVs) when it carries a flagset+flagclr mix co-occurring with an item-row
+    burst (>= LOAD_ITEM_BURST inventory re-key rows at the same tick) - a real
+    cutscene commit never rewrites the inventory in the same tick. Bulk ticks
+    are excluded from the beat list and reported separately (load-screened
+    ticks also land in `load_ticks`). Remaining flag events aggregate per flag idx: churn
+    count, the last SET tick+scene, sticky-ness. Only sticky flags are returned
+    as beats. Each beat is annotated with the player tile it fired at (P1) and
+    a known-flag label (P6, None => a new lead).
+    """
+    # count flag events per tick to find bulk frames; item rows per tick feed
+    # the sub-threshold load-frame signature.
+    per_tick: dict[int, list[Row]] = {}
+    items_per_tick: dict[int, int] = {}
+    for r in rows:
+        if r.kind in ("flagset", "flagclr"):
+            per_tick.setdefault(r.tick, []).append(r)
+        elif r.kind == "item":
+            items_per_tick[r.tick] = items_per_tick.get(r.tick, 0) + 1
+
+    bulk_ticks_set: set[int] = set()
+    bulk_ticks: list[tuple[int, str, int]] = []
+    load_ticks: list[int] = []
+    for tick, evs in sorted(per_tick.items()):
+        note_bulk = any(BULK_NOTE in e.note for e in evs)
+        note_load = any(LOAD_NOTE in e.note for e in evs)
+        kinds = {e.kind for e in evs}
+        sig_load = (
+            kinds >= {"flagset", "flagclr"}
+            and items_per_tick.get(tick, 0) >= LOAD_ITEM_BURST
+        )
+        if len(evs) >= bulk_threshold or note_bulk or note_load or sig_load:
+            bulk_ticks_set.add(tick)
+            bulk_ticks.append((tick, evs[0].scene, len(evs)))
+            if note_load or sig_load:
+                load_ticks.append(tick)
+
+    churn: dict[int, int] = {}
+    last_set_tick: dict[int, int] = {}
+    last_set_scene: dict[int, str] = {}
+    last_kind: dict[int, str] = {}
+    for r in rows:
+        if r.kind not in ("flagset", "flagclr"):
+            continue
+        if r.tick in bulk_ticks_set:
+            continue
+        churn[r.idx] = churn.get(r.idx, 0) + 1
+        last_kind[r.idx] = r.kind
+        if r.kind == "flagset":
+            last_set_tick[r.idx] = r.tick
+            last_set_scene[r.idx] = r.scene
+
+    track = player_track(rows)
+    beats: list[FlagBeat] = []
+    for idx, n in churn.items():
+        sticky = last_kind.get(idx) == "flagset"
+        if not sticky:
+            continue
+        t = last_set_tick[idx]
+        sc = last_set_scene[idx]
+        beats.append(
+            FlagBeat(
+                idx=idx,
+                set_tick=t,
+                scene=sc,
+                churn=n,
+                sticky=True,
+                tile=tile_at(track, t, sc),
+                label=KNOWN_FLAGS.get(idx),
+            )
+        )
+    beats.sort(key=lambda b: b.set_tick)
+    return FlagCensus(beats=beats, bulk_ticks=bulk_ticks, load_ticks=load_ticks)
+
+
+def item_changes(rows: list[Row]) -> list[Row]:
+    """Item rows with a non-zero delta (pickups gain count, uses lose count)."""
+    return [r for r in rows if r.kind == "item" and r.delta != 0]
+
+
+def gold_changes(rows: list[Row], min_abs: int = 1) -> list[Row]:
+    return [r for r in rows if r.kind == "gold" and abs(r.delta) >= min_abs]
+
+
+def party_changes(rows: list[Row]) -> list[Row]:
+    return [r for r in rows if r.kind == "party"]
+
+
+def level_changes(rows: list[Row]) -> list[Row]:
+    """`level` rows: per-roster-slot displayed-level byte changes (level-ups)."""
+    return [r for r in rows if r.kind == "level"]
+
+
+def spell_changes(rows: list[Row]) -> list[Row]:
+    """`spell` rows: per-roster-slot Seru-magic list changes.
+
+    A positive delta on the count (`value`) is a Seru-capture grant; a row with
+    delta 0 is a spell level-up (the level array changed under a fixed count).
+    """
+    return [r for r in rows if r.kind == "spell"]
+
+
+def xp_changes(rows: list[Row]) -> list[Row]:
+    """`xp` rows: per-roster-slot cumulative-XP changes (battle grants)."""
+    return [r for r in rows if r.kind == "xp"]
+
+
+def equip_changes(rows: list[Row]) -> list[Row]:
+    """`equip` rows: per-equip-slot byte changes (idx = roster_slot*8 + slot)."""
+    return [r for r in rows if r.kind == "equip"]
+
+
+def counter_changes(rows: list[Row]) -> list[Row]:
+    """`counter` rows: fishing points / casino coins / Point Card (note = name)."""
+    return [r for r in rows if r.kind == "counter"]
+
+
+def status_changes(rows: list[Row]) -> list[Row]:
+    """`status` rows: battle-actor +0x16E status-word changes (idx = slot)."""
+    return [r for r in rows if r.kind == "status"]
+
+
+def hp_changes(rows: list[Row]) -> list[Row]:
+    """`hp` rows: battle-actor +0x14C current-HP changes (per-hit timeline)."""
+    return [r for r in rows if r.kind == "hp"]
+
+
+def aq_changes(rows: list[Row]) -> list[Row]:
+    """`aq` rows: party action-queue window changes (idx = party slot 0..2)."""
+    return [r for r in rows if r.kind == "aq"]
+
+
+def _aq_window_bytes(note: str) -> list[int]:
+    """Parse an `aq` row note `q=<hex>` into its window bytes ([] if absent)."""
+    if not note.startswith("q="):
+        return []
+    hexs = note[2:].strip()
+    if len(hexs) % 2 != 0:
+        return []
+    try:
+        return [int(hexs[i : i + 2], 16) for i in range(0, len(hexs), 2)]
+    except ValueError:
+        return []
+
+
+ART_STARTER = 0x19
+SUPER_ART_STARTER = 0x1A
+
+
+def arts_commits(rows: list[Row]) -> list[tuple[Row, bool]]:
+    """`aq` rows whose window holds a committed arts queue (starter form).
+
+    Returns (row, is_super) pairs: the window contains the 0x19 art-starter
+    byte; is_super when the 0x1A Super-Art special starter is also present -
+    those rows are the byte-exact `replace`-string validation data the
+    Super-Art capture batch needs (docs/tooling/super-art-queue-capture.md;
+    tail-match the hex against crates/art/src/super_art.rs).
+    """
+    out: list[tuple[Row, bool]] = []
+    for r in aq_changes(rows):
+        win = _aq_window_bytes(r.note)
+        if ART_STARTER in win:
+            out.append((r, SUPER_ART_STARTER in win))
+    return out
+
+
+def status_leads(rows: list[Row]) -> list[Row]:
+    """Status rows that RAISE the open 0x400 guard-disable bit - each one is
+    the exact bracket the +0x16E-0x400 applier hunt needs (idx = actor slot).
+    """
+    out = []
+    for r in status_changes(rows):
+        old = r.value - r.delta
+        if (r.value & 0x400) and not (old & 0x400):
+            out.append(r)
+    return out
+
+
+def bgm_changes(rows: list[Row]) -> list[Row]:
+    """`bgm` rows (P5): global BGM id changes (`value` == id in the 2000+ space)."""
+    return [r for r in rows if r.kind == "bgm"]
+
+
+def fmv_changes(rows: list[Row]) -> list[Row]:
+    """`fmv` rows: FMV trigger id 0x8007BA78 changes (`value` == fmv_id).
+
+    Live-confirms the disc-mined per-scene trigger assignment
+    (`man_field_scripts::scene_fmv_triggers`; docs/formats/str-fmv-table.md).
+    """
+    return [r for r in rows if r.kind == "fmv"]
+
+
+def wmcam_changes(rows: list[Row]) -> list[Row]:
+    """`wmcam` rows: world-map walk-view camera tuple (idx = pitch, value = H,
+    note = yaw/roll/TR/view). The pitch/TR trajectory between the two pinned
+    zoom anchors is the open walk-camera zoom-dynamics thread."""
+    return [r for r in rows if r.kind == "wmcam"]
+
+
+def dt_changes(rows: list[Row]) -> list[Row]:
+    """`dt` rows: scratchpad frame-step byte 0x1F800393 (value = step;
+    note = `baseline` on the run's first stable sample)."""
+    return [r for r in rows if r.kind == "dt"]
+
+
+def picker_choices(rows: list[Row]) -> list[Row]:
+    """`pick` rows (P4): dialogue picker cursor index at a confirm press."""
+    return [r for r in rows if r.kind == "pick"]
+
+
+def snapshots(rows: list[Row]) -> list[Row]:
+    """`snap` rows (P2): auto-dumped save states (note = reason + filename)."""
+    return [r for r in rows if r.kind == "snap"]
+
+
+def input_edges(rows: list[Row]) -> list[Row]:
+    """`input` rows (P4): pad press/release edges (`value` 1 press / 0 release)."""
+    return [r for r in rows if r.kind == "input"]
+
+
+def _fmt_flag(idx: int) -> str:
+    return f"0x{idx:X} ({idx})"
+
+
+def render_report(rows: list[Row], bulk_threshold: int, want: set[str]) -> str:
+    lines: list[str] = []
+    span = (rows[0].tick, rows[-1].tick) if rows else (0, 0)
+    lines.append(f"# state_poll analysis  rows={len(rows)}  ticks {span[0]}..{span[1]}")
+
+    if "scenes" in want:
+        lines.append("\n## scene timeline")
+        for w in scene_timeline(rows):
+            if w.scene == BOOT_SCENE:
+                continue
+            lines.append(f"  {w.enter_tick:>7}..{w.exit_tick:<7} ({w.duration:>6}f)  {w.scene}")
+
+    if "battles" in want:
+        lines.append("\n## battle windows (mode in {0x14,0x15})")
+        for b in battle_windows(rows):
+            lines.append(f"  {b.enter_tick:>7}..{b.exit_tick:<7} ({b.duration:>5}f)  {b.scene}")
+        starts = battle_starts(rows)
+        if starts:
+            lines.append("\n## battle starts (formation identity; * = lone enemy / likely boss)")
+            for s in starts:
+                form = "".join(f"{f:02X}" for f in s.formation)
+                boss = " *" if s.is_lone else ""
+                stage = f"  staged=0x{s.staging_id:02X}" if s.staging_id else ""
+                lines.append(
+                    f"  tick {s.tick:>7}  {s.scene:<8}  form={form}  enter=0x{s.enter_mode:02X}{stage}{boss}"
+                )
+
+    if "flags" in want:
+        cen = flag_census(rows, bulk_threshold)
+        lines.append(
+            f"\n## bulk flag frames (>= {bulk_threshold} flags/tick = load/init;"
+            " [load] = sub-threshold save-state load frame, screened)"
+        )
+        for tick, scene, n in cen.bulk_ticks:
+            load = "  [load]" if tick in cen.load_ticks else ""
+            lines.append(f"  tick {tick:>7}  scene {scene:<8}  {n} flags{load}")
+        lines.append("\n## story-flag beats (sticky, per-frame, load frames excluded)")
+        lines.append("##   [lead] = unlabeled sticky flag (a candidate new gate)")
+        for b in cen.beats:
+            churn = "" if b.churn == 1 else f"  churn={b.churn}"
+            tile = f"  @tile({b.tile[0]},{b.tile[1]})" if b.tile is not None else ""
+            tag = f"  {b.label}" if b.label else "  [lead]"
+            lines.append(
+                f"  tick {b.set_tick:>7}  {b.scene:<8}  flag {_fmt_flag(b.idx)}{tile}{churn}{tag}"
+            )
+
+    if "items" in want:
+        lines.append("\n## item changes (non-zero delta)")
+        for r in item_changes(rows):
+            sign = "+" if r.delta > 0 else ""
+            lines.append(
+                f"  tick {r.tick:>7}  {r.scene:<8}  id 0x{r.idx:02X}  count={r.value} ({sign}{r.delta})  {r.note}"
+            )
+
+    if "gold" in want:
+        lines.append("\n## gold changes")
+        for r in gold_changes(rows):
+            sign = "+" if r.delta > 0 else ""
+            lines.append(f"  tick {r.tick:>7}  {r.scene:<8}  gold={r.value} ({sign}{r.delta})")
+
+    if "party" in want:
+        lines.append("\n## party changes")
+        for r in party_changes(rows):
+            lines.append(f"  tick {r.tick:>7}  {r.scene:<8}  count={r.value}  {r.note}")
+
+    if "progress" in want:
+        lines.append("\n## level-ups (per roster slot)")
+        for r in level_changes(rows):
+            sign = "+" if r.delta > 0 else ""
+            lines.append(
+                f"  tick {r.tick:>7}  {r.scene:<8}  slot {r.idx}  level={r.value} ({sign}{r.delta})"
+            )
+        lines.append("\n## spell / Seru grants (count delta > 0 = capture grant)")
+        for r in spell_changes(rows):
+            sign = "+" if r.delta > 0 else ""
+            lines.append(
+                f"  tick {r.tick:>7}  {r.scene:<8}  slot {r.idx}  spells={r.value} ({sign}{r.delta})  {r.note}"
+            )
+        lines.append("\n## XP grants (per roster slot, cumulative)")
+        for r in xp_changes(rows):
+            sign = "+" if r.delta > 0 else ""
+            lines.append(
+                f"  tick {r.tick:>7}  {r.scene:<8}  slot {r.idx}  xp={r.value} ({sign}{r.delta})"
+            )
+        lines.append("\n## equipment changes (idx = roster_slot*8 + equip_slot)")
+        for r in equip_changes(rows):
+            lines.append(f"  tick {r.tick:>7}  {r.scene:<8}  {r.note}")
+
+    if "counters" in want:
+        lines.append("\n## counters (fishing points / casino coins / Point Card)")
+        for r in counter_changes(rows):
+            sign = "+" if r.delta > 0 else ""
+            lines.append(
+                f"  tick {r.tick:>7}  {r.scene:<8}  {r.note}={r.value} ({sign}{r.delta})"
+            )
+
+    if "status" in want:
+        lines.append("\n## battle status changes (+0x16E; slot 0..2 party, 3..7 monsters)")
+        for r in status_changes(rows):
+            old = r.value - r.delta
+            lines.append(
+                f"  tick {r.tick:>7}  {r.scene:<8}  slot {r.idx}  "
+                f"0x{old & 0xFFFF:04X}->0x{r.value:04X}  {decode_status(r.value)}"
+            )
+        leads = status_leads(rows)
+        if leads:
+            lines.append("\n## !! 0x400 guard-disable raised (OPEN applier thread - report these)")
+            for r in leads:
+                lines.append(
+                    f"  tick {r.tick:>7}  {r.scene:<8}  slot {r.idx}  {r.note}"
+                )
+
+    if "arts" in want:
+        commits = arts_commits(rows)
+        lines.append("\n## arts commits (party queue in starter form; ** = Super Art)")
+        lines.append("##   Super rows: tail-match hex vs crates/art/src/super_art.rs replace strings")
+        for r, is_super in commits:
+            mark = " **SUPER" if is_super else ""
+            lines.append(
+                f"  tick {r.tick:>7}  {r.scene:<8}  slot {r.idx}  {r.note}{mark}"
+            )
+
+    if "hp" in want:
+        lines.append("\n## battle HP timeline (+0x14C per hit; opt-in verbose)")
+        for r in hp_changes(rows):
+            sign = "+" if r.delta > 0 else ""
+            lines.append(
+                f"  tick {r.tick:>7}  {r.scene:<8}  slot {r.idx}  hp={r.value} ({sign}{r.delta})  {r.note}"
+            )
+
+    if "bgm" in want:
+        lines.append("\n## BGM changes (global id; 2000+ = global pool)")
+        for r in bgm_changes(rows):
+            lines.append(f"  tick {r.tick:>7}  {r.scene:<8}  bgm={r.value}")
+
+    if "fmv" in want:
+        fmvs = fmv_changes(rows)
+        if fmvs:
+            lines.append("\n## FMV triggers (0x8007BA78; live-confirms scene_fmv_triggers)")
+            for r in fmvs:
+                lines.append(f"  tick {r.tick:>7}  {r.scene:<8}  fmv_id={r.value}")
+
+    if "wmcam" in want:
+        cams = wmcam_changes(rows)
+        if cams:
+            lines.append("\n## world-map camera tuple (pitch/H + yaw/roll/TR/view)")
+            for r in cams:
+                lines.append(
+                    f"  tick {r.tick:>7}  {r.scene:<8}  pitch={r.idx}  H={r.value}  {r.note}"
+                )
+
+    if "dt" in want:
+        dts = dt_changes(rows)
+        if dts:
+            lines.append("\n## frame-step (scratchpad 0x1F800393; dt-scaled timer base)")
+            for r in dts:
+                lines.append(f"  tick {r.tick:>7}  {r.scene:<8}  dt={r.value}  {r.note}")
+
+    if "picks" in want:
+        lines.append("\n## dialogue picker choices (cursor index at a confirm)")
+        for r in picker_choices(rows):
+            lines.append(f"  tick {r.tick:>7}  {r.scene:<8}  choice={r.idx}  ({r.note})")
+
+    if "snaps" in want:
+        lines.append("\n## auto-snapshot save states (P2 harvest)")
+        for r in snapshots(rows):
+            lines.append(f"  tick {r.tick:>7}  {r.scene:<8}  {r.note}")
+
+    if "walk" in want:
+        lines.append("\n## walk track (per-scene tile-crossing count + bounds)")
+        track = player_track(rows)
+        by_scene: dict[str, list[PosSample]] = {}
+        for s in track:
+            by_scene.setdefault(s.scene, []).append(s)
+        for scene, samples in by_scene.items():
+            xs = [s.tile_x for s in samples]
+            zs = [s.tile_z for s in samples]
+            lines.append(
+                f"  {scene:<8}  crossings={len(samples):>4}  "
+                f"x[{min(xs)}..{max(xs)}] z[{min(zs)}..{max(zs)}]"
+            )
+
+    if "input" in want:
+        lines.append("\n## input edges (pad press/release)")
+        for r in input_edges(rows):
+            edge = "down" if r.value else "up"
+            lines.append(f"  tick {r.tick:>7}  {r.scene:<8}  {r.note} {edge}")
+
+    return "\n".join(lines)
+
+
+def build_json(rows: list[Row], bulk_threshold: int) -> dict:
+    cen = flag_census(rows, bulk_threshold)
+    return {
+        "rows": len(rows),
+        "tick_span": [rows[0].tick, rows[-1].tick] if rows else [0, 0],
+        "scenes": [
+            {"scene": w.scene, "enter": w.enter_tick, "exit": w.exit_tick, "duration": w.duration}
+            for w in scene_timeline(rows)
+            if w.scene != BOOT_SCENE
+        ],
+        "battles": [
+            {"enter": b.enter_tick, "exit": b.exit_tick, "duration": b.duration, "scene": b.scene}
+            for b in battle_windows(rows)
+        ],
+        "battle_starts": [
+            {
+                "tick": s.tick,
+                "scene": s.scene,
+                "staging_id": s.staging_id,
+                "formation": s.formation,
+                "enter_mode": s.enter_mode,
+                "is_lone": s.is_lone,
+            }
+            for s in battle_starts(rows)
+        ],
+        "flag_bulk_frames": [
+            {"tick": t, "scene": s, "flags": n, "load_frame": t in cen.load_ticks}
+            for (t, s, n) in cen.bulk_ticks
+        ],
+        "flag_beats": [
+            {
+                "flag": b.idx,
+                "flag_hex": f"0x{b.idx:X}",
+                "tick": b.set_tick,
+                "scene": b.scene,
+                "churn": b.churn,
+                "tile": list(b.tile) if b.tile is not None else None,
+                "label": b.label,
+                "lead": b.label is None,
+            }
+            for b in cen.beats
+        ],
+        "items": [
+            {"tick": r.tick, "scene": r.scene, "id": r.idx, "count": r.value, "delta": r.delta, "note": r.note}
+            for r in item_changes(rows)
+        ],
+        "gold": [
+            {"tick": r.tick, "scene": r.scene, "gold": r.value, "delta": r.delta} for r in gold_changes(rows)
+        ],
+        "party": [
+            {"tick": r.tick, "scene": r.scene, "count": r.value, "note": r.note} for r in party_changes(rows)
+        ],
+        "levels": [
+            {"tick": r.tick, "scene": r.scene, "slot": r.idx, "level": r.value, "delta": r.delta}
+            for r in level_changes(rows)
+        ],
+        "spells": [
+            {"tick": r.tick, "scene": r.scene, "slot": r.idx, "count": r.value, "delta": r.delta, "note": r.note}
+            for r in spell_changes(rows)
+        ],
+        "bgm": [
+            {"tick": r.tick, "scene": r.scene, "id": r.value} for r in bgm_changes(rows)
+        ],
+        "fmv": [
+            {"tick": r.tick, "scene": r.scene, "fmv_id": r.value} for r in fmv_changes(rows)
+        ],
+        "picks": [
+            {"tick": r.tick, "scene": r.scene, "choice": r.idx, "button": r.note}
+            for r in picker_choices(rows)
+        ],
+        "snapshots": [
+            {"tick": r.tick, "scene": r.scene, "note": r.note} for r in snapshots(rows)
+        ],
+        "walk": [
+            {"tick": s.tick, "scene": s.scene, "tile": [s.tile_x, s.tile_z]}
+            for s in player_track(rows)
+        ],
+        "xp": [
+            {"tick": r.tick, "scene": r.scene, "slot": r.idx, "xp": r.value, "delta": r.delta}
+            for r in xp_changes(rows)
+        ],
+        "equip": [
+            {
+                "tick": r.tick,
+                "scene": r.scene,
+                "slot": r.idx // 8,
+                "equip_slot": r.idx % 8,
+                "id": r.value,
+                "note": r.note,
+            }
+            for r in equip_changes(rows)
+        ],
+        "counters": [
+            {"tick": r.tick, "scene": r.scene, "name": r.note, "value": r.value, "delta": r.delta}
+            for r in counter_changes(rows)
+        ],
+        "status": [
+            {
+                "tick": r.tick,
+                "scene": r.scene,
+                "slot": r.idx,
+                "word": r.value,
+                "delta": r.delta,
+                "decoded": decode_status(r.value),
+                "note": r.note,
+            }
+            for r in status_changes(rows)
+        ],
+        "status_leads_0x400": [
+            {"tick": r.tick, "scene": r.scene, "slot": r.idx, "note": r.note}
+            for r in status_leads(rows)
+        ],
+        "hp": [
+            {"tick": r.tick, "scene": r.scene, "slot": r.idx, "hp": r.value, "delta": r.delta, "note": r.note}
+            for r in hp_changes(rows)
+        ],
+        "aq": [
+            {"tick": r.tick, "scene": r.scene, "slot": r.idx, "changed": r.delta, "note": r.note}
+            for r in aq_changes(rows)
+        ],
+        "wmcam": [
+            {"tick": r.tick, "scene": r.scene, "pitch": r.idx, "h": r.value, "note": r.note}
+            for r in wmcam_changes(rows)
+        ],
+        "dt": [
+            {"tick": r.tick, "scene": r.scene, "dt": r.value, "delta": r.delta, "note": r.note}
+            for r in dt_changes(rows)
+        ],
+        "arts_commits": [
+            {
+                "tick": r.tick,
+                "scene": r.scene,
+                "slot": r.idx,
+                "queue_hex": r.note[2:] if r.note.startswith("q=") else r.note,
+                "is_super": is_super,
+            }
+            for r, is_super in arts_commits(rows)
+        ],
+    }
+
+
+def _resolve_csv(arg: str) -> Path:
+    p = Path(arg)
+    if p.is_dir():
+        cand = p / "state_poll.csv"
+        if cand.exists():
+            return cand
+    return p
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("csv", help="state_poll.csv, or a capture dir containing one")
+    ap.add_argument("--json", action="store_true", help="emit JSON instead of a text report")
+    ap.add_argument(
+        "--bulk-threshold",
+        type=int,
+        default=DEFAULT_BULK_THRESHOLD,
+        help=f"flags/tick that marks a bulk load frame (default {DEFAULT_BULK_THRESHOLD})",
+    )
+    ap.add_argument(
+        "--only",
+        default="scenes,battles,flags,items,gold,party,progress,counters,status,arts,bgm,fmv,picks,snaps,dt",
+        help="comma list of sections: scenes,battles,flags,items,gold,party,"
+        "progress,counters,status,arts,bgm,fmv,picks,snaps,dt,wmcam,walk,input,hp "
+        "(wmcam+walk+input+hp are opt-in: verbose; arts = committed arts/"
+        "Super-Art queue rewrites from the aq stream)",
+    )
+    ap.add_argument(
+        "--labels",
+        help="JSON file of extra {flag_idx: label} to merge into the flag-label "
+        "map (P6). idx may be decimal or 0x-hex string.",
+    )
+    args = ap.parse_args(argv)
+
+    if args.labels:
+        with open(args.labels) as fh:
+            for k, v in json.load(fh).items():
+                idx = int(k, 16) if str(k).lower().startswith("0x") else int(k)
+                KNOWN_FLAGS[idx] = v
+
+    path = _resolve_csv(args.csv)
+    if not path.exists():
+        print(f"no such CSV: {path}", file=sys.stderr)
+        return 2
+    rows = load_csv(path)
+
+    if args.json:
+        print(json.dumps(build_json(rows, args.bulk_threshold), indent=2))
+    else:
+        want = {s.strip() for s in args.only.split(",") if s.strip()}
+        print(render_report(rows, args.bulk_threshold, want))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

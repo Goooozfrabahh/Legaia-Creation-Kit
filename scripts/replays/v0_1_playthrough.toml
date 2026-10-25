@@ -1,0 +1,39 @@
+[meta]
+schema = "j-replay-v1"
+scenario = "v0_1_pre_battle_tetsu"
+rng_seed = 3735929054
+frames = 366
+
+[[event]]
+frame = 103
+pad = 8192
+
+[[event]]
+frame = 110
+pad = 0
+
+# v0.1 Phase 1 (current): the engine drives a cold boot into Field/town01
+# via BootSession::enter_field_live and stays there, converging against the
+# clean pre-battle town01 field snapshot (v0_1_pre_battle_tetsu: Vahn in front
+# of his house, game_mode 0x03 -> Field). This is the cold-boot-reproducible
+# field anchor. The Tetsu-battle saves (loading/start/menu/submenu) are all
+# BattleMode (game_mode 0x15) and the engine cannot cold-boot into BattleMode,
+# so they are not valid Field-convergence anchors.
+[[expected]]
+frame = 250
+scene_mode = "Field"
+active_scene = "town01"
+
+# The Battle leg is NOT deferred any more, and it does not belong in this
+# file. It landed as its own fixture, `v0_1_battle_leg.toml`, which pins the
+# literal Field -> Battle mode-trace for the scripted Tetsu tutorial fight
+# (`v0_1_battle_leg_mode_trace_matches_expected` diffs it; two sibling tests
+# reach Battle by dialogue-accept and by walk-talk-accept). The retail
+# ground-truth is the BattleMode anchor v0_1_battle_loading_tetsu.
+#
+# The split is deliberate rather than historical. This file's leg is the
+# cold-boot-reproducible *Field* anchor and its convergence target is a
+# `game_mode 0x03` retail snapshot; the battle leg needs a NEW GAME seed
+# (`BootSession::begin_new_game`) so the sparring carrier's prompt arms, and
+# its convergence target is a `0x15` snapshot. Adding a Battle row here would
+# assert one scenario's fixture against the other scenario's save.

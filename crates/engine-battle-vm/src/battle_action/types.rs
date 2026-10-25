@@ -1,0 +1,1408 @@
+//! Core battle-action types: actor slots, action categories/states, poses, and the per-actor `BattleActor` / `BattleActionCtx` state structs.
+
+pub use crate::battle_anim_rate::AnimRate;
+
+/// Number of battle actor pointer-table slots (`0x801C9370` in retail).
+/// Slots `0..3` are party members, `3..8` are monsters.
+pub const ACTOR_SLOTS: usize = 8;
+
+/// Number of bytes in the per-action parameter stream
+/// (`actor[+0x1DF..+0x1F2]`).
+pub const ACTION_PARAM_BYTES: usize = 0x14;
+
+/// Action category - the actor's `+0x1DE` byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ActionCategory {
+    /// Martial Arts (Tactical Arts). The directional input chain is staged
+    /// before this driver runs; by the time `action_state` hits `0x0C`, the
+    /// chain is recorded and the action is "done" for this state machine.
+    TacticalArts = 0,
+    /// Item.
+    Item = 1,
+    /// Magic.
+    Magic = 2,
+    /// Standard physical attack.
+    Attack = 3,
+    /// Spirit (Originals).
+    Spirit = 4,
+    /// Run / Defend.
+    Run = 5,
+    /// Item-target re-route. Not a true category - it's an intermediate
+    /// signal that the item-arm of the magic flow uses.
+    ///
+    /// NB the re-route itself is **not** keyed on this byte: state `0x28`
+    /// reads the *target* byte `+0x1DD` (see
+    /// `battle_action::magic`'s `retarget_item_codes`). These two variants
+    /// name the same values in the category space, and what the category
+    /// dispatch does with them is open.
+    ItemRetargetB = 8,
+    /// Item-target re-route. Same caveat as [`ActionCategory::ItemRetargetB`].
+    ItemRetargetA = 9,
+}
+
+impl ActionCategory {
+    /// Decode from the raw byte stored at `actor[+0x1DE]`. Reserved values
+    /// (`>= 6` except `8` and `9`) decode as [`ActionCategory::TacticalArts`]
+    /// to match the retail "category-zero" fallback.
+    pub fn from_byte(b: u8) -> Self {
+        match b {
+            0 => Self::TacticalArts,
+            1 => Self::Item,
+            2 => Self::Magic,
+            3 => Self::Attack,
+            4 => Self::Spirit,
+            5 => Self::Run,
+            8 => Self::ItemRetargetB,
+            9 => Self::ItemRetargetA,
+            _ => Self::TacticalArts,
+        }
+    }
+
+    /// Encode back to the byte at `actor[+0x1DE]`.
+    pub const fn as_byte(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Symbolic names for the `ctx.action_state` cursor. The retail dispatch is a
+/// 256-entry jump table at `0x801E29A8 + (action_state << 2)`; values not
+/// listed here fall through to the function epilogue (no-op for that frame).
+///
+/// Names mirror the band classifications in `docs/subsystems/battle-action.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ActionState {
+    /// Action begin - resets ctx counters, copies queued action.
+    Begin = 0x00,
+    /// Pre-action wait (FUN_8003F2B8 gate).
+    PreActionWait = 0x0A,
+    /// Action queued from menu (holds while `ctx.menu_open != 0`).
+    QueuedFromMenu = 0x0B,
+    /// Action seed - reads action category, dispatches into appropriate band.
+    ActionSeed = 0x0C,
+
+    /// Attack - face target.
+    AttackFace = 0x14,
+    /// Attack - windup.
+    AttackWindup = 0x15,
+    /// Attack - advance toward target.
+    AttackAdvance = 0x16,
+    /// Attack - close-range.
+    AttackCloseRange = 0x17,
+    /// Attack - strike.
+    AttackStrike = 0x18,
+    /// Attack - short-step (party slot < 3 only).
+    AttackShortStep = 0x19,
+    /// Attack chain - strike loop.
+    AttackChain = 0x1E,
+    /// Attack - recovery wait.
+    AttackRecovery = 0x1F,
+    /// Attack - return.
+    AttackReturn = 0x20,
+
+    /// Magic / Item - cast begin.
+    MagicCastBegin = 0x28,
+    /// Magic - pre-cast wait.
+    MagicPreCastWait = 0x29,
+    /// Magic - animation chain.
+    MagicAnimChain = 0x2A,
+    /// Magic - sustained anim.
+    MagicSustain = 0x2B,
+    /// Magic - hit-frame loop.
+    MagicHitLoop = 0x2C,
+    /// Magic - recovery.
+    MagicRecovery = 0x2D,
+    /// Magic - exit.
+    MagicExit = 0x2E,
+
+    /// Summon - invoke.
+    SummonInvoke = 0x32,
+    /// Summon - fade in.
+    SummonFadeIn = 0x33,
+    /// Summon - actor freeze.
+    SummonActorFreeze = 0x34,
+    /// Summon - sustain.
+    SummonSustain = 0x35,
+    /// Summon - return-from-fade.
+    SummonReturn = 0x36,
+    /// Summon - verify all alive.
+    SummonVerifyAlive = 0x37,
+    /// Summon - done.
+    SummonDone = 0x38,
+
+    /// Spirit / Item - pre-arm.
+    SpiritPreArm = 0x3C,
+    /// Spirit - wait.
+    SpiritWait = 0x3D,
+    /// Spirit - fire.
+    SpiritFire = 0x3E,
+    /// Spirit - wait & fire damage.
+    SpiritFireDamage = 0x3F,
+    /// Spirit - post-damage.
+    SpiritPostDamage = 0x40,
+
+    /// Spirit super-arts - entry variant.
+    SpiritArtsEntry = 0x46,
+    /// Spirit-arts - sustain.
+    SpiritArtsSustain = 0x47,
+    /// Spirit-arts - flush.
+    SpiritArtsFlush = 0x48,
+
+    /// Done - cleanup phase. Universal "action concluded, clean up" arm.
+    DoneCleanup = 0x50,
+    /// Done - fade-down.
+    DoneFadeDown = 0x51,
+    /// Done - Seru-absorb banner hold: entered only when the killing blow
+    /// absorbed a Seru (`ctx[+0x269]`), it holds the "acquired the power of"
+    /// banner for `0xB4` frames (a newly-pressed button cuts it to `0x13`).
+    DoneSeruAbsorb = 0x52,
+    /// End-of-action gate.
+    EndOfAction = 0x5A,
+
+    /// Run - flee anim begin.
+    RunBegin = 0x64,
+    /// Run - wait. On timer expiry the retail 0x65 case branches on the
+    /// run outcome: a FAILED run routes back to `0x50` (Done band - the
+    /// action is consumed, the battle continues), a SUCCESSFUL escape
+    /// routes to `0x66`.
+    RunWait = 0x65,
+    /// Run - successful-escape teardown. The retail 0x66 case stages a
+    /// 0x40-frame `(0xFF,0xFF,0xFF) → (0,0,0)` screen fade through the
+    /// fade-primitive spawner (`FUN_80024E80`, template at `DAT_801C9070`),
+    /// sets the battle-end signal `DAT_8007BD71 = 0xFE` (the same byte the
+    /// `0x5A` wipe gate sets), and parks in the `0x67` terminal hold - the
+    /// party leaves the battle. (An earlier reading labelled this state
+    /// "run failed, battle continues"; the battle-end signal byte falsifies
+    /// that - the failed-run path is the `0x65 → 0x50` branch above.)
+    RunEscape = 0x66,
+    /// Capture - start.
+    CaptureStart = 0x68,
+    /// Capture - wait.
+    CaptureWait = 0x69,
+    /// Capture - sustain.
+    CaptureSustain = 0x6A,
+    /// Capture - end.
+    CaptureEnd = 0x6B,
+
+    /// Magic-capture branch.
+    MagicCaptureBranch = 0x6E,
+    /// Magic-capture - fade.
+    MagicCaptureFade = 0x6F,
+    /// Magic-capture - phase 2.
+    MagicCapturePhase2 = 0x70,
+    /// Magic-capture - finalize.
+    MagicCaptureFinalize = 0x71,
+
+    /// Idle hold (battle paused?).
+    IdleHold = 0xFD,
+    /// End of round. Retail's only writer is the **non-wipe** arm of the
+    /// `0x5A` end-of-action gate, reached when every living actor has acted
+    /// and BOTH sides still have someone standing. The wipe arms never write
+    /// a state byte - they raise the battle-end signal `DAT_8007BD71 = 0xFE`
+    /// instead (as does the escape teardown `0x66`), so battle end is
+    /// signalled through the signal byte, never through this state. See
+    /// `docs/subsystems/battle-action.md`
+    /// § "`0xFF` is the round boundary, not the battle's end".
+    RoundEnd = 0xFF,
+}
+
+impl ActionState {
+    /// Decode from the raw byte. Returns `None` for unmapped values; callers
+    /// treat those as "default no-op arm" (the retail dispatcher's default
+    /// epilogue).
+    pub fn from_byte(b: u8) -> Option<Self> {
+        Some(match b {
+            0x00 => Self::Begin,
+            0x0A => Self::PreActionWait,
+            0x0B => Self::QueuedFromMenu,
+            0x0C => Self::ActionSeed,
+
+            0x14 => Self::AttackFace,
+            0x15 => Self::AttackWindup,
+            0x16 => Self::AttackAdvance,
+            0x17 => Self::AttackCloseRange,
+            0x18 => Self::AttackStrike,
+            0x19 => Self::AttackShortStep,
+            0x1E => Self::AttackChain,
+            0x1F => Self::AttackRecovery,
+            0x20 => Self::AttackReturn,
+
+            0x28 => Self::MagicCastBegin,
+            0x29 => Self::MagicPreCastWait,
+            0x2A => Self::MagicAnimChain,
+            0x2B => Self::MagicSustain,
+            0x2C => Self::MagicHitLoop,
+            0x2D => Self::MagicRecovery,
+            0x2E => Self::MagicExit,
+
+            0x32 => Self::SummonInvoke,
+            0x33 => Self::SummonFadeIn,
+            0x34 => Self::SummonActorFreeze,
+            0x35 => Self::SummonSustain,
+            0x36 => Self::SummonReturn,
+            0x37 => Self::SummonVerifyAlive,
+            0x38 => Self::SummonDone,
+
+            0x3C => Self::SpiritPreArm,
+            0x3D => Self::SpiritWait,
+            0x3E => Self::SpiritFire,
+            0x3F => Self::SpiritFireDamage,
+            0x40 => Self::SpiritPostDamage,
+
+            0x46 => Self::SpiritArtsEntry,
+            0x47 => Self::SpiritArtsSustain,
+            0x48 => Self::SpiritArtsFlush,
+
+            0x50 => Self::DoneCleanup,
+            0x51 => Self::DoneFadeDown,
+            0x52 => Self::DoneSeruAbsorb,
+            0x5A => Self::EndOfAction,
+
+            0x64 => Self::RunBegin,
+            0x65 => Self::RunWait,
+            0x66 => Self::RunEscape,
+            0x68 => Self::CaptureStart,
+            0x69 => Self::CaptureWait,
+            0x6A => Self::CaptureSustain,
+            0x6B => Self::CaptureEnd,
+
+            0x6E => Self::MagicCaptureBranch,
+            0x6F => Self::MagicCaptureFade,
+            0x70 => Self::MagicCapturePhase2,
+            0x71 => Self::MagicCaptureFinalize,
+
+            0xFD => Self::IdleHold,
+            0xFF => Self::RoundEnd,
+
+            _ => return None,
+        })
+    }
+
+    /// Encode back to the byte at `ctx.action_state`.
+    pub const fn as_byte(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Pose IDs used by `FUN_801D5854(actor_id, pose_id)`. Surfaced from the
+/// docs:
+///
+/// - `6` = idle / breathing
+/// - `7` = ready / pre-action
+/// - `8` = action-end / hit-recovery
+/// - `9` = defeat / down
+///
+/// Retail-side these select **camera/presentation programs** (the driver
+/// never writes the anim fields; anim ids are entry indices with idle = 0,
+/// aligned with this space at 7/8/9 by design - see
+/// `docs/subsystems/battle-action.md`). The engine's pose host hook also
+/// drives the same-numbered action clips, which matches the frames retail
+/// shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Pose {
+    Idle = 6,
+    Ready = 7,
+    Recover = 8,
+    Defeat = 9,
+}
+
+/// Per-actor flag bits at `actor[+0x1DC]`. Set by the strike / spell loops.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ActorFlags(pub u8);
+
+impl ActorFlags {
+    pub const WINDUP_DONE: u8 = 0x01;
+    pub const ADVANCE_DONE: u8 = 0x02;
+    pub const EXIT: u8 = 0x04;
+    /// "This actor's effects are suppressed": the per-frame effect-script
+    /// walk (`FUN_801DEA50`, `0x801decd0..dc`) is a no-op while set.
+    pub const FX_SUPPRESSED: u8 = 0x08;
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+    pub const fn has(self, mask: u8) -> bool {
+        (self.0 & mask) != 0
+    }
+    pub fn set(&mut self, mask: u8) {
+        self.0 |= mask;
+    }
+    pub fn clear(&mut self, mask: u8) {
+        self.0 &= !mask;
+    }
+}
+
+/// Per-actor state read or written by `FUN_801E295C`.
+///
+/// Field naming uses the byte-offset convention from `docs/subsystems/battle-action.md`
+/// to keep the link to the decompilation explicit. Engines free to back this
+/// with whatever data structure makes sense - the state machine mutates this
+/// The value the strike cursor `ctx[+0x15]` is parked at once the band has
+/// left the loop (`li v0,0xff ; sb v0,0x4(s5)` at `0x801E3B14..0x801E3B1C`).
+/// The damage kernel reads it to tell a mid-chain hit (accumulate only) from
+/// a hit of the action's last clip (apply the accumulated total) -
+/// `0x801EE9A4`.
+pub const STRIKE_CURSOR_PARKED: u8 = 0xFF;
+
+/// struct directly and dispatches side effects through [`BattleActionHost`].
+#[derive(Debug, Clone, Default)]
+pub struct BattleActor {
+    /// `+0x00` - the **combo damage accumulator**. The damage kernel
+    /// `FUN_801EC3E4` adds every landed hit's damage here (`0x801EDB40`,
+    /// beside the HP-bar seed at `+0x10`) and leaves live HP alone; the
+    /// hit that lands once the action SM has left the strike loop (the
+    /// cursor `ctx[+0x15]` reads `0xFF`, `0x801EE9A4`) and is its clip's
+    /// last listed hit subtracts the whole accumulator from `+0x14C` in one
+    /// write (`0x801EEA10..0x801EEA3C`) and zeroes it (`0x801EEA74`). The
+    /// TOTAL counter the HUD draws is this word. Retail's tail also tests
+    /// it against live HP to decide whether the target is "still standing"
+    /// for the flinch staging (`0x801EC5CC`, `0x801EEC18`).
+    pub damage_accum: u32,
+    /// `+0x14C` - liveness flag (non-zero = alive). Read by every state's
+    /// "is target valid" check.
+    pub liveness: u16,
+    /// `+0x150` - current MP (subtracted by Magic / Spirit cast costs).
+    pub mp: u16,
+    /// `+0x16E` - per-actor flag bank. Bit `0x4` = "non-targetable", bits
+    /// `0x380` = AI-controlled, `0x404` = AI + non-targetable. Read at state
+    /// `ActionSeed` to decide between party-setup and monster-setup hooks.
+    pub field_flags: u16,
+    /// `+0x16c` - per-turn **initiative key**. The next-actor selector
+    /// (`recompute_battle_order` / `FUN_801daba4`) picks the living actor with
+    /// the highest key each turn (random tiebreak), then the key is consumed.
+    /// Seeded each round from the actor's SPD (`+0x164`):
+    /// `init_key = speed + rand()%(speed/2 + 1) + 1` (`overlay_0897_801e23ec`).
+    /// `0` = "has acted this round / dead" (the selector zeroes dead actors'
+    /// keys). See `docs/subsystems/battle-formulas.md`.
+    pub init_key: u16,
+    /// `+0x154` - **live action gauge (AGL)**, the pool a turn's actions are
+    /// paid out of. Restored at every round boundary by `FUN_801D88CC` loop A
+    /// ([`crate::battle_formulas::round_reset_agility`]) from [`Self::agl_base`],
+    /// and spent per swing by the enemy budget loop
+    /// ([`crate::battle_action::enemy_action_budget`]).
+    ///
+    /// Distinct from [`Self::init_key`]: the key decides *when* an actor acts,
+    /// this decides *how much* it can do once it does.
+    pub agl: u16,
+    /// `+0x156` - **base action gauge**, the value [`Self::agl`] is restored to
+    /// each round. Read-only during a battle.
+    pub agl_base: u16,
+    /// `+0x170` - **spirit-art gauge** (0..=100). The shared damage finisher
+    /// `FUN_801ddb30` accrues this on the *defender* from each hit's
+    /// post-mitigation damage (`pct = max(1, over*100/maxhp)`, plus the two
+    /// equipment "spirit gain up" bits for a party defender), clamped to 100;
+    /// the engine fills it via [`crate::battle_formulas::spirit_gauge_fill`].
+    /// A party member's Spirit-Art (`ActionState::SpiritArtsEntry`) becomes
+    /// available once this reaches its ceiling. Distinct from the per-turn AP
+    /// budget the **Spirit command** charges (`ApGauge::charge_spirit`).
+    ///
+    /// REF: FUN_801ddb30 (the finisher's spirit stage; ported as
+    /// [`crate::battle_formulas::spirit_gauge_fill`])
+    pub spirit_gauge: u16,
+    /// `+0x14C` / `+0x14E` - live (authoritative) HP and max HP. Every
+    /// liveness test in the SM reads `+0x14C`; [`Self::liveness`] is the same
+    /// halfword under the name the flag-shaped reads use.
+    pub hp: u16,
+    pub max_hp: u16,
+    /// `+0x172` - HP-bar **display** cursor. Retail keeps the authoritative
+    /// current HP at `+0x14C` and drains the on-screen bar value at `+0x172`
+    /// toward it over several frames; the fade-down settle check
+    /// (`FUN_801E7250`) compares the pair. `Some(shown)` while the host
+    /// animates HP bars, `None` when it does not (always settled).
+    pub hp_display: Option<u16>,
+    /// `+0x10` - signed **pending HP-bar delta accumulator**: how much
+    /// [`Self::hp_display`] still owes. Positive means the bar has to fall.
+    ///
+    /// The bar and live HP converge only through this field
+    /// ([`crate::battle_hp_bar`]): `FUN_80047430` moves a quarter of it into
+    /// the bar per frame on a party slot, and does nothing at all while it is
+    /// zero (the guard at `0x800474E8`). A `hp != hp_display` pair with a zero
+    /// accumulator is therefore absorbing, and parks the action SM in state
+    /// `0x51` forever on any party-targeted action.
+    pub hp_bar_pending: i32,
+    /// `+0x178` - last-action MP cost (used to display `-N MP` on screen).
+    pub last_mp_cost: u16,
+    /// `+0x21D` - the per-actor **animation-rate scalar** (normal `8`). Three
+    /// consumers read it in the dumped corpus, which is what settles the
+    /// name:
+    ///
+    /// * the SCUS anim tick `FUN_80047430` advances the render node's 12.4
+    ///   anim cursor by `(frame_dt * rate * clip_rate) >> 1` (`>> 2` for a
+    ///   Slowed actor on idle), so `4` is half speed, `2` quarter speed, `0` a freeze;
+    /// * the arts after-image walk `FUN_80049348` spaces its two mesh ghosts
+    ///   `8 / rate` frames apart, so the trail stretches as time slows;
+    /// * the attack band multiplies it into the per-frame X/Z impact drift,
+    ///   so knockback slows with the clock (the reading this field was
+    ///   previously named for - "impact-step magnitude" - is that one
+    ///   consumer, not the field).
+    ///
+    /// Writers: the anim commit `FUN_8004AD80` drives the arts slow-motion
+    /// (see [`crate::battle_anim_rate`]), and `FUN_801E93C8` restores every
+    /// slot to `8` once the art clip has ended
+    /// ([`crate::battle_gauge_rearm::restore_anim_rates`]).
+    pub anim_rate: AnimRate,
+    /// `+0x21F` - the 1-based **impact-effect selector**: which entry of
+    /// the 5-entry impact-config table (`0x801F53D4`) currently owns this
+    /// actor's tint word [`Self::render_color`]. Written by the move-power
+    /// impact arm (`FUN_801E09F8` stores the record's `+0x0A` selector) and
+    /// by the per-clip impact arms (`FUN_8004CE2C` -
+    /// [`crate::battle_impact_fx`]); cleared by the presentation tick
+    /// `FUN_80050120` once the tint has decayed to neutral. `0` = no
+    /// impact tint armed.
+    pub impact_state: u8,
+    /// `+0x224` - action recoil magnitude - written by `DoneCleanup`.
+    pub action_recoil: u8,
+    /// `+0x225` - capture state byte - `2` while captured.
+    pub capture_state: u8,
+    /// The render node's `+0x42` (`*(actor + 0x22C) + 0x42`), raised to `1`
+    /// by the defeat fade's sink (`sh s4,0x42(a0)` at `0x800504AC`,
+    /// `FUN_80050120` arm 2). A non-zero `+0x42` sends the body's draw
+    /// through the clipping renderer (`FUN_80048A08`'s far arm,
+    /// `0x80048E84..0x80048FE4`) under object-effect row `+0x42 - 1`, which
+    /// battle setup seeds as the floor plane - so a sinking body is cut off
+    /// at the floor instead of showing through it. Nothing lowers it; the
+    /// node is rebuilt with the next fight.
+    pub floor_clip: bool,
+    /// `+0x1BA` - the **shatter** word. `FUN_80047430` copies it into the
+    /// render node's `+0x7A` (`0x800480A4`), and a non-zero `+0x7A` sends the
+    /// body through the shatter renderer (`FUN_80029888`) instead of the
+    /// plain dispatcher: the mesh breaks into its own triangles, each spun
+    /// about its centroid and pushed out by `+0x1BA / 128` of its distance
+    /// (`docs/subsystems/renderer.md`, the shatter renderer). Its writers are
+    /// cast modules - Zenoir and Jedo on monsters, six summons on their own
+    /// creature seat - and the Jette clip hook in `FUN_8004CE2C`. Nothing
+    /// clears it inside a fight; the record is rebuilt with the next one.
+    pub shatter: u16,
+    /// The render node's `+0x6D`: the row of the deformation table
+    /// `0x8007BE60` the shatter reads (offset, sweep front, flags). `None`
+    /// is the byte battle setup leaves there - `0xFF` on every node the
+    /// Zenoir captures read, whose row (`0x8007C5F4`, past the table's
+    /// written rows) reads zero - so the default shatter takes the plain
+    /// spin and push. The Jette hook stages `Some(2)` and clears to
+    /// `Some(0)`.
+    pub shatter_row: Option<u8>,
+    /// `+0x21B` - hit-count bound (script-defined; loop exits at
+    /// `ctx.hit_counter >= hit_count_bound`).
+    pub hit_count_bound: u8,
+    /// `+0x21C` - per-actor render flag - `0xFF` while hidden by summon
+    /// fade, `0x02` while captured, `0` otherwise. The target-select cursor
+    /// ([`crate::battle_action::target_cursor_highlight`]) also drives it as a
+    /// brightness level: `5` on the pointed-at monster, `200` on the others.
+    pub render_flag: u8,
+    /// `+0x4` - per-actor mesh colour/tint word fed to the battle actor
+    /// renderer. The target-select cursor writes `0x20080200` (bright) or
+    /// `0x00401004` (dimmed); the summon fade clears it to `0`.
+    pub render_color: u32,
+    /// `+0xC` - per-actor **tint-blend intensity** (q12). The battle tint
+    /// pass copies it verbatim into the actor's render packet `+0x78` blend
+    /// word whenever it is non-zero (`FUN_8004A908`), so it weights how hard
+    /// the `render_color` word modulates the mesh; it is **not** a mesh
+    /// scale. Writers: the target-select cursor sets `0x1000` while the
+    /// cursor is up and `0` when it retires; the item/spirit cue-group
+    /// expander flashes it to `0x2000` (`FUN_801E22C8`); the status
+    /// inflictors reset it to `0x1000`. `FUN_80050120` arm 0 drains it by
+    /// `0x20` per frame back to `0` once the colour word has eased neutral.
+    pub render_blend: u32,
+    /// `+0x46` - facing angle (i12 in `0xFFF` range; written from bearing
+    /// checks).
+    pub facing_angle: u16,
+    /// `+0x3C` / `+0x40` - the actor's **body** position pair. The battle
+    /// setup stamps the authored formation seat here and copies it into the
+    /// live pair `+0x34`/`+0x38` (`FUN_800513F0`; see
+    /// `engine-battle::battle_seats`) - hence the field name - but from then on
+    /// the pose decoder re-derives it on every drawn frame as the live pair
+    /// plus the facing-rotated pose centroid (`FUN_8004998C`
+    /// `0x8004A3DC..0x8004A5F8`), so it is not a fixed seat. The range law
+    /// measures the *target* side against this pair, the separation pass
+    /// measures overlap on it, and state `0x16`'s arrival shove moves it
+    /// together with the live pair. `None` = not seated yet - hosts fall back
+    /// to the live position.
+    pub seat: Option<(i16, i16)>,
+    /// `+0x1D9` - current anim ID (read-only here; written by the animation
+    /// system).
+    pub current_anim: u8,
+    /// `+0x1DA` - queued next anim ID. The state machine writes this; the
+    /// animation system reads `current_anim` toward `queued_anim`.
+    pub queued_anim: u8,
+    /// `+0x1DB` - the **latched** staged anim id: `FUN_8004AD80` copies
+    /// `+0x1DA` here once per animation tick, *before* an art-bank id is
+    /// rewritten to its dynamic slot (`0x8004AEB0..0x8004AEB8`), so this byte
+    /// keeps the raw id of the clip that is playing.
+    ///
+    /// It is the byte the battle camera dispatches on - twice, over two
+    /// disjoint bands of the same id space: `FUN_801D5854` case 6's own
+    /// per-character arms take `0x11..=0x18` and the per-art attack camera
+    /// `FUN_801D71B8` takes `0x1A..=0x2D`
+    /// ([`crate::battle_attack_camera::ART_JUMP_TABLES`]). Nothing else in
+    /// the ported state machine reads it.
+    pub latched_anim: u8,
+    /// `+0x08` - the pool actor's draw-mode word. The engine carries only
+    /// the bits the near-camera ghost pass `FUN_8004DC68` owns
+    /// ([`GHOST_BITS`](crate::battle_action::GHOST_BITS)); the tint pass
+    /// packs its top byte into the render node's colour word.
+    pub flag_word: u32,
+    /// `+0x1DC` - per-actor flag bits. See [`ActorFlags`].
+    pub flag_bits: ActorFlags,
+    /// The per-frame root-motion truncation carry
+    /// ([`crate::battle_action::motion::RootMotionCarry`]) - port state, not
+    /// a retail field.
+    pub root_carry: crate::battle_action::motion::RootMotionCarry,
+    /// The same carry for the strike loop's swing drift, which retail
+    /// truncates on its own (`0x801E386C..0x801E3994`).
+    pub drift_carry: crate::battle_action::motion::RootMotionCarry,
+    /// The same carry for the anim tick's in-range back-off, another term
+    /// retail truncates on its own (`0x80047C3C..0x80047D1C`).
+    pub backoff_carry: crate::battle_action::motion::RootMotionCarry,
+    /// `+0x1DD` - active-target slot index (used by Magic / Item to retarget
+    /// mid-chain).
+    pub active_target: u8,
+    /// `+0x1DE` - action category. See [`ActionCategory`].
+    pub action_category: u8,
+    /// `+0x1DF..+0x1F2` - per-action parameter byte stream (item ID / spell
+    /// ID / strike-anim list). The attack band terminates on `0x00`, the
+    /// magic band on `0xFF` (`-1`) - retail uses different sentinels per
+    /// band. Read sequentially via `params[strike_index]`. Pre-sized to
+    /// [`ACTION_PARAM_BYTES`].
+    pub params: [u8; ACTION_PARAM_BYTES],
+    /// The arts queue-builder's per-token **side array** `0x801F6990`, as the
+    /// builder left it for this actor's staged queue.
+    ///
+    /// Retail keeps it as one 16-word global rather than per actor, because
+    /// only one queue is ever under construction and only one actor is ever
+    /// mid-action. The values are
+    /// [`BUILD_STARTER_MARK`](crate::battle_action::BUILD_STARTER_MARK) at
+    /// each art the build loop accepted (`0x801EF788`) and
+    /// [`SUPER_STARTER_MARK`](crate::battle_action::SUPER_STARTER_MARK) at
+    /// each `0x1A` the Super tail-replace wrote (`0x801EFBA8`) - and the
+    /// difference is load-bearing in two places, not one: the Attack x2
+    /// refill (`0x801E3A4C`) demotes only the former, and the staged-anim
+    /// commit reads the mark straight out as the **banner position**
+    /// (`0x8004B804`), where `1` is `NEW ARTS!!` and `4` is `SUPER ARTS!!`
+    /// ([`crate::battle_action::flash_ramp`]).
+    ///
+    /// `None` means no builder ran for this actor's queue (a monster, a
+    /// synthetic host); the refill then reconstructs the build-loop marks
+    /// from the queue bytes, which is what it did before this field existed.
+    pub starter_marks: Option<[u32; crate::battle_action::ACTION_QUEUE_CAP]>,
+    /// `+0x15` - per-strike index used to walk `params` during attack-chain
+    /// and magic-anim-chain. Each strike bumps it.
+    pub strike_index: u8,
+    /// `+0x16` - combo bit (cleared by `AttackShortStep` when in range).
+    pub combo_bit: u8,
+    /// `+0x1F4` - the **per-clip hit index**. `FUN_801EC3E4` reads it at
+    /// `0x801EC45C`, bounds it with `sltiu v0,v1,0x4` at `0x801EC480`, uses
+    /// it to pick the committed entry's event frame (`entry[0x10 + idx]`)
+    /// and power byte (`entry[idx]`), and advances it once in the epilogue
+    /// (`0x801EECDC..0x801EECE8`) of every resolved call. Its caller is the
+    /// **animation** tick `FUN_80047430` (`0x800478A0`, `0x80047BF0`), every
+    /// frame a battle clip plays, and every clip commit zeroes it
+    /// (`FUN_8004AD80`, `0x8004B064`) - so a single staged byte walks its
+    /// clip's whole hit list without the stream cursor
+    /// ([`Self::strike_index`]) moving. Kernel:
+    /// [`crate::battle_action::hit_event_admits`].
+    pub input_cursor: u8,
+    /// `+0x158` - ATK **working** (the attacker's offense the damage routine
+    /// reads; `+0x15A` is the base a buff restores to). The Arms execution
+    /// resolver folds the equipped weapon's attack bonus into this per
+    /// committed command - see
+    /// [`crate::battle_formulas::arms_weapon_atk_fold`].
+    pub atk_working: u16,
+    /// `+0x15A` - ATK **base**, the half a buff restores to. The stat block
+    /// runs `+0x158..+0x16A` as five pairs `(working, base)`
+    /// (`docs/subsystems/battle-formulas.md`); this is the second half of
+    /// the ATK pair and the one PROT 0955's Power Charge and Melt Spray
+    /// arms write alongside `+0x158`.
+    pub atk_base: u16,
+    /// `+0x164` - SPD **working**, the turn-order initiative seed
+    /// `FUN_801DA780` reads.
+    pub spd: u16,
+    /// `+0x166` - SPD **base** (`FUN_80053CB8` resets `+0x164 = +0x166` each
+    /// round).
+    pub spd_base: u16,
+    /// `+0x168` - INT **working**: the magic-damage / magic-defence column
+    /// and the accuracy-evasion seed. The engine also mirrors it per slot in
+    /// `World::battle.accuracy`; this is the actor's own halfword, so the
+    /// band's five-stat writers have somewhere to land.
+    pub intel: u16,
+    /// `+0x16A` - INT **base**.
+    pub intel_base: u16,
+    /// `+0x1F5` - anim-cue flag (read at state `SummonFadeIn` for fade-in
+    /// trigger).
+    pub anim_cue: u8,
+    /// `+0x1F9` - "spirit shield" flag - gates spirit-arts variant path.
+    pub spirit_shield: u8,
+    /// `+0x1FA` - spell-cast iteration counter.
+    pub spell_iter: u8,
+    /// `+0x18` - UI element id (transient - written by `ActionSeed`).
+    pub ui_element_id: u8,
+    /// `+0x1E0` - sub-routing byte. `9` routes Magic to summon path.
+    pub sub_route: u8,
+    /// `+0x1E7` - queued anim staged for spirit / item paths.
+    pub queued_anim_b: u8,
+    /// `+0x1E8` - the committed action's **effect class**, seeded once at
+    /// [`ActionState::SpiritPreArm`] and read by everything downstream that
+    /// has to know *what kind* of thing this action does.
+    ///
+    /// Retail seeds it from one of two disc tables, picked on the category
+    /// byte `+0x1DE` (`overlay_battle_action_801e295c.txt`
+    /// `0x801E3B70..0x801E3CB0`):
+    ///
+    /// * category `1` (Item): the item's property record `+1`
+    ///   (`0x80074368 + id*0xC`) indexes the **item-effect descriptor table**
+    ///   `0x800752C0` (4-byte stride) and this takes the record's `+0` byte -
+    ///   `legaia_game_tables::item_effect::ItemEffect::class`.
+    /// * any other category (Magic / Spirit): the **spell table** record
+    ///   `0x800754C8 + id*0xC`, byte `+0` -
+    ///   `legaia_game_tables::spell_names::SpellEntry::class`.
+    ///
+    /// Both legs land in one class space: `0..=8` are the applier's effect
+    /// classes (heal / cure / revive / shield / buff), and the larger values
+    /// (`0x14` plain cast, `0x32` summon, `0x63` capture) are the spell-band
+    /// routing bytes. Consumers: the damage primitive's `a0`
+    /// ([`BattleActionHost::apply_damage`], retail `0x801E4124`), the
+    /// cue-group site selection ([`crate::battle_cue_group::cue_group_for`])
+    /// and the cast-audio dispatcher
+    /// ([`crate::battle_cast_cue::cast_audio_cue`]).
+    pub cast_class: u8,
+    /// `+0x1E9` - the class's **tier / sub-index**, seeded beside
+    /// [`Self::cast_class`] from byte `+1` of the same record.
+    ///
+    /// For an item this is `legaia_game_tables::item_effect::ItemEffect::tier` (the
+    /// heal-amount row, the buff stat, ...); for a spell it is the record's
+    /// `+1` sub-index (`docs/formats/spell-table.md`). It is the `param_2`
+    /// the applier's cue-group sites turn into a group id for classes `0`,
+    /// `1`, `2` and `7`, and the byte the cast-cue dispatcher's class-`7` arm
+    /// gates on.
+    pub cast_sub_class: u8,
+    /// **Port-side fallback, no retail offset.** The art a host that stages
+    /// plain dynamic-slot ids (`0x10` / `0x11`) rather than art constants
+    /// means by them. Retail identifies the art from the staged byte itself
+    /// (the anim commit latches it into `+0x1DB`), and so does the engine's
+    /// hit-event driver ([`crate::battle_action::staged_art_constant`]);
+    /// this is consulted only when the latched id is not an art constant.
+    pub chosen_art: Option<legaia_art::ActionConstant>,
+    /// Which playable character occupies this slot. Used as the lookup
+    /// key into the per-character art tables. Defaults to Vahn - engines
+    /// must set this for the correct slot before the strike runs.
+    pub character: legaia_art::Character,
+}
+
+impl BattleActor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Read a parameter byte at `strike_index + offset`.
+    /// Out-of-range reads return `0xFF` (the sentinel terminator).
+    pub fn read_param(&self, offset: usize) -> u8 {
+        let idx = self.strike_index as usize + offset;
+        self.params.get(idx).copied().unwrap_or(0xFF)
+    }
+
+    /// Drop the staged Tactical-Arts fallback ([`Self::chosen_art`]).
+    ///
+    /// Called wherever the action-parameter stream itself is cleared: a
+    /// fallback that outlived its stream would re-key the *next* action's
+    /// strikes to the previous turn's art, which is the same carried-over-byte
+    /// class of defect the stream clear exists to prevent.
+    pub fn clear_art_profile(&mut self) {
+        self.chosen_art = None;
+    }
+
+    /// Seed the HP-bar accumulator the way a landed hit does
+    /// ([`crate::battle_hp_bar::accumulate_pending`], retail `FUN_801EC3E4`):
+    /// **add** `delta` to any remainder still in flight, then clamp it to the
+    /// value currently drawn on the bar so the ramp cannot overshoot zero.
+    ///
+    /// `delta` is positive for damage (the bar has to fall). No-op when the
+    /// host does not animate bars (`hp_display == None`), which keeps a
+    /// non-animating engine exactly where it was.
+    ///
+    /// REF: FUN_801EC3E4 (kernel + `// PORT:` tag in `battle_hp_bar`)
+    pub fn accumulate_hp_bar(&mut self, delta: i32) {
+        let Some(display) = self.hp_display else {
+            return;
+        };
+        self.hp_bar_pending =
+            crate::battle_hp_bar::accumulate_pending(self.hp_bar_pending, display, delta);
+    }
+
+    /// Seed the HP-bar accumulator the way the **item / restore applier**
+    /// does ([`crate::battle_hp_bar::assign_pending`], retail `FUN_800402F4`):
+    /// a bare *assignment* of `-delta`, discarding any remainder still in
+    /// flight.
+    ///
+    /// `delta` is the signed change applied to live HP - a heal is positive, a
+    /// hit negative - i.e. the same `s4` the routine folds into the stat
+    /// halfword at `0x800408A8` before the three identical seed stores at
+    /// `0x800408FC` / `0x80040D28` / `0x800410BC`. Retail leaves the displayed
+    /// value `+0x172` alone here; the ramp is what carries it, which is why a
+    /// caller that writes live HP and **skips this seed** leaves the pair
+    /// `hp != hp_display` with a zero accumulator - the absorbing state that
+    /// parks the action SM at `0x51` forever (see [`crate::battle_hp_bar`]).
+    ///
+    /// No-op when the host does not animate bars (`hp_display == None`),
+    /// matching [`Self::accumulate_hp_bar`].
+    ///
+    /// REF: FUN_800402F4 (kernel + `// PORT:` tag in `battle_hp_bar`)
+    pub fn assign_hp_bar(&mut self, delta: i16) {
+        if self.hp_display.is_none() {
+            return;
+        }
+        self.hp_bar_pending = crate::battle_hp_bar::assign_pending(delta);
+    }
+
+    /// Begin animating this actor's HP bar from its current live HP, if the
+    /// host is not already animating it. Idempotent.
+    ///
+    /// Retail has no equivalent - `+0x172` is seeded at battle load and never
+    /// unset. The port's `Option` models "this host draws bars at all", so a
+    /// host opts in once and the pair behaves like retail from then on.
+    pub fn arm_hp_bar(&mut self) {
+        if self.hp_display.is_none() {
+            self.hp_display = Some(self.hp);
+            self.hp_bar_pending = 0;
+        }
+    }
+
+    /// One frame of HP-bar ramp for this actor in retail pool slot `slot`
+    /// ([`crate::battle_hp_bar::bar_step_for_slot`], retail `FUN_80047430`).
+    /// The arm select is on the pool slot, so an engine slot goes through
+    /// [`crate::battle_slot::SeatMap::retail`] first.
+    ///
+    /// REF: FUN_80047430 (kernel + `// PORT:` tags in `battle_hp_bar`)
+    pub fn tick_hp_bar(&mut self, slot: crate::battle_slot::RetailSlot) {
+        let Some(display) = self.hp_display else {
+            return;
+        };
+        let st = crate::battle_hp_bar::bar_step_for_slot(slot, display, self.hp_bar_pending);
+        self.hp_display = Some(st.display);
+        self.hp_bar_pending = st.pending;
+    }
+
+    /// Force the displayed HP back onto live HP, dropping any outstanding
+    /// accumulator - the per-round status ticker's re-sync
+    /// ([`crate::battle_hp_bar::resync_display`], retail `FUN_801E752C`).
+    ///
+    /// REF: FUN_801E752C (kernel + `// PORT:` tag in `battle_hp_bar`)
+    pub fn resync_hp_bar(&mut self) {
+        if self.hp_display.is_none() {
+            return;
+        }
+        let st = crate::battle_hp_bar::resync_display(self.hp);
+        self.hp_display = Some(st.display);
+        self.hp_bar_pending = st.pending;
+    }
+
+    /// Set live HP **and keep the readout pair coherent** - the one safe way
+    /// for a runtime writer outside the damage/heal appliers (a harness
+    /// force-heal, a scripted stat poke, a debug fill) to touch `hp`.
+    ///
+    /// The trap this guards: writing `hp` alone leaves `hp != hp_display`
+    /// with a **zero** accumulator, and the ramp's only guard is
+    /// `+0x10 != 0` (`0x800474E8`) - the pair is then absorbing, and the
+    /// action SM's `0x51` bar-drain gate ([`super::hp_bar_drain_pending`],
+    /// retail `FUN_801E7250`, which compares `+0x14C` vs `+0x172` each tick)
+    /// parks the battle forever on the next party-targeted action. Retail
+    /// cannot reach that state from a bare stat write because every one of
+    /// its `+0x14C` writers either seeds the accumulator in the same routine
+    /// (`FUN_800402F4`'s three seed stores, `FUN_801EC3E4`'s accumulate) or
+    /// force-assigns the display right after the write - the per-round status
+    /// ticker's `lhu v1,0x14c(v0); sh v1,0x172(v0)` at `0x801E7600` /
+    /// `0x801E7698`. This method is that ticker shape: write, then re-sync
+    /// ([`Self::resync_hp_bar`]), so the drain gate sees a settled pair.
+    ///
+    /// Direct `hp` writes remain possible (the field is `pub`, and the
+    /// damage appliers own their seeding) - a host that wants the trap named
+    /// at run time can arm [`Self::debug_assert_hp_bar_coherent`] after its
+    /// own writers.
+    ///
+    /// REF: FUN_801E752C (the re-sync stores this composes with the write)
+    pub fn set_hp_synced(&mut self, hp: u16) {
+        self.hp = hp;
+        self.resync_hp_bar();
+    }
+
+    /// Debug-only tripwire naming the `0x51` absorbing park: a
+    /// `hp != hp_display` pair with a **zero** accumulator can never settle
+    /// (the ramp's `0x800474E8` guard skips a zero accumulator), so a caller
+    /// that produced it wrote `hp` directly without seeding or re-syncing the
+    /// bar - route the write through [`Self::set_hp_synced`] (or the
+    /// damage-path seeds [`Self::accumulate_hp_bar`] /
+    /// [`Self::assign_hp_bar`]) instead.
+    ///
+    /// A *non-zero* accumulator with a differing pair is normal (a drain in
+    /// flight), and a differing pair with a zero accumulator is ALSO
+    /// retail-reachable through the damage-path clamp asymmetry
+    /// (`crate::battle_hp_bar`'s module doc) - which is why this is an
+    /// opt-in, debug-only tripwire a host arms after its **own** writers
+    /// rather than an invariant wired into the SM's gate: on the damage path
+    /// the pair is retail's, but right after a host-level write it can only
+    /// mean the write skipped the sync.
+    pub fn debug_assert_hp_bar_coherent(&self, slot: u8) {
+        debug_assert!(
+            !(self.hp_bar_pending == 0 && self.hp_display.is_some_and(|shown| shown != self.hp)),
+            "battle slot {slot}: hp={} but hp_display={:?} with a ZERO hp_bar_pending - \
+             an absorbing pair the 0x51 bar-drain gate parks on forever. A runtime \
+             writer set `hp` directly; route it through BattleActor::set_hp_synced \
+             (or the damage-path accumulate/assign seeds).",
+            self.hp,
+            self.hp_display,
+        );
+    }
+}
+
+/// Battle context fields read or written by `FUN_801E295C`. The retail layout
+/// is the live struct at `0x800EB654` pointed-to by `_DAT_8007BD24`. Field
+/// names mirror the `+0xNNN` offsets from `docs/subsystems/battle-action.md`.
+///
+/// We model only the fields the action state machine touches; the full ctx
+/// struct is much larger and managed by the rest of the battle overlay.
+#[derive(Debug, Clone, Default)]
+pub struct BattleActionCtx {
+    /// `[7]` - execution phase / action-state cursor. The outer `switch
+    /// (ctx[7])`. Stored as raw byte so unmapped values round-trip.
+    pub action_state: u8,
+    /// `[+0x13]` - active actor slot index (drives the
+    /// `(&DAT_801C9370)[ctx[0x13]]` lookup). Range `0..=7`.
+    pub active_actor: u8,
+    /// `[+0x274]` - the action category the battle UI staged for this turn.
+    /// `recompute_battle_order` (`FUN_801DABA4`) is its retail writer
+    /// (`lbu v0,0x11(v1); sb v0,0x274`).
+    pub queued_action: u8,
+    /// `[+0x1A]` - the **turn cursor**: how many entries of this round's
+    /// battle order have been consumed.
+    ///
+    /// It is a context field, not an actor one. Every access in
+    /// `FUN_801E295C` goes through `s5 = ctx + 0x11` as `0x9(s5)`, and there
+    /// are exactly four across the dispatcher's 4099 instructions:
+    ///
+    /// * `Begin` seeds it from the formation-advantage byte `+0x290` -
+    ///   `0` when the byte is `0`, `ctx[+0x00]` (the party count) when it is
+    ///   `1`, `ctx[+0x01]` (the monster count) when it is `2`, and left alone
+    ///   for anything else (`0x801E2AC0..0x801E2B24`).
+    /// * the counter-attack swap bumps it (`0x801E36D0`),
+    /// * the run arm bumps it once per combatant it removes from the round
+    ///   (`0x801E5870`),
+    /// * the end-of-action gate bumps it and compares the result against
+    ///   `ctx[+0x00] + ctx[+0x01] - ctx[+0x25]` to decide "next actor" versus
+    ///   "round over" (`0x801E679C..0x801E67C8`).
+    ///
+    /// That last compare is what pins the reading: the bound is the seated
+    /// combatant count less the skipped tail, so the thing being compared is a
+    /// position in the order, not anything per-actor.
+    ///
+    /// `ctx[+0x00]` / `ctx[+0x01]` are the **seated** party / monster counts
+    /// (`FUN_801E7250`'s all-target arm scans `0 .. ctx[+0x00]`, which is what
+    /// makes it a party-side scan); the port reads them off the host's seated
+    /// slots. `ctx[+0x25]` is [`Self::round_skip`].
+    ///
+    /// REF: FUN_801E295C (`ctx[+0x1A]`; the `PORT:` anchor for the seeding
+    /// arm is `battle_action::dispatch`'s `seed_turn_cursor`)
+    pub turn_cursor: u8,
+    /// `[+0x25]` - the **round-skip count**: combatants dropped out of this
+    /// round's order without acting. Its only two writers are in the
+    /// initiative code: the seeder `FUN_801DA780` clears it once per round
+    /// (`sb zero,0x25(v0)` at `0x801DAB84`, the delay slot of its
+    /// `jal 0x801DABA4`), and the pick `FUN_801DABA4` bumps it at
+    /// `0x801DAC2C..0x801DAC38` for each slot that is dead (`+0x14C == 0`)
+    /// **and** still holds an unspent key (`+0x16C != 0`). Every other
+    /// `sb ...,0x25(...)` in PROT 0898 stores into a GPU packet's `u`/`v`
+    /// byte, not into the context. The end-of-action gate subtracts it from
+    /// the seated count (`0x801E67B4..0x801E67C8`).
+    ///
+    /// Written by the engine's initiative code (`World::begin_battle_round`
+    /// resets it, `World::next_combatant_by_initiative`'s dead-slot sweep
+    /// bumps it); read by `battle_action::done::end_of_action`.
+    pub round_skip: u8,
+    /// `0x801F696C` - the queue builder's **special-trigger flag** (a
+    /// battle-overlay global, not a context byte; carried here because it
+    /// lives exactly as long as one party action). `FUN_801EED1C` clears it
+    /// at its head and sets it when the queue ends in a Miracle or a Super
+    /// Art ([`crate::battle_action::finish_action_queue_with_trigger`]).
+    /// Its one reader is the strike loop's per-swing drift at `0x801E3840`
+    /// ([`crate::battle_action::swing_drift_armed`]).
+    pub super_trigger: bool,
+    /// `[+0x262]` - the **cast readout cursor**: which of the eight
+    /// value-window slots the next effect-child hit files its damage in.
+    /// `FUN_801E09F8`'s hit arm writes `ctx[0x83C + slot*4]`,
+    /// `ctx[0x318 + slot*2]` and `ctx[0x85C + slot*4]`, then stores
+    /// `(slot + 1) & 7` back (`0x801E18E8` / `0x801E18FC`).
+    /// Kernel: [`crate::battle_cast_census::effect_child_hit`].
+    pub cast_readout_cursor: u8,
+    /// `[+0x16]` - the **Attack x2 pass counter** the War God Icon's pair
+    /// runs on.
+    ///
+    /// Two writers, both in the strike loop of `FUN_801E295C` and both
+    /// behind the character record's `+0xF4 & 0x2000`. The end-of-stream
+    /// arm (`0x801E3A20..0x801E3A64`), reached only for a party actor
+    /// (`ctx[+0x13] < 3`) whose counter still reads `0`, rewinds the strike
+    /// cursor, bumps this byte to `1` and rewrites every marked queue slot
+    /// to `0x19`, so the whole action stream replays once. The stage site's
+    /// tail (`0x801E37AC..0x801E37BC`) then bumps it again on every staged
+    /// byte while it is already non-zero, so the second pass's first stage
+    /// lifts it to `2`.
+    ///
+    /// Its reader is the damage kernel's apply-mode arm
+    /// ([`crate::battle_action::apply_mode`], `0x801EE114`): while the pair is
+    /// running (`< 2`) the action applies nothing and its combo total carries
+    /// into the second pass.
+    ///
+    /// An earlier revision of `docs/subsystems/battle-action.md` read the
+    /// `0x801E3A20` arm as a "Miracle continuation". It is not - `s5` is
+    /// `ctx + 0x11`, so `0x4(s5)` is the strike cursor `+0x15` and `0x5(s5)`
+    /// is this byte, and the arm's own guard chain is the War God Icon bit.
+    ///
+    /// REF: FUN_801E295C (`0x801E3A20`), FUN_801EC3E4 (`0x801EE0C0`)
+    pub attack_x2_pass: u8,
+    /// `[+0x263]` - the **effect-record skip strobe**. The melee kernel's
+    /// limb-vs-height miss arm raises it (`sb v0,0x263(v1)` at `0x801EC554`,
+    /// [`crate::battle_action::limb_misses`]), and the next effect-script
+    /// call consumes it whole (`FUN_801DEA50`, `0x801DEBF4..0x801DEC48`):
+    /// it clears the byte and bumps the stepped actor's `+0x1F5` effect and
+    /// `+0x1F6` cue cursors without walking a record. The anim tick calls
+    /// the two routines back to back for the same actor (`0x800478A0` /
+    /// `0x800478B8`), so the missed swing loses the record it would have
+    /// fired next - its impact spark.
+    ///
+    /// REF: FUN_801EC3E4 (`0x801EC548`), FUN_801DEA50 (`0x801DEBF4`)
+    pub effect_skip_strobe: u8,
+    /// `[+0x19]` - the **Spirit-action counter**, bumped once per Spirit
+    /// action at the action seed (`lbu v0,0x8(s5)` / `addiu v0,v0,0x1` /
+    /// `sb v0,0x8(s5)` at `0x801E2FF0..0x801E3000`, in the `jal 0x80056798`
+    /// delay slot).
+    ///
+    /// It is a **latch**, not a per-action flag: nothing in `FUN_801E295C`
+    /// clears it, and its one reader is the Done band's UI teardown
+    /// (`lbu v0,0x8(s5)` at `0x801E61CC`), which tears down the two
+    /// Spirit-only HUD elements `0x0F` and `0x52`
+    /// (`FUN_801D8DE8(id, 1)` at `0x801E61DC` / `0x801E61E8`) once the
+    /// battle has seen at least one Spirit action. So the elements are
+    /// unloaded on every later action too, which is harmless and is what
+    /// retail does.
+    ///
+    /// REF: FUN_801E295C (`0x801E2FF0`, `0x801E61CC`)
+    pub spirit_action_count: u8,
+    /// `[+0x17]` - the Done band's **UI-teardown latch**. Cleared by state
+    /// `0x50` (`sb zero,0x6(s5)` at `0x801E5F60`) and bumped by the `0x51`
+    /// tail once it has run (`0x801E6208..0x801E6214`), so the unload block
+    /// fires exactly once per action however many passes the band takes.
+    pub done_ui_torn_down: u8,
+    /// `[+0x18]` - the **action's own HUD element id**, the one the Done
+    /// band's teardown unloads first (`lbu v0,0x7(s5)` at `0x801E6178`).
+    ///
+    /// Written by the action seed's Attack arm (`li v0,0x7` /
+    /// `sb v0,0x7(s5)` at `0x801E2F48..0x801E2F50`), which is why a party
+    /// attack's weapon-slash element `7` is torn down with the action.
+    /// Element `6` is the one value that drags a pair with it.
+    ///
+    /// This is a **context** byte. `BattleActor::ui_element_id` carries the
+    /// same `7` on the acting actor and is the port's own field - retail's
+    /// `0x801E2F44` writes the acting *slot* to `ctx[+0x20]` there, not an
+    /// element id to the actor.
+    pub action_ui_element: u8,
+    /// `[+0x276]` - the side-band applier stage (`FUN_801F12D0`): seeded to
+    /// `1` when a `summon.dat` / `readef.DAT` read starts, `0` once its slots
+    /// have landed. It gates the `QueuedFromMenu` / `PreActionWait`
+    /// transition, the Done band's `0x51` exit and the `0x35` band word.
+    pub menu_open: u8,
+    /// `[+0x277]` - summon-frame index written at `SummonInvoke`.
+    pub summon_frame_idx: u8,
+    /// `[+0x278]` / `[+0x279]` - summon staging counters.
+    pub summon_staging_a: u8,
+    pub summon_staging_b: u8,
+    /// `[+0x287]` - the **scripted-fight flag**. Battle init derives it from
+    /// the formation's per-battle flags (`FUN_800513F0` `0x80051430` stores
+    /// `(DAT_8007BD60 >> 5) & 4`, so the live value is `4`, not `1`), and the
+    /// field-VM's scripted-battle op reaches the same byte. All three of
+    /// `FUN_801E295C`'s reads are gates on it: the two capture-band audio
+    /// ducks (`0x801E4F94`, `0x801E5058`) and the `AttackReturn` reaction
+    /// hold's bypass (`0x801E5554`).
+    ///
+    /// It is **not** a counter-attack flag, and neither is
+    /// [`Self::lone_defeat_latch`] one byte up.
+    ///
+    /// REF: FUN_800513F0, FUN_801E295C
+    pub scripted_fight: u8,
+    /// `[+0x288]` - the **lone-monster defeat latch**. Its one writer is the
+    /// tint SM's defeat-fade arm `FUN_80050120` (`sb s4,0x288(v1)` with `s4 =
+    /// 1` at `0x800504E8`): a monster seat fading out on render flag `2`,
+    /// still drawn, not captured, no Seru absorb staged (`ctx[+0x269]`), in
+    /// a scripted fight (`ctx[+0x287]`) whose formation carries no second
+    /// monster (`gp+0x9F5` = `0x8007BD0D` zero). The same predicate is what
+    /// skips that arm's floor sink, so the latch marks "the lone scripted
+    /// monster is dying in place". Its one reader is the `AttackReturn`
+    /// reaction hold (`lbu v0,0x288(v1)` at `0x801E5574`, after `+0x287` and
+    /// `0x8007BD0D`), which it lets out at once instead of waiting out the
+    /// body's fade; the Done band's menu arm clears it (`sb zero,0x288(v1)`
+    /// at `0x801E6114`). Reading it as a counter-attack byte routed the hold's
+    /// bypass into a counter swap the bytes do not have.
+    pub lone_defeat_latch: u8,
+    /// The **counterattack latch** `0x801F6970` - the countering party
+    /// seat plus one, `0` for none. It is a battle-overlay global rather than
+    /// a `ctx` byte; the port keeps it here for the same reason as
+    /// [`Self::message_id`]'s follow-up latch.
+    ///
+    /// The turn picker `FUN_801DABA4` arms it right after a monster's pick
+    /// (`sw v1,0x6970(a0)` at `0x801DB050`): a physical strike (`+0x1DE == 3`)
+    /// on a party seat, a coin (`rand & 1`), a monster free of the `0x380`
+    /// status bits, a target still holding its initiative key (`+0x16C != 0`)
+    /// and wearing the Counterattack passive (character `+0xF4` bit
+    /// `0x8000`). The strike loop consumes it on the attacker's first frame
+    /// (`0x801E35F0..0x801E36E0`, [`crate::battle_action`]'s attack band).
+    pub counter_pending: u8,
+    /// `[+0x290]` - the formation advantage the battle-setup roll
+    /// (`FUN_80051D84`) wrote: `1` back attack, `2` pre-emptive strike. `Begin`
+    /// **latches** it into [`Self::formation_latched`] and then clears it, so
+    /// this field is only live until round one's pass through state `0x00`.
+    ///
+    /// REF: FUN_80051D84
+    pub formation_advantage: u8,
+    /// `[+0x291]` - the latched copy of [`Self::formation_advantage`], written
+    /// by `Begin` at every round's state `0x00`. This is the copy that
+    /// survives the round, and it is what the escape roll reads: `== 2` (pre-emptive strike) means escape is
+    /// assured. Clearing `+0x290` without latching it here silently disables
+    /// pre-emptive-strike escapes.
+    ///
+    /// REF: FUN_801E791C
+    pub formation_latched: u8,
+    /// Port-only: has state `0x00`'s once-per-round pass
+    /// ([`crate::battle_action::round_state_zero`] - the auto-fill leg and the
+    /// formation arm) already run for **this round**?
+    ///
+    /// Retail needs no such flag because it enters state `0x00` once per
+    /// round, never per action: `ctx[7]` has exactly one zero-writer in the
+    /// corpus, the battle flow SM's `0xFE` arm (`FUN_801D0748`,
+    /// `0x801D3224`), the flow reaches `0xFE` from the commit confirm's Begin
+    /// (`0x801D31AC`) and the Run confirm, and the end-of-action gate hands
+    /// the next actor `0x0A`, never `0x00`. The port re-arms
+    /// [`ActionState::Begin`] per action instead, so this flag keeps the
+    /// pass to the round's first entry: an unguarded re-entry would rewind
+    /// the turn cursor mid-round and re-run the delegated fill.
+    ///
+    /// The host clears it at the round boundary, so round two's pass copies
+    /// the `+0x290` round one cleared over `+0x291` exactly as retail's does
+    /// (`+0x291` has one writer, `0x801E2B38`, and one reader, the escape roll
+    /// at `0x801E7AD8`): a pre-emptive strike's assured escape lasts one
+    /// round. Reset with the rest of the context at battle entry.
+    pub formation_armed: bool,
+    /// The party seats (bit `slot`) the round's **delegated fill** took -
+    /// `FUN_801F0450`'s Rage arm, which stamped category `3`, a target and
+    /// a learned-arts stream at state `0x00`. Not a retail byte: retail
+    /// needs no record because its seed `0x0C` plays whatever `+0x1DE` /
+    /// `+0x1DF` hold, while the port arms each party turn from the round's
+    /// commits and needs to know which seats carry a stream it must leave
+    /// in place. Rewritten by every pass of the fill.
+    pub delegated_seats: u8,
+    /// `[+0x269]` - the Seru a killing blow absorbed this action (the
+    /// player-magic index, spell `id - 0x80`), staged by the arts resolver
+    /// `FUN_801EC3E4` at `0x801EE2E8`. Non-zero routes `DoneFadeDown` to
+    /// `DoneSeruAbsorb` - the `0xB4`-frame hold behind the learn banner - and
+    /// the Done teardown grants the spell through
+    /// [`BattleActionHost::learn_absorbed_seru`]; zero routes to
+    /// `EndOfAction`. The run band also carries its escape outcome here (a
+    /// port choice; retail tests a pointer), which never meets a staged Seru
+    /// because an escape leaves the battle.
+    pub absorbed_seru: u8,
+    /// `[+0x243]` - the action-in-progress marker. Raised by the summon
+    /// close-up, the cast begin's capture route (`0x801E44FC`), the Spirit /
+    /// Item pre-arm (`0x801E3B6C`) and a committed clip's non-zero header
+    /// byte; cleared by the gauge re-arm once it has run (`FUN_801E93C8`'s
+    /// tail store at `0x801E94F8`, reached only on the arm whose gate passed),
+    /// via [`crate::battle_action::done_cleanup`] /
+    /// [`crate::battle_gauge_rearm::restore_anim_rates`], and by the summon /
+    /// capture band exits.
+    pub gauge_rearm_latch: u8,
+    /// `[+0x890]` - the battle **ambient base**, a packed `10:10:10` colour
+    /// that `FUN_80050120` ramps every frame on [`Self::gauge_rearm_latch`]
+    /// (down while it is set, back up while it is clear) and derives the
+    /// ground grid's near colour `0x8007B7B0` and far colour `0x8007BB48`
+    /// from. Kernel: [`crate::battle_ground_grid::ambient_base_step`]. Battle
+    /// init seeds [`crate::battle_ground_grid::AMBIENT_BASE_FLOOR`]; the
+    /// summon band's `0x37` exit and the capture band's `0x71` exit write
+    /// [`crate::battle_ground_grid::AMBIENT_BASE_CAST_EXIT`]. A zero here is
+    /// the port's "no battle yet", not a retail value.
+    pub ambient_base: u32,
+    /// How many passes state `0x71` has held on its settle test - the port's
+    /// bound on a wait retail leaves unbounded
+    /// ([`crate::battle_action::CAPTURE_SETTLE_PASS_LIMIT`]). Not a retail byte.
+    pub capture_settle_passes: u16,
+    /// How many clips the **active** actor has committed - a counter the
+    /// port keeps for the commit's camera-counter reset, not a retail byte.
+    /// `FUN_8004AD80`'s install path zeroes `ctx[+0x26E]` / `+0x87C` /
+    /// `+0x26F` when the committing actor is `ctx[+0x13]`
+    /// (`0x8004BF50..0x8004BF78`); the battle camera re-zeroes its copies of
+    /// those counters whenever this moves
+    /// (`BattleCamInputs::active_commits`).
+    pub active_clip_commits: u32,
+    /// How many times `FUN_8004E13C`'s value-2 arm has re-seeded the camera
+    /// yaw counter `ctx[+0x6DA]` (`0x8004E288..0x8004E2B0`) - a counter the
+    /// port keeps so the battle camera, which owns its copy of the counter,
+    /// sees each re-seed (`BattleCamInputs::swing_reseed`). Not a retail byte.
+    pub swing_yaw_seeds: u32,
+    /// The last re-seed's coin, `rand() % 2`: the counter becomes
+    /// `coin * 0x800 + 0x280`.
+    pub swing_yaw_coin: u8,
+    /// The display frame of the active actor's last clip commit - the
+    /// origin the re-zeroed `ctx[+0x87C]` counts from (`8` per vsync), which
+    /// the retail comparison corpus aligns a summon `0x33` capture on.
+    pub active_clip_commit_frame: u64,
+    /// How many clips the active actor has **installed** - the commits
+    /// that change the committed id, without the natural-end re-commit that
+    /// replays a looping clip. Port-only (`BattleCamInputs::active_installs`).
+    pub active_clip_installs: u32,
+    /// `[+0x28B]` - the **Arts announcement banner**: `0` idle, `1..=4` a
+    /// live banner, `5..=8` a cancel request. Raised by the staged-animation
+    /// commit's SpecialStarter arm and stepped once per battle frame; see
+    /// [`crate::battle_action::flash_ramp`] for both halves.
+    pub arts_banner_stage: u8,
+    /// `[+0x28C]` - the banner's **slide clock**, `0..=0xF0`. Cleared by
+    /// every raise and by the cancel, walked up by
+    /// [`crate::battle_action::flash_ramp::step_flash_ramp`].
+    pub arts_banner_level: u8,
+    /// `[+0x28D + slot]` - the per-seat flag the Super / Miracle trigger arm
+    /// raises (`FUN_801EED1C` at `0x801EF5A8`), read by the commit's banner
+    /// block as the first of its three picks.
+    pub arts_banner_seat_flags: [u8; 8],
+    /// `[+0x249]` - exit gate read at `MagicExit`.
+    pub magic_exit_gate: u8,
+    /// `[+0x24A]` - item-target byte A (read at `MagicCastBegin` for
+    /// `ItemRetargetA`).
+    pub item_target_a: u8,
+    /// `[+0x24B]` - item-target byte B (read at `MagicCastBegin` for
+    /// `ItemRetargetB`).
+    pub item_target_b: u8,
+    /// `[+0x24C]` - hit counter incremented by the spell hit-loop. The loop
+    /// exits when `>= actor.hit_count_bound`.
+    pub hit_counter: u8,
+    /// `[+0x24D]` - recovery gate read at `MagicRecovery`.
+    pub magic_recovery_gate: u8,
+    /// `[+0x18]` - the battle **message id** the last printer call mirrored
+    /// here. Retail's `FUN_801F3C34` writes `0x66` into it beside the
+    /// `FUN_801D8DE8(0x66, 0)` call it makes
+    /// ([`crate::move_no_effect_guard::queued_magic_message`]); the port
+    /// writes it from the same place, through
+    /// [`BattleActionHost::ui_element`].
+    pub message_id: u8,
+    /// The follow-up latch `0x801F6960` - non-zero while a queued-magic
+    /// follow-up is already pending, which is what makes
+    /// [`crate::move_no_effect_guard::queued_magic_message`] stay silent.
+    ///
+    /// It is a battle-overlay global rather than a `ctx` byte in retail; the
+    /// port keeps it here because it has the same lifetime as the rest of the
+    /// action context. Its writer is the Seru side-effect stager, which
+    /// `engine-core`'s `World::stage_seru_side_effect` runs at the cast fold:
+    /// it stores the staged percent here on every player Seru cast, `0` when
+    /// nothing staged.
+    pub follow_up_pending: u8,
+    /// `[+0x6D6]` - the **make-way countdown**: state `0x14` seeds it with the
+    /// melee monster's size class (`sh v0,0x0(s7)` at `0x801E31E8`, `s7 =
+    /// ctx + 0x6D6`), and while it is non-zero the SM's shared tail steps
+    /// every bystander aside along [`Self::dodge_angles`], draining it by the
+    /// frame step. See [`super::make_way_step`].
+    pub dodge_countdown: i16,
+    /// `[+0x6D8]` - frame countdown timer (signed; decremented by frame dt
+    /// every state that needs to wait).
+    pub frame_timer: i16,
+    /// `[+0x6DA]` - combo / sub-timer (separate from `frame_timer`).
+    pub combo_timer: i16,
+    /// `[+0x6DC]` - damage-target value used by spirit-arts ramps.
+    pub damage_target: i16,
+    /// `[+0x6DE]` - HP-bar target (paired with `damage_target`).
+    pub hp_bar_target: i16,
+    /// `[+0x6E6 + i*2]` - each bystander's **make-way heading**, written by
+    /// state `0x14` (`0x801E3108..0x801E3198`): the attack heading turned a
+    /// quarter towards the side of the attack line the bystander stands on.
+    /// Indexed by engine slot. See [`super::make_way_angles`].
+    pub dodge_angles: [u16; ACTOR_SLOTS],
+    /// `[+0x0D]` - the per-action **battle-camera angle variant**, `0..=3`.
+    ///
+    /// Rolled once per action at [`ActionState::ActionSeed`]
+    /// (`jal 0x80056798` / `sb v0,0xd(a0)` at `0x801E2D04..0x801E2D30`,
+    /// `rand() % 4`) and then narrowed by the category arm: `0` for Tactical
+    /// Arts (`0x801E2E1C`) and for the Magic arm's `0x28` route
+    /// (`0x801E2EC8`), `(rand % 2) * 2` for Item (`0x801E2E60`) and Spirit
+    /// (`0x801E3024`), and `0` again on the Item arm's summon override
+    /// (`0x801E2E94`). A later band masks it down to bit 0
+    /// (`lbu`/`andi 1`/`sb` at `0x801E321C..0x801E322C`).
+    ///
+    /// The camera setup reads it as a four-way switch - `1` and `3` add
+    /// `0x800` (a half-turn) to the staged yaw, `2` raises the staged pitch
+    /// by `0x80` and stamps roll `0x400`, `0` leaves the framing alone
+    /// (`0x801D6510`, `0x801D6698`, `0x801D689C` - all three inside the
+    /// battle camera `FUN_801D5854`, whose prologue is the only one in
+    /// `0x801D5854..0x801D6A00`). So the byte is what makes two runs of the
+    /// same action frame from different sides.
+    ///
+    /// REF: FUN_801E295C (`0x801E2D30`, `0x801E2E60`, `0x801E2E94`)
+    pub camera_variant: u8,
+
+    /// Capture-harness pin for [`Self::camera_variant`]: when set, the
+    /// action seed (`0x0C`) stores it over its own `rand() % 4` roll and the
+    /// category arm's narrowing, after the draws themselves were made so the
+    /// shared `rand()` stream is unchanged.
+    ///
+    /// A replay of a retail capture reaches the capture's action on its own
+    /// RNG stream, so the side and tilt it frames from are its own coin, not
+    /// retail's; the retail comparison drive pins the variant the capture
+    /// reads (`ctx[+0xD]`) for the seat it drives. The seed is the only
+    /// place the pin can land in time: the state after it arms its framing
+    /// on the same tick. Nothing in play sets it.
+    pub camera_variant_pin: Option<u8>,
+
+    /// `[+0x6D0]` - the battle camera's framing height / distance.
+    ///
+    /// Seeded at [`ActionState::ActionSeed`] by `FUN_801F0348`
+    /// ([`crate::battle_formulas::camera_height_for_frame`], `jal` at
+    /// `0x801E2D2C`), and then **not** constant for the action: the capture
+    /// band's `0x6F` arm ramps it down by `frame_scalar * 16` every frame
+    /// (`0x801E4FFC..0x801E5014`, `lhu` / `subu` / `sh`, so it wraps as a
+    /// u16), and the `0x70` arm re-runs `FUN_801F0348` in the same breath as
+    /// the `0x71` store (`jal 0x801F0348` at `0x801E50DC`, whose delay slot
+    /// is `sb v0,0x7(v1)` = the state write). The re-seed is what makes the
+    /// ramp a pull-in: the camera closes on the target through the fade and
+    /// snaps back to the size-derived framing when the module finishes.
+    ///
+    /// Published to the host through
+    /// [`crate::battle_action::BattleActionHost::camera_frame_height`]
+    /// wherever it changes, so a host that draws a camera sees the ramp and
+    /// not only the seed.
+    pub camera_frame_height: i16,
+    /// The Spirit band's **AP bar** widget width - placement record `0x0F`
+    /// (`0x80076D78`, its `+6` width halfword `0x80076D7E`), the widget whose
+    /// handle `ctx[+0x1074]` the sustain state ramps through its `+0x0E`.
+    ///
+    /// Seeded by the Spirit dispatch arm (`0x801E2F64..0x801E2FB0`: the
+    /// acting actor's live AGL `+0x154` less 6, or the extended gauge when
+    /// the `+0x1F9` charge byte is up), raised as element `0x0F`, then grown
+    /// toward `ctx[+0x6DC] - 6` by state `0x47` one frame step at a time
+    /// (`0x801E5468..0x801E54A8`) - the visible "the AP gauge extends" of a
+    /// Spirit turn. The same `-6` law sizes the arts-entry bar off the pool.
+    pub spirit_bar_width: i16,
+    /// The Spirit band's **AP plate** value - the `+0x10` halfword of the
+    /// element-`0x52` widget whose handle the dispatch arm parks at
+    /// `0x801F6968` (`sw v0,0x6968(v1)` at `0x801E2FEC`). Seeded with the
+    /// actor's Spirit gauge `+0x170` (the element's own read) and ramped
+    /// toward `ctx[+0x6DE]` by states `0x47` / `0x48`
+    /// (`0x801E5400..0x801E5454`, `0x801E56D0..0x801E5728`).
+    pub spirit_plate_value: i16,
+    /// `[+0x26]` - the **level-up banner** UI element id, or `0` when no
+    /// banner is up.
+    ///
+    /// Written `0x65` by the in-battle magic level-up check
+    /// (`sb v0,0x26(v1)` at `0x801E723C`, in `FUN_801E70BC` - the routine
+    /// `engine-core`'s `accrue_summon_spell_xp` ports), bumped by the Final
+    /// Heal revive arm's scripted-battle tail (`0x801E6D3C`), and cleared at
+    /// the head of every [`ActionState::ActionSeed`]
+    /// (`sb zero,0x15(s5)` at `0x801E2CFC`, `s5 = ctx + 0x11`).
+    ///
+    /// Three readers, all in the Done band: the `0x50` seed picks `0x96`
+    /// instead of `0x3C` when it is set (`0x801E5F2C`), the `0x51` fade-down
+    /// lets a pad press cut the tail once the countdown is below `0x5B`
+    /// (`0x801E6078`), and the same state unloads the element it names
+    /// (`FUN_801D8DE8(ctx[+0x26], 1)` at `0x801E61B4`).
+    ///
+    /// REF: FUN_801E70BC (the writer)
+    pub levelup_banner_element: u8,
+    /// Models the randomizer's enemy-ally ("charm") **victory widen**: the
+    /// one-word overlay edit at `0x801E6638` that turns the monster-wipe
+    /// scan's down-mask from `andi 0x4` into `andi 0x384`, so a living
+    /// charmed monster (`+0x16E & 0x380`) counts as "down" and the player
+    /// does not have to kill their own ally to win. `false` = retail mask
+    /// `0x4`. See `docs/subsystems/battle.md` § enemy-ally charm at the
+    /// end-of-action gate.
+    pub charm_widen: bool,
+}
+
+impl BattleActionCtx {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Read the [`ActionState`] cursor; returns the underlying byte if it
+    /// doesn't decode to a known state.
+    pub fn current_state(&self) -> Result<ActionState, u8> {
+        ActionState::from_byte(self.action_state).ok_or(self.action_state)
+    }
+
+    /// Set the [`ActionState`] cursor. Convenience wrapper.
+    pub fn set_state(&mut self, state: ActionState) {
+        self.action_state = state.as_byte();
+    }
+}
+
+/// Outcome of a single battle action `step`.
+///
+/// Most states return [`StepOutcome::Stay`] (waiting on an animation match or
+/// timer expiration); transitions are signalled by [`StepOutcome::Transition`].
+/// Battle end surfaces via [`StepOutcome::BattleComplete`], raised only by
+/// the paths that raise retail's battle-end signal `DAT_8007BD71 = 0xFE`
+/// (the wipe arms of the `0x5A` gate and the successful-escape teardown
+/// `0x66`) - never by the `0xFF` round boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepOutcome {
+    /// Stayed in the current state - condition not yet met.
+    Stay,
+    /// Transitioned from `from` to `to`.
+    Transition { from: u8, to: u8 },
+    /// Battle complete. The mode-state machine should unload the battle
+    /// overlay.
+    BattleComplete,
+    /// Unknown / unmapped state byte. The retail dispatcher's default arm is
+    /// a no-op (function epilogue); we surface this so engines can log.
+    UnknownState { state: u8 },
+}
+
+/// Per-strike values resolved from the active actor's chosen Tactical Art.
+///
+/// Built by [`ActionState::AttackChain`] when the actor has `chosen_art`
+/// set and [`BattleActionHost::art_record`] returns a record. Surfaces the
+/// power byte, dmg_timing, status effect, and hit cue for the current
+/// strike (1-indexed via `actor.strike_index`).
+///
+/// `power` is `None` when the strike index runs past the recorded power
+/// bytes (e.g. an extra anim frame at the end of the chain) - engines
+/// should treat that as "this anim plays but does no damage."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtStrikeInfo {
+    /// 0-indexed strike position within the art's power list.
+    pub strike_index: u8,
+    /// Animation byte read from the actor's strike-script (`params[strike_index]`).
+    pub anim_byte: u8,
+    /// Source / target party slots. `actor_slot` is the party / monster
+    /// slot that owns the strike; `target_slot` is the resolved
+    /// `actor.active_target` value.
+    pub actor_slot: u8,
+    pub target_slot: u8,
+    /// The character whose art table we looked up.
+    pub character: legaia_art::Character,
+    /// Action constant identifying the active art.
+    pub art: legaia_art::ActionConstant,
+    /// Decoded power byte for this hit, if the art's power vec includes
+    /// the current strike index.
+    pub power: Option<legaia_art::PowerByte>,
+    /// Animation-frame timing for this hit, if `dmg_timing` covers the
+    /// current strike index. Engines use this to schedule the HP-deduction
+    /// at the correct frame within the anim.
+    pub dmg_timing: Option<u8>,
+    /// Enemy status effect the art applies on hit (if any).
+    pub enemy_effect: legaia_art::EnemyEffect,
+    /// Hit cue (sound / visual) for this strike, if the art's hit-cue list
+    /// covers the current strike index.
+    pub hit_cue: Option<legaia_art::HitCue>,
+}
+
+/// Cause classification for `BattleEnd`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BattleEndCause {
+    /// Party wipe (all party `liveness == 0`). `_DAT_8007BD2C = 5`.
+    PartyWipe,
+    /// Monster wipe (all monsters `liveness == 0`). `_DAT_8007BD2C = 0`.
+    MonsterWipe,
+    /// Party escaped (the `0x66` run teardown). Sets the same battle-end
+    /// signal byte (`DAT_8007BD71 = 0xFE`) as the wipe gate but neither
+    /// wipe cause - the battle ends with no loot and no defeat.
+    Escaped,
+}

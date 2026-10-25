@@ -1,0 +1,178 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">tooling</a> &middot; overlay capture</div>
+  <h1>Overlay capture</h1>
+  <p class="lede">When you walk into a town, open the pause menu or start a battle, Legaia quietly swaps a different chunk of program code into the same 256 KB of console memory. Those chunks are <strong>overlays</strong>, and they hold most of what makes the game a game: the script interpreter behind every NPC conversation, the battle state machine, the whole menu system - none of it in the executable Ghidra sees on the disc. This page is the workflow for getting that code anyway: freeze an emulator at the right moment, slice the overlay window out of its save state, and import the slice into Ghidra.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>The window</dt><dd><code>0x801C0000-0x80200000</code>, 256 KB, shared by every overlay; only one is resident at a time</dd>
+    <dt>Slot A</dt><dd>Field (PROT 0897), battle (0898) and menu (0899) all load at base <code>0x801CE818</code>; smaller overlays load elsewhere in the window</dd>
+    <dt>One-command tool</dt><dd><code>scripts/ghidra-analysis/auto-name-overlay.py</code> - slices, fingerprints the resident overlay, writes a stub dump script</dd>
+    <dt>Emulators</dt><dd>PCSX-Redux (recommended), mednafen (gzip states), Duckstation (<code>.sav</code>, zstd) - equivalent dumps</dd>
+    <dt>Output</dt><dd>Function dumps <code>ghidra/scripts/funcs/overlay_&lt;label&gt;_&lt;addr&gt;.txt</code> (gitignored, Sony-derived)</dd>
+    <dt>Static complement</dt><dd><a href="static-overlay-pipeline.html">Static overlay pipeline</a> - clean bytes with disc-pinned identity, no emulator; this page stays authoritative for runtime values</dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="overview">
+  <h2>What this solves</h2>
+  <p>Disassembling <code>SCUS_942.54</code> alone gives you the loader, the renderer wrappers and the sound driver - and a wall of <code>jal 0x801Dxxxx</code> calls into code that is not on the disc as a file Ghidra can open. Overlay capture is the dynamic answer. Reach for it when a function you are tracing lives at <code>0x801C0000+</code> and no static image contains it, when you need the <em>runtime values</em> around that code (initialised globals, filled tables), or when you want the exact list of archive entries a scene requested from the loader (the <a href="#asset-loader-csv">asset-loader CSV</a>).</p>
+  <ol class="steps">
+    <li><b>Play to the moment</b><span>The overlay you want is resident: town, battle, menu, minigame.</span></li>
+    <li><b>Save state</b><span>A frozen snapshot of the console's full 2 MiB RAM (PCSX-Redux, mednafen or Duckstation).</span></li>
+    <li><b>Slice the window</b><span><code>0x801C0000..0x80200000</code> out of the state, fingerprinted. <code>auto-name-overlay.py</code></span></li>
+    <li><b>Import at base</b><span>A named Ghidra program at <code>0x801C0000</code>, MIPS LE. <code>import-overlay-named.sh</code></span></li>
+    <li><b>Dump functions</b><span>Disassembly per entry point into <code>ghidra/scripts/funcs/</code>. <code>dump_&lt;label&gt;_overlay.py</code></span></li>
+  </ol>
+</section>
+
+<section class="doc-section" id="quick-start">
+  <h2>Quick start</h2>
+  <p><a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/scripts/ghidra-analysis/auto-name-overlay.py"><code>auto-name-overlay.py</code></a> detects the save-state format from the magic bytes (mednafen gzip+<code>MDFNSVST</code> or Duckstation <code>DUCCS</code>+zstd), extracts the overlay window, fingerprints which overlay is loaded against an anchor-function table, and emits both the binary slice and a stub <code>dump_&lt;label&gt;_overlay.py</code> Ghidra script with the largest function entry points pre-seeded.</p>
+  <div class="cli"><code>scripts/ghidra-analysis/auto-name-overlay.py "$HOME/.mednafen/mcs/Legend of Legaia (USA).&lt;HASH&gt;.mc0"</code></div>
+  <p>It reports the format, the slice size, the label it detected with the anchor votes behind it (e.g. <code>world_map=4, field=3</code>), and the two files it wrote: <code>/tmp/overlay_&lt;label&gt;.bin</code> and <code>ghidra/scripts/dump/dump_&lt;label&gt;_overlay.py</code>.</p>
+  <p>Then import the slice (slice path first, label second - both required) and run the stub:</p>
+  <div class="cli"><code>scripts/ghidra-analysis/import-overlay-named.sh /tmp/overlay_&lt;label&gt;.bin &lt;label&gt;</code></div>
+  <div class="cli"><code>docker compose exec ghidra /ghidra/support/analyzeHeadless /projects legaia -process overlay_&lt;label&gt;.bin -noanalysis -postScript /scripts/dump/dump_&lt;label&gt;_overlay.py</code></div>
+  <p>When the auto-detection picks the wrong label (the anchor table has no function exclusive to the shop, cutscene or level-up subset), pass <code>--label name</code>; an existing stub is preserved (<code>--force</code> overwrites). To grow the anchor table, add any function you confirm exclusive to one overlay to <code>ANCHOR_FUNCTIONS</code> in the same script.</p>
+</section>
+
+<section class="doc-section" id="what-s-in-the-overlay-window">
+  <h2>What's in the overlay window</h2>
+  <p>Two terms recur. Overlays that load at the same virtual address <strong>VA-alias</strong>: one address names <em>different</em> code depending on which overlay is resident, so a bare <code>FUN_801xxxxx</code> is ambiguous until you say which overlay you mean. <strong>Slot A</strong> is the primary shared slot the runtime streams the active overlay into - field, battle and menu are VA-alias siblings there, and the mode-24 minigame overlays stream into the same slot.</p>
+  <aside class="notice">
+    <span class="notice-title">The trap: a capture is a snapshot of a buffer, not a file.</span> Everything above the resident overlay's own footprint is the <em>previous</em> occupant, still in RAM - plus streaming buffers (SEQ data), multi-pak loads, and runtime BSS with no on-disc counterpart. PROT 0971 (<code>debug_menu</code>) carries only <code>0x1800</code> bytes, so most of what an <code>overlay_debug_menu_</code> filename claims is actually fishing (0972) bytes. Resolve the image with <code>locate-entry-image.py</code> before trusting a filename prefix; genuine aliasing is much rarer than a shared base suggests (<a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/reference/overlay-va-aliases.md">overlay-va-aliases</a>).
+  </aside>
+  <h3>Captured overlays</h3>
+  <p>Committed function dumps land under <code>ghidra/scripts/funcs/</code> as <code>overlay_&lt;label&gt;_&lt;addr&gt;.txt</code>. Several rows share one on-disc source: the save screen and the shop are the <em>menu</em> overlay (0899) captured in different states; the world map and scripted dialogue are the <em>field</em> overlay (0897) resident in different modes.</p>
+<table>
+<thead><tr><th>Overlay</th><th>Named program</th><th>Disc source</th><th>Key functions</th></tr></thead>
+<tbody>
+<tr><td>Title screen</td><td><code>overlay_title.bin</code></td><td>PROT 0899 @ <code>0x801CE818</code></td><td>Actor / sprite VM <code>FUN_801D6628</code>; title tick <code>FUN_801DD35C</code> (see <a href="../subsystems/boot.html#title-overlay-state">boot</a>)</td></tr>
+<tr><td>Town / field / dialog / inventory</td><td><code>overlay_dialog_mc4.bin</code> / <code>overlay_dialog_typing.bin</code></td><td>PROT 0897 @ <code>0x801CE818</code></td><td>Field/event VM <code>FUN_801DE840</code>, MES renderer <code>FUN_801ED710</code>, inventory hub <code>FUN_801F5748</code></td></tr>
+<tr><td>Field - battle-start transition</td><td><code>overlay_field_battle_intro.bin</code></td><td>PROT 0897</td><td>Partial image captured mid-camera-spin; functions unique to this capture</td></tr>
+<tr><td>Battle / battle-action</td><td><code>overlay_battle_action.bin</code> / <code>overlay_magic_capture.bin</code></td><td>PROT 0898 @ <code>0x801CE818</code></td><td>Per-actor SM <code>FUN_801E295C</code>, battle dispatcher <code>FUN_801D0748</code>, effect-VM cluster</td></tr>
+<tr><td>Menu (options + all pause screens)</td><td><code>overlay_menu.bin</code></td><td>PROT 0899 @ <code>0x801CE818</code></td><td>Items / magic / equipment / status / options UI; equipment stat aggregator <code>FUN_801CF650</code></td></tr>
+<tr><td>Save / load screen</td><td><code>overlay_save_ui_select.bin</code> / <code>_saving.bin</code></td><td>PROT 0899</td><td>Save-screen SM <code>FUN_801DC6B4</code>; 33 sub-state handlers at <code>PTR_FUN_801E4F40</code></td></tr>
+<tr><td>Shop / merchant</td><td><code>overlay_shop_save.bin</code></td><td>PROT 0899</td><td>A menu-overlay capture taken during a shop session, not a separate entry</td></tr>
+<tr><td>Level-up</td><td><code>overlay_magic_level_up.bin</code> / <code>_full.bin</code></td><td>PROT 0891</td><td>XP / stat-gain UI; full 256 KB re-capture for the data section</td></tr>
+<tr><td>World map</td><td><code>overlay_world_map.bin</code> / <code>_top.bin</code> / <code>_walk.bin</code></td><td>PROT 0897</td><td>World-map controller <code>FUN_801E76D4</code>, dev-menu renderer <code>FUN_801EAD98</code> - the field overlay resident during overworld</td></tr>
+<tr><td>Cutscene / dialogue</td><td><code>overlay_cutscene_dialogue.bin</code> / <code>_mapview.bin</code></td><td>PROT 0897</td><td>The field overlay during actor-scripted dialogue - <em>not</em> the FMV decoder, which is PROT 0970 (<code>cutscene_str</code>)</td></tr>
+<tr><td>Minigame hub (fishing, slot, Baka Fighter, dance, debug menu)</td><td><code>overlay_fishing.bin</code> and siblings</td><td>PROT 0972 / 0975 / 0976 / 0980 / 0971</td><td>Five distinct slot-A overlays that VA-alias one window; controllers in the disclosure below</td></tr>
+<tr><td>Muscle Dome</td><td><code>overlay_muscle_dome.bin</code></td><td>battle-action overlay</td><td>Runs on the general battle round SM <code>FUN_801D0748</code> - the dome is a battle mode, not a card game</td></tr>
+</tbody>
+</table>
+  <details class="disclosure">
+    <summary>Minigame-hub and Muscle Dome controllers</summary>
+    <div class="disclosure-body">
+      <p>All five hub minigames are variants of one overlay binary sharing a library core, so a given address <em>may</em> host a different function per minigame - always read the overlay-qualified dump. Per-frame controllers (each a switch-on-state-byte state machine, documented in the per-minigame pages under <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/tree/main/docs/subsystems"><code>docs/subsystems/</code></a>): fishing <code>FUN_801CF3BC</code>, slot machine <code>FUN_801CF0D8</code>, Baka Fighter <code>FUN_801D3468</code>, dance <code>FUN_801CF470</code>. The addresses <code>FUN_801D63B0</code> / <code>FUN_801D2CC0</code> / <code>FUN_801D5ED0</code> / <code>FUN_801D2F38</code> are the shared textured-quad sprite/HUD emitter the minigames reuse for every draw - their high caller counts reflect that, not control flow.</p>
+      <p>Muscle Dome: the per-frame controller is <code>FUN_801D0748</code> (pad read, phase dispatch on <code>ctx+6</code>) - the round SM <em>every</em> battle runs, not a dome-specific one: its single <code>jal</code> disc-wide is at <code>0x80047014</code>, unconditional in the SCUS battle frame driver. The <em>score</em> tally belongs to the arena hub (<code>FUN_801CF074</code> / <code>FUN_801D1184</code>, PROT 0977), which runs only between fights, never between turns. <code>FUN_801D5854</code> is the camera/view director, <code>FUN_801D8DE8</code> the HUD renderer, <code>FUN_801D388C</code> the presentation driver. See <a href="../subsystems/minigame-muscle-dome.html">Muscle Dome</a>.</p>
+    </div>
+  </details>
+  <details class="disclosure">
+    <summary>Level-up overlay data section</summary>
+    <div class="disclosure-body">
+      <p>A level-up state re-extracted at the full 256 KB window and imported as <code>overlay_magic_level_up_full.bin</code> gives the data section (<code>dump_levelup_data_section.py</code>):</p>
+      <table>
+        <thead><tr><th>Address</th><th>Content</th></tr></thead>
+        <tbody>
+          <tr><td><code>0x801F4B8C</code></td><td>4-byte display row-ID array for magic slots</td></tr>
+          <tr><td><code>0x801F4B98</code></td><td>Magic-type name strings (Spirit / Defense / Meta / Terra / Ozma)</td></tr>
+          <tr><td><code>0x801F4C28+</code></td><td>Battle-result text strings</td></tr>
+          <tr><td><code>0x801F5CF8</code>, <code>0x801F5D90</code></td><td>18-byte move-VM trigger programs, one per burst arm - they reach the particle spawner only via the <code>0x17</code> escape inside them</td></tr>
+          <tr><td><code>0x801F6000+</code></td><td>Live animation state globals (zero at rest)</td></tr>
+        </tbody>
+      </table>
+      <p>Per-character growth is not in this <em>display</em> overlay - it is in static <code>SCUS_942.54</code> (<code>DAT_800769CC</code> curves + <code>DAT_80076918</code> param block), applied by <code>FUN_801E9504</code>. See <a href="../subsystems/level-up.html#stat-gains">level-up</a>. The "HP grant at Seru <code>+0x74</code>" reading is falsified: <code>+0x74</code> is the actor's colour word.</p>
+    </div>
+  </details>
+  <p class="hint">Superseded attributions (menu overlay as PROT 0896, a hub minigame as 0973, earlier "main entry" readings) are recorded on <a href="../reference/re-do-not-re-walk.html">do-not-re-walk</a>; both PROT misreadings came from the old over-reading entry-size expression (<a href="../formats/prot.html">PROT.DAT</a>).</p>
+</section>
+
+<section class="doc-section" id="capturing-with-pcsx-redux">
+  <h2>Capturing with PCSX-Redux</h2>
+  <p>Boot with the disc, play to the scene, open <code>File &rarr; Show Lua Console</code>, and run <code>ghidra/scripts/import/dump_overlay.lua</code> - it writes <code>0x801C0000-0x801EFFFF</code> to <code>/tmp/legaia_overlay_&lt;TIMESTAMP&gt;.bin</code>. Then <code>ghidra/scripts/import/import_overlay.sh &lt;dump&gt;</code> copies the file into the container and imports it at base <code>0x801C0000</code> (MIPS LE, auto-analysed). Copy dumps to a <em>writable</em> container path: <code>/data</code> is bind-mounted read-only; <code>/tmp</code> is what the committed importers use.</p>
+  <aside class="notice">
+    The 192 KB window in <code>dump_overlay.lua</code> is too narrow for some battle-effect handlers and for the world-map overlay's high-mode prim renderers at <code>0x801F7644..0x801F8690</code>. Use <code>extract-mednafen-overlay.py</code> (default 228 KB) or pass <code>--end 0x80200000</code> for the full 256 KB.
+  </aside>
+  <p>For closed-loop probing (breakpoints, watch addresses, per-VSync CSV) rather than a one-off slice, see <a href="pcsx-redux-automation.html">PCSX-Redux automation</a>.</p>
+</section>
+
+<section class="doc-section" id="mednafen-pipeline-asset-loader-csv">
+  <h2 id="asset-loader-csv">Mednafen pipeline with asset-loader CSV</h2>
+  <p><code>scripts/ghidra-analysis/analyze-overlay.sh</code> is the older mednafen flow; use it when you specifically need the asset-loader CSV. It slices the state, re-imports it as <code>overlay.bin</code> (overwriting the previous import - keep separate labels per scene), then scans every <code>jal</code> to a known SCUS asset loader and const-tracks the <code>$a0</code> argument into <code>/tmp/overlay_loads_&lt;label&gt;.csv</code>.</p>
+  <div class="cli"><code>scripts/ghidra-analysis/analyze-overlay.sh "$HOME/.mednafen/mcs/Legend of Legaia (USA).&lt;HASH&gt;.mc0" --label level_up</code></div>
+  <p>The CSV gives the <em>exact</em> PROT entries the runtime loader requests for that scene - it replaces the iterative <code>--vram-extra-dir</code> guesswork in the asset viewer. For the broader save-state toolkit (diff, bisect, scenario manifest), see <a href="mednafen-automation.html">mednafen automation</a>.</p>
+</section>
+
+<section class="doc-section" id="capturing-with-duckstation">
+  <h2>Capturing with Duckstation</h2>
+  <p>Duckstation <code>.sav</code> states are <code>DUCCS</code> magic plus a zstd stream. <code>scripts/ghidra-analysis/extract-duckstation-overlay.py</code> decompresses with the system <code>zstd</code> and locates main RAM by the same anchor-string approach; default slice is the full 256 KB.</p>
+  <div class="cli"><code>scripts/ghidra-analysis/extract-duckstation-overlay.py SCUS-94254_1.sav --out /tmp/legaia_overlay_fishing.bin</code></div>
+  <details class="disclosure">
+    <summary>Payload layout, and the VRAM-base trap</summary>
+    <div class="disclosure-body">
+      <p>The decompressed payload carries more than main RAM at fixed offsets: the cue path string in the uncompressed header, a 256x192 RGBA thumbnail in the first zstd frame, main RAM at payload <code>+0x1A62</code> in the second, and <strong>VRAM (1 MiB) at <code>RAM_end + 0x396</code></strong> - a GPU-register block sits between. Pin the VRAM base against a landmark before reading coordinates out of it: a base short by that block makes every located CLUT colour appear at one uniform halfword shift, which reads as a "relocation" when it is only an extraction error.</p>
+      <p>Seven Duckstation saves cover the minigame overlays: fishing, slot machine, Baka Fighter, dance and the debug menu are variants of one binary (2-34 unique prologues between pairs; <code>debug_menu</code> is the superset capture); the two Muscle Dome saves share identical code and only one is imported.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="capture-protocol-per-overlay">
+  <h2>Capture protocol per overlay</h2>
+  <p>The rule everywhere: the overlay is only resident while its screen is on - a dialog box, a level-up banner, a cutscene - so save <em>during</em> it, not after.</p>
+  <table>
+    <thead><tr><th>Overlay</th><th>When to save the state</th><th>Label</th></tr></thead>
+    <tbody>
+      <tr><td>Town / field</td><td>Standing in any town map</td><td><code>town</code></td></tr>
+      <tr><td>Battle</td><td>During the action menu (a clean state, not mid-animation)</td><td><code>battle</code></td></tr>
+      <tr><td>Level-up</td><td>While the post-battle level-up screen is displayed</td><td><code>level_up</code></td></tr>
+      <tr><td>Dialog</td><td>As soon as a dialog box appears - the overlay unloads when the box closes</td><td><code>dialog</code></td></tr>
+      <tr><td>Cutscene</td><td>Within the first seconds of playback (XA audio audible, fullscreen)</td><td><code>cutscene</code></td></tr>
+    </tbody>
+  </table>
+  <details class="disclosure">
+    <summary>What to look for after a dialog or cutscene import</summary>
+    <div class="disclosure-body">
+      <ul class="bullets">
+        <li><strong>Dialog:</strong> glyph-table strings near the base; functions taking a <code>MES container ptr + msg_id + (x, y)</code> shape feeding the dialog pager <code>FUN_801D84D0</code>; per-page glyph uploads to VRAM. Field NPC dialogue has no opener function - it is the actor's inline MES walked by <code>FUN_80039b7c</code> (see <a href="../subsystems/script-vm.html">script-vm</a>). The renderer-side quads land in <code>crates/engine-render</code> against the extracted font atlas (<a href="../formats/dialog-font.html">dialog font</a>).</li>
+        <li><strong>Cutscene:</strong> XA-DMA writes to the SPU register region; a mode table indexed by cutscene ID (the cutscene equivalent of the game-mode table at <code>0x8007078C</code>); per-chapter XA filename strings. The mode-26/27 STR dispatcher is described in <a href="../subsystems/cutscene.html">cutscene</a>.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="extracting-tims-from-ram">
+  <h2>Extracting TIMs from a RAM snapshot</h2>
+  <p>A captured RAM dump often contains transient textures (TIMs) staged in main RAM before upload to video memory. When the on-disc source is uncompressed, the staged copy is byte-identical except the RECT fields (VRAM target coordinates), so a texture can be traced back to its source PROT entry: sweep the dump for the TIM magic plus valid flags, decode each hit to PNG to identify it visually, fingerprint 16 bytes of the first CLUT row (skipping the runtime-relocated RECT), and grep the PROT corpus for that fingerprint.</p>
+  <details class="disclosure">
+    <summary>Worked example: the boot publisher logos</summary>
+    <div class="disclosure-body">
+      <p>A full 2 MiB snapshot taken during the publisher-logo phase contains four TIMs at <code>0x801D09DC</code>, <code>0x801DBBFC</code>, <code>0x801E761C</code>, <code>0x801EB65C</code> - the publisher / warning screens. All four CLUT fingerprints match <code>0895_bat_back_dat.BIN</code> at well-separated offsets: PROT 0895 is the boot <code>init.pak</code> bundle, and the <code>bat_back_dat</code> filename label is the CDNAME <a href="../formats/cdname.html#numbering-space">+2 numbering shift</a>. Documented in <a href="../subsystems/boot.html#init-pak-publisher-logos">boot</a>.</p>
+      <p>The method works for any transient TIM (battle backgrounds, menu chrome, terrain textures) whose source is stored uncompressed; LZS-compressed sources will not match by direct byte search - decompress first or use a different signature.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="bulk-import-of-static-overlay-candidates">
+  <h2>Bulk import of static overlay candidates</h2>
+  <p>The <code>find-overlay</code> heuristic ranks PROT entries by likelihood-of-being-overlay-code via <code>addiu sp, sp, -X</code> prologue density (see <a href="../formats/mips-overlay.html">MIPS overlay detection</a>). <code>scripts/ghidra-analysis/bulk-import-overlays.sh --score 3.5</code> imports the top candidates at base <code>0x801C0000</code> and runs auto-analysis + the inventory dumper; per-overlay function inventories land in <code>ghidra/scripts/inventory_overlay_&lt;stem&gt;.bin.csv</code>. Bulk import only gives function lists - the <a href="static-overlay-pipeline.html">static overlay pipeline</a> is the successor, importing each overlay at its <em>recovered</em> base with the PROT entry as identity.</p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="static-overlay-pipeline.html">Static overlay pipeline</a>
+    <a href="ghidra.html">Ghidra in Docker</a>
+    <a href="pcsx-redux-automation.html">PCSX-Redux automation</a>
+    <a href="mednafen-automation.html">Mednafen automation</a>
+    <a href="spine-flag-writers-capture.html">Spine flag-writers capture</a>
+    <a href="../formats/mips-overlay.html">MIPS overlay detection</a>
+    <a href="../reference/functions.html">Functions</a>
+    <a href="../reference/memory-map.html">Memory map</a>
+    <a href="../reference/re-do-not-re-walk.html">Do not re-walk</a>
+  </div>
+</section>

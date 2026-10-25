@@ -1,0 +1,719 @@
+use super::*;
+
+#[test]
+fn packet_length_empty_buffer_is_zero() {
+    assert_eq!(packet_length(&[]), 0);
+}
+
+#[test]
+fn packet_length_immediate_terminator_is_zero() {
+    // Any byte <= 0x1E ends the packet without contributing.
+    for b in 0..=0x1Eu8 {
+        assert_eq!(packet_length(&[b]), 0, "terminator byte {b:#x}");
+    }
+}
+
+#[test]
+fn packet_length_pure_printable_run() {
+    let buf = [0x20, 0x40, 0x80, 0xBF, 0x00];
+    assert_eq!(packet_length(&buf), 4);
+}
+
+#[test]
+fn packet_length_escape_sequence_counts_two() {
+    // 0xC1 is an escape lead - the next byte is consumed unconditionally.
+    let buf = [0xC1, 0xAB, 0x00];
+    assert_eq!(packet_length(&buf), 2);
+}
+
+#[test]
+fn delimited_field_offset_finds_nth_delimiter() {
+    // Delimiter 0x2A at offsets 1 and 3.
+    let buf = [0x40, 0x2A, 0x41, 0x2A, 0x42, 0x00];
+    assert_eq!(delimited_field_offset(&buf, 0x2A, 1), Some(1));
+    assert_eq!(delimited_field_offset(&buf, 0x2A, 2), Some(3));
+    assert_eq!(delimited_field_offset(&buf, 0x2A, 3), None);
+}
+
+#[test]
+fn delimited_field_offset_skips_escape_operands() {
+    // The escape pair's operand byte equals the delimiter but is never
+    // tested; it still advances the returned offset by one.
+    let buf = [0xC1, 0x2A, 0x40, 0x2A, 0x00];
+    assert_eq!(delimited_field_offset(&buf, 0x2A, 1), Some(3));
+}
+
+#[test]
+fn delimited_field_offset_zero_nth_never_matches() {
+    let buf = [0x2A, 0x00];
+    assert_eq!(delimited_field_offset(&buf, 0x2A, 0), None);
+}
+
+#[test]
+fn delimited_field_offset_terminates_on_nul() {
+    let buf = [0x40, 0x00, 0x2A];
+    assert_eq!(delimited_field_offset(&buf, 0x2A, 1), None);
+}
+
+#[test]
+fn packet_length_multiple_escapes_with_runs() {
+    let buf = [0x40, 0xC1, 0xAB, 0x40, 0xCD, 0x05, 0x00];
+    assert_eq!(packet_length(&buf), 6);
+}
+
+#[test]
+fn packet_length_escape_at_buffer_boundary() {
+    // 0xC2 with no following byte: we guard and stop; the lead still counts.
+    assert_eq!(packet_length(&[0xC2]), 1);
+}
+
+#[test]
+fn packet_length_no_terminator_runs_to_end() {
+    assert_eq!(packet_length(&[0x20, 0x21, 0x22, 0x23]), 4);
+}
+
+#[test]
+fn packet_length_high_nibble_matters_for_escape() {
+    assert_eq!(packet_length(&[0xC0, 0xFF, 0x00]), 2);
+    assert_eq!(packet_length(&[0xD0, 0xFF, 0x00]), 2);
+    for lead in 0xC0..=0xCFu8 {
+        assert_eq!(
+            packet_length(&[lead, 0xAB, 0x00]),
+            2,
+            "escape lead {lead:#x}"
+        );
+    }
+    for lead in [0xB0u8, 0xBFu8, 0xD0u8, 0xDFu8] {
+        assert_eq!(packet_length(&[lead, 0x00]), 1, "non-escape lead {lead:#x}");
+    }
+}
+
+#[test]
+fn nop_decodes() {
+    let insn = decode(&[0x21], 0).unwrap();
+    assert_eq!(insn.size, 1);
+    assert!(matches!(insn.info, InsnInfo::Nop));
+}
+
+#[test]
+fn extended_bit_skips_target_id_byte() {
+    // 0xA1 = 0x21 | 0x80 (extended Nop).
+    let insn = decode(&[0xA1, 0x07], 0).unwrap();
+    assert_eq!(insn.size, 2);
+    assert_eq!(insn.extended, Some(0x07));
+    assert_eq!(insn.opcode, 0x21);
+}
+
+#[test]
+fn fmv_trigger_decodes_fmv_id_and_total_size_six_bytes() {
+    // [4C, E2, 03, 00, _, _]
+    let bc = [0x4C, 0xE2, 0x03, 0x00, 0x00, 0x00];
+    let insn = decode(&bc, 0).unwrap();
+    assert_eq!(insn.size, 6);
+    match insn.info {
+        InsnInfo::MenuCtrl {
+            op0: 0xE2,
+            kind: MenuCtrlKind::FmvTrigger { fmv_id },
+        } => assert_eq!(fmv_id, 3),
+        other => panic!("unexpected info: {other:?}"),
+    }
+}
+
+#[test]
+fn fmv_trigger_negative_index() {
+    let bc = [0x4C, 0xE2, 0xFF, 0xFF, 0x00, 0x00];
+    let insn = decode(&bc, 0).unwrap();
+    match insn.info {
+        InsnInfo::MenuCtrl {
+            kind: MenuCtrlKind::FmvTrigger { fmv_id },
+            ..
+        } => assert_eq!(fmv_id, -1),
+        _ => panic!("expected FmvTrigger"),
+    }
+}
+
+#[test]
+fn jmp_rel_target_is_post_header() {
+    // 0x26 + LE u16 0x0008. Target = pc + header_size + delta = 0 + 1 + 8 = 9.
+    let bc = [0x26, 0x08, 0x00, 0xAA, 0xBB];
+    let insn = decode(&bc, 0).unwrap();
+    match insn.info {
+        InsnInfo::JmpRel { delta, target } => {
+            assert_eq!(delta, 0x0008);
+            assert_eq!(target, 9);
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn animate_consumes_count_times_four_extra_bytes() {
+    // count = 2, 4 * 2 = 8 keyframe bytes; total = 1 (op) + 1 (count) + 1 (base) + 8 = 11.
+    let mut bc = vec![0x4Bu8, 2, 0xFF];
+    bc.extend_from_slice(&[0x11; 8]);
+    let insn = decode(&bc, 0).unwrap();
+    assert_eq!(insn.size, 11);
+}
+
+#[test]
+fn data_block_consumes_len_bytes() {
+    // len = 5: total = 1 (op) + 1 (len) + 5 (payload) = 7.
+    let bc = [0x40u8, 5, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+    let insn = decode(&bc, 0).unwrap();
+    assert_eq!(insn.size, 7);
+}
+
+#[test]
+fn cond_jmp_always_advances_by_five() {
+    let bc = [0x42u8, 0, 7, 0x10, 0x00];
+    let insn = decode(&bc, 0).unwrap();
+    match insn.info {
+        InsnInfo::CondJmp { delta, target, .. } => {
+            assert_eq!(delta, 0x0010);
+            // target = pc + header_size + 2 + delta = 0 + 1 + 2 + 16 = 19.
+            assert_eq!(target, 19);
+        }
+        _ => panic!(),
+    }
+    assert_eq!(insn.size, 5);
+}
+
+#[test]
+fn bbox_test_skip_target_offset() {
+    // operand bytes: x_min=1, z_min=2, x_max=3, z_max=4, skip=0x0007.
+    let bc = [0x4Du8, 1, 2, 3, 4, 0x07, 0x00];
+    let insn = decode(&bc, 0).unwrap();
+    match insn.info {
+        InsnInfo::BBoxTest {
+            skip_delta,
+            skip_target,
+            ..
+        } => {
+            assert_eq!(skip_delta, 7);
+            // skip_target = pc + header + 4 + delta = 0 + 1 + 4 + 7 = 12.
+            assert_eq!(skip_target, 12);
+        }
+        _ => panic!(),
+    }
+    assert_eq!(insn.size, 7);
+}
+
+#[test]
+fn warp_uses_six_bytes_when_op0_ge_100() {
+    let bc = [0x3Eu8, 100, 0, 0, 0, 0];
+    let insn = decode(&bc, 0).unwrap();
+    assert_eq!(insn.size, 6);
+    match insn.info {
+        InsnInfo::WarpOrInteract { is_warp, .. } => assert!(is_warp),
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn scripted_battle_uses_three_bytes_when_op0_under_100() {
+    let bc = [0x3Eu8, 5, 0xAB];
+    let insn = decode(&bc, 0).unwrap();
+    assert_eq!(insn.size, 3);
+    match insn.info {
+        InsnInfo::WarpOrInteract { is_warp, .. } => assert!(!is_warp),
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn linear_walker_yields_three_instructions_then_stops() {
+    // [22, 5] ExecMove; [21] Nop; [37, 0, 0] Yield.
+    let bc = [0x22u8, 5, 0x21, 0x37, 0, 0];
+    let walked: Vec<_> = LinearWalker::new(&bc, 0).collect();
+    assert_eq!(walked.len(), 3);
+    assert!(walked.iter().all(|r| r.is_ok()));
+}
+
+#[test]
+fn linear_walker_recovers_from_unknown_sub_op() {
+    // 0x4C 0xB0: outer nibble 0xB has no `case 0xb` in the retail switch -
+    // genuinely undefined, so the decoder errors and the walker advances one
+    // byte to resync.
+    let bc = [0x4Cu8, 0xB0, 0x21];
+    let mut walked = LinearWalker::new(&bc, 0);
+    let first = walked.next().unwrap();
+    assert!(first.is_err(), "first instruction should error");
+    // Walker advanced 1 byte; next instruction is at pc=1 (still inside 0x4C/0xB0/0x21).
+    let second = walked.next().unwrap();
+    match second {
+        Ok(_) | Err(_) => {}
+    }
+}
+
+#[test]
+fn menu_ctrl_high_nibble_widths_match_the_retail_dispatcher() {
+    // Widths for the outer nibbles 9/A/C/D/F, mirrored from the executing
+    // VM's menu_ctrl port (retail `param_2 + N` advances). Each entry is
+    // (op0, total_size_without_ext_header).
+    let cases: &[(u8, usize)] = &[
+        // nibble 9: floor-ladder rung 9 total, sub-E 16-word table copy, sub-F.
+        (0x90, 9),
+        (0x92, 9),
+        (0x9E, 34),
+        (0x9F, 2),
+        // nibble A: conditional flag jump, 5 total for every sub.
+        (0xA0, 5),
+        (0xA1, 5),
+        (0xA2, 5),
+        (0xAF, 5),
+        // nibble C.
+        (0xC0, 2),
+        (0xC2, 3),
+        (0xC4, 4),
+        (0xC5, 4),
+        (0xC7, 4),
+        (0xCA, 5),
+        (0xCD, 2),
+        (0xCE, 3),
+        (0xCF, 4),
+        // nibble D. Sub-3 is SCHEDULE_TIMED_FLAGS (14 total) - the timed
+        // flag writer the flag census has to be able to walk.
+        (0xD0, 6),
+        (0xD1, 4),
+        (0xD3, 14),
+        (0xD4, 6),
+        (0xD8, 9),
+        (0xDB, 13),
+        (0xDC, 5),
+        (0xDF, 3),
+        // nibble F: pass-through, 2 total.
+        (0xFF, 2),
+    ];
+    for &(op0, total) in cases {
+        let mut bc = vec![0x4Cu8, op0];
+        bc.extend(std::iter::repeat_n(0u8, 40));
+        let insn = decode(&bc, 0).unwrap_or_else(|e| panic!("op0 {op0:#04X} should decode: {e:?}"));
+        assert_eq!(insn.size, total, "op0 {op0:#04X} width");
+        match insn.info {
+            InsnInfo::MenuCtrl {
+                kind: MenuCtrlKind::HighNibble { outer, sub, .. },
+                ..
+            } => {
+                assert_eq!(outer, op0 >> 4, "op0 {op0:#04X} outer");
+                assert_eq!(sub, op0 & 0x0F, "op0 {op0:#04X} sub");
+            }
+            ref other => panic!("op0 {op0:#04X}: unexpected info {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn menu_ctrl_nibble_9_undefined_subs_error() {
+    // Nibble-9 subs 3..=0xD have no `case` arm in retail - keep erroring.
+    for sub in 3u8..=0xD {
+        let bc = [0x4Cu8, 0x90 | sub, 0, 0, 0, 0];
+        assert!(
+            decode(&bc, 0).is_err(),
+            "nibble-9 sub {sub:#X} should stay undefined"
+        );
+    }
+}
+
+#[test]
+fn menu_ctrl_nibble_a_extended_form_decodes_the_jouinc_door_branch() {
+    // The extended-target form seen on every jouinc J-family door record:
+    // [CC, actor, A1, bit, lo, hi] - 6 bytes total with the ext header.
+    let bc = [0xCCu8, 0x06, 0xA1, 0x0A, 0x1D, 0x00];
+    let insn = decode(&bc, 0).unwrap();
+    assert_eq!(insn.size, 6);
+    assert_eq!(insn.extended, Some(0x06));
+    match insn.info {
+        InsnInfo::MenuCtrl {
+            op0: 0xA1,
+            kind: MenuCtrlKind::HighNibble {
+                outer: 0xA, sub: 1, ..
+            },
+        } => {}
+        ref other => panic!("unexpected info {other:?}"),
+    }
+}
+
+#[test]
+fn fmv_trigger_search_finds_all() {
+    // Build a script with 3 FMV triggers.
+    let mut bc = Vec::new();
+    // Trigger 0: MV1.STR at pc=0
+    bc.extend_from_slice(&[0x4C, 0xE2, 0, 0, 0, 0]);
+    // Some unrelated nop
+    bc.push(0x21);
+    // Trigger 4: MV6.STR
+    bc.extend_from_slice(&[0x4C, 0xE2, 4, 0, 0, 0]);
+    // Trigger 3: MV4.STR
+    bc.extend_from_slice(&[0x4C, 0xE2, 3, 0, 0, 0]);
+    let triggers = find_fmv_triggers(&bc);
+    assert_eq!(triggers.len(), 3);
+    assert_eq!(triggers[0], (0, 0));
+    assert_eq!(triggers[1].1, 4);
+    assert_eq!(triggers[2].1, 3);
+}
+
+#[test]
+fn fmv_filename_known_indices() {
+    assert_eq!(fmv_filename(0), "MV1.STR");
+    assert_eq!(fmv_filename(1), "MV2.STR");
+    assert_eq!(fmv_filename(4), "MV3.STR");
+    assert_eq!(fmv_filename(8), "MV6.STR");
+    assert_eq!(fmv_filename(10), "(dev: MOV15.STR)");
+    assert_eq!(fmv_filename(99), "(unknown)");
+}
+
+#[test]
+fn scene_change_consumes_inline_payload_and_recovers_name() {
+    // [3F, index_lo, index_hi, name_len=4, 'd','o','l','k', entry_x, entry_z, dir].
+    let bc = [0x3Fu8, 60, 0, 4, b'd', b'o', b'l', b'k', 0x10, 0x20, 0x30];
+    let insn = decode(&bc, 0).unwrap();
+    assert_eq!(insn.size, 11); // header 1 + 6 + name_len 4
+    match insn.info {
+        InsnInfo::SceneChange {
+            index,
+            name_len,
+            entry_x,
+            entry_z,
+            dir,
+        } => {
+            assert_eq!(index, 60);
+            assert_eq!(name_len, 4);
+            assert_eq!(entry_x, 0x10);
+            assert_eq!(entry_z, 0x20);
+            assert_eq!(dir, 0x30);
+        }
+        other => panic!("expected SceneChange, got {other:?}"),
+    }
+    // The destination name is recovered from the bytecode slice.
+    assert_eq!(scene_change_name(&bc, &insn).as_deref(), Some("dolk"));
+}
+
+#[test]
+fn scene_change_name_rejects_text_desync_phantom() {
+    // A 0x3F whose "name" bytes carry punctuation or a space (a literal '?'
+    // landing inside message text) is not a clean CDNAME label.
+    let bc = [0x3Fu8, 0, 0, 4, b'H', b'i', b'!', b' ', 0x00, 0x00, 0x00];
+    let insn = decode(&bc, 0).unwrap();
+    assert_eq!(scene_change_name(&bc, &insn), None);
+    // Mixed case is message text too - the disc carries no mixed-case `0x3F`
+    // name run at all.
+    let bc = [
+        0x3Fu8, 0, 0, 5, b'J', b'e', b't', b't', b'e', 0x00, 0x00, 0x00,
+    ];
+    let insn = decode(&bc, 0).unwrap();
+    assert_eq!(scene_change_name(&bc, &insn), None);
+    // And a run shorter than the shortest CDNAME label (`jou` / `kor` / `son`
+    // / `uru`) is a phantom: `J`, `L8` and `L9L` are the three the raw byte
+    // scan turns up, and none survives a real instruction walk.
+    let bc = [0x3Fu8, 0, 0, 2, b'L', b'8', 0x00, 0x00, 0x00];
+    let insn = decode(&bc, 0).unwrap();
+    assert_eq!(scene_change_name(&bc, &insn), None);
+}
+
+#[test]
+fn scene_change_name_accepts_uppercase_and_folds_it() {
+    // Retail never compares the operand against a name table: `FUN_8001FD44`
+    // copies it into the next-scene global and the field asset loader
+    // (`FUN_8001F7C0` at `0x8001F7E8..0x8001F88C`) concatenates it into the
+    // ISO path `DATA\FIELD\<name>.MAP` for `FUN_8003E6BC` -> `FUN_800608F0`.
+    // ISO 9660 identifiers are upper case, so the operand's case is invisible
+    // to the disc - and roughly half of it is written upper case, `uru`'s own
+    // `MAP03` exit included. The gate folds to the CDNAME index's lower case.
+    let bc = [
+        0x3Fu8, 0x87, 0x01, 5, b'M', b'A', b'P', b'0', b'3', 0x24, 0x46, 0x00,
+    ];
+    let insn = decode(&bc, 0).unwrap();
+    assert_eq!(scene_change_name(&bc, &insn).as_deref(), Some("map03"));
+}
+
+#[test]
+fn system_flag_test_includes_target() {
+    // Opcode 0x70, idx low byte 5, jump 0x000A.
+    let bc = [0x70u8, 5, 0x0A, 0x00];
+    let insn = decode(&bc, 0).unwrap();
+    match insn.info {
+        InsnInfo::SystemFlag {
+            kind: FlagKind::Test,
+            target,
+            ..
+        } => assert_eq!(target.unwrap(), (1 + 1) + 0x0A),
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn truncated_returns_error_at_pc() {
+    let bc = [0x22u8]; // ExecMove with no operand byte.
+    let err = decode(&bc, 0).unwrap_err();
+    assert!(matches!(err, DisasmError::Truncated { pc: 0, .. }));
+}
+
+#[test]
+fn format_instruction_includes_byte_dump_and_mnemonic() {
+    let bc = [0x4Cu8, 0xE2, 0x03, 0x00, 0x00, 0x00];
+    let insn = decode(&bc, 0).unwrap();
+    let line = format_instruction(&insn, &bc);
+    assert!(line.contains("0x0000"));
+    assert!(line.contains("4C E2 03 00 00 00"));
+    assert!(line.contains("FmvTrigger"));
+    assert!(line.contains("MV3.STR")); // fmv_id 3 = the second MV3 segment
+}
+
+#[test]
+fn menu_ctrl_nibble6_clut_fx_decodes_the_16_byte_form() {
+    // map01's first row-498 fade op: A=(0,498) B=(112,499) dest=(0,498)
+    // frames=128 (the retail bytes at MAN offset 0xf03).
+    let bc = [
+        0x4Cu8, 0x61, 0x00, 0x00, 0xF2, 0x01, 0x70, 0x00, 0xF3, 0x01, 0x00, 0x00, 0xF2, 0x01, 0x80,
+        0x00,
+    ];
+    let insn = decode(&bc, 0).unwrap();
+    assert_eq!(insn.size, 16);
+    match insn.info {
+        InsnInfo::MenuCtrl {
+            op0: 0x61,
+            kind: MenuCtrlKind::Nibble6ClutFx { a, b, dest, frames },
+        } => {
+            assert_eq!(a, (0, 498));
+            assert_eq!(b, (112, 499));
+            assert_eq!(dest, (0, 498));
+            assert_eq!(frames, 128);
+        }
+        other => panic!("wrong decode: {other:?}"),
+    }
+}
+
+#[test]
+fn inventory_cmp_sub_ops_4_through_8_decode_as_the_7_byte_compare() {
+    // cave01 P2[12]'s spawn gate: `4E 00 50 08 00 06 00` = sub-5 slot-table
+    // compare (slot 0x801C6460[0] vs 8, skip +6). The raw jump table at
+    // 0x801CEE30 routes every sub-op 0..9 to a value loader joining the
+    // shared compare at 0x801E0B40 - the earlier "sub-5..8 absolute jump"
+    // and "sub-4 rand -> next PC" readings were the collapsed decomp switch.
+    let bc = [0x4Eu8, 0x00, 0x50, 0x08, 0x00, 0x06, 0x00];
+    let insn = decode(&bc, 0).unwrap();
+    assert_eq!(insn.size, 7);
+    match insn.info {
+        InsnInfo::InventoryCmp {
+            kind:
+                InventoryCmpKind::Compare {
+                    sub_op: 5,
+                    arg: 8,
+                    skip_delta: 6,
+                    skip_target,
+                    ..
+                },
+            ..
+        } => {
+            // skip base = pc + header + 4 = 5; +6 = 11.
+            assert_eq!(skip_target, 11);
+        }
+        other => panic!("wrong decode: {other:?}"),
+    }
+    // Sub-4 (BIOS-rand chance branch) shares the exact same shape.
+    let bc = [0x4Eu8, 0x00, 0x40, 0x64, 0x00, 0x10, 0x00];
+    let insn = decode(&bc, 0).unwrap();
+    assert_eq!(insn.size, 7);
+    assert!(matches!(
+        insn.info,
+        InsnInfo::InventoryCmp {
+            kind: InventoryCmpKind::Compare { sub_op: 4, .. },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn jmp_rel_high_bit_delta_is_a_backward_jump() {
+    // The `[21] [26 FE FF]` wait loop: retail's script PC is a 16-bit field,
+    // so delta 0xFFFE is -2 and the jump at pc 1 parks on the halt at pc 0.
+    let bc = [0x21, 0x26, 0xFE, 0xFF];
+    let insn = decode(&bc, 1).unwrap();
+    match insn.info {
+        InsnInfo::JmpRel { delta, target } => {
+            assert_eq!(delta, 0xFFFE);
+            assert_eq!(target, 0);
+        }
+        _ => panic!("expected JmpRel"),
+    }
+}
+
+#[test]
+fn text_segment_is_a_stride_of_lead_glyphs_and_terminator() {
+    // `1F "Hi" 00` then a Nop: the walk steps over the whole segment.
+    let buf = [0x1F, b'H', b'i', 0x00, 0x21];
+    let t = decode(&buf, 0).unwrap();
+    assert!(matches!(t.info, InsnInfo::TextSegment { len: 2 }));
+    assert_eq!(t.size, 4);
+    assert!(matches!(decode(&buf, 4).unwrap().info, InsnInfo::Nop));
+    // A `C1 00` name substitution does not terminate the line.
+    let buf = [0x1F, 0xC1, 0x00, b'!', 0x00, 0x21];
+    let t = decode(&buf, 0).unwrap();
+    assert!(matches!(t.info, InsnInfo::TextSegment { len: 3 }));
+    assert_eq!(t.size, 5);
+    // No terminator before the buffer ends: truncated, not a segment.
+    assert!(decode(&[0x1F, b'H', b'i'], 0).is_err());
+}
+
+#[test]
+fn picker_jump_entries_are_relative_to_their_own_offset() {
+    // 4-option picker at pc 0: entry i sits at 1 + i*2, target = entry + delta.
+    let mut buf = vec![0x29];
+    for d in [10i16, 20, -4, 30] {
+        buf.extend_from_slice(&d.to_le_bytes());
+    }
+    buf.push(0x21);
+    let p = decode(&buf, 0).unwrap();
+    assert_eq!(p.size, 9);
+    let InsnInfo::Picker {
+        count,
+        deltas,
+        targets,
+    } = p.info
+    else {
+        panic!("not a picker: {:?}", p.info);
+    };
+    assert_eq!(count, 4);
+    assert_eq!(deltas, [10, 20, -4, 30]);
+    assert_eq!(targets, [11, 23, 1, 37]);
+    assert!(matches!(decode(&buf, 9).unwrap().info, InsnInfo::Nop));
+    for (open, n) in [(0x27u8, 2usize), (0x28, 3), (0x2A, 2)] {
+        let mut b = vec![open];
+        b.extend(std::iter::repeat_n(0u8, n * 2));
+        let i = decode(&b, 0).unwrap();
+        assert_eq!(i.size, 1 + n * 2, "open {open:#x}");
+        assert!(matches!(i.info, InsnInfo::Picker { count, .. } if count as usize == n));
+    }
+}
+
+#[test]
+fn effect_capture_yield_is_two_bytes_and_leaves_the_data_block_to_the_walk() {
+    // `34 20` then the `40 01 00` DATA_BLOCK the capture forwards, then a Nop.
+    let buf = [0x34, 0x20, 0x40, 0x01, 0x00, 0x21];
+    let e = decode(&buf, 0).unwrap();
+    assert_eq!(e.size, 2);
+    assert!(matches!(
+        e.info,
+        InsnInfo::Effect {
+            op0: 0x20,
+            kind: EffectKind::CaptureYield { b1: 0x40 }
+        }
+    ));
+    let d = decode(&buf, 2).unwrap();
+    assert!(matches!(d.info, InsnInfo::DataBlock { len: 1 }));
+    assert_eq!(d.size, 3);
+    assert!(matches!(decode(&buf, 5).unwrap().info, InsnInfo::Nop));
+}
+
+#[test]
+fn state_resume_sub0_shop_record_spans_the_ids_and_the_name() {
+    let mut buf = vec![0x49, 0x00, 0x00, 0x03, 0x22, 0x28, 0x03];
+    buf.extend_from_slice(b"Arms Shop\0");
+    buf.push(0x21);
+    let s = decode(&buf, 0).unwrap();
+    assert!(matches!(
+        s.info,
+        InsnInfo::StateResume {
+            sub_op: 0,
+            kind: StateResumeKind::DoneSub0Shop {
+                count: 3,
+                name_len: 9
+            }
+        }
+    ));
+    assert_eq!(s.size, buf.len() - 1);
+    assert!(matches!(decode(&buf, s.size).unwrap().info, InsnInfo::Nop));
+    // The MES form: `49 00 00 00 1F "hi" 00` - the length (0) is the
+    // operand's third byte - is 8 bytes, through the line's terminator.
+    let buf = [0x49, 0x00, 0x00, 0x00, 0x1F, b'h', b'i', 0x00, 0x21];
+    let m = decode(&buf, 0).unwrap();
+    assert_eq!(m.size, 8);
+    assert!(matches!(
+        m.info,
+        InsnInfo::StateResume {
+            sub_op: 0,
+            kind: StateResumeKind::DoneSub0Mes { .. }
+        }
+    ));
+}
+
+#[test]
+fn menu_ctrl_14_is_the_eight_byte_form_of_nibble_1() {
+    let buf = [0x4C, 0x14, 1, 2, 3, 4, 5, 6, 0x21];
+    assert_eq!(decode(&buf, 0).unwrap().size, 8);
+    assert!(matches!(decode(&buf, 8).unwrap().info, InsnInfo::Nop));
+    let buf = [0x4C, 0x13, 1, 2, 3, 4, 5, 0x21];
+    assert_eq!(decode(&buf, 0).unwrap().size, 7);
+    assert!(matches!(decode(&buf, 7).unwrap().info, InsnInfo::Nop));
+}
+
+#[test]
+fn menu_ctrl_d2_carries_its_channel_byte() {
+    let buf = [0x4C, 0xD2, 0x0F, 0x4C, 0xD2, 0x10, 0x21];
+    assert_eq!(decode(&buf, 0).unwrap().size, 3);
+    assert_eq!(decode(&buf, 3).unwrap().size, 3);
+    assert!(matches!(decode(&buf, 6).unwrap().info, InsnInfo::Nop));
+}
+
+#[test]
+fn text_lead_names_the_lead_byte_of_every_text_carrying_shape() {
+    let bare = [0x21, 0x1F, b'h', 0x00];
+    assert_eq!(text_lead(&bare, &decode(&bare, 1).unwrap()), Some(1));
+    assert_eq!(text_lead(&bare, &decode(&bare, 0).unwrap()), None);
+    let mes = [0x49, 0x00, 0x00, 0x00, 0x1F, b'h', 0x00];
+    assert_eq!(text_lead(&mes, &decode(&mes, 0).unwrap()), Some(4));
+    let balloon = [0x4C, 0xE1, 0x1F, b'h', b'i', 0x00, 0x21];
+    let b = decode(&balloon, 0).unwrap();
+    assert_eq!(b.size, 6);
+    assert_eq!(text_lead(&balloon, &b), Some(2));
+    // An operand `1F` inside an instruction is not a lead: `CC 1F 50 4B 00`
+    // is a cross-context MENU_CTRL whose bytes happen to read `1F "PK" 00`.
+    let op = [0xCC, 0x1F, 0x50, 0x4B, 0x00];
+    let i = decode(&op, 0).unwrap();
+    assert_eq!(i.size, 5);
+    assert_eq!(text_lead(&op, &i), None);
+}
+
+#[test]
+fn op43_arc_jump_decodes_tile_apex_frames_and_explicit_y() {
+    // town01 `C3 F8 00 5F 0D 26 00 1C 00`: player arc to tile (0x5F, 0x0D),
+    // apex 0x26, 0x1C frames. The halfwords are the arc's apex / frame
+    // count, not a resume PC.
+    let bc = [0xC3u8, 0xF8, 0x00, 0x5F, 0x0D, 0x26, 0x00, 0x1C, 0x00];
+    let insn = decode(&bc, 0).unwrap();
+    assert_eq!(insn.size, 9);
+    match insn.info {
+        InsnInfo::ActorCtrl {
+            kind:
+                ActorCtrlKind::ArcJump {
+                    sub_op,
+                    tile_x,
+                    tile_z,
+                    apex,
+                    frames,
+                    y,
+                },
+            ..
+        } => {
+            assert_eq!(
+                (sub_op, tile_x, tile_z, apex, frames, y),
+                (0, 0x5F, 0x0D, 0x26, 0x1C, None)
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // Sub-A carries an explicit landing height, stored negated
+    // (`0x801DF524..0x801DF530`: `jal 0x8003CE9C` on `+7`, then `negu`).
+    let bc = [0x43u8, 0x0A, 0x76, 0x70, 0x50, 0x00, 0x32, 0x00, 0xA0, 0x00];
+    let insn = decode(&bc, 0).unwrap();
+    assert_eq!(insn.size, 10);
+    match insn.info {
+        InsnInfo::ActorCtrl {
+            kind: ActorCtrlKind::ArcJump {
+                apex, frames, y, ..
+            },
+            ..
+        } => assert_eq!((apex, frames, y), (0x50, 0x32, Some(-0xA0))),
+        other => panic!("{other:?}"),
+    }
+}

@@ -1,0 +1,107 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">reference</a> &middot; open RE threads</div>
+  <h1>Open reverse-engineering threads</h1>
+  <p class="lede">The live list of this project's unsolved mysteries. Every row is a reverse-engineering <em>question</em> about how Legaia's runtime works that is still contested, with what is already known and the concrete next step that would close it. If you are looking for a way to contribute, this page is the invitation.</p>
+</header>
+
+<!--REGISTER-NAV:open-->
+
+<section class="doc-section" id="overview" data-doc="what-this-page-is-for">
+  <h2>How to use these three pages</h2>
+  <p>Reverse engineering a sealed game produces three kinds of knowledge: questions still being worked, questions answered, and readings that turned out to be wrong. Each has its own page. Before starting a hunt, check all three - if a question is not on this page, it is probably already answered or already disproved.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 760 200" role="img" aria-label="Thread lifecycle: a question moves from open to partial to mostly resolved, then to the settled register; a reading that is disproved leaves for the do-not-re-walk register">
+      <defs><marker id="ore-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="dg-group" x="10" y="14" width="470" height="84" rx="8"/>
+      <text class="dg-sub" x="245" y="32">this page - live hunts</text>
+      <rect class="dg-node-accent" x="24" y="44" width="120" height="42" rx="6"/>
+      <text class="dg-label" x="84" y="70">open</text>
+      <rect class="dg-node-accent" x="182" y="44" width="120" height="42" rx="6"/>
+      <text class="dg-label" x="242" y="70">partial</text>
+      <rect class="dg-node-accent" x="340" y="44" width="128" height="42" rx="6"/>
+      <text class="dg-label" x="404" y="70">mostly resolved</text>
+      <rect class="dg-node-ok" x="540" y="40" width="200" height="50" rx="6"/>
+      <text class="dg-label" x="640" y="62">settled threads</text>
+      <text class="dg-sub" x="640" y="79">answer + evidence grade</text>
+      <rect class="dg-node-warn" x="300" y="138" width="200" height="50" rx="6"/>
+      <text class="dg-label" x="400" y="160">do not re-walk</text>
+      <text class="dg-sub" x="400" y="177">disproved, reasoning kept</text>
+      <path class="dg-edge" d="M144,65 H178" marker-end="url(#ore-arrow)"/>
+      <path class="dg-edge" d="M302,65 H336" marker-end="url(#ore-arrow)"/>
+      <path class="dg-edge" d="M468,65 H536" marker-end="url(#ore-arrow)"/>
+      <path class="dg-edge-dim" d="M242,86 V163 H296" marker-end="url(#ore-arrow)"/>
+      <text class="dg-edge-label" x="252" y="122">reading disproved</text>
+    </svg>
+    <figcaption>A question narrows left to right and leaves this page for one of two terminal registers. New evidence moves a row back here; it never edits a terminal row in place.</figcaption>
+  </figure>
+  <table>
+    <thead><tr><th>Page</th><th>Holds</th><th>Read it when</th></tr></thead>
+    <tbody>
+      <tr><td>This page</td><td>Live hunts: <span class="tag tag-open">open</span>, <span class="tag tag-partial">partial</span>, <span class="tag tag-mostly">mostly resolved</span></td><td>You are picking up work, or want to know whether a question is still contested.</td></tr>
+      <tr><td><a href="re-settled-threads.html">Settled threads</a></td><td>Answered questions, each carrying an evidence grade</td><td>You need the answer to something, or are about to build on a claim and want to know how firmly it is pinned.</td></tr>
+      <tr><td><a href="re-do-not-re-walk.html">Do not re-walk</a></td><td>Falsified hypotheses, reasoning intact</td><td>A reading of the bytes looks obvious and you want to check nobody has already disproved it.</td></tr>
+    </tbody>
+  </table>
+  <p>A falsified row is kept with its reasoning, because the reasoning <em>is</em> the deliverable - "the world-map slot-4 bodies are coastline wireframes" is a very plausible reading of those bytes, and knowing why it is wrong is worth more than the row it occupies.</p>
+</section>
+
+<section class="doc-section" id="at-a-glance" data-doc="-">
+  <h2>Where the live hunts are</h2>
+  <p>The live list is kept area by area below, one table per area holding every open question in it. An area with no open question stays on the page and says so - "this area has nothing open" is worth knowing before you start a hunt in it - and points at the settled and falsified pages for that area. The areas, their rows and the corrected-claims list are rendered from <code>docs/reference/open-rev-eng-threads.md</code> when the site is built, so a thread that closes in the docs leaves this page in the same build.</p>
+</section>
+
+<section class="doc-section" id="grades" data-doc="what-an-evidence-grade-means">
+  <h2>What an evidence grade means</h2>
+  <p>When a thread closes it moves to <a href="re-settled-threads.html">settled threads</a> carrying a <em>grade</em>: a label for what kind of evidence its answer actually rests on. Grades are explained here because they are the first thing to check when a settled fact is load-bearing for live work, and because a thread on this page is only closable by evidence of the strongest two kinds.</p>
+  <p>Where a row cites more than one kind, it is graded by the <strong>weakest load-bearing</strong> claim - the one that breaks the conclusion if it is wrong.</p>
+  <table>
+    <thead><tr><th>Grade</th><th>The row cites</th></tr></thead>
+    <tbody>
+      <tr><td><span class="tag tag-done">disassembly</span></td><td>Instructions, addresses, opcode encodings, branch or store sequences. The strongest grade.</td></tr>
+      <tr><td><span class="tag tag-done">capture</span></td><td>A runtime capture, save state, probe, firehose, or disc-derived oracle.</td></tr>
+      <tr><td><span class="tag tag-partial">decompiled-C</span></td><td>Ghidra's C output, a <code>FUN_x(...)</code> call signature, a Ghidra label or plate comment, or a claim about store order / store count / a boolean operator with no instruction behind it.</td></tr>
+      <tr><td><span class="tag tag-partial">inference</span></td><td>Reasoning from surrounding facts, corpus absence, or analogy, with no direct evidence cited.</td></tr>
+    </tbody>
+  </table>
+  <p><strong><code>decompiled-C</code> is the re-audit bucket, not a wrong-answer bucket.</strong> It marks a claim nobody has confirmed against instructions. Most are probably right; the point is that none has been checked. The C is a rendering: dropped register arguments, <code>||</code> printed as nested <code>if</code>s, reordered or omitted stores, and hand-written Ghidra annotations read as fact have each already put a wrong statement on these pages. The catalogue of rendering artifacts on the <a href="../tooling/ghidra.html">Ghidra tooling</a> page is also the grading rubric. When a <code>decompiled-C</code> row is load-bearing for something you are about to build, re-derive it from the disassembly first.</p>
+</section>
+
+<section class="doc-section" id="status-conventions" data-doc="status-conventions,how-a-thread-is-laid-out">
+  <h2>Status conventions, and how a thread is laid out</h2>
+  <table>
+    <thead><tr><th>Status</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><span class="tag tag-open">open</span></td><td>Active hunt. A concrete next step exists; the row names it.</td></tr>
+      <tr><td><span class="tag tag-partial">partial</span></td><td>The main result is pinned; a residual sub-question remains.</td></tr>
+      <tr><td><span class="tag tag-mostly">mostly resolved</span></td><td>The mechanism is pinned; one leg is unconfirmed.</td></tr>
+    </tbody>
+  </table>
+  <p>Many rows qualify the status in parentheses - <em>partial (transcode closed)</em>, <em>open (narrowed)</em> - naming <em>how far</em> it got. Read the parenthetical.</p>
+  <p>Each area below opens with a table of one-line rows. A thread whose write-up outgrows a table cell keeps its one-liner in the table and links to a subsection after it; the full analysis - every address, capture and falsification - lives in that subsection under its own <em>Status</em> line, with the long evidence folded into a disclosure so the page scans.</p>
+</section>
+
+<!--REGISTER:open-->
+
+<section class="doc-section" id="adding-rows" data-doc="adding-a-thread">
+  <h2>When to add a row</h2>
+  <p>A thread belongs here when:</p>
+  <ol class="bullets">
+    <li>There is something <em>specific</em> that would close it - a probe to run, a dump to read, a function to port. "Generally understand X better" is not closable; skip.</li>
+    <li>The next step is non-obvious from the code or git log. If <code>grep</code> would surface it, no row needed.</li>
+    <li>The detail lives elsewhere (a docs page, a Ghidra dump). The row is the pointer, not the analysis.</li>
+  </ol>
+  <p>When a thread closes, move its answer to <a href="re-settled-threads.html">settled threads</a> with an evidence grade, move any reading it disproved to <a href="re-do-not-re-walk.html">do not re-walk</a> with its reasoning, and delete the row here. Do not leave a "closed here" note behind: this page lists live hunts only.</p>
+</section>
+
+<section class="doc-section" id="see-also" data-doc="related-pages">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="re-settled-threads.html">Settled threads</a>
+    <a href="re-do-not-re-walk.html">Do not re-walk</a>
+    <a href="functions.html">Key functions</a>
+    <a href="../tooling/ghidra.html">Ghidra tooling (decompiler artifacts)</a>
+    <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/tooling/worklist-classification.md" target="_blank" rel="noopener">Worklist classification</a>
+    <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/subsystems/vm-inventory.md" target="_blank" rel="noopener">VM inventory</a>
+  </div>
+</section>

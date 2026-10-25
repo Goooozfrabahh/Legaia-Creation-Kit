@@ -1,0 +1,241 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">subsystems</a> &middot; boot path</div>
+  <h1>Boot path</h1>
+  <p class="lede">Everything between the disc spinning up and the moment you press NEW GAME. The publisher logos fade by, the wordmark appears - and behind that the game reads its archive directory, streams its first code overlay and enters the &ldquo;what mode am I in&rdquo; state machine that runs for the rest of the session. This page follows that chain, the title screen, and the scripted opening NEW GAME starts. The per-address tables live on <a href="boot-internals.html">boot internals</a>.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Entry point</dt><dd><code>main()</code> = <code>FUN_80015E90</code>; it never returns in normal play</dd>
+    <dt>Archive directory</dt><dd>The first three sectors of <code>PROT.DAT</code> (6 KB) land at <code>0x801C70F0</code>; every later load is a table lookup</dd>
+    <dt>Mode machine</dt><dd>14 modes, each an INIT / per-frame pair, in a table at <code>0x8007078C</code>; the current mode is the word <code>_DAT_8007B83C</code></dd>
+    <dt>Overlay window</dt><dd>Slot A at <code>0x801CE818</code> holds one of field / battle / menu / cutscene / minigame code at a time</dd>
+    <dt>Title screen</dt><dd>Has no mode of its own: it runs under <code>CARD</code> (modes 22/23), the same pair as the pause menu, from code at the tail of PROT 0899</dd>
+    <dt>NEW GAME</dt><dd>Writes mode 2 (field) and opens the prologue scene <code>opdeene</code>; name entry comes later, in <code>town01</code></dd>
+    <dt>In the port</dt><dd><code>engine-session::BootSession</code> runs the per-frame order; <code>engine-mode::mode::ModeSeat</code> holds the mode word; <code>engine-title::title_overlay</code> is the title tick</dd>
+    <dt>Confidence</dt><dd>Confirmed - mode table read off the disc; title tick and launch write pinned by live watchpoints</dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="how-it-works">
+  <h2>The boot chain</h2>
+  <p>A cold boot is six writes of a literal into the mode word. Each one hands the frame to the next screen, and none of the screens is named in the mode table - which is why the order has to be read off the stores rather than the table's dev labels.</p>
+  <ol class="steps">
+    <li><b>Hardware init</b><span>GPU, CD, sound, heap; the PROT.DAT directory and the CDNAME name map into RAM</span></li>
+    <li><b>Mode 16 &middot; READ INIT</b><span>one frame: upload the four <code>init.pak</code> logo textures</span></li>
+    <li><b>Mode 17 &middot; READ</b><span>the publisher logos fade in, hold and fade out</span></li>
+    <li><b>Mode 22 &middot; CARD INIT</b><span>stream PROT 0899 into slot A</span></li>
+    <li><b>Mode 23 &middot; CARD</b><span>the title screen, ticking as a spawned actor</span></li>
+    <li><b>Mode 2 &middot; MAIN INIT</b><span>NEW GAME: stream the field overlay 0897, load <code>opdeene</code></span></li>
+    <li><b>Mode 3 &middot; MAIN</b><span>the field loop - the game proper</span></li>
+  </ol>
+  <p>Almost every PlayStation game bundles its files into one archive so the disc can stream them; Legaia&rsquo;s is <code>PROT.DAT</code>, with a table of contents saying &ldquo;entry N starts at sector S&rdquo;. Reading that table is job one. Job two is the <em>asset-type dispatcher</em>: each asset&rsquo;s size word carries a type byte, and one router hands the bytes to the matching handler (<a href="../formats/asset-type.html">asset-type</a>). Job three is the mode machine below.</p>
+</section>
+
+<section class="doc-section" id="main-loop">
+  <h2>The main loop</h2>
+  <p>After hardware init, <code>main()</code> spins forever: run the current mode&rsquo;s handler; if the handler wrote a different mode, tidy up and switch. A mode&rsquo;s INIT handler runs for one frame and usually streams an overlay into slot A; its per-frame handler runs the game from then on, through the master frame driver that ticks actors, VMs and draws. Writing the mode word is the only way to change what the game is doing.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 860 250" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The main loop reads the mode word and dispatches the mode table: the INIT handler runs once and streams an overlay into slot A, the per-frame handler runs every frame through the master frame driver, and any handler may write a new mode word, which feeds back into the loop.">
+      <defs><marker id="bt-loop-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="dg-node-accent" x="20" y="60" width="170" height="56" rx="5"/>
+      <text class="dg-label" x="105" y="84">main loop</text><text class="dg-sub" x="105" y="102">reads the mode word</text>
+      <rect class="dg-node" x="240" y="60" width="170" height="56" rx="5"/>
+      <text class="dg-label" x="325" y="84">mode table</text><text class="dg-sub" x="325" y="102">14 INIT / run pairs</text>
+      <rect class="dg-node" x="460" y="60" width="170" height="56" rx="5"/>
+      <text class="dg-label" x="545" y="84">INIT handler</text><text class="dg-sub" x="545" y="102">one frame</text>
+      <rect class="dg-node" x="670" y="60" width="170" height="56" rx="5"/>
+      <text class="dg-label" x="755" y="84">per-frame handler</text><text class="dg-sub" x="755" y="102">every frame</text>
+      <rect class="dg-node" x="460" y="176" width="170" height="56" rx="5"/>
+      <text class="dg-label" x="545" y="200">overlay slot A</text><text class="dg-sub" x="545" y="218">streamed off the disc</text>
+      <rect class="dg-node" x="670" y="176" width="170" height="56" rx="5"/>
+      <text class="dg-label" x="755" y="200">master frame driver</text><text class="dg-sub" x="755" y="218">actors, VMs, draw</text>
+      <path class="dg-edge" d="M190 88 L238 88" marker-end="url(#bt-loop-arrow)"/>
+      <path class="dg-edge" d="M410 88 L458 88" marker-end="url(#bt-loop-arrow)"/>
+      <path class="dg-edge" d="M630 88 L668 88" marker-end="url(#bt-loop-arrow)"/>
+      <path class="dg-edge" d="M545 116 L545 174" marker-end="url(#bt-loop-arrow)"/>
+      <path class="dg-edge" d="M755 116 L755 174" marker-end="url(#bt-loop-arrow)"/>
+      <path class="dg-edge" d="M755 60 L755 30 L105 30 L105 58" marker-end="url(#bt-loop-arrow)"/>
+      <text class="dg-edge-label" x="430" y="24" text-anchor="middle">a handler writes a new mode word</text>
+      <text class="dg-edge-label" x="747" y="150" text-anchor="end">pause menu skips this</text>
+    </svg>
+    <figcaption>One loop, one table. A mode switch also stops CD audio, flushes the GPU queue and clears held input before the new mode&rsquo;s INIT runs.</figcaption>
+  </figure>
+  <p class="hint">Most gameplay code is <strong>not</strong> in the executable. The field VM, dialog renderer and battle logic live in overlays streamed into slot A. &ldquo;Zero callers in <code>SCUS_942.54</code>&rdquo; never means dead code - it means the caller is in an overlay. Init stages in order: <a href="boot-internals.html#init-sequence">internals</a>.</p>
+</section>
+
+<section class="doc-section" id="game-mode">
+  <h2>The game modes</h2>
+  <p>Walking a town, fighting, browsing the pause menu, watching a movie - to the game these are <em>modes</em>, and exactly one is active. Half the table is dev tooling the retail disc never enters; these are the ones a player sees:</p>
+  <div class="table-wrap">
+  <table class="data-table">
+    <thead><tr><th>Mode</th><th>Disc name</th><th>What it really is</th><th>Overlay</th></tr></thead>
+    <tbody>
+      <tr><td>2/3</td><td>MAIN</td><td>field and town gameplay, including the three kingdom overworlds</td><td>0897</td></tr>
+      <tr><td>12/13</td><td>MAPDSIP</td><td>world-map display - a head swap over the field overlay</td><td>0981 over 0897</td></tr>
+      <tr><td>16/17</td><td>READ</td><td>publisher logos at boot</td><td>0895 (<code>init.pak</code>)</td></tr>
+      <tr><td>18/19</td><td>GAME OVER</td><td>game over</td><td>0902</td></tr>
+      <tr><td>20/21</td><td>BATTLE</td><td>battle; setup is in the executable, the overlay comes in via the field</td><td>0898</td></tr>
+      <tr><td>22/23</td><td>CARD</td><td>the title screen and the menu: pause menu, save, options, shops</td><td>0899</td></tr>
+      <tr><td>24/25</td><td>OTHER</td><td>the five warp minigames, one overlay each</td><td>0972..0977, 0980</td></tr>
+      <tr><td>26/27</td><td>STR</td><td>FMV movies</td><td>0970</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <ul class="bullets">
+    <li><strong>The pause menu runs under CARD, not the field mode</strong>, and mode 23 runs no frame driver - so nothing in the world moves while the menu is up.</li>
+    <li><strong>The mode word does not say which minigame.</strong> All five share modes 24/25; the sub-id the door warp wrote (<code>op0 &minus; 100</code>) picks the overlay (<a href="asset-loader.html#warp-flow">warp flow</a>).</li>
+    <li><strong>The dev names mislead.</strong> CONFIG is the debug menu, READ is the logo screen, CARD is the title and the whole menu. The full 14-row table, with every INIT handler address and the dev modes, is on <a href="boot-internals.html#mode-table">internals</a>.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="overlay-slots">
+  <h2>Code that pages in: two slots and one index rule</h2>
+  <p>The executable holds the engine - loaders, the renderer core, the sound libraries, the mode table. Most game logic is not in it. Field scripts, battle, the menu, movies and each minigame are separate code images in <code>PROT.DAT</code>, streamed into one of two fixed windows of RAM when a mode needs them. That is why a function with no caller in the executable is not dead: its caller is usually in an image that is not loaded yet.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 860 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Memory layout of code. The executable is always resident and holds the two overlay loaders. Slot A, at 0x801CE818, holds exactly one of: the field overlay 0897, battle 0898, the menu and title 0899, the movie player 0970, the battle intro 0979, a minigame 0972 to 0977 or 0980, or the boot logos 0895. Slot B, at 0x801F69D8, holds a render library, 0900 or 0901, or a battle cast module, 0903 to 0966. A mode's init handler calls a loader with a small parameter, and the extraction index of the entry it loads is the parameter plus 0x37F.">
+      <defs><marker id="bt-ov-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="dg-node" x="20" y="30" width="230" height="200" rx="6"/>
+      <text class="dg-label" x="135" y="58">executable</text>
+      <text class="dg-sub" x="135" y="78">always resident</text>
+      <text class="dg-sub" x="135" y="112">mode table and handlers</text>
+      <text class="dg-sub" x="135" y="130">two overlay loaders</text>
+      <text class="dg-sub" x="135" y="148">archive directory at 0x801C70F0</text>
+      <text class="dg-sub" x="135" y="166">renderer core, sound libraries</text>
+      <text class="dg-sub" x="135" y="200">loader(param) reads entry</text>
+      <text class="dg-sub" x="135" y="216">param + 0x37F</text>
+
+      <rect class="dg-node-accent" x="350" y="30" width="490" height="96" rx="6"/>
+      <text class="dg-label dg-start" x="366" y="56">slot A at 0x801CE818 - one image at a time</text>
+      <text class="dg-sub dg-start" x="366" y="80">field 0897 &#183; battle 0898 &#183; menu and title 0899 &#183; movies 0970</text>
+      <text class="dg-sub dg-start" x="366" y="98">battle intro 0979 &#183; minigames 0972..0977, 0980 &#183; boot logos 0895</text>
+      <text class="dg-sub dg-start" x="366" y="116">map display 0981 swaps over the field image's head and back</text>
+
+      <rect class="dg-node-ok" x="350" y="150" width="490" height="80" rx="6"/>
+      <text class="dg-label dg-start" x="366" y="176">slot B at 0x801F69D8 - a helper beside slot A</text>
+      <text class="dg-sub dg-start" x="366" y="200">field and world-map render libraries 0900 / 0901</text>
+      <text class="dg-sub dg-start" x="366" y="218">battle cast and summon modules 0903..0966, one per spell</text>
+
+      <path class="dg-edge" d="M250 78 L348 78" marker-end="url(#bt-ov-arrow)"/>
+      <path class="dg-edge" d="M250 190 L348 190" marker-end="url(#bt-ov-arrow)"/>
+    </svg>
+    <figcaption>Entry numbers are extraction indices. Both slots are fixed addresses, so two images that would overlap can never be resident together - and the same address means different code in different modes.</figcaption>
+  </figure>
+  <ul class="bullets">
+    <li><strong>One index rule.</strong> Both loaders add <code>0x381</code> to their parameter and index the in-RAM directory, which counts two words ahead of the extraction numbering - so the entry loaded is <code>parameter + 0x37F</code>. Parameter 2 is the field overlay 0897, 3 is battle 0898, 4 is the menu 0899.</li>
+    <li><strong>The census is closed.</strong> A scan of the whole executable for both loaders finds sixteen call sites, with constant parameters for the fixed images and computed ones for the bands: a minigame's warp sub-id, a spell's cast module, a battle stage.</li>
+    <li><strong>Parameter 0 has one producer: <code>main()</code> itself,</strong> loading the boot logo image before the mode loop starts. Parameter 1 has none, so entry 0896 is unreachable from any loader call.</li>
+    <li><strong>Three init handlers load nothing.</strong> The battle mode's setup lives in the executable; the logo mode calls straight into the image <code>main()</code> already loaded; and one dev mode writes mode 0 and bounces back to the debug menu it came from.</li>
+    <li><strong>A wipe is not the game-over image.</strong> A party wipe routes to the title's CONTINUE flow. The game-over overlay 0902 has an init handler and no retail path that stores its mode.</li>
+    <li><strong>Swaps save what they cover.</strong> The minigame and map-display modes back up the scene name or the field image's first <code>0x4000</code> bytes before loading over them, and restore on the way out - which is how a minigame returns you to the room you left.</li>
+  </ul>
+  <p>The practical consequence for tracing: an address in the overlay window names a routine only together with the image that is resident. Per-mode handler addresses and what each loads: <a href="boot-internals.html#mode-table">internals</a>; how an image is identified and extracted from the disc: <a href="../tooling/static-overlay-pipeline.html">static overlay pipeline</a>.</p>
+</section>
+
+<section class="doc-section" id="title-overlay-state">
+  <h2>The title screen</h2>
+  <p>The title screen is a small program of its own: an attract countdown that eventually plays the opening movie, a Press-Start wait, a two-row NEW GAME / CONTINUE menu, the memory-card manager, and the launch. It runs as a spawned actor under the <code>CARD</code> pair, whose INIT loads PROT 0899 - which is also why the title shares code with the save screen. The tick (<code>FUN_801DD35C</code>) is a 25-way sub-mode switch.</p>
+  <ul class="bullets">
+    <li><strong>Attract.</strong> A countdown starting at <code>0x8000</code> drains each frame; when it underflows the game switches to movie mode and plays <code>MV1.STR</code> (<a href="cutscene.html">cutscene</a>), then comes back to the title.</li>
+    <li><strong>NEW GAME</strong> fades out, writes mode 2 and the scene id <code>opdeene</code>. <strong>CONTINUE</strong> detours through the card-load path first and then writes the same mode 2.</li>
+    <li><strong>No arrow cursor.</strong> The two menu rows are a band of the title sheet; the selection is shown bright vs dim.</li>
+    <li><strong>The menu opens on NEW GAME on the US build, saves or no saves.</strong> Startup raises the row to CONTINUE only when its card scan finds a save, and that scan compares every filename against a <code>BISCUS-94254PRO-</code> prefix no US save carries (they are <code>BASCUS-</code>), so the count stays zero. The row is never reset afterwards: a later title - after a party wipe, or a backed-out Continue - opens on whichever row it last held. The port does the same on both hosts.</li>
+  </ul>
+  <p>State struct, countdown instruction and the packed pad-mask layout the tick reads: <a href="boot-internals.html#title-tick">internals</a>.</p>
+</section>
+
+<section class="doc-section" id="title-overlay-source">
+  <h2>Where the title overlay lives on disc</h2>
+  <p>The title code is the <strong>tail of PROT entry 0899</strong> - the same entry whose head is the options-menu bundle - streamed raw and uncompressed straight into the overlay window: 74 sectors from LBA 47227, in five DMA bursts that all land inside the entry. The same tail carries two embedded TIMs, the save-menu UI atlas and the memory-card icon strip. Sector ranges and burst offsets: <a href="boot-internals.html#title-source-detail">internals</a>.</p>
+</section>
+
+<section class="doc-section" id="new-game-chain">
+  <h2>What NEW GAME launches</h2>
+  <p>Press NEW GAME and you do not get a name-entry screen. You get a scripted opening - the creation-myth crawl, the Seru intro, the Mist story, a fly-in over Rim Elm - and only once you stand in Rim Elm does &ldquo;Select your name&rdquo; appear. Every leg is an ordinary field scene chained by its own script, not a movie.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 860 170" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The opening chain: opdeene creation myth, opstati Seru intro, opurud Mist story, map01 world-map fly-in, town01 Rim Elm where name entry opens. A confirm press from opdeene onward skips straight to town01.">
+      <defs><marker id="ng-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="dg-node" x="10" y="30" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="85" y="54">opdeene</text><text class="dg-sub" x="85" y="72">creation-myth crawl</text>
+      <rect class="dg-node" x="185" y="30" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="260" y="54">opstati</text><text class="dg-sub" x="260" y="72">Seru intro</text>
+      <rect class="dg-node" x="360" y="30" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="435" y="54">opurud</text><text class="dg-sub" x="435" y="72">the Mist story</text>
+      <rect class="dg-node" x="535" y="30" width="150" height="56" rx="5"/>
+      <text class="dg-label" x="610" y="54">map01</text><text class="dg-sub" x="610" y="72">fly-in + title card</text>
+      <rect class="dg-node-accent" x="710" y="30" width="140" height="56" rx="5"/>
+      <text class="dg-label" x="780" y="54">town01</text><text class="dg-sub" x="780" y="72">name entry</text>
+      <path class="dg-edge" d="M160 58 L183 58" marker-end="url(#ng-arrow)"/>
+      <path class="dg-edge" d="M335 58 L358 58" marker-end="url(#ng-arrow)"/>
+      <path class="dg-edge" d="M510 58 L533 58" marker-end="url(#ng-arrow)"/>
+      <path class="dg-edge" d="M685 58 L708 58" marker-end="url(#ng-arrow)"/>
+      <path class="dg-edge-dim" d="M85 86 L85 130 L780 130 L780 90" marker-end="url(#ng-arrow)"/>
+      <text class="dg-edge-label" x="430" y="150" text-anchor="middle">confirm press: skip straight to town01 (armed once opdeene's timeline sets flag bit 26)</text>
+    </svg>
+    <figcaption>Five field scenes, each one's script ending in a scene change to the next. The skip is a one-shot: it clears its own flag bit as it fires.</figcaption>
+  </figure>
+  <ul class="bullets">
+    <li><strong>The fresh-state seed.</strong> Gold is set to a hard-coded 500, a story-flag region is zeroed, and the executable&rsquo;s <a href="../formats/new-game-table.html">starting-party template</a> is expanded into the live <code>0x414</code>-byte character records, default names included.</li>
+    <li><strong>The intro skip.</strong> Once <code>opdeene</code>&rsquo;s timeline raises a scratchpad flag bit, a confirm press fades out, sets the <code>town01</code> entry coordinates and issues a name-based scene change to <code>town01</code>. The target name is a literal in the field overlay, which is why <code>opdeene</code>&rsquo;s own data holds no <code>town01</code> string.</li>
+    <li><strong>Name entry</strong> opens from <code>town01</code>&rsquo;s opening timeline (field-VM op <code>0x49</code> sub-op 3): a 6&times;17 letter grid plus a Backspace / Space / End row, and a Yes/No commit. The name lands in the character record at <code>+0x2A7</code>.</li>
+  </ul>
+  <p>Skip conditions, the scene-change packet and the name-entry grid&rsquo;s addresses: <a href="boot-internals.html#new-game-detail">internals</a>.</p>
+</section>
+
+<section class="doc-section" id="init-pak-publisher-logos">
+  <h2>Boot-time art</h2>
+  <p>Three separate sources feed the boot screens.</p>
+  <ul class="bullets">
+    <li><strong>Publisher logos - PROT 0895 <code>init.pak</code>.</strong> Four uncompressed TIMs (PROKION, Contrail, &ldquo;SCEA Presents&rdquo;, an epilepsy warning) played by the bundle&rsquo;s own sequencer in the order SCEA, Contrail, PROKION. The fade is not alpha: the quads are opaque and the sequencer scales their vertex colour, so the PSX texture blend <code>texel &times; colour / 128</code> darkens them to black. The warning is uploaded and <strong>never drawn</strong> - its sprite descriptor is the one no emit call passes.</li>
+    <li><strong>Title wordmark - PROT 0890.</strong> One 256&times;256 sheet holds the orb, wordmark, Press Start prompt, copyright lines and the NEW GAME / CONTINUE footer; retail samples it in bands, and a demo-build label on the sheet is never drawn.</li>
+    <li><strong>System-UI textures - raw TOC entry 0, <code>init_data</code>.</strong> The 118 sectors between the TOC and extraction entry 0 are two TOC entries the extraction index skips: <code>init_data</code> (the menu font, the boot cursor and several sprite sheets, which <code>init.pak</code> loads and uploads) and <code>gameover_data</code> (the GAME OVER screen's art).</li>
+  </ul>
+  <p>Per-logo offsets, quad rectangles and pacing; the wordmark's source rectangles; the two head entries' TIMs and loaders: <a href="boot-internals.html#boot-art">internals</a>. The <a href="../play.html">play page</a> and the native window both run the logo stage ahead of the title card.</p>
+</section>
+
+<section class="doc-section" id="debug-flags">
+  <h2>Debug flags</h2>
+  <p>Two RAM values decide whether the game behaves like the shipped disc or a dev station. On real hardware both read &ldquo;retail&rdquo;; a cheat device can flip them, which is how the debug menu on the retail disc becomes reachable.</p>
+  <div class="table-wrap">
+  <table class="data-table">
+    <thead><tr><th>Address</th><th>Role</th><th>Retail value</th></tr></thead>
+    <tbody>
+      <tr><td><code>_DAT_8007B8C2</code></td><td>dev / retail loader selector, read as a halfword at 40 sites; <code>!= 0</code> takes the PROT-index path, <code>== 0</code> opens a host path that ends in <code>break 0x103</code></td><td><code>1</code>, written once by <code>main()</code></td></tr>
+      <tr><td><code>_DAT_8007B98C</code></td><td>debug-mode word tested by the input dispatcher and ~14 field-overlay gates; poking its top byte <code>_DAT_8007B98F</code> to 1 makes every gate read active, and SELECT+&#9651; opens the debug menu</td><td><code>0</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <details class="disclosure">
+    <summary>History: why both flags were once read backwards</summary>
+    <div class="disclosure-body">
+      <p>A sweep for absolute <code>lui</code>+offset references saw no writer for the loader flag, because the one write is gp-relative, and concluded it booted at 0; the executable&rsquo;s header carries <code>b_size = 0</code>, so no BSS is cleared either. The debug byte returned zero byte-granular references because consumers read the word. Both are under <a href="../reference/re-do-not-re-walk.html">do-not-re-walk</a>; the gp-relative blind spot is why the <a href="../tooling/address-reference-scan.html">address reference scan</a> checks all five forms.</p>
+    </div>
+  </details>
+  <p>Not every debug-menu entry works once it is reached. On a retail console three of them fail:</p>
+  <ul>
+    <li><strong>TMD TEST</strong> (mode 6) stores its two draw buffers at the fixed addresses <code>0x80400040</code> and <code>0x80419040</code> instead of taking them from the heap. A 2 MB console has no RAM there. The addresses wrap onto the BIOS area and the game's own code, so the console crashes. The branch is the <code>beq</code> at <code>0x8001F6D8</code>; replacing it with a <code>nop</code> should send the mode down the heap path, but that has not been tested.</li>
+    <li><strong>TEST</strong> (mode 10) has an empty start-up handler, so it hangs.</li>
+    <li><strong>READ</strong> (mode 16) jumps into the boot overlay <code>init.pak</code>, which is no longer loaded once the debug menu has replaced it.</li>
+  </ul>
+  <p>The mode table these entries come from is on <a href="boot-internals.html#mode-table">internals</a>. Found by Stann0x.</p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="boot-internals.html">Boot internals</a>
+    <a href="../formats/prot.html">PROT.DAT TOC</a>
+    <a href="../formats/cdname.html">CDNAME name map</a>
+    <a href="../formats/asset-type.html">Asset-type dispatch</a>
+    <a href="asset-loader.html">Asset loader</a>
+    <a href="cutscene.html">Cutscenes</a>
+    <a href="save-screen.html">Save screen</a>
+    <a href="world-map.html">World map</a>
+    <a href="../reference/memory-map.html">Memory map</a>
+    <a href="../tooling/overlay-capture.html">Overlay capture</a>
+    <a href="../tooling/static-overlay-pipeline.html">Static overlay pipeline</a>
+    <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/subsystems/boot.md" target="_blank" rel="noopener">Full doc</a>
+  </div>
+</section>

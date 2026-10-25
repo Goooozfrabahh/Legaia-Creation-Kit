@@ -1,0 +1,299 @@
+# Asset extraction
+
+The extraction tools turn a user-supplied disc image into ordinary files:
+textures as PNG, streamed audio as WAV, meshes as OBJ, dialog as JSON, plus the
+raw archive entries every other tool in the repo reads. One command runs the
+whole pipeline; each stage also has its own binary for when only one step is
+wanted. No game data ships in this repository - the tools run against the
+user's own disc, and their output (`extracted/`) is gitignored.
+
+```bash
+cargo build --release
+./target/release/legaia-extract "/path/to/Legend of Legaia (USA).bin" --out extracted
+```
+
+The input is a raw Mode 2/2352 `.bin` dump; a `.cue` sheet is also accepted and
+resolved to the BINARY track it references.
+
+## Top-level pipeline
+
+`legaia-extract` (in [`crates/extract`](../../crates/extract/README.md)) runs
+these stages in order. Each later stage reads what an earlier one wrote.
+
+```mermaid
+flowchart LR
+    bin["disc .bin"] --> verify["verify SHA-256"]
+    verify --> disc["ISO 9660 walk"]
+    disc --> prot["split PROT.DAT"]
+    prot --> cat["categorize entries"]
+    cat --> stream["extract streaming sub-assets"]
+    stream --> png["TIM to PNG"]
+    bin --> xa["CD-XA demux to WAV"]
+    prot --> tsv["TIM catalogs"]
+    prot --> font["dialog font"]
+```
+
+| Stage | Writes | Skip flag |
+|---|---|---|
+| Verify the image's SHA-256 | - | `--skip-verify` |
+| Walk ISO 9660, copy every file | `PROT.DAT`, `CDNAME.TXT`, `SCUS_942.54`, `XA/`, ... | - |
+| Split `PROT.DAT` into its 1233 entries | `PROT/####_<name>.BIN` | - |
+| Categorize each entry by format | `PROT/categorize.json` | - |
+| Extract DATA_FIELD streaming sub-assets | `streaming/####_<name>/chunk##_<TYPE>/` | - |
+| Convert the streaming containers' TIMs to PNG | `.png` beside each `.tim` | `--skip-png` |
+| Demux CD-XA audio per channel | `XA_WAV/` | `--skip-xa` |
+| Write the texture inventories | `prot_tim_catalog.tsv`, `prot_tim_deep_catalog.tsv` | `--skip-catalog` |
+| Build the dialog-font artifacts | `font/` | `--skip-font` |
+
+`--verbose` prints one line per file written. `--all-textures` adds one
+stage: every TIM in every PROT entry, raw or LZS-compressed, written as `.tim`
++ `.png` under `tim_scan/` (`asset tim-scan` and `tim convert-dir` in one step).
+
+Output lands in `./extracted/` (gitignored):
+
+```
+extracted/
+├── PROT.DAT                       - raw archive copy
+├── CDNAME.TXT                     - entry name map
+├── SCUS_942.54                    - executable
+├── prot_tim_catalog.tsv           - flat TIM inventory (see `asset tim-catalog` below)
+├── prot_tim_deep_catalog.tsv      - TIMs inside LZS-compressed sections
+├── PROT/                          - per-PROT-entry files (1233 entries, named via CDNAME).
+│                                     Each file is the entry's whole sector footprint,
+│                                     so trailing-overlay tails (PROT 899's title-screen
+│                                     overlay code) are present (see formats/prot.md).
+│   ├── categorize.json            - per-class breakdown
+│   └── ####_<name>.BIN
+├── streaming/                     - DATA_FIELD streaming sub-assets, one dir per container
+│   └── ####_<name>/               - chunk##_<TYPE>/ per chunk, plus _trailer.bin
+│       ├── chunk##_TMD/####.tmd   - TMD/TMD2 chunks split into numbered meshes
+│       ├── chunk##_TIM_LIST/####.tim  (+ .png unless --skip-png)
+│       └── chunk##_<TYPE>/blob.bin    - opaque chunk types (MAN, MES, MOVE, VDF, ...)
+├── font/                          - dialog-font artifacts (atlas/sheet PNGs, widths, metadata)
+├── XA/                            - raw Form-1 .XA dumps (truncated audio; not listenable)
+└── XA_WAV/                        - correctly-paced per-channel WAVs (one per (file_no, ch_no))
+    └── XAn_fileN_chM.wav
+```
+
+The PNG step covers only the TIMs the streaming containers themselves carry (a
+handful). The full texture set is inventoried by the TIM catalogs; export it
+with `asset tim-scan extracted/PROT --out extracted/tim_scan` and convert with
+`tim convert-dir extracted/tim_scan` (the final pipeline summary prints exactly
+this). The `font/` step is what `legaia-engine`, `asset-viewer field`/`dialog`
+and the site load text from; `font-extract --disc <bin-or-PROT.DAT>` produces
+the same files standalone.
+
+The CD-XA step reads the raw disc directly and demuxes every `*.XA` file
+into one WAV per `(file_no, ch_no)` channel, each decoded at its true
+per-sector rate / stereo mode. This bypasses the `extracted/XA/` Form-1
+dumps from the disc-walk step, which truncate the Form-2 audio sectors
+(2324 → 2048) and collapse a file's multiplexed channels into one shuffled
+stream. The NA corpus is 34 files / 316 channels, all 4-bit 37.8 kHz;
+non-4-bit channels are skipped with a warning (the group decoder is 4-bit
+only). The decoder is bit-exact, so the WAVs are reference-quality.
+
+## Per-stage tools
+
+When you want to drive a single stage:
+
+### Disc → files (`disc-extract`)
+
+```bash
+disc-extract extract /path/to/disc.bin extracted/
+```
+
+Walks ISO9660 and writes every file. See [disc + ISO9660](../formats/disc.md).
+
+### PROT.DAT → entries (`prot-extract`)
+
+```bash
+prot-extract extract extracted/PROT.DAT extracted/PROT/ --cdname extracted/CDNAME.TXT
+prot-extract list   extracted/PROT.DAT --cdname extracted/CDNAME.TXT
+prot-extract locate extracted/PROT.DAT 0x17855 --in-entry 866 --cdname extracted/CDNAME.TXT
+prot-extract retail-names extracted/CDNAME.TXT
+```
+
+Splits PROT.DAT into 1233 numbered entries with CDNAME-derived filenames, plus
+a `manifest.json` and an unpacked `tim/<entry>/` dir per TIM-pack entry. Each
+`.BIN` holds exactly that entry's sectors - `toc[p+3] - toc[p+2]`, the gap to
+the next entry's start LBA, which is what retail's own span routine returns.
+The footprints tile the archive with no gaps and no overlaps, so no file
+carries a neighbour's bytes and none is truncated mid-payload: PROT 899's
+title-screen overlay code is inside its footprint, not past it.
+`--clamp-footprint` is a deprecated no-op, accepted so existing invocations
+keep working.
+
+`list` prints the entry size next to `decl_span`, the superseded
+`toc[p+5] - toc[p+3] + 4` expression, and flags with `ovr` the entries where
+that expression overshoots into a neighbour (865 / 866 into the monster archive
+867). A coordinate measured under it may name the wrong owning entry. `locate` maps a byte
+offset (absolute, or in-`.BIN` via `--in-entry`) to the entry that really owns
+it and says so when the offset runs past that entry's end. `retail-names`
+shows what the **retail** loader reads back out of a `CDNAME.TXT` next to the
+tolerant parse - the view an edit to that file needs, see
+[CDNAME](../formats/cdname.md). See [PROT TOC](../formats/prot.md).
+
+### LZS decode (`lzs-decode`)
+
+```bash
+lzs-decode raw --size N <file>          # standalone LZS body
+lzs-decode container <file> <out_dir>   # multi-section player.lzs container, one file per section
+```
+
+See [LZS compression](../formats/lzs.md).
+
+### TIM → PNG (`tim`)
+
+```bash
+tim info    <file>                      # header, CLUT block, image dims
+tim convert <file> [-o out.png] [--clut N | --all-cluts]   # out defaults to <file>.png
+tim convert-dir <dir> [-o <out_dir>]    # recursively convert every .tim under <dir>
+```
+
+### TMD analysis (`tmd`)
+
+```bash
+tmd info        <file>                    # header + object table
+tmd dump-obj    <file> --out <file.obj>   # OBJ-with-faces export (one file, all objects)
+tmd validate-prims <DIR>                  # bulk-walk every prim group, sanity-check
+```
+
+### VAB extraction (`vab`)
+
+```bash
+vab list    <file>                                  # find + describe every VAB
+vab extract <file> --out <out_dir> [--wav] [--sample-rate 22050]   # VAG bodies (+ optional WAV)
+```
+
+### CD-XA demux → WAV (`xa`)
+
+The streamed-audio (`XA*.XA`) decoder. The disc-wide demux is the
+correct-pacing path the top-level pipeline uses:
+
+```bash
+xa demux-disc-all <disc.bin> --out extracted/XA_WAV   # every .XA → per-channel WAV
+xa demux-disc <disc.bin> --lba L --size S --out <dir>  # one .XA by LBA/size
+xa info    <file.xa> [--channels stereo] [--sample-rate 37800]
+xa convert <file.xa> [-o out.wav]                       # single Form-1 dump (must guess rate)
+```
+
+Prefer `demux-disc-all` over `convert`/`convert-dir`: it reads the raw
+2352-byte sectors, splits by `(file_no, ch_no)`, and takes the true rate /
+channel mode from each sector's CD-XA subheader instead of guessing a
+global rate. See [XA audio](../formats/xa.md).
+
+### Sub-asset extraction (`asset`)
+
+The format-aware extractor:
+
+```bash
+asset categorize     <DIR> [--out categorize.json]    # per-class breakdown
+asset disc-map       <disc.bin> [--out f.json]        # layout map (files, PROT entries, classes) for site/disc-map.json
+asset extract        <file> --out <out_dir>           # streaming-format chunks → individual files
+asset stream         <file>                           # walk DATA_FIELD chunks, no extraction
+asset describe       <file>                           # container TOC (player.lzs-style descriptor header)
+asset effect-bundle  <file>
+asset tmd-scan       <DIR>                            # bulk byte-search for TMD magic
+asset tim-scan       <DIR>                            # bulk byte-search for TIM magic (per-entry, lenient)
+asset tim-catalog    <PROT.DAT> [--out f.tsv|f.json]  # flat strict-validated TIM catalog (jPSXdec parity)
+asset tim-deep-catalog <PROT.DAT> [--out f.tsv|f.json] # TIMs inside LZS-compressed sections
+asset slot-art       <0975_*.BIN> <1200_*.BIN> --out <dir>  # casino slot machine art + manifest
+```
+
+`tim-catalog` scans the whole `PROT.DAT` image (not per-entry), strict-validates
+each TIM (see [`formats/tim.md`](../formats/tim.md#strict-validation-what-counts-as-a-tim)),
+and maps each hit to its owning PROT entry + offset (or the unindexed system-UI
+gap). It recovers the same set an independent reference decoder reports; the
+committed catalog + a disc-gated regression pin the result. `--rollup` prints
+the count + digest the test pins.
+
+`tim-deep-catalog` covers what the flat catalog can't see: it LZS-decompresses
+every entry and catalogs the TIMs inside each decoded section (most character /
+scene textures are compressed). Each row is keyed by `(entry, LZS section,
+offset-in-section)`. A hit is admitted only when the decompressed bytes
+strict-parse **and** decode to RGBA - LZS "decodes without error" is never a
+validity signal (the ring buffer inits to zeros). It has its own committed
+reference + disc-gated regression. See
+[`formats/tim.md`](../formats/tim.md#deep-catalog-tims-inside-lzs-compressed-sections).
+
+`slot-art` decodes the casino slot machine's art and scene data out of the slot
+overlay (PROT 0975) + its art pack (PROT 1200): the 10 reel symbols and 10
+bonus numerals (each through its own CLUT column), the payline lamps /
+medallions / reel-stop pedestals / marquee billboards, the 21 dot-matrix
+messages, the paytable board and the digit strip - plus `slot-machine.json`,
+the manifest carrying the payout table, the disc's geometry tables and the
+retail projection constants
+([`minigame-slot-machine.md`](../subsystems/minigame-slot-machine.md)). It is
+the feed for the VRChat world kit's cabinet builder
+([`scripts/vrchat-world/`](../../scripts/vrchat-world/README.md)); the output
+is disc-decoded and stays out of any repo, like `extracted/` itself.
+
+### MES dialog (`mes`)
+
+```bash
+mes info     <file>
+mes disasm   <file>
+mes json     <file>
+```
+
+### Move tables (`mdt`)
+
+```bash
+mdt classify <file>                       # detect runtime-buffer vs flat-record layout
+mdt records  <file> --limit 8
+mdt slots    <file> --limit 8
+```
+
+Beyond these, `asset` carries the analysis subcommands documented on their own
+pages: `asset account` ([byte accounting](byte-accounting.md)), `asset overlay`
+([static overlay pipeline](static-overlay-pipeline.md)) and
+`asset field-op-census` ([field-op census](field-op-census.md)).
+
+## Disc-gated tests
+
+The extraction layer's integration tests touch a real disc and only run when `LEGAIA_DISC_BIN` points at a valid `.bin`:
+
+- `crates/iso/tests/disc_pipeline.rs` - disc walk, file count, key file SHA-256s.
+- `crates/iso/tests/ecc_real.rs` - sector write-back keeps EDC/ECC valid.
+- `crates/prot/tests/archive_tiling_real.rs` - the entry footprints tile PROT.DAT exactly.
+- `crates/extract/tests/validation_suite.rs` - full pipeline, PROT entry count, sub-asset totals, TIM round-trip.
+
+```bash
+LEGAIA_DISC_BIN="/path/to/Legend of Legaia (USA).bin" cargo test --workspace
+```
+
+Without the env var, every one of them **skips and passes** - that's intentional, so CI works without redistributing Sony data. Don't change that gating. The same pattern covers disc-gated tests across the rest of the workspace; find them with `grep -rl LEGAIA_DISC_BIN crates/*/tests`.
+
+## Asset viewer
+
+Once assets are extracted, browse them interactively:
+
+```bash
+# Single TIM (a `tim-scan` hit, or a PROT entry starting with a TIM)
+asset-viewer tim extracted/tim_scan/<entry>/raw_off<HEX>_<W>x<H>_<BPP>bpp.tim
+
+# TIM at a non-zero offset within a larger file. Use this for TIMs in
+# the unindexed pre-`init_data` gap of PROT.DAT (system-UI sprite
+# sheet, menu-glyph atlas, etc.) - these aren't reachable through
+# the `prot` browser because no TOC entry covers them.
+asset-viewer tim extracted/PROT.DAT --offset 0x018E0 --clut 2   # system-UI panel CLUT
+asset-viewer tim extracted/PROT.DAT --offset 0x018E0 --clut 7   # system-UI cursor CLUT
+asset-viewer tim extracted/PROT.DAT --offset 0x11218 --clut 13  # menu-glyph atlas, "Load" text CLUT
+
+# A Legaia TMD as a 3D mesh (auto-rotating)
+asset-viewer tmd extracted/streaming/<entry>/chunk##_TMD/####.tmd
+
+# Directory of TMDs (N/P/PgDn/PgUp to cycle)
+asset-viewer tmd extracted/streaming
+
+# Battle bundle (paired TIMs auto-loaded for correct CLUTs)
+asset-viewer tmd extracted/streaming/<character> --bundle battle
+
+# A VAB sample
+asset-viewer vab extracted/PROT/<entry>.BIN --offset 0xN --sample N
+
+# PROT entry browser (auto-detects format per entry)
+asset-viewer prot extracted/PROT.DAT --cdname extracted/CDNAME.TXT
+```
+
+See [`subsystems/engine.md`](../subsystems/engine.md) for the engine port architecture.

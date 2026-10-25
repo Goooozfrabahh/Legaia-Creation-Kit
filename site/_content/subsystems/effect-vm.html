@@ -1,0 +1,316 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">subsystems</a> &middot; effect VM</div>
+  <h1>Effect VM - battle sprite effects</h1>
+  <p class="lede">Every spark, puff and spell flash in a fight is a short on-disc script that spawns a burst of sprites, animates each one for a few frames and lets it fade. This is the runtime that plays those scripts. It is called a &ldquo;VM&rdquo; for symmetry with its siblings, but it has no opcode table at all: it is a pool of slots driven by countdown timers, and the only data it reads are spawn records and animation frames.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance" data-doc="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Where</dt><dd>Battle overlay (PROT 0898). Spawn API <code>0x801DFDF0</code>, per-frame walker <code>0x801E0080</code> (called once per battle frame by the draw tick), pool at <code>_DAT_8007BD30</code>, 5008 bytes</dd>
+    <dt>Input</dt><dd><code>efect.dat</code> (extraction 0873) - a 2-pack of 14 sprite-animation records and 33 effect scripts; see <a href="../formats/effect.html">effect format</a></dd>
+    <dt>Capacity</dt><dd>32 effects (master slots, 28 B each) &times; 128 sprites (child slots, 32 B each)</dd>
+    <dt>Textures</dt><dd>Effect atlas <code>etim.dat</code> (0870, battle-only) and the field-resident character texture band (0874 &sect;2)</dd>
+    <dt>In the port</dt><dd><code>engine-vm::effect_vm</code> (<code>Pool::tick_retail</code>, <code>Pool::child_billboards</code>), driven by <code>World::tick_effects</code> - the engine's only per-frame effect path; the render-mode-4 emitters are <code>engine-effects</code> (<code>effect_ribbon</code>, <code>effect_sprite_arm</code>, <code>effect_default_arm</code>)</dd>
+    <dt>Confidence</dt><dd>Confirmed - walker and spawn traced instruction-for-instruction</dd>
+    <dt>Used by</dt><dd>The animation effect arm, the per-action effect-script walk, the move-power effect lists and the per-move effect-list spawner (<a href="#spawn-sources">spawn sources</a>)</dd>
+  </dl>
+  <div class="notice">
+    <p class="notice-title">Two addresses per entry</p>
+    <p>Both the spawn API and the walker begin two words ahead of their stack prologue, loading the pool-ready byte <code>0x8007BD58</code> first. Every <code>jal</code> on the disc names <code>0x801DFDF0</code> and <code>0x801E0080</code>; dumps and pages citing <code>0x801DFDF8</code> / <code>0x801E0088</code> name the prologue word of the same routines.</p>
+  </div>
+</section>
+
+<section class="doc-section" id="how-it-works" data-doc="lifecycle,pass-1---spawn-cadence-and-child-walk">
+  <h2>How it works</h2>
+  <p>Cast a spell and three things happen on screen: the caster poses, a stream of sprites flies to the target, and a hit flash plays. Internally that is <em>one</em> effect script: a list of spawn records, each saying &ldquo;start sprite animation K at this offset, then wait N frames&rdquo;. A <strong>master slot</strong> walks the record list; each record it reaches claims a <strong>child slot</strong>, which walks its own animation frames and drifts along a velocity until its last frame retires it.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 860 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="The spawn API claims a master slot for an effect id at the acting actor's position and facing. Pass 1 of the walker counts the master's wait down and, at zero, consumes spawn records from the effect script, each claiming a child slot. Each child counts its own wait, steps its position by its velocity and advances animation frames. Pass 2 draws every live child as one semi-transparent textured quad, brightness ramped in and out.">
+      <defs><marker id="ev-ah" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect x="20" y="30" width="190" height="60" rx="4" class="dg-node"/>
+      <text x="115" y="54" class="dg-label">spawn(effect id)</text>
+      <text x="115" y="72" class="dg-sub">actor position + facing</text>
+      <rect x="20" y="160" width="190" height="60" rx="4" class="dg-node"/>
+      <text x="115" y="184" class="dg-label">efect.dat</text>
+      <text x="115" y="202" class="dg-sub">scripts + anim records</text>
+      <rect x="270" y="30" width="230" height="60" rx="4" class="dg-node-accent"/>
+      <text x="385" y="54" class="dg-label">master slot (x32)</text>
+      <text x="385" y="72" class="dg-sub">wait, record cursor, origin</text>
+      <rect x="270" y="160" width="230" height="60" rx="4" class="dg-node-accent"/>
+      <text x="385" y="184" class="dg-label">child slot (x128)</text>
+      <text x="385" y="202" class="dg-sub">wait, frame, position, velocity</text>
+      <rect x="590" y="160" width="250" height="60" rx="4" class="dg-node"/>
+      <text x="715" y="184" class="dg-label">one textured quad</text>
+      <text x="715" y="202" class="dg-sub">semi-transparent, faded in / out</text>
+      <rect x="590" y="30" width="250" height="60" rx="4" class="dg-group"/>
+      <text x="715" y="54" class="dg-label">retire</text>
+      <text x="715" y="72" class="dg-sub">after the last record / frame</text>
+      <path class="dg-edge" d="M210 60 L268 60" marker-end="url(#ev-ah)"/>
+      <path class="dg-edge-dim" d="M210 178 L240 178 L240 80 L268 80" marker-end="url(#ev-ah)"/>
+      <path class="dg-edge" d="M385 90 L385 158" marker-end="url(#ev-ah)"/>
+      <path class="dg-edge-dim" d="M210 205 L268 205" marker-end="url(#ev-ah)"/>
+      <path class="dg-edge" d="M500 190 L588 190" marker-end="url(#ev-ah)"/>
+      <path class="dg-edge-dim" d="M500 60 L588 60" marker-end="url(#ev-ah)"/>
+      <text x="395" y="128" class="dg-edge-label">pass 1: one record = one child</text>
+      <text x="544" y="242" class="dg-edge-label" text-anchor="middle">pass 2: draw</text>
+    </svg>
+    <figcaption>Pass 1 runs the timers and spawns, repeated once per elapsed vsync so effect time tracks wall-clock under frame skip; pass 2 draws every live child once. No opcode is ever decoded.</figcaption>
+  </figure>
+</section>
+
+<section class="doc-section" id="dispatch" data-doc="-">
+  <h2>What the slots read</h2>
+  <p>The "state" bytes are wait counters. Every wait in the system is 5.3 fixed-point: a frame count stored <code>&lt;&lt; 3</code> and decremented by 8 per frame. The only data consumed are two record kinds.</p>
+  <h3 id="spawn-record">Spawn record (effect script, 14 bytes each)</h3>
+  <div class="byte-map">
+    <div class="bm-cell bm-accent" style="--w:1"><span class="bm-off">+0x00</span><span class="bm-name">anim</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell bm-accent" style="--w:1"><span class="bm-off">+0x01</span><span class="bm-name">delay</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell" style="--w:2"><span class="bm-off">+0x02</span><span class="bm-name">offset a</span><span class="bm-size">i16</span></div>
+    <div class="bm-cell" style="--w:2"><span class="bm-off">+0x04</span><span class="bm-name">height</span><span class="bm-size">i16</span></div>
+    <div class="bm-cell" style="--w:2"><span class="bm-off">+0x06</span><span class="bm-name">offset b</span><span class="bm-size">i16</span></div>
+    <div class="bm-cell bm-dim" style="--w:2"><span class="bm-off">+0x08</span><span class="bm-name">vel a</span><span class="bm-size">i16</span></div>
+    <div class="bm-cell bm-dim" style="--w:2"><span class="bm-off">+0x0A</span><span class="bm-name">vel y</span><span class="bm-size">i16</span></div>
+    <div class="bm-cell bm-dim" style="--w:2"><span class="bm-off">+0x0C</span><span class="bm-name">vel b</span><span class="bm-size">i16</span></div>
+  </div>
+  <p>The script's header is <code>[child_count][flags][spread:i16]</code>. The two planar legs (offsets and velocities) are rotated into world space by the master's spawn angle, so one script aims wherever the caster faces. With flag bit 0 set, the spawn API rewrites every record's two offsets in place with a random value in <code>&plusmn;spread</code> - the resident <code>efect.dat</code> buffer mutates on every randomised spawn.</p>
+  <h3 id="anim-frame">Animation frame (6 bytes each)</h3>
+  <div class="byte-map">
+    <div class="bm-cell bm-accent" style="--w:1"><span class="bm-off">+0</span><span class="bm-name">atlas index</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell bm-accent" style="--w:1"><span class="bm-off">+1</span><span class="bm-name">delay</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell" style="--w:1"><span class="bm-off">+2</span><span class="bm-name">speed</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell bm-pad" style="--w:3"><span class="bm-off">+3</span><span class="bm-name">unread</span><span class="bm-size">3 B</span></div>
+  </div>
+  <ul class="bullets">
+    <li><strong>Bursts.</strong> Zero-delay records spawn as one burst and zero-delay frames advance as one burst: both loops repeat while the freshly loaded wait is zero.</li>
+    <li><strong>Graceful exhaustion.</strong> On a full pool the record is still consumed with no child - effects degrade rather than stall.</li>
+    <li><strong>Delays wrap.</strong> The wait is stored in a byte after the <code>&lt;&lt; 3</code>, so a delay of 32 frames or more wraps modulo 32.</li>
+    <li><strong>Motion.</strong> Each step is <code>pos += vel &times; frame.speed</code> with the retail pool scale; each child also gets two random UV-mirror bits for variety.</li>
+    <li><strong>Idle early-out.</strong> A sweep that finds no active master and no active child skips the remaining catch-up iterations.</li>
+    <li><strong>Retirement overrun.</strong> Retiring a child zeroes its active flag and its wait, but the frame-advance loop tests only the wait, so retail keeps reading 6-byte strides past the batch end on the already-dead slot until it meets a non-zero delay byte. Only the dead slot is touched (the next seed rewrites it), so the port stops at retirement instead.</li>
+    <li><strong>Summon side call.</strong> Spawn ids <code>4</code> and <code>0x13</code> first call the move-VM part spawner <code>0x80050ED4</code>, then take the ordinary spawn path.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="render" data-doc="pass-2---render">
+  <h2>How a child is drawn</h2>
+  <ul class="bullets">
+    <li><strong>Brightness envelope.</strong> With <code>n = frame_count &gt;&gt; 3</code>, the colour ramps in over the first eighth of the animation and back out over the rest, clamped at <code>0x80</code> (neutral) and written as <code>r = g = b</code>.</li>
+    <li><strong>Size.</strong> Atlas <code>w/h &times; sprite_scale &gt;&gt; 8</code> (retail scale <code>0xA00</code>, ten times the texel size) is the <em>half</em>-extent, applied in <strong>view space</strong> after the centre is transformed - so the battle camera's 4&times; world scale never touches it.</li>
+    <li><strong>UVs.</strong> From the 8-byte atlas entry, corner order swapped by the child's mirror bits; CLUT from atlas <code>+4</code>, texture page from atlas <code>+6</code>.</li>
+    <li><strong>Battle centres are Y-flipped.</strong> The pool integrates in raw PSX units, Y down. The battle view-projection both hosts share carries a trailing <code>scale(1, -1, 1)</code> that cancels the per-model Y-flip every mesh draw carries; a billboard has no model matrix, so the port flips its centre before building corners (<code>effect_billboard::battle_billboard_centre</code>). Without it a spark rising past an actor's head draws as far below its feet.</li>
+    <li><strong>Blend.</strong> The packet's prim code <code>0x2E</code> is a semi-transparent textured quad, so every effect child blends, and the page's own ABR bits pick how: pages <code>(320,0)</code> / <code>(448,0)</code> are additive (<code>B + F</code>), page <code>(384,0)</code> is <code>B + 0.25F</code> - why walk dust reads as almost nothing over a bright floor. Every effect the Rim Elm spar fires resolves to the <code>(384,0)</code> page under a dark warm-grey CLUT row, so it is faint by data, not by a bug; the bright additive pages belong to effect ids that fight never requests. The atlas stores its page in one byte, so the blend enable has nowhere to come from except the code byte; a port that copies the page alone draws the flames as opaque tan blobs.</li>
+  </ul>
+  <p>Each host also carries a tinted <strong>billboard outline</strong> builder - a flat rectangle around each quad, faded by age. Retail draws no such rectangle; it is a diagnostic, off by default on both hosts (<code>LEGAIA_DIAG_FX=1</code> on the native window, <code>set_battle_fx_outline(true)</code> on the play page).</p>
+</section>
+
+<section class="doc-section" id="render-mode-4" data-doc="the-three-render-mode-4-emitters-and-which-one-the-disc-uses">
+  <h2>The other effect primitives: render mode 4</h2>
+  <p>The pool's quads are not the only way an effect actor draws. The per-actor render dispatcher's mode 4 picks one of three emitters off a selector halfword at <code>actor+0x9E</code>, and the <a href="move-vm.html">move VM</a> writes both the mode and the selector:</p>
+  <table class="data-table">
+    <thead><tr><th>Selector</th><th>Emitter</th><th>Set by move op</th><th>Where it appears</th></tr></thead>
+    <tbody>
+      <tr><td>neither bit</td><td>Default emitter <code>FUN_80028158</code> - the ring / disc / fan family</td><td><code>0x13</code></td><td>Most render-mode-4 nodes in captured battles; the bulk of the summons' procedural geometry</td></tr>
+      <tr><td><code>0x4000</code></td><td>Sprite arm <code>FUN_8002A5A4</code> - one textured quad</td><td><code>0x23</code></td><td>Captured in battle states alongside the default</td></tr>
+      <tr><td><code>0x2000</code></td><td>Random-walk <strong>ribbon</strong> <code>FUN_801CFA48</code> - lightning bolts, beams, whips</td><td><code>0x42</code></td><td>Only in slot-B cast / summon images (PROT 0923, 0934, 0957, 0964)</td></tr>
+    </tbody>
+  </table>
+  <p>All three arms carry shipped content. An earlier census concluded the default arm was the only reachable one; it swept for the stores in the wrong form and missed the move VM's own. Both hosts draw every live kind-4 node of the summon, move-FX, effect-script and field ambient parts through <code>World::active_effect_kind4_draws</code>, composed like a mesh part.</p>
+  <p>None of the three emitters draws anything itself. Each writes a small Legaia TMD object into a scratch buffer, and the render dispatcher then draws it as the actor's own model through the ordinary TMD path.</p>
+  <h3 id="ribbon">The ribbon</h3>
+  <p>Per step the ribbon writes six vertices and six packets joining them to the next step: a core strip stored twice in the core colour, two inner flares fading core to flare colour, and two outer fringes fading flare to black. Every packet samples one fixed 2&times;2 texel patch, so the colour words carry the look. In play the ribbon is Gilium's summon; the other carriers are not staged as scenes by the engine.</p>
+  <h3 id="sprite-arm">The sprite arm</h3>
+  <p>The sprite arm builds one textured quad and falls into the ordinary model draw: scaled by the part's render scale <code>+0x72 / 0x1000</code>, turned by the rotation banks, and handed to the prim dispatcher with the colour word <code>+0x74</code> and level <code>+0x78</code>. The scale is seated by the spawn call, not the record. Nearly every seater passes <code>0x1000</code>, and the engine seats a staged part at that value unless a cast module reports the call with its own scale - PROT 0911&rsquo;s group-extent calls, PROT 0913&rsquo;s depth-scaled ones and the stager arms that forward a parent&rsquo;s scale (<code>SummonScene::push_parts_scaled</code>).
+  Its builder is main-executable code, so unlike the ribbon it draws in every mode; Baka Fighter's impact flash uses the same quad kernel.</p>
+  <h3 id="default-arm">The default arm</h3>
+  <p>The default builder takes a packed count / phase argument and a parameter block (inner / outer colours, a UV rectangle, page and CLUT, inner / outer radius and height, two in-plane scales). Besides move-VM op <code>0x13</code> it is called directly by the battle ground shadow, the field battle-intro ring and Baka Fighter's floor disc. Its mode word splits three ways:</p>
+  <table class="data-table">
+    <thead><tr><th>Bits</th><th>Selects</th></tr></thead>
+    <tbody>
+      <tr><td><code>mode &amp; 3</code></td><td>The plane the three builder axes land in; mode <code>1</code> lays a ring on the ground</td></tr>
+      <tr><td><code>(mode &gt;&gt; 3) &amp; 0xF</code></td><td>The shape: <code>0</code> a ring or open arc of <code>count</code> columns (a disc when the inner radius is zero), <code>1</code>..<code>3</code> multi-quad and fan variants, <code>4</code>..<code>7</code> jittered, shifted and pivoted rings</td></tr>
+      <tr><td><code>mode &gt;&gt; 8</code></td><td>The texture mode, read for shape <code>0</code> only: the ribbon's fixed patch, or the parameter block's rectangle mapped polar, as-is or turned; a page word carrying <code>0x4000</code> samples the display page itself</td></tr>
+    </tbody>
+  </table>
+  <p>The captured battle states use shapes <code>0</code>..<code>3</code> and none of <code>4</code>..<code>7</code>. The port's <code>effect_default_arm</code> transliterates the builder onto a byte buffer and is held byte-for-byte to the scratch blocks retail captures left behind, including every ground-shadow build.</p>
+</section>
+
+<section class="doc-section" id="vdf-morph" data-doc="battle-effect-parts-morph-through-vdfdat">
+  <h2>Battle effect parts morph through vdf.dat</h2>
+  <p>The effect-script table form stages move-VM parts like any other scene graph, and a part with op <code>0x0A</code> lanes draws <strong>morphed</strong>: the lanes index the battle VDF pack <code>vdf.dat</code> (PROT 0872), whose sub-entry table battle init rebuilds from index 0. The Spirit charge is the visible case - two small rest meshes that VDF entry 12 grows into the aura cone.</p>
+  <ul class="bullets">
+    <li><strong>Waits drain at retail's per-frame rate.</strong> The part tick subtracts the frame factor times the rate byte from the wait each frame, so a wait of <code>v</code> holds <code>v</code> frames.</li>
+    <li><strong>Lanes grow from the frame after the spawn.</strong> The ramp envelope runs from the part tick's tail, which the spawn's own first VM step does not reach. Captures read the lane at exactly <code>0x66</code> per elapsed frame, so the cone takes <code>0x28</code> frames to open.</li>
+    <li><strong>The model draw applies the part's scale and colour word.</strong> The aura's op <code>0x0C</code> writes an additive colour word at full level; op <code>0x0D</code>'s level rate takes the level to 0 over <code>0x20</code> frames and back to full over the last <code>0x0B</code>.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="teardown" data-doc="-">
+  <h2>Battle effects die with the battle</h2>
+  <p>Retail never tears effects down one by one. The mode initialiser calls the per-stage init <code>FUN_8001E1B4</code> on every mode switch, which re-seeds the 143-slot actor free stack and re-pops the seven actor-list sentinels, unlinking every effect actor still on a list with no walk. The <code>efect.dat</code> pool needs no reset on the way out: its walker is battle-overlay code behind the pool-ready byte, and the battle loader re-initialises it on the way in.</p>
+  <p>The port's <code>World</code> outlives every mode switch and both hosts draw effect state with no mode test, so it drops the same state by name: <code>World::teardown_battle_effects</code> runs at battle entry, at battle exit and at every scene load, resetting the pool and every battle-scoped cast, move-FX and effect-script scene graph. A staged cast module's scene is retired earlier, when the action state machine opens the next action, because the engine runs its records as data and nothing else would halt their infinite loops.</p>
+</section>
+
+<section class="doc-section" id="render-bridge" data-doc="effect-textures-and-models,what-draws-a-summon,the-floating-value-readout-rides-the-same-atlas">
+  <h2>Textures and models</h2>
+  <p>Effect sprites sample two texture pools. The flame atlas <code>etim.dat</code> is uploaded at battle entry only (its VRAM columns hold town textures on the field), while the character texture band stays resident from the field through battle - the Gimard summon flame samples the latter. A separate 30-entry model library, <code>etmd.dat</code>, gives 3D effects their meshes, and effect parts morph through <code>vdf.dat</code>.</p>
+  <p>The player <strong>summon</strong> (Gimard&rsquo;s Burning Attack, and friends) is not an effect-pool child at all: a live trace shows it posed like an enemy body, the battle per-actor draw <code>FUN_80048A08</code> running in lockstep with the rigid-keyframe decoder <code>FUN_8004998C</code>, one call per live actor per frame. Its flame animation is geometric, not palette cycling. The summon stager images in slot B hold real move-VM part records, run by the executable&rsquo;s stager, and the engine drives them as a scene graph beside the body. The enemy Gimard&rsquo;s <em>Tail Fire</em> is a different move again: a single move-VM part actor from the move-FX module PROT 0900.
+  The floating damage numeral is not a pool child either; it samples the third <code>etim</code> TIM through its own sub-palette. Read from retail's own display list, the digit run keeps its horizontal centre while each cell grows toward its 1:1 24-pixel size and the run rises to a fixed screen row; the quads are unmodulated, so the numeral never fades. Placing it is a host job - the seat is the struck actor's projected screen position - and both hosts emit the cells through one builder, <code>battle_numerals</code>.</p>
+  <details class="disclosure">
+    <summary>History: superseded readings</summary>
+    <div class="disclosure-body">
+      <ul>
+        <li>The atlas value <code>0x7680</code> is the entry's CLUT (row 474), not a page-(0,0) 8bpp texture page - the <code>+4</code> / <code>+6</code> fields are CLUT then page.</li>
+        <li>&ldquo;Flame flicker is CLUT cycling&rdquo; is falsified: two animation-distinct frames carry a byte-identical CLUT band while the framebuffer differs.</li>
+        <li>&ldquo;The summon stagers hold no move-VM records&rdquo; was a wrong-link-base artifact; they recover under base <code>0x801F69D8</code>.</li>
+        <li>&ldquo;Only the default render-mode-4 emitter is reachable&rdquo; is falsified (above).</li>
+      </ul>
+      <p>More on <a href="../reference/re-do-not-re-walk.html">do-not-re-walk</a>.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="pool" data-doc="pool-layout-_dat_8007bd30-5008-bytes-total">
+  <h2>Pool layout</h2>
+  <div class="byte-map">
+    <div class="bm-cell bm-dim" style="--w:1"><span class="bm-off">+0x000</span><span class="bm-name">head</span><span class="bm-size">16 B</span></div>
+    <div class="bm-cell bm-accent" style="--w:8"><span class="bm-off">+0x010</span><span class="bm-name">128 child slots &times; 32 B</span><span class="bm-size">4096 B</span></div>
+    <div class="bm-cell" style="--w:2"><span class="bm-off">+0x1010</span><span class="bm-name">32 masters &times; 28 B</span><span class="bm-size">896 B</span></div>
+  </div>
+  <table class="data-table">
+    <thead><tr><th>Master field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>+0</code> child_count</td><td>Total spawn records; 0 = free slot</td></tr>
+      <tr><td><code>+1</code> flags</td><td>Bit 0 = randomised offsets at spawn</td></tr>
+      <tr><td><code>+2</code> spawn_cursor</td><td>Records consumed so far</td></tr>
+      <tr><td><code>+3</code> wait</td><td>5.3 countdown</td></tr>
+      <tr><td><code>+4</code> angle</td><td>12-bit spawn facing</td></tr>
+      <tr><td><code>+8..+0x10</code> origin</td><td>World x / y / z, 16.8 fixed</td></tr>
+      <tr><td><code>+0x18</code> script_cursor</td><td>Next 14-byte spawn record</td></tr>
+    </tbody>
+  </table>
+  <p>The head holds the motion scale (<code>0x1000</code>) and the sprite scale (<code>0xA00</code>) the init writes. A child slot mirrors the master's shape: frame count (doubling as the active flag), mirror bits, frame cursor, wait, i16 velocity, 16.8 position and an animation cursor.</p>
+</section>
+
+<section class="doc-section" id="streaming" data-doc="side-band-streaming-effect-handler-0x801f17f8">
+  <h2>Side-band streaming: summon.dat and readef.DAT</h2>
+  <p>A separate loader case streams one of two runtime-only files into <code>0x10800</code>-byte slots: per-special-attack CLUT rows and 4bpp texture pages, summon-creature actor records, and the player art-animation archives. The loader consumes a raw TOC index rather than the path string, which is why the names map to extraction entries 893 / 894. Full format: <a href="../formats/summon-readef.html">summon-readef</a>.</p>
+  <table class="data-table">
+    <thead><tr><th>File</th><th>Raw TOC index</th><th>Extraction entry</th><th>Selected when</th></tr></thead>
+    <tbody>
+      <tr><td><code>data\battle\summon.dat</code></td><td><code>0x37F</code></td><td>893 (103 slots)</td><td><code>_DAT_8007BD24[0x26B] &amp; 0x80</code> set</td></tr>
+      <tr><td><code>data\battle\readef.DAT</code></td><td><code>0x380</code></td><td>894 (78 slots)</td><td>otherwise</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="doc-section" id="spawn-sources" data-doc="spawn-sources">
+  <h2>Spawn sources</h2>
+  <p>The effect catalog (<code>efect.dat</code>) loads at scene entry and stays resident across field / battle transitions. Four producers feed the spawn API:</p>
+  <table class="data-table">
+    <thead><tr><th>Producer</th><th>Retail</th><th>Port</th></tr></thead>
+    <tbody>
+      <tr><td>Animation effect arm</td><td><code>FUN_8004998C</code>, spawning at the actor's position and facing</td><td><code>BattleActionHost::ui_element</code></td></tr>
+      <tr><td>Per-action effect-script walk</td><td><code>FUN_801DEA50</code></td><td><code>World::route_battle_effect_spawns</code></td></tr>
+      <tr><td>Move-power effect-id lists</td><td><code>FUN_801E09F8</code></td><td><code>World::spawn_move_fx</code></td></tr>
+      <tr><td>Per-move effect-list spawner</td><td><code>FUN_801E22C8</code>, called by the battle effect driver <code>FUN_800402F4</code></td><td><code>battle_cue_group::expand_cue_group</code></td></tr>
+    </tbody>
+  </table>
+  <ul class="bullets">
+    <li><strong>A spawn is seated at an actor, never the world origin</strong>: the caller copies the actor's world position, offsets it by the effect's planar legs rotated through its facing, and passes the facing as the spawn angle.</li>
+    <li><strong>The effect-script walk has two record forms.</strong> Its <code>0x80</code>-flagged records route into this pool; its table-form records stage a small move-VM scene graph instead (see <a href="#vdf-morph">vdf.dat morphs</a>).</li>
+    <li><strong>The last two producers share the bit-7 multiplex</strong> (<a href="../formats/effect.html">effect format</a>).</li>
+    <li><strong>HUD screen-element raises do not spawn here</strong>: the HUD spawner calls no effect routine.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="effect-id-mapping" data-doc="-">
+  <h2>Naming an effect id</h2>
+  <p>Effect ids are anonymous - no string table says &ldquo;fireball&rdquo;. To name an id, trace the call sites of the spawn API: each caller passes a literal byte, which correlates with the action that triggered it (a Tactical Art, an item use, a spell cast).</p>
+</section>
+
+<section class="doc-section" id="port" data-doc="engine-port">
+  <h2>In the port</h2>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Retail</th><th>Port</th></tr></thead>
+    <tbody>
+      <tr><td>Init <code>FUN_801DE914</code></td><td><code>Pool::init_head</code></td></tr>
+      <tr><td>Spawn <code>FUN_801DFDF0</code></td><td><code>Pool::spawn</code>, <code>Pool::spawn_by_ui_id</code></td></tr>
+      <tr><td>Walker pass 1</td><td><code>Pool::tick_retail</code>, with the frame-skip catch-up factor</td></tr>
+      <tr><td>Walker pass 2</td><td><code>Pool::child_billboards</code>: envelope, atlas, size, mirror order</td></tr>
+      <tr><td><code>rand()</code> and the summon side call</td><td><code>EffectHost::next_random</code>, <code>is_summon_effect</code> / <code>handle_summon</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p><code>World::tick_effects</code> runs one walker sweep per retail logic frame, and <code>World::active_effect_sprites</code> maps pass 2 one-for-one into billboards, which both hosts draw as camera-facing textured quads sampling the scene VRAM. It is the engine&rsquo;s only per-frame effect path.</p>
+  <h3 id="same-frame">A script spawn is walked on the frame it fires</h3>
+  <p>Retail spawns and walks in one frame, in that order: the per-actor anim tick steps the action effect script, whose direct arm calls the spawn API, and the walker runs afterwards from the draw tick. The engine walks the pool inside its tick and routes queued script and homing spawns in the frame tail, after the walk - so each direct spawn is caught up by the sweeps that frame&rsquo;s walker gave everything else (<code>Pool::catch_up_master</code>: that master and the children it seeds, nothing more). Without it an effect&rsquo;s first batch landed one sweep late.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 880 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Frame order. Retail: the anim tick steps the effect script, which spawns through the spawn API, then the draw tick runs the walker, which sweeps the new master in the same frame. Port: the world tick queues the script spawn and runs the walker, then the frame tail routes the queued spawns, and catch_up_master gives each new master and its children the sweeps the walker already ran this frame.">
+      <defs><marker id="evm-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <text class="dg-sub dg-start" x="20" y="22">retail, one frame</text>
+      <rect class="dg-node" x="20" y="34" width="190" height="56" rx="4"/>
+      <text class="dg-label" x="115" y="58">Anim tick</text><text class="dg-sub" x="115" y="76">FUN_80047430</text>
+      <rect class="dg-node" x="240" y="34" width="190" height="56" rx="4"/>
+      <text class="dg-label" x="335" y="58">Effect script</text><text class="dg-sub" x="335" y="76">FUN_801DEA50</text>
+      <rect class="dg-node-accent" x="460" y="34" width="190" height="56" rx="4"/>
+      <text class="dg-label" x="555" y="58">Spawn</text><text class="dg-sub" x="555" y="76">FUN_801DFDF0</text>
+      <rect class="dg-node-ok" x="680" y="34" width="180" height="56" rx="4"/>
+      <text class="dg-label" x="770" y="58">Walker</text><text class="dg-sub" x="770" y="76">from the draw tick</text>
+      <path class="dg-edge" d="M210 62 L238 62" marker-end="url(#evm-arrow)"/>
+      <path class="dg-edge" d="M430 62 L458 62" marker-end="url(#evm-arrow)"/>
+      <path class="dg-edge" d="M650 62 L678 62" marker-end="url(#evm-arrow)"/>
+      <text class="dg-sub dg-start" x="20" y="140">port, one tick</text>
+      <rect class="dg-node" x="20" y="152" width="190" height="56" rx="4"/>
+      <text class="dg-label" x="115" y="176">World::tick</text><text class="dg-sub" x="115" y="194">spawn queued</text>
+      <rect class="dg-node-ok" x="240" y="152" width="190" height="56" rx="4"/>
+      <text class="dg-label" x="335" y="176">Walker</text><text class="dg-sub" x="335" y="194">tick_retail</text>
+      <rect class="dg-node-accent" x="460" y="152" width="190" height="56" rx="4"/>
+      <text class="dg-label" x="555" y="176">Frame tail</text><text class="dg-sub" x="555" y="194">route queued spawns</text>
+      <rect class="dg-node-ok" x="680" y="152" width="180" height="56" rx="4"/>
+      <text class="dg-label" x="770" y="176">catch_up_master</text><text class="dg-sub" x="770" y="194">the missed sweeps</text>
+      <path class="dg-edge" d="M210 180 L238 180" marker-end="url(#evm-arrow)"/>
+      <path class="dg-edge" d="M430 180 L458 180" marker-end="url(#evm-arrow)"/>
+      <path class="dg-edge" d="M650 180 L678 180" marker-end="url(#evm-arrow)"/>
+    </svg>
+    <figcaption>The same effect state at the end of the frame, reached in a different order: the catch-up stands in for the walker retail runs after the spawn.</figcaption>
+  </figure>
+  <ul class="bullets">
+    <li><strong>Two port-side deltas</strong>, both invisible to retail behaviour: the retirement overrun is cut at retirement, and a dead master lane is reused as an age counter for render fades.</li>
+    <li><strong>Debug spawns</strong> (the <code>E</code> key in <code>play-window</code>) live outside the pool, so the walker never sees them.</li>
+    <li><strong>A faint effect is usually faint by data</strong> (see <a href="#render">how a child is drawn</a>). Differencing two frames with the billboard draw suppressed (<code>LEGAIA_DIAG_NOFX=1</code>) shows the sprites really are drawn; <code>LEGAIA_DIAG_FX=1</code> logs each live sprite&rsquo;s position, size, page, CLUT and VRAM residency.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="how-we-know" data-doc="-">
+  <h2>How we know</h2>
+  <table class="data-table">
+    <thead><tr><th>Function</th><th>Address</th><th>What it proves</th><th>Dump</th></tr></thead>
+    <tbody>
+      <tr><td>Init / pack fix-up</td><td><code>0x801DE914</code></td><td>Pool head scalars; called from <code>FUN_800520F0</code> case <code>0xE</code> with <code>(0x1000, 0xA00)</code></td><td><code>overlay_battle_801de914.txt</code></td></tr>
+      <tr><td>Spawn API</td><td><code>0x801DFDF0</code></td><td><code>(effect_id, world_pos*, angle)</code>; master seeding; every <code>jal</code> on the disc names this entry</td><td><code>overlay_battle_801dfdf8.txt</code> (prologue word)</td></tr>
+      <tr><td>Per-frame walker</td><td><code>0x801E0080</code></td><td>Pass 1 timers / spawn, pass 2 quads; ready flag; catch-up factor <code>DAT_1F800393</code></td><td><code>overlay_battle_801e0088.txt</code> (prologue word)</td></tr>
+      <tr><td>Spawn caller</td><td><code>FUN_8004998C</code> effect arm</td><td>Spawns at the actor's position and facing</td><td><code>funcs/8004998c.txt</code></td></tr>
+      <tr><td>Producers</td><td><code>FUN_801DEA50</code>, <code>FUN_801E09F8</code>, <code>FUN_801E22C8</code> (via <code>FUN_800402F4</code>)</td><td>The script walk, move-power lists and per-move list spawner</td><td>battle overlay dumps</td></tr>
+      <tr><td>Render dispatcher</td><td><code>FUN_8001ADA4</code> case 4</td><td>The three emitters on the <code>+0x9E</code> selector</td><td><code>funcs/8001ada4.txt</code></td></tr>
+      <tr><td>Per-stage init</td><td><code>FUN_8001E1B4</code></td><td>Every mode switch re-seeds the actor free stack and list sentinels</td><td><code>funcs/8001e1b4.txt</code></td></tr>
+      <tr><td>Streaming handler</td><td><code>0x801F17F8</code> via <code>FUN_800558FC</code></td><td>Raw-TOC-index load of summon / readef; byte-verified RAM&harr;disc in a mid-cast state</td><td>-</td></tr>
+      <tr><td>Sprite projector</td><td><code>FUN_800195A8</code></td><td>Corners offset after the centre transform</td><td><code>funcs/800195a8.txt</code></td></tr>
+    </tbody>
+  </table>
+  <p class="hint">Full write-up: <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/subsystems/effect-vm.md" target="_blank" rel="noopener"><code>docs/subsystems/effect-vm.md</code></a>.</p>
+</section>
+
+<section class="doc-section" id="see-also" data-doc="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../formats/effect.html">efect.dat format</a>
+    <a href="../formats/summon-readef.html">summon.dat / readef.DAT format</a>
+    <a href="battle-action.html">Battle action SM</a>
+    <a href="move-vm.html">Move-table VM</a>
+    <a href="battle.html">Battle</a>
+    <a href="battle-action.html#summon-overlay">Summon overlays</a>
+    <a href="../magic.html">Magic browser</a>
+  </div>
+</section>

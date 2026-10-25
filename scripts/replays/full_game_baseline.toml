@@ -1,0 +1,90 @@
+# Full-game ladder baseline.
+#
+# The scores `crates/engine-shell/tests/full_game_ladder.rs` part B last
+# cleared over the story spine in `scripts/replays/full_game_spine.toml`.
+# Each number is asserted `>=`, so a drop fails the run and a rise is a
+# reviewed edit (the test prints the block to paste). Never raise a number
+# the run did not clear, and never lower one to make a red run green -
+# a drop is a finding.
+#
+# Segment keys name the milestone the segment ENDS at. Tiers:
+#   0 none        seeding failed or panicked
+#   1 loads       the seeded save lands in its scene
+#   2 enters      the entry script settles (control back, or the script left)
+#   3 progresses  the next milestone is reached by seated traversal + beats
+#   4 pad         the next milestone is reached with pad input only
+#
+# The headline counts are how many segments, taken in spine order, reach
+# their next milestone at each tier; tier_sum is the sum over all segments.
+# Every segment is seeded from the retail save at its milestone, so these
+# are not what one New Game reaches - that is `[continuous]` below.
+# See docs/tooling/full-game-ladder.md.
+
+[headline]
+contiguous_progresses = 35
+contiguous_pad = 35
+tier_sum = 140
+
+# Part C, the continuous run: milestones one New Game reaches in order on
+# pad input when it is never re-seeded from a retail save and reloads only
+# the engine's own saves. Asserted `>=` like the rest.
+[continuous]
+reached = 35
+
+# Part C on other hands of the rand stream: a run under
+# LEGAIA_FGL_RNG_SEED=<n> is asserted against its own seed_<n> row. One
+# stream's score can rest on a boss the hand only won by the deal; the set
+# says the route holds across deals. Asserted `>=` like the rest.
+[continuous_seeds]
+seed_3 = 35
+seed_4 = 35
+seed_5 = 35
+seed_6 = 35
+seed_7 = 35
+seed_8 = 35
+seed_9 = 35
+# --- lane C ---
+seed_10 = 35
+seed_11 = 35
+seed_12 = 35
+seed_13 = 35
+seed_14 = 35
+seed_15 = 35
+seed_16 = 35
+
+[segments]
+rim_elm = 4
+tetsu_spar = 4
+mist_rim_elm = 4
+hunters_spring = 4
+drake_castle = 4
+rim_elm_restored = 4
+ravine = 4
+snowdrift_cave = 4
+mt_rikuroa = 4
+caruban_defeated = 4
+drake_castle_revisited = 4
+west_voz_forest = 4
+voz_forest = 4
+zeto_dungeon = 4
+zeto_dungeon_late = 4
+sky_gardens = 4
+fire_path = 4
+mt_letona = 4
+ratayu = 4
+dohati_castle = 4
+sol_tower = 4
+sol_tower_b2 = 4
+usha_research = 4
+nivora = 4
+nivora_late = 4
+zora_castle = 4
+conkram_past = 4
+rogue_tower = 4
+jette_fortress = 4
+jette_fortress_late = 4
+noaru_valley = 4
+bio_castle = 4
+cort_chamber = 4
+ending = 4
+credits = 4

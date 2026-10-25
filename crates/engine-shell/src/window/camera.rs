@@ -1,0 +1,1339 @@
+//! Extracted from `window.rs` (mechanical split; behavior-preserving).
+
+use super::*;
+
+/// Retail field follow-camera parameters: pitch `_DAT_8007B790 = 450` units
+/// (~39.6 deg down-tilt), GTE `H = _DAT_8007B6F4 = 512`, and the
+/// engine-calibrated eye-back depth. They live in the shared camera resolver
+/// (`legaia_engine_world_views::camera_view`) because the browser play page frames
+/// the same shot from the same numbers; re-declaring them here is how the two
+/// hosts' field cameras used to drift apart without a diff.
+use legaia_engine_world_views::camera_view;
+
+/// The debug orbit vantage's **input vocabulary**, shared with the browser
+/// play page's own orbit (`site/js/play-app.js`, its `pointermove` and
+/// `wheel` handlers on the canvas).
+///
+/// The two hosts each keep exactly one camera of their own - the `F3` debug
+/// orbit - and the toggle was at parity long before the controls were. The
+/// page steered it with three knobs (drag yaw, drag pitch, wheel zoom) while
+/// this window had only yaw, at a different rate: a horizontal drag turned
+/// the view a third faster here, on the *same* `Camera::manual_orbit` field,
+/// so the movement compass the field remaps the d-pad through also answered
+/// differently to the same gesture. Pitch and zoom had no native input at
+/// all, which is why the window's vantage could only be steepened by editing
+/// a constant.
+///
+/// These are the page's numbers, so the same drag moves the same camera by
+/// the same amount on either host. They are JS literals on that side, so no
+/// paired-constant check can bind them - the pairing is this comment and the
+/// two tests below.
+///
+/// The rates serve two cameras. With the retail follow camera live (no
+/// `F3`) the same gestures steer the engine's follow knobs
+/// (`Camera::orbit_by` / `tilt_by` / `zoom_by`, whose clamps live in
+/// `engine-field::camera::follow_knobs` and which drop a gesture while a
+/// cutscene owns the camera); only under `F3` do they steer this window's
+/// own vantage through the pitch / half-extent clamps below.
+pub(super) mod debug_orbit {
+    /// Radians of yaw per pixel of horizontal drag. Feeds
+    /// `Camera::manual_orbit`, which the retail follow camera and the
+    /// movement compass both read, so this rate is not debug-only.
+    pub const YAW_RAD_PER_PX: f32 = 0.006;
+    /// Radians of pitch per pixel of vertical drag.
+    pub const PITCH_RAD_PER_PX: f32 = 0.004;
+    /// Pitch clamp. The lower bound keeps the eye above the floor plane; the
+    /// upper stops the vantage going fully top-down, where the follow
+    /// camera's own framing has no horizon to compose against.
+    pub const PITCH_MIN: f32 = 0.12;
+    /// See [`PITCH_MIN`].
+    pub const PITCH_MAX: f32 = 1.35;
+    /// Framing half-extent multiplier per wheel notch, out and in.
+    pub const ZOOM_OUT: f32 = 1.12;
+    /// See [`ZOOM_OUT`].
+    pub const ZOOM_IN: f32 = 0.89;
+    /// Framing half-extent clamp, in world units - the same quantity the
+    /// page calls `halfWidth`.
+    pub const HALF_MIN: f32 = 220.0;
+    /// See [`HALF_MIN`].
+    pub const HALF_MAX: f32 = 6000.0;
+}
+
+impl PlayWindowApp {
+    /// Whether this frame's camera stands where retail's would
+    /// (`field_view_window::retail_vantage`, the kernel the browser play
+    /// page asks too): the placed-object near reject runs only there.
+    pub(super) fn retail_vantage(&self) -> bool {
+        legaia_engine_world_views::field_view_window::retail_vantage(
+            &self.session.host.world,
+            &self.session.camera,
+            self.field_debug_camera,
+        )
+    }
+
+    pub(super) fn camera_mvp(&self, aspect: f32) -> Mat4 {
+        // Frame the player's vicinity, not the whole scene. Loading the full
+        // town environment-geometry pack makes `scene_aabb` (the union of every
+        // mesh's local extent) span thousands of units, so fitting it pulls the
+        // orbit camera far enough out that the actually-drawn terrain near the
+        // player shrinks to a speck. Until per-mesh world placement lands, build
+        // a fixed-size framing box around the player actor (the field draws
+        // actor-bound meshes at actor positions) so the view stays close.
+        const FIELD_VIEW_HALF: f32 = 700.0;
+        // The camera-distance preset (T cycles) widens the framing box, and
+        // a mouse drag-orbit swings the vantage - same knobs as the follow
+        // camera, so the debug view composes with both. The wheel then scales
+        // the box continuously on top, which is the browser page's `halfWidth`
+        // knob: the two hosts' one own camera takes the same three inputs.
+        let view_half =
+            (FIELD_VIEW_HALF * self.session.camera.distance.scale() * self.debug_orbit_zoom)
+                .clamp(debug_orbit::HALF_MIN, debug_orbit::HALF_MAX);
+        let (lo, hi) = self
+            .session
+            .host
+            .world
+            .actors
+            .first()
+            .filter(|p| p.active || p.tmd_binding.is_some())
+            .map(|p| {
+                let (cx, cy, cz) = (
+                    p.move_state.world_x as f32,
+                    p.move_state.world_y as f32,
+                    p.move_state.world_z as f32,
+                );
+                (
+                    [cx - view_half, cy - view_half, cz - view_half],
+                    [cx + view_half, cy + view_half, cz + view_half],
+                )
+            })
+            .unwrap_or((self.scene_aabb.0, self.scene_aabb.1));
+        // Retail's field camera is a *fixed* per-scene 3/4 vantage that follows
+        // the player, NOT a spinning orbit. Passing `elapsed_secs` here made the
+        // camera rotate continuously (after ~15 s it points up at the sky with
+        // the town splayed at the edges). Freeze the orbit angle to a fixed
+        // diagonal and steepen the eye height to a town-like overhead pitch. The
+        // AABB is still the player-centred box, so the view tracks the player.
+        //
+        // `orbit_camera_mvp` derives its azimuth from `elapsed_secs *
+        // orbit_speed`; feed a constant "time" so the azimuth is fixed at
+        // `FIELD_ORBIT_ANGLE`. Height ratio `FIELD_EYE_HEIGHT` sets the pitch
+        // (`atan(height) ≈ 40deg`), matching Rim Elm's overhead framing.
+        const FIELD_ORBIT_SPEED: f32 = 0.25;
+        const FIELD_ORBIT_ANGLE: f32 = 0.75;
+        let angle = FIELD_ORBIT_ANGLE + self.session.camera.manual_orbit;
+        let fixed_time = angle / FIELD_ORBIT_SPEED;
+        // `orbit_camera_mvp` takes the eye *height ratio*, not an angle, so
+        // the pitch the drag steers converts through `tan` - which is the
+        // same relation the default `0.85` encoded (`atan(0.85)` rad). The
+        // page steers an angle directly; keeping the angle as the stored
+        // knob is what lets both hosts clamp the same two numbers.
+        orbit_camera_mvp(
+            lo,
+            hi,
+            FIELD_ORBIT_SPEED,
+            self.debug_orbit_pitch().tan(),
+            fixed_time,
+            aspect,
+        )
+    }
+
+    /// The debug orbit's pitch this frame, in radians, clamped to the range
+    /// the browser page clamps its own to. The default is the angle the
+    /// window's long-standing `0.85` eye-height ratio encoded, so the
+    /// untouched vantage is unchanged.
+    pub(super) fn debug_orbit_pitch(&self) -> f32 {
+        self.debug_orbit_pitch
+            .clamp(debug_orbit::PITCH_MIN, debug_orbit::PITCH_MAX)
+    }
+
+    /// World-space **eye position** of the retail field follow camera, in
+    /// RAW retail Y-down world coordinates (the frame the field draws use) -
+    /// the analytic inverse of the follow view (`camera_view::field_follow_view`)
+    /// `compute_scene_camera` uploads. Consumed by the camera-occlusion
+    /// fade's visibility gate, which ray-casts eye->player against the static
+    /// scene geometry in this same frame. `None` on the same no-player guard
+    /// as the follow camera.
+    pub(super) fn field_follow_camera_eye(&self) -> Option<Vec3> {
+        let view = camera_view::field_follow_view(&self.session.camera, &self.session.host.world)?;
+        Some(Vec3::from(view.eye()))
+    }
+
+    /// The phase-scripted battle camera's diagnostics for this frame.
+    ///
+    /// The camera itself is **engine** state now: `World::tick` steps it for
+    /// every host (`World::tick_battle_camera`, over the shared
+    /// `legaia_engine_core::battle_cam_inputs` derivation), so the gate is the
+    /// world's mode and nothing this window renders, and the browser play page
+    /// reads the very same state. What stays here is the draw-side probe.
+    pub(super) fn tick_battle_camera(&mut self) {
+        // `LEGAIA_DIAG_BATCAM=1`: one line per camera tick with the framing
+        // pose, the phase that selected it and the action-SM state that
+        // derived the phase, plus each drawn combatant's clip `w` and NDC
+        // through the live battle matrix. Reading a *pose* alone cannot tell
+        // a legitimate close-up from a camera parked inside the geometry -
+        // a negative `w` can, which is what this exists for.
+        if std::env::var_os("LEGAIA_DIAG_BATCAM").is_some()
+            && let Some(c) = self.session.host.world.battle.camera.as_ref()
+        {
+            let p = c.framing_pose();
+            let world = &self.session.host.world;
+            eprintln!(
+                "BATCAM f={} phase={:?} st=0x{:02X} act={} pitch={} yaw={} tr={:?} focus={:?}",
+                world.clock.display_frames,
+                c.phase(),
+                world.battle_ctx.action_state,
+                world.battle_ctx.active_actor,
+                p.pitch,
+                p.yaw,
+                p.tr,
+                p.focus,
+            );
+            // The per-art attack camera's three inputs, so "the channel is
+            // armed but no arm matched" reads differently from "the channel
+            // is not armed at all".
+            let slot = world.battle_ctx.active_actor;
+            match legaia_engine_core::battle_cam_inputs::battle_attack_channels(world, slot) {
+                Some(ch) => eprintln!(
+                    "  attackcam char={:?} art=0x{:02X} arm={} animf={} arm_va={:?}",
+                    ch.character,
+                    ch.art_id,
+                    ch.arm_select,
+                    ch.anim_frame,
+                    legaia_engine_battle_vm::battle_attack_camera::art_arm(ch.character, ch.art_id)
+                        .map(|v| format!("{v:#010x}")),
+                ),
+                None => eprintln!("  attackcam not armed"),
+            }
+            let cam = self.battle_dome_camera_mvp(4.0 / 3.0)
+                * Mat4::from_scale(Vec3::splat(super::BATTLE_WORLD_SCALE));
+            for (i, a) in world.actors.iter().enumerate() {
+                if !a.active || a.tmd_binding.is_none() {
+                    continue;
+                }
+                let w = Vec3::new(
+                    a.move_state.world_x as f32,
+                    a.move_state.world_y as f32,
+                    a.move_state.world_z as f32,
+                );
+                let clip = cam * w.extend(1.0);
+                // On-screen extent of a `DIAG_ACTOR_HEIGHT`-unit vertical
+                // reference segment standing at the actor's feet, in PSX
+                // scanlines (the frame is 240 lines, NDC spans 2). This is
+                // the number a framing change is measured in - a pose alone
+                // does not say how much of the frame the actor fills.
+                //
+                // The reference is a real battle-form party mesh, not a round
+                // number: the posed AABBs are 425 (Vahn), 390 (Noa) and 503
+                // (Gala) battle-world units, feet on the seat plane
+                // (`docs/formats/character-mesh.md` § Rest-pose orientation).
+                // The old `800` here was nearly *double* the mesh it claimed
+                // to stand in for, so every `lines` reading came out 1.9x
+                // high - and one was read as evidence that the assembled mesh
+                // was itself oversized. It is not: nothing on the load path
+                // scales a vertex. Change this only to another measured mesh
+                // height.
+                const DIAG_ACTOR_HEIGHT: f32 = 425.0;
+                let head = cam * Vec3::new(w.x, w.y - DIAG_ACTOR_HEIGHT, w.z).extend(1.0);
+                let lines = if clip.w > 0.0 && head.w > 0.0 {
+                    ((head.y / head.w - clip.y / clip.w).abs() * 120.0).round()
+                } else {
+                    -1.0
+                };
+                eprintln!(
+                    "  actor{i} world={w:?} clipw={:.1} ndc=({:.2},{:.2}) lines={lines}",
+                    clip.w,
+                    clip.x / clip.w,
+                    clip.y / clip.w
+                );
+            }
+        }
+    }
+
+    /// The **exact** retail overworld-battle camera (game mode `0x15`), pinned
+    /// from the four fingerprinted `overworld_battle_bg_angle_*` saves and
+    /// `FUN_80026988`/`FUN_80026f50`. For a PSX (Y-down) world vertex `v` retail
+    /// computes `screen = H * (R*v + TR) / Ze` with
+    ///   `R  = Rx(pitch=32u) * Ry(yaw)`         (12-bit angles, 4096 = 360°),
+    ///   `TR = (0, 1280, 7680)`                 (eye-space: depth 7680, height 1280),
+    ///   `H  = 256`                             (GTE projection focal length),
+    /// the look-at target is the world origin, and PSX screen `+Y` is **down**
+    /// with screen-centre `(160, 120)` over the 320x240 frame.
+    ///
+    /// The engine draws its meshes Y-flipped (`scale(1,-1,1)` = `F`, PSX Y-down
+    /// -> renderer Y-up), so this builds `cam = Proj_H * T(TR) * R * F`: every
+    /// battle draw is `cam * model` where `model` already carries an `F` (the
+    /// dome's plain flip, the actors' `Translate * F`), and `F*F = I` recovers
+    /// the raw PSX vertex the retail transform expects. Verified by projecting
+    /// PROT 88's dome through this matrix and matching the savestate framebuffer
+    /// (sky / mountain-ring / horizon). See `project_battle_camera_re`.
+    /// The exact retail dome projection (`tr = (0,1280,7680)`), kept as the
+    /// camera-RE reference and the regression-test target. The live battle uses
+    /// the unified [`battle_dome_camera_mvp`] (closer depth) for a coherent
+    /// single-camera scene; this stays as the pinned ground truth.
+    #[allow(dead_code)]
+    pub(super) fn retail_battle_mvp(yaw_rad: f32, aspect: f32) -> Mat4 {
+        Self::battle_mvp_with_tr(yaw_rad, Vec3::new(0.0, 1280.0, 7680.0), aspect)
+    }
+
+    /// The shared battle projection-times-view for a given eye-space translation
+    /// `tr`. Retail keeps a single rotation `R = Rx(32u)·Ry(yaw)` (stored
+    /// rotation-only in `DAT_8007bf10`) and applies the translation per draw
+    /// class: the backdrop gets `tr = (0, 1280, 7680)` (pushed far), the actors
+    /// get their own (closer) translation off the rotation-only matrix
+    /// ([`FUN_80048A08`] composes each actor's world transform onto `8007bf10`,
+    /// NOT onto the backdrop's `7680`-deep matrix). Sharing `R` keeps the
+    /// foreground and backdrop orbiting in lock-step; the differing `tr.z`
+    /// is what lets the party read large while the dome sits on the horizon.
+    pub(super) fn battle_mvp_with_tr(yaw_rad: f32, tr: Vec3, aspect: f32) -> Mat4 {
+        const PITCH_UNITS: f32 = 32.0;
+        let pitch = PITCH_UNITS / 4096.0 * std::f32::consts::TAU;
+        Self::psx_camera_mvp(pitch, yaw_rad, 0.0, 256.0, tr, Vec3::ZERO, aspect)
+    }
+
+    /// Shared PSX-projection camera: `screen = H * (R*(v - target) + tr) / Ze`
+    /// with `R = Rx(pitch)·Ry(yaw)·Rz(roll)` (the retail camera matrix
+    /// `FUN_800172C0` builds through `FUN_80026988`), `tr` the post-rotation eye-space translation, `target`
+    /// the world-space look-at (retail folds it into the GTE translation as
+    /// the negated focus trio `_DAT_80089118/1C/20`), and `H` the GTE
+    /// projection register (`_DAT_8007B6F4`). The battle camera is this with
+    /// `target = origin`, `H = 256`; the field camera drives `target` from
+    /// the player anchor with the savestate-pinned angle globals.
+    ///
+    /// The engine draws its meshes Y-flipped (`scale(1,-1,1)` = `F`, PSX
+    /// Y-down -> renderer Y-up); every draw's `model` carries an `F`, and
+    /// `F*F = I` recovers the raw PSX vertex the retail transform expects.
+    pub(super) fn psx_camera_mvp(
+        pitch_rad: f32,
+        yaw_rad: f32,
+        roll_rad: f32,
+        h: f32,
+        tr: Vec3,
+        target: Vec3,
+        aspect: f32,
+    ) -> Mat4 {
+        // Retail's own composition order, `Rx * Ry * Rz` with pitch outermost
+        // (the Euler kernel `FUN_80026988` the view build `FUN_800172C0` runs
+        // over the angle globals; `FUN_8001CF50` is the per-node
+        // camera-relative variant, not this). `glam`'s `from_rotation_*` build the
+        // same right-handed factors as the crate's own q3.12 rendition
+        // `legaia_render_kernels::gte::math::camera_view_rotation`, so this is
+        // that product in float. Roll (op-`0x45` slot 2, `_DAT_8007B794`) is
+        // authored by retail - eight scenes stage a non-zero one; see
+        // `crates/engine-core/tests/thread_camera_roll_execution.rs`.
+        let r = Mat4::from_rotation_x(pitch_rad)
+            * Mat4::from_rotation_y(yaw_rad)
+            * Mat4::from_rotation_z(roll_rad);
+        let t = Mat4::from_translation(tr);
+        let f = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0));
+        // PSX perspective onto a 320x240 frame: ndc.x = H*Ex/(160*Ez),
+        // ndc.y = -H*Ey/(120*Ez) (PSX +Y down -> NDC up), clip.w = Ez, depth
+        // mapped to wgpu [0,1]. Correct X for non-4:3 viewports so the 4:3
+        // retail framing holds at any window size.
+        // Near stays at the retail-ish 4 units (it is what governs depth
+        // precision); the far plane is the engine-wide `SCENE_FAR`. The old
+        // 60 000 looked generous in the 1x field frame but the **overworld
+        // walk** composes a 6x world scale onto this camera, so 60 000 eye
+        // units is only ~8.5 k world units of draw distance: continent
+        // terrain past that was silently far-clipped and popped in as the
+        // player walked toward it. Nothing is distance-culled now.
+        let (near, far) = (4.0f32, legaia_engine_render::window::SCENE_FAR);
+        let a = far / (far - near);
+        let b = -near * far / (far - near);
+        let aspect_fix = (4.0 / 3.0) / aspect.max(0.01);
+        // The `y`-from-`w` term is retail's screen centre
+        // `legaia_engine_camera::projection::GTE_OFY` = 114, not the naive
+        // `240 / 2`: the GTE control file carries `OFX = 160` / `OFY = 114`
+        // unchanged through field, battle, battle load and minigame, so every
+        // projected point sits six rows above the geometric centre of the
+        // frame. Shared with the browser host through `battle_vp`, which folds
+        // the identical term.
+        let proj = Mat4::from_cols(
+            Vec4::new(h / 160.0 * aspect_fix, 0.0, 0.0, 0.0),
+            Vec4::new(0.0, -h / 120.0, 0.0, 0.0),
+            Vec4::new(
+                0.0,
+                legaia_engine_camera::projection::GTE_OFY_NDC_BIAS,
+                a,
+                1.0,
+            ),
+            Vec4::new(0.0, 0.0, b, 0.0),
+        );
+        proj * t * r * Mat4::from_translation(-target) * f
+    }
+
+    /// The single battle camera, used for **everything** in a stage-dome
+    /// battle: the RETAIL phase-scripted camera. Rotation trio `0x8007B790`
+    /// = `(pitch, yaw, 0)`, GTE `H = 256`, translation trio `0x800840B8` -
+    /// all four driven per battle phase by [`super::battle_cam`] (dialogue
+    /// close-up / far menu framing with the idle orbit / per-character
+    /// submenu close-up, with the measured glides between), stepped by
+    /// [`Self::tick_battle_camera`]. The static-projection composition was
+    /// verified to 0.0002 px against the savestate framebuffer
+    /// (`retail_battle_mvp_matches_psx_projection`).
+    ///
+    /// The ACTORS ride the same rotation but with the **4.0x uniform world
+    /// scale** base matrix `0x8007BF10` (`16384 * I`; GTE `4096` = 1.0)
+    /// composed under it (`FUN_80048A08` multiplies the camera matrix per
+    /// actor) - that scale is what makes the small battle meshes (130-370
+    /// units) read at retail size against the far 7680-deep translation
+    /// (`256 * 4*370 / 7680` = ~49 px). The draw branch composes
+    /// [`BATTLE_WORLD_SCALE`] onto this camera for the actor + battle-FX
+    /// draws only, superseding the old DEPTH=1500 single-camera compromise
+    /// (and its "separate close actor matrix" reading).
+    pub(super) fn battle_dome_camera_mvp(&self, aspect: f32) -> Mat4 {
+        let to_rad = |units: f32| units / 4096.0 * std::f32::consts::TAU;
+        // First frame before the tick armed the state: the shared BOOT_POSE
+        // (far framing at its minimum depth, on the origin) - the same
+        // fallback the browser host renders.
+        let p = self.session.host.world.battle_cam_pose();
+        let (pitch, yaw, tr, focus) = (p.pitch, p.yaw, Vec3::from(p.tr), Vec3::from(p.focus));
+        // The focus trio is the world point the camera orbits (retail stores
+        // it negated at `0x80089118/1C/20`). Retail folds the battle world
+        // scale into the camera rotation, so the focus is scaled with the
+        // geometry it targets; the engine composes [`BATTLE_WORLD_SCALE`] on
+        // the actor draws *after* this camera, so the focus has to be
+        // pre-scaled by the same factor to land on the same eye-space point.
+        let focus = focus * super::BATTLE_WORLD_SCALE;
+        // The battle camera's rotation trio is `(pitch, yaw, 0)` - the battle
+        // phase script never stages a roll.
+        Self::psx_camera_mvp(to_rad(pitch), to_rad(yaw), 0.0, 256.0, tr, focus, aspect)
+    }
+
+    /// The matrix **every** battle draw of this frame goes through: the
+    /// phase-scripted dome camera, in every battle.
+    ///
+    /// One selector, because two have already shipped here. The scene pass
+    /// once picked between this camera and an auto-framed monster orbit
+    /// while the move-FX streak and the weapon-trail passes called the orbit
+    /// unconditionally, so in a stage battle the swing ribbon sat wherever
+    /// the two framings disagreed: a trail is attached to a body and has to
+    /// ride the body's camera. And a fight whose stage did not resolve used
+    /// to fall back to that orbit, unscaled, while the browser page drew it
+    /// through the phase camera at the 4x base matrix - which is retail's
+    /// frame: the camera and the base matrix belong to the battle mode, and
+    /// the backdrop is only one more actor drawn through them
+    /// (`legaia_engine_session::battle_fx::battle_world_scale`).
+    pub(super) fn battle_scene_mvp(&self, aspect: f32) -> Mat4 {
+        self.battle_dome_camera_mvp(aspect)
+    }
+
+    /// The model factor every **stage-class** battle draw carries: the
+    /// backdrop arena and the ground grid.
+    ///
+    /// It is the actor class's factor - [`BATTLE_WORLD_SCALE`] (retail's
+    /// `0x8007BF10 = 16384*I` base matrix, composed per drawn object by
+    /// `FUN_80048A08`, and the arena is registered as an ordinary background
+    /// *actor*) - with the per-model Y-flip folded in, because the stage
+    /// meshes are drawn from raw PSX Y-down vertices.
+    ///
+    /// **One scale for every battle draw class.** The phase camera's
+    /// translation trio (`0x800840B8`) is authored in the scaled stage
+    /// space: the traced far framing's `TR.z = 7680` is the eye distance to
+    /// a formation whose seats are `+-800` *before* the scale. Drawing the
+    /// stage at raw 1x against that trio orbited the eye at four times the
+    /// intended radius - clear on one side of the arena and straight
+    /// through its shell on the other, which is the frame filling with a
+    /// single magnified wall - and left every actor drawn `3 * seat` away
+    /// from the ground cell it stands on.
+    pub(super) fn battle_stage_model() -> Mat4 {
+        Mat4::from_scale(Vec3::new(
+            super::BATTLE_WORLD_SCALE,
+            -super::BATTLE_WORLD_SCALE,
+            super::BATTLE_WORLD_SCALE,
+        ))
+    }
+
+    /// Camera parameters for the cutscene shot, decoded from the cutscene
+    /// timeline's executed op-`0x45` Camera Configure params (read from
+    /// `World::camera.state`, committed by `FUN_801DE084`). Returns
+    /// `(focus, pitch_radians, yaw_radians, h, tr_eye)` - the inputs to the
+    /// retail PSX GTE camera `screen = H * (R*(v - focus) + tr_eye) / Ze`
+    /// (see [`Self::psx_camera_mvp`]), the SAME model the field follow camera
+    /// uses. Provenance (`FUN_800172c0` view builder + `FUN_801DE084` apply):
+    ///
+    /// - **focus**: the world look target. Retail stores the *negated* focus
+    ///   X / Z in params 6 / 8 (`_DAT_80089118` / `_DAT_80089120`; the
+    ///   follow-cam `FUN_801DBE9C` writes `-(anchor X/Z)`), so X / Z are
+    ///   negated back to world space; Y (param 7) is un-negated and defaults
+    ///   to `0` (retail never writes `_DAT_8008911C`, and the eye-space Y
+    ///   offset below - not the focus Y - is what frames the shot vertically).
+    /// - **pitch / yaw**: params 0 / 1 (`_DAT_8007B790/92`), PSX `4096` = turn.
+    /// - **h**: param 9 (`_DAT_8007B6F4`), written straight to the GTE H
+    ///   projection register - the focal length. Passed through unchanged.
+    /// - **tr_eye**: the eye-space translation trio, params 3 / 4 / 5
+    ///   (`0x800840B8/BC/C0`; the analog of the battle camera's
+    ///   `(0, 1280, 7680)`). Retail builds `R` with a 6x world scale folded in
+    ///   (base matrix `DAT_8007BF10` = `24576*I`); the engine renders the
+    ///   scene geometry at native 1x, so the trio is divided by that scale to
+    ///   frame identically (the perspective divide makes 6x-geometry-at-`z`
+    ///   and 1x-geometry-at-`z/6` project to the same pixels - the same trick
+    ///   the field follow view applies to its own composed trio).
+    ///   opdeene supplies all three per beat; the Z component is the eye-back
+    ///   depth (raw ~16k-21k across beats).
+    pub(super) fn cutscene_view(&self) -> ([f32; 3], f32, f32, f32, f32, [f32; 3]) {
+        let v = self.host_view().scripted_target();
+        (v.focus, v.pitch, v.yaw, v.roll, v.h, v.tr_eye)
+    }
+
+    /// A battle body's model at retail position `pos` (Y down) turned by its
+    /// facing `+0x46`: `T(F pos) . Ry . F`, drawn under `cam * scale`.
+    ///
+    /// The translation takes the frame flip too (`T(F pos)`, as the effect
+    /// parts and ground shadows are placed): the battle camera ends in `F`,
+    /// so `F . T(pos) . R . F` puts the mesh back in retail's Y-down frame
+    /// but would draw a body's height `+0x36` upside down - a killed monster
+    /// the defeat fade sinks (`+0x36 += size * step / 4`) rose out of the
+    /// floor instead.
+    pub(super) fn battle_body_model(pos: Vec3, facing: u16) -> Mat4 {
+        let rot = Mat4::from_rotation_y(f32::from(facing & 0xFFF) / 4096.0 * std::f32::consts::TAU);
+        let pos = Vec3::from(legaia_engine_battle::battle_afterimage::placement_pos(
+            pos.to_array(),
+        ));
+        Mat4::from_translation(pos) * rot * Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0))
+    }
+
+    pub(super) fn actor_model(&self, slot: usize) -> Mat4 {
+        let a = &self.session.host.world.actors[slot];
+        let pos = Vec3::new(
+            a.move_state.world_x as f32,
+            a.move_state.world_y as f32,
+            a.move_state.world_z as f32,
+        );
+        // Field actors carry their heading in `render_26` (PSX 12-bit angle,
+        // maintained by the locomotion controller); retail builds the actor
+        // matrix from the rotation trio before the per-bone pose is composed
+        // onto it (`FUN_8001B964` -> `FUN_80026988`).
+        //
+        // The engine heading convention is `0` = travel Z+ (atan2), while the
+        // rest-pose mesh faces Z- (retail's facing byte stores `0` = Z-: a Z+
+        // walk writes `0x800` to `+0x26`, and retail feeds that byte straight
+        // into the rotation trio). Compose the half-turn so the model faces
+        // its travel direction instead of rendering 180 deg opposite.
+        //
+        // Y handling is per render frame: BATTLE keeps the per-model
+        // `scale(1,-1,1)` (its cameras carry no world negation), while the
+        // field frame draws the raw PSX Y-down vertices and lets the camera's
+        // `FIELD_WORLD_FLIP` provide the single net negation - so field
+        // actor world Y (the retail-convention floor tier) renders at the
+        // correct elevation. Yaw is unaffected either way (a Y negation
+        // leaves X/Z, and thus the heading, untouched).
+        if self.session.host.world.mode == SceneMode::Battle {
+            // Every battle mesh rests facing +Z and turns by the live facing
+            // `+0x46`, the angle the root-motion drive moves the actor along
+            // (`(sin f, cos f)`). Seated, that is the monsters' `0x800`
+            // half-turn toward the party - the retail Tetsu dialogue
+            // close-up (camera at yaw 0 on the party side, looking +Z) shows
+            // the monster's FACE - and the party's `0`; it is also what turns
+            // an approaching attacker toward its target and a fleeing party
+            // away from the fight.
+            Self::battle_body_model(pos, a.battle.facing_angle)
+        } else {
+            let yaw = std::f32::consts::PI
+                + (a.move_state.render_26 as f32) / 4096.0 * std::f32::consts::TAU;
+            // The player draws at its `+0x72` render scale (`0xC00` on a
+            // kingdom map) - `World::player_render_scale`, which the browser
+            // play page folds into its posed player mesh.
+            let world = &self.session.host.world;
+            let scale = if world.player_actor_slot.map(usize::from) == Some(slot) {
+                world.player_render_scale()
+            } else {
+                1.0
+            };
+            Mat4::from_translation(pos)
+                * Mat4::from_rotation_y(yaw)
+                * Mat4::from_scale(Vec3::splat(scale))
+        }
+    }
+}
+
+#[cfg(test)]
+mod debug_orbit_tests {
+    use super::debug_orbit as d;
+
+    /// The debug orbit's three input rates and two clamps are the browser
+    /// play page's, so the same gesture moves the same camera by the same
+    /// amount on either host.
+    ///
+    /// The yaw rate is the one that matters beyond framing: it writes
+    /// `Camera::manual_orbit`, which the retail follow camera and the
+    /// movement compass both read, so a host-local rate is a host-local
+    /// *control* feel on a field the simulation consumes. It was `0.008`
+    /// here against the page's `0.006`.
+    ///
+    /// These are JS literals on the other side, so no paired-constant gate
+    /// can bind them; this test is the pairing, and its numbers are quoted
+    /// from `site/js/play-app.js`'s `pointermove` / `wheel` handlers.
+    #[test]
+    fn the_input_vocabulary_matches_the_play_pages() {
+        assert_eq!(d::YAW_RAD_PER_PX, 0.006);
+        assert_eq!(d::PITCH_RAD_PER_PX, 0.004);
+        assert_eq!((d::PITCH_MIN, d::PITCH_MAX), (0.12, 1.35));
+        assert_eq!((d::ZOOM_OUT, d::ZOOM_IN), (1.12, 0.89));
+        assert_eq!((d::HALF_MIN, d::HALF_MAX), (220.0, 6000.0));
+    }
+
+    /// The untouched vantage is unchanged: the default pitch is the angle the
+    /// window's long-standing `0.85` eye-height ratio encoded, so adding a
+    /// steerable pitch does not silently re-frame every existing capture.
+    #[test]
+    fn the_default_pitch_is_the_old_eye_height() {
+        let pitch = 0.85f32.atan();
+        assert!(
+            (pitch.tan() - 0.85).abs() < 1e-5,
+            "the stored angle round-trips to the ratio orbit_camera_mvp takes"
+        );
+        assert!(pitch > d::PITCH_MIN && pitch < d::PITCH_MAX);
+    }
+}
+
+#[cfg(test)]
+mod battle_entry_yaw_tests {
+    use legaia_engine_battle_vm::battle_cam_script::BATTLE_ENTRY_YAW_SAMPLE;
+    use legaia_engine_core::battle_cam_inputs::battle_cam_inputs;
+
+    fn world_at(azimuth: u16) -> legaia_engine_core::world::World {
+        let mut w = legaia_engine_core::world::World::new();
+        w.locomotion.camera_azimuth = azimuth;
+        w
+    }
+
+    /// **The host applies the shared guard**, not just "the guard is right":
+    /// the kernel's own cases live in `legaia_engine_battle_vm::battle_cam_script`,
+    /// and what this pins is that the window's `BattleCamInputs` carries its
+    /// result rather than the raw compass word. The browser play page's twin
+    /// of this test is in `crates/web-play/src/play_battle_render.rs`.
+    ///
+    /// Every azimuth on (or beside) the seat axis is replaced - `0` and `2048`
+    /// are the two that put the eye straight down it, and the port's fixed
+    /// follow camera parks at `0`.
+    #[test]
+    fn an_on_axis_entry_azimuth_is_replaced() {
+        for az in [0u16, 8, 160, 191, 2048, 2100, 4090] {
+            assert_eq!(
+                battle_cam_inputs(&world_at(az)).entry_yaw,
+                BATTLE_ENTRY_YAW_SAMPLE,
+                "azimuth {az} frames both rows at the same screen X"
+            );
+        }
+    }
+
+    /// A real orbit sample is passed through untouched. These five are the
+    /// captured retail battle yaws.
+    #[test]
+    fn a_real_orbit_azimuth_survives() {
+        for az in [224u16, 2632, 3136, 3808, 3882] {
+            assert_eq!(battle_cam_inputs(&world_at(az)).entry_yaw, f32::from(az));
+        }
+    }
+}
+
+#[cfg(test)]
+mod follow_compass_tests {
+    use super::*;
+    // The follow camera's fixed base yaw (PSX 12-bit units, savestate-pinned
+    // `_DAT_8007B792 = -160` on the town01 anchor). One constant, in the
+    // shared camera resolver, because the browser play page frames the same
+    // shot from it; the movement-compass bias is its negation
+    // (`camera_frame::retail_field_render_yaw_bias`).
+    use legaia_engine_field::camera_frame::FIELD_FOLLOW_YAW_UNITS;
+    use std::f32::consts::TAU;
+
+    /// The movement compass must agree with the rendered follow camera at
+    /// ANY manual orbit: walking the compass-forward direction
+    /// (`alpha = base_bias + manual_orbit`, forward = `(sin a, 0, cos a)`)
+    /// must move the player UP the screen (away from the camera), and the
+    /// compass-right direction must move screen-right. This is the
+    /// engine-shell ground-truth check for `Camera::compass_azimuth_units`'s
+    /// sign convention against `psx_camera_mvp` (the same job
+    /// `world_map_camera_remap.rs` does for the overworld remap).
+    #[test]
+    fn compass_forward_walks_up_screen_for_any_manual_orbit() {
+        const PITCH_UNITS: f32 = 450.0;
+        let to_rad = |units: f32| units / 4096.0 * TAU;
+        for manual_orbit in [0.0f32, 0.4, 1.2, 2.5, -0.7, 3.9] {
+            // The exact composition the follow arm of `compute_scene_camera` builds
+            // (with the caller's FIELD_WORLD_FLIP post-multiply).
+            let yaw = to_rad(FIELD_FOLLOW_YAW_UNITS) - manual_orbit;
+            let target = Vec3::new(500.0, 0.0, 800.0);
+            let mvp = PlayWindowApp::psx_camera_mvp(
+                to_rad(PITCH_UNITS),
+                yaw,
+                0.0,
+                512.0,
+                Vec3::new(0.0, 0.0, 1200.0),
+                target,
+                4.0 / 3.0,
+            ) * FIELD_WORLD_FLIP;
+            // Compass azimuth = render bias + manual orbit (what
+            // NativeSession feeds World::field_camera_azimuth).
+            let alpha = -to_rad(FIELD_FOLLOW_YAW_UNITS) + manual_orbit;
+            let forward = Vec3::new(alpha.sin(), 0.0, alpha.cos());
+            let right = Vec3::new(alpha.cos(), 0.0, -alpha.sin());
+            let project = |p: Vec3| {
+                let c = mvp * p.extend(1.0);
+                (c.x / c.w, c.y / c.w)
+            };
+            let (x0, y0) = project(target);
+            let (xf, yf) = project(target + forward * 100.0);
+            let (xr, yr) = project(target + right * 100.0);
+            // NDC +y is up: forward must increase y and stay ~centred in x.
+            assert!(
+                yf > y0 + 1e-4,
+                "orbit {manual_orbit}: forward walks up-screen (dy={})",
+                yf - y0
+            );
+            assert!(
+                (xf - x0).abs() < 0.35 * (yf - y0).abs().max(1e-3),
+                "orbit {manual_orbit}: forward stays near-vertical (dx={} dy={})",
+                xf - x0,
+                yf - y0
+            );
+            // Right must increase x and stay ~level in y.
+            assert!(
+                xr > x0 + 1e-4,
+                "orbit {manual_orbit}: right walks screen-right (dx={})",
+                xr - x0
+            );
+            let _ = yr;
+        }
+    }
+}
+
+#[cfg(test)]
+mod battle_cam_shared_tests {
+    use super::*;
+    use legaia_engine_battle_vm::battle_cam_script as script;
+    use legaia_engine_camera::projection;
+    use legaia_engine_core::battle_cam_inputs::battle_cam_inputs;
+    use legaia_engine_core::world::World;
+    use legaia_engine_mode::mode::SceneMode;
+
+    /// The shared projection's far plane must stay paired with the native
+    /// renderer's `SCENE_FAR` (the script crate cannot take the wgpu link,
+    /// so the constant is duplicated there by design - this is the pin).
+    #[test]
+    fn scene_far_paired_with_renderer() {
+        assert_eq!(
+            projection::SCENE_FAR,
+            legaia_engine_render::window::SCENE_FAR
+        );
+    }
+
+    /// The shared `battle_vp` must reproduce the native glam composition
+    /// (`battle_dome_camera_mvp` = `psx_camera_mvp(pitch, yaw, 0, H=256,
+    /// tr, focus * BATTLE_WORLD_SCALE)`) element-for-element: the browser
+    /// projects through `battle_vp`, the native window through glam, and
+    /// this is what keeps them the same camera.
+    #[test]
+    fn battle_vp_matches_the_native_glam_composition() {
+        let to_rad = |units: f32| units / 4096.0 * std::f32::consts::TAU;
+        let poses = [
+            script::BOOT_POSE,
+            projection::BattleCamPose {
+                pitch: 32.0,
+                yaw: 224.0,
+                tr: [0.0, 1280.0, 7680.0],
+                focus: [100.0, 0.0, -50.0],
+            },
+            projection::BattleCamPose {
+                pitch: 32.0,
+                yaw: 2288.0,
+                tr: [-512.0, 1152.0, 2457.0],
+                focus: [0.0, 0.0, -800.0],
+            },
+            projection::BattleCamPose {
+                pitch: 256.0,
+                yaw: 4064.0,
+                tr: [0.0, 1536.0, 3276.0],
+                focus: [-700.0, 0.0, -900.0],
+            },
+        ];
+        for aspect in [4.0f32 / 3.0, 16.0 / 9.0, 1.0] {
+            for p in &poses {
+                let native = PlayWindowApp::psx_camera_mvp(
+                    to_rad(p.pitch),
+                    to_rad(p.yaw),
+                    0.0,
+                    256.0,
+                    Vec3::from(p.tr),
+                    Vec3::from(p.focus) * BATTLE_WORLD_SCALE,
+                    aspect,
+                )
+                .to_cols_array();
+                let shared = projection::battle_vp(p, BATTLE_WORLD_SCALE, aspect);
+                for (i, (a, b)) in shared.iter().zip(native.iter()).enumerate() {
+                    assert!(
+                        (a - b).abs() <= 1e-3 * b.abs().max(1.0),
+                        "pose {p:?} aspect {aspect} elem {i}: shared {a} vs native {b}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The weapon trail rides the body, on both hosts.** A sweep control
+    /// point is an object position in the body's mesh frame; retail turns it
+    /// by the body's yaw and sets it on the slot's ground base
+    /// (`FUN_800485BC`), and the shared kernel places and projects it
+    /// (`battle_trail::project_battle_point`) through the battle VP both
+    /// hosts hand it - the native composition here, `battle_vp` on the page,
+    /// pinned equal above. Where the body's own draw (`battle_body_model`
+    /// under `cam * scale`) puts the same mesh-frame point is where the
+    /// trail must land. The two hosts' old per-host projections each missed
+    /// it: the native one dropped the world scale and the body's turn, the
+    /// page's the frame flip, so its bands hung under the floor.
+    #[test]
+    fn the_weapon_trail_lands_on_the_body_it_trails() {
+        use legaia_render_kernels::battle_trail as bt;
+        let to_rad = |units: f32| units / 4096.0 * std::f32::consts::TAU;
+        let pose = projection::BattleCamPose {
+            pitch: 32.0,
+            yaw: 2288.0,
+            tr: [-512.0, 1152.0, 2457.0],
+            focus: [0.0, 0.0, -800.0],
+        };
+        let cam = PlayWindowApp::psx_camera_mvp(
+            to_rad(pose.pitch),
+            to_rad(pose.yaw),
+            0.0,
+            256.0,
+            Vec3::from(pose.tr),
+            Vec3::from(pose.focus) * BATTLE_WORLD_SCALE,
+            4.0 / 3.0,
+        );
+        let page_vp = projection::battle_vp(&pose, BATTLE_WORLD_SCALE, 4.0 / 3.0);
+        let actor_cam = cam * Mat4::from_scale(Vec3::splat(BATTLE_WORLD_SCALE));
+        for (ground, facing) in [
+            ([0i16, -800i16], 0u16),
+            ([350, -775], 0x300),
+            ([-600, -900], 0xA40),
+        ] {
+            let body = PlayWindowApp::battle_body_model(
+                Vec3::new(f32::from(ground[0]), 0.0, f32::from(ground[1])),
+                facing,
+            );
+            for local in [[0i16, -420, 60], [35, -610, 180], [-20, -300, -90]] {
+                let clip = actor_cam
+                    * body
+                    * glam::Vec4::new(
+                        f32::from(local[0]),
+                        f32::from(local[1]),
+                        f32::from(local[2]),
+                        1.0,
+                    );
+                let want = (
+                    (clip.x / clip.w * 0.5 + 0.5) * 320.0,
+                    (0.5 - clip.y / clip.w * 0.5) * 240.0,
+                );
+                let p = bt::trail_world_point(ground, facing, local);
+                for vp in [cam.to_cols_array(), page_vp] {
+                    let got = bt::project_battle_point(&vp, BATTLE_WORLD_SCALE, p).unwrap();
+                    assert!(
+                        (f32::from(got.0) - want.0).abs() <= 1.5
+                            && (f32::from(got.1) - want.1).abs() <= 1.5,
+                        "ground {ground:?} facing {facing:#x} local {local:?}: trail {got:?} vs body {want:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **Cross-host single-model pin, native half.** One battle world state
+    /// (solo Vahn at the tutorial seat, command menu open, one bound
+    /// monster) driven through THIS host's derivation + the shared drive
+    /// must land on the literal measured close-up. The browser host's
+    /// mirror test (`web_pose_matches_the_native_recipe` in
+    /// `web-play::play_battle_render`) runs the identical world recipe to
+    /// the identical literals, so the two hosts' poses are equal to each
+    /// other by transitivity.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn native_pose_matches_the_shared_recipe() {
+        let mut world = World::default();
+        world.mode = SceneMode::Battle;
+        world.party.party_count = 1;
+        let mut vahn = legaia_engine_core::world::Actor::default();
+        vahn.active = true;
+        vahn.move_state.world_x = 0;
+        vahn.move_state.world_y = 0;
+        vahn.move_state.world_z = -800;
+        vahn.move_state.render_26 = 0;
+        let mut tetsu = legaia_engine_core::world::Actor::default();
+        tetsu.active = true;
+        tetsu.move_state.world_z = 800;
+        tetsu.battle_monster_id = Some(1);
+        tetsu.tmd_binding = Some(0);
+        world.actors = vec![vahn, tetsu];
+        world.battle.command =
+            Some(legaia_engine_battle_menus::battle_input::BattleCommandSession::new(0, 0));
+        // The **arts input** picker is what arms retail's case-0 close-up;
+        // the command chooser alone keeps the far framing (see
+        // `script::phase_for_state`).
+        world.battle.arts_menu = Some(legaia_engine_battle::battle_arts::BattleArtsSession::new(
+            0,
+            0,
+            Vec::new(),
+        ));
+
+        let inputs = battle_cam_inputs(&world);
+        assert_eq!(inputs.phase, script::BattleCamPhase::Submenu);
+        assert_eq!(
+            inputs.acting,
+            Some(script::BattleCamActor {
+                facing: 0,
+                world: [0.0, 0.0, -800.0],
+                height: None,
+            })
+        );
+        assert_eq!(
+            inputs.formation,
+            Some(script::FormationBox {
+                min: [0.0, -800.0],
+                max: [0.0, 800.0],
+            })
+        );
+        let mut slot = None;
+        for f in 0..=6u64 {
+            script::drive(&mut slot, true, inputs, f * 2, None);
+        }
+        let pose = slot.as_ref().unwrap().pose();
+        // The measured solo-Vahn submenu close-up, arrived after the 6-step
+        // glide - the SAME literals the web mirror test asserts.
+        assert_eq!(pose.pitch, 32.0);
+        assert_eq!(pose.yaw.rem_euclid(4096.0), 2288.0);
+        assert_eq!(pose.tr, [-512.0, 1152.0, 2457.0]);
+        assert_eq!(pose.focus, [0.0, 0.0, -800.0]);
+    }
+
+    /// **The camera reads the BATTLE heading, not the field heading.**
+    /// Retail's framing arms subtract `actor[+0x46]`, which the action SM
+    /// writes as `(bearing(target -> attacker) + 0x800) & 0xFFF`
+    /// (`FUN_801E295C` case `0x14`, `0x801E32EC..0x801E3318`); the port keeps
+    /// it in `Actor::battle.facing_angle`. `move_state.render_26` is the
+    /// *field* locomotion heading, which no battle path writes.
+    ///
+    /// The two are equal at `0` for the canonical seats, so the old wiring
+    /// was invisible on the pinned recipe. This seats the actor **off-axis**
+    /// with the two headings deliberately different, so reading the wrong one
+    /// lands on a different yaw. The browser mirror
+    /// (`web-play::play_battle_render`) asserts the same literals.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn the_camera_reads_the_battle_heading_not_the_field_heading() {
+        // Field heading and battle heading, deliberately different.
+        const FIELD_26: u16 = 0x333;
+        const BATTLE_46: u16 = 0x600;
+
+        let mut world = World::default();
+        world.mode = SceneMode::Battle;
+        world.party.party_count = 1;
+        let mut vahn = legaia_engine_core::world::Actor::default();
+        vahn.active = true;
+        // An off-axis seat: neither on the arena centre line nor square to it.
+        vahn.move_state.world_x = 600;
+        vahn.move_state.world_z = -775;
+        vahn.move_state.render_26 = FIELD_26 as i16;
+        vahn.battle.facing_angle = BATTLE_46;
+        let mut tetsu = legaia_engine_core::world::Actor::default();
+        tetsu.active = true;
+        tetsu.move_state.world_x = -400;
+        tetsu.move_state.world_z = 900;
+        tetsu.battle_monster_id = Some(1);
+        tetsu.tmd_binding = Some(0);
+        world.actors = vec![vahn, tetsu];
+        world.battle.command =
+            Some(legaia_engine_battle_menus::battle_input::BattleCommandSession::new(0, 0));
+        // The **arts input** picker is what arms retail's case-0 close-up;
+        // the command chooser alone keeps the far framing (see
+        // `script::phase_for_state`).
+        world.battle.arts_menu = Some(legaia_engine_battle::battle_arts::BattleArtsSession::new(
+            0,
+            0,
+            Vec::new(),
+        ));
+
+        let inputs = battle_cam_inputs(&world);
+        assert_eq!(inputs.phase, script::BattleCamPhase::Submenu);
+        let acting = inputs.acting.expect("acting actor");
+        assert_eq!(
+            acting.facing,
+            i32::from(BATTLE_46),
+            "the battle heading actor[+0x46] is what the framing subtracts"
+        );
+        assert_ne!(
+            acting.facing,
+            i32::from(FIELD_26),
+            "the field heading +0x26 must not reach the battle camera"
+        );
+
+        let mut slot = None;
+        for f in 0..=6u64 {
+            script::drive(&mut slot, true, inputs, f * 2, None);
+        }
+        let yaw = slot.as_ref().unwrap().pose().yaw.rem_euclid(4096.0);
+        // `0x8F0 - actor[+0x46]` (the submenu close-up's yaw base).
+        assert_eq!(yaw, 752.0, "0x8F0 - 0x600");
+        // What the field-heading wiring would have produced - the divergence
+        // this test exists to catch.
+        assert_ne!(yaw, 1469.0, "0x8F0 - 0x333 (the field heading)");
+    }
+
+    /// **The formation box is a WORLD fact, not a render fact.** Retail's
+    /// case-9 walk gates on the live-HP halfword `actor[+0x14c]`
+    /// (`0x801D7000`) and consults no mesh, so the engine's presence
+    /// predicate is `battle_monster_id` (this slot is a combatant), not
+    /// `tmd_binding` (this host bound a mesh). The native host used to key on
+    /// the binding while the browser keyed on the monster id; they agreed
+    /// only because the recipes bind every monster and seat scene actors at
+    /// the origin.
+    ///
+    /// This is the case where the two predicates disagree: a live combatant
+    /// seated off the origin whose mesh has NOT been bound yet. The browser
+    /// mirror asserts the same literals.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn the_formation_box_is_a_world_fact_not_a_render_fact() {
+        let mut world = World::default();
+        world.mode = SceneMode::Battle;
+        world.party.party_count = 1;
+        let mut vahn = legaia_engine_core::world::Actor::default();
+        vahn.active = true;
+        vahn.move_state.world_z = -800;
+        let mut tetsu = legaia_engine_core::world::Actor::default();
+        tetsu.active = true;
+        tetsu.move_state.world_x = 600;
+        tetsu.move_state.world_z = 900;
+        // A live combatant the world knows about, whose mesh this host has
+        // not bound (asset still loading / headless sim / browser lag).
+        tetsu.battle_monster_id = Some(1);
+        tetsu.tmd_binding = None;
+        world.actors = vec![vahn, tetsu];
+
+        let formation = legaia_engine_core::battle_cam_inputs::battle_formation_box(&world);
+        assert_eq!(
+            formation,
+            Some(script::FormationBox {
+                min: [0.0, -800.0],
+                max: [600.0, 900.0],
+            }),
+            "the unbound-but-live monster is inside the framing box"
+        );
+        // The render-fact predicate would have dropped it, collapsing the box
+        // onto the lone party seat.
+        assert_ne!(
+            formation,
+            Some(script::FormationBox {
+                min: [0.0, -800.0],
+                max: [0.0, -800.0],
+            })
+        );
+        // And the far framing that box sizes differs, so this is not merely a
+        // bookkeeping difference.
+        let framed = script::menu_framing(formation, 0.0);
+        let dropped = script::menu_framing(
+            Some(script::FormationBox {
+                min: [0.0, -800.0],
+                max: [0.0, -800.0],
+            }),
+            0.0,
+        );
+        assert_ne!(framed.focus, dropped.focus, "the framing itself diverges");
+    }
+
+    /// Closing the command menu and letting the action SM run must move the
+    /// camera onto the acting actor - the whole point of the Action phase.
+    /// Driven through THIS host's derivation, so a phase that the shared
+    /// script supports but the host never selects would fail here.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn host_derivation_selects_the_action_phase_and_frames_the_actor() {
+        let mut world = World::default();
+        world.mode = SceneMode::Battle;
+        world.party.party_count = 1;
+        let mut vahn = legaia_engine_core::world::Actor::default();
+        vahn.active = true;
+        vahn.move_state.world_z = -800;
+        let mut tetsu = legaia_engine_core::world::Actor::default();
+        tetsu.active = true;
+        tetsu.move_state.world_z = 800;
+        tetsu.battle_monster_id = Some(1);
+        tetsu.tmd_binding = Some(0);
+        world.actors = vec![vahn, tetsu];
+
+        // Idle between actions: the far framing, not the action framing.
+        world.battle_ctx.action_state =
+            legaia_engine_battle_vm::battle_action::ActionState::Begin.as_byte();
+        assert_eq!(
+            battle_cam_inputs(&world).phase,
+            script::BattleCamPhase::Menu
+        );
+
+        // The strike is executing on party slot 0.
+        world.battle_ctx.action_state =
+            legaia_engine_battle_vm::battle_action::ActionState::AttackStrike.as_byte();
+        world.battle_ctx.active_actor = 0;
+        let inputs = battle_cam_inputs(&world);
+        assert_eq!(inputs.phase, script::BattleCamPhase::Action);
+        assert!(inputs.action.party_slot, "slot 0 is a party seat");
+        assert_eq!(inputs.action.char_id, 1, "DAT_8007BD10[0]");
+
+        // The re-armed tween eases out (each pass closes a share of the
+        // remaining gap), so drive past the settle before reading the pose.
+        let mut slot = None;
+        for f in 0..=120u64 {
+            script::drive(&mut slot, true, inputs, f * 2, None);
+        }
+        let pose = slot.as_ref().unwrap().pose();
+        let want = script::action_framing(inputs.acting.unwrap(), inputs.action);
+        assert_eq!(pose.tr, want.tr);
+        assert_eq!(pose.focus, [0.0, 0.0, -800.0], "framed on the attacker");
+        // Closer than the far framing this battle idles at.
+        let idle = script::menu_framing(inputs.formation, 0.0);
+        assert!(pose.tr[2] < idle.tr[2], "{:?} vs {:?}", pose.tr, idle.tr);
+
+        // A monster's turn frames on the computed size-class depth instead.
+        world.battle_ctx.active_actor = 1;
+        world.battle.camera_frame_height =
+            legaia_engine_battle_vm::battle_formulas::CAMERA_HEIGHT_MAX;
+        let mob = battle_cam_inputs(&world);
+        assert!(!mob.action.party_slot);
+        assert_eq!(
+            mob.action.depth_raw,
+            legaia_engine_battle_vm::battle_formulas::CAMERA_HEIGHT_MAX as i32,
+            "the fallback arm reads ctx[+0x6D0]"
+        );
+        assert_eq!(mob.action.raw_z(), mob.action.depth_raw);
+    }
+
+    /// The field VM's shake opcode reaches the camera through this host.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn host_derivation_carries_the_field_vm_shake_amplitude() {
+        let mut world = World::default();
+        world.mode = SceneMode::Battle;
+        world.party.party_count = 1;
+        let mut vahn = legaia_engine_core::world::Actor::default();
+        vahn.active = true;
+        world.actors = vec![vahn];
+        assert_eq!(battle_cam_inputs(&world).shake_amplitude, 0);
+        world.camera.shake_amplitude = 9;
+        let inputs = battle_cam_inputs(&world);
+        assert_eq!(inputs.shake_amplitude, 9);
+        let mut slot = None;
+        for f in 0..4u64 {
+            script::drive(&mut slot, true, inputs, f * 2, None);
+        }
+        let cam = slot.as_ref().unwrap();
+        assert_ne!(cam.shake_offset(), [0, 0], "the jitter is live");
+        assert_ne!(cam.pose().tr, cam.framing_pose().tr);
+    }
+
+    /// **One world, one scale.** The ground cell an actor stands on must
+    /// project to the same pixel as the actor's own feet, at every framing -
+    /// which is only true if the stage class ([`PlayWindowApp::
+    /// battle_stage_model`], used by the arena and grid draws) and the actor
+    /// class (`cam * scale(BATTLE_WORLD_SCALE)`) ride the same scale.
+    ///
+    /// This is the regression. The stage used to draw at raw 1x while the
+    /// actors rode 4x, so every actor was drawn `3 * seat` away from its own
+    /// ground, and the phase camera - whose translation trio is authored in
+    /// the *scaled* stage space - orbited the raw arena at four times the
+    /// intended radius and swung through its shell. The far framing on a
+    /// centred formation hid it (focus at the origin, so the two classes
+    /// coincide), which is exactly the one configuration the pose tests and
+    /// the pinned `retail_battle_mvp` oracle sample; a close framing, whose
+    /// focus is the acting actor, did not.
+    #[test]
+    fn the_ground_under_an_actor_projects_under_the_actor() {
+        let actor_scale = Mat4::from_scale(Vec3::splat(BATTLE_WORLD_SCALE));
+        let flip = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0));
+        // Every framing the script rests in, including the close-ups whose
+        // focus is off the origin - the case the old split broke.
+        let poses = [
+            script::BOOT_POSE,
+            script::menu_framing(
+                Some(script::FormationBox {
+                    min: [-600.0, -825.0],
+                    max: [600.0, 1400.0],
+                }),
+                1900.0,
+            ),
+            script::BattleCamActor {
+                facing: 0,
+                world: [0.0, 0.0, -800.0],
+                height: None,
+            }
+            .submenu_pose(),
+            script::action_framing(
+                script::BattleCamActor {
+                    facing: 0,
+                    world: [600.0, 0.0, -775.0],
+                    height: None,
+                },
+                script::ActionFraming::default(),
+            ),
+        ];
+        let to_rad = |units: f32| units / 4096.0 * std::f32::consts::TAU;
+        for pose in poses {
+            let cam = PlayWindowApp::psx_camera_mvp(
+                to_rad(pose.pitch),
+                to_rad(pose.yaw),
+                0.0,
+                projection::GTE_H,
+                Vec3::from(pose.tr),
+                Vec3::from(pose.focus) * BATTLE_WORLD_SCALE,
+                4.0 / 3.0,
+            );
+            // Retail seats, plus the stage origin the arena is authored on.
+            for seat in [
+                Vec3::new(0.0, 0.0, -825.0),
+                Vec3::new(600.0, 0.0, -775.0),
+                Vec3::new(0.0, 0.0, 800.0),
+                Vec3::ZERO,
+            ] {
+                // Actor class: `cam * scale(S)` over a model carrying the flip.
+                let a = cam * actor_scale * flip * seat.extend(1.0);
+                // Stage class: the shared stage model (scale + flip).
+                let s = cam * PlayWindowApp::battle_stage_model() * seat.extend(1.0);
+                assert!(
+                    a.w.signum() == s.w.signum(),
+                    "seat {seat:?} at pose {pose:?}: the actor and its ground \
+                     cell fall on opposite sides of the eye ({} vs {})",
+                    a.w,
+                    s.w
+                );
+                if a.w <= 1.0 {
+                    continue;
+                }
+                let (ax, ay) = (a.x / a.w, a.y / a.w);
+                let (sx, sy) = (s.x / s.w, s.y / s.w);
+                assert!(
+                    (ax - sx).abs() < 1e-4 && (ay - sy).abs() < 1e-4,
+                    "seat {seat:?} at pose {pose:?}: actor at ({ax},{ay}) but \
+                     its ground cell at ({sx},{sy})"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cutscene_framing_tests {
+    use super::*;
+    use std::f32::consts::TAU;
+
+    /// Project a raw retail (Y-down) world point through the full cutscene
+    /// camera composition (`psx_camera_mvp(..) * FIELD_WORLD_FLIP`, exactly as
+    /// `compute_scene_camera`'s cutscene branch builds it) to 320x240 screen
+    /// pixels (PSX frame; wgpu NDC, framebuffer origin top-left).
+    fn project_cutscene(v: Vec3, tr_eye: Vec3, focus: Vec3) -> (f32, f32) {
+        // Intro-beat globals, pinned live from the `new_game_cutscene_intro_a`
+        // save state (`0x8007B790`/`0x8007B6F4`/`0x800840B8`/`0x80089118`).
+        let pitch = 180.0 / 4096.0 * TAU;
+        let yaw = -2967.0 / 4096.0 * TAU;
+        let h = 792.0;
+        // The captured intro beat's roll global reads `0`.
+        let mvp = PlayWindowApp::psx_camera_mvp(pitch, yaw, 0.0, h, tr_eye, focus, 4.0 / 3.0)
+            * FIELD_WORLD_FLIP;
+        let clip = mvp * v.extend(1.0);
+        let ndc = clip.truncate() / clip.w;
+        let px = (ndc.x * 0.5 + 0.5) * 320.0;
+        let py = (0.5 - ndc.y * 0.5) * 240.0;
+        (px, py)
+    }
+
+    /// The shell composes the camera rotation in `glam`; retail composes it
+    /// through the GTE. This pins the two to the same product, roll included,
+    /// so a sign or ordering slip in the third factor cannot pass unnoticed:
+    /// `psx_camera_mvp`'s `R` must equal
+    /// [`legaia_render_kernels::gte::camera_view_rotation`] with no skip bit,
+    /// which is the full `Rx * Ry * Rz` product (pitch outermost) retail's
+    /// camera matrix also is.
+    #[test]
+    fn the_shell_rotation_matches_the_ported_gte_composition_including_roll() {
+        use legaia_render_kernels::gte::camera_view_rotation;
+        // `juui2`'s beat: pitch -643, yaw -1480, roll -660 (12-bit units).
+        let to_rad = |u: f32| u / 4096.0 * TAU;
+        let (pitch, yaw, roll) = (to_rad(-643.0), to_rad(-1480.0), to_rad(-660.0));
+        let want = camera_view_rotation(0, pitch, yaw, roll).expect("no saved-matrix flag");
+        let got =
+            Mat4::from_rotation_x(pitch) * Mat4::from_rotation_y(yaw) * Mat4::from_rotation_z(roll);
+        // `camera_view_rotation` is row-major q3.12; `glam` is column-major
+        // f32. Compare element by element through both conventions.
+        for r in 0..3 {
+            for c in 0..3 {
+                let a = f32::from(want.m[r][c]) / 4096.0;
+                let b = got.col(c)[r];
+                assert!(
+                    (a - b).abs() < 2e-3,
+                    "R[{r}][{c}]: gte {a} vs glam {b}\nwant {:?}",
+                    want.m
+                );
+            }
+        }
+        // Dropping the third factor is visibly different, which is what makes
+        // this a test of the roll rather than of the pitch/yaw pair.
+        let without = Mat4::from_rotation_x(pitch) * Mat4::from_rotation_y(yaw);
+        assert_ne!(got.to_cols_array(), without.to_cols_array());
+    }
+
+    /// The retail intro shot ("It was the Seru.") frames the party low and
+    /// left of centre in the PSX frame. The camera's focus tracks the party
+    /// anchor, so the focus point itself must land there - regardless of the
+    /// 6x world scale (the perspective divide cancels it) - which is exactly
+    /// what pins the eye-back depth. This guards against the old heuristic
+    /// that framed the shot too close.
+    ///
+    /// The two axes are not equally sharp, and it matters which is which. `X`
+    /// is exact: `OFX + h * tr.x / tr.z` = `172.0` on the nose, so a wrong
+    /// eye-back depth moves it immediately. `Y` is `OFY + h * tr.y / tr.z`
+    /// with the retail screen centre `OFY = 114` (see
+    /// `legaia_engine_camera::projection::GTE_OFY`), giving `173.7`. The
+    /// framebuffer read this expectation was first taken from said "~180",
+    /// which is what a soft eyeball of a *cluster* of small actors gives
+    /// against a projection of the single ground anchor they stand around -
+    /// and holding `180` here is what kept the naive `240 / 2` centre alive in
+    /// `psx_camera_mvp`. The sharp constraint on the centre is the GTE control
+    /// file plus the battle framebuffer, where a party member's soles land on
+    /// the row `OFY = 114` predicts and six rows above the one `120` does.
+    #[test]
+    fn intro_focus_projects_to_retail_party_position() {
+        // Eye-space translation trio `0x800840B8 = (260, 1293, 17145)`, reduced
+        // into the engine's native-1x frame by the 6x world scale.
+        let tr_eye = Vec3::new(260.0, 1293.0, 17145.0) / 6.0;
+        let focus = Vec3::new(8640.0, 0.0, 10304.0);
+        let (px, py) = project_cutscene(focus, tr_eye, focus);
+        assert!(
+            (px - 172.0).abs() < 3.0,
+            "focus X projects to retail ~172, got {px}"
+        );
+        let want_y = legaia_engine_camera::projection::GTE_OFY + 792.0 * (1293.0 / 17145.0);
+        assert!(
+            (py - want_y).abs() < 3.0,
+            "focus Y projects to OFY + h*tr.y/tr.z = {want_y} (lower-centre), got {py}"
+        );
+    }
+
+    /// A ~133-unit-tall field character standing at the focus (retail-Y-down,
+    /// up = negative Y) subtends the retail ~1/6-frame height and renders
+    /// upright (head above feet). Confirms the world scale + orientation, not
+    /// just the focus position.
+    #[test]
+    fn intro_character_subtends_retail_height_upright() {
+        let tr_eye = Vec3::new(260.0, 1293.0, 17145.0) / 6.0;
+        let focus = Vec3::new(8640.0, 0.0, 10304.0);
+        let (_, feet_y) = project_cutscene(focus, tr_eye, focus);
+        // Head is 133 units UP = negative Y in the retail convention.
+        let head = focus + Vec3::new(0.0, -133.0, 0.0);
+        let (_, head_y) = project_cutscene(head, tr_eye, focus);
+        let height_px = feet_y - head_y;
+        assert!(
+            head_y < feet_y,
+            "head renders above feet (upright): head {head_y} < feet {feet_y}"
+        );
+        assert!(
+            (20.0..48.0).contains(&height_px),
+            "character subtends ~retail height (~37 px of 240), got {height_px}"
+        );
+    }
+}

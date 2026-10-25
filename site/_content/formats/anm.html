@@ -1,0 +1,336 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">formats</a> &middot; anm animation container</div>
+  <h1>ANM animation container <span class="tag tag-done">Confirmed</span></h1>
+  <p class="lede">Every time Vahn walks across Rim Elm, a villager shifts on their feet, or a house door swings
+  open, the motion comes from an ANM clip: a list of per-bone positions and rotations, one set per frame, that
+  the field engine plays back over a <a href="tmd.html">TMD</a> mesh. It is the animation format of the
+  <strong>field</strong> - party, NPCs and props. Battle monsters and the party's battle poses use other formats
+  (<a href="monster-animation.html">monster animation</a>, <a href="battle-data-pack.html">battle data pack</a>).</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Where</dt><dd>Party clips: PROT extraction entry 0874, section 1. NPC / prop clips: the type-<code>0x05</code> section of every scene's first asset-table slot. Both LZS-compressed.</dd>
+    <dt>Marker</dt><dd>No magic word; every record header carries <code>marker_1 = 0x080C</code></dd>
+    <dt>Size / stride</dt><dd>Record = <code>16 + 8 &times; bones &times; frames</code> bytes; one 8-byte entry per (bone, frame)</dd>
+    <dt>Parser</dt><dd><code>crates/anm</code>, <code>legaia_actor_formats::player_anm</code>, <code>legaia_actor_formats::character_pack::field_locomotion_anm</code></dd>
+    <dt>Engine</dt><dd><code>engine-scene::field_env::PropAnim</code>, <code>engine-vm::anim_vm</code>, <code>engine-vm::actor_tick</code></dd>
+    <dt>Confidence</dt><dd>Confirmed - decode and playback traced in disassembly; decoded bundles byte-match the runtime copies in save states</dd>
+    <dt>Used by</dt><dd><a href="../subsystems/field-locomotion.html">field locomotion</a>, <a href="../subsystems/script-vm.html">field script VM</a>, <a href="../characters.html">characters</a> and <a href="../npcs.html">NPC</a> viewers</dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="layout">
+  <h2>Container and record layout</h2>
+  <p>A container is an offset table followed by records. Each record is an 8-byte header, the frames, then 8 zero bytes of padding. Frames are stored frame-major: all of frame 0's bones, then frame 1's, and so on.</p>
+  <div class="byte-map" role="img" aria-label="ANM container: u32 record count, a table of u32 byte offsets, then the records">
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+0x00</span><span class="bm-name">count</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell bm-accent" style="--w:5"><span class="bm-off">+0x04</span><span class="bm-name">byte_offsets[count]</span><span class="bm-size">u32 &times; count</span></div>
+    <div class="bm-cell" style="--w:5"><span class="bm-off">offsets[0]</span><span class="bm-name">record 0</span><span class="bm-size">varies</span></div>
+    <div class="bm-cell" style="--w:5"><span class="bm-off">offsets[1]</span><span class="bm-name">record 1</span><span class="bm-size">varies</span></div>
+    <div class="bm-cell bm-dim" style="--w:2"><span class="bm-off">&hellip;</span><span class="bm-name">&hellip;</span><span class="bm-size"></span></div>
+  </div>
+  <p>One record - <code>16 + 8 &times; bones &times; frames</code> bytes:</p>
+  <div class="byte-map" role="img" aria-label="ANM record: bones byte, scale byte, frames u16, marker 0x080C, flag u16, then frames blocks of bones 8-byte entries, then 8 zero bytes">
+    <div class="bm-cell bm-accent" style="--w:1"><span class="bm-off">+0</span><span class="bm-name">bones</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell" style="--w:1"><span class="bm-off">+1</span><span class="bm-name">scale</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+2</span><span class="bm-name">frames</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell bm-dim" style="--w:2"><span class="bm-off">+4</span><span class="bm-name">0x080C</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell" style="--w:2"><span class="bm-off">+6</span><span class="bm-name">flag</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell bm-accent" style="--w:8"><span class="bm-off">+8</span><span class="bm-name">frame 0: bones &times; 8 B</span><span class="bm-size">entries</span></div>
+    <div class="bm-cell bm-accent" style="--w:6"><span class="bm-off"></span><span class="bm-name">frame 1 &hellip; frame n-1</span><span class="bm-size">entries</span></div>
+    <div class="bm-cell bm-pad" style="--w:3"><span class="bm-off">end-8</span><span class="bm-name">padding</span><span class="bm-size">8 zero bytes</span></div>
+  </div>
+  <figure class="diagram">
+    <svg viewBox="0 0 720 236" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="anm-fig-title">
+      <title id="anm-fig-title">An ANM record is a grid of 8-byte entries, one row per frame and one column per bone. Each entry holds a translation and a rotation, and bone i poses TMD object i directly.</title>
+      <defs><marker id="anm-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <text class="dg-edge-label" x="250" y="22" text-anchor="middle">one record: frames x bones entries of 8 bytes</text>
+      <text class="dg-sub" x="146" y="44">bone 0</text>
+      <text class="dg-sub" x="198" y="44">bone 1</text>
+      <text class="dg-sub" x="250" y="44">bone 2</text>
+      <text class="dg-sub" x="302" y="44">...</text>
+      <text class="dg-sub" x="354" y="44">last</text>
+      <text class="dg-sub" x="86" y="72">frame 0</text>
+      <rect class="dg-node" x="120" y="50" width="52" height="36"/>
+      <rect class="dg-node" x="172" y="50" width="52" height="36"/>
+      <rect class="dg-node" x="224" y="50" width="52" height="36"/>
+      <rect class="dg-node" x="276" y="50" width="52" height="36"/>
+      <rect class="dg-node" x="328" y="50" width="52" height="36"/>
+      <text class="dg-sub" x="86" y="108">frame 1</text>
+      <rect class="dg-node" x="120" y="86" width="52" height="36"/>
+      <rect class="dg-node" x="172" y="86" width="52" height="36"/>
+      <rect class="dg-node-accent" x="224" y="86" width="52" height="36"/>
+      <rect class="dg-node" x="276" y="86" width="52" height="36"/>
+      <rect class="dg-node" x="328" y="86" width="52" height="36"/>
+      <text class="dg-sub" x="86" y="144">frame 2</text>
+      <rect class="dg-node" x="120" y="122" width="52" height="36"/>
+      <rect class="dg-node" x="172" y="122" width="52" height="36"/>
+      <rect class="dg-node" x="224" y="122" width="52" height="36"/>
+      <rect class="dg-node" x="276" y="122" width="52" height="36"/>
+      <rect class="dg-node" x="328" y="122" width="52" height="36"/>
+      <text class="dg-sub" x="86" y="180">...</text>
+      <rect class="dg-node" x="120" y="158" width="52" height="36"/>
+      <rect class="dg-node" x="172" y="158" width="52" height="36"/>
+      <rect class="dg-node" x="224" y="158" width="52" height="36"/>
+      <rect class="dg-node" x="276" y="158" width="52" height="36"/>
+      <rect class="dg-node" x="328" y="158" width="52" height="36"/>
+      <path class="dg-edge-dim" d="M36 62 V180" marker-end="url(#anm-arrow)"/>
+      <text class="dg-edge-label" x="20" y="216">stored row by row: all of frame 0, then frame 1 ...</text>
+      <path class="dg-edge" d="M276 104 H398" marker-end="url(#anm-arrow)"/>
+      <rect class="dg-node-accent" x="400" y="76" width="188" height="56"/>
+      <text class="dg-label" x="494" y="100">translation</text>
+      <text class="dg-sub" x="494" y="118">bytes 0..4: 3 x 12-bit</text>
+      <rect class="dg-node" x="588" y="76" width="112" height="56"/>
+      <text class="dg-label" x="644" y="100">rotation</text>
+      <text class="dg-sub" x="644" y="118">bytes 5..7</text>
+      <text class="dg-edge-label" x="400" y="66">the 8-byte entry for (frame 1, bone 2)</text>
+      <path class="dg-edge" d="M550 132 V166" marker-end="url(#anm-arrow)"/>
+      <rect class="dg-node-ok" x="400" y="168" width="300" height="50" rx="5"/>
+      <text class="dg-label" x="550" y="189">TMD object 2 this frame</text>
+      <text class="dg-sub" x="550" y="207">every vertex: R * v + T, no parent bone</text>
+    </svg>
+    <figcaption>"Bone" here means one rigid mesh piece: column <em>i</em> moves TMD object <em>i</em> on its own, so there is no skeleton to walk. Playback steps down the rows and interpolates between neighbouring frames.</figcaption>
+  </figure>
+  <table class="layout">
+    <thead><tr><th>Offset</th><th>Size</th><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>+0x00</code></td><td>4</td><td><code>count</code></td><td>Number of records</td></tr>
+      <tr><td><code>+0x04</code></td><td>4 &times; count</td><td><code>byte_offsets[]</code></td><td>Absolute byte offset of each record; <code>offsets[i+1] - offsets[i]</code> = record size</td></tr>
+      <tr><td><code>offsets[i]</code></td><td>varies</td><td><code>records[]</code></td><td>Record bodies, layout below</td></tr>
+    </tbody>
+  </table>
+  <h3 id="record-header">Record header</h3>
+  <table class="layout">
+    <thead><tr><th>Offset</th><th>Size</th><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>+0x00</code></td><td>1</td><td><code>bones</code></td><td>Bone count = number of animated TMD objects; must equal the mesh's object count or the renderer skips the draw</td></tr>
+      <tr><td><code>+0x01</code></td><td>1</td><td><code>scale</code></td><td>Bit 0 set: per-tick step becomes <code>(rate*2 + div - 1) / div</code>. Clear for records 0..8 of every field bundle, set for records 9+ and every PROT 1203 record</td></tr>
+      <tr><td><code>+0x02</code></td><td>2</td><td><code>frames</code></td><td>Frame count (3..60 across the corpus)</td></tr>
+      <tr><td><code>+0x04</code></td><td>2</td><td><code>marker_1</code></td><td>Always <code>0x080C</code></td></tr>
+      <tr><td><code>+0x06</code></td><td>2</td><td><code>flag</code></td><td>Low byte = the scaled step's divisor (<code>2</code> / <code>4</code> in the field corpus)</td></tr>
+      <tr><td><code>+0x08</code></td><td>8 &times; bones &times; frames</td><td>frames</td><td>Frame-major 8-byte entries</td></tr>
+      <tr><td><code>end - 8</code></td><td>8</td><td>padding</td><td>Zero bytes</td></tr>
+    </tbody>
+  </table>
+  <p>The size equation holds byte-exact across every record of every scene bundle; the per-scene detector (<code>player_anm::find_in_entry</code>) validates it before declaring a bundle parsed.</p>
+</section>
+
+<section class="doc-section" id="bone-entry">
+  <h2>The 8-byte (bone, frame) entry</h2>
+  <p>One bone's translation and rotation for one frame. Translations are nibble-packed signed 12-bit joint offsets in actor-local space; rotations are one byte per axis, shifted left 4 to a 12-bit PSX angle (4096 = 360&deg;). Port: <code>player_anm::BoneTransform::decode</code>.</p>
+  <div class="byte-map" role="img" aria-label="Bone entry: T0 low byte, T1 low byte, the two high nibbles, T2 low byte, T2 high nibble in the low half of byte 4, then rotation X, Y, Z bytes">
+    <div class="bm-cell bm-accent"><span class="bm-off">+0</span><span class="bm-name">T0 lo</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell bm-accent"><span class="bm-off">+1</span><span class="bm-name">T1 lo</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell bm-accent"><span class="bm-off">+2</span><span class="bm-name">T1 hi | T0 hi</span><span class="bm-size">nibbles</span></div>
+    <div class="bm-cell bm-accent"><span class="bm-off">+3</span><span class="bm-name">T2 lo</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell bm-accent"><span class="bm-off">+4</span><span class="bm-name">&ndash; | T2 hi</span><span class="bm-size">low nibble</span></div>
+    <div class="bm-cell"><span class="bm-off">+5</span><span class="bm-name">rot X</span><span class="bm-size">u8&lt;&lt;4</span></div>
+    <div class="bm-cell"><span class="bm-off">+6</span><span class="bm-name">rot Y</span><span class="bm-size">u8&lt;&lt;4</span></div>
+    <div class="bm-cell"><span class="bm-off">+7</span><span class="bm-name">rot Z</span><span class="bm-size">u8&lt;&lt;4</span></div>
+  </div>
+  <table class="layout">
+    <thead><tr><th>Offset</th><th>Size</th><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>+0</code></td><td>1</td><td><code>low8(T0)</code></td><td>Translation X, low byte</td></tr>
+      <tr><td><code>+1</code></td><td>1</td><td><code>low8(T1)</code></td><td>Translation Y, low byte</td></tr>
+      <tr><td><code>+2</code></td><td>1</td><td><code>high4(T1) &lt;&lt; 4 | high4(T0)</code></td><td>The two high nibbles (sign bits live here)</td></tr>
+      <tr><td><code>+3</code></td><td>1</td><td><code>low8(T2)</code></td><td>Translation Z, low byte</td></tr>
+      <tr><td><code>+4</code></td><td>1</td><td><code>? &lt;&lt; 4 | high4(T2)</code></td><td>T2's high nibble is the <strong>low</strong> nibble of byte 4; the high nibble is never read</td></tr>
+      <tr><td><code>+5</code></td><td>1</td><td><code>rot X</code></td><td><code>u8 &lt;&lt; 4</code></td></tr>
+      <tr><td><code>+6</code></td><td>1</td><td><code>rot Y</code></td><td>same</td></tr>
+      <tr><td><code>+7</code></td><td>1</td><td><code>rot Z</code></td><td>same</td></tr>
+    </tbody>
+  </table>
+  <ul class="bullets">
+    <li>Sign-extend each translation: <code>if (v &amp; 0x800) v |= 0xFFFFF000</code>.</li>
+    <li>The three angles compose the rotation matrix in Z, Y, X order (post-multiplication).</li>
+    <li>The renderer poses object <code>i</code> with a flat <code>R&middot;v + T</code> about the object origin - there is no bone hierarchy to accumulate. Bone <code>i</code> drives TMD object <code>i</code>.</li>
+    <li>Frame 0 of an idle clip is the rest pose: it places each TMD object at its joint with its rest orientation.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="disc-sources">
+  <h2>Two families of clips</h2>
+  <p>The same record layout reaches the runtime from two places, never mixed: the party's clips ship once for the whole game, while every town carries its own pool of NPC and prop clips. A field actor's clip pointer (<code>actor[+0x4C]</code>) points into one or the other.</p>
+  <table>
+    <thead><tr><th></th><th>Party locomotion bundle</th><th>Per-scene NPC / prop bundle</th></tr></thead>
+    <tbody>
+      <tr><td>Who plays it</td><td>Vahn, Noa, Gala on the field, plus the savepoint crystal</td><td>Every NPC, scripted actor and animated prop in one scene</td></tr>
+      <tr><td>Where</td><td>PROT extraction entry 0874, section 1</td><td>Each scene block's first asset-table slot, third descriptor, type byte <code>0x05</code></td></tr>
+      <tr><td>Records</td><td>23: three 7-record banks (Vahn <code>0..=6</code>, Noa <code>7..=13</code>, Gala <code>14..=20</code>, 10 bones) + record 21 (3-bone savepoint loop) + record 22 (2-bone aux clip)</td><td>69-72 per field scene (town01: 69)</td></tr>
+      <tr><td>Which record plays</td><td>Bank slot 0 = walk, slot 1 = idle; the other slots are not plain locomotion (no "run" exists - holding the pad never leaves the walk record)</td><td>The MAN placement header's <code>anim_id</code> byte = record index + 1 (<code>0</code> = none) - see <a href="../subsystems/script-vm.html#placement-header-model-animation-resolution">placement resolution</a></td></tr>
+      <tr><td>Parser</td><td><code>character_pack::field_locomotion_anm</code></td><td><code>player_anm::find_in_entry</code></td></tr>
+    </tbody>
+  </table>
+  <p>The party meshes ship <code>nobj = 12</code> but only 10 objects are animated: groups 10 and 11 are equipment-swap templates that are never rendered (<a href="character-mesh.html">character mesh</a>).</p>
+  <h3 id="prot-1203">The battle-form sibling: PROT 1203</h3>
+  <p>PROT 1203 is the same container with 30 records for the <strong>Baka Fighter</strong> battle-form meshes (PROT 1204): three 9-record banks (Vahn <code>0..=8</code> 15 bones, Noa <code>9..=17</code> 16 bones, Gala <code>18..=26</code> 15 bones) plus three 10-bone records <code>27..=29</code>. Within a bank: <code>0</code> idle, <code>1..=3</code> attacks, <code>4</code> special, <code>5..=7</code> hit / knockdown, <code>8</code> win flourish. It is <strong>not</strong> what a real battle poses the party with - that is each character's own stream in its <a href="battle-data-pack.html#battle-animations">player battle file</a>.</p>
+</section>
+
+<section class="doc-section" id="playback">
+  <h2>Playback</h2>
+  <p>The clip driver runs once per actor per tick. It binds the requested clip, then advances a <strong>frame cursor</strong> in 1/16-frame units; the renderer poses from <code>cursor &gt;&gt; 4</code>. The decoder blends two adjacent frames by the low 4 cursor bits when the header's scale bit is set.</p>
+  <table>
+    <thead><tr><th>Actor field</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr><td><code>+0x4C</code></td><td>Bound clip pointer = <code>bank + offsets[id &amp; 0x3FF]</code>. The bank is the scene's MOVE slot (<code>_DAT_8007B888</code>), <code>_DAT_8007B840</code> for ids <code>&gt;= 0x400</code>, or <code>DAT_8007B75C</code> when actor flag <code>+0x10</code> bit <code>0x01000000</code> is set</td></tr>
+      <tr><td><code>+0x5C</code> / <code>+0x5E</code></td><td>Requested / bound clip id; a mismatch rebinds and resets the cursor</td></tr>
+      <tr><td><code>+0x62</code></td><td>Mode bits: hold <code>0x0002</code>, clamp <code>0x0008</code> (clear = loop), reverse <code>0x0080</code>, end latch <code>0x0100</code>, restart request <code>0x0200</code></td></tr>
+      <tr><td><code>+0x68</code></td><td>Frame cursor, 1/16-frame units; last position = <code>frames * 16 - 1</code></td></tr>
+      <tr><td><code>+0x6A</code></td><td>Per-tick step (through the header's scale bit and divisor)</td></tr>
+    </tbody>
+  </table>
+  <p>Scripts drive all of it through the <a href="../subsystems/script-vm.html">field VM</a>: ops <code>0x2B</code> / <code>0x2C</code> / <code>0x2D</code> set, clear or wait on a mode bit, <code>0x22 &lt;id&gt;</code> selects a clip, and <code>0x4C</code> sub-ops set the rate and the two pose snaps. That is what swings a town's doors open (<a href="../subsystems/field-locomotion.html#doorways">field locomotion</a>).</p>
+  <details class="disclosure">
+    <summary>Interpolation details</summary>
+    <div class="disclosure-body">
+      <p>The entry decoder reads <strong>two</strong> entries and blends them when the gate <code>header[+1] &amp; 1</code> is set; otherwise the current frame is emitted as-is. It is the same header bit that selects the clip tick's scaled step, so a clip either scales its step and blends, or does neither. The weight is the cursor's low nibble. The second entry is the same part one frame later; on the last frame it is the entry itself when the clamp bit <code>+0x62 &amp; 8</code> is set, else the part's frame-0 entry (the loop wrap).</p>
+      <p>Translations lerp as <code>cur + (((next - cur) * frac) &gt;&gt; 4)</code>. Angles go through a wraparound-aware interpolator with the next frame as <code>from</code>: <code>(to + ((from - to) * frac &gt;&gt; 4)) &amp; 0xFFF</code>, with the pair first brought onto the short arc by two sequential guards - add a turn to <code>to</code> when <code>from - to &gt;= 0x800</code>, then to <code>from</code> when the updated <code>to - from &gt;= 0x800</code>. Inputs exactly half a turn apart fire both guards, which cancel, so that case resolves forward.</p>
+      <p>Each angle call adds its arc length to a counter and journals its pair. If the three arcs sum past <code>0xC00</code>, the blender redoes the angles against the next frame's equivalent Euler triple <code>(x + 0x800, -(y + 0x800), z + 0x800)</code> - the same orientation by a shorter total path. Results land in scratchpad <code>0x1F8002C0</code> before the GTE load. A whole-frame cursor (fraction zero) poses exactly as the single-entry decode.</p>
+      <p>The same header bit slows the clip: a gated clip steps <code>(rate*2 + div - 1) / div</code> sixteenths a tick instead of the rate, so the common divisor-4 clips play at half speed - a live capture on Rim Elm matched that rule on every call it checked. In the port: <code>PlayerAnmBundle::sample_bone</code> (two-frame sampler), <code>blend_bone_transform</code> (blend with the flip retry), <code>lerp_angle_12</code> (angle interpolator).</p>
+    </div>
+  </details>
+  <details class="disclosure">
+    <summary>Where the clip bank lives, and the <code>play_anm_by_id</code> misreading</summary>
+    <div class="disclosure-body">
+      <p>The scene's clip bundle rides type byte <code>0x05</code>: the asset-type dispatcher allocates it with the <code>move_malloc_err</code> string into <code>_DAT_8007B888</code>, and the clip driver binds from that buffer. The dispatcher's <code>anm_malloc_err</code> arm is type <code>0x06</code>, whose buffer <code>_DAT_8007B7C8</code> holds the scene's <a href="asset-type.html#type-table">CLUT-walk table</a>, not clips - the enum labels and the contents are crossed.</p>
+      <p><code>FUN_80024CFC</code>, long called <code>play_anm_by_id</code>, reads that type-6 buffer (<code>_DAT_8007B7C8 + id*4 + 4</code>), stores the entry in <code>actor[+0x4C]</code> and writes state <code>0xB</code> to <code>actor[+0x56]</code>. State <code>0xB</code> in the per-actor tick <code>FUN_8001ADA4</code> is the CLUT-walk step: it advances a per-entry frame counter and issues a 16&times;1 <code>MoveImage</code> per frame. It spawns palette-cycling walkers, not animation clips (<a href="../subsystems/field-ambient-fx.html">field ambient FX</a>).</p>
+      <p>In RAM a loaded section carries a 16-byte allocator preamble the disc form lacks (<code>back_ptr, forward_ptr, forward_ptr_2, expanded_size</code>); <code>crates/anm::peel_preamble</code> strips it.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <details class="disclosure">
+    <summary>Provenance: clip driver, entry decode, angle interpolator, pose renderer, captures</summary>
+    <div class="disclosure-body">
+  <table>
+    <thead><tr><th>Function</th><th>Address</th><th>What it proves</th><th>Dump</th></tr></thead>
+    <tbody>
+      <tr><td>Clip driver / frame cursor</td><td><code>FUN_800204F8</code></td><td>Header fields read at <code>+0/+1/+2/+6</code>; cursor, step, mode bits</td><td><code>funcs/800204f8.txt</code></td></tr>
+      <tr><td>Entry decode + blend</td><td><code>FUN_8001BE80</code></td><td>Nibble packing (<code>andi 0xf</code> at <code>0x8001BF38</code>), next-entry rule, two-entry lerp, Euler-flip retry past <code>0xC00</code></td><td><code>funcs/8001be80.txt</code></td></tr>
+      <tr><td>Angle interpolator</td><td><code>FUN_8001D088</code></td><td>Sequential short-arc guards at <code>0x8001D090..B8</code></td><td><code>funcs/8001d088.txt</code></td></tr>
+      <tr><td>Pose renderer</td><td><code>FUN_8001B964</code></td><td>Flat <code>R&middot;v + T</code> per object; bone-count sanity check; <code>frame = cursor &gt;&gt; 4</code></td><td><code>funcs/8001b964.txt</code></td></tr>
+      <tr><td>Actor tick</td><td><code>FUN_80021DF4</code></td><td>Dispatch-byte ladder; opcode-6 keyframe block at <code>0x80022EC4..0x80023040</code></td><td><code>funcs/80021df4.txt</code></td></tr>
+      <tr><td>Clip bank selection</td><td><code>FUN_800204F8</code> at <code>0x8002055C</code></td><td>Binds from <code>_DAT_8007B888</code> (type-5 buffer); <code>FUN_80024CFC</code> instead reads the type-6 CLUT-walk table and arms walker state <code>0xB</code></td><td><code>funcs/800204f8.txt</code>, <code>funcs/80024cfc.txt</code></td></tr>
+      <tr><td>MOVE dispatch (type 5)</td><td><code>FUN_8001F05C</code>, store at <code>0x8001F3A8</code></td><td>Allocates the clip bundle into <code>_DAT_8007B888</code> (<code>move_malloc_err</code>); the <code>anm_malloc_err</code> arm stores <code>_DAT_8007B7C8</code> at <code>0x8001F3E4</code></td><td><code>funcs/8001f05c.txt</code></td></tr>
+      <tr><td>Rotation builders</td><td><code>FUN_8004638C</code>, <code>FUN_8004629C</code>, <code>FUN_800461A4</code></td><td>Z, Y, X matrix order; sin/cos tables at <code>DAT_80070A2C</code> / <code>DAT_8007122C</code></td><td>per-function dumps</td></tr>
+      <tr><td>Save-state captures</td><td>town01 field anchor; walk / idle pad probes</td><td>The runtime copy byte-matches the decoded bundle; slot 0 = walk, 1 = idle; no run record</td><td><a href="../tooling/pcsx-redux-automation.html">probe harness</a></td></tr>
+    </tbody>
+  </table>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="deep-dive">
+  <h2>Deep dive</h2>
+  <details class="disclosure" id="per-record-body-animation-opcode-6">
+    <summary>Kind 6: the two-pose tween record (the other record body)</summary>
+    <div class="disclosure-body">
+      <p>For a kind-<code>6</code> actor (<code>actor[+0x5A] = 6</code>, below), <code>actor[+0x4C]</code> points at a <strong>runtime record the tick rewrites every frame</strong>: a one-frame clip in the ordinary 8-byte encoding, followed by the two poses it is tweened from. <code>N = *(actor[+0x44])</code> is the object count; total size <code>8 + 32N</code>.</p>
+      <table class="layout">
+        <thead><tr><th>Offset</th><th>Size</th><th>Field</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>+0x00</code></td><td>8</td><td>header</td><td>Clip header, stamped by the tick: <code>+0 = N</code>, <code>+2 = 1</code> (one frame), <code>+6 = 1</code></td></tr>
+          <tr><td><code>+0x08</code></td><td>8 &times; N</td><td>output slots</td><td>One ordinary 8-byte entry per object, <strong>written</strong> by the tick</td></tr>
+          <tr><td><code>+0x08 + 8N</code></td><td>24 &times; N</td><td>source poses</td><td>Per object twelve <code>i16</code>, read by the tick; each lane's <code>dst</code> sits 12 bytes after its <code>src</code></td></tr>
+        </tbody>
+      </table>
+      <p>Per object the tick computes <code>src + ((dst - src) * actor[+0x22]) &gt;&gt; 12</code> on five lanes and packs them (<code>0x80022F0C..0x80023040</code>): source <code>+0x06</code> / <code>+0x08</code> / <code>+0x0A</code> become <code>T0</code> / <code>T1</code> / <code>T2</code>, <code>+0x02 &gt;&gt; 4</code> goes into <strong>both</strong> rot-X and rot-Z, <code>+0x04 &gt;&gt; 4</code> into rot-Y; the halfwords at <code>+0x00</code> / <code>+0x0C</code> are not read. <code>crates/anm</code> models the record as <code>KeyframeReader</code> / <code>BoneKeyframe</code> (<code>infer_bone_count</code> recovers N from the size), but its field order (<code>src_pos, dst_pos, src_rot, dst_rot</code>) and <code>/256</code> factor do not match these lanes. Disc records whose size does not fit <code>16 + 8 &times; bones &times; frames</code> are surfaced by <code>anm scan-non-keyframe --histogram</code>.</p>
+    </div>
+  </details>
+  <details class="disclosure" id="dispatch-byte-at-actor-0x5a">
+    <summary>Dispatch byte <code>actor[+0x5A]</code></summary>
+    <div class="disclosure-body">
+      <table>
+        <thead><tr><th><code>+0x5A</code></th><th>Handler block in the actor tick</th><th>Role</th></tr></thead>
+        <tbody>
+          <tr><td><code>0x01</code></td><td>-</td><td>Common stages only (the ladder never tests <code>1</code>)</td></tr>
+          <tr><td><code>0x02</code></td><td>shares with <code>0x06</code> at <code>0x80021E90..0x80021FA4</code></td><td>Rate-integrated channel block (<code>+0x34..</code> stepped by <code>+0x40..</code>, <code>&gt;&gt; 6</code>)</td></tr>
+          <tr><td><code>0x03</code></td><td><code>0x800226E8..0x800228A0</code></td><td>CLUT-cell HSV integrate, then <code>FUN_80019D50</code></td></tr>
+          <tr><td><code>0x04</code></td><td><code>0x80022CC8..0x80022EE4</code></td><td>VRAM rect wrap-scroll</td></tr>
+          <tr><td><code>0x05</code></td><td><code>0x80021FB4..0x800226D8</code></td><td>Positional SFX emitter</td></tr>
+          <tr><td><code>0x06</code></td><td><code>0x80021E90..0x80021FA4</code>, <code>0x80022F0C..0x80023040</code></td><td>The kind-<code>2</code> block, then the two-pose tween above</td></tr>
+          <tr><td><code>0x07</code></td><td><code>0x80022C30..0x80022CB8</code></td><td>Spline / curve-driven</td></tr>
+        </tbody>
+      </table>
+      <p>These are the kinds of the move-VM / ambient-effect actors the tick serves; none of them is the ordinary clip path, which is the clip driver <code>FUN_800204F8</code>. Only kind <code>6</code>'s second block reads <code>actor[+0x4C]</code>. The span <code>0x800228B8..0x80022B80</code> is the default motion block that kinds <code>3</code> and <code>5</code> branch past, not a kind handler.</p>
+      <p>In the port: <code>engine-vm::DispatchByte</code> and <code>engine-vm::actor_tick</code> (see <a href="../subsystems/actor-vm.html#per-arm-physics-tick">the per-arm breakdown</a>). A second, overlay-resident path in the field-VM dispatcher (<code>FUN_801DE840</code>, sub-dispatch table <code>0x801CEF88</code>) gates on <code>actor[+0x5C] &gt; 0</code>, calls the clip driver, loads <code>actor[+0x4C]</code>, calls the BIOS vector <code>0xA0/0x2F</code>, then runs a 40-byte body at <code>0x801E2630..70</code> over that pointer and the return value; that body is not decoded.</p>
+    </div>
+  </details>
+  <details class="disclosure" id="per-actor-anim-state-offsets">
+    <summary>Battle-side anim state (the battle actor record)</summary>
+    <div class="disclosure-body">
+      <p>Battle-actor animation state is not ANM: the battle actor record (<code>0x2D4</code> bytes, slot 0 at <code>0x800EC9E8</code>) points at a <strong>battle action entry</strong> with a 9-byte packed stream (<a href="monster-animation.html">monster animation</a> owns the entry; the party's entries are in the <a href="battle-data-pack.html">battle data pack</a>). A quiet-frame vs mid-strike save pair pins three actor regions:</p>
+      <table class="layout">
+        <thead><tr><th>Offset</th><th>Size</th><th>Field</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>+0x1D8</code></td><td>16</td><td>anim state</td><td>Mostly zero pre-anim (<code>01 77</code> at <code>+0x1D7..8</code>); e.g. <code>00 11 00 27 00 03 03 0F 0E 19 27 00</code> mid-anim</td></tr>
+          <tr><td><code>+0x1F4</code></td><td>18</td><td>per-clip counters</td><td>Zero pre-anim; a stamped run of <code>0x11</code> bytes mid-anim</td></tr>
+          <tr><td><code>+0x234</code></td><td>16</td><td>entry pointer queue</td><td>4-deep history of action-entry pointers, back-shifted through <code>+0x238..+0x244</code> by <code>FUN_80047430</code> when a new entry activates; <code>FUN_80049348</code> shadows the head into the render context</td></tr>
+        </tbody>
+      </table>
+      <p>The pointer names a battle action entry, not an ANM clip. The staged-anim commit <code>FUN_8004AD80</code> tests its first byte - the entry's action tag - once per commit: <code>0x02</code> becomes <code>0x04</code> in place when the battle's first monster is <code>0xB3</code> / <code>0xB5</code> and the actor's HP is <code>0</code>; <code>0x04</code> stages the get-up <code>+0x1F2</code> into <code>actor[+0x1DA]</code> on a living actor, entry <code>7</code> on a dead party member, and clears <code>+0x1DC</code>; <code>0x05</code> / <code>0x08</code> OR <code>4</code> / <code>8</code> into <code>actor[+0x1DC]</code>; <code>0x07</code> stages entry <code>8</code>; anything else raw playback. The captured mid-strike entry carries tag <code>0x18</code>: raw playback.</p>
+      <table class="layout">
+        <thead><tr><th>Offset</th><th>Type</th><th>Field</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>+0x00</code></td><td><code>u8</code></td><td>action tag</td><td>See above</td></tr>
+          <tr><td><code>+0x0E</code></td><td><code>i16</code></td><td>movement scale</td><td>Per-frame translation = <code>angle_lookup * scale * frame_index / frame_count</code></td></tr>
+          <tr><td><code>+0x14..+0x53</code></td><td>8 &times; 8 B</td><td>effect script</td><td>Per-frame visual-effect placements, walked by <code>FUN_801DEA50</code> (<a href="monster-animation.html">monster animation</a>)</td></tr>
+          <tr><td><code>+0x56</code></td><td><code>u16</code></td><td>sub-state counter</td><td>Ticked during <code>0x02 &rarr; 0x04</code></td></tr>
+          <tr><td><code>+0x76..+0x78</code></td><td><code>u8</code></td><td>flag / adjust / multiplier</td><td>Adjust is added to a per-arm constant; multiplier is per-frame</td></tr>
+          <tr><td><code>+0x84</code></td><td><code>u8</code></td><td>max frame</td><td>Stamped to <code>actor[+0x21B]</code>; <code>actor[+0x176] = max &lt;&lt; 4</code></td></tr>
+          <tr><td><code>+0x85</code> / <code>+0x86</code></td><td><code>u8</code></td><td>loop target / trigger</td><td>At <code>frame == trigger - 1</code> (and <code>+0x21B != 0</code>) the next frame is the loop target</td></tr>
+          <tr><td><code>+0x87</code></td><td><code>u8</code></td><td>special-effect id</td><td>Non-zero goes to <code>FUN_8004E13C</code></td></tr>
+          <tr><td><code>+0x88</code></td><td>ptr</td><td>nested frame data</td><td>Below</td></tr>
+        </tbody>
+      </table>
+      <p>Those are entry fields; the consumers also read actor-side fields: the position vectors <code>+0x34</code> / <code>+0x38</code> and <code>+0x44</code> / <code>+0x48</code> (copied into the render context), the loop-hold counter <code>+0x176</code> (stamped <code>entry[+0x84] &lt;&lt; 4</code>), the render flag set <code>+0x1BA</code> (copied to render-ctx <code>+0x7A</code>), the loop counter <code>+0x21B</code>, and the speed scale <code>+0x21D</code> (<code>0</code> / <code>2</code> / <code>4</code> / <code>8</code> observed), which <code>FUN_80047430</code> multiplies into the cursor step and <code>FUN_80049348</code> reads as <code>8 / actor[+0x21D]</code>, the stride of its child-actor walk. Engine views: <code>engine-vm::anim_vm::OpaqueAnimRecord</code>, <code>OpaqueRecordKind</code>, <code>ActorAnimState</code> - which names <code>+0x21D</code> an LOD step; the battle player the hosts run is <code>engine-battle::battle_anim</code>, not these views.</p>
+    </div>
+  </details>
+  <details class="disclosure" id="nested-frame-data">
+    <summary>Nested per-frame data (battle)</summary>
+    <div class="disclosure-body">
+      <p>The buffer at <code>struct[+0x88]</code> carries the bone keyframes the battle renderer interpolates each tick.</p>
+      <table class="layout">
+        <thead><tr><th>Offset</th><th>Size</th><th>Field</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>+0x00</code></td><td>1</td><td><code>bones_per_frame</code> (B)</td><td>Inner render-loop bound</td></tr>
+          <tr><td><code>+0x01</code></td><td>1</td><td><code>frame_count</code> (N)</td><td>Cap = <code>(N - 1) * 16</code>; velocity divides by it, so zero is a runtime divide-by-zero</td></tr>
+          <tr><td><code>+0x02</code></td><td>N &times; B &times; 9</td><td>keyframes</td><td>Frame stride <code>B * 9</code></td></tr>
+        </tbody>
+      </table>
+      <p>Each 9-byte bone block packs six 12-bit values, a translation then an Euler rotation:</p>
+<pre><code>byte[0] | (byte[2] &amp; 0x0F) &lt;&lt; 8   &rarr; tx
+byte[1] | (byte[2] &amp; 0xF0) &lt;&lt; 4   &rarr; ty
+byte[3] | (byte[5] &amp; 0x0F) &lt;&lt; 8   &rarr; tz
+byte[4] | (byte[5] &amp; 0xF0) &lt;&lt; 4   &rarr; rx
+byte[6] | (byte[8] &amp; 0x0F) &lt;&lt; 8   &rarr; ry
+byte[7] | (byte[8] &amp; 0xF0) &lt;&lt; 4   &rarr; rz</code></pre>
+      <p>The decoder <code>FUN_8004998C</code> sign-extends the three translations (bit 11 set ORs in <code>0xF000</code>) and masks the three angles with <code>andi 0xfff</code> (unsigned, <code>4096</code> = a full turn); <code>engine-vm::anim_vm::BoneFrame</code> sign-extends all six, which the decoder does not. The cursor <code>actor[+0x68]</code> holds the frame index in bits 4..15 and a sub-frame factor in bits 0..3; with a non-zero factor the renderer lerps toward the next frame (<code>a + (b - a) * frac &gt;&gt; 4</code>), where "next" is the loop target, <code>N - 1</code> on the terminal frame, or <code>frame + 1</code>. Validated against <code>FUN_8004AD80</code>, <code>FUN_80048A08</code>, <code>FUN_8004998C</code>, <code>FUN_80047430</code>. Engine accessors: <code>engine-vm::anim_vm::NestedFrameData</code>, <code>BoneFrame</code>, <code>ActorAnimState</code>.</p>
+    </div>
+  </details>
+  <p>Capture recipes behind each pin: <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/formats/anm.md" target="_blank" rel="noopener"><code>docs/formats/anm.md</code></a>.</p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="character-mesh.html">Character mesh</a>
+    <a href="monster-animation.html">Monster animation</a>
+    <a href="battle-data-pack.html">Battle data pack</a>
+    <a href="tmd.html">Legaia TMD</a>
+    <a href="asset-type.html">Asset type byte</a>
+    <a href="../subsystems/field-locomotion.html">Field locomotion</a>
+    <a href="../subsystems/motion-vm.html">Motion VMs</a>
+    <a href="../subsystems/actor-vm.html">Actor tick / actor VM</a>
+    <a href="../subsystems/script-vm.html">Field script VM</a>
+    <a href="../characters.html">Characters viewer</a>
+    <a href="../npcs.html">NPC viewer</a>
+    <a href="../reference/re-do-not-re-walk.html">Do not re-walk</a>
+  </div>
+</section>

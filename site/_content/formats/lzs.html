@@ -1,0 +1,195 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">formats</a> &middot; legaia lzs compression</div>
+  <h1>Legaia LZS compression <span class="tag tag-done">Confirmed</span></h1>
+  <p class="lede">Every time the game loads a town, a battle arena, a monster or a menu texture, the first thing it does is unpack it. Almost everything on the disc - meshes, textures, scene scripts, the whole monster archive - is squeezed with one small compressor so that more of the game fits on a single CD and streams off it faster. That compressor is a Legaia-flavoured LZSS: the classic scheme that replaces repeated byte runs with short back-references into a sliding window of recent output. It is reverse-engineered byte-for-byte from the executable's decompressor (<a href="#how-we-know">how we know</a>); the from-scratch implementation also carries the encoder the disc patcher needs to put edited assets back.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>In the game</dt><dd>Invisible to the player - it is the unpack step behind every loading pause. Meshes, textures, scene MANs and the monster archive all pass through it.</dd>
+    <dt>Magic / marker</dt><dd>None - a bare LZSS bitstream. The <em>decoded</em> bytes carry the magic (TIM, TMD, MES, ...), which is why you must check them.</dd>
+    <dt>Lives in</dt><dd>Wrapped around most <a href="prot.html">PROT.DAT</a> entries; selected by the <a href="asset-type.html">asset-type dispatcher</a> when its <code>copy_only</code> flag is zero.</dd>
+    <dt>Retail reader</dt><dd><code>FUN_8001A55C</code> (decoder only - Sony's packer never shipped)</dd>
+    <dt>Parser</dt><dd><code>crates/lzs</code> - <code>decompress</code>, <code>decompress_tracked</code>, <code>parse_container</code> / <code>decompress_container_strict</code>, <code>compress</code> / <code>compress_optimal</code>; CLI <code>lzs-decode</code></dd>
+    <dt>Confidence</dt><dd>Confirmed - traced from the decoder's disassembly and round-tripped over the whole PROT corpus.</dd>
+  </dl>
+</section>
+
+<aside class="notice warn">
+  <div class="notice-title">"Decompresses without error" is not a validity signal</div>
+  The decoder's 4096-byte ring buffer initialises to zeros, so most <em>random</em> inputs also decode without error - to plausible-looking zero-padded output. Feeding arbitrary bytes through the decoder proves nothing. Always magic-check the <em>decoded</em> bytes before treating an LZS-decode result as a hit. For multi-section containers, <code>decompress_container_strict</code> adds a consumed-bytes gate (see <a href="#container-format">container format</a>).
+</aside>
+
+<section class="doc-section" id="overview">
+  <h2>How it works</h2>
+  <p>LZSS keeps a window of the most recent output. Each item in the stream is either a <strong>literal</strong> (one byte, copied straight through) or a <strong>back-reference</strong> ("copy <em>n</em> bytes from position <em>p</em> of the window"). A flag byte ahead of every eight items says which is which. The stream carries no length and no end marker, so the caller always supplies the decompressed size. Legaia's variant makes three specific choices:</p>
+  <ul class="bullets">
+    <li><strong>4096-byte sliding ring buffer</strong> (the dictionary of recent output that back-references copy from), initialised to zero.</li>
+    <li><strong>Initial write position 0xFEE</strong> (4078).</li>
+    <li><strong>Control byte: 8 bits, LSB-first</strong> - bit set = literal, bit clear = back-reference.</li>
+  </ul>
+
+  <figure class="overlay-strip">
+    <svg viewBox="0 0 880 200" width="100%" style="max-width:880px" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="lzs-fig-title">
+      <title id="lzs-fig-title">One control byte governs the next eight items; a back-reference copies from the 4 KB ring buffer</title>
+      <style>
+        .lz-lab  { font: 11px 'Inter', sans-serif; fill: var(--text-muted); }
+        .lz-mono { font: 11px 'JetBrains Mono', monospace; fill: var(--accent); }
+        .lz-ctl  { fill: var(--bg-card); stroke: var(--accent); stroke-width: 1.3; }
+        .lz-lit  { fill: var(--bg-card); stroke: var(--border); stroke-width: 1.1; }
+        .lz-ref  { fill: none; stroke: var(--accent); stroke-width: 1.3; stroke-dasharray: 4 3; }
+        .lz-ring { fill: none; stroke: var(--border); stroke-width: 1.2; }
+        .lz-seg  { font: 10px 'Inter', sans-serif; fill: var(--text-muted); text-anchor: middle; }
+        .lz-arr  { stroke: var(--accent); stroke-width: 1.2; fill: none; }
+      </style>
+      <text x="20" y="34" class="lz-lab">input stream</text>
+      <rect x="140" y="20" width="60" height="30" class="lz-ctl"/>
+      <text x="170" y="39" class="lz-seg">control</text>
+      <rect x="200" y="20" width="40" height="30" class="lz-lit"/><text x="220" y="39" class="lz-seg">lit</text>
+      <rect x="240" y="20" width="40" height="30" class="lz-lit"/><text x="260" y="39" class="lz-seg">lit</text>
+      <rect x="280" y="20" width="80" height="30" class="lz-ref"/><text x="320" y="39" class="lz-seg">ref (2 B)</text>
+      <rect x="360" y="20" width="40" height="30" class="lz-lit"/><text x="380" y="39" class="lz-seg">lit</text>
+      <rect x="400" y="20" width="80" height="30" class="lz-ref"/><text x="440" y="39" class="lz-seg">ref (2 B)</text>
+      <text x="500" y="39" class="lz-lab">... 8 items per control byte, LSB first</text>
+
+      <text x="20" y="120" class="lz-lab">ring buffer (4096 B)</text>
+      <rect x="140" y="100" width="720" height="34" class="lz-ring"/>
+      <line x1="740" y1="100" x2="740" y2="134" class="lz-ring"/>
+      <text x="440" y="121" class="lz-seg">recent output (wraps at 0xFFF)</text>
+      <text x="800" y="121" class="lz-seg">zeros at start</text>
+      <text x="140" y="152" class="lz-mono">0x000</text>
+      <text x="740" y="152" class="lz-mono" text-anchor="middle">0xFEE</text>
+      <text x="740" y="168" class="lz-seg">first write</text>
+      <text x="860" y="152" class="lz-mono" text-anchor="end">0xFFF</text>
+
+      <path class="lz-arr" d="M320 50 C 320 80, 380 80, 380 100"/>
+      <text x="398" y="82" class="lz-lab">copies len bytes from window[base..]</text>
+    </svg>
+    <figcaption>Each control byte flags the next eight items as literal or back-reference. A back-reference names an <em>absolute</em> window position, not a distance behind the write cursor.</figcaption>
+  </figure>
+
+  <h3 id="token-layout">Token layout</h3>
+  <table class="layout">
+    <thead><tr><th>Item</th><th>Size</th><th>Bits</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>control byte</td><td>1</td><td>bit 0 first</td><td>Set = next item is a literal; clear = next item is a back-reference. Refilled after 8 items.</td></tr>
+      <tr><td>literal</td><td>1</td><td>-</td><td>Byte copied to the output and written into the window at the cursor.</td></tr>
+      <tr><td>back-reference</td><td>2</td><td><code>b0[7:0]</code> + <code>b1[7:4]</code> = 12-bit window position; <code>b1[3:0]</code> = length &minus; 3</td><td>Copy 3..18 bytes starting at the absolute window position, each also written at the cursor.</td></tr>
+    </tbody>
+  </table>
+  <p>A back-reference packs a 12-bit absolute window position and a 4-bit length into two bytes:</p>
+  <div class="byte-map" role="img" aria-label="Back-reference token: byte 0 is position bits 7..0; byte 1 high nibble is position bits 11..8; byte 1 low nibble is length minus 3">
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">b0 [7:0]</span><span class="bm-name">position low 8 bits</span><span class="bm-size">8 bits</span></div>
+    <div class="bm-cell bm-accent" style="--w:1"><span class="bm-off">b1 [7:4]</span><span class="bm-name">position high 4 bits</span><span class="bm-size">4 bits</span></div>
+    <div class="bm-cell" style="--w:1"><span class="bm-off">b1 [3:0]</span><span class="bm-name">length &minus; 3</span><span class="bm-size">4 bits</span></div>
+  </div>
+</section>
+
+<section class="doc-section" id="pseudocode">
+  <h2>Pseudocode</h2>
+<pre><code>let mut window = [0u8; 4096];
+let mut window_pos = 0xFEE;
+let mut control = 0u32;
+
+while out.len() &lt; expected_output_size {
+    if (control &amp; 0x100) == 0 {
+        control = (input[src] as u32) | 0xFF00;
+        src += 1;
+    }
+    if (control &amp; 1) != 0 {
+        // LITERAL: copy 1 byte
+        let v = input[src]; src += 1;
+        out.push(v);
+        window[window_pos] = v;
+        window_pos = (window_pos + 1) &amp; 0xFFF;
+    } else {
+        // BACK-REF: 2 bytes encode (12-bit absolute window position, 4-bit length-3)
+        let b0 = input[src] as u32;
+        let b1 = input[src + 1] as u32;
+        src += 2;
+        let base = b0 | ((b1 &amp; 0xF0) &lt;&lt; 4);
+        let len = (b1 &amp; 0x0F) + 3;
+        for n in 0..len {
+            let v = window[(base + n as u32) as usize &amp; 0xFFF];
+            out.push(v);
+            window[window_pos] = v;
+            window_pos = (window_pos + 1) &amp; 0xFFF;
+        }
+    }
+    control &gt;&gt;= 1;
+}</code></pre>
+  <p>The <code>0xFF00</code> mask is how the control register knows when to refill. Each shift right moves one of the eight set high bits down; after eight shifts bit 8 is clear, and the test at the top of the loop reads the next flag byte.</p>
+  <p>A back-reference copies byte by byte and writes each byte to the ring as it goes, so a reference may overlap its own output (the run-length case). The copy stops early if it reaches the expected output size.</p>
+</section>
+
+<section class="doc-section" id="container-format">
+  <h2>Container format</h2>
+  <p>Some PROT entries hold several independently compressed sections behind a small header. The header is the <a href="asset-descriptor.html">asset descriptor</a> layout: two <code>u32</code> header words, then 8-byte <code>(size, byte_offset)</code> pairs, where the size's low 24 bits are the section's decompressed length and its high byte is the asset type.</p>
+  <table>
+    <thead><tr><th>Function</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>parse_container</code></td><td>Scans the pair table heuristically; stops at a zero size or offset, an offset past the file, or a non-ascending offset.</td></tr>
+      <tr><td><code>decompress_container</code></td><td>Decodes every section it finds.</td></tr>
+      <tr><td><code>decompress_container_strict</code></td><td>Also rejects a section whose input consumption runs past the next section's offset. Use this one for detection.</td></tr>
+      <tr><td><code>decompress_tracked</code></td><td>Decodes one stream and returns the input bytes consumed, which is what the strict gate compares.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="doc-section" id="encoding-re-packing">
+  <h2>Encoding (re-packing)</h2>
+  <p>The retail game ships only the <em>decoder</em>; there is no Sony encoder to reverse. <code>legaia_lzs::compress</code> is an encoder written fresh for re-packing edited assets - it is what lets the <a href="../tooling/randomizer.html">randomizer / disc patcher</a> put a modified monster, script or texture back into the same slot on the disc:</p>
+  <ul class="bullets">
+    <li>An LZSS matcher with one-step lazy matching (defer a match by a byte when the next position yields a strictly longer one) whose output the retail decoder accepts byte-for-byte - <strong>not</strong> a bit-exact clone of Sony's packer.</li>
+    <li>Correctness criterion: <code>decompress(compress(x)) == x</code>, checked by round-tripping every compressed entry on the disc.</li>
+    <li>The lazy step matters for in-place editing. A purely greedy parse overshoots a scene MAN's original footprint by a handful of bytes, and those footprints have no compressed slack; with the lazy step every scene MAN but one fits its exact original span.</li>
+    <li><code>compress_optimal</code> is a slower shortest-encoding parse (a dynamic program over the token graph). Its output is never longer than <code>compress</code>'s, and it closes the last couple of bytes on the few retail streams whose footprint has zero slack.</li>
+  </ul>
+  <p>A linear-history match at distance <code>d</code> maps onto the ring-buffer back-reference position <code>(0xFEE + i - d) &amp; 0xFFF</code>, where <code>i</code> is the output position; capping the emitted distance at <code>4096 - 18</code> keeps every in-copy read (including the self-overlapping run-length case where <code>d &lt; len</code>) unambiguous. It does real compression (not literal-only), so re-packed streams fit the slack in fixed-size slots like the monster archive's <code>0x14000</code>-byte records - the story told in <a href="../writeups/disc-patching/b-lzs-slots.html">the disc-patching write-up on LZS slots</a>.</p>
+</section>
+
+<section class="doc-section" id="where-lzs-is-consumed">
+  <h2>Where LZS is consumed</h2>
+  <p>The asset-type dispatcher - the routine that routes each loaded asset to its format handler - calls the LZS path when its <code>copy_only</code> flag is zero. See <a href="asset-type.html">asset type dispatcher</a>. The descriptor-pair containers above are walked by <code>FUN_80020224</code> (<a href="asset-descriptor.html">asset descriptor</a>).</p>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <p>The algorithm is read straight off the retail decoder's disassembly, and the from-scratch decoder and encoder round-trip every LZS entry on the disc.</p>
+  <details class="disclosure">
+    <summary>Provenance: functions and dumps</summary>
+    <div class="disclosure-body">
+  <table>
+    <thead><tr><th>Function</th><th>Address</th><th>What it proves</th><th>Dump</th></tr></thead>
+    <tbody>
+      <tr><td>Retail decoder</td><td><code>FUN_8001A55C</code></td><td>The complete algorithm above - ring size, <code>0xFEE</code> start, control-byte order, token encoding</td><td><code>funcs/8001a55c.txt</code></td></tr>
+      <tr><td>Asset-type dispatcher</td><td><code>FUN_8001F05C</code></td><td>When the LZS path is taken (<code>copy_only == 0</code>)</td><td><code>funcs/8001f05c.txt</code></td></tr>
+      <tr><td>Round-trip validation</td><td><code>crates/lzs</code></td><td><code>decompress(compress(x)) == x</code> over the whole PROT corpus; re-packed MANs fit their original spans</td><td>-</td></tr>
+    </tbody>
+  </table>
+    </div>
+  </details>
+  <p>Source of record: <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/formats/lzs.md" target="_blank" rel="noopener"><code>docs/formats/lzs.md</code></a>.</p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="asset-type.html">Asset-type dispatch</a>
+    <a href="asset-descriptor.html">Asset descriptor</a>
+    <a href="prot.html">PROT.DAT TOC</a>
+    <a href="../subsystems/asset-loader.html">Asset loader</a>
+  </div>
+  <div class="see-also">
+    <span class="see-also-label">Tooling</span>
+    <a href="../tooling/randomizer.html">Randomizer / disc patcher</a>
+    <a href="../tooling/rom-patcher.html">ROM patcher (in-browser)</a>
+    <a href="../tooling/extraction.html">Extraction pipeline</a>
+  </div>
+  <div class="see-also">
+    <span class="see-also-label">Write-up</span>
+    <a href="../writeups/disc-patching/b-lzs-slots.html">Disc patching: re-packing LZS slots</a>
+  </div>
+</section>

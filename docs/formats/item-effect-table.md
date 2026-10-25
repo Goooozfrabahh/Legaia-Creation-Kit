@@ -1,0 +1,376 @@
+# Item-effect descriptor table
+
+A static `SCUS_942.54` table that says **what kind of effect** each consumable
+has - heal HP, restore MP, cure status, revive, raise a stat, escape a dungeon -
+plus its target shape (single ally vs. whole party) and where it can be used
+(field menu vs. battle). It is the sibling of the [item-name table](item-table.md)
+(`DAT_80074368`) and the [spell table](spell-table.md): the three are contiguous
+static data, and this table ends exactly where the spell table begins.
+
+## What it is and is NOT
+
+This table holds the effect **class + tier + flags**, **not** the literal
+restore amounts. "Healing Leaf restores 200 HP" is split in two: this table
+records `(class = heal-HP, tier = 0)`, and the `(class, tier) -> 200` mapping is
+a separate, **also static** [heal-amount table](#heal-amount-table-0x8007655c).
+
+The apply handler is the **static** `FUN_800402F4` (`ghidra/scripts/funcs/
+800402f4.txt`), reached through a 132-entry jump table at `0x80014FA0`. **What
+indexes that table depends on the caller** - three callers index it with three
+different bytes: the descriptor class at `0x801d84b4` (the field item-use path),
+the item record's own `+0` kind byte at `0x801d9280`, and the battle actor's
+`+0x1E8` at `0x801e40dc`. "Indexed by the descriptor class byte" describes only
+the first. It handles both the field item menu and the battle
+item path in one function (it branches on `game_mode == 0x15`, walking either the
+char records or the battle-actor table `0x801C9370`). The HP / MP heal arms size
+the restore by reading a tier-indexed `u16` table at `0x8007655C` (HP) /
+`0x80076564` (MP) - so the numbers **are** on the disc, decoded by
+`legaia_game_tables::item_effect` (`ItemEffectTable::heal_amounts` / `restore_amount`).
+The amounts are not a switch of immediates inside an overlay handler.
+
+## Table base + record layout
+
+| | |
+|---|---|
+| Record base | `DAT_800752C0` (file `0x65AC0`) |
+| Stride | `0x4` bytes |
+| Record count | `130` (subtypes `0x00..=0x81`); ends at the spell table `0x800754C8` |
+
+| Offset | Type | Field | Confidence |
+|---|---|---|---|
+| `+0` | u8 | effect **class** (action-validator arm) | Confirmed |
+| `+1` | u8 | **tier** / sub-case (per-class selector; e.g. heal-HP `0/1/2` = `200/800/max`) | Confirmed |
+| `+2` | u8 | **flags** (see below) | Confirmed |
+| `+3` | u8 | **passive-effect index** (`0x00..=0x3F`) for accessory / quest-item rows; `0x41` = no-passive sentinel on consumable rows (see [accessory-passive-table.md](accessory-passive-table.md)) | Confirmed |
+
+### Flag byte (`+2`)
+
+| Bit | Meaning |
+|---|---|
+| `0x80` | base / "has an effect" - set on every populated descriptor |
+| `0x40` | target **side** is the enemy party (clear = the ally party) |
+| `0x20` | **all** targets on the selected side (clear = one) |
+| `0x04` | usable from the **battle** item menu |
+| `0x02` | usable from the **field** item menu |
+
+### `0x40` is the target side, and it has exactly one reader
+
+The battle Item command forks on `0x40` and `0x20` together, at
+`0x801D18E0..0x801D18EC` inside the battle dispatcher `FUN_801D0748`
+(PROT 0898). The chain is all in the instructions: the bag slot's item id
+(`lbu a0, 0x1818(...)` off the `0x80084140` block), the item record's `+1`
+effect subtype (`0x80074368 + id*0xC`), then this table (`lui a1, 0x8007` at
+`0x801D1898` + `addiu a1, a1, 0x52c0` at `0x801D18CC`), `lbu v1, 0x2(v0)` at
+`0x801D18D8`, and the pair `andi v0, v1, 0x40` / `andi v0, v1, 0x20`. The four
+combinations select four target modes, each writing a different phase byte and
+entering a different picker:
+
+| `0x40` | `0x20` | Phase | Target mode |
+|---|---|---|---|
+| set | clear | `0x5B` | one enemy - picker armed with `a0 = 0x12` |
+| set | set | `0x5D` | all enemies - `actor[+0x1DD] = 9`, no picker |
+| clear | clear | `0x64` | one ally - picker at `0x801D2D1C`, `a0 = 0x16` |
+| clear | set | `0x66` | all allies - the `0x801D1D50` arm |
+
+The **spell** table shares the encoding and the fork: `FUN_801D0748`'s magic arm
+reads `DAT_800754C8 + id*0xC` `+2` at `0x801D1C48` and runs the identical
+`0x40`/`0x20` ladder at `0x801D1C50`/`0x801D1C58` into phases `0x5C` / `0x5E` /
+`0x65` / `0x67`. That is what pins the sense of the bit: the two tables' `+2`
+low nibbles agree (an item's `0xC4` is `0x80 | 0x44` = the spell table's "one
+enemy", `0xE4` is `0x80 | 0x64` = "all enemies", `0x86`/`0xA6` are `0x80 | 0x06`
+/ `0x80 | 0x26` = one / all allies), and the five `0x40` subtypes are exactly
+the enemy-directed descriptors - the Point Card (subtype `0x7E`, flag `0xC4`)
+and two pairs for the summon flutes, whose class-`126` member carries
+`0xC4`/`0xC6` (one enemy) and whose class-`127` member carries `0xE4`/`0xE6`
+(all enemies). Three consumables select them: the Point Card, the Lippian Flute
+(subtype `0x27`, `0xC4`) and the Spikefish Flute (subtype `0x28`, `0xE4`). The
+`0xC6` / `0xE6` rows (subtypes `0x23`, `0x24`) are selected by no consumable.
+
+An opcode-decoding sweep of `SCUS_942.54` plus all 80 based overlay images for a
+`+2` byte load followed within five instructions by `andi ..., 0x40` finds
+`0x801D18E0` and `0x801D1C50` and nothing else. In particular the item-info
+panel `FUN_801D0F1C` does **not** read the bit - it contains no `andi 0x40` at
+all. Its `slti a0, 0x40` at `0x801D107C` / `0x801D1110` is not a flag test: that
+instruction compares the record's `+3` **passive index** against the `>= 0x40`
+no-passive sentinel ([accessory-passive-table.md](accessory-passive-table.md)), a
+different field and a magnitude compare rather than a mask.
+
+Bit `0x08` is a sixth populated bit this table does not name. It is read at
+`0x800308D8` / `0x80030BB4` (the bag-list builder, gating a consumable into the
+third menu list at `0x801C6420`) and at `0x801D1164` (the sell/info panel,
+selecting between two glyph ids); what it selects is not pinned here.
+
+Healers carry `0x04 | 0x02` (field + battle); permanent stat-ups and the
+field-utility items carry `0x02` only; status-cures and revive carry `0x04`
+only. Key items resolve to a descriptor with **neither** usability bit set
+(e.g. flag `0x89`), which is how the item menu greys them out.
+
+### Class byte (`+0`)
+
+Class labels are validated against the on-disc item *description* strings (item
+record `+8` pointer):
+
+| Class | Effect | Example item / on-disc description |
+|---|---|---|
+| `0` | heal HP, one ally | Healing Leaf - "Recover 200HP. Ally." |
+| `1` | heal HP, whole party | Healing Bloom - "Recover 200HP. All allies." |
+| `2` | restore MP | Magic Leaf - "Recover 50MP. Ally." |
+| `3` | cure all status | Medicine - "Cure all status. Ally." |
+| `4` | revive | Phoenix - "Restore life. Ally." |
+| `5` | extend action gauge (one battle) | Fury Boost - "Extend action gauge for one battle." |
+| `6` | permanent stat-up (tier = which stat) | Miracle Water - "All stats +4. Ally." |
+| `7` | temporary stat buff (one battle) | Power Elixir - "Increase attacking power for one battle." |
+| `8` | cure single status | Antidote - "Cure Venom. Ally." |
+| `11`/`12`/`13` | arts book (Fire/Wind/Thunder; tier = the art id it grants, [below](#arts-books-class-111213-the-tier-is-an-art-id)) | Fire Book I - "Book of Hyper Arts. For Meta." |
+| `14` | Point Card strike - reached by item `0xFE` through an id test in the battle action SM, not through a descriptor (see below) | Point Card |
+| `126`/`127` | summon flute | Lippian Flute - "Flute that calls the Lippian monster." |
+| `128` | field escape (dungeon) | Door of Light - "Teleport out of dungeons." |
+| `129` | field warp (city) | Door of Wind - "Teleport to another city." |
+| `130` | reduce encounter rate | Incense - "Decrease encounter rate for a period of time." |
+
+Note that the class byte is meaningful **only together with the usability
+flags**: many key items funnel to class `0` with no usability bit set, so
+"class 0" is not by itself "an HP potion" - gate on the field/battle bits.
+
+### Arts books (class `11`/`12`/`13`): the tier is an art id
+
+The arts-book tier is **not** a book level. The apply handler takes the class as
+argument 0 and the tier as argument 1 (`move $t4, $a0` at `0x800402F4 + 4`,
+`move $s6, $a1` at `0x80040300`), and the `0x0B`..`0x0D` arm writes the **tier
+byte verbatim** into a per-character displayed-skill list - `sb $s6, 0x74e($a0)`
+at `0x80042064`. The list holds skill-table ids, so the tier is the art id the
+book grants.
+
+The same arm picks the character from the class alone: `andi $v1, $t4, 0xff;
+addiu $v1, $v1, -0xb` at `0x80041FC0`, scaled by the `0x414` per-character
+record stride (`sll 6; addu; sll 2; addu; sll 2`) onto `0x80084140`. Class `11`
+is roster slot 0, `12` is slot 1, `13` is slot 2 - **the picked target is never
+read**, so a Fire Book always lands on the same roster slot whoever the menu
+highlights.
+
+The field VM confirms the encoding from the other side. Its own grant arm
+`[4C C7]` (`0x801E28D4`) reads two operand bytes and calls the same applier
+with `addiu $a0, $a0, 0xb` in the `jal` delay slot at `0x801E28E8` - a script
+names the roster **slot** and the arm adds the `0xb` the applier subtracts
+back. The `-0xb` is a class-to-slot rebase, not an offset into anything. The insert itself is ordered, not a head insert: the loop at
+`0x80041FFC`..`0x8004202C` walks down from the count shifting entries up only
+while the new id compares smaller (`sltu $v0, $a3, $v1`), so the list stays
+sorted ascending by id.
+
+On disc the nine rows are `(class, tier)` = Fire `3/2/1`, Wind `5/4/1`, Thunder
+`3/2/1` for books I/II/III, all with flag byte `0x83` (base + field-use only,
+no battle bit). Books III all share tier `1`.
+
+**Class 14 has no descriptor row, and is live all the same.** Arm `14` (`0x8004209C`)
+takes `min(_DAT_800845B4, 9999)` off the Point Card bank and applies it as
+battle damage - a Point Card strike scaling with how much the player has shopped.
+Decoding all 256 item records against this table finds no item carrying class
+14: the Point Card's own descriptor (subtype `0x7E`) is `01 00 C4 41`. The arm is
+reached by item id instead. State `0x3E` of the battle action SM `FUN_801E295C`
+tests `actor[+0x1DF] == 0xFE` at `0x801E4080..0x801E4088` and overwrites the
+seeded selector `actor[+0x1E8]` with `0x0E` at `0x801E40C0`, so a Point Card used
+in battle with a non-zero bank runs the strike. See
+[`glitches/items-and-equipment.md`](../reference/glitches/items-and-equipment.md).
+
+## Heal-amount table (`0x8007655C`)
+
+The literal restore *amounts* the apply handler `FUN_800402F4` reads. Two
+contiguous `u16[4]` sub-tables, indexed by the descriptor **tier** (`base +
+tier*2`); only tiers `0..=2` are read flat.
+
+| VA | Sub-table | Tier 0 | Tier 1 | Tier 2 | Read by |
+|---|---|---|---|---|---|
+| `0x8007655C` (file `0x66D5C`) | HP restore cap | `200` | `800` | `9999` | class `0` (single), class `1` (all-party) |
+| `0x80076564` | MP restore cap | `50` | `200` | `20` | class `2` (MP) |
+
+Each restore is **deficit-clamped**: `applied = min(max - current, table[tier])`,
+so tier `2`'s `9999` is an effective full HP restore. Tier `3+` does **not** read
+this table - those higher HP heals are **character-relative** (they scale off the
+per-character `0x80084140` Seru-heal tables). **Revive** (class `4`) is also not a
+flat amount: tier `0` restores `max_hp*0.4 + rand()%(max_hp/8)`, tier `>0` is a
+full revive. Provenance: HP arm `0x800404b8`, MP arm `0x80040dc0`, revive arm
+`0x80040f58` (`ghidra/scripts/funcs/800402f4.txt`).
+
+Parser: `ItemEffectTable::heal_amounts()` (the two `u16` arrays) and
+`restore_amount(id)` (resolves an item id through its `(class, tier)` to a
+[`RestoreAmount`] - `Hp(u16)` / `Mp(u16)` / `CharRelative`). The disc-gated
+`item_effect_real` test pins the table and a set of items byte-for-byte against
+the engine's curated figures (Leaf `200`, Flower `800`, Berry `9999` full, Magic
+Leaf `50` MP, Magic Fruit `200` MP, Healing Shroom `200`).
+
+## Stat-up / buff items (class 5/6/7)
+
+The stat-affecting classes do **not** read a data table - their magnitudes are
+inline immediates in the apply handler's switch (`FUN_800402F4` `case 5/6/7`).
+The `(class, tier)` → effect mapping is therefore pinned to the disassembly,
+while each item's `(class, tier)` is parsed from the descriptor table above.
+
+**Class 6 - permanent stat-up** (field-use, flag byte `0x82`). Adds a flat
+increment to the **character record** (`0x80084708 + slot*0x414`, the same
+record window the [save schema](../../crates/save/src/character.rs) maps), `tier`
+selecting which stat. The amounts and caps:
+
+| Tier | Stat | Record offset | `+delta` | Cap | Item |
+|---|---|---|---|---|---|
+| 0 | Max HP | `+0x11C` | `+16` | `9999` | Life Water (`0x82`) |
+| 1 | ATK | `+0x124` | `+4` | `999` | Power Water (`0x83`) |
+| 2 | DEF (both facets `+0x126`/`+0x128`) | `+0x126`/`+0x128` | `+4` | `999` | Guardian Water (`0x84`) |
+| 3 | SPD | `+0x12A` | `+4` | `999` | Swift Water (`0x85`) |
+| 4 | INT | `+0x12C` | `+4` | `999` | Wisdom Water (`0x86`) |
+| 5 | Max MP | `+0x11E` | `+8` | `999` | Magic Water (`0x87`) |
+| 6 | **all** (AGL/HP/ATK/SPD/INT/MP/DEF) | - | `+4` each | AGL `280`, HP `9999`, else `999` | Honey (`0x65`), Miracle Water (`0x6D`) |
+
+The handler writes the **base** window (`+0x11C..+0x12C`) and nothing else:
+Life Water is `lhu / addiu 0x10 / sh` on `+0x11C` and the `9999` clamp
+(`0x8004119C..0x800411C0`), and every other arm has that shape on its own
+halfword. The live window follows because the menu's use routine calls the
+stat aggregator straight after it (`FUN_801D8308`: `jal 0x800402F4` at
+`0x801D8538`, `jal 0x80042558` at `0x801D8540`). The aggregator copies each
+base value over its live one, adds the equipment's percent boosts off the
+base - ability bit 0 a tenth of base Max HP, bit 1 a quarter, bits 2 and 3
+the same two for Max MP (`0x800429A0..0x80042A5C`) - clamps to `9999` /
+`999`, and lowers a current value that now exceeds its maximum
+(`0x80042CE4..0x80042D18`). So a raised maximum is the base plus whatever
+boost is worn, and the gain is not refilled: current HP / MP stay where they
+were.
+
+Port: `World::apply_stat_up_item` raises the base window and
+`World::rebuild_record_live_hp_mp` rebuilds the two maxima from it - the
+same rebuild `World::refresh_party_ability_bits` runs for every party
+member, since the aggregator is one pass: an equipment change (the equip
+screen, a shop's equip-now, the field VM's `0x3B`) moves the maxima with
+the accessory; the combat
+stats take the base raise and the same increment on the live value, which
+the battle seed re-derives from the base. A library save shows the rebuild
+on its own: a record with base Max HP `521` under a +10% accessory carries
+a live maximum of `573`.
+
+**Class 7 - one-battle buff** (battle-use, flag byte `0x84`). Multiplies the
+**battle-actor** stat halfwords by `6/5` (+20%, the handler's `uVar + uVar/5`),
+clamped to `0xFFFF`, for the rest of the battle. `param_2` = `tier`:
+
+| `param_2` | Stat(s) buffed | Item |
+|---|---|---|
+| 1 | SPD (`+0x164/+0x166`) | Speed Elixir (`0x8D`) |
+| 2 | DEF, both facets (`+0x15C/+0x15E` + `+0x160/+0x162`) | Shield Elixir (`0x8C`) |
+| 3 | ATK (`+0x158/+0x15A`) | Power Elixir (`0x8B`) |
+| 4 | **all** - SPD + DEF + ATK + INT (`+0x168/+0x16A`) | Wonder Elixir (`0x8E`) |
+
+**Class 5 - Fury Boost** (`0x81`): extends the action gauge for one battle
+(sets the actor `+0x1F9` gauge flag); no stat target. See the buff-selector
+table in [`battle-formulas.md`](../subsystems/battle-formulas.md#stat-buff-selectors-17).
+
+Parser: `ItemEffectTable::stat_effect(id)` → `StatItemEffect` (`ActionGauge` /
+`Permanent(Vec<StatChange>)` / `BuffOneBattle(Vec<StatTarget>)`), and the raw
+`stat_item_effect(class, tier)` mapping. The disc-gated `item_effect_real` test
+pins every Water item, both all-stats items, the four Elixirs, and Fury Boost by
+their real ids. Provenance: `case 6` lines `2380-2472`, `case 7` lines
+`2473-2639` of `ghidra/scripts/funcs/800402f4.txt`.
+
+## Indexing
+
+The lookup is **double-indirected by item id -> subtype -> descriptor**. From
+`FUN_8003043C`:
+
+```text
+// FUN_8003043C
+0x80030474  subtype    = item_name_table[id].byte(+1)   // 0x80074368 + id*0xC
+0x80030478  descriptor = 0x800752C0 + subtype * 4       // stride-4 record
+0x80030484  flags      = descriptor[+2]
+0x80030498  arm        = descriptor[+0]                 // effect class / validator arm
+0x8003049C  tier       = descriptor[+1]
+```
+
+The item record's `+0` byte - its **kind** - is a sibling selector some callers
+gate on before they read the descriptor at all: the pause-menu target-panel
+preview derivation `FUN_801D6A54` requires `kind == 2` *and* `class == 6`
+before it maps the tier onto a preview mode. `ItemEffectTable::kind` exposes it
+alongside `subtype`, since the two are read as a pair.
+
+The `& 0x20` all-party test is read in `FUN_8003043C` itself (`andi 0x20` at
+`0x8003048C`): a flagged item makes one call to the action validator
+`FUN_8003FB10(arm, tier, 0)` (`0x800304A0`) and returns its result. Every retail
+flagged item's arm is the party walker `0x01` or an out-of-battle arm
+`0x80..=0x83`, none of which reads the target argument - except item `0x99`,
+whose arm `0x7F` is past every validator arm and so always refuses. The `0x02` / `0x04`
+field-vs-battle usability bits are read by the field item-menu list builder
+`FUN_80030628` (`ghidra/scripts/funcs/80030628.txt`), where two menu contexts
+gate on `flags & 2` and `flags & 4` respectively. The battle item path reads the
+class + tier straight into the actor's action context (`overlay_battle_action_801e295c`,
+`addiu a0,a0,0x52c0` at `0x801e3ba4`).
+
+## Provenance + parser
+
+`legaia_game_tables::item_effect::ItemEffectTable::from_scus` resolves both tables from
+a `SCUS_942.54` image at runtime (`t_addr -> file-offset` map, identical to the
+[item-name table](item-table.md) resolver). The disc-gated `item_effect_real`
+test pins the `(class, tier, flags)` bytes for a span of consumables against the
+real executable and cross-checks each against its on-disc description.
+
+## Engine consumption
+
+`legaia_engine_menus::items::ItemCatalog::apply_effect_flags` installs three of
+the flag bits over the curated catalog from disc: the `0x02`/`0x04` usability
+gates (per item id) and the `0x20` all-party flag (`ItemCatalog::is_all_party`).
+The item-use session ([`legaia_engine_menus::inventory_use::InventoryUseSession`])
+reads `is_all_party`: a flagged restorative item (Healing Bloom `0x7A`, Healing
+Fruit `0x7B`) skips target-select and fans its effect across every living ally
+in one use, consuming one copy. The disc-gated `item_effect_flags_disc` test
+pins the all-party flag for `0x7A`/`0x7B` (and its absence on the single-target
+heals) against the real executable.
+
+Beyond the static field/battle bits, the session also models the retail
+**menu-usability gate** that `FUN_8003043c` performs: an item is only offered
+(not greyed) when at least one currently-eligible target would actually benefit
+from it. An unflagged item's `FUN_8003043C` walks the party list - count
+`0x80084594`, member ids from `0x80084598` (`0x800304B0..0x80030518`), skipping
+any id `>= 3` (`sltiu v0,v0,0x3` at `0x800304DC`) - calling the shared
+relevance/validity predicate `FUN_8003FB10(class, tier, member)` per member and
+returning "usable" if any call succeeds (`sltu v0,zero,s1` at `0x8003051C`). The from-scratch equivalent (`inventory_use::item_has_valid_target` ->
+`effect_benefits_target`) greys a heal when every living ally is at full HP, a
+cure when nobody carries the matching status, and a revive when nobody has
+fallen, re-implementing the item-relevance arms of the retail predicate
+`FUN_8003fb10` (the 16-arm menu/UI validator documented in
+[`battle-action.md`](../subsystems/battle-action.md#action-validator-fun_8003fb10)).
+
+The **permanent stat-up *Water* line** (class 6) is seeded into the catalog
+from the installed table by `ItemCatalog::apply_stat_items` (so it appears only
+when the disc is present, never as a no-op on a disc-free build);
+`World::use_item` resolves each item's per-stat changes from the table at use
+time and applies them through the shared persistent stat-raise path (a `Defense`
+change raises both defence facets, matching the handler). The disc-gated
+`water_line_stat_up_items_seed_and_apply_from_disc` test pins that Life Water
+raises Max HP +16, the single-stat Waters raise their stat by +4, and Honey
+raises all stats.
+
+The **class-7 one-battle buff Elixirs** are seeded by `ItemCatalog::apply_buff_items`
+(battle-only) and applied in `World::use_item` through the shared buff path
+(`apply_battle_buff`, the same `×6/5` ramp + revert-on-expiry / revert-at-battle-end
+bookkeeping as buff *spells*): Power/Shield/Speed Elixir ramp ATK / DEF / SPD,
+Wonder Elixir ramps all four (SPD + DEF + ATK + INT). The disc-gated
+`elixir_battle_buffs_seed_and_ramp_from_disc` test pins that Power Elixir ramps a
+100 ATK scalar to 120 and Wonder Elixir installs four buff trackers without
+compounding.
+
+**Fury Boost** (class 5) is seeded by `ItemCatalog::apply_action_gauge_items`
+(battle-only) and extends the target's action gauge for the battle. Retail sets
+the actor `+0x1F9` flag, after which the action-SM gauge-build phase (`case 4`,
+`overlay_0898_801e295c.txt` line ~4294) sizes the gauge as `gauge_stat * 7 / 5 + 8`
+(clamped to `0x120`) instead of the base length. `World::use_item` raises that
+byte on the battle actor (`spirit_shield`), and the round boundary
+(`BattleRound::boundary`, `FUN_801D88CC` loop A) then restores the live gauge
+`+0x154` - the pool the arts entry spends - to the extended length; the flag is
+cleared at battle end. It also still raises the slot's legacy `ApGauge::base_ap`
+by the `×7/5` ratio. Before the flag was set, that budget was the only thing the
+item touched, and the arts pool never grew. The disc-gated
+`fury_boost_seeds_and_extends_the_ap_gauge_from_disc` test pins the seeding +
+extension, and the in-crate
+`use_item_fury_boost_extends_ap_gauge_and_reverts_at_battle_end` the full
+apply / idempotent / revert lifecycle.
+
+## See also
+
+- [Item-name table](item-table.md) - the sibling name/price table this indexes through.
+- [Accessory passive-effect table](accessory-passive-table.md) - the `+3` byte's index space (accessory "Goods" passives).
+- [Spell table](spell-table.md) - the static table immediately after this one.
+- [`reference/gamedata.md`](../reference/gamedata.md) - curated item effect *amounts* (the numbers this table does not carry).

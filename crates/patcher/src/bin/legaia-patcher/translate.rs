@@ -1,0 +1,1266 @@
+//! `translate` subcommand implementations: export / init / stats / import.
+
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
+
+use legaia_disc_patch::disc::DiscPatcher;
+use std::collections::BTreeMap;
+
+use legaia_disc_patch::ppf;
+use legaia_patcher::apply;
+use legaia_translate::{
+    LanguagePack, accents, diff, export_pack, fit, import::WritePath, import_pack, lift,
+    markup::Target, space,
+};
+
+use crate::disc_io::{cue_contents, load_image};
+
+fn read_pack(path: &Path) -> Result<LanguagePack> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("read pack {}", path.display()))?;
+    LanguagePack::from_yaml(&text)
+}
+
+fn write_pack(pack: &LanguagePack, path: &Path) -> Result<()> {
+    std::fs::write(path, pack.to_yaml()?).with_context(|| format!("write pack {}", path.display()))
+}
+
+/// Collapse an issue message to a per-reason group key by normalising digit
+/// runs (so "needs 41 bytes but the budget is 39" and "needs 52 bytes but the
+/// budget is 40" fall into the same bucket).
+fn reason_key(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut in_digits = false;
+    for c in msg.chars() {
+        if c.is_ascii_digit() {
+            if !in_digits {
+                out.push('N');
+                in_digits = true;
+            }
+        } else {
+            in_digits = false;
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Print per-entry issues. Default: a per-reason summary (count + a few
+/// example keys per reason) so tens of thousands of skip lines don't drown
+/// the totals; `verbose` streams every entry like before.
+fn print_issues(label: &str, issues: &[(String, String)], verbose: bool) {
+    if issues.is_empty() {
+        return;
+    }
+    if verbose {
+        for (key, msg) in issues {
+            println!("  [{label}] {key}: {msg}");
+        }
+        return;
+    }
+    const EXAMPLES: usize = 3;
+    let mut groups: std::collections::BTreeMap<String, Vec<&(String, String)>> =
+        std::collections::BTreeMap::new();
+    for issue in issues {
+        groups.entry(reason_key(&issue.1)).or_default().push(issue);
+    }
+    println!(
+        "  {} [{label}] entr{} across {} reason(s) - pass --verbose to list every one:",
+        issues.len(),
+        if issues.len() == 1 { "y" } else { "ies" },
+        groups.len()
+    );
+    for (reason, items) in &groups {
+        println!("    {:>6}x  {reason}", items.len());
+        for (key, _) in items.iter().take(EXAMPLES) {
+            println!("             e.g. {key}");
+        }
+        if items.len() > EXAMPLES {
+            println!("             ... and {} more", items.len() - EXAMPLES);
+        }
+    }
+}
+
+fn print_coverage(pack: &LanguagePack) {
+    println!("language: {}", pack.language);
+    let mut ttot = 0usize;
+    let mut ttr = 0usize;
+    for (name, translated, total) in pack.coverage() {
+        println!("  {name:<20} {translated:>6} / {total:<6} translated");
+        ttot += total;
+        ttr += translated;
+    }
+    println!("  {:<20} {ttr:>6} / {ttot:<6} translated", "TOTAL");
+}
+
+pub(crate) fn cmd_export(input: &Path, output: &Path) -> Result<()> {
+    let image = load_image(input)?;
+    let patcher = DiscPatcher::open(image).context("parse disc image")?;
+    let pack = export_pack(&patcher)?;
+    write_pack(&pack, output)?;
+    print_coverage(&pack);
+    println!("wrote {}", output.display());
+    println!(
+        "NB: the pack contains the game's text - keep it out of version control / \
+         redistribution."
+    );
+    Ok(())
+}
+
+pub(crate) fn cmd_init(
+    lang: &str,
+    from: Option<&Path>,
+    input: Option<&Path>,
+    contributors: Vec<String>,
+    resume: Option<&Path>,
+    chunk: Option<usize>,
+    output: &Path,
+) -> Result<()> {
+    let pack = match (from, input) {
+        (Some(p), _) => read_pack(p)?,
+        (None, Some(disc)) => {
+            let image = load_image(disc)?;
+            let patcher = DiscPatcher::open(image).context("parse disc image")?;
+            export_pack(&patcher)?
+        }
+        (None, None) => bail!("pass --from <pack.yaml> or --input <disc.bin>"),
+    };
+    let mut skeleton = pack.into_skeleton(lang, contributors);
+    if let Some(prev) = resume {
+        let seed = read_pack(prev)?;
+        let n = skeleton.merge_translations(&seed);
+        println!("resumed {n} translation(s) from {}", prev.display());
+    }
+    write_pack(&skeleton, output)?;
+    println!(
+        "wrote {} ({} entries, language {lang})",
+        output.display(),
+        skeleton.sections.total()
+    );
+    if let Some(size) = chunk {
+        if size == 0 {
+            bail!("--chunk must be at least 1");
+        }
+        let chunks = skeleton.split_chunks(size);
+        let stem = output
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "pack".into());
+        let dir = output.parent().unwrap_or(Path::new("."));
+        for (i, c) in chunks.iter().enumerate() {
+            let path = dir.join(format!("{stem}.{:03}.yaml", i + 1));
+            write_pack(c, &path)?;
+        }
+        println!(
+            "wrote {} chunk file(s) of <= {size} entries ({stem}.001.yaml ...)",
+            chunks.len()
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn cmd_strip(pack_path: &Path, output: &Path, notes: Option<&str>) -> Result<()> {
+    let pack = read_pack(pack_path)?;
+    let total = pack.sections.total();
+    let mut dist = pack.strip_sources();
+    if let Some(n) = notes {
+        dist.notes = n.to_string();
+    }
+    let kept = dist.sections.total();
+    write_pack(&dist, output)?;
+    println!(
+        "wrote {} ({kept} translated entr{} kept of {total}; source text stripped)",
+        output.display(),
+        if kept == 1 { "y" } else { "ies" }
+    );
+    Ok(())
+}
+
+pub(crate) fn cmd_merge(base: &Path, packs: &[std::path::PathBuf], output: &Path) -> Result<()> {
+    let mut merged = read_pack(base)?;
+    let mut total = 0usize;
+    for p in packs {
+        let other = read_pack(p)?;
+        let n = merged.merge_translations(&other);
+        total += n;
+        println!("  {}: {n} translation(s)", p.display());
+    }
+    write_pack(&merged, output)?;
+    println!(
+        "wrote {} ({total} translation(s) merged; {} / {} filled)",
+        output.display(),
+        merged.sections.filled(),
+        merged.sections.total()
+    );
+    Ok(())
+}
+
+/// Pack sections whose names import moves when they outgrow their in-place
+/// budget (`legaia_translate::name_pool`).
+const GROWABLE_NAME_SECTIONS: [&str; 5] = [
+    "items",
+    "item_types",
+    "spells",
+    "arts",
+    "accessory_passives",
+];
+
+/// `true` when import may still land a `len`-byte translation of `e` past its
+/// in-place budget. An arts-menu description never moves (the in-battle
+/// matcher reads the combo string after it); a distributable pack carries no
+/// context to tell one apart, so only a working pack's is flagged here.
+fn name_can_grow(section: &str, e: &legaia_translate::Entry, len: usize) -> bool {
+    use legaia_translate::monster_names::RETAIL_LONGEST_NAME;
+    match section {
+        "monster_names" => len <= RETAIL_LONGEST_NAME,
+        "arts" => !e.context.contains("description"),
+        s => GROWABLE_NAME_SECTIONS.contains(&s),
+    }
+}
+
+/// Offline validation: encodability + the pack's own budget. For a
+/// distributable (source-less) pack the budget is only a hint, so this is a
+/// pre-check - `--input` runs the real thing.
+fn offline_check(pack: &LanguagePack) -> Vec<(String, String)> {
+    let mut problems = Vec::new();
+    for (section, entries) in pack.sections.iter() {
+        for e in entries {
+            if !e.is_filled() {
+                continue;
+            }
+            let target = if e.key.starts_with("scus:") || e.key.starts_with("ui:") {
+                Target::CString
+            } else {
+                Target::Segment
+            };
+            match accents::encode_as_imported(&e.translation, target, accents::AccentMode::of(pack))
+            {
+                Err(issues) => {
+                    let detail: Vec<String> = issues.iter().map(ToString::to_string).collect();
+                    problems.push((
+                        format!("[{section}] {}", e.key),
+                        format!("not encodable: {}", detail.join("; ")),
+                    ));
+                }
+                // A name over its in-place budget can still land: the SCUS
+                // name tables move it into room other names give up, and a
+                // monster record grows up to the longest retail name. Only
+                // `--input` can tell, so offline it is not a problem.
+                Ok(bytes) if bytes.len() > e.budget && name_can_grow(section, e, bytes.len()) => {}
+                Ok(bytes) if bytes.len() > e.budget => {
+                    problems.push((
+                        format!("[{section}] {}", e.key),
+                        format!(
+                            "{} bytes over budget ({} > {})",
+                            bytes.len() - e.budget,
+                            bytes.len(),
+                            e.budget
+                        ),
+                    ));
+                }
+                Ok(_) => {}
+            }
+        }
+    }
+    problems
+}
+
+/// Print every character of the pack that will not draw as typed, with its
+/// key and character index, grouped by reason. Returns the line count.
+fn print_char_notes(pack: &LanguagePack, font: Option<&accents::DiscFont>, verbose: bool) -> usize {
+    let mode = accents::AccentMode::of(pack);
+    let notes = accents::pack_notes(pack, font.map(|f| f as &dyn accents::DrawLookup));
+    let bad: Vec<&accents::KeyedNote> = notes
+        .iter()
+        .filter(|n| accents::is_undrawable(&n.note, mode))
+        .collect();
+    let folds = notes.len() - bad.len();
+    let lines: std::collections::BTreeSet<&str> = bad.iter().map(|n| n.key.as_str()).collect();
+    println!(
+        "characters (accents: {}): {} undrawable in {} line(s){}",
+        if mode.header().is_empty() {
+            "strict"
+        } else {
+            mode.header()
+        },
+        bad.len(),
+        lines.len(),
+        if folds > 0 {
+            format!(", {folds} fold to ASCII on import")
+        } else {
+            String::new()
+        }
+    );
+    let shown = if verbose {
+        bad.len()
+    } else {
+        bad.len().min(20)
+    };
+    for n in &bad[..shown] {
+        println!(
+            "  [{}] {} char {} {:?}: {}",
+            n.section, n.key, n.note.index, n.note.fragment, n.note.reason
+        );
+    }
+    if shown < bad.len() {
+        println!("  ... {} more (--verbose)", bad.len() - shown);
+    }
+    lines.len()
+}
+
+pub(crate) fn cmd_stats(pack_path: &Path, input: Option<&Path>, verbose: bool) -> Result<()> {
+    let pack = read_pack(pack_path)?;
+    print_coverage(&pack);
+    let offline_problems = offline_check(&pack);
+    print_issues("over-budget", &offline_problems, verbose);
+    let mut problems = offline_problems.len();
+    if input.is_none() {
+        print_char_notes(&pack, None, verbose);
+    }
+
+    // With a disc: plan every entry exactly as `import` would, in memory. This
+    // measures each target's real byte budget on the disc, which is the only
+    // way to validate a distributable pack (its budgets are hints).
+    if let Some(disc) = input {
+        let image = load_image(disc)?;
+        let mut patcher = DiscPatcher::open(image).context("parse disc image")?;
+        let font = accents::DiscFont::read(&patcher).ok();
+        print_char_notes(&pack, font.as_ref(), verbose);
+        let report = import_pack(&mut patcher, &pack)?;
+        println!(
+            "dry run vs {}: {} would apply, {} already applied, {} skipped",
+            disc.display(),
+            report.applied,
+            report.already_applied,
+            report.issues.len()
+        );
+        print_issues("skip", &report.issues, verbose);
+        problems += report.issues.len();
+    }
+
+    if problems == 0 {
+        println!("all filled entries encode within budget");
+    } else {
+        println!(
+            "{problems} entr{} need fixing",
+            if problems == 1 { "y" } else { "ies" }
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn cmd_diff_disc(input: &Path, other: &Path) -> Result<()> {
+    let a = DiscPatcher::open(load_image(input)?).context("parse target disc image")?;
+    let b = DiscPatcher::open(load_image(other)?).context("parse other disc image")?;
+    let rep = diff::diff_disc(&a, &b);
+
+    println!("target: {}", input.display());
+    println!("other:  {}", other.display());
+    println!(
+        "PROT entries: target={} other={} (LBA-aligned by index: {} / {})",
+        rep.entries_a,
+        rep.entries_b,
+        rep.entries_lba_aligned,
+        rep.entries_a.min(rep.entries_b),
+    );
+
+    let dump = |name: &str, d: &diff::DomainStats| {
+        println!("=== {name} ===");
+        println!(
+            "  entries with segments: target={} other={} both={}",
+            d.entries_a, d.entries_b, d.entries_both
+        );
+        println!(
+            "  total qualifying segments: target={} other={}",
+            d.total_segs_a, d.total_segs_b
+        );
+        println!(
+            "  order-pairable (sum min per entry): {} = {:.1}% of corpus (needs reconcile: {} lines)",
+            d.order_pairable,
+            d.order_pairable_pct(),
+            d.order_delta,
+        );
+        println!(
+            "  order-paired fit: {} = {:.1}% fit target budget, {} overflow",
+            d.order_fit,
+            d.order_fit_pct(),
+            d.order_overflow,
+        );
+        if d.order_overflow > 0 {
+            println!(
+                "    order overflow bytes: total={} avg={:.1} max={}",
+                d.order_overflow_bytes_total,
+                d.order_overflow_bytes_total as f64 / d.order_overflow as f64,
+                d.order_overflow_bytes_max
+            );
+        }
+        println!(
+            "  strict count-match (lower bound): {} / {} entries ({:.1}%), {} paired, {:.1}% fit",
+            d.count_matched_entries,
+            d.entries_both,
+            d.count_match_pct(),
+            d.paired_segments,
+            d.fit_pct(),
+        );
+    };
+    dump("scene MAN dialog", &rep.man);
+    dump("raw event-script carriers", &rep.raw);
+
+    println!("=== other-disc high glyph bytes (0x7F..; accented-Latin tiles) ===");
+    println!("  distinct high bytes: {}", rep.high_byte_census.len());
+    let mut rows: Vec<(u8, u64)> = rep.high_byte_census.iter().map(|(&b, &c)| (b, c)).collect();
+    rows.sort_by_key(|y| std::cmp::Reverse(y.1));
+    for chunk in rows.chunks(6) {
+        let line: Vec<String> = chunk
+            .iter()
+            .map(|(b, c)| format!("0x{b:02x}={c}"))
+            .collect();
+        println!("  {}", line.join("  "));
+    }
+    Ok(())
+}
+
+pub(crate) fn cmd_lift_official(
+    from: &Path,
+    target: &Path,
+    output: &Path,
+    fold_accents: bool,
+    language: Option<&str>,
+    baseline: Option<&Path>,
+) -> Result<()> {
+    let source = DiscPatcher::open(load_image(from)?).context("parse source disc image")?;
+    let usa = DiscPatcher::open(load_image(target)?).context("parse target (USA) disc image")?;
+    let (mut pack, mut rep) = lift::lift_official(&usa, &source)?;
+    if let Some(lang) = language {
+        pack.language = lang.to_string();
+        rep.language = lang.to_string();
+    }
+    // The baseline comparison runs on the raw bytes, before any fold: a line
+    // the patch re-accented (`Silencio` -> `Sil{88}ncio`) is the translator's
+    // work, and folding first would erase exactly that difference.
+    if let Some(base_path) = baseline {
+        let base_disc =
+            DiscPatcher::open(load_image(base_path)?).context("parse baseline disc image")?;
+        let (base_pack, _) = lift::lift_official(&usa, &base_disc)?;
+        drop(base_disc);
+        let blanked = lift::drop_baseline_text(&mut pack, &base_pack);
+        println!(
+            "baseline: {blanked} line(s) the baseline disc also carries blanked; {} translated line(s) remain",
+            pack.sections.filled()
+        );
+    }
+    if fold_accents {
+        let f = lift::fold_pack_accents(&mut pack);
+        println!(
+            "accents: {} folded to ASCII, {} non-accent high glyph(s) left raw",
+            f.folded, f.unmapped
+        );
+    } else {
+        // The accent bytes sit on the accent font's layout: ask the import to
+        // write that font so they draw.
+        pack.accents = accents::AccentMode::Font.header().to_string();
+        println!("accents: kept as PAL bytes; the pack is stamped `accents: font` so they draw");
+    }
+    write_pack(&pack, output)?;
+
+    println!(
+        "lifted {} text from {} ({})",
+        rep.language, rep.exe_name, rep.build_label
+    );
+    println!("name tables:");
+    for t in &rep.tables {
+        if t.located {
+            println!(
+                "  {:<20} located @ 0x{:08x} ({:.0}% valid), {} strings paired",
+                t.name,
+                t.pal_base,
+                t.valid_fraction * 100.0,
+                t.paired
+            );
+        } else {
+            println!("  {:<20} NOT located (no candidate base validated)", t.name);
+        }
+    }
+    match rep.party_base {
+        Some(b) if rep.party_fingerprint_ok => {
+            println!(
+                "  {:<20} located @ 0x{b:08x} (stat fingerprint matched)",
+                "party template"
+            )
+        }
+        Some(b) => println!(
+            "  {:<20} pinned @ 0x{b:08x} (stat fingerprint did NOT match - names read blind)",
+            "party template"
+        ),
+        None => println!(
+            "  {:<20} NOT located (no stat-fingerprint hit)",
+            "party template"
+        ),
+    }
+    println!(
+        "  scus strings: {} filled, {} unmapped; party names: {} / {} filled",
+        rep.names_filled, rep.names_unmapped, rep.party_filled, rep.party_total
+    );
+    let pct = |n: usize, d: usize| {
+        if d == 0 {
+            100.0
+        } else {
+            100.0 * n as f64 / d as f64
+        }
+    };
+    println!(
+        "dialog (MAN): {} / {} paired ({:.1}%), {} unpaired",
+        rep.man_paired,
+        rep.man_total,
+        pct(rep.man_paired, rep.man_total),
+        rep.man_unpaired(),
+    );
+    println!(
+        "dialog (raw): {} / {} paired ({:.1}%), {} unpaired",
+        rep.raw_paired,
+        rep.raw_total,
+        pct(rep.raw_paired, rep.raw_total),
+        rep.raw_unpaired(),
+    );
+    for (label, p) in [("MAN", rep.man_pairing), ("raw", rep.raw_pairing)] {
+        println!(
+            "  {label} pairing: {} structural (script walk), {} by scan ordinal; \
+             {} of the structural pairs differ from the ordinal pairing (shifted lines)",
+            p.structural, p.positional, p.shifted
+        );
+    }
+    println!(
+        "overlay UI pools: {} / {} strings paired",
+        rep.ui_paired, rep.ui_total
+    );
+    for p in &rep.ui_pools {
+        println!("  {:<40} {} / {}", p.label, p.paired, p.total);
+    }
+    println!(
+        "SCUS system strings: {} / {} paired; place-name cells: {} / {} paired",
+        rep.system_paired, rep.system_total, rep.cells_paired, rep.cells_total
+    );
+    println!(
+        "  pool strings paired through a code / data reference: {}",
+        rep.pool_ref_paired
+    );
+    println!(
+        "monster names: {} / {} paired",
+        rep.monsters_paired, rep.monsters_total
+    );
+    println!("wrote {}", output.display());
+    println!(
+        "NB: this pack contains the game's text - keep it out of version control / \
+         redistribution."
+    );
+    Ok(())
+}
+
+pub(crate) fn cmd_coverage(input: &Path, json: bool, verbose: bool) -> Result<()> {
+    let patcher = DiscPatcher::open(load_image(input)?).context("parse disc image")?;
+    let rep = legaia_translate::coverage::measure(&patcher)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rep)?);
+        return Ok(());
+    }
+    let (walked, exported, missing) = rep.totals();
+    println!("=== dialog coverage: {} ({}) ===", rep.exe, rep.codec);
+    for (name, n) in &rep.sections {
+        if *n > 0 {
+            println!("  {name:<20} {n:>6} entries");
+        }
+    }
+    println!(
+        "script-walked lines {walked}, exported {exported}, missing {missing} \
+         across {} MAN carriers",
+        rep.carriers.len()
+    );
+    let mut reasons: BTreeMap<&str, usize> = BTreeMap::new();
+    for c in &rep.carriers {
+        for (_, r) in &c.missing {
+            *reasons.entry(r).or_default() += 1;
+        }
+    }
+    for (r, n) in &reasons {
+        println!("  missing - {r}: {n}");
+    }
+    let sum = |f: fn(&legaia_translate::coverage::CarrierCoverage) -> usize| {
+        rep.carriers.iter().map(f).sum::<usize>()
+    };
+    println!(
+        "exported but not walked (quality-gated) {}; raw lines outside a MAN {}",
+        sum(|c| c.exported_unwalked),
+        rep.raw_unwalked_lines
+    );
+    println!(
+        "text-shaped lines no walk reaches {}; Japanese lines in a Latin MAN {}; \
+         shop vendor names (not exported) {}",
+        sum(|c| c.unreached_candidates),
+        sum(|c| c.foreign_lines),
+        sum(|c| c.shop_names)
+    );
+    println!(
+        "{:>5} {:<10} {:<10} {:>6} {:>6} {:>6} {:>6} {:>7} {:>5}",
+        "entry", "scene", "kind", "walked", "export", "miss", "gated", "unreach", "jp"
+    );
+    for c in &rep.carriers {
+        let interesting =
+            !c.missing.is_empty() || c.unreached_candidates > 0 || c.foreign_lines > 0;
+        if !(verbose || interesting) {
+            continue;
+        }
+        println!(
+            "{:>5} {:<10} {:<10} {:>6} {:>6} {:>6} {:>6} {:>7} {:>5}",
+            c.entry,
+            c.scene,
+            c.kind,
+            c.walked,
+            c.exported,
+            c.missing.len(),
+            c.exported_unwalked,
+            c.unreached_candidates,
+            c.foreign_lines
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn cmd_fit_report(from: &Path, target: &Path) -> Result<()> {
+    let source = DiscPatcher::open(load_image(from)?).context("parse source (PAL) disc image")?;
+    let usa = DiscPatcher::open(load_image(target)?).context("parse target (USA) disc image")?;
+    let rep = fit::lift_and_measure(&usa, &source)?;
+
+    let pct = |n: usize, d: usize| {
+        if d == 0 {
+            0.0
+        } else {
+            100.0 * n as f64 / d as f64
+        }
+    };
+    println!("=== fit report: {} ===", rep.language);
+    println!(
+        "pooled names ({} lines): per-string fit {} ({:.1}%)",
+        rep.name_lines,
+        rep.name_perstring_fit,
+        pct(rep.name_perstring_fit, rep.name_lines)
+    );
+    println!("MAN dialog:");
+    println!(
+        "  lines {} - per-string fit {} ({:.1}%)",
+        rep.man_lines,
+        rep.man_perstring_fit,
+        pct(rep.man_perstring_fit, rep.man_lines)
+    );
+    println!(
+        "  per-MAN (in-place growth) fit {} lines ({:.1}%), residual {} lines",
+        rep.man_lines_perman_fit,
+        pct(rep.man_lines_perman_fit, rep.man_lines),
+        rep.man_lines_residual
+    );
+    println!(
+        "  MAN entries {}: fit-in-place {}, residual {} (overflow {} + structural {})",
+        rep.man_entries,
+        rep.man_entries_fit,
+        rep.man_entries_residual_overflow + rep.man_entries_residual_structural,
+        rep.man_entries_residual_overflow,
+        rep.man_entries_residual_structural,
+    );
+    if !rep.residual_deficits.is_empty() {
+        let sum: usize = rep.residual_deficits.iter().sum();
+        println!(
+            "  residual compressed deficits: max {} B, avg {} B, all within one sector: {}",
+            rep.residual_deficit_max(),
+            sum / rep.residual_deficits.len(),
+            rep.all_residuals_within_one_sector(),
+        );
+    }
+    println!(
+        "raw carriers ({} lines, same-size only): per-string fit {} ({:.1}%)",
+        rep.raw_lines,
+        rep.raw_perstring_fit,
+        pct(rep.raw_perstring_fit, rep.raw_lines)
+    );
+    Ok(())
+}
+
+pub(crate) fn cmd_import(
+    input: &Path,
+    pack_path: &Path,
+    output: Option<&Path>,
+    patch: Option<&Path>,
+    allow_relayout: bool,
+    accent_mode: Option<&str>,
+    verbose: bool,
+) -> Result<()> {
+    if output.is_none() && patch.is_none() {
+        bail!("pass --output <patched.bin> and/or --patch <out.ppf>");
+    }
+    if allow_relayout && patch.is_some() {
+        // A relayout inserts sectors + shifts LBAs, so the patched image is not a
+        // same-size overlay of the original; the PPF diff model can't express it.
+        bail!("--allow-relayout grows the image; write --output <patched.bin>, not --patch");
+    }
+    let mut pack = read_pack(pack_path)?;
+    if let Some(m) = accent_mode {
+        let mode = accents::AccentMode::parse(m)
+            .with_context(|| format!("--accents {m:?}: expected strict, fold or font"))?;
+        pack.accents = mode.header().to_string();
+    }
+    let original = load_image(input)?;
+    let mut patcher = DiscPatcher::open(original.clone()).context("parse disc image")?;
+    let report = if allow_relayout {
+        legaia_translate::import_pack_relayout(&mut patcher, &pack)?
+    } else {
+        import_pack(&mut patcher, &pack)?
+    };
+    if report.relayout_entries > 0 {
+        println!(
+            "disc relayout: grew {} scene MAN entr{} by {} sector(s) total (image +{} bytes)",
+            report.relayout_entries,
+            if report.relayout_entries == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+            report.relayout_sectors_added,
+            report.relayout_sectors_added as usize * 2352,
+        );
+    }
+
+    if report.accents.lines > 0 {
+        println!(
+            "accents: {} encoded into accent-font cells, {} folded to ASCII, in {} line(s)",
+            report.accents.cells, report.accents.folded, report.accents.lines
+        );
+    }
+    if let Some(f) = &report.accent_font {
+        if f.already {
+            println!("accent font: already on this disc ({} cells)", f.cells);
+        } else {
+            println!(
+                "accent font: {} accented glyphs drawn into the dialog font ({} bytes written)",
+                f.cells, f.bytes_written
+            );
+        }
+    }
+
+    if report.relocated_names + report.grown_monster_names > 0 {
+        println!(
+            "longer names: {} executable name(s) moved to free table space, {} monster \
+             record(s) grown",
+            report.relocated_names, report.grown_monster_names
+        );
+    }
+    if report.relocated_strings > 0 {
+        println!(
+            "longer labels: {} menu / system string(s) moved with every reference rewritten",
+            report.relocated_strings
+        );
+    }
+    println!(
+        "applied {} entr{}, {} already applied, {} untranslated (left vanilla)",
+        report.applied,
+        if report.applied == 1 { "y" } else { "ies" },
+        report.already_applied,
+        report.untranslated
+    );
+    for s in report.section_counts(&pack) {
+        if s.filled == 0 {
+            continue;
+        }
+        println!(
+            "  {:20} {:5} of {:5} applied{}",
+            s.name,
+            s.applied + s.already_applied,
+            s.filled,
+            if s.skipped > 0 {
+                format!(" ({} skipped)", s.skipped)
+            } else {
+                String::new()
+            }
+        );
+    }
+    print_issues("skip", &report.issues, verbose);
+
+    let patched = patcher.into_image();
+    if let Some(ppf_path) = patch {
+        let runs = ppf::diff_runs(&original, &patched);
+        let desc = format!("Legaia translation pack ({})", pack.language);
+        crate::disc_io::note_overwrite(ppf_path);
+        std::fs::write(ppf_path, ppf::write_ppf3(&desc, &runs))
+            .with_context(|| format!("write PPF {}", ppf_path.display()))?;
+        println!("wrote {} ({} change runs)", ppf_path.display(), runs.len());
+    }
+    if let Some(out) = output {
+        crate::disc_io::note_overwrite(out);
+        std::fs::write(out, &patched)
+            .with_context(|| format!("write patched image {}", out.display()))?;
+        let cue = out.with_extension("cue");
+        let bin_name = out
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "patched.bin".to_string());
+        std::fs::write(&cue, cue_contents(&bin_name))
+            .with_context(|| format!("write cue {}", cue.display()))?;
+        println!("wrote {} (+ {})", out.display(), cue.display());
+        // Same sanity check the randomizer runs: the patched image still parses.
+        let check = DiscPatcher::open(patched).context("re-parse patched image")?;
+        let _ = apply::current_drops(&check)?;
+    }
+    if !report.issues.is_empty() {
+        println!(
+            "{} entr{} skipped - fix and re-run (import is idempotent)",
+            report.issues.len(),
+            if report.issues.len() == 1 {
+                "y was"
+            } else {
+                "ies were"
+            }
+        );
+    }
+    Ok(())
+}
+
+/// Rows a human-readable space table shows unless `--verbose`.
+const SPACE_ROWS: usize = 12;
+
+fn opt<T: std::fmt::Display>(v: Option<T>) -> String {
+    v.map_or_else(|| "-".to_string(), |v| v.to_string())
+}
+
+fn path_name(p: Option<WritePath>) -> &'static str {
+    match p {
+        None | Some(WritePath::None) => "-",
+        Some(WritePath::Padded) => "padded",
+        Some(WritePath::Relocated) => "relocated",
+        Some(WritePath::Relayout) => "relayout",
+    }
+}
+
+/// `rows` capped at [`SPACE_ROWS`] unless `verbose`, with a "more" line.
+fn capped<T>(rows: &[T], verbose: bool, mut print: impl FnMut(&T)) {
+    let shown = if verbose {
+        rows.len()
+    } else {
+        rows.len().min(SPACE_ROWS)
+    };
+    for r in &rows[..shown] {
+        print(r);
+    }
+    if shown < rows.len() {
+        println!("  ... {} more (--verbose)", rows.len() - shown);
+    }
+}
+
+/// Filled entries that do not land, most over their room first.
+fn misses(entries: &[space::EntrySpace]) -> Vec<&space::EntrySpace> {
+    let mut rows: Vec<&space::EntrySpace> = entries
+        .iter()
+        .filter(|e| {
+            e.outcome
+                .is_some_and(|o| !o.lands() && o != space::Outcome::Untranslated)
+        })
+        .collect();
+    rows.sort_by_key(|e| {
+        (
+            std::cmp::Reverse(e.pack_len.unwrap_or(0) as isize - e.room as isize),
+            e.key.clone(),
+        )
+    });
+    rows
+}
+
+fn print_misses(rows: &[&space::EntrySpace], verbose: bool) {
+    println!("  key                          section             room  pack  over  outcome");
+    capped(rows, verbose, |e| {
+        let over = e.pack_len.map(|p| p as isize - e.room as isize);
+        println!(
+            "  {:<28} {:<18} {:>5}  {:>4}  {:>4}  {}",
+            e.key,
+            e.section,
+            e.room,
+            opt(e.pack_len),
+            opt(over),
+            e.outcome.map_or("-", |o| o.as_str())
+        )
+    });
+}
+
+pub(crate) fn cmd_space(
+    input: &Path,
+    pack_path: Option<&Path>,
+    section: Option<&str>,
+    allow_relayout: bool,
+    scene: Option<usize>,
+    json: bool,
+    verbose: bool,
+) -> Result<()> {
+    let patcher = DiscPatcher::open(load_image(input)?).context("parse disc image")?;
+    let pack = pack_path.map(read_pack).transpose()?;
+
+    if let (Some(prot), Some(pack)) = (scene, pack.as_ref()) {
+        let t0 = std::time::Instant::now();
+        let fit = space::scene_fit(&patcher, pack, prot, allow_relayout);
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&fit)?);
+            return Ok(());
+        }
+        let s = &fit.scene;
+        println!(
+            "scene {} ({}): {} keyed, {} filled - footprint {} disc {} slack {}",
+            s.prot,
+            s.scene.as_deref().unwrap_or("?"),
+            s.lines,
+            s.filled.unwrap_or(0),
+            s.footprint,
+            s.disc_len,
+            s.slack
+        );
+        println!(
+            "  path {} written {} full-overflow {} padded-overflow {} refused {} \
+             rolled back {} relayout {} would-add {}",
+            path_name(s.path),
+            opt(s.written_len),
+            opt(s.full_overflow),
+            opt(s.padded_overflow),
+            s.refused,
+            s.rolled_back.len(),
+            opt(s.relayout_sectors),
+            opt(s.relayout_would_add)
+        );
+        let rows = misses(&fit.entries);
+        if !rows.is_empty() {
+            print_misses(&rows, verbose);
+        }
+        println!("scene fit took {ms:.1} ms");
+        return Ok(());
+    }
+
+    let mut report = space::space_report(
+        &patcher,
+        pack.as_ref(),
+        space::SpaceOptions {
+            relayout: allow_relayout,
+        },
+    )?;
+    if let Some(s) = section {
+        report.retain_section(s);
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    print_space(&report, verbose);
+    if !report.characters.is_empty() {
+        let lines: std::collections::BTreeSet<&str> =
+            report.characters.iter().map(|n| n.key.as_str()).collect();
+        println!(
+            "\n== characters that will not draw as typed: {} in {} line(s) ==",
+            report.characters.len(),
+            lines.len()
+        );
+        capped(&report.characters, verbose, |n| {
+            println!(
+                "  {:<28} char {:>3} {:<6} {}",
+                n.key,
+                n.note.index,
+                format!("{:?}", n.note.fragment),
+                n.note.reason
+            )
+        });
+    }
+    Ok(())
+}
+
+fn print_name_regions(r: &space::SpaceReport, verbose: bool) {
+    println!(
+        "\n== SCUS name regions ({} bytes, English leaves {} free{}) - fullest first ==",
+        r.summary.name_bytes,
+        r.summary.name_free_english,
+        r.summary
+            .name_free_pack
+            .map_or(String::new(), |f| format!(", the pack leaves {f}"))
+    );
+    println!("  region  VA range                total  strings  english  free  pack  free");
+    let mut rows: Vec<&space::NameRegion> = r.name_regions.iter().collect();
+    rows.sort_by_key(|g| {
+        (
+            g.pack_free.unwrap_or(g.english_free),
+            std::cmp::Reverse(g.total),
+            g.index,
+        )
+    });
+    capped(&rows, verbose, |g| {
+        println!(
+            "  {:>6}  0x{:08x}..0x{:08x}  {:>5}  {:>7}  {:>7}  {:>4}  {:>4}  {:>4}",
+            g.index,
+            g.start_va,
+            g.end_va,
+            g.total,
+            g.strings,
+            g.english_used,
+            g.english_free,
+            opt(g.pack_used),
+            opt(g.pack_free)
+        )
+    });
+    let movable = r.names.iter().filter(|n| n.movable).count();
+    let mut pins: BTreeMap<String, usize> = BTreeMap::new();
+    for p in r.names.iter().filter_map(|n| n.pin) {
+        let name = serde_json::to_string(&p).unwrap_or_default();
+        *pins.entry(name.trim_matches('"').to_string()).or_default() += 1;
+    }
+    let pins: Vec<String> = pins.iter().map(|(k, v)| format!("{k} {v}")).collect();
+    println!(
+        "  names: {movable} movable, {} pinned ({})",
+        r.names.len() - movable,
+        pins.join(", ")
+    );
+}
+
+fn print_scenes(r: &space::SpaceReport, with_pack: bool, verbose: bool) {
+    println!(
+        "\n== scene MANs ({} scenes, room = compressed footprint) - tightest first ==",
+        r.scenes.len()
+    );
+    if with_pack {
+        println!(
+            "  prot  scene       lines  filled  footprint   disc  written  over  path       rolled  +sect"
+        );
+    } else {
+        println!("  prot  scene       lines  footprint   disc  slack");
+    }
+    let mut rows: Vec<&space::SceneSpace> = r.scenes.iter().collect();
+    if with_pack {
+        rows.sort_by_key(|s| {
+            (
+                std::cmp::Reverse(s.rolled_back.len()),
+                std::cmp::Reverse(s.full_overflow.or(s.padded_overflow).unwrap_or(0)),
+                s.prot,
+            )
+        });
+    } else {
+        rows.sort_by_key(|s| (s.slack, s.prot));
+    }
+    capped(&rows, verbose, |s| {
+        let name = s.scene.as_deref().unwrap_or("?");
+        if with_pack {
+            println!(
+                "  {:>4}  {:<10}  {:>5}  {:>6}  {:>9}  {:>5}  {:>7}  {:>4}  {:<9}  {:>6}  {:>5}",
+                s.prot,
+                name,
+                s.lines,
+                opt(s.filled),
+                s.footprint,
+                s.disc_len,
+                opt(s.written_len),
+                opt(s.full_overflow.or(s.padded_overflow)),
+                path_name(s.path),
+                s.rolled_back.len(),
+                opt(s.relayout_sectors.or(s.relayout_would_add))
+            );
+        } else {
+            println!(
+                "  {:>4}  {:<10}  {:>5}  {:>9}  {:>5}  {:>5}",
+                s.prot, name, s.lines, s.footprint, s.disc_len, s.slack
+            );
+        }
+    });
+    if with_pack {
+        println!(
+            "  (over = compressed bytes past the footprint before rollback; +sect = relayout \
+             sectors staged, or that --allow-relayout would add)"
+        );
+    }
+}
+
+/// The per-category capacity table, the code images behind `ui_menu` /
+/// `system_text`, and the space ledger's regions.
+fn print_categories(r: &space::SpaceReport, with_pack: bool, verbose: bool) {
+    println!("\n== room per category (bytes; free = what a longer string can still take) ==");
+    println!(
+        "  category        strings  growable  english   room  free  spare{}",
+        if with_pack { "  pack free" } else { "" }
+    );
+    for c in &r.categories {
+        println!(
+            "  {:<14}  {:>7}  {:>8}  {:>7}  {:>5}  {:>4}  {:>5}{}",
+            c.category,
+            c.strings,
+            c.growable,
+            c.english_bytes,
+            c.room_bytes,
+            c.free_english,
+            c.spare_bytes,
+            if with_pack {
+                format!("  {:>9}", opt(c.free_pack))
+            } else {
+                String::new()
+            }
+        );
+    }
+    for c in &r.categories {
+        println!(
+            "  {}: {}; reached by {}.",
+            c.category, c.carrier, c.addressing
+        );
+        println!("    longer: {}.", c.growth);
+        if verbose {
+            for m in &c.competing {
+                println!("    shares with: {m}");
+            }
+        }
+    }
+    if !r.code_images.is_empty() {
+        println!("\n== code images (ui_menu / system_text): strings that can move ==");
+        println!("  image        section      strings  movable  free  spare  pinned");
+        for c in &r.code_images {
+            let pinned: Vec<String> = c.pinned.iter().map(|(k, v)| format!("{k} {v}")).collect();
+            println!(
+                "  {:<11}  {:<11}  {:>7}  {:>7}  {:>4}  {:>5}  {}",
+                c.image,
+                c.section,
+                c.strings,
+                c.movable,
+                c.english_free,
+                c.spare,
+                pinned.join(", ")
+            );
+        }
+    }
+    if verbose && !r.spare_regions.is_empty() {
+        println!("\n== space ledger: spare regions and their owners ==");
+        for g in &r.spare_regions {
+            println!(
+                "  {:<11}  0x{:08x}..0x{:08x}  {:>5} B ({:>5} zero)  {}{}  - {}",
+                g.image,
+                g.start_va,
+                g.end_va,
+                g.end_va - g.start_va,
+                g.zero_on_disc,
+                g.owner,
+                if g.mods.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", g.mods.join(" "))
+                },
+                g.why
+            );
+        }
+    }
+}
+
+fn print_space(r: &space::SpaceReport, verbose: bool) {
+    let with_pack = r.language.is_some();
+    match &r.language {
+        Some(l) => println!(
+            "space report: pack '{l}' ({} filled of {} keys){}",
+            r.summary.filled,
+            r.summary.entries,
+            if r.relayout { ", relayout dry run" } else { "" }
+        ),
+        None => println!("space report: disc only ({} keys)", r.summary.entries),
+    }
+
+    if !r.categories.is_empty() {
+        print_categories(r, with_pack, verbose);
+    }
+
+    if !r.name_regions.is_empty() {
+        print_name_regions(r, verbose);
+    }
+
+    if !r.monsters.is_empty() {
+        let mut rooms: BTreeMap<usize, usize> = BTreeMap::new();
+        for m in &r.monsters {
+            *rooms.entry(m.room).or_default() += 1;
+        }
+        let rooms: Vec<String> = rooms.iter().map(|(k, v)| format!("{k}: {v}")).collect();
+        let capped_n = r.monsters.iter().filter(|m| m.cap < m.longest).count();
+        println!(
+            "\n== monster names ({} records) ==\n  in-place room {}; a longer name grows its \
+             record to {} bytes ({capped_n} record(s) capped lower by the retail block / head bound)",
+            r.monsters.len(),
+            rooms.join(", "),
+            r.monsters.first().map_or(0, |m| m.longest)
+        );
+    }
+
+    if !r.pools.is_empty() {
+        println!("\n== fixed-room pools (ui_menu / system_text) - least slack first ==");
+        println!(
+            "  pool  section      prot  VA window               strings  english  room  slack  pack"
+        );
+        let mut rows: Vec<&space::PoolSpace> = r.pools.iter().filter(|p| p.strings > 0).collect();
+        rows.sort_by_key(|p| (p.slack, p.index));
+        capped(&rows, verbose, |p| {
+            println!(
+                "  {:>4}  {:<11}  {:>4}  0x{:08x}..0x{:08x}  {:>7}  {:>7}  {:>4}  {:>5}  {:>4}",
+                p.index,
+                p.section,
+                opt(p.prot),
+                p.va_start,
+                p.va_end,
+                p.strings,
+                p.english_bytes,
+                p.room_bytes,
+                p.slack,
+                opt(p.pack_bytes)
+            )
+        });
+    }
+
+    if !r.scenes.is_empty() {
+        print_scenes(r, with_pack, verbose);
+    }
+
+    if !r.carriers.is_empty() {
+        let streaming: Vec<&space::CarrierSpace> =
+            r.carriers.iter().filter(|c| c.streaming).collect();
+        let event: Vec<&space::CarrierSpace> = r.carriers.iter().filter(|c| !c.streaming).collect();
+        println!(
+            "\n== raw carriers: {} streaming dungeon scene(s), {} event carrier(s) \
+             ({} lines, own span only) ==",
+            streaming.len(),
+            event.len(),
+            event.iter().map(|c| c.lines).sum::<usize>()
+        );
+        if !streaming.is_empty() {
+            println!("  prot  scene       lines  footprint  sector slack  path       +sect");
+            let mut rows = streaming.clone();
+            rows.sort_by_key(|c| (c.sector_slack.unwrap_or(0), c.prot));
+            capped(&rows, verbose, |c| {
+                println!(
+                    "  {:>4}  {:<10}  {:>5}  {:>9}  {:>12}  {:<9}  {:>5}",
+                    c.prot,
+                    c.scene.as_deref().unwrap_or("?"),
+                    c.lines,
+                    c.footprint,
+                    opt(c.sector_slack),
+                    path_name(c.path),
+                    opt(c.grown_sectors)
+                )
+            });
+        }
+    }
+
+    if with_pack {
+        println!("\n== outcomes of filled entries ==");
+        for (o, n) in &r.summary.outcomes {
+            println!("  {n:>7}  {o}");
+        }
+        if r.summary.relayout_entries > 0 {
+            println!(
+                "  relayout grows {} entr(ies) by {} sector(s)",
+                r.summary.relayout_entries, r.summary.relayout_sectors
+            );
+        }
+        let rows = misses(&r.entries);
+        if !rows.is_empty() {
+            println!("\n== entries that do not land - most over first ==");
+            print_misses(&rows, verbose);
+        }
+    }
+}

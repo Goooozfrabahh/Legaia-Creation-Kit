@@ -1,0 +1,281 @@
+# Cheat databases
+
+Published GameShark / Pro-Action-Replay cheat codes for *Legend of Legaia*
+(NTSC-U) are labelled `(address, value)` writes into the running game, which
+makes them ground-truth RAM addresses: "Infinite HP (Vahn)" names the cell that
+holds Vahn's HP. The project parses two public cheat databases, classifies every
+code by the RAM region it targets, and can apply them to the Rust engine to
+check that the engine's state lives where retail's does.
+
+| Section | Covers |
+|---|---|
+| [Format 1](#format-1---gameshark-text-dump) / [Format 2](#format-2---mednafen-cht) | The two input encodings |
+| [Parser + classifier](#parser--classifier) | `crates/cheats` API and the `cheat-tool` CLI |
+| [Citation table](#citation-table-per-category) | What the codes pin, per RAM region |
+| [Runtime applier](#runtime-applier) | `legaia-engine play-window --cheat-file` |
+
+The data files live under [`data/cheats/`](../../data/cheats/) and
+are committed to the repo. They contain no Sony-owned bytes - just
+labelled `(addr, value)` pairs published in public cheat databases
+since the late 1990s.
+
+## Format 1 - GameShark text dump
+
+`legaia-ntsc-u.gs.txt` is a plain-text dump where each line is one
+write:
+
+```text
+R I 2 L 0 80084816 64 100 AP
+^ ^ ^ ^ ^ ^^^^^^^^ ^^ ^^^^^^^^
+| | | | | |        |  description (rest of line)
+| | | | | |        value (hex, no 0x)
+| | | | | address (8 hex digits, no 0x)
+| | | | compression group (always 0)
+| | | endianness (L = little)
+| | width-in-bytes (1, 2, or 4)
+| encoding flag (always I)
+read/write classifier (always R for cheat-as-write)
+```
+
+The high byte of the address is the GameShark **prefix**:
+
+| Prefix | Meaning | Example |
+|---|---|---|
+| `0x80` | u16 LE write | `80084816 0064` ⇒ `mem16[0x80084816] = 0x0064` |
+| `0x30` | u8 write | `300848A3 0000` ⇒ `mem8[0x800848A3] = 0x00` |
+| `0xD0` | conditional: if `mem16 == value`, execute next | `D007B7C0 0100` (Select pressed) |
+| `0xE0` | conditional: if `mem16 != value`, execute next | `E007B83C 0003` |
+
+When the prefix is `0x80` the parser uses the field-width column as
+ground truth (1 / 2 / 4) and rewrites the prefix accordingly - this
+matters because user-edited dumps occasionally desync the prefix
+from the column value.
+
+## Format 2 - Mednafen `.cht`
+
+`legaia-ntsc-u.cht` is a TOML-shaped dump where each effect is one
+indexed triplet:
+
+```toml
+cheat0_desc = "Max Exp (Vahn)"
+cheat0_code = "80084708 FFFF+8008470A 0098"
+cheat0_enable = false
+```
+
+Multi-write effects join their codes with `+`; the parser splits on
+that delimiter. Conditional codes use the same `D0` / `E0` prefix
+encoding as Format 1.
+
+## Parser + classifier
+
+`crates/cheats` exposes:
+
+| Item | Purpose |
+|---|---|
+| [`parse_gs_text`] | Format 1 → [`Database`] |
+| [`parse_mednafen_cht`] | Format 2 → [`Database`] |
+| [`Database::dedupe_identical`] | Drop the "Have 99 Items × 70" duplicate sprawl |
+| [`classify_address`] | Map one address to a [`Category`] + detail label |
+| [`Category`] | Coarse buckets, in enum order: CharacterRecord / PartyMoney / Inventory / BattleActor / ScriptVmGlobal / PadInput / CameraGlobal / WorldStoryFlag / Minigame / FieldVmCollision / ScratchActiveActor / CodePatch / Unknown |
+| `classify_writes` | Roll a set of **changed** RAM addresses up into per-region buckets (the classification half of a gameplay-driven write tracer) |
+
+### Write taxonomy
+
+`taxonomy::classify_writes(addrs)` buckets a set of changed RAM addresses by
+the [`Category`] region they fall in (via [`classify_address`]), de-duped and
+with per-bucket sample classifications. It flags writes that land **outside**
+every known data region (`Category::Unknown`) or in the `0x8007Bxxx` script-VM /
+build-flag scratch (`Category::ScriptVmGlobal` - the band holding the
+`0x8007B8C2` build-mode selector and the debug-menu enable) - the anomalies a
+write tracer exists to surface. Pure and capture-free (input is a list of
+`u32`), so it is unit-tested with synthetic deltas. Wired end-to-end as
+`mednafen-state write-taxonomy LEFT RIGHT`, which diffs two save states at byte
+granularity and prints the per-region roll-up + attack-surface candidates.
+
+The companion `cheat-tool` CLI:
+
+```bash
+cargo run -p legaia-cheats --bin cheat-tool -- parse data/cheats/legaia-ntsc-u.cht
+cargo run -p legaia-cheats --bin cheat-tool -- list data/cheats/legaia-ntsc-u.gs.txt
+cargo run -p legaia-cheats --bin cheat-tool -- classify data/cheats/legaia-ntsc-u.gs.txt --dedupe
+cargo run -p legaia-cheats --bin cheat-tool -- diff data/cheats/legaia-ntsc-u.gs.txt data/cheats/legaia-ntsc-u.cht
+cargo run -p legaia-cheats --bin cheat-tool -- extract-offsets data/cheats/legaia-ntsc-u.cht
+cargo run -p legaia-cheats --bin cheat-tool -- offset-table data/cheats/legaia-ntsc-u.cht
+```
+
+[`parse_gs_text`]: ../../crates/cheats/src/gs_text.rs
+[`parse_mednafen_cht`]: ../../crates/cheats/src/mednafen_cht.rs
+[`Database`]: ../../crates/cheats/src/lib.rs
+[`Database::dedupe_identical`]: ../../crates/cheats/src/lib.rs
+[`classify_address`]: ../../crates/cheats/src/classify.rs
+[`Category`]: ../../crates/cheats/src/classify.rs
+
+## Citation table (per category)
+
+What the cheat database pins in each category. The `Detail`
+column is the [`ClassifiedAddress::detail`] string the classifier
+emits.
+
+### CharacterRecord
+
+Per-character `0x414`-byte record at `0x80084708 + slot * 0x414`.
+Every offset is named in [`docs/formats/save-record.md`](../formats/save-record.md);
+the `Detail` strings drop in via the field-name table there.
+
+### Inventory
+
+Inventory array at `0x80085958`, 2-byte stride alternating `(id, count)`. The
+`Have 99 Items` cheat stamps `0x63` into every count byte across its **72-slot
+general-item page** - the 72 is the cheat's span, not an engine bound; the live
+inventory window is 128 or 256 slots (see
+[memory-map](memory-map.md#0x80085958---item-inventory)). The `Have Max Items`
+cheat stamps `0xFF`; `Item Modifier` zeroes the ID byte.
+
+### BattleActor
+
+Per-actor battle record at `0x800EC9E8 + n * 0x2D4`. Pinned offsets:
+
+| Offset | Field | Cheat |
+|---:|---|---|
+| `+0x14C` | `hp_curr` | "Infinite HP" (per character) |
+| `+0x14E` | `hp_max` | (read by reader at battle init) |
+| `+0x150` | `mp_curr` | "Infinite MP" |
+| `+0x152` | `mp_max` | |
+| `+0x172` | `hp_max_settled` | "Infinite HP" second site |
+| `+0x174` | `mp_max_settled` | "Infinite MP" second site |
+
+The "second site" pair at `+0x172 / +0x174` is the engine's record
+copy that survives `FUN_80042558`'s per-frame stat aggregation
+clamp. Cheats target both sites to keep the value pinned across
+clamping.
+
+### ScriptVmGlobal
+
+| Address | Cheat | Engine semantic |
+|---|---|---|
+| `0x8007B450` | "Status Modifier Menu", "Save Anywhere", "Shop Modifier", "End of Game Stat Page" | Menu-request register the menu overlay polls each frame |
+| `0x8007B5FC` | "No Random Battles" | Encounter step counter (cheat sets to `0x377` to force trigger or suppress) |
+| `0x8007B6A8` | "Save Anywhere (Press Select+X)" | Save-anywhere allow flag |
+| `0x8007B7C0` | (cond gate in many cheats) | Pad state register the `D0` / `E0` codes read |
+| `0x8007B83C` | "Press R2 For Debug Menu" | Next game-mode register; FUN_801E30E4 sets `0x1A` for FMV |
+
+### CameraGlobal
+
+`0x8007B6F4` is the camera mode word. "Control Camera" and "Small
+Maps" cheats target it.
+
+### PartyMoney
+
+The party-wide globals between the inventory header and the per-character
+records: `0x80084540` scene-name pool slot, `0x80084570` game time (u32),
+`0x80084594` party-member count, `0x80084598..0x8008459A` member ids and the
+Noa / Gala join gates, `0x8008459C` gold (u32), `0x800845A4` / `0x800845A6`
+casino coins, `0x800845DC` scene-name mirror.
+
+### WorldStoryFlag
+
+A region bucket for the story-flag block at `0x80085600..0x80085800` - outside
+the per-character records and outside the inventory window. **No cheat in the
+shipped corpus lands in it.** The one candidate, "Access All Towns When You Use
+Door of Wind" at `0x8008575C` / `0x8008575E` (a 32-bit visited-towns bitmask),
+is claimed first by `classify_script_vm_global`, which names those two cells
+`story_flag_door_of_wind_lo` / `_hi`, so `cheat-tool list` reports it as
+`ScriptVmGlobal`. That is arm ordering inside `classify_address`, not a
+statement about the cheat.
+
+### Minigame
+
+Mini-game scratch RAM. The fishing minigame uses
+`0x801D9168 / 0x801D9274 / 0x801D9298 / 0x801D91CC` for tension /
+casting power / life / fish ID; baka fighter at
+`0x801DBFC4 / 0x801DBFF0 / 0x801DC06C`; dance points at
+`0x801D53CC`; slot machine at `0x801D3CAC`. These are cells inside
+the mini-game overlay images, so they are recorded as citations and are not in
+the applier's `ram_map` registry (the engine's mini-game sessions keep their own
+state). The one mini-game cell the applier maps is the fishing point pool
+`0x8008444C`.
+
+### FieldVmCollision
+
+The "Walk Thru Walls" cheat patches four instructions in the field
+overlay: `0x801D078C / 0x801D071C / 0x801D065C / 0x801D06BC`. Each is
+a `beq v0,zero,...` in the collision path of the player movement
+controller `FUN_801D01B0`; the cheat writes `0x06` over the low byte,
+which rewrites the branch displacement so the collision response is
+bypassed. It is a code patch, not a RAM cell - see
+[`memory-map.md`](memory-map.md#field--dialog--world-map-prot-0897).
+
+### ScratchActiveActor
+
+`0x8007A6BC` is shared scratch for the currently-acting character.
+Every "Infinite HP / MP" cheat hits this cell first - the runtime
+reads it during the per-actor frame tick before applying back to
+the per-record copy. Useful to know when chasing post-battle
+stat-leak issues.
+
+### CodePatch
+
+A handful of cheats patch running code rather than a RAM cell. The classifier
+flags these so they can be told apart. Three write `0x2400` to an instruction's
+**upper** halfword (`addr % 4 == 2`), rendering it `addiu $zero, $zero, imm` -
+the GameShark `nop` idiom:
+
+- `0x8004309E` – "Infinite Items All Slots" nops the
+  count-decrement instruction.
+- `0x8004390E` – "Remove Vahn's Chest" nops a draw-call site.
+- `0x8007EA96` – "Maxed HP for All Characters". **This address is past the end
+  of the `SCUS_942.54` image** - text spans `0x80010000..0x8007B800` - so
+  whatever it patches is not SCUS code, even though the bucket is `CodePatch`.
+
+One is a different shape and does not write `0x2400` at all:
+
+- `0x800422F4` – "Bought Any Item / Find Items You Will Get 99 Quantity" writes
+  `0001`. The word there is `bne r2, r0, +2` inside the inventory-add clamp
+  (`slti r2,r2,100` / `addiu r3,99` / `sb`); shortening the displacement makes
+  the clamp always run.
+
+These are useful Ghidra anchors: a patched instruction address is a
+call-site hint that an address-reference query does not surface.
+
+## Runtime applier
+
+`legaia-engine play-window --cheat-file <PATH>` parses the file via
+`legaia_cheats`, applies every entry **once at boot** via
+`legaia_engine_cheats::cheat_applier::apply`, and dispatches each
+write through the `ram_map` registry to the appropriate `World` /
+`CharacterRecord` field. Conditional codes are treated as
+always-true by default (use `--cheat-strict` to honour them, which
+will skip every cheat that gates on a button press the engine
+doesn't emulate).
+
+The applier reports per-entry status:
+
+```text
+Cheat report (49 entries, 96 writes; 71 applied, 25 unmapped, 0 unknown):
+  ok    Infinite HP (Vahn)............................................ 4/4 writes
+  ok    Infinite Gold (Never Glitchy)................................. 1/1 writes
+  skip  Walk Thru Walls............................................... 0/4 writes
+  ...
+```
+
+A `skip` line means every write in the entry landed in a RAM region
+the `ram_map` registry does not map onto engine state (for Walk Thru
+Walls that region is `FieldVmCollision`); `part` marks a mixed entry.
+
+Use this to validate that a code change keeps the same set of
+cheats applying. If a previously-applying cheat starts failing,
+either:
+
+- the engine field it targets was renamed (update `ram_map`), or
+- the engine no longer exposes the field (update `WorldField`), or
+- the cheat database had stale data (update the citation in the
+  format doc).
+
+## See also
+
+- [`docs/formats/save-record.md`](../formats/save-record.md) - full
+  record offset table that the cheat citations anchor.
+- [`docs/reference/memory-map.md`](memory-map.md) - the RAM map the
+  cheat-pinned globals sit in.
+- [`crates/cheats/README.md`](../../crates/cheats/README.md) -
+  parser + CLI reference.

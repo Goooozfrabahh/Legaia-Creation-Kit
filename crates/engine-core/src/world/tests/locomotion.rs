@@ -1,0 +1,1048 @@
+use super::*;
+use legaia_engine_mode::mode::SceneMode;
+
+#[test]
+fn locomotion_moves_player_on_dpad() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    world.actors[0].move_state.world_x = 200;
+    world.actors[0].move_state.world_z = 200;
+    // Up -> +Z. speed = (8 * 0x1000 >> 12) * 1 = 8 -> +8 in 2-unit steps.
+    world.set_pad(input::PadButton::Up.mask());
+    let _ = world.tick();
+    assert_eq!(world.actors[0].move_state.world_z, 208);
+    assert_eq!(world.actors[0].move_state.world_x, 200);
+}
+
+#[test]
+fn locomotion_diagonal_normalises_speed() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    world.actors[0].move_state.world_x = 400;
+    world.actors[0].move_state.world_z = 400;
+    // Up+Right -> Z+ and X+. speed = 8, diagonal -= 8>>2 = 6 -> +6 each.
+    world.set_pad(input::PadButton::Up.mask() | input::PadButton::Right.mask());
+    let _ = world.tick();
+    assert_eq!(world.actors[0].move_state.world_z, 406);
+    assert_eq!(world.actors[0].move_state.world_x, 406);
+}
+
+#[test]
+fn precise_movement_walks_true_diagonals_at_full_speed() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    world.locomotion.precise_movement = true;
+    world.actors[0].move_state.world_x = 400;
+    world.actors[0].move_state.world_z = 400;
+    // Up+Right in precise mode: the normalised 45-degree vector at speed 8
+    // is ~5.66 units per axis per frame (vs the quantised path's 6+6 =
+    // over-speed diagonal). Two frames accumulate ~11.3 per axis; the
+    // carry keeps the fraction, so both axes land on the same total.
+    for _ in 0..2 {
+        world.set_pad(input::PadButton::Up.mask() | input::PadButton::Right.mask());
+        let _ = world.tick();
+    }
+    let dx = world.actors[0].move_state.world_x - 400;
+    let dz = world.actors[0].move_state.world_z - 400;
+    assert_eq!(dx, dz, "true 45-degree diagonal: equal per-axis distance");
+    assert!((10..=12).contains(&dx), "~8/sqrt(2) per frame, got {dx}");
+}
+
+#[test]
+fn precise_movement_honours_continuous_camera_azimuth() {
+    // The default path rings the held mask by whole eighth-turns (retail's
+    // `func_0x800467e8`); precise mode rotates the screen vector continuously.
+    // The contrast is therefore an azimuth the ring cannot express: 200 units
+    // is ~17.6 degrees, which rounds to ring step 0, so the rung walk is world
+    // `+Z` alone while the continuous walk leans into `+X` without reaching it.
+    let drive = |precise: bool, azimuth: u16| -> (i16, i16) {
+        let mut world = World::new();
+        world.mode = SceneMode::Field;
+        world.install_field_player(0);
+        world.locomotion.precise_movement = precise;
+        world.locomotion.camera_azimuth = azimuth;
+        world.actors[0].move_state.world_x = 400;
+        world.actors[0].move_state.world_z = 400;
+        for _ in 0..4 {
+            world.set_pad(input::PadButton::Up.mask());
+            let _ = world.tick();
+        }
+        (
+            world.actors[0].move_state.world_x - 400,
+            world.actors[0].move_state.world_z - 400,
+        )
+    };
+    let (qx, qz) = drive(false, 200);
+    assert!(qx == 0 && qz > 0, "rung: step-0 rounding walks +Z only");
+    let (px, pz) = drive(true, 200);
+    assert!(px > 0 && pz > px, "precise: a 17.6-degree lean into +X");
+
+    // 512 units is exactly 45 degrees, which the ring *can* express - and the
+    // rung path walks the same true diagonal precise mode does. That is the
+    // half of the eight-step ring the old 90-degree quantisation dropped: it
+    // snapped this azimuth to a quadrant and walked +X alone.
+    let (qx, qz) = drive(false, 512);
+    assert_eq!(qx, qz, "rung: a 45-degree camera walks the true diagonal");
+    assert!(qx > 0, "and it does move");
+}
+
+#[test]
+fn precise_movement_passes_analog_stick_angle_through() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    world.locomotion.precise_movement = true;
+    world.actors[0].move_state.world_x = 400;
+    world.actors[0].move_state.world_z = 400;
+    // Stick deflected up-and-slightly-right (~26.6 degrees off forward):
+    // an angle no 8-way quantisation can produce. Stick +Y is down, so
+    // "up" is negative Y. Expect Z to advance ~2x X.
+    for _ in 0..8 {
+        world.input.set_lstick((50, -100));
+        world.set_pad(0);
+        let _ = world.tick();
+    }
+    let dx = (world.actors[0].move_state.world_x - 400) as f32;
+    let dz = (world.actors[0].move_state.world_z - 400) as f32;
+    assert!(dx > 0.0 && dz > 0.0, "moved along the stick angle");
+    let ratio = dz / dx;
+    assert!(
+        (1.6..=2.4).contains(&ratio),
+        "z/x tracks the 2:1 stick deflection, got {ratio}"
+    );
+}
+
+#[test]
+fn precise_movement_off_is_bit_identical_to_quantised_path() {
+    // The default (precise off) must reproduce the historical positions
+    // exactly - the determinism / replay contract.
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    world.actors[0].move_state.world_x = 400;
+    world.actors[0].move_state.world_z = 400;
+    world.set_pad(input::PadButton::Up.mask() | input::PadButton::Right.mask());
+    let _ = world.tick();
+    assert_eq!(world.actors[0].move_state.world_z, 406);
+    assert_eq!(world.actors[0].move_state.world_x, 406);
+    assert_eq!(
+        world.locomotion.precise_move_carry,
+        (0.0, 0.0),
+        "carry untouched"
+    );
+}
+
+#[test]
+fn precise_movement_stops_at_wall() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    world.locomotion.precise_movement = true;
+    world.actors[0].move_state.world_x = 200;
+    world.actors[0].move_state.world_z = 250;
+    // Same wall band as `locomotion_stops_at_wall_and_slides_along_it` - the precise stepper
+    // routes through the same per-axis collision probes.
+    world.paint_field_collision(1, (1, 2), (3, 4), 0);
+    world.set_pad(input::PadButton::Up.mask());
+    let _ = world.tick();
+    assert_eq!(world.actors[0].move_state.world_z, 254);
+    assert_eq!(world.actors[0].move_state.world_x, 200);
+}
+
+#[test]
+fn locomotion_stops_at_wall_and_slides_along_it() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    world.actors[0].move_state.world_x = 200;
+    world.actors[0].move_state.world_z = 250;
+    // Block tile (col=1, row=3) - covers world z in [256,384) under the
+    // retail biased derivation, the band the +Z walk crosses into at
+    // z=256.
+    world.paint_field_collision(1, (1, 2), (3, 4), 0);
+    world.set_pad(input::PadButton::Up.mask());
+    let _ = world.tick();
+    // Player advances 250 -> 254, then the candidate 256 lands in the
+    // blocked tile and is rejected. Without the wall it would reach 258.
+    assert_eq!(world.actors[0].move_state.world_z, 254);
+    // ... and the wall-slide resolver `FUN_80046494`, which
+    // `step_field_locomotion` now runs the held mask through, skids the
+    // player along that wall: the painted band is finite, so the resolver's
+    // perpendicular sweep finds more open ground on the `+X` side and ORs
+    // that bit into the mask the step loop walks. The pre-wire stepper
+    // stopped dead at `x = 200`.
+    assert_eq!(world.actors[0].move_state.world_x, 208);
+}
+
+#[test]
+fn locomotion_follows_terrain_height_only_when_gated_on() {
+    const STRIDE: usize = 0x80;
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    world.reset_field_collision_grid();
+    world.actors[0].move_state.world_x = 200;
+    world.actors[0].move_state.world_z = 200;
+    // Sentinel: distinct from both floor tiers, and inside the ledge-hop dead
+    // band against them (`floor - y` lands in `[-0x60, 0x61)` either way), so
+    // the vertical controller's hop trigger stays out of this test.
+    world.actors[0].move_state.world_y = 20;
+    // Floor tier 3 -> -40 across the 2x2 block around tile (1,1), which the
+    // +Z walk lands in (x=200, z=208 -> tile (1,1)).
+    world.terrain.floor_height_lut[3] = -40;
+    let base = STRIDE + 1;
+    for &i in &[base, base + 1, base + STRIDE, base + STRIDE + 1] {
+        world.terrain.collision_grid[i] = 0x03; // low nibble = tier 3, walkable
+    }
+
+    // Gate off (default): Y stays at the sentinel, flat-Y behaviour preserved.
+    world.set_pad(input::PadButton::Up.mask());
+    let _ = world.tick();
+    assert_eq!(world.actors[0].move_state.world_z, 208);
+    assert_eq!(world.actors[0].move_state.world_y, 20);
+
+    // Gate on: the next step snaps Y to the sampled floor height.
+    world.locomotion.follow_terrain_height = true;
+    world.set_pad(input::PadButton::Up.mask());
+    let _ = world.tick();
+    assert_eq!(world.actors[0].move_state.world_y, -40);
+}
+
+#[test]
+fn locomotion_gated_by_movement_disabled_flag() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    world.actors[0].move_state.world_z = 200;
+    world.actors[0].move_state.flags |= 0x0008_0000; // encounter / cutscene owns player
+    world.set_pad(input::PadButton::Up.mask());
+    let _ = world.tick();
+    assert_eq!(
+        world.actors[0].move_state.world_z, 200,
+        "no movement while disabled"
+    );
+}
+
+#[test]
+fn locomotion_gated_by_active_dialog() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    world.actors[0].move_state.world_z = 200;
+    world.dialog.current = Some(DialogRequest {
+        text_id: 1,
+        inline: Vec::new(),
+        world_x: 0,
+        world_z: 0,
+        depth_id: 0,
+    });
+    world.set_pad(input::PadButton::Up.mask());
+    let _ = world.tick();
+    assert_eq!(
+        world.actors[0].move_state.world_z, 200,
+        "dialog owns the frame"
+    );
+}
+
+#[test]
+fn locomotion_deterministic_across_identical_pad_stream() {
+    fn drive(pads: &[u16]) -> (i16, i16) {
+        let mut world = World::new();
+        world.mode = SceneMode::Field;
+        world.install_field_player(0);
+        world.actors[0].move_state.world_x = 300;
+        world.actors[0].move_state.world_z = 300;
+        // A couple of deterministic walls so collision rejection is in
+        // the path being compared.
+        world.paint_field_collision(1, (0, 3), (0, 3), 0);
+        for &p in pads {
+            world.set_pad(p);
+            let _ = world.tick();
+        }
+        let ms = &world.actors[0].move_state;
+        (ms.world_x, ms.world_z)
+    }
+    let up = input::PadButton::Up.mask();
+    let down = input::PadButton::Down.mask();
+    let left = input::PadButton::Left.mask();
+    let right = input::PadButton::Right.mask();
+    let seq = [up, up | right, right, down, down | left, left, 0, up];
+    assert_eq!(
+        drive(&seq),
+        drive(&seq),
+        "identical pad stream is bit-identical"
+    );
+}
+
+#[test]
+fn cutscene_narration_roller_is_timer_driven_not_confirm_paced() {
+    use legaia_engine_field::cutscene_narration::OPENING_FRAME_STEP;
+    let mut world = World::new();
+    world.mode = SceneMode::Title; // isolate the top-of-tick narration advance
+    // The opening's cadence, which its prescript installs (ext `0x2F`).
+    world.clock.frame_step_floor = OPENING_FRAME_STEP as u8;
+    world.clock.frame_step = OPENING_FRAME_STEP as u8;
+    world.open_cutscene_narration(vec!["Page 1".into(), "Page 2".into()]);
+    let entered = |w: &World| {
+        w.cutscene
+            .narration
+            .as_ref()
+            .map(|n| n.current_index())
+            .unwrap_or(usize::MAX)
+    };
+    assert_eq!(entered(&world), 0, "no line has entered yet");
+
+    // A confirm press does NOT advance the crawl (retail `FUN_80037174` is
+    // timer-driven; the intro skip goes through the hand-off packet).
+    world.set_pad(input::PadButton::Cross.mask());
+    // Fewer vsyncs than one retail frame: nothing has run yet.
+    for _ in 0..(OPENING_FRAME_STEP - 1) {
+        let _ = world.tick();
+    }
+    assert_eq!(entered(&world), 0);
+
+    // The timer does: the first handler pass admits line 0.
+    world.set_pad(0);
+    for _ in 0..8 {
+        let _ = world.tick();
+    }
+    assert_eq!(entered(&world), 1, "line 0 entered on the first pass");
+
+    // Two pages at 1 px per two frames: (2 + 8) line steps of 16 px, each
+    // two 3-vsync frames per pixel, plus margin.
+    for _ in 0..(12 * 16 * 2 * u32::from(OPENING_FRAME_STEP)) {
+        let _ = world.tick();
+    }
+    assert!(
+        world.cutscene.narration.is_none(),
+        "the crawl completes on its own timer"
+    );
+}
+
+#[test]
+fn locomotion_held_while_helper_context_active() {
+    // A concurrent helper context (a mid-play op-0x44 spawned record) is not
+    // cutscene-class - it never reads as the modal timeline, so it leaves the
+    // camera and the NPC motions alone - but retail's script runner raises
+    // the player's engaged bit for every context it steps
+    // (`FUN_80039B7C` `0x80039DB8..0x80039DD4`), so the pad is refused until
+    // the record ends. This test used to assert the opposite.
+    use legaia_engine_field::cutscene_timeline::CutsceneTimeline;
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    world.actors[0].move_state.world_z = 200;
+    // A long WAIT_FRAMES so the context stays live across the step.
+    world
+        .field_vm
+        .helper_contexts
+        .push(CutsceneTimeline::new(vec![0x4A, 0xFF, 0x7F], 0));
+    world.step_helper_contexts();
+    assert_eq!(
+        world.field_vm.helper_contexts.len(),
+        1,
+        "the context stays live"
+    );
+    assert!(
+        !world.cutscene_timeline_active(),
+        "a helper context never reads as the modal timeline"
+    );
+    assert!(world.script_context_engages_player());
+    assert!(world.field_player_movement_locked());
+    assert!(
+        !world.field_menu_open_allowed(),
+        "the menu button is refused too"
+    );
+    world.set_pad(input::PadButton::Up.mask());
+    world.step_field_locomotion();
+    assert_eq!(
+        world.actors[0].move_state.world_z, 200,
+        "the pad does not walk the player while a helper context runs"
+    );
+    // The record ends: the pad is back on the next step.
+    world.field_vm.helper_contexts.clear();
+    assert!(!world.script_context_engages_player());
+    assert!(world.field_menu_open_allowed(), "and so is the menu button");
+    world.step_field_locomotion();
+    assert_eq!(world.actors[0].move_state.world_z, 208);
+}
+
+#[test]
+fn locomotion_gated_while_cutscene_timeline_active() {
+    use legaia_engine_field::cutscene_timeline::CutsceneTimeline;
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    world.actors[0].move_state.world_z = 200;
+    // An opening-cutscene timeline owns the scene (establishing sweep). A
+    // non-empty body so it is not immediately `done`.
+    world.cutscene.timeline = Some(CutsceneTimeline::new(vec![0x21, 0x2E, 0x1A], 0));
+    assert!(world.cutscene_timeline_active());
+    world.set_pad(input::PadButton::Up.mask());
+    world.step_field_locomotion();
+    assert_eq!(
+        world.actors[0].move_state.world_z, 200,
+        "pad-driven walk is locked while the cutscene timeline owns the scene"
+    );
+    // Once the timeline finishes, free-roam control returns.
+    if let Some(tl) = world.cutscene.timeline.as_mut() {
+        tl.done = true;
+    }
+    assert!(!world.cutscene_timeline_active());
+    world.step_field_locomotion();
+    assert_eq!(
+        world.actors[0].move_state.world_z, 208,
+        "locomotion resumes the frame the timeline drops"
+    );
+}
+
+#[test]
+fn world_tick_drives_per_actor_move_vm() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.actors[0].active = true;
+    // Move-VM bytecode: WORLD_SET (op 0x07) x=42, y=10, z=5, then HALT.
+    world.set_move_bytecode(0, Some(vec![0x0007, 42, 10, 5, 0x0008]));
+    let _ = world.tick();
+    // First step is WORLD_SET; should write the position.
+    assert_eq!(world.actors[0].move_state.world_x, 42);
+    assert_eq!(world.actors[0].move_state.world_y, 10);
+}
+
+#[test]
+fn world_tick_skips_move_vm_when_wait_timer_set() {
+    let mut world = World::new();
+    world.actors[0].active = true;
+    world.actors[0].move_state.wait_timer = 5;
+    world.set_move_bytecode(0, Some(vec![0x0007, 99, 99, 99, 0x0008]));
+    let _ = world.tick();
+    // Wait timer decremented, but move VM didn't run -> position unchanged.
+    assert_eq!(world.actors[0].move_state.wait_timer, 4);
+    assert_eq!(world.actors[0].move_state.world_x, 0);
+}
+
+#[test]
+fn load_field_script_resets_pc_and_ctx() {
+    let mut world = World::new();
+    world.field_pc = 42;
+    world.field_ctx.flags = 0xFFFF;
+    world.load_field_script(vec![0xFF; 8]);
+    assert_eq!(world.field_pc, 0);
+    assert_eq!(world.field_ctx.flags, 0);
+    assert_eq!(world.field_bytecode.len(), 8);
+}
+
+// ---------------------------------------------------------------------------
+// Ledge hop: FUN_801d1878 (probe + post) driven by FUN_801d1ba0 (per-frame
+// vertical settle + trigger), wired into the field frame tick.
+// ---------------------------------------------------------------------------
+
+/// A field world whose collision grid is all-floor (high nibble `0` = no
+/// walls) with the 2x2 tile block covering the hop's floor-sample point on
+/// elevation tier `1`. The LUT puts tier `1` at `height` world units, so
+/// walking +Z off tier `0` faces a `height`-unit change of floor.
+///
+/// **World Y grows downward**, which is what the height LUT's sign means:
+/// `field_floor_height_lut` is loaded from the MAN header's 16 *negated*
+/// shorts, so a **negative** `height` is a raised tile (a step **up**) and a
+/// positive one is a drop.
+///
+/// The player starts at the centre of tile (2, 2) facing +Z.
+fn ledge_world(height: i16) -> World {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    world.actors[0].move_state.world_x = 320;
+    world.actors[0].move_state.world_z = 320;
+    world.terrain.collision_grid = vec![0u8; FIELD_GRID_LEN];
+    // Opt into the retail glide so the settle is observable; it is off by
+    // default so the flat-Y locomotion oracles keep their exact positions.
+    world.locomotion.vertical_settle = true;
+    world.terrain.floor_height_lut = [0i16; 16];
+    world.terrain.floor_height_lut[1] = height;
+    // The floor sampler reads the 2x2 corner block at tile (2, 2).
+    for (tx, tz) in [(2usize, 2usize), (3, 2), (2, 3), (3, 3)] {
+        world.terrain.collision_grid[tz * FIELD_GRID_STRIDE + tx] = 0x01;
+    }
+    world
+}
+
+#[test]
+fn ledge_hop_posted_through_frame_tick() {
+    // A tier-1 floor 200 units *below* (world Y grows downward) clears
+    // retail's `>= +0x61` arm, so one walking frame posts the drop class.
+    // Driven through `tick()` rather than by calling the controller directly
+    // - this is the wiring test.
+    let mut world = ledge_world(200);
+    world.set_pad(input::PadButton::Up.mask());
+    let _ = world.tick();
+    assert_eq!(
+        world.locomotion.step_delta,
+        (0, 8),
+        "the committed +Z sub-step records the retail probe delta"
+    );
+    let hop = world
+        .locomotion
+        .ledge_hop
+        .expect("the frame tick runs the vertical controller and it posts the hop");
+    assert_eq!(hop.kind, 0x10, "a drop is retail hop class 0x10");
+    assert!(!hop.is_up());
+    // Landing point is three step-deltas ahead: z + 3 * (8 * 4) = z + 96.
+    assert_eq!(
+        hop.target_z,
+        world.actors[0].move_state.world_z + 96,
+        "the landing point sits 96 units ahead, retail's 3x probe scale"
+    );
+    assert_eq!(hop.target_x, world.actors[0].move_state.world_x);
+}
+
+#[test]
+fn ledge_hop_up_class_takes_the_taller_apex() {
+    // The mirror case: a *raised* tier-1 tile (negated LUT, so negative) is
+    // retail's `< -0x60` arm - the step up, which gets the 0x18 apex.
+    let mut world = ledge_world(-200);
+    world.set_pad(input::PadButton::Up.mask());
+    let _ = world.tick();
+    let hop = world
+        .locomotion
+        .ledge_hop
+        .expect("a raised tile is a ledge too");
+    assert_eq!(hop.kind, 0x18, "a step up is retail hop class 0x18");
+    assert!(hop.is_up());
+    assert_eq!(hop.arc.step, 0x100, "0x1000 / 0x10 frames");
+}
+
+#[test]
+fn ledge_hop_refused_on_flat_ground() {
+    // Tier 1 at 8 units is inside retail's [-0x60, 0x61) dead band: flat
+    // ground, so the probe runs and declines rather than posting a hop.
+    let mut world = ledge_world(8);
+    world.set_pad(input::PadButton::Up.mask());
+    let _ = world.tick();
+    assert_eq!(
+        world.locomotion.step_delta,
+        (0, 8),
+        "the walk still committed"
+    );
+    assert!(
+        world.locomotion.ledge_hop.is_none(),
+        "a sub-threshold rise is flat ground - no hop"
+    );
+    // Non-vacuous: `is_none()` is trivially true if the controller never
+    // ran, so pin the settle it *did* perform. The 8-unit floor is inside
+    // one frame's glide rate, so the height arrives exactly.
+    assert_eq!(
+        world.actors[0].move_state.world_y, 8,
+        "the vertical settle still ran and reached the tier-1 floor"
+    );
+}
+
+#[test]
+fn ledge_hop_refused_when_wall_ahead() {
+    // Same geometry, but the cell the two forward probes land in is a wall.
+    // Retail returns 0 without sampling the floor: the actor is walking into
+    // a wall, not up a step.
+    let mut world = ledge_world(200);
+    let (px, pz) = (320i16, 424i16);
+    let xc = (((px as i32) + 0x3F) >> 6) - 1;
+    let zc = ((pz as i32) >> 6) + 2;
+    let idx = ((xc / 2) & 0x7F) as usize + (zc >> 1) as usize * FIELD_GRID_STRIDE;
+    let quad = ((zc & 1) << 1 | (xc & 1)) as u32;
+    world.terrain.collision_grid[idx] |= 0x10 << quad;
+    assert!(
+        world.field_tile_is_wall(px, pz),
+        "the forward probe point now reads as a wall"
+    );
+    world.set_pad(input::PadButton::Up.mask());
+    let _ = world.tick();
+    assert!(
+        world.locomotion.ledge_hop.is_none(),
+        "a wall at the forward probe refuses the hop"
+    );
+    // Non-vacuous, as above: the settle ran, rate-clamped to 12 units of the
+    // 200-unit rise, proving the refusal came from the probe and not from
+    // the controller being absent.
+    assert_eq!(
+        world.actors[0].move_state.world_y, 12,
+        "the vertical settle still ran, one glide step toward the floor"
+    );
+}
+
+#[test]
+fn step_delta_clears_on_an_input_free_frame() {
+    // Retail's `0x801d0550` clears the pair before the direction decode, so
+    // a released pad leaves no stale delta for the hop trigger to act on.
+    // Flat ground here, so no hop session takes the frame off the walk.
+    let mut world = ledge_world(8);
+    world.set_pad(input::PadButton::Up.mask());
+    let _ = world.tick();
+    assert_eq!(world.locomotion.step_delta, (0, 8));
+    world.set_pad(0);
+    let _ = world.tick();
+    assert_eq!(
+        world.locomotion.step_delta,
+        (0, 0),
+        "an input-free frame clears the step delta"
+    );
+    assert!(
+        world.locomotion.ledge_hop.is_none(),
+        "and posts no hop, since nothing walked"
+    );
+}
+
+#[test]
+fn a_started_hop_survives_the_pad_being_released() {
+    // The retail hop is a committed clip on two pool actors, not a per-frame
+    // reading of the pad: once `FUN_801d2404` has run, letting go of the pad
+    // does not cancel it - the phase machine holds the movement lock until
+    // its own end arm.
+    let mut world = ledge_world(200);
+    world.set_pad(input::PadButton::Up.mask());
+    let _ = world.tick();
+    assert!(world.locomotion.ledge_hop.is_some(), "posted while walking");
+    world.set_pad(0);
+    let _ = world.tick();
+    let hop = world
+        .locomotion
+        .ledge_hop
+        .expect("the session outlives the frame that started it");
+    assert!(hop.arc.cursor > 0, "and it advanced rather than idling");
+    assert_ne!(
+        world.actors[0].move_state.flags & 0x0008_0000,
+        0,
+        "the movement lock is held for the flight"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Base-step selector: Walk / Run (retail `FUN_801d01b0` @ 0x801D0334..0x801D03E0)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn run_is_the_xor_of_the_option_and_the_button() {
+    let mut world = World::new();
+    // Walk selected, button clear -> walk.
+    world.locomotion.run_default = false;
+    world.locomotion.run_button_held = false;
+    assert!(!world.field_run_active());
+    assert_eq!(world.field_base_step(), 8);
+
+    // Walk selected, button HELD -> run. (Hold-to-run.)
+    world.locomotion.run_button_held = true;
+    assert!(world.field_run_active());
+    assert_eq!(world.field_base_step(), 0xc);
+
+    // Run selected, button clear -> run.
+    world.locomotion.run_default = true;
+    world.locomotion.run_button_held = false;
+    assert!(world.field_run_active());
+    assert_eq!(world.field_base_step(), 0xc);
+
+    // Run selected, button HELD -> WALK. The button inverts the option; it
+    // does not simply force run. This is the arm that a plain OR would get
+    // wrong, and it is what the paired branches at 0x801D0370 / 0x801D0398
+    // encode.
+    world.locomotion.run_button_held = true;
+    assert!(!world.field_run_active());
+    assert_eq!(world.field_base_step(), 8);
+}
+
+#[test]
+fn forced_slow_cannot_be_run_out_of() {
+    let mut world = World::new();
+    // Retail's `_DAT_8007B6A8` arm jumps past the run check entirely, so a
+    // forced walk stays slow no matter what the option or the button say.
+    world.locomotion.forced_slow = true;
+    for (opt, btn) in [(false, false), (false, true), (true, false), (true, true)] {
+        world.locomotion.run_default = opt;
+        world.locomotion.run_button_held = btn;
+        assert_eq!(
+            world.field_base_step(),
+            5,
+            "forced-slow overridden by option={opt} button={btn}"
+        );
+    }
+}
+
+/// The debug turbo (`0x801D03A8..0x801D03DC`): all three gates or nothing,
+/// and when it fires it overwrites the forced-slow and run arms alike.
+#[test]
+fn debug_turbo_needs_both_debug_words_and_square() {
+    use legaia_engine_field::world_map::WorldMapController;
+
+    let square = input::PadButton::Square.mask();
+    let arm = |debug: bool, dev: i32, pad: u16| {
+        let mut world = World::new();
+        world.world_map.ctrl = Some(WorldMapController {
+            debug_enabled: debug,
+            ..WorldMapController::default()
+        });
+        world.audio.dual_mode_gate = dev;
+        world.set_pad(pad);
+        world
+    };
+
+    // Each gate alone off -> no turbo. Square is also a run alternate, so
+    // the step it falls back to is the run step.
+    assert_eq!(arm(false, 1, square).field_base_step(), 0xc);
+    assert_eq!(arm(true, 0, square).field_base_step(), 0xc);
+    assert_eq!(arm(true, 1, 0).field_base_step(), 8);
+    // Retail's dev word is the gate a retail disc never opens.
+    assert_eq!(arm(true, 0, square).field_base_step(), 0xc);
+
+    // All three -> 0x18, over walk, run and forced slow.
+    assert_eq!(arm(true, 1, square).field_base_step(), 0x18);
+    let mut world = arm(true, 1, square);
+    world.locomotion.forced_slow = true;
+    assert_eq!(
+        world.field_base_step(),
+        0x18,
+        "the turbo test runs after the forced-slow jump"
+    );
+    world.locomotion.run_default = true;
+    assert_eq!(world.field_base_step(), 0x18);
+}
+
+/// The turbo reaches the player through the frame tick: one field tick with
+/// Up + Square moves `0x18` units where the same press without the dev word
+/// moves the run step's `0xc`.
+#[test]
+fn debug_turbo_moves_the_player_on_the_frame_tick() {
+    use legaia_engine_field::world_map::WorldMapController;
+
+    let step = |dev: i32| {
+        let mut world = World::new();
+        world.mode = SceneMode::Field;
+        world.install_field_player(0);
+        world.actors[0].move_state.world_x = 200;
+        world.actors[0].move_state.world_z = 200;
+        // The debug-mode word's mirror lives on the overworld controller.
+        world.world_map.ctrl = Some(WorldMapController {
+            debug_enabled: true,
+            ..WorldMapController::default()
+        });
+        world.audio.dual_mode_gate = dev;
+        world.set_pad(input::PadButton::Up.mask() | input::PadButton::Square.mask());
+        let _ = world.tick();
+        world.actors[0].move_state.world_z - 200
+    };
+    assert_eq!(step(0), 0xc, "retail dev word clear: the run step");
+    assert_eq!(step(1), 0x18, "both debug words set: the turbo step");
+}
+
+#[test]
+fn set_pad_latches_the_run_button() {
+    let mut world = World::new();
+    assert!(!world.locomotion.run_button_held);
+    world.set_pad(input::PadButton::Square.mask());
+    assert!(world.locomotion.run_button_held);
+    // Released on the next word - it is a held state, not an edge.
+    world.set_pad(input::PadButton::Up.mask());
+    assert!(!world.locomotion.run_button_held);
+}
+
+/// The default run button is **retail's**: the config word `0x800846DC` is
+/// `0x48` = Cross | R1 in the packed pad layout (`li v0,0x48` /
+/// `sw v0,0x59c(s0)` at `0x80034AB4`, read at `0x801D0364`), and holding
+/// either has to run. The port latched only Square for a while, which is the
+/// debug-turbo bit on the same selector and not a run button at all.
+#[test]
+fn the_default_run_button_is_the_retail_pair() {
+    use crate::world::config::{FIELD_RUN_BUTTON_MASK_DEFAULT, FIELD_RUN_BUTTON_MASK_RETAIL};
+
+    assert_eq!(
+        FIELD_RUN_BUTTON_MASK_RETAIL,
+        input::PadButton::Cross.mask() | input::PadButton::R1.mask(),
+        "retail's mask word 0x800846DC is 0x48 = Cross | R1"
+    );
+
+    let mut world = World::new();
+    assert_eq!(
+        world.locomotion.run_button_mask,
+        FIELD_RUN_BUTTON_MASK_DEFAULT
+    );
+    assert_eq!(
+        FIELD_RUN_BUTTON_MASK_DEFAULT & FIELD_RUN_BUTTON_MASK_RETAIL,
+        FIELD_RUN_BUTTON_MASK_RETAIL,
+        "the default has to contain the retail pair"
+    );
+
+    // Both retail buttons run, out of the box.
+    for btn in [input::PadButton::Cross, input::PadButton::R1] {
+        world.set_pad(btn.mask());
+        assert!(
+            world.locomotion.run_button_held,
+            "{} is a retail run button",
+            btn.name()
+        );
+        assert!(world.field_run_active(), "Walk selected + button = run");
+        assert_eq!(world.field_base_step(), 0xc);
+    }
+
+    // Square stays bound as the port's alternate.
+    world.set_pad(input::PadButton::Square.mask());
+    assert!(
+        world.locomotion.run_button_held,
+        "Square is kept as an alternate"
+    );
+
+    // A host that wants the retail set exactly drops the alternate, and then
+    // Square is just Square.
+    world.locomotion.run_button_mask = FIELD_RUN_BUTTON_MASK_RETAIL;
+    world.set_pad(input::PadButton::Square.mask());
+    assert!(!world.locomotion.run_button_held);
+    world.set_pad(input::PadButton::Cross.mask());
+    assert!(world.locomotion.run_button_held);
+
+    // Nothing else on the pad runs, under either mask.
+    for m in [FIELD_RUN_BUTTON_MASK_DEFAULT, FIELD_RUN_BUTTON_MASK_RETAIL] {
+        world.locomotion.run_button_mask = m;
+        for btn in [
+            input::PadButton::Up,
+            input::PadButton::Circle,
+            input::PadButton::Triangle,
+            input::PadButton::L1,
+            input::PadButton::Start,
+        ] {
+            world.set_pad(btn.mask());
+            assert!(
+                !world.locomotion.run_button_held,
+                "{} must not run under mask {m:#06x}",
+                btn.name()
+            );
+        }
+    }
+}
+
+#[test]
+fn running_covers_more_ground_per_frame_than_walking() {
+    let step = |run: bool| {
+        let mut world = World::new();
+        world.mode = SceneMode::Field;
+        world.install_field_player(0);
+        world.locomotion.run_default = run;
+        world.actors[0].move_state.world_x = 200;
+        world.actors[0].move_state.world_z = 200;
+        world.set_pad(input::PadButton::Up.mask());
+        let _ = world.tick();
+        world.actors[0].move_state.world_z - 200
+    };
+    // speed = (base_step * 0x1000) >> 12, so the step IS the base step.
+    assert_eq!(step(false), 8, "walk");
+    assert_eq!(step(true), 0xc, "run");
+}
+
+// ---------------------------------------------------------------------------
+// Source-agnostic motion detection (the glide fix)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn script_driven_player_movement_raises_the_walk_flag() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    world.actors[0].move_state.world_x = 200;
+    world.actors[0].move_state.world_z = 200;
+    // Seed the snapshot with a first tick and NO pad, so the actor is known
+    // to be standing still.
+    world.set_pad(0);
+    let _ = world.tick();
+    assert!(!world.locomotion.actor_moving.contains(&0));
+
+    // Now move the player the way a cutscene MoveTo does: write the position
+    // directly, touching no locomotion path and raising no flag of its own.
+    world.actors[0].move_state.world_z += 32;
+    world.set_pad(0);
+    let _ = world.tick();
+    assert!(
+        world.locomotion.actor_moving.contains(&0),
+        "a script-moved player must read as moving - selecting the walk clip \
+         off the MOVER rather than off the MOTION is what made it glide"
+    );
+}
+
+#[test]
+fn standing_still_is_not_motion_and_a_new_actor_is_not_a_step() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    world.actors[0].move_state.world_x = 640;
+    world.actors[0].move_state.world_z = 640;
+    world.set_pad(0);
+    let _ = world.tick();
+    let _ = world.tick();
+    assert!(!world.locomotion.actor_moving.contains(&0), "idle player");
+
+    // An NPC seated mid-scene by a timeline appears in the position map for
+    // the first time. Its ARRIVAL is a placement, not a step, so it must not
+    // read as moving on the frame it shows up.
+    world.npcs.positions.insert(7, (1024, 1024));
+    let _ = world.tick();
+    assert!(
+        !world.locomotion.actor_moving.contains(&7),
+        "a freshly-seated actor must not read as walking on its arrival frame"
+    );
+    // But its next actual move does.
+    world.npcs.positions.insert(7, (1064, 1024));
+    let _ = world.tick();
+    assert!(world.locomotion.actor_moving.contains(&7), "NPC walked");
+}
+
+/// Between a battle's commit and the battle nothing field-side walks: retail
+/// raises the player's `+0x10 |= 0x80000` in the roll and pages the intro
+/// overlay over the field frame pump. A prop run the transition let the
+/// player start was dropped by battle entry with the engaged bit still up,
+/// and the field came back with the pad locked for good (`town0b`).
+#[test]
+fn locomotion_frozen_through_the_encounter_transition() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    world.actors[0].move_state.world_z = 200;
+    world.install_encounter_bracket();
+    let roll = legaia_engine_battle::encounter::EncounterRoll {
+        formation_id: 0,
+        row_index: 0,
+        roll_q8: 0,
+    };
+    assert!(
+        world
+            .encounters
+            .session
+            .as_mut()
+            .is_some_and(|s| s.trigger_with(roll))
+    );
+    assert!(world.field_scripts_held_for_battle());
+    world.set_pad(input::PadButton::Up.mask());
+    world.step_field_locomotion();
+    assert_eq!(world.actors[0].move_state.world_z, 200, "the pad is frozen");
+
+    // A prop run battle entry drops releases the engaged bit with it.
+    world.actors[0].move_state.flags |= 0x0008_0000;
+    let mut runner = legaia_engine_field::inline_dialogue::InlineDialogue::new(
+        std::sync::Arc::new(vec![0x21]),
+        0,
+    );
+    runner.prop_anchor = Some((1, 1));
+    world.dialog.inline = Some(runner);
+    let formation = legaia_engine_battle::monster_catalog::FormationDef {
+        formation_id: 0,
+        slots: Vec::new(),
+        label: String::new(),
+        ..Default::default()
+    };
+    world.enter_battle_from_formation(&formation);
+    assert!(world.dialog.inline.is_none());
+    assert_eq!(world.actors[0].move_state.flags & 0x0008_0000, 0);
+}
+
+/// The battle range metric keys a party attacker's reach on the seat's
+/// roster character (`DAT_80078878[char_id - 1]`), not on the arts-path
+/// `BattleActor::character` - which a plain Attack never writes, so every
+/// seat used to read Vahn's `+43`.
+#[test]
+fn battle_reach_is_keyed_on_the_seats_character() {
+    let mut world = World::new();
+    world.enter_battle(3, 1);
+    for i in 0..4 {
+        world.actors[i].battle.liveness = 1;
+        world.actors[i].battle.hp = 100;
+        world.actors[i].battle.max_hp = 100;
+    }
+    // Every party seat stands at the same spot against the monster's seat,
+    // with the arts key left at its default.
+    let (mx, mz) = (0i16, 800i16);
+    world.actors[3].battle.seat = Some((mx, mz));
+    for i in 0..3 {
+        world.actors[i].move_state.world_x = 0;
+        world.actors[i].move_state.world_z = 0;
+        world.actors[i].battle.character = legaia_art::Character::Vahn;
+    }
+    let m: Vec<u16> = (0..3).map(|i| world.battle_range_metric(i, 3)).collect();
+    // Vahn +43, Noa 0, Gala -53: three different distances.
+    assert_ne!(m[0], m[1], "{m:?}");
+    assert_ne!(m[1], m[2], "{m:?}");
+    assert_ne!(m[0], m[2], "{m:?}");
+}
+
+/// The pad-controller gates `FUN_801D1344` puts in front of the menu accept
+/// (`0x801D16A8..0x801D16E4`) and the accept's own menu lock
+/// (`0x801D02C0..0x801D02E4`): the system lock, a kind-0 warp and its pad
+/// hold refuse silently; the menu lock refuses with the deny buzz `0x23`.
+#[test]
+fn the_menu_accept_honours_retails_pad_controller_gates_and_buzzes_on_the_lock() {
+    use crate::world::{FIELD_MENU_DENY_CUE, FIELD_MENU_LOCK_BIT, FIELD_SYSTEM_LOCK_BIT};
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    assert!(world.field_menu_open_allowed(), "control: an idle field");
+
+    world.flags.story_flags |= FIELD_SYSTEM_LOCK_BIT;
+    assert!(
+        !world.field_menu_open_allowed(),
+        "the system lock skips the controller"
+    );
+    world.audio.sfx_ring_ops.clear();
+    assert!(!world.field_menu_press_denied(), "silently");
+    assert!(world.audio.sfx_ring_ops.is_empty());
+    world.flags.story_flags &= !FIELD_SYSTEM_LOCK_BIT;
+
+    world.locomotion.warp.hold = 0x28;
+    assert!(!world.field_menu_open_allowed(), "the post-warp pad hold");
+    world.locomotion.warp.hold = 0;
+    world.locomotion.warp.timer = 0x26;
+    assert!(!world.field_menu_open_allowed(), "a running kind-0 warp");
+    assert!(!world.field_menu_press_denied());
+    world.locomotion.warp.timer = 0;
+
+    world.flags.story_flags |= FIELD_MENU_LOCK_BIT;
+    assert!(!world.field_menu_open_allowed(), "the menu lock");
+    assert!(
+        world.field_menu_press_denied(),
+        "a locked press reaches the accept"
+    );
+    assert_eq!(
+        world.audio.sfx_ring_ops,
+        vec![legaia_engine_system::sound_state::SfxRingOp::ReplaceLast(
+            FIELD_MENU_DENY_CUE
+        )],
+        "and buzzes through the overwrite producer"
+    );
+    world.flags.story_flags &= !FIELD_MENU_LOCK_BIT;
+    assert!(world.field_menu_open_allowed());
+
+    world.cutscene.opening_chain_active = true;
+    assert!(!world.field_menu_open_allowed(), "the opening chain");
+}
+
+/// A fight committed and not yet begun (`3E FF`'s latched formation) keeps
+/// the menu accept shut and refuses a host's session save: retail pages the
+/// battle-intro overlay over the frame pump `FUN_801D1344` that holds the
+/// accept, so no save can land between the commit and the fight. A save
+/// there (`jouine` P2[5], Cort committed on arrival) carried the record's
+/// flags past the op without the fight and reloaded past Cort.
+#[test]
+fn a_committed_fight_shuts_the_menu_and_the_host_save() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    world.install_field_player(0);
+    assert!(world.field_menu_open_allowed(), "control: an idle field");
+    assert!(world.host_save_allowed());
+    world.carriers.pending_battle = Some(21);
+    assert!(world.field_scripts_held_for_battle());
+    assert!(
+        !world.field_menu_open_allowed(),
+        "no accept between commit and fight"
+    );
+    assert!(
+        !world.field_menu_press_denied(),
+        "and no buzz: it never reaches the accept"
+    );
+    assert!(!world.host_save_allowed());
+    world.carriers.pending_battle = None;
+    assert!(world.field_menu_open_allowed());
+    assert!(world.host_save_allowed());
+}

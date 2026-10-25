@@ -1,0 +1,80 @@
+[package]
+name = "legaia-web-viewer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# tests/integration.rs gathers every tests/*.rs into one binary.
+autotests = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+legaia-web-play.workspace = true
+legaia-web-patcher.workspace = true
+legaia-engine-menus.workspace = true
+legaia-engine-field.workspace = true
+legaia-render-kernels.workspace = true
+legaia-tim.workspace = true
+legaia-prot.workspace = true
+legaia-lzs.workspace = true
+legaia-iso.workspace = true
+legaia-tmd.workspace = true
+legaia-art.workspace = true
+legaia-gamedata.workspace = true
+legaia-mes.workspace = true
+legaia-seq.workspace = true
+legaia-vab.workspace = true
+legaia-xa.workspace = true
+legaia-mdec.workspace = true
+legaia-font.workspace = true
+legaia-engine-world-views.workspace = true
+legaia-engine-scene-host.workspace = true
+legaia-engine-scene.workspace = true
+legaia-engine-audio = { workspace = true, features = ["audio-webaudio"] }
+legaia-mednafen.workspace = true
+legaia-actor-formats.workspace = true
+legaia-container-formats.workspace = true
+legaia-disc-audit.workspace = true
+legaia-engine-battle.workspace = true
+legaia-engine-effects.workspace = true
+legaia-engine-system.workspace = true
+legaia-game-tables.workspace = true
+legaia-minigame-formats.workspace = true
+legaia-ram-image.workspace = true
+legaia-scene-formats.workspace = true
+legaia-ui-formats.workspace = true
+serde_json.workspace = true
+wasm-bindgen.workspace = true
+js-sys.workspace = true
+console_error_panic_hook.workspace = true
+
+[dependencies.web-sys]
+workspace = true
+features = [
+    "console",
+    "Window",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "ImageData",
+    "Storage",
+]
+
+[dev-dependencies]
+legaia-engine-minigames.workspace = true
+legaia-engine-ui.workspace = true
+sha2.workspace = true
+toml.workspace = true
+
+# Strip only. The name section (function names for stack traces) is about
+# 1.5 MB of the bundle and stripping it costs seconds; a full `-O` pass takes
+# over twenty minutes on this bundle for a further ~2% gzipped, which no deploy
+# budget pays for.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["--strip-debug", "--strip-producers"]
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

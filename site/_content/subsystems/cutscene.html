@@ -1,0 +1,302 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">subsystems</a> &middot; cutscenes</div>
+  <h1>Cutscenes: movies and the 3D opening</h1>
+  <p class="lede">Legaia has two kinds of cutscene. The six pre-rendered movies on the disc are STR files - the PlayStation's standard movie container, video frames for the MDEC video-decompressor chip interleaved with XA audio the CD drive plays by itself. The famous creation-myth opening is not one of them: it is the ordinary field engine running scripts with the controller ignored. This page covers how a movie is started, streamed and decoded, then how the scripted opening is built; the register-level detail lives on <a href="cutscene-internals.html">cutscene internals</a>.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance" data-doc="at-a-glance,contents">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Movie player</dt><dd>PROT 0970 (<code>cutscene_str</code>), an overlay loaded at slot A <code>0x801CE818</code>; game modes 26 (<code>StrInit</code>) and 27 (<code>StrMode</code>)</dd>
+    <dt>Movies</dt><dd>Six <code>MOV/MV*.STR</code> files, nine <code>fmv_id</code> slots (<code>MV3.STR</code> is split by frame range); <code>MV1.STR</code> is the title attract reel</dd>
+    <dt>Dispatch table</dt><dd>Overlay data at <code>0x801D0A6C</code>, 23 &times; 32-byte slots; parser <code>legaia_game_tables::fmv_dispatch</code> - <a href="../formats/str-fmv-table.html">STR FMV table</a></dd>
+    <dt>Bitstream</dt><dd>PSX <strong>Iki</strong> variant, not STRv2; 15 fps (10 sectors per frame); decoder <code>crates/mdec</code></dd>
+    <dt>Audio</dt><dd>One XA-ADPCM track per movie at <code>(file 1, channel 0)</code>, stereo 37.8 kHz, interleaved sector by sector; decoder <code>crates/xa</code></dd>
+    <dt>In the port</dt><dd><code>crates/mdec</code> (decoder, and the <code>str_av</code> demuxer both play hosts open a movie through), <code>crates/xa</code>, <code>engine-shell::cutscene_av</code>; opening timeline in <code>engine-core</code></dd>
+    <dt>Confidence</dt><dd>Confirmed - disassembly of PROT 0970 plus RAM captures during playback and a cold-boot pixel capture of the opening (<a href="cutscene-internals.html#how-we-know">evidence</a>)</dd>
+  </dl>
+  <figure class="diagram">
+    <svg viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="STR playback pipeline. Disc sectors split into video and audio. Video: frame assembly, Iki entropy decode (LZSS DC table and AC VLC), dequantise and IDCT, YCbCr to RGB, then the frame shown. Audio: XA ADPCM decode, then the SPU in retail or the audio cursor in the port, which picks the video frame due.">
+      <defs><marker id="cs-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <text class="dg-edge-label" x="170" y="22">video: Mode 2 Form 1, magic 0x0160</text>
+      <text class="dg-edge-label" x="170" y="292">audio: Mode 2 Form 2, XA (file 1, channel 0)</text>
+      <rect class="dg-node" x="10" y="118" width="130" height="64" rx="5"/>
+      <text class="dg-label" x="75" y="143">STR sectors</text>
+      <text class="dg-sub" x="75" y="161">interleaved run</text>
+      <rect class="dg-node" x="170" y="34" width="130" height="64" rx="5"/>
+      <text class="dg-label" x="235" y="59">Frame assembly</text>
+      <text class="dg-sub" x="235" y="77">10 sectors each</text>
+      <rect class="dg-node-accent" x="315" y="34" width="130" height="64" rx="5"/>
+      <text class="dg-label" x="380" y="59">Entropy decode</text>
+      <text class="dg-sub" x="380" y="77">LZSS DC + AC VLC</text>
+      <rect class="dg-node-accent" x="460" y="34" width="130" height="64" rx="5"/>
+      <text class="dg-label" x="525" y="59">Dequant + IDCT</text>
+      <text class="dg-sub" x="525" y="77">8x8 blocks</text>
+      <rect class="dg-node-accent" x="605" y="34" width="130" height="64" rx="5"/>
+      <text class="dg-label" x="670" y="59">YCbCr to RGB</text>
+      <text class="dg-sub" x="670" y="77">4:2:0, BT.601</text>
+      <rect class="dg-node-ok" x="750" y="34" width="140" height="64" rx="5"/>
+      <text class="dg-label" x="820" y="59">Frame shown</text>
+      <text class="dg-sub" x="820" y="77">strips into VRAM</text>
+      <rect class="dg-node" x="170" y="202" width="130" height="64" rx="5"/>
+      <text class="dg-label" x="235" y="227">XA ADPCM</text>
+      <text class="dg-sub" x="235" y="245">stereo 37.8 kHz</text>
+      <rect class="dg-node" x="315" y="202" width="275" height="64" rx="5"/>
+      <text class="dg-label" x="452" y="227">Retail: drive feeds the SPU</text>
+      <text class="dg-sub" x="452" y="245">CPU never sees the samples</text>
+      <rect class="dg-node-warn" x="605" y="202" width="285" height="64" rx="5"/>
+      <text class="dg-label" x="747" y="227">Port: audio cursor is the clock</text>
+      <text class="dg-sub" x="747" y="245">frame due = position / frame period</text>
+      <path class="dg-edge" d="M140 135 L168 72" marker-end="url(#cs-arrow)"/>
+      <path class="dg-edge" d="M140 165 L168 228" marker-end="url(#cs-arrow)"/>
+      <path class="dg-edge" d="M300 66 L313 66" marker-end="url(#cs-arrow)"/>
+      <path class="dg-edge" d="M445 66 L458 66" marker-end="url(#cs-arrow)"/>
+      <path class="dg-edge" d="M590 66 L603 66" marker-end="url(#cs-arrow)"/>
+      <path class="dg-edge" d="M735 66 L748 66" marker-end="url(#cs-arrow)"/>
+      <path class="dg-edge" d="M300 234 L313 234" marker-end="url(#cs-arrow)"/>
+      <path class="dg-edge-dim" d="M820 200 L820 100" marker-end="url(#cs-arrow)"/>
+      <text class="dg-edge-label" x="812" y="155" text-anchor="end">picks the frame</text>
+    </svg>
+    <figcaption>Video and audio share one sector stream, so they are aligned by construction. Retail hands the picture to the MDEC chip and the sound to the drive; the port decodes both in software and lets the soundtrack's playback position decide which frame is on screen.</figcaption>
+  </figure>
+</section>
+
+<section class="doc-section" id="what-is-this" data-doc="game-modes">
+  <h2>Two kinds of cutscene</h2>
+  <table>
+    <thead><tr><th>Kind</th><th>Examples</th><th>Runs in</th><th>Skippable</th></tr></thead>
+    <tbody>
+      <tr><td>Pre-rendered movie (STR)</td><td>Title attract reel, the seven mid-game movies</td><td>Movie overlay PROT 0970, modes 26/27</td><td>Only the attract reel (<code>fmv_id 0</code>)</td></tr>
+      <tr><td>Scripted 3D scene</td><td>New Game opening (<code>opdeene</code> &rarr; <code>town01</code>), door and story beats</td><td>Field engine, mode 3, field-VM records</td><td>Opening: confirm press after the first crawl</td></tr>
+      <tr><td>Battle-intro transition</td><td>The shatter / swirl before a fight</td><td>PROT 0979, same overlay slot</td><td>No</td></tr>
+    </tbody>
+  </table>
+  <p>Function names of the form <code>FUN_80xxxxxx</code> are RAM addresses of routines traced in the original executable. The movie player is an <em>overlay</em> - code streamed from the disc into a shared RAM window on demand - which is why its addresses sit in the <code>0x801C0000+</code> band alongside the field, battle and menu overlays.</p>
+</section>
+
+<section class="doc-section" id="fmv-trigger-op" data-doc="field-vm-fmv-trigger-op">
+  <h2>How a movie starts</h2>
+  <p>Every route into a movie ends the same way: two globals are written, and on the next frame the main mode dispatcher boots mode 26. Scene scripts do it with a 7-byte field-VM instruction; the title screen does it from its idle countdown.</p>
+  <table class="layout">
+    <thead><tr><th>Byte</th><th>Value</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td><code>0x4C</code></td><td>Outer opcode <code>MENU_CTRL</code> (high-nibble re-dispatch)</td></tr>
+      <tr><td>1</td><td><code>0xE2</code></td><td>Sub-dispatcher <code>0xE</code>, sub-op <code>2</code> = FMV trigger</td></tr>
+      <tr><td>2..3</td><td><code>i16 LE</code></td><td><code>fmv_id</code>, sign-extended</td></tr>
+      <tr><td>4..6</td><td>-</td><td>Padding the PC math reserves; never read</td></tr>
+    </tbody>
+  </table>
+  <p>The handler stores the id in the FMV-index global and sets the next-game-mode global to 26. Nothing else happens until the next frame, when <code>StrInit</code> loads the overlay and reads the id back to pick a dispatch slot. The field script is suspended for the duration.</p>
+  <h3 id="seven-mid-game-scenes">Which scene plays which movie</h3>
+  <p>The assignment is disc data: each triggering scene's MAN (its script-and-data bundle) carries exactly one trigger op, recovered by decompressing every scene and walking its scripts (<code>man_field_scripts::scene_fmv_triggers</code>). After playback the master dispatch does not return to the triggering scene - it writes a <strong>return scene</strong> from its own label table.</p>
+  <table>
+    <thead><tr><th><code>fmv_id</code></th><th>Trigger scene</th><th>File</th><th>Return scene</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td>title screen (idle)</td><td><code>MV1.STR</code></td><td>mode 22 (memory-card init)</td></tr>
+      <tr><td>1</td><td><code>town01</code></td><td><code>MV2.STR</code></td><td><code>town0b</code></td></tr>
+      <tr><td>2</td><td><code>garmel</code></td><td><code>MV3.STR</code> segment</td><td><code>map01</code></td></tr>
+      <tr><td>3</td><td><code>deroa</code>, <code>chitei2</code></td><td><code>MV3.STR</code> segment</td><td><code>chitei2</code></td></tr>
+      <tr><td>4</td><td><code>dohaty</code></td><td><code>MV3.STR</code> segment</td><td><code>map02</code></td></tr>
+      <tr><td>5</td><td>(no MAN carries it)</td><td><code>MV3.STR</code> segment</td><td>stay in current scene</td></tr>
+      <tr><td>6</td><td><code>town0d</code></td><td><code>MV4.STR</code></td><td><code>jou</code></td></tr>
+      <tr><td>7</td><td><code>uru</code></td><td><code>MV5.STR</code></td><td><code>uru2</code></td></tr>
+      <tr><td>8</td><td><code>jouine</code></td><td><code>MV6.STR</code></td><td><code>town0e</code></td></tr>
+    </tbody>
+  </table>
+  <p>Slots 9 and above name dev files (<code>MOV15.STR</code>, <code>MV1A.STR</code>, <code>\DATA\MOV.STR</code>) that are not on the disc. Retail writes the return-scene globals whether or not the picture played, so the port moves the player on even when a movie is skipped or cannot be decoded.</p>
+</section>
+
+<section class="doc-section" id="retail-playback" data-doc="retail-playback-engine-str-overlay--scus-st-streaming-library,strmdec-fmv-overlay-residency">
+  <h2>Playing a movie: the retail path</h2>
+  <ol class="steps">
+    <li><b>Mode 26</b><span>Pick the 32-byte slot <code>0x801D0A6C + fmv_id &times; 0x20</code>, clear the letterbox bands, select the Iki decoder (<code>FUN_801CEA3C</code>).</span></li>
+    <li><b>Seek</b><span><code>CdSearchFile</code> resolves the path; seek <code>(start_frame &minus; 1) &times; 10</code> sectors in and open the SPU CD input (<code>FUN_801CF098</code>).</span></li>
+    <li><b>Stream</b><span><code>CdlReadS</code> with real-time XA on and the sector filter off, into a 32-sector ring.</span></li>
+    <li><b>Demux</b><span>Video sectors gather per frame in ring slots; XA sectors are played by the drive and never touch the CPU.</span></li>
+    <li><b>Decode</b><span>The Iki bitstream becomes MDEC codes, DMA'd to the chip; each 32-px strip is blitted to VRAM as it comes out.</span></li>
+    <li><b>Exit</b><span>End of stream, or a pad press when <code>fmv_id == 0</code>: mute the CD mix, pause, write the return scene.</span></li>
+  </ol>
+  <p>Only the intro is skippable - the mid-game movies ignore the pad. Every retail movie takes the Iki path; the overlay also carries an STRv2/v3 decoder that only the dev slots select. The demux state machine, ring layout and MDEC feed are on <a href="cutscene-internals.html#demux">cutscene internals</a>. While a movie plays, RAM also holds the CD library&rsquo;s cache of the <code>MOV</code> directory, the overlay&rsquo;s path-string table (including the dev paths that do not ship) and its return-scene label table.</p>
+</section>
+
+<section class="doc-section" id="str-sector" data-doc="str-sector-format,mdec-decoder-iki-bitstream">
+  <h2>What is on the disc: STR sectors and the Iki frame</h2>
+  <p>A movie is a run of 2048-byte Mode 2 Form 1 sectors, each tagged with the frame it belongs to and its position within that frame. Concatenating the payloads of one frame's sectors in arrival order gives the demuxed bitstream.</p>
+  <div class="byte-map">
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+0x00</span><span class="bm-name">magic 0x0160</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell" style="--w:2"><span class="bm-off">+0x02</span><span class="bm-name">type 0x8001</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell" style="--w:2"><span class="bm-off">+0x04</span><span class="bm-name">chunk no.</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell" style="--w:2"><span class="bm-off">+0x06</span><span class="bm-name">chunks / frame</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell" style="--w:4"><span class="bm-off">+0x08</span><span class="bm-name">frame number</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell" style="--w:4"><span class="bm-off">+0x0C</span><span class="bm-name">frame size (bytes)</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell" style="--w:4"><span class="bm-off">+0x10</span><span class="bm-name">width, height</span><span class="bm-size">u16 &times; 2</span></div>
+    <div class="bm-cell bm-pad" style="--w:6"><span class="bm-off">+0x14</span><span class="bm-name">header copy, padding</span><span class="bm-size">12 B</span></div>
+  </div>
+  <div class="byte-map">
+    <div class="bm-cell bm-dim" style="--w:1"><span class="bm-off">+0x00</span><span class="bm-name">32-byte header</span><span class="bm-size">above</span></div>
+    <div class="bm-cell bm-accent" style="--w:6"><span class="bm-off">+0x20</span><span class="bm-name">payload chunk - concatenate a frame's chunks in order</span><span class="bm-size">2016 B</span></div>
+  </div>
+  <p id="mdec">The demuxed frame is the PSX <strong>Iki</strong> layout: a 10-byte header, then an LZSS-compressed table holding every block's quantisation scale and DC value, then an AC-only entropy stream. Legaia puts the frame width and height where a strict STRv2 parser expects version and qscale, which is why generic tools reject these movies. One frame decodes in six steps:</p>
+  <ol class="steps">
+    <li><b>Header</b><span>10 bytes: code count, magic <code>0x3800</code>, width, height, LZSS size.</span></li>
+    <li><b>DC table</b><span>LZSS inflates to one 6-bit qscale + 10-bit DC per 8&times;8 block.</span></li>
+    <li><b>AC codes</b><span>Run/level VLC per block, ended by EOB; an escape carries a raw 16-bit code.</span></li>
+    <li><b>IDCT</b><span>Dequantise through the zigzag order, then a separable 8&times;8 inverse DCT.</span></li>
+    <li><b>Macroblocks</b><span>Six blocks each - Cr, Cb, Y0..Y3 - laid out column by column.</span></li>
+    <li><b>Colour</b><span>Upsample 4:2:0 chroma, convert BT.601 YCbCr to RGB.</span></li>
+  </ol>
+  <p>Formulas for every step are on <a href="cutscene-internals.html#mdec-steps">cutscene internals</a>; the port's decoder is <code>legaia_mdec::MdecDecoder</code>.</p>
+</section>
+
+<section class="doc-section" id="xa" data-doc="xa-audio,xa-channel-selection">
+  <h2>XA audio and the sync clock</h2>
+  <p>The soundtrack never touches the CPU in retail: the drive decodes the XA-ADPCM sectors as they stream past and feeds the SPU. The port decodes them itself and uses the result as the clock the picture follows.</p>
+  <ul class="bullets">
+    <li><strong>Where it is.</strong> Mode 2 Form 2 sectors with <code>submode &amp; 0x24 == 0x24</code>, sharing the movie's LBA range with the video; every movie carries exactly one track at <code>(file 1, channel 0)</code>.</li>
+    <li><strong>Why the extract is silent.</strong> The Form-1 extract under <code>extracted/MOV/</code> truncates each audio sector from 2324 to 2048 bytes. Faithful playback reads the raw 2352-byte sectors from the disc image (<code>cutscene_av::decode_str_av_from_disc</code>).</li>
+    <li><strong>Sync.</strong> The PCM is staged into <code>AudioOut::play_xa</code>; the visible frame is <code>audio_position / frame_period</code> (<code>cutscene_av::due_video_frame</code>). With no audio the same function paces off the wall clock.</li>
+    <li><strong>Frame rate.</strong> STR carries no rate field; it is implied by sectors per frame at 2&times; (150 sectors/s). All six movies measure 10 sectors per frame = 15 fps (<code>analyze_str_timing</code>).</li>
+  </ul>
+  <h3 id="xa-channel-selection">XA channel selection</h3>
+  <p>The disc's <code>XA1.XA..XA34.XA</code> files carry many channels each (voice banks, streamed music), so something has to pick a channel - but not for movies.</p>
+  <table>
+    <thead><tr><th>Source</th><th>Channel mechanism</th><th>Who selects</th></tr></thead>
+    <tbody>
+      <tr><td>Movie (<code>MV*.STR</code>)</td><td>None: the read runs real-time mode <em>without</em> the sector filter, so the drive plays every ADPCM sector, and each movie interleaves one track</td><td>File + frame range from the dispatch table</td></tr>
+      <tr><td>Clip (<code>XA&lt;n&gt;.XA</code>)</td><td><code>CdlSetfilter {file 1, chan}</code> in the clip starter's CdSync state machine, from a 34-slot <code>[CdlLOC][len]</code> table at <code>0x801C6ED8</code> filled at boot</td><td>Per cue: slot <code>(id &minus; 0x100) &gt;&gt; 3</code>, channel <code>id &amp; 7</code></td></tr>
+    </tbody>
+  </table>
+  <p>The clip-side arithmetic (slot/channel mapping, the duration scale, the end-LBA clamp) is ported in <code>legaia_engine_shell::xa_clip</code>; the CD-control state machines stay hardware-side. Per-channel content extracts with <code>xa demux-disc-all</code>; the cue census lives on <a href="audio.html">audio</a>.</p>
+</section>
+
+<section class="doc-section" id="playback" data-doc="playback-loop-play-str,cli-reference,cdname--str-override-map">
+  <h2>The engine player</h2>
+  <p><code>legaia-engine play-str</code> is the from-scratch player on its own. It decodes the video (and, from a disc image, the audio) up front, stages the PCM on the first redraw so cursor and picture start together, and on each redraw shows the frame due at the current position. The movie plays at its real rate, not the display refresh rate. Inside a game session <code>play-window</code> uses the same <code>cutscene_av</code> module: it pauses the scene BGM, suspends world ticks, shows one frame per redraw, then calls <code>finish_cutscene()</code>.</p>
+  <pre class="cli"><code># Frame inventory + detected frame rate
+mdec scan-str cutscene.str
+
+# Decode all frames to PPM images
+mdec decode-str cutscene.str --out-dir frames/
+
+# Play a disc movie with its interleaved XA audio, in sync
+legaia-engine play-str MOV/MV1.STR --disc "Legend of Legaia (USA).bin"</code></pre>
+  <p id="cutscene-map">A TOML map (<code>legaia-engine config dump-cutscene-map</code>, then <code>--cutscene-map</code> on <code>play</code> / <code>play-window</code>) overrides the scene-to-movie resolver per scene; explicit entries win, missing keys fall through to the disc-decoded table.</p>
+</section>
+
+<section class="doc-section" id="opdeene" data-doc="in-engine-3d-opening-the-five-scene-new-game-chain">
+  <h2>The 3D opening: five scenes, zero input</h2>
+  <p>Start a new game and the creation myth scrolls over a rendered grove, then the Seru, then the Mist, then a fly-in to Rim Elm. It looks like a movie; it is field scenes in the ordinary field mode, each carrying a <strong>timeline record</strong> - a field-VM script that stages the camera, pokes the background actors and ends with a scene change. There is no dedicated cutscene executor.</p>
+  <table>
+    <thead><tr><th>Scene</th><th>What plays</th><th>Timeline spawned by</th><th>Next</th></tr></thead>
+    <tbody>
+      <tr><td><code>opdeene</code></td><td>Creation crawl (14 pages) + Seru-history crawl (8 pages) over the grove and villager tableau</td><td>Op <code>0x44</code> in the entry script</td><td><code>opstati</code></td></tr>
+      <tr><td><code>opstati</code></td><td>Seru intro, 3 + 6 pages</td><td>Op <code>0x44</code></td><td><code>opurud</code></td></tr>
+      <tr><td><code>opurud</code></td><td>Mist story, 4 + 3 + 5 pages</td><td>Op <code>0x44</code></td><td><code>map01</code></td></tr>
+      <tr><td><code>map01</code></td><td>&ldquo;Twilight of humanity&rdquo; title card + 5-page crawl over the aerial approach to Rim Elm</td><td>Walk-on tile trigger</td><td><code>town01</code></td></tr>
+      <tr><td><code>town01</code></td><td>Establishing pan, name entry, Vahn's walk-out</td><td>Walk-on tile trigger at <code>(0x1D, 0x5B)</code>, one-shot gate</td><td>play</td></tr>
+    </tbody>
+  </table>
+  <p>A confirm press after the first crawl arms story flag 26, which fires the <code>town01</code> packet - the <strong>intro skip</strong>. The engine drives the whole chain by executing the same records (<code>World::step_cutscene_timeline</code>), pinned against a cold-boot pixel capture.</p>
+  <h3 id="narration-format">The narration crawl</h3>
+  <ul class="bullets">
+    <li><strong>Text.</strong> Inline ASCII pages inside the timeline record, each framed <code>0x1F &hellip; 0x00</code>, introduced by <code>CC F8 80 N</code> (<code>N</code> = page count). A sibling op <code>CC F8 89</code> shows a static title card while the script continues. Parser <code>legaia_scene_formats::cutscene_text</code>; no text is committed.</li>
+    <li><strong>Presentation.</strong> A bottom-up roller actor (handler <code>FUN_80037174</code>) spawned as a child, so the camera cuts authored between crawl blocks play <em>under</em> the text. Retail's per-scene geometry (window top, visible lines, scroll cadence) comes from a 10-byte config op and is tabulated on <a href="cutscene-internals.html#roller">internals</a>. Lines are centred and enter and leave a clip window a pixel at a time: the roller links a draw-area pair after its lines, which runs before them, and a second pair restoring the full area ahead of them.</li>
+    <li><strong>&ldquo;It was the Seru.&rdquo;</strong> is not text at all: a pre-rendered 112&times;32 image in the <code>opdeene</code> geometry pack (PROT 0749). Two move-VM stager parts draw it, spawned as children down a chain the opening timeline installs: both camera-locked sprites over the same rect, one the face and one a shadow a pixel down-right in a different blend mode, each starting fully cued to black and ramping to full colour - the fade-in. A cold-boot capture holds both nodes on the actor lists and their two packets in the ordering table, shadow first. The engine spawns and draws the same two parts (<code>engine-effects::effect_sprite_arm</code>).</li>
+    <li><strong>Pacing.</strong> Retail counts every wait in display frames at 60 Hz, through the adaptive frame-skip factor: a logic tick that spans two or three display frames credits two or three. One engine tick is one vsync, and the script's frame delta is the game frame's length on the vsyncs that are game frames and zero between them, so a wait's sum moves exactly as retail's does (<a href="cutscene-internals.html#pacing">the wait law</a>).</li>
+  </ul>
+  <h3 id="timeline-execution-engine-port">Camera, actors and the engine port</h3>
+  <p>Camera Configure (op <code>0x45</code>) writes up to ten masked parameters - pitch, yaw, roll, an eye-space offset trio, the focus point and the GTE projection distance <code>H</code> - and either snaps or hands a mover actor a glide over <code>apply</code> display frames with one of four easing curves.
+  The vignette actors are per-placement script channels the timeline halt-acquires and pokes beat by beat, waiting on a completion flag each raises. The port runs the record as a second field-VM context, merges each beat's parameters into a persistent camera state, spawns the channels (<code>field_channels</code>) and renders through the exact retail GTE model. The full model - record header, parameter table, mover curves, channel handshake and the engine's completion rules - is on <a href="cutscene-internals.html#timeline">cutscene internals</a>.</p>
+  <h3 id="color-fade">Fades and the gold grade</h3>
+  <ul class="bullets">
+    <li><strong>Screen fade</strong> (op <code>0x4C 0x12</code>): a global multiply tint, optionally ramped over N frames. Every scene's entry script arms an instant black then a 68-frame ramp to neutral - the fade-in that opens the prologue. It darkens the 3D scene only; the crawl stays white. Engine <code>fade::SceneTintRamp</code>.</li>
+    <li><strong>Effect colour</strong> (op <code>0x34</code> sub-0): a separate ramp on the effect layer, driven in the crawl gaps. It is <em>not</em> a screen fade - the capture holds the lit tableau across it.</li>
+    <li id="sepia-grade"><strong>Sepia grade.</strong> <code>opdeene</code> / <code>opstati</code> / <code>opurud</code> render gold because every uploaded palette entry is rewritten <code>L = max(r,g,b) &rarr; (L, L&minus;1, L&gt;&gt;1)</code> at load - a palette-space luminance collapse, not a per-frame tint and not a depth cue. The engine applies the same law in its mesh shaders (<code>Renderer::set_palette_grade</code>), pixel-matched on the villager tableau. A packet built at draw time keeps its colour, because it is made after the rewrite and outside the resident meshes it walks: the caption sprites above are such packets, so both hosts&rsquo; shaders skip the grade for them. Detail on <a href="cutscene-internals.html#grade">internals</a>.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="battle-intro" data-doc="script-cutscene-helpers-overlay_cutscene_dialogue">
+  <h2>Battle intro and script helpers</h2>
+  <p>The shatter or swirl before a fight is a third overlay, <strong>PROT 0979</strong>, sharing the movie player's slot. Its init picks a style from the battle flags byte, the formation's first monster id and (two arms) the scene index - style 2 is the ordinary shatter, 3 and 4 are reached by a handful of formations - and its per-frame tick owns the whole frame until the battle scene takes over. Port <code>render-kernels::battle_intro_styles</code> + <code>render-kernels::battle_intro</code>. The scripted <code>op*</code> / <code>ed*</code> scenes also lean on five shared per-frame helpers in the dialogue overlay (party-leader swap, position tween, teardown, particle emitter, colour rotate); both are tabulated on <a href="cutscene-internals.html#battle-intro">internals</a>.</p>
+</section>
+
+<section class="doc-section" id="battle-transition" data-doc="field-to-battle-transition-the-battle-intro-overlay">
+  <h2>From field to battle: one overlay owns the frame</h2>
+  <p>Between the encounter and the battle scene the screen shatters, scatters or swirls. For those two to four seconds nothing else is drawn: the transition overlay's init captures the field's last frame, switches the game to its own mode, and from then on every visible pixel is a transition primitive sampling that capture.</p>
+  <figure class="diagram">
+    <svg viewBox="0 0 860 240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Flow of the field-to-battle transition. Init picks a style, sets the duration, captures the field frame into a texture page and sets game mode 9. The tick then runs once per frame and does three things in parallel: a phase counter steps through the start cue, battle mesh assembly, and the battle music plus scene bundle load; the chosen style emitter draws that frame's primitives; and a per-style fade ramps in near the end. When the timer reaches the duration and both ready bits are set, the tick writes game mode 0x14 and the battle begins.">
+      <defs><marker id="cs-bt-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="dg-node" x="20" y="86" width="170" height="72" rx="5"/>
+      <text class="dg-label" x="105" y="110">init</text>
+      <text class="dg-sub" x="105" y="128">style, duration,</text>
+      <text class="dg-sub" x="105" y="144">capture frame, mode 9</text>
+      <rect class="dg-node-accent" x="250" y="86" width="130" height="72" rx="5"/>
+      <text class="dg-label" x="315" y="116">tick</text>
+      <text class="dg-sub" x="315" y="136">once per frame</text>
+      <rect class="dg-node" x="430" y="14" width="230" height="56" rx="5"/>
+      <text class="dg-label" x="545" y="38">phase 0, 1, 2</text>
+      <text class="dg-sub" x="545" y="56">cue, meshes, music + bundle</text>
+      <rect class="dg-node" x="430" y="94" width="230" height="56" rx="5"/>
+      <text class="dg-label" x="545" y="118">style emitter 0..4</text>
+      <text class="dg-sub" x="545" y="136">primitives over the capture</text>
+      <rect class="dg-node" x="430" y="174" width="230" height="56" rx="5"/>
+      <text class="dg-label" x="545" y="198">per-style fade</text>
+      <text class="dg-sub" x="545" y="216">to white or to black</text>
+      <rect class="dg-node-ok" x="744" y="86" width="96" height="72" rx="5"/>
+      <text class="dg-label" x="792" y="116">mode 0x14</text>
+      <text class="dg-sub" x="792" y="136">battle</text>
+      <path class="dg-edge" d="M190 122 L248 122" marker-end="url(#cs-bt-arrow)"/>
+      <path class="dg-edge" d="M380 104 L428 48" marker-end="url(#cs-bt-arrow)"/>
+      <path class="dg-edge" d="M380 122 L428 122" marker-end="url(#cs-bt-arrow)"/>
+      <path class="dg-edge" d="M380 140 L428 196" marker-end="url(#cs-bt-arrow)"/>
+      <path class="dg-edge" d="M660 122 L742 122" marker-end="url(#cs-bt-arrow)"/>
+      <text class="dg-edge-label" x="701" y="98" text-anchor="middle">timer done,</text>
+      <text class="dg-edge-label" x="701" y="112" text-anchor="middle">ready == 3</text>
+    </svg>
+    <figcaption>The loading happens <em>under</em> the effect: the battle's meshes, music and scene bundle are staged by the phase counter while the style plays.</figcaption>
+  </figure>
+  <div class="table-wrap">
+  <table class="data-table">
+    <thead><tr><th>Style</th><th>Look</th><th>Length</th><th>Fade tail</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td>Scatter: 1280 particles carrying patches of the field</td><td>132 frames</td><td>black (white on one sub-arm)</td></tr>
+      <tr><td>1</td><td>Spin-up</td><td>132 frames</td><td>white</td></tr>
+      <tr><td>2</td><td>Tile shatter - the default, so an ordinary random encounter shatters</td><td>132 frames</td><td>black</td></tr>
+      <tr><td>3</td><td>Curtain: the capture cut into row and column strips</td><td>132 frames</td><td>black</td></tr>
+      <tr><td>4</td><td>Swirl</td><td>252 frames</td><td>white</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <ul class="bullets">
+    <li><strong>Which style.</strong> The init reads the battle flags byte, the formation's first monster and, for two arms, the scene index. Three formations get the curtain and one gets the swirl. Two of its stores sit in branch delay slots and land on both arms, which is why a flagged battle defaults to style 1 and not 2.</li>
+    <li><strong>The base colour is black, not the field.</strong> The capture is taken once and the frame is cleared; a particle at rest reproduces its patch exactly only over that cleared frame, and each patch that flies away leaves black behind. Drawing the live field underneath gets both halves wrong - resting patches read at double brightness, and the tail shows a still-animating field. The port emits an opaque backdrop quad on every frame of the window to stand in for the clear.</li>
+    <li><strong>The duration is the denominator of everything.</strong> Each fade is a lead before the end, the ready bits rise 30 and 6 frames before it, and the shatter's tiles start on random delays that reach about frame 84. A transition shorter than that leaves part of the grid parked; one shorter than twenty frames draws as a whitening fade over a statically re-tiled screen.</li>
+    <li><strong>The same white ramp ends two ways.</strong> The fade helper's second argument is a blend mode: under additive it whites out, under subtractive it blacks out. Read as a depth, every style would half-blend and never reach either end.</li>
+    <li><strong>Sound.</strong> Phase 0 writes the battle-start cue straight into slot 0 of the pending effects ring, and for an ordinary fight re-applies the live music level to the field track over a ramp. Phase 2 starts the battle track during the effect, which is where the port starts it too.</li>
+  </ul>
+  <p>Port: the state machine is the encounter session's transition phase (<code>battle_intro_transition::tick_transition</code>); the per-record simulation of each style and the packet builders are shared by both hosts. Two retail nuances are not carried, because the port's screen-overlay path has no depth-cue channel: a moving tile's opaque faces and the late swirl fade toward a far colour in retail and keep their packet colours in the port. Both sides drop a quad whose projected corners outrun the GPU polygon-size limit, which is what removes a swirl band flying into the lens.</p>
+</section>
+
+<section class="doc-section" id="open-items" data-doc="open-items,provenance">
+  <h2>What is still open, and how it is known</h2>
+  <p>One port difference remains: the engine&rsquo;s cutscene camera arms its glides per component, where retail re-seeds all ten camera axes on every apply beat. The XA clip-table writer and the clip-cue census are settled on <a href="audio.html">audio</a>; the dev movie paths in the overlay do not ship on the disc.</p>
+  <p>Every claim here traces to the PROT 0970 disassembly, save-state captures taken during playback, and cold-boot probes of the opening; the per-claim source list (decoder formulas, the XA layout, the playback clock, the mode handlers) is on <a href="cutscene-internals.html#how-we-know">cutscene internals</a> and in the full doc.</p>
+</section>
+
+<section class="doc-section" id="see-also" data-doc="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="cutscene-internals.html">Cutscene internals</a>
+    <a href="../formats/str-fmv-table.html">STR FMV table</a>
+    <a href="../formats/xa.html">XA audio</a>
+    <a href="audio.html">Audio stack</a>
+    <a href="script-vm.html">Field/event VM</a>
+    <a href="boot.html">Boot path (title attract)</a>
+    <a href="battle.html">Battle</a>
+    <a href="renderer.html">Renderer (camera model)</a>
+    <a href="../tooling/static-overlay-pipeline.html">Static overlay pipeline</a>
+    <a href="../media.html">Media gallery (watch the movies)</a>
+    <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/subsystems/cutscene.md" target="_blank" rel="noopener">docs/subsystems/cutscene.md</a>
+  </div>
+</section>

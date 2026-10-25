@@ -1,0 +1,1484 @@
+//! World-map ticking, locomotion, entity install/engage, portal auto-engage, NPC dialog, and encounter setup.
+
+use super::*;
+use legaia_engine_mode::mode::SceneMode;
+
+/// [`legaia_engine_field::world_map_panel_host::PanelFlagStore`] over the world's shared
+/// system flag bank - the engine's `FUN_8003CE64` / `FUN_8003CE08` /
+/// `FUN_8003CE34` triple.
+struct WorldPanelFlags<'a> {
+    world: &'a mut World,
+}
+
+impl legaia_engine_field::world_map_panel_host::PanelFlagStore for WorldPanelFlags<'_> {
+    fn flag_test(&self, id: i32) -> bool {
+        u16::try_from(id).is_ok_and(|i| self.world.system_flag_test(i))
+    }
+    fn flag_set(&mut self, id: i32) {
+        if let Ok(i) = u16::try_from(id) {
+            self.world.system_flag_set(i);
+        }
+    }
+    fn flag_clear(&mut self, id: i32) {
+        if let Ok(i) = u16::try_from(id) {
+            self.world.system_flag_clear(i);
+        }
+    }
+}
+
+impl World {
+    /// Drive the world-map controller from this frame's pad.
+    ///
+    /// The pad word is whatever the host installed via [`World::set_pad`]
+    /// before this [`World::tick`]; the "held" mask is the just-pressed
+    /// edge (`pad & !pad_prev`), matching the retail newly-pressed word
+    /// (`_DAT_8007B874`) that [`WorldMapController::tick`] expects. No-ops
+    /// when no controller is installed (e.g. world-map mode entered
+    /// without [`World::enter_world_map`]).
+    ///
+    /// Reads only pad bits, never wall-clock state, so the resulting
+    /// controller mutation is deterministic across identical pad streams.
+    ///
+    /// When overworld entities are installed
+    /// ([`Self::install_world_map_entities`]) it also steps each one through
+    /// the ported entity SM ([`legaia_engine_field::world_map_entity::step`]): the Idle state drains
+    /// the shared encounter countdown and, when it reaches zero with
+    /// encounters enabled, latches the configured formation, which this method
+    /// then resolves into a battle ([`SceneMode::WorldMap`] → [`SceneMode::Battle`],
+    /// returning to the world map on victory). Interactions / portal
+    /// transitions surface as [`FieldEvent::FieldInteract`] for the host.
+    ///
+    /// The per-entity SM itself is ported in [`legaia_engine_field::world_map_entity`]; the encounter
+    /// formation resolver it gates is the retail BGM/asset resolver.
+    ///
+    /// REF: FUN_801DA51C
+    /// REF: FUN_800243F0
+    pub(crate) fn tick_world_map(&mut self) {
+        let pad = self.input.pad();
+        let pad_held = pad & !self.input.pad_prev();
+        let mut ctrl_sfx = Vec::new();
+        let mut open_map_display = false;
+        if let Some(ctrl) = &mut self.world_map.ctrl {
+            ctrl.tick(pad, pad_held);
+            // Retail runs the top-view screen-dim pass (`FUN_801E75DC`)
+            // immediately after the toggle/camera block, gated on
+            // `view_mode != 0 && anim_flags & 1` - see
+            // `WorldMapController::run_screen_dim`. Walk-mode frames clear it,
+            // so this costs one flag test on the common path.
+            ctrl.run_screen_dim();
+            ctrl_sfx = ctrl.drain_sfx();
+            // The fade-up reached `0x100`: retail stores game mode `0xC`,
+            // whose handler swaps PROT 0981 in and calls its enter routine.
+            // The display's mode-0 frame runs here too, so the black the
+            // ramp ended on is held across the hand-off rather than dropped
+            // for a frame (retail's mode-12 frame is the disc load).
+            if ctrl.map_display_requested {
+                open_map_display = true;
+            }
+        }
+        if open_map_display {
+            self.world_map.map_display =
+                Some(legaia_engine_field::map_display::MapDisplay::enter());
+            self.tick_map_display();
+        }
+        // The map-display arm's cue is a `jal FUN_80035B50` (`0x801D0220`) -
+        // the same SFX-ring producer the field VM's op `0x36` sub `0` calls -
+        // so it rides the ring both hosts already replay
+        // (`World::take_sfx_ring_ops`) instead of a queue only tests drained.
+        for id in ctrl_sfx {
+            self.push_sfx_cue(i16::from(id));
+        }
+        // Player is "walking" on the overworld this frame when any d-pad
+        // direction is held. These are the Up/Right/Down/Left bits the
+        // locomotion step ([`Self::step_world_map_locomotion`]) reads - the
+        // face buttons (Triangle/Circle/Cross/Square, 0x1000..0x8000) must not
+        // count as walking or a confirm press would suppress the talk-to gate.
+        const WORLD_MAP_DPAD: u16 = input::PadButton::Up as u16
+            | input::PadButton::Right as u16
+            | input::PadButton::Down as u16
+            | input::PadButton::Left as u16;
+        self.world_map.player_walking = pad & WORLD_MAP_DPAD != 0;
+
+        // Talk-to: open / dismiss an adjacent NPC's dialogue on a confirm
+        // press. Runs before locomotion so opening a box suppresses movement +
+        // portal auto-engage this frame (both gate off `current_dialog`).
+        self.tick_world_map_npc_dialog();
+        // The talk runner the field drives: a record the action button just
+        // engaged starts this frame, and a running one steps on the frame's
+        // pad edges. Its ops do the rest - a fishing signboard's `0x3E` arms
+        // the minigame warp exactly as a casino cabinet's does in a town.
+        self.drive_inline_dialogue();
+        if !self.dialogue_owns_input()
+            && self.dialog.active_inline_prologue.is_none()
+            && !self.interaction_timeline_holds_talk_facing()
+        {
+            self.release_talk_facing();
+        }
+
+        // Move the player first, then auto-engage any portal the player just
+        // walked onto (sets its SM to Transitioning), so the entity SM step
+        // below fires the portal's transition the *same* tick.
+        self.step_world_map_locomotion();
+        self.auto_engage_world_map_portals();
+        // The overworld runs the field overlay's walk tick too (the frame
+        // driver `FUN_801D1344` calls `FUN_801D0B90` right before the
+        // locomotion controller, `0x801D16EC`): walk-regen passives, the
+        // Incense window drain and its wear-off notice.
+        self.tick_field_walk_regen();
+        self.tick_incense_notice();
+        // The player's locomotion clip, in the field pump's order: the
+        // settle's clip tail binds the base the step above wrote
+        // (`jal 0x801D1BA0` at `0x801D1744`, the same call the field pump
+        // makes), the system channel's per-tick idle store follows, then the
+        // clip advances into the player's `pose_frame`. Without these the
+        // overworld figure held its rest pose while it slid across the map.
+        // REF: FUN_801D1344, FUN_801D1BA0
+        self.field_settle_clip_tail();
+        self.tick_field_system_channel_clip_reset();
+        self.tick_player_scale_ramp();
+        self.npcs.looks.tick(self.move_vm.ramp_ratio.max(1));
+        self.detect_field_actor_motion();
+        self.tick_field_player_anim();
+
+        if !self.world_map.entities.is_empty() {
+            // Take the entity list out so the SM's host bridge can borrow the
+            // world mutably (mirrors the monster-AI-state borrow window).
+            let mut entities = std::mem::take(&mut self.world_map.entities);
+            for (idx, ctx) in entities.iter_mut().enumerate() {
+                let mut host = WorldMapEntityHostImpl { world: self };
+                legaia_engine_field::world_map_entity::step(idx, ctx, &mut host);
+            }
+            self.world_map.entities = entities;
+        }
+
+        // Run the one-shot horizon / sky band emitter if something armed its
+        // gate this frame (retail `FUN_801D7EA0`). Unarmed frames cost a
+        // flag test.
+        self.tick_world_map_horizon();
+
+        // The world-map band's panel screen: the six `ctx[+0x54]` panel actors
+        // over the shared window system, plus the field party HUD's idle timer.
+        self.tick_world_map_panels();
+
+        // The region-keyed random-encounter roll (the `FUN_801D9E1C` path): on
+        // each 128-unit tile crossing, roll the active region. No-op without a
+        // region tracker, so a camera-only world map is unchanged.
+        self.live_world_map_tick();
+
+        // Resolve a latched overworld encounter into a battle. Runs for both
+        // the entity-SM countdown path and the region-roll path.
+        if let Some(formation_id) = self.world_map.pending_encounter.take() {
+            self.begin_world_map_encounter(formation_id);
+        }
+    }
+
+    /// The live kingdom index (`0x8007B970`): the one the entry fade derives
+    /// from the scene PROT base, else the active kingdom scene's.
+    pub fn world_map_kingdom_index(&self) -> Option<u8> {
+        self.world_map
+            .ctrl
+            .as_ref()
+            .and_then(|c| {
+                legaia_engine_field::world_map::kingdom_index_for_scene_base(c.scene_base)
+                    .or(c.entry_fade.kingdom_index)
+            })
+            .or_else(|| kingdom_index_for_scene_label(&self.active_scene_label))
+    }
+
+    /// Install the kingdom MAN's world-map location table (`DAT_80073EE0`),
+    /// the pointer the MAN loader `FUN_8003AEB0` stores for the map display.
+    /// `man` is the decompressed scene MAN, or `None` for a scene without
+    /// one. Any open map display is dropped: the table it indexes is gone.
+    pub fn install_world_map_locations(&mut self, man: Option<&[u8]>) {
+        self.world_map.map_display = None;
+        // The installer's own `FUN_800271A8` (`0x8003AF98`) runs under the
+        // `OFY = 120` the field init's display-env setup just stored.
+        self.world_map.curve_bias = 0;
+        self.world_map.locations = man
+            .and_then(legaia_scene_formats::place_names::world_map_table)
+            .map(|t| {
+                t.locations
+                    .into_iter()
+                    .map(|l| legaia_engine_field::map_display::MapLocation {
+                        region: l.region,
+                        map_x: l.map_x,
+                        map_y: l.map_y,
+                        discovery_flag: l.discovery_flag,
+                        name: l.name.into_bytes(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    /// One frame of the map display: the module tick, its ring cues, and on
+    /// the way out the walk frame's fade-in and the hand-back.
+    ///
+    /// The cues are bare stores into ring slot 0 (`sh id,0x8007B6D8`), not
+    /// calls to the cursor producer. The exit fade is
+    /// `FUN_801D58F0(2, 0xFFFFFF, 0, 0, 8, 0)` - the field overlay's fade
+    /// spawner, which sits past the `0x4000` bytes PROT 0981 replaces.
+    ///
+    /// REF: FUN_80025F2C (the mode-`0x0D` handler), FUN_801D58F0
+    pub fn tick_map_display(&mut self) {
+        use legaia_engine_field::map_display::EXIT_FADE;
+        use legaia_engine_field::world_map_panel_host::packed_pad;
+        let raw_held = self.input.pad();
+        let raw_edge = raw_held & !self.input.pad_prev();
+        let player = self.world_map_player_xz();
+        let kingdom = self.world_map_kingdom_index().map_or(u32::MAX, u32::from);
+        let Some(mut display) = self.world_map.map_display.take() else {
+            return;
+        };
+        let tick = display.tick(
+            packed_pad(raw_held),
+            packed_pad(raw_edge),
+            player,
+            &self.world_map.locations,
+            kingdom,
+        );
+        for id in tick.sfx {
+            self.audio
+                .sfx_ring_ops
+                .push(legaia_engine_system::sound_state::SfxRingOp::WriteSlot(
+                    0, id,
+                ));
+        }
+        if tick.spawn_exit_fade {
+            let (kind, from, to, delay, duration, hold) = EXIT_FADE;
+            let rgb = |w: u32| [0u32, 8, 16].map(|s| ((w >> s) & 0xFF) as i16);
+            legaia_engine_system::fade::spawn_fade(
+                &mut self.presentation.fade,
+                &legaia_engine_system::fade::FadeTemplate {
+                    kind,
+                    duration,
+                    start_rgb: rgb(from),
+                    end_rgb: rgb(to),
+                    mode: [delay, hold, 0],
+                },
+                0,
+            );
+        }
+        // Mode `1` rebuilds the curvature table flat and mode `3` rebuilds it
+        // from the saved coefficients (`jal 0x800271A8` at `0x801CE958` and
+        // `0x801CEB88`), both under the running frame's `OFY = 114`.
+        if display.camera_staged {
+            self.world_map.curve_bias = legaia_render_kernels::overworld_curvature::REBUILD_BIAS;
+        }
+        if !tick.exit {
+            self.world_map.map_display = Some(display);
+        }
+    }
+
+    /// The overworld curvature table's build offset in screen rows, or `None`
+    /// off the overworld (the consumers gate on the overworld bit
+    /// `_DAT_1F800394 & 1`). Every consumer of the table adds it: the prim
+    /// leaves (the hosts' mesh passes), the fog sheets and the drop shadow.
+    ///
+    /// `0` after a scene load. The map display rebuilds the table twice
+    /// inside a running frame, whose `OFY` is `114` where the builder
+    /// subtracts `120`, so from its mode `1` on every bent draw sits six
+    /// rows higher - through the display and on the walk frame after it.
+    ///
+    /// REF: FUN_800271A8, FUN_801CE850
+    pub fn overworld_curve_bias(&self) -> Option<i16> {
+        self.overworld_bit().then_some(self.world_map.curve_bias)
+    }
+
+    /// Whether the map display, or the fade-up ramp into it, holds the pad
+    /// away from the walk frame's controller `FUN_801D01B0`.
+    ///
+    /// REF: FUN_801D1344 (the `0x8007BAF4 != 0` head)
+    pub fn map_display_owns_pad(&self) -> bool {
+        self.world_map.map_display.is_some()
+            || self
+                .world_map
+                .ctrl
+                .as_ref()
+                .is_some_and(|c| self.mode == SceneMode::WorldMap && c.entry_fade.ramp != 0)
+    }
+
+    /// Retail's dev flag `_DAT_8007B868`, which the map display's label pass
+    /// reads as "show every place" (`0x801CF3A8`). `0` in retail.
+    pub fn map_display_show_all(&self) -> bool {
+        self.audio.dual_mode_gate != 0
+    }
+
+    /// The map display's mini-map panel this frame
+    /// ([`legaia_engine_field::map_display::MapDisplay::chrome`]), `None`
+    /// while the display is down, in a fade, or cycled off the panel.
+    pub fn map_display_chrome(&self) -> Option<legaia_engine_field::map_display::MapChrome> {
+        if self.mode != SceneMode::WorldMap {
+            return None;
+        }
+        self.world_map
+            .map_display
+            .as_ref()?
+            .chrome(self.world_map_player_xz())
+    }
+
+    /// The overworld leader's world `(x, z)`, the origin when none is seated.
+    pub(crate) fn world_map_player_xz(&self) -> (i32, i32) {
+        self.player_actor_slot
+            .and_then(|s| self.actors.get(s as usize))
+            .map(|a| {
+                (
+                    i32::from(a.move_state.world_x),
+                    i32::from(a.move_state.world_z),
+                )
+            })
+            .unwrap_or((0, 0))
+    }
+
+    /// The full-screen subtractive washes the map display's two fades draw
+    /// this frame, as `FUN_80024EE4`'s `(layer, blend, packed)` triples: the
+    /// L1 fade-up `FUN_800196A4` (`(1, 2, grey)`) and the display's own
+    /// timer fade (`(0, 2, grey)`, `0x801CEC4C..0x801CEC90`).
+    ///
+    /// REF: FUN_800196A4, FUN_80024EE4
+    pub fn map_display_fade_push_args(&self) -> Vec<(i16, i16, u32)> {
+        let mut out = Vec::new();
+        if self.mode != SceneMode::WorldMap {
+            return out;
+        }
+        if let Some(q) = self.world_map.ctrl.as_ref().and_then(|c| c.entry_fade_draw) {
+            out.push((1, 2, u32::from(q.grey) * 0x01_01_01));
+        }
+        if let Some(grey) = self
+            .world_map
+            .map_display
+            .as_ref()
+            .and_then(|d| d.fade_grey())
+        {
+            out.push((0, 2, u32::from(grey) * 0x01_01_01));
+        }
+        out
+    }
+
+    /// Move the overworld player actor from the held d-pad, bounded by the
+    /// scene's walkability grid.
+    ///
+    /// Held d-pad is remapped through the overworld camera azimuth
+    /// ([`world_map_camera_relative_bits`]) so "screen up" walks away from the
+    /// follow camera and "screen right" walks screen-right regardless of how
+    /// the map is rotated - the same camera-relative remap retail's
+    /// `func_0x800467e8` applies, and the counterpart to the field's
+    /// [`Self::decode_field_direction`].
+    ///
+    /// Collision is **not** a separate unknown: the retail world-map-walk
+    /// overlay's locomotion is the same `FUN_801d01b0` as the field, colliding
+    /// against the same `_DAT_1f8003ec + 0x4000` walkability grid
+    /// ([`Self::field_tile_is_wall`]) which [`legaia_engine_scene_host::scene_host::SceneHost::enter_field_scene`]
+    /// already loads from the scene's MAP file. Stepping runs through the shared
+    /// [`Self::advance_with_collision`], so walls stop the overworld player
+    /// exactly as on the field.
+    ///
+    /// **Speed and clip are the field controller's.** The world-map-walk
+    /// overlay's frame pump `FUN_801D1344` and pad controller `FUN_801D01B0`
+    /// are instruction-identical to the field overlay's, so the overworld step
+    /// is `((base_step * player[+0x72]) >> 12) * DAT_1F800393` - walk / run
+    /// off [`Self::field_base_step`] - and the frame writes the same clip base
+    /// (idle `2` / walk `1` / run `3`) the settle tail binds
+    /// ([`Self::field_settle_clip_tail`]). What differs on a kingdom map is
+    /// the multiplier and the base step: each kingdom's entry script sets the
+    /// player's `+0x72` to `0xC00` (`CC F8 40 00 0C 00 00`) - the same word
+    /// the per-actor draw reads as its render scale - and `_DAT_8007B6A8`
+    /// forces the slow step `5`, so a retail frame at the overworld's frame
+    /// step `3` walks `10` units ([`WORLD_MAP_FRAME_STEP`], paid out over
+    /// three vsync ticks through [`legaia_engine_field::world_map_entity_config::WorldMapState::walk_carry`]).
+    ///
+    /// No-op without a live player actor, while a dialog owns the frame, in the
+    /// top-view debug camera, or while the player's movement-disabled flag
+    /// (`+0x10 & 0x80000`) is set (encounter queued / cutscene owns the player).
+    ///
+    /// REF: FUN_801D01B0 (speed + the clip-base slice `0x801D0424..0x801D04A4`)
+    fn step_world_map_locomotion(&mut self) {
+        if self.dialogue_owns_input() {
+            return;
+        }
+        // A spawned overworld cutscene timeline owns the player - the opening
+        // `map01` fly-in and, in free-roam, a gate-1 walk-on **beat** record
+        // (the Drake mist-wall force-walk band, dispatched by
+        // `SceneHost::dispatch_walk_on_trigger`). The timeline drives the
+        // player's MoveTo choreography, so free locomotion stands down while it
+        // plays - the force-walk lock, matching the field walk-on beat.
+        if self.cutscene_timeline_active() {
+            return;
+        }
+        // In the top-view debug camera the d-pad scrolls the camera
+        // ([`WorldMapController::tick`]); only walk the player in walk mode.
+        if self
+            .world_map
+            .ctrl
+            .as_ref()
+            .is_some_and(|c| c.is_top_view())
+        {
+            return;
+        }
+        let Some(slot) = self.player_actor_slot else {
+            return;
+        };
+        let slot = slot as usize;
+        if slot >= self.actors.len() || !self.actors[slot].active {
+            return;
+        }
+        // A committed fight holds the player from the rolling step on, as
+        // retail's trigger raises the engaged bit (`0x801DA2C0..0x801DA2D8`).
+        if self.actors[slot].move_state.flags & 0x0008_0000 != 0 || self.encounter_owns_player() {
+            return;
+        }
+        // Held d-pad → camera-relative direction bits. `sx`/`sy` are the raw
+        // screen deltas (right / forward); the azimuth remap rotates them into
+        // world space against the overworld follow camera.
+        let pad = self.input.pad();
+        let mut sx = 0i32;
+        let mut sy = 0i32;
+        if pad & input::PadButton::Up.mask() != 0 {
+            sy += 1;
+        }
+        if pad & input::PadButton::Down.mask() != 0 {
+            sy -= 1;
+        }
+        if pad & input::PadButton::Right.mask() != 0 {
+            sx += 1;
+        }
+        if pad & input::PadButton::Left.mask() != 0 {
+            sx -= 1;
+        }
+        let azimuth = self.world_map.ctrl.as_ref().map(|c| c.azimuth).unwrap_or(0);
+        let dir_bits = world_map_camera_relative_bits(azimuth, sx, sy);
+        // The frame's direction bits pick the leading probes an object
+        // entrance's contact is read from ([`Self::auto_engage_world_map_portals`]),
+        // as the field controller's do for a door.
+        self.locomotion.last_move_dir_bits = dir_bits;
+        // The clip base the settle tail strides into the player's clip -
+        // the same slice of `FUN_801D01B0` the field step runs, since the
+        // overworld runs that very controller.
+        if let Some(base) = legaia_engine_field::field_player_clip::locomotion_clip_base(
+            self.locomotion.player_clip,
+            dir_bits,
+            self.field_base_step(),
+            self.party.scene_save_allowed,
+        ) {
+            self.locomotion.clip_base = base;
+            self.locomotion.player_party_bank = true;
+            if let Some(anim) = &mut self.locomotion.player_anim {
+                anim.pad_drove_this_frame = true;
+            }
+        }
+        if dir_bits == 0 {
+            self.world_map.walk_carry = 0;
+            return;
+        }
+        // A held direction walks the clip even when a wall blocks the step
+        // (retail walks in place), as on the field.
+        if let Some(anim) = &mut self.locomotion.player_anim {
+            anim.moved_this_frame = true;
+        }
+        // Record the heading from the world-space movement direction (the same
+        // `render_26` field the field path stores from `decode_field_direction`,
+        // a PSX 12-bit angle: 4096 = full turn). The world-map walk uses the
+        // camera-relative bits rather than `decode_field_direction`, so it must
+        // set the heading itself; the player marker reads it to draw a facing
+        // tick. Deterministic: same pad + azimuth -> same heading.
+        let dz = (dir_bits & 0x1000 != 0) as i32 - (dir_bits & 0x4000 != 0) as i32;
+        let dx = (dir_bits & 0x2000 != 0) as i32 - (dir_bits & 0x8000 != 0) as i32;
+        if dx != 0 || dz != 0 {
+            let heading = (((dx as f32).atan2(dz as f32) / std::f32::consts::TAU * 4096.0).round()
+                as i32)
+                .rem_euclid(4096) as i16;
+            self.actors[slot].move_state.render_26 = heading;
+        }
+        // speed = ((base_step * player[+0x72]) >> 12) * DAT_1F800393, for
+        // one retail frame at the overworld's frame step
+        // ([`WORLD_MAP_FRAME_STEP`]).
+        let mult = i32::from(self.actors[slot].move_state.field_72);
+        let dt = WORLD_MAP_FRAME_STEP;
+        let mut speed = ((self.field_base_step() * mult) >> 12) * dt;
+        // Diagonal normalise: when both axes are moving, x0.75 - mirroring the
+        // field controller (`FUN_801d01b0`) and the retail world-map walk
+        // overlay (`speed -= speed >> 2`). `advance_with_collision` steps both
+        // axes by the same amount, so without this a diagonal travels `speed` on
+        // each axis = ~1.41x the cardinal speed.
+        if dx != 0 && dz != 0 {
+            speed -= speed >> 2;
+        }
+        if speed <= 0 {
+            self.world_map.walk_carry = 0;
+            return;
+        }
+        // Retail commits that frame step in whole 2-unit sub-steps (the
+        // stepper loops while the remainder is positive, so `9` walks `10`),
+        // once per `dt` vsyncs. The port ticks every vsync: carry the rounded
+        // frame step in `1/dt` units and commit the sub-steps it has paid
+        // for, so the displacement over time is retail's - `10` units every
+        // `3` vsyncs, `130` per `39` - rather than `4` every vsync.
+        let frame_units = (speed + FIELD_STEP_UNIT - 1) / FIELD_STEP_UNIT * FIELD_STEP_UNIT;
+        let per_sub_step = FIELD_STEP_UNIT * dt;
+        let carry = self.world_map.walk_carry + frame_units;
+        let speed = (carry / per_sub_step) * FIELD_STEP_UNIT;
+        self.world_map.walk_carry = carry % per_sub_step;
+        if speed <= 0 {
+            return;
+        }
+        let before = {
+            let ms = &self.actors[slot].move_state;
+            (ms.world_x, ms.world_z)
+        };
+        self.advance_with_collision(slot, dir_bits, speed);
+        // The walk-regen accumulator `_DAT_801F2274`: the locomotion
+        // controller's tail adds `DAT_1F800393` on every frame whose step
+        // committed (`0x801D08F4..0x801D0928`), on the overworld as on the
+        // field - same fill as `step_field_locomotion`.
+        {
+            let ms = &self.actors[slot].move_state;
+            if (ms.world_x, ms.world_z) != before {
+                self.locomotion.walk_regen_steps = self
+                    .locomotion
+                    .walk_regen_steps
+                    .saturating_add(self.clock.display_frame_step as i32);
+            }
+        }
+        // Terrain follow (gated, like the field walk): snap the player's Y to
+        // the continent floor at the new tile. The field path snaps inside
+        // `step_field_locomotion`; this path advances directly, so without
+        // the snap the overworld figure holds its entry-plane Y and sinks
+        // under (or floats over) rising terrain. Same `.MAP` floor LUT the
+        // drawn continent heightfield bakes (`FUN_80019278`), so the figure
+        // stands on the rendered surface.
+        if self.locomotion.follow_terrain_height {
+            let (x, z) = {
+                let ms = &self.actors[slot].move_state;
+                (ms.world_x as i32, ms.world_z as i32)
+            };
+            let y = self.sample_field_floor_height(x, z);
+            self.actors[slot].move_state.world_y = y as i16;
+        }
+    }
+
+    /// Per-tile overworld step → region-keyed encounter roll (the world-map
+    /// counterpart to [`Self::live_field_tick`]).
+    ///
+    /// A "step" is the player actor crossing into a new 128-unit tile
+    /// (`world >> 7`); each step drives one
+    /// [`legaia_engine_battle::region_encounter::RegionEncounterTracker::on_step`] against the
+    /// player's current position. A trigger latches
+    /// [`legaia_engine_field::world_map_entity_config::WorldMapState::pending_encounter`], which [`Self::tick_world_map`]
+    /// resolves into a battle. The RNG comes from the world's shared
+    /// deterministic source, drawn only on the trigger branch, so replays stay
+    /// bit-identical. No-op without a player actor or region tracker.
+    fn live_world_map_tick(&mut self) {
+        // The region reader runs from the entity handler `FUN_801DA51C`, once
+        // per actor game tick (every 3rd vsync on the overworld), so the tile
+        // it compares is the one the player stands on at that tick.
+        if !self.clock.game_tick_fired {
+            return;
+        }
+        let Some(slot) = self.player_actor_slot else {
+            return;
+        };
+        let (wx, wz) = match self.actors.get(slot as usize) {
+            Some(a) => (a.move_state.world_x, a.move_state.world_z),
+            None => return,
+        };
+        let tile = ((wx as i32) >> 7, (wz as i32) >> 7);
+        let crossed = match self.world_map.last_tile {
+            Some(prev) if prev != tile => {
+                self.world_map.last_tile = Some(tile);
+                // A seat or warp landing two or more tiles away is not a
+                // step to the region reader.
+                legaia_engine_battle::region_encounter::is_region_step(prev, tile)
+            }
+            None => {
+                self.world_map.last_tile = Some(tile);
+                false
+            }
+            _ => false,
+        };
+        if !crossed {
+            return;
+        }
+        // Roll the active region. Take the tracker out so the RNG closure can
+        // borrow `self` (same pattern as the entity-SM borrow window).
+        // The Incense window skips the whole roll while it is non-zero
+        // (`FUN_801D9E1C` at `0x801DA174`, the same routine the field steps
+        // through), so the step counter does not drain either.
+        if self.locomotion.walk_regen_window != 0 {
+            return;
+        }
+        // The engaged / dialogue-pacing / warp gates (`0x801DA130..`): the
+        // step onto a door, a scripted walk or an open box rolls nothing.
+        if self.encounter_roll_held() {
+            return;
+        }
+        if let Some(mut tracker) = self.world_map.region_tracker.take() {
+            tracker.set_modifiers(self.encounter_rate_modifiers());
+            // Same per-step condition walk the field path runs: the kingdom
+            // MANs carry four story-state variants of the overworld region
+            // set, and only one is live.
+            tracker.select_group(|flag| self.encounter_condition_flag_test(flag));
+            let roll = tracker.on_step(wx, wz, || self.next_rand());
+            self.encounters.step_counter = tracker.counter();
+            self.world_map.region_tracker = Some(tracker);
+            if let Some(roll) = roll {
+                self.world_map.pending_encounter = Some(roll.formation_id as u16);
+            }
+        }
+    }
+
+    /// Seat the player on raw world `(x, z)` with the floor height sampled
+    /// under it, and refresh the per-tile region tables - a debug seat for
+    /// frame-pairing a host against a retail save state at the state's own
+    /// player position (`play-window`'s `LEGAIA_SEAT`, the play page's
+    /// `play_debug_seat`). The caller re-arms its camera's arrival snap
+    /// (`Camera::zone.arm_arrival()`), which the world does not own.
+    ///
+    /// On a field scene the seat is a warp landing, so it also re-centres the
+    /// camera window on the new tile as retail's kind-0 warp landing does
+    /// (`FUN_80017EC8`): the region box and the windowed static-object list
+    /// follow the player instead of staying planned for the entry spawn.
+    pub fn debug_seat_player(&mut self, x: i16, z: i16) -> bool {
+        let Some(slot) = self.player_actor_slot else {
+            return false;
+        };
+        let y = self.sample_field_floor_height(i32::from(x), i32::from(z)) as i16;
+        let Some(a) = self.actors.get_mut(slot as usize) else {
+            return false;
+        };
+        a.move_state.world_x = x;
+        a.move_state.world_y = y;
+        a.move_state.world_z = z;
+        self.refresh_field_regions();
+        if self.mode == SceneMode::Field {
+            self.recentre_field_window_on_player();
+        }
+        true
+    }
+
+    /// Arm the overworld's developer band for a **picker** entry: walk mode,
+    /// with the top-view debug camera and the panel chords reachable through
+    /// retail's `_DAT_8007B98C` gate (`ControllerState::debug_enabled`).
+    ///
+    /// The one rule both play hosts ask: a scene picked by name (the native
+    /// `--scene`, the page's scene picker) arms it, and nothing else does -
+    /// not a card Load, not a New Game, not a door. Retail ships the byte at
+    /// zero, and arming it shadows the retail L1 map-display arm, so a
+    /// player-reachable entry must leave it off. The page used to arm it on
+    /// every entry it ran (a Load included) while the native window armed it
+    /// on its CLI entries only, so the same save behaved differently per host.
+    ///
+    /// Returns whether a world-map controller was there to arm.
+    pub fn arm_picker_world_map_debug(&mut self) -> bool {
+        let Some(ctrl) = self.world_map.ctrl.as_mut() else {
+            return false;
+        };
+        ctrl.debug_enabled = true;
+        ctrl.view_mode = 0;
+        true
+    }
+
+    /// Route the scene's region-keyed encounter table onto the overworld so
+    /// `Self::tick_world_map` rolls random encounters per region. Resets the
+    /// step-tile latch. Pair with [`Self::enter_world_map`] (or call after it).
+    pub fn set_world_map_regions(
+        &mut self,
+        table: legaia_engine_battle::region_encounter::RegionEncounterTable,
+    ) {
+        let mut tracker =
+            legaia_engine_battle::region_encounter::RegionEncounterTracker::new(table);
+        tracker.set_counter(self.encounters.step_counter);
+        self.world_map.region_tracker = Some(tracker);
+        self.world_map.last_tile = None;
+        self.world_map.seat_hold_tile = None;
+        self.refresh_encounter_rollable();
+    }
+
+    /// Route the current FIELD scene's region-keyed encounter table so
+    /// [`Self::on_field_step`] rolls per *active region* (the retail
+    /// `FUN_801D9E1C` rate counter + formation-range pick) instead of the
+    /// aggregated mean-rate [`legaia_engine_battle::encounter::EncounterSession`]. The
+    /// session stays installed and supplies the transition / grace
+    /// bracketing (via [`legaia_engine_battle::encounter::EncounterSession::trigger_with`]);
+    /// the region tracker just replaces *which* rate and formation a step
+    /// rolls. `None` clears the field tracker (back to the mean path).
+    ///
+    /// The scene-entry path calls this from the same MAN the mean table is
+    /// built from ([`legaia_engine_battle::region_encounter::region_encounter_table_from_man`]),
+    /// so a scene whose MAN has no encounter-region section keeps the mean
+    /// path untouched.
+    pub fn set_field_regions(
+        &mut self,
+        table: Option<legaia_engine_battle::region_encounter::RegionEncounterTable>,
+    ) {
+        // Every field scene entry (the world map enters through the same
+        // path) runs retail's scene-entry top-up of the shared step counter
+        // before any tracker is seeded from it.
+        self.top_up_encounter_step_counter();
+        self.terrain.region_tracker = table.map(|t| {
+            let mut tracker =
+                legaia_engine_battle::region_encounter::RegionEncounterTracker::new(t);
+            tracker.set_counter(self.encounters.step_counter);
+            tracker
+        });
+        self.refresh_encounter_rollable();
+    }
+
+    /// The encounter step counter `_DAT_8007B5FC`.
+    pub fn encounter_step_counter(&self) -> i32 {
+        self.encounters.step_counter
+    }
+
+    /// Write the encounter step counter `_DAT_8007B5FC` - the shared global
+    /// and every installed region tracker, which each carry a working copy.
+    pub fn set_encounter_step_counter(&mut self, counter: i32) {
+        self.encounters.step_counter = counter;
+        if let Some(t) = self.terrain.region_tracker.as_mut() {
+            t.set_counter(counter);
+        }
+        if let Some(t) = self.world_map.region_tracker.as_mut() {
+            t.set_counter(counter);
+        }
+    }
+
+    /// Reroll the step counter to a fresh `488..=1460` triangular draw - the
+    /// store field-VM op `4C EC` and the op-`0x3E` scripted-formation arm make
+    /// (`sw v0, _DAT_8007B5FC` after `jal 0x801DDF48` at `0x801E3500` /
+    /// `0x801E077C`).
+    ///
+    /// REF: FUN_801DDF48 (ported as
+    /// [`legaia_engine_battle::region_encounter::encounter_counter_reroll`])
+    pub fn reroll_encounter_step_counter(&mut self) {
+        let v =
+            legaia_engine_battle::region_encounter::encounter_counter_reroll(|| self.next_rand());
+        self.set_encounter_step_counter(v);
+    }
+
+    /// The scene-entry top-up: below 487 the counter gains half a reroll,
+    /// otherwise it carries across the door untouched.
+    ///
+    /// REF: FUN_8003AB2C (ported as
+    /// [`legaia_engine_battle::region_encounter::encounter_counter_scene_entry_top_up`])
+    pub fn top_up_encounter_step_counter(&mut self) {
+        let c = self.encounters.step_counter;
+        let v =
+            legaia_engine_battle::region_encounter::encounter_counter_scene_entry_top_up(c, || {
+                self.next_rand()
+            });
+        self.set_encounter_step_counter(v);
+    }
+
+    /// Seed `count` overworld entity state machines (all Idle) so
+    /// `Self::tick_world_map` drives encounter / interaction gameplay.
+    /// Replaces any previously installed set. The retail engine builds one
+    /// record per on-map entity from the scene's entity table; the port's
+    /// world takes the count and pairs it with the shared encounter state
+    /// configured via [`Self::set_world_map_encounter`].
+    pub fn install_world_map_entities(&mut self, count: usize) {
+        self.world_map.entities = (0..count)
+            .map(|_| legaia_engine_field::world_map_entity::WorldMapEntityCtx::default())
+            .collect();
+        self.world_map.entity_configs.clear();
+    }
+
+    /// Seed overworld entities with per-entity [`WorldMapEntityConfig`]s. One
+    /// state machine (Idle) is created per config, so encounter zones spawn
+    /// their own formation and portals carry their own target map. Replaces any
+    /// previously installed set.
+    pub fn install_world_map_entities_with_configs(&mut self, configs: Vec<WorldMapEntityConfig>) {
+        self.world_map.entities = (0..configs.len())
+            .map(|_| legaia_engine_field::world_map_entity::WorldMapEntityCtx::default())
+            .collect();
+        self.world_map.entity_configs = configs;
+        self.world_map.entity_positions.clear();
+    }
+
+    /// Seed overworld entities with a per-entity config **and** world position.
+    /// One Idle state machine per `(config, position)`. The positions enable
+    /// the auto-engage-on-walkover trigger in `Self::tick_world_map` (the
+    /// player stepping onto a `Portal` entity's tile fires it). Replaces any
+    /// previously installed set. This is the disc-placement seeding path
+    /// ([`legaia_engine_scene_host::scene_host::SceneHost::enter_world_map_scene`] feeds it the
+    /// classified actor placements + their spawn positions).
+    pub fn install_world_map_entities_at(
+        &mut self,
+        entities: Vec<(WorldMapEntityConfig, (i16, i16))>,
+    ) {
+        self.world_map.entities = (0..entities.len())
+            .map(|_| legaia_engine_field::world_map_entity::WorldMapEntityCtx::default())
+            .collect();
+        self.world_map.entity_positions = entities.iter().map(|(_, pos)| *pos).collect();
+        self.world_map.entity_configs = entities.into_iter().map(|(cfg, _)| cfg).collect();
+    }
+
+    /// Auto-engage any walk-onto overworld entity the player is standing on -
+    /// a town / dungeon entrance ([`WorldMapEntityConfig::OverworldPortal`]) or
+    /// a minigame door ([`WorldMapEntityConfig::MinigameDoor`]).
+    ///
+    /// The port-side stand-in for retail's per-entity player-position-in-zone
+    /// trigger: an entity whose placement tile (`pos >> 7`) matches the player's
+    /// current tile is driven to its transition state, exactly as a host
+    /// [`Self::engage_world_map_entity`] call would, so the next SM step runs
+    /// its transition arm. Only `Idle` entities are engaged, so one fires once
+    /// per visit and the player can stand on the tile without re-triggering.
+    /// NPC entities are *not* auto-engaged (they are talk-to, not walk-onto).
+    /// No-op without entity positions, a player actor, while a dialog owns the
+    /// frame, or **while a cutscene timeline is running**.
+    ///
+    /// The timeline clause is the same refusal retail's locomotion controller
+    /// opens with: `FUN_801D01B0`'s first test is the player actor's
+    /// `+0x10 & 0x80000` disabled bit, which a cutscene raises, and a player
+    /// who is not walking crosses no trigger tile
+    /// ([`docs/subsystems/field-locomotion.md`], per-frame flow step 1). The
+    /// opening chain's `map01` fly-in is the case that needs it: the leg seats
+    /// the party on Rim Elm's own overworld entrance tile and plays an aerial
+    /// camera cutscene over it, so an ungated auto-engage warps to `town01` on
+    /// the first tick and the fly-in never runs.
+    fn auto_engage_world_map_portals(&mut self) {
+        if self.dialogue_owns_input()
+            || self.encounter_owns_player()
+            || self.cutscene_timeline_active()
+            || self.world_map.entity_positions.is_empty()
+        {
+            return;
+        }
+        let Some(slot) = self.player_actor_slot else {
+            return;
+        };
+        let Some((wx, wz)) = self
+            .actors
+            .get(slot as usize)
+            .map(|a| (a.move_state.world_x, a.move_state.world_z))
+        else {
+            return;
+        };
+        let (px, pz) = ((wx as i32) >> 7, (wz as i32) >> 7);
+        // A standing seat holds its tile's portals until the player leaves
+        // it (`WorldMapState::seat_hold_tile`).
+        match self.world_map.seat_hold_tile {
+            Some(hold) if hold == (px, pz) => return,
+            Some(_) => self.world_map.seat_hold_tile = None,
+            None => {}
+        }
+        // An object entrance (a `.MAP` object whose bind record runs to a
+        // `0x3F` on contact - `map01` P0[10], the Drake castle door) is
+        // solid: its collider stops the player a probe's length short of its
+        // tile, so the tile compare never fires. Retail posts the contact
+        // from the same probe points that refuse the step (`FUN_801CFE4C`'s
+        // `FUN_801CFC40` calls); read it the way the field walk-touch does.
+        // REF: FUN_801CFC40, FUN_801D5B5C
+        let mut probes: Vec<(i32, i32)> = vec![(i32::from(wx), i32::from(wz))];
+        for dir in Self::dirs_of_bits(self.locomotion.last_move_dir_bits) {
+            for &(dx, dz) in &FIELD_ACTOR_PROBES[dir] {
+                probes.push((
+                    i32::from(wx.saturating_add(dx)),
+                    i32::from(wz.saturating_sub(dz)),
+                ));
+            }
+        }
+        let in_contact = |ex: i16, ez: i16| {
+            probes.iter().any(|&(qx, qz)| {
+                (qx - i32::from(ex)).abs() < FIELD_PROP_BOX_HALF
+                    && (qz - i32::from(ez)).abs() < FIELD_PROP_BOX_HALF
+            })
+        };
+        // Collect the portals the player is standing on (still Idle), then
+        // engage them - separated so the immutable scan drops before the
+        // mutable `engage` borrow.
+        let mut to_engage: Vec<usize> = Vec::new();
+        for (idx, ctx) in self.world_map.entities.iter().enumerate() {
+            if ctx.state != legaia_engine_field::world_map_entity::EntityState::Idle as u16 {
+                continue;
+            }
+            match self.world_map.entity_configs.get(idx) {
+                Some(WorldMapEntityConfig::OverworldPortal { .. }) => {}
+                // A door whose placement carries an interaction record is
+                // talk-to, not walk-onto: the action-button probe runs that
+                // record and its own `0x3E` warps
+                // ([`Self::world_map_record_talk_slot`]).
+                Some(WorldMapEntityConfig::MinigameDoor { slot, .. })
+                    if !self.world_map_door_runs_record(*slot) => {}
+                _ => continue,
+            }
+            let Some(&(ex, ez)) = self.world_map.entity_positions.get(idx) else {
+                continue;
+            };
+            let object = matches!(
+                self.world_map.entity_configs.get(idx),
+                Some(WorldMapEntityConfig::OverworldPortal { object: true, .. })
+            );
+            if ((ex as i32) >> 7 == px && (ez as i32) >> 7 == pz) || (object && in_contact(ex, ez))
+            {
+                to_engage.push(idx);
+            }
+        }
+        for idx in to_engage {
+            self.engage_world_map_entity(idx);
+        }
+    }
+
+    /// Open / dismiss an overworld NPC's dialogue on a confirm press.
+    ///
+    /// The talk-to counterpart of [`Self::auto_engage_world_map_portals`]
+    /// (portals are walk-onto, NPCs are talk-to). While a box is up, a
+    /// confirm/cancel press (`Cross`/`Circle`) dismisses it: the overworld has
+    /// no field VM ticking to run the op-`0x4C` dismiss hook the field path
+    /// uses ([`vm_hosts`](crate::world)), so the world map owns the dismiss
+    /// directly. Otherwise, a confirm press while the player stands within one
+    /// tile of an [`WorldMapEntityConfig::Npc`] that carries inline dialog text
+    /// (the `Dialog` op the placement walker found) opens that text against the
+    /// scene's MES container - sets [`legaia_engine_field::dialog_state::DialogState::current`] and emits
+    /// [`FieldEvent::OpenDialog`], which the host renders through
+    /// [`legaia_engine_scene_host::scene_host::SceneHost::open_pending_dialog`], the same panel path
+    /// the field VM's op `0x3F` feeds.
+    ///
+    /// No-op while walking (a held direction is a movement frame, not a
+    /// talk-to), without entity positions, or without a player actor. An NPC
+    /// with an interaction but no inline text is left to the SM's
+    /// [`FieldEvent::FieldInteract`] path unchanged.
+    /// Consume the world-map emitter gate and, when armed, build this
+    /// frame's horizon bands.
+    ///
+    /// The trig samples come from [`Self::sin_lut`] - the engine's copy of
+    /// the `0x1000`-entry table retail reaches through `_DAT_8007B81C`
+    /// (`lw v0,-0x47e4(v0)` at `0x801D7F9C`), which is the **sine** view.
+    /// This read the cosine view while both LUTs were left empty, which hid
+    /// the quarter-revolution phase error; an empty LUT samples as zero.
+    ///
+    /// REF: FUN_801d7ea0
+    fn tick_world_map_horizon(&mut self) {
+        // Take the controller out so the emitter can borrow `self.sin_lut`.
+        let Some(mut ctrl) = self.world_map.ctrl.take() else {
+            return;
+        };
+        let frame_step = self.clock.frame_step;
+        let lut = &self.sin_lut;
+        ctrl.run_horizon_emitter(frame_step, &|i| lut.get(i as usize).copied().unwrap_or(0));
+        self.world_map.ctrl = Some(ctrl);
+    }
+
+    /// Drive the world-map band's **panel screen** for one frame.
+    ///
+    /// This is the host side of `legaia_engine_world_views::world_map_panel_host`: it records the
+    /// party's stored tile, binds the pad chords that install a panel actor,
+    /// steps whichever actor is up, and applies what the frame produced. The
+    /// phase machines themselves are the ports in
+    /// [`legaia_engine_field::world_map_panel_actors`]; the window system under
+    /// them is [`legaia_engine_field::world_map_panel`].
+    ///
+    /// **The chords are the port's, not retail's.** Retail reaches this band
+    /// from debug branches inside the world-map controller; the engine gates
+    /// the whole screen behind the same `debug_enabled` flag the top-view
+    /// camera toggle uses, and only in walk mode, so the top-view camera's own
+    /// d-pad handling is never shadowed:
+    ///
+    /// | Chord | Actor |
+    /// |---|---|
+    /// | Square | sub-list picker (`FUN_801ED590`) |
+    /// | L1 | brightness fade / flash (`FUN_801ED308`); L1 again releases it |
+    /// | L2 | screen-fill fade (`FUN_801EE5D4`) |
+    /// | R1 | story-flag window (`FUN_801EF014`) |
+    /// | R2 | yes/no text box (`FUN_801EE90C`) |
+    /// | Start | return-to-title soft reset (`FUN_801EDF00`) |
+    ///
+    /// The sub-list's own row-1 confirm takes retail's state-3 hand-off, which
+    /// the port binds to installing the Riremito travel art
+    /// ([`legaia_engine_field::travel_art_actor`]) - the art then warps the party
+    /// back to the tile recorded before the screen opened.
+    fn tick_world_map_panels(&mut self) {
+        use legaia_engine_field::travel_art_actor::TravelArt;
+        use legaia_engine_field::world_map_panel_host::{PanelActorKind, packed_pad};
+
+        if self.world_map.ctrl.is_none() {
+            return;
+        }
+        let raw_held = self.input.pad();
+        let raw_edge = raw_held & !self.input.pad_prev();
+        let held = packed_pad(raw_held);
+        let edge = packed_pad(raw_edge);
+        let frame_step = self.clock.frame_step;
+        let player_tile = self.player_actor_slot.and_then(|slot| {
+            self.actors.get(slot as usize).map(|a| {
+                (
+                    (a.move_state.world_x as i32) >> 7,
+                    (a.move_state.world_z as i32) >> 7,
+                )
+            })
+        });
+        let player_pos = self.player_actor_slot.and_then(|slot| {
+            self.actors
+                .get(slot as usize)
+                .map(|a| (a.move_state.world_x, a.move_state.world_z))
+        });
+        // What a travel art reads off the world: the player's live Y (Rula's
+        // lift re-reads `+0x16` every frame) and flag `0x0B`, which its
+        // opener program holds until its state 4.
+        let travel_env = legaia_engine_field::world_map_panel_host::TravelEnv {
+            player_y: self
+                .player_actor_slot
+                .and_then(|slot| self.actors.get(slot as usize))
+                .map(|a| a.move_state.world_y),
+            effect_busy: self.system_flag_test(u16::from(
+                legaia_engine_field::field_actor_program::FLAG_PLAYER_BUSY,
+            )),
+        };
+
+        // Take the controller out so the flag-bank adapter can borrow the
+        // world mutably (the same borrow window `tick_world_map_horizon` uses).
+        let Some(mut ctrl) = self.world_map.ctrl.take() else {
+            return;
+        };
+        let walk_mode = ctrl.view_mode == 0;
+        let debug = ctrl.debug_enabled;
+
+        // The stored tile only advances while no panel actor owns the screen,
+        // so opening the screen freezes the return point the travel art warps
+        // back to - retail's `0x80084624` / `0x8008462C` pair, written on map
+        // entry rather than every frame. The record is keyed by the map the
+        // party is standing ON - the kingdom index the entry fade derives
+        // from the scene PROT base (retail's map word `0x80084628`), with the
+        // active kingdom scene label as the fallback when no entry fade has
+        // run - NOT the table's own last entry: reading `visited.last()`
+        // back fed the table its own output, so the table could never grow
+        // past one record however many kingdoms were visited.
+        if !ctrl.panels.is_active()
+            && let Some((tx, tz)) = player_tile
+        {
+            let map = legaia_engine_field::world_map::kingdom_index_for_scene_base(ctrl.scene_base)
+                .or(ctrl.entry_fade.kingdom_index)
+                .or_else(|| kingdom_index_for_scene_label(&self.active_scene_label))
+                .map(u32::from)
+                .unwrap_or(0);
+            ctrl.panels.note_visit(map, tx, tz);
+        }
+
+        if debug && walk_mode {
+            use input::PadButton as B;
+            let pressed = |b: B| raw_edge & b.mask() != 0;
+            if !ctrl.panels.is_active() {
+                let install = if pressed(B::Square) {
+                    Some(PanelActorKind::SubList)
+                } else if pressed(B::L1) {
+                    Some(PanelActorKind::FadeFlash)
+                } else if pressed(B::L2) {
+                    Some(PanelActorKind::FillFade)
+                } else if pressed(B::R1) {
+                    Some(PanelActorKind::FlagWindow)
+                } else if pressed(B::R2) {
+                    Some(PanelActorKind::TextBox)
+                } else if pressed(B::Start) {
+                    Some(PanelActorKind::SoftReset)
+                } else {
+                    None
+                };
+                if let Some(kind) = install {
+                    log::info!("world-map: panel actor {kind:?} installed");
+                    ctrl.panels.install(kind, 0x1A);
+                }
+            } else if pressed(B::Square) {
+                // The escape hatch: several arms park instead of exiting, so
+                // the chord that opens the screen also closes it.
+                if ctrl.panels.dismiss() {
+                    log::info!("world-map: panel actor dismissed");
+                }
+            } else if pressed(B::L1) {
+                ctrl.panels.release_flash();
+            }
+        }
+
+        // The party HUD's idle countdown runs every frame, panel actor or not.
+        ctrl.panels
+            .tick_party_hud(false, i32::from(ctrl.view_mode), held, player_pos, 1, None);
+
+        ctrl.panels.travel_env = travel_env;
+        let mut store = WorldPanelFlags { world: self };
+        let frame = ctrl.panels.tick(edge, held, frame_step, &mut store);
+        self.world_map.ctrl = Some(ctrl);
+
+        // The panel's ring calls cross to the host ring like the field VM's
+        // op-`0x36` ones (`World::take_sfx_ring_ops`); a replace keeps the
+        // engine-core mirror's parked-slot delay in step as retail's does.
+        for &op in &frame.sfx {
+            match op {
+                SfxRingOp::ReplaceLast(id) => self.replace_last_sfx_cue(id),
+                SfxRingOp::Push(id) => self.push_sfx_cue(id),
+                op => self.audio.sfx_ring_ops.push(op),
+            }
+        }
+        for id in &frame.flags_set {
+            log::info!("world-map panel: flag window set story flag {id}");
+        }
+        if frame.retired {
+            log::info!(
+                "world-map: panel actor retired ({} window(s) still open)",
+                self.world_map
+                    .ctrl
+                    .as_ref()
+                    .map(|c| c.panels.windows.open_count())
+                    .unwrap_or(0)
+            );
+        }
+        if frame.hand_off {
+            // Retail's sub-list state 3 hands the actor on through the handler
+            // table; the port binds that arm to the Riremito travel art.
+            // (Retail's own state 3 is the `FUN_801D84B4` return-to-title
+            // hand-off - see `801ed590.txt`. Retail's production installer
+            // of both travel arts is the pause-menu session handler
+            // `FUN_801ED308` (handler id `0x30`): a Door of Light / Door of
+            // Wind use returns exit code `7` / `8`, and its case 4 turns that
+            // into state `6` / `7`, which hand the actor on to handler id
+            // `0x29` (`FUN_801EE094`) / `0x2B` (`FUN_801EE328`). The engine
+            // runs that hand-off for the two items in
+            // `World::tick_pause_session`.)
+            if let Some(ctrl) = self.world_map.ctrl.as_mut() {
+                log::info!("world-map: sub-list hand-off -> Riremito travel art");
+                ctrl.panels
+                    .install(PanelActorKind::TravelArt(TravelArt::Riremito), 0x1A);
+            }
+        }
+        if frame.restore_party {
+            self.restore_party_hp_mp();
+        }
+        if frame.travel_unfound {
+            log::info!("world-map: travel art found no stored map - nothing happens");
+        }
+        if frame.reload_executable {
+            log::info!("world-map: soft reset reached its executable reload (not acted on)");
+        }
+        self.apply_travel_art_frame(&frame);
+        if let Some(dest) = frame.warp
+            && let Some(slot) = self.player_actor_slot
+            && let Some(actor) = self.actors.get_mut(slot as usize)
+        {
+            actor.move_state.world_x =
+                dest.x.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            actor.move_state.world_z =
+                dest.z.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+            // `*0x80073EFC = 0`: the arrival's Y term.
+            actor.move_state.world_y = dest.y as i16;
+            self.world_map.last_tile = None;
+            log::info!(
+                "world-map: travel art warped the party to ({}, {})",
+                dest.x,
+                dest.z
+            );
+            // Retail's resolve stages the destination's scene load
+            // (`FUN_8001FD44`), and that load's MAN init resumes the
+            // program whose opener ran - Rula's descent (program 2, flag
+            // `0x17`) or Riremito's speed restore (program 3, flag `0x0C`).
+            // The engine's warp stays on the loaded map, so it runs the
+            // same resume here.
+            let resumed = self.man_load_resume_programs();
+            if !resumed.is_empty() {
+                log::info!("world-map: travel-art arrival resumed programs {resumed:?}");
+            }
+        }
+    }
+
+    /// Apply what a travel-art frame did to the world: the phase-0 opener
+    /// (flag `0x0B` + scripted-scene program `n`, `0x801EE39C` / Riremito's
+    /// twin), the phase exit's pad-hold clear (Riremito `0x801EE168`, Rula
+    /// `0x801EE478`), Rula's lift on the player (`0x801EE400..0x801EE4C4`:
+    /// live `+0x16`, `+0x10 |= 1`, scratchpad `0x1F800394 |= 0x1000000`) and
+    /// Riremito's resolve-time restore of the player
+    /// (`0x801EE268..0x801EE294`).
+    ///
+    /// REF: FUN_801EE328, FUN_801EE094 (the kernel is
+    /// `legaia_engine_field::travel_art_actor::TravelArtActor::tick`)
+    fn apply_travel_art_frame(
+        &mut self,
+        frame: &legaia_engine_field::world_map_panel_host::PanelFrame,
+    ) {
+        self.apply_travel_art_outputs(
+            frame.travel_queue_program,
+            frame.clear_warp_hold,
+            frame.lift_player_y,
+            frame.restore_player,
+        );
+    }
+
+    /// The world half of one travel-art frame, shared by the world-map panel
+    /// binding ([`Self::apply_travel_art_frame`]) and the pause-menu session
+    /// (`World::tick_pause_session`).
+    pub(crate) fn apply_travel_art_outputs(
+        &mut self,
+        queue_program: Option<u16>,
+        clear_warp_hold: bool,
+        lift_player_y: Option<i16>,
+        restore_player: bool,
+    ) {
+        use legaia_engine_field::travel_art_actor as ta;
+        if let Some(program) = queue_program {
+            self.system_flag_set(u16::from(
+                legaia_engine_field::field_actor_program::FLAG_PLAYER_BUSY,
+            ));
+            if self.spawn_scene_program(program).is_some() {
+                log::info!("travel art queued opener program {program}");
+            }
+        }
+        if clear_warp_hold {
+            self.locomotion.warp.hold = 0;
+        }
+        if lift_player_y.is_some() {
+            self.flags.story_flags |= ta::RULA_LIFT_SCRATCH_FLAG;
+        }
+        let Some(slot) = self.player_actor_slot else {
+            return;
+        };
+        let Some(actor) = self.actors.get_mut(slot as usize) else {
+            return;
+        };
+        if let Some(y) = lift_player_y {
+            actor.move_state.world_y = y;
+            actor.move_state.flags |= ta::RULA_LIFT_PLAYER_FLAG;
+        }
+        if restore_player {
+            actor.move_state.field_72 = ta::RIREMITO_RESTORE_SCALE as u16;
+            actor.move_state.flags &= !ta::RIREMITO_RESTORE_CLEARED_FLAG;
+        }
+    }
+
+    /// The party restore `FUN_801EE90C`'s confirm arm asks for: copy each of
+    /// the first three character records' **maximum** HP and MP over their
+    /// current values.
+    ///
+    /// Retail's stores are save-block relative (`+0x6CC -> +0x6CE`,
+    /// `+0x6D0 -> +0x6D2`); rebased onto a bare `0x414`-byte record by the
+    /// `0x5C8` block-to-record distance those are `+0x104 -> +0x106` and
+    /// `+0x108 -> +0x10A`, which `legaia_save`'s own schema names as
+    /// `hp_max -> hp_cur` and `mp_max -> mp_cur`.
+    fn restore_party_hp_mp(&mut self) {
+        const PAIRS: [(usize, usize); 2] = [(0x104, 0x106), (0x108, 0x10A)];
+        let mut restored = 0usize;
+        for member in self.party.roster.members.iter_mut().take(3) {
+            let raw = &mut member.raw;
+            if raw.len() < 0x10C {
+                continue;
+            }
+            for (src, dst) in PAIRS {
+                let v = [raw[src], raw[src + 1]];
+                raw[dst] = v[0];
+                raw[dst + 1] = v[1];
+            }
+            restored += 1;
+        }
+        log::info!("world-map panel: restored HP/MP on {restored} party record(s)");
+    }
+
+    fn tick_world_map_npc_dialog(&mut self) {
+        // A box is up: a confirm/cancel press dismisses it (and the locomotion
+        // + auto-engage steps stay gated off `dialogue_owns_input` meanwhile).
+        // The outer test covers BOTH channels so a runner-owned conversation
+        // can never have a *second* overworld dialogue opened on top of it by
+        // the same button edge that is advancing the first.
+        if self.dialogue_owns_input() {
+            // The inline-script runner, when active, owns dismissal.
+            if self.dialog.inline.is_none()
+                && (self.input.just_pressed(input::PadButton::Cross)
+                    || self.input.just_pressed(input::PadButton::Circle))
+            {
+                self.dialog.current = None;
+                self.pending_field_events.push(FieldEvent::DialogDismissed);
+            }
+            return;
+        }
+        // Otherwise a confirm press next to a talkable NPC opens its dialogue.
+        if self.world_map.player_walking || !self.input.just_pressed(input::PadButton::Cross) {
+            return;
+        }
+        // A placement whose interaction record the field-VM dialogue runner
+        // can execute takes the field's own path: the retail facing probe
+        // finds it, the interact posts on it, and the record runs from its
+        // interaction cursor (`drive_inline_dialogue`, stepped right after
+        // this in [`Self::tick_world_map`]).
+        if let Some(slot) = self.world_map_record_talk_slot() {
+            self.dialog.input_consumed = true;
+            self.trigger_field_interact(0, slot);
+            self.face_field_npc(slot);
+            return;
+        }
+        // The rest is the simplified-dialogue fallback: an NPC entity's inline
+        // text, keyed to its static spawn tile. With the runner on, the probe
+        // above is the only talk path, as in retail - a placement whose spawn
+        // section parked it in the hide box is not there to be talked to, and
+        // one its spawn seated elsewhere (`map02` `P1[6]`'s `23 53 49`) is
+        // found at that seat.
+        if self.toggles.use_vm_dialogue || self.world_map.entity_positions.is_empty() {
+            return;
+        }
+        let Some(slot) = self.player_actor_slot else {
+            return;
+        };
+        let (px, pz) = match self.actors.get(slot as usize) {
+            Some(a) => (
+                (a.move_state.world_x as i32) >> 7,
+                (a.move_state.world_z as i32) >> 7,
+            ),
+            None => return,
+        };
+        // First talkable NPC within one tile (Chebyshev) of the player. An NPC
+        // is talkable when it carries inline dialog text or a box-config id.
+        let mut open: Option<(u16, Vec<u8>)> = None;
+        for (idx, cfg) in self.world_map.entity_configs.iter().enumerate() {
+            let (text_id, inline) = match cfg {
+                WorldMapEntityConfig::Npc {
+                    text_id, inline, ..
+                } if text_id.is_some() || !inline.is_empty() => {
+                    (text_id.unwrap_or(0), inline.clone())
+                }
+                _ => continue,
+            };
+            let Some(&(ex, ez)) = self.world_map.entity_positions.get(idx) else {
+                continue;
+            };
+            if ((ex as i32 >> 7) - px).abs() <= 1 && ((ez as i32 >> 7) - pz).abs() <= 1 {
+                open = Some((text_id, inline));
+                break;
+            }
+        }
+        if let Some((text_id, inline)) = open {
+            self.dialog.current = Some(DialogRequest {
+                text_id,
+                inline: inline.clone(),
+                world_x: 0,
+                world_z: 0,
+                depth_id: 0,
+            });
+            self.pending_field_events.push(FieldEvent::OpenDialog {
+                text_id,
+                inline,
+                world_x: 0,
+                world_z: 0,
+                depth_id: 0,
+            });
+        }
+    }
+
+    /// The placement the overworld action button engages through its own
+    /// interaction record, if any.
+    ///
+    /// The overworld runs the field overlay's pad controller
+    /// (`FUN_801D01B0`, from the frame driver `FUN_801D1344`), so its
+    /// action button is the field's interaction probe (`FUN_801CF9F4`,
+    /// [`Self::field_interact_probe_slot`]): one compass point 64 units
+    /// ahead of the player, box-tested at ±72 against every placed actor.
+    /// A hit hands the touched placement's record to the dialog SM
+    /// (`FUN_80039B7C`), which resumes it past its spawn section. `map03`
+    /// `P1[19]`, the Buma fishing signboard, is a record of that shape:
+    /// the frozen-lake flag `0x378`, the rod and lure holdings (`4C DC`),
+    /// "Do you want to fish?", a 48-frame white fade (`34 01`, `4A 30`)
+    /// and only then its `3E 64` warp.
+    ///
+    /// `None` while the field-VM dialogue runner is off (the simplified
+    /// path has nothing to run the record with) or when the probe hits a
+    /// placement with no installed record.
+    ///
+    /// REF: FUN_801CF9F4, FUN_80039B7C, FUN_801D1344
+    pub fn world_map_record_talk_slot(&self) -> Option<u8> {
+        if !self.toggles.use_vm_dialogue || self.npcs.dialog_prologue.is_empty() {
+            return None;
+        }
+        // The probe lives inside the pad controller, which the frame driver
+        // skips while a script context engages the player (`+0x10 &
+        // 0x80000`) - the field's gate in `tick_field_interaction_probe`.
+        if self.script_context_engages_player()
+            || self.field_scripts_held_for_battle()
+            || self.encounter_owns_player()
+        {
+            return None;
+        }
+        self.field_interact_probe_slot()
+            .filter(|slot| self.npcs.dialog_prologue.contains_key(slot))
+    }
+
+    /// Whether the overworld minigame door on placement `slot` is entered
+    /// through its interaction record (talk-to) rather than the walk-over
+    /// fallback: the record is installed and the runner that executes it
+    /// is on.
+    fn world_map_door_runs_record(&self, slot: u8) -> bool {
+        self.toggles.use_vm_dialogue && self.npcs.dialog_prologue.contains_key(&slot)
+    }
+
+    /// Host signal that the player engaged overworld entity `idx` (walked onto
+    /// a portal tile / pressed confirm on it). Drives the entity SM straight to
+    /// its scene-transition state so the next `Self::tick_world_map` runs the
+    /// entity's transition arm. No-op for an out-of-range index.
+    ///
+    /// The arm forks on the config row: an
+    /// [`WorldMapEntityConfig::OverworldPortal`] surfaces a
+    /// [`legaia_engine_field::field_events::FieldEvent::WorldMapTransition`], while a
+    /// [`WorldMapEntityConfig::MinigameDoor`] arms
+    /// [`legaia_engine_minigame_scenes::minigame_state::MinigameState::pending_warp`] instead - its payload is a mode-24
+    /// sub-id, not a map id.
+    ///
+    /// Hosts can call this directly; `Self::auto_engage_world_map_portals`
+    /// also calls it each tick for any walk-onto entity the player is standing
+    /// on (the engine-driven trigger), so an entity installed with a position
+    /// via [`Self::install_world_map_entities_at`] fires on walk-over without a
+    /// host call.
+    pub fn engage_world_map_entity(&mut self, idx: usize) {
+        if let Some(ctx) = self.world_map.entities.get_mut(idx) {
+            // State 2 = Transitioning: the SM fires `on_scene_transition` and
+            // retires the entity on the next tick.
+            ctx.state = legaia_engine_field::world_map_entity::EntityState::Transitioning as u16;
+        }
+    }
+
+    /// Remove and return the first pending
+    /// [`legaia_engine_field::field_events::FieldEvent::WorldMapTransition`] as
+    /// `(dest_index, slot)`.
+    ///
+    /// The host's scene-transition drain calls this each tick to consume the
+    /// overworld-entrance engage the entity SM emitted (walk-onto its tile),
+    /// leaving every other queued field event in place. `None` when no
+    /// world-map transition is queued. The returned `slot` indexes
+    /// [`legaia_engine_field::world_map_entity_config::WorldMapState::entity_configs`], where the
+    /// [`WorldMapEntityConfig::OverworldPortal`] that raised it carries the
+    /// real CDNAME destination - `dest_index` is only that entrance's `0x3F`
+    /// index, never a door-warp map id.
+    pub fn take_world_map_transition(&mut self) -> Option<(u16, u8)> {
+        let pos = self
+            .pending_field_events
+            .iter()
+            .position(|e| matches!(e, FieldEvent::WorldMapTransition { .. }))?;
+        match self.pending_field_events.remove(pos) {
+            FieldEvent::WorldMapTransition { dest_index, slot } => Some((dest_index, slot)),
+            _ => unreachable!("position matched WorldMapTransition"),
+        }
+    }
+
+    /// Configure the shared overworld encounter rate. `enabled` is the master
+    /// gate, `start_countdown` the initial per-step counter, `formation_id`
+    /// the formation an encounter spawns (resolved against
+    /// [`crate::world::DiscTables::formation_table`]), and `reset_to` the value the countdown is
+    /// reset to after each encounter fires.
+    pub fn set_world_map_encounter(
+        &mut self,
+        enabled: bool,
+        start_countdown: i8,
+        formation_id: u16,
+        reset_to: i8,
+    ) {
+        self.world_map.encounter = WorldMapEncounterState {
+            enabled,
+            countdown: start_countdown,
+            formation_id,
+            reset_to,
+        };
+    }
+}
+
+/// Kingdom index (`0..=2`, the `kingdom_index_for_scene_base` space) for a
+/// kingdom overworld CDNAME label - the fallback key
+/// [`World::tick_world_map_panels`] stamps visited-map records with when the
+/// controller's entry fade has not derived one from a scene PROT base. The
+/// three overworld scenes are `map01` (Drake) / `map02` (Sebucus) / `map03`
+/// (Karisto), in the same order as the kingdom bundle bases
+/// `0x55` / `0xF4` / `0x187`.
+fn kingdom_index_for_scene_label(label: &str) -> Option<u8> {
+    match label {
+        "map01" => Some(0),
+        "map02" => Some(1),
+        "map03" => Some(2),
+        _ => None,
+    }
+}

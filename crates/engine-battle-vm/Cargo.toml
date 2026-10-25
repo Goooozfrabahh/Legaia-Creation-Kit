@@ -1,0 +1,35 @@
+[package]
+name = "legaia-engine-battle-vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# tests/integration.rs gathers every tests/*.rs into one binary.
+autotests = false
+
+[lib]
+name = "legaia_engine_battle_vm"
+path = "src/lib.rs"
+
+[dependencies]
+legaia-art.workspace = true
+legaia-engine-camera.workspace = true
+legaia-engine-system.workspace = true
+legaia-actor-formats.workspace = true
+legaia-game-tables.workspace = true
+legaia-overlay-images.workspace = true
+legaia-scene-formats.workspace = true
+
+[dev-dependencies]
+legaia-prot.workspace = true
+# The camera-mover recomp oracle parses the external frame-tagged JSONL
+# captures (env-gated via LEGAIA_RECOMP_TRACE_DIR; never committed).
+serde_json.workspace = true
+# translated_battle_strings_disc imports a language pack in memory and reads
+# the patched images back through the battle and name-entry readers.
+legaia-disc-patch.workspace = true
+legaia-translate.workspace = true
+legaia-ui-formats.workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

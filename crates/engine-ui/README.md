@@ -1,0 +1,202 @@
+# legaia-engine-ui
+
+Pure, renderer-agnostic UI draw-list builders for the Legaia engine port. The
+wgpu-free draw layer that both the native renderer (`legaia-engine-render`)
+and the browser play page (`legaia-web-play`) share. Inside the engine it
+depends on `legaia-render-kernels` and, for the battle HUD model its builders
+project (`battle_party_panel`, `battle_commit_log`, the value readout), on
+`legaia-engine-battle-vm`; it links no other kernel crate and not `legaia-engine-core`.
+
+## Scope
+
+The shared render kernels (GTE math, screen primitives, the VRAM capture,
+the effect emitters and the enhanced scene lighting)
+live in [`legaia-render-kernels`](../render-kernels/README.md), the crate
+below this one.
+
+Every function projects a renderer-agnostic *view* struct - built by the host
+from the live `World` - into a `Vec` of `TextDraw` / `SpriteDraw` primitives.
+Each primitive is a screen rectangle plus a source rect into either the
+proportional font atlas (`legaia-font`) or a VRAM sprite page, with an RGBA
+tint. The host renderer rasterises them; neither the geometry nor the menu
+navigation logic depends on the GPU backend.
+
+- `battle_hud` - dialog box, cutscene narration, battle HUD, encounter banner,
+  stage-scale text, per-glyph sprite emit helpers, and the floating value
+  readout's font fallback (`battle_value_readout_draws_for` - retail's own
+  cells and pitch, for hosts with no screen-space VRAM sink to draw the real
+  24x24 sheet through).
+- `battle_numerals` - the battle value readout's quads: retail's 24x24 numeral
+  cells and the `N HIT` / `TOTAL` / `DAMAGE` word cells as `ScreenPrim`s on
+  the effect atlas's glyph page. The layout is `engine-battle-vm`'s; this is the draw
+  both hosts had written separately, one sampling VRAM and one restyling the
+  digits in the dialog font.
+- `cast_theeder` - PROT 0904's (Theeder, spell `0x82`) beam packets: the
+  four packet builders its tick body calls, as screen primitives.
+- `menu::screens` - pause-menu field / status / spell / inventory / equipment panels,
+  options + key-rebind, name entry, game-over, the post-battle spoils panel
+  (`battle_spoils_draws_for`), tactical-arts editor, the
+  world-map battle-records screen (`records_screen_draws_for`, `FUN_801ED710`)
+  and the dev-menu list-body geometry (`dev_menu_list_draws_for`,
+  `FUN_801EAD98`).
+- `title_save` - title menu, 9-slice window chrome, save-select, save-slot
+  grid + info panel, "Now checking" dialog.
+- `battle_tutorial_box` - the sparring-tutorial prompt window: text rows at the
+  emitter's measured rect plus that rect's window skin. Stage-space, so both
+  hosts run it through their stage transform.
+- `text_balloon_box` - the `4C E1` **text balloon**: the line measurement the
+  engine's record needs (retail measures at spawn, the atlas is host-side),
+  plus the line and its fixed-width window skin. Geometry arrives from
+  `engine-core`, as for `battle_tutorial_box`.
+- `arts_input` - the **arts command-input** screen: the four direction chips
+  and their D-pad glyph, the pennant input bar and its cost-weighted seat
+  law, the AP plate, and the Triangle arts-list window. Retail runs one such
+  screen for the battle Arts command and for the Muscle Dome's Attack, so
+  the battle hosts and the dome page all compose from this module.
+  Packet-pinned - see
+  [`minigame-muscle-dome.md`](../../docs/subsystems/minigame-muscle-dome.md).
+- `battle_command_ui` - the **battle command menu**'s chip cluster: the blue
+  plate 3-slice with its clipped final body tile, the packet-pinned four-arm
+  diamond at `(228, 70)` and the `Begin | Run` pair at `(160, 92)`, the D-pad
+  glyph they share with `arts_input`, and the `-` chip retail draws for a
+  command that cannot be chosen. Both battle hosts seat their command menu
+  through it. Geometry mirrors `battle_chrome`, which `engine-shell`'s HUD
+  tests pin equal.
+- `battle_chrome` - the retail battle-screen chrome, packet-pinned off the
+  live ordering table: the actor-name plaque, the party status readout and
+  the command-chip cluster's sheet rects, palettes and screen seats. Pure
+  layout; no VM steps it.
+- `battle_hud_chrome` - the battle surfaces that are **widget-table records**
+  rather than plate runs: the class-0 **message banner** (`banner_frame` /
+  `message_banner_chrome_draws_for` / `message_banner_text_draws_for` - which
+  draws no interior fill, and shares content pen `(16, 12)` with the
+  actor-name plaque, so the two never coexist) and the **badge cells**
+  (`BattleBadgeRects`) the HUD blits for a slot's status element and for an
+  actor's element badge.
+- `fishing::hud` - fishing-minigame HUD: the ported persistent / catch HUD
+  layout, gauge bars, digit field and banner animators, plus
+  `fishing_hud_draws_for`, the consumer that renders that draw list.
+- `fishing::line` - the fishing line (retail's `LINE_G2` packet, built and
+  clipped by `legaia_engine_fishing::fishing::PondSession::line_frame`) as the
+  prim set's line kind with its two Gouraud end colours; both play hosts wrap
+  the packet through it.
+- `menu::window_painters` (+ `menu::equip_stat_compare`) - content painters for the
+  menu-overlay **window-descriptor table**: title tabs, prompt / counter /
+  choice windows, the shop's item-info and sell-quantity panels, and the two
+  equip stat-compare panels.
+- `menu::window_dispatch` - which of those painters draws a given
+  descriptor, keyed on its `renderer_va` the way the retail window walker
+  keys on the live window's `+0x28`. A host resolves a parsed descriptor
+  (`painter_at`) or walks a whole table (`menu_window_painters`) instead of
+  hard-coding a screen; the disc oracle is
+  `engine-shell/tests/menu_window_dispatch_real.rs`.
+- `pause_menu` - pause-menu **composition**: which windows a screen opens,
+  which painter draws each, and the order frames / content / modals land in.
+- `field_party_hud` - the persistent field party readout (name, `LV`, `HP`
+  and `MP` per present member over a semi-transparent plate).
+- `battle_item_ui` / `battle_name_banner` - the battle item window (retail
+  state `0x3C`) and the art-name banner's measured centring (`FUN_8004C650`).
+- `prize_exchange` - the casino prize-exchange sub-screen (`0x20`,
+  `FUN_801DC1CC`), drawn while a `PrizeExchangeSession` owns the pad.
+- `muscle_dome_hud` - the PROT 0977 arena overlay's HUD primitive layer: a
+  table-driven textured-Gouraud-quad emitter plus the decimal readout on it.
+- `dialog_reading_box` - the field dialog reading box's text rows: the draw
+  half of `engine-dialog::dialog_window`'s row window, scroll and typing reveal.
+- `incense_notice_box` / `tile_board_prompt` - the Incense wear-off notice
+  (`FUN_801F1E48` / `FUN_801F1B64`) and the tile board's quit prompt (walk-SM
+  state `5`); geometry arrives from `engine-core::incense_notice` /
+  `engine-world-views::tile_board`.
+- `world_map_labels` - the overworld map display's place labels and compass
+  letters (PROT 0981's label pass): each label's dialog-skin box and name;
+  the gate and projection arrive from `engine-screens::world_map_labels`.
+- `battle_timed_fight_strip` - the `Turns Left / HP Left` strip of the one
+  turn-limited boss fight; gate and numbers are `engine-world-views::timed_fight`.
+- `baka_strips` - the Baka Fighter HUD's digit strips (`FUN_801d69e4`,
+  `FUN_801d6ef4`, `FUN_801d6f44`), drawn as font glyphs at the ported cell x.
+- `fishing::hub` / `fishing::exchange` / `fishing::rod` - the fishing
+  venue's hub menu and help pages, its point-exchange sub-screen, and the
+  first-person rod's faces (`PondSession::rod_faces`) as flat prims.
+- `fishing::sprite` - the fishing HUD's sprite quads (the overlay's shared
+  emitter `FUN_801D63B0` and its digit wrappers) as `POLY_GT4`s sampling the
+  venue's own HUD page.
+- `slot_paylines` - the slot machine's five projected paylines as the prim
+  set's line kind.
+- `slot_cabinet` - the slot machine's 3D scene as screen primitives:
+  cabinet mesh, reel cylinders, glass, marquee and coin HUD, projected
+  through the machine's camera and linked at depth-derived OT buckets.
+- `shop_screen` - the gold shop's screen composition: window frames, the
+  Buy / Sell / Quit picker, the paged lists and the party-compare column.
+  `legaia-engine-screens` projects the live shop state into it.
+- `text_lines` - positioned `(bytes, x, y, marked)` / `(bytes, x, y, pen)`
+  lines to `TextDraw`s, the last step every engine-laid-out text screen shares.
+- `ringside_backdrop` - the Muscle Dome hub's ringside still: the two
+  `POLY_FT4` quads a re-entered hub draws and the 16bpp sheet they sample.
+
+`fishing::hud` is the one module that owns both halves. The fishing overlay's
+HUD helpers are ports in their own right (`FUN_801d13f0`, `FUN_801d1580`,
+`FUN_801d1870`, `FUN_801d76e0`, the banner animators), and they decide layout
+rather than simulation state, so they sit beside their consumer here instead
+of in `engine-core`, which keeps the minigame's numeric kernels.
+
+Several modules are not UI at all but live here for the same structural reason -
+they are wgpu-free draw kernels both hosts must share, and this crate is the
+shared leaf:
+
+- `minigame_fx` - the draw builder for `engine-minigames::minigame_fx`'s effect-part pool and
+  for the dance run's own sprite-part emits: one placeholder-cell
+  materialisation, so a part looks the same on the native HUD, the play
+  page's overlay and the minigames page's canvas.
+- `boot_logos` - the publisher-logo boot pass's stage-into-surface fit, so
+  the native `--boot-ui` chain and the play page's own logo stage letterbox
+  retail's 640x480 quads identically.
+- `battle_stage_clear` - the colour a battle frame clears to (black, per the
+  `FUN_80016B6C` draw-environment pair), answered once for both hosts.
+- `dance` - the dance count-in banner and the how-to tutorial's captions,
+  projected from the phase `World::tick_dance` publishes.
+
+## Composition
+
+Native callers name the builders here directly; `legaia-engine-render`
+depends on this crate for the draw types it uploads. The GPU-resident batch wrappers
+(`TextOverlay` / `SpriteOverlay` / `UploadedSpriteAtlas`) stay in
+`legaia-engine-render` because they hold wgpu handles.
+
+Depends only on `legaia-game-tables`, `legaia-ui-formats`,
+`legaia-minigame-formats`, `legaia-engine-battle-vm`,
+`legaia-render-kernels`, `legaia-font`, `legaia-tim`, `glam`, `serde`, `serde_json`, and `bytemuck` -
+no wgpu, no winit, and not `legaia-engine-core` - so it links into the lean
+WASM play build. The projection from live `engine-core` state into these
+builders, where it would otherwise be written once per host, lives in
+[`legaia-engine-screens`](../engine-screens/README.md).
+
+## Whole-screen compositions
+
+Most builders paint one window. A few paint a **whole sub-screen** - several
+windows plus the rules that decide which of them draws - and those exist so the
+two hosts cannot answer that question differently.
+
+`recipient_picker_draws_for` is the pattern: the shop's equipment-buy recipient
+sub-screen (retail `0x1C`, `FUN_801DB380`) is windows 36 / 25 / 41 together,
+and the row order, the "row 0 is the bag" cursor offset, the note precedence
+("already equipped" beats "cannot equip") and the compare-category chain are
+all screen-level decisions rather than window-level ones. A host supplies the
+three rects it resolved off the disc window table plus a plain-data model, and
+gets the draws back. The alternative - each host composing the three painters
+itself - is what put the browser page a screen ahead of the native window for
+a release.
+
+## Host-drift gate
+
+`scripts/ci/check-ui-host-drift.py` treats the set of draw builders here as a
+machine-checkable feature surface: a host "has" a screen when its source calls
+that builder, transitively through this crate's own builder-to-builder edges.
+Native-only is a CI failure unless waived; unused is a failure unless waived;
+web-ahead is reported for information. Waivers live in
+`scripts/ci/ui-host-drift-waivers.toml` and each must name the capability that
+blocks the wire, because the checker validates a waiver's bucket but cannot
+read its prose.
+
+What the gate cannot see is drift *inside* a shared builder's inputs - two
+hosts calling the same function with different models. The gaps of that
+shape found by reading the hosts side by side are recorded in the
+[browser-host page](../../docs/subsystems/browser-host.md#platform-drift-against-the-native-window).

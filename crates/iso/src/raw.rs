@@ -1,0 +1,289 @@
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+
+pub const SECTOR_SIZE: usize = 2352;
+pub const USER_DATA_OFFSET: usize = 24;
+pub const USER_DATA_SIZE: usize = 2048;
+
+/// The 12-byte sync pattern that opens every raw CD sector
+/// (`00 FF FF FF FF FF FF FF FF FF FF 00`). Its presence at offset 0 is the
+/// cheap tell that a file really is a raw 2352-byte-sector dump and not, say,
+/// a 2048-byte ISO or an unrelated file handed to the CLI by mistake.
+pub const SECTOR_SYNC: [u8; 12] = [
+    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
+];
+
+#[derive(Debug)]
+pub struct RawDisc {
+    file: File,
+    sector_count: u64,
+}
+
+impl RawDisc {
+    /// Open a Mode2/2352 disc image. Accepts either the raw `.bin` or a
+    /// `.cue` sheet pointing at it (resolved via [`resolve_disc_path`]).
+    ///
+    /// Rejects inputs that clearly aren't 2352-byte raw-sector dumps (too
+    /// small, or missing the CD sync pattern at sector 0) with an error that
+    /// names the offending file, instead of failing later with a bare
+    /// "failed to fill whole buffer" deep inside the ISO9660 walk.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let resolved = resolve_disc_path(path)?;
+        let mut file = File::open(&resolved)?;
+        let len = file.metadata()?.len();
+        if len < SECTOR_SIZE as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "not a Mode2/2352 disc image: {} ({} bytes is smaller than one \
+                     2352-byte raw sector; pass the raw .bin dump or its .cue sheet)",
+                    resolved.display(),
+                    len
+                ),
+            ));
+        }
+        let mut head = [0u8; 12];
+        file.read_exact(&mut head)?;
+        file.seek(SeekFrom::Start(0))?;
+        if head != SECTOR_SYNC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "not a Mode2/2352 disc image: {} (expected 2352-byte raw sectors \
+                     starting with the CD sync pattern; pass the raw .bin dump or its \
+                     .cue sheet - a 2048-byte .iso or any other file type won't work)",
+                    resolved.display()
+                ),
+            ));
+        }
+        Ok(Self {
+            file,
+            sector_count: len / SECTOR_SIZE as u64,
+        })
+    }
+
+    pub fn sector_count(&self) -> u64 {
+        self.sector_count
+    }
+
+    pub fn read_sector(&mut self, lba: u32) -> io::Result<[u8; USER_DATA_SIZE]> {
+        let mut sector = [0u8; SECTOR_SIZE];
+        self.file
+            .seek(SeekFrom::Start(lba as u64 * SECTOR_SIZE as u64))?;
+        self.file.read_exact(&mut sector)?;
+        let mut out = [0u8; USER_DATA_SIZE];
+        out.copy_from_slice(&sector[USER_DATA_OFFSET..USER_DATA_OFFSET + USER_DATA_SIZE]);
+        Ok(out)
+    }
+
+    pub fn read_user_data(&mut self, lba: u32, count: u32, out: &mut Vec<u8>) -> io::Result<()> {
+        out.clear();
+        // `count` can be derived from an attacker-controlled directory size.
+        // Use a checked multiply and only pre-reserve up to the bytes that
+        // could actually be present on disc; the per-sector `read_exact`
+        // below still errors out cleanly if the extent runs past EOF, so we
+        // never need to speculatively allocate the full claimed size.
+        let want_bytes = (count as u64).saturating_mul(USER_DATA_SIZE as u64);
+        let on_disc_bytes = self
+            .sector_count
+            .saturating_mul(USER_DATA_SIZE as u64)
+            .min(want_bytes);
+        out.reserve(usize::try_from(on_disc_bytes).unwrap_or(0));
+        let mut sector = [0u8; SECTOR_SIZE];
+        self.file
+            .seek(SeekFrom::Start(lba as u64 * SECTOR_SIZE as u64))?;
+        for _ in 0..count {
+            self.file.read_exact(&mut sector)?;
+            out.extend_from_slice(&sector[USER_DATA_OFFSET..USER_DATA_OFFSET + USER_DATA_SIZE]);
+        }
+        Ok(())
+    }
+
+    /// Read one raw 2352-byte sector. Use this when you need the CD-XA
+    /// subheader (bytes 16..24) and full Form 2 user data (bytes 24..2348),
+    /// which the Form 1 view at [`Self::read_sector`] truncates. The XA
+    /// audio path uses this to demux multiplexed channels.
+    pub fn read_raw_sector(&mut self, lba: u32) -> io::Result<[u8; SECTOR_SIZE]> {
+        let mut sector = [0u8; SECTOR_SIZE];
+        self.file
+            .seek(SeekFrom::Start(lba as u64 * SECTOR_SIZE as u64))?;
+        self.file.read_exact(&mut sector)?;
+        Ok(sector)
+    }
+}
+
+/// If `path` is a `.cue` sheet, parse it and return the absolute path to
+/// the referenced binary track. Otherwise return `path` unchanged. Only
+/// the FIRST `FILE "<name>" BINARY` line is honoured - Legaia ships a
+/// single-track Mode2/2352 image, so multi-track cue layouts aren't a
+/// concern in this project.
+pub fn resolve_disc_path(path: &Path) -> io::Result<PathBuf> {
+    let is_cue = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("cue"))
+        .unwrap_or(false);
+    if !is_cue {
+        return Ok(path.to_path_buf());
+    }
+    let text = std::fs::read_to_string(path)?;
+    let bin_name = parse_cue_first_file(&text).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cue sheet has no FILE \"...\" BINARY line",
+        )
+    })?;
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let resolved = parent.join(&bin_name);
+    if !resolved.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "cue references {bin_name:?} but {} does not exist",
+                resolved.display()
+            ),
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Pull the first `FILE "<name>" BINARY` token out of a cue sheet body.
+/// Lenient about whitespace and accepts both quoted and unquoted file
+/// names. Returns `None` if no FILE line is present.
+fn parse_cue_first_file(text: &str) -> Option<String> {
+    for raw in text.lines() {
+        let line = raw.trim();
+        if !line.to_ascii_uppercase().starts_with("FILE") {
+            continue;
+        }
+        // After "FILE", find a quoted name first; fall back to the first
+        // whitespace-delimited token if quotes are missing.
+        let after = line[4..].trim_start();
+        if let Some(rest) = after.strip_prefix('"')
+            && let Some(end) = rest.find('"')
+        {
+            return Some(rest[..end].to_string());
+        }
+        // Unquoted: take until next whitespace.
+        let unquoted: String = after.chars().take_while(|c| !c.is_whitespace()).collect();
+        if !unquoted.is_empty() {
+            return Some(unquoted);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cue_quoted_name() {
+        let cue = "FILE \"Legend of Legaia (USA).bin\" BINARY\n  TRACK 01 MODE2/2352\n";
+        assert_eq!(
+            parse_cue_first_file(cue).as_deref(),
+            Some("Legend of Legaia (USA).bin")
+        );
+    }
+
+    #[test]
+    fn parse_cue_unquoted_name() {
+        let cue = "FILE legaia.bin BINARY\n  TRACK 01 MODE2/2352\n";
+        assert_eq!(parse_cue_first_file(cue).as_deref(), Some("legaia.bin"));
+    }
+
+    #[test]
+    fn parse_cue_with_leading_indent() {
+        let cue = "  REM hello\n   FILE \"x.bin\" BINARY\n";
+        assert_eq!(parse_cue_first_file(cue).as_deref(), Some("x.bin"));
+    }
+
+    #[test]
+    fn parse_cue_returns_none_when_missing() {
+        assert!(parse_cue_first_file("REM no file line\n").is_none());
+    }
+
+    #[test]
+    fn parse_cue_handles_adversarial_input_without_panic() {
+        // A `FILE` line with no name, no quotes, unterminated quote, embedded
+        // NULs, and pure garbage must all parse to Some/None without panicking
+        // on the `line[4..]` byte slice or the quote-find logic.
+        for cue in [
+            "FILE",                  // bare keyword, nothing after
+            "FILE ",                 // keyword + trailing space only
+            "FILE \"",               // unterminated quote
+            "FILE \"\"",             // empty quoted name
+            "file lower.bin BINARY", // lowercase keyword
+            "FILE\tname.bin",        // tab separator
+            "\0\0FILE x\0y",         // embedded NULs around the token
+            "FILEBUNDLED",           // "FILE" prefix but not the FILE command
+        ] {
+            // Just assert it doesn't panic; value correctness is covered above.
+            let _ = parse_cue_first_file(cue);
+        }
+        // A tab-separated FILE token is still recovered.
+        assert_eq!(
+            parse_cue_first_file("FILE\tname.bin").as_deref(),
+            Some("name.bin")
+        );
+    }
+
+    #[test]
+    fn resolve_returns_unchanged_for_bin() {
+        let p = Path::new("/tmp/foo.bin");
+        assert_eq!(resolve_disc_path(p).unwrap(), p);
+    }
+
+    #[test]
+    fn resolve_reads_cue_when_present() {
+        let dir = std::env::temp_dir().join("legaia-cue-resolve-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let bin_path = dir.join("game.bin");
+        std::fs::write(&bin_path, b"").unwrap();
+        let cue_path = dir.join("game.cue");
+        std::fs::write(&cue_path, "FILE \"game.bin\" BINARY\n").unwrap();
+        let resolved = resolve_disc_path(&cue_path).unwrap();
+        assert_eq!(resolved, bin_path);
+    }
+
+    #[test]
+    fn open_rejects_non_disc_file_with_path_in_error() {
+        let dir = std::env::temp_dir().join("legaia-raw-open-test");
+        let _ = std::fs::create_dir_all(&dir);
+        // A PNG-magic file padded past one sector: wrong sync pattern.
+        let png_path = dir.join("not-a-disc.png");
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.resize(SECTOR_SIZE * 2, 0);
+        std::fs::write(&png_path, &bytes).unwrap();
+        let err = RawDisc::open(&png_path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not a Mode2/2352 disc image"), "msg: {msg}");
+        assert!(msg.contains("not-a-disc.png"), "msg: {msg}");
+
+        // A tiny file: smaller than one raw sector.
+        let tiny_path = dir.join("tiny.bin");
+        std::fs::write(&tiny_path, b"short").unwrap();
+        let err = RawDisc::open(&tiny_path).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not a Mode2/2352 disc image"), "msg: {msg}");
+        assert!(msg.contains("tiny.bin"), "msg: {msg}");
+
+        // A file that does start with the sync pattern opens fine.
+        let ok_path = dir.join("ok.bin");
+        let mut ok_bytes = vec![0u8; SECTOR_SIZE];
+        ok_bytes[..12].copy_from_slice(&SECTOR_SYNC);
+        std::fs::write(&ok_path, &ok_bytes).unwrap();
+        assert!(RawDisc::open(&ok_path).is_ok());
+    }
+
+    #[test]
+    fn resolve_errors_when_referenced_bin_missing() {
+        let dir = std::env::temp_dir().join("legaia-cue-resolve-test-missing");
+        let _ = std::fs::create_dir_all(&dir);
+        let cue_path = dir.join("orphan.cue");
+        std::fs::write(&cue_path, "FILE \"nope.bin\" BINARY\n").unwrap();
+        let err = resolve_disc_path(&cue_path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+}

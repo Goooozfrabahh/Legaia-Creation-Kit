@@ -1,0 +1,126 @@
+//! Battle action state machine, ported from `FUN_801E295C` (battle
+//! overlay `0898`). Drives the per-actor execution of a chosen battle action -
+//! the layer between "the player picked Attack" and "the actor's body has
+//! finished swinging the sword and HP has been deducted."
+//!
+//! PORT: FUN_801E295C, FUN_8003F2B8, FUN_8004E2F0, FUN_801D8DE8
+//! REF: FUN_801D5854 (the battle camera's framing builder; its arms carry their
+//! own tags in `battle_cam_script` and `battle_chrome`)
+//! PORT: FUN_801DABA4, FUN_801DBF9C, FUN_801DC0A0, FUN_801E7320, FUN_801EED1C, FUN_801EFE44 (PROT 0898)
+//!
+//! See [`docs/subsystems/battle-action.md`](../../../docs/subsystems/battle-action.md)
+//! for the byte-level reference. This is **not** a bytecode VM. It's a
+//! per-frame edge-triggered state machine: each `case ctx.action_state` body
+//! waits on a per-actor condition (animation matched, timer expired, distance
+//! check passed) and writes the next `action_state` value when ready. Actions
+//! that need multiple frames (most) do nothing on the frames where their
+//! condition isn't met yet.
+//!
+//! ## Three nested keys
+//!
+//! 1. **Action category** - `actor.action_category` (was `actor[+0x1DE]`):
+//!    0=Tactical Arts, 1=Item, 2=Magic, 3=Attack, 4=Spirit, 5=Run/Defend.
+//! 2. **Execution phase** - `ctx.action_state` (was `ctx[7]`).
+//! 3. **Per-actor sub-state** - `actor.flag_bits` and the per-action parameter
+//!    byte stream `actor.params[..]`.
+//!
+//! ## Port boundary
+//!
+//! No bytes from `SCUS_942.54` or any overlay live here. The Ghidra
+//! decompilation at `ghidra/scripts/funcs/overlay_battle_action_801e295c.txt`
+//! is the *spec*, not source. The [`BattleActionHost`] trait abstracts every
+//! call the original made into the engine layer. Tests use synthetic ctx /
+//! actor state.
+#![allow(clippy::too_many_arguments)]
+
+mod types;
+pub use types::*;
+
+mod host;
+pub use host::*;
+
+mod dispatch;
+pub use dispatch::*;
+
+mod attack;
+use attack::*;
+
+mod make_way;
+pub use make_way::*;
+
+mod action_tags;
+pub use action_tags::*;
+
+pub mod motion;
+
+mod magic;
+use magic::*;
+pub use magic::{
+    CAPTURE_CAMERA_VARIANT, CAPTURE_SETTLE_DOWN_CLIP, CAPTURE_SETTLE_PASS_LIMIT, CaptureSettleSeat,
+    capture_finalize_settled,
+};
+
+mod summon;
+use summon::*;
+pub use summon::{
+    SIDEBAND_SLOT_READ_VSYNCS, SPELL_TRIGGER_SUMMON_MIN_ID, SUMMON_CAST_EFFECT_ID, SUMMON_FADE_ID,
+    SUMMON_FLASH_CUE, SUMMON_FLASH_IN, SUMMON_FLASH_OUT, SummonFadeTemplate, sideband_slot_count,
+    sideband_token_vsyncs, summon_fade_template,
+};
+
+mod spirit;
+use spirit::*;
+pub use spirit::{
+    SPIRIT_AP_BAR_ELEMENT, SPIRIT_AP_PLATE_ELEMENT, SPIRIT_AP_RETAIL, SPIRIT_BAR_WIDTH_BIAS,
+    SPIRIT_CAMERA_DEPTH, SPIRIT_TURN_GAIN, extended_gauge, spirit_turn_gains,
+};
+
+mod done;
+pub use crate::battle_slot::retail_pool_slot;
+use done::*;
+pub use done::{hp_bar_drain_pending, tick_cast_census, tick_hp_bars};
+
+mod run;
+use run::*;
+
+mod enemy_budget;
+pub use enemy_budget::*;
+
+mod validator;
+pub use validator::*;
+
+mod overlay_rng;
+pub use overlay_rng::*;
+
+mod pool_ops;
+pub use pool_ops::*;
+
+mod camera_ghost;
+pub use camera_ghost::{GHOST_BITS, GhostInputs, GhostSlot, camera_ghost_pass};
+
+mod queue_applier;
+pub use queue_applier::*;
+
+mod apply_mode;
+pub use apply_mode::*;
+
+mod flash_ramp;
+pub use flash_ramp::*;
+
+mod hit_event;
+pub use hit_event::*;
+
+mod target_cursor;
+pub use target_cursor::*;
+
+mod effect_selector;
+pub use effect_selector::*;
+
+mod ai_companion;
+pub use ai_companion::*;
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod queue_live_tests;

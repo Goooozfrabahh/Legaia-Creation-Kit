@@ -1,0 +1,610 @@
+//! Audio-side state: BGM selection and resume, the SFX cue / delay slots, sound-bank handshakes and the battle SFX / XA / shout cue queues.
+//!
+//! One subsystem's state, held as a unit on the composite [`World`].
+//! Fields keep their retail provenance notes.
+
+use super::*;
+use legaia_engine_mode::mode::SceneMode;
+
+/// The `FieldEvent::Bgm` sub-op the **engine** raises to stop the score -
+/// the battle and minigame restores when no field track was playing. It is
+/// not a retail op-`0x35` word: the field overlay's arm table (`0x801CEE00`)
+/// is indexed `sub - 1` behind `sltiu 0xB`, so this value would be a no-op
+/// in retail's dispatcher, and the disc-wide census carries no sub-op outside
+/// `1..=0xA`. Retail's sub-op `4` - which this port once routed as the stop -
+/// is the re-attach (`0x801E0180`: clear pause bit 1, `FUN_80026478` on the
+/// BGM slot).
+pub const BGM_SUB_OP_ENGINE_STOP: u8 = 0xFF;
+
+/// Audio-side state: BGM selection and resume, the SFX cue / delay slots, sound-bank handshakes and the battle SFX / XA / shout cue queues.
+pub struct AudioState {
+    /// "Sound bank ready" gate.
+    pub sound_bank_ready: bool,
+    /// Per-strike battle sound cues surfaced this frame for the host to play
+    /// through its SFX bank (the art-record `HitCue` sound cues that
+    /// [`crate::world::World::fold_battle_event`] resolves from an `ApplyArtStrike` outcome -
+    /// previously dropped). Cosmetic, like [`crate::world::BattleState::hit_fx`]: no gameplay
+    /// state depends on them. Drained via [`crate::world::World::drain_battle_sfx_cues`];
+    /// cleared on battle exit.
+    pub battle_sfx_cues: Vec<BattleSfxCue>,
+    /// CD-XA one-shot clip requests the battle raised this tick - the
+    /// `FUN_8003D53C(clip, channel, dur)` calls the melee kernel makes (the
+    /// per-character `XA30` grunt) and the party voice leg of the sound
+    /// funnel resolves (`XA27` for `0x10C`). Drained by the hosts into the
+    /// XA mixing path ([`crate::world::World::drain_battle_xa_cues`]).
+    pub battle_xa_cues: Vec<legaia_engine_system::sound_state::XaVoiceClip>,
+    /// Cast voices this round's committed spells **may** raise, listed at the
+    /// round's start so a host whose clip decode is asynchronous can have
+    /// them resident before the cast arms
+    /// ([`crate::world::World::drain_battle_xa_prestage`]). Advisory: nothing
+    /// plays from this list; the cast still raises its clip on
+    /// [`Self::battle_xa_cues`].
+    pub battle_xa_prestage: Vec<legaia_engine_system::sound_state::XaVoiceClip>,
+    /// Frames the modelled CD drive stays busy after a clip start - the
+    /// read span in vsyncs (`dur * 2.5` sectors at 150/s = `dur / 60` s). The
+    /// funnel's voice leg drops a request while it is non-zero
+    /// (`FUN_8003DE7C(1) != 0` at `0x8004FE9C`), so two `0x10C` stings
+    /// inside one read span collapse to the first. Counted down once per
+    /// battle tick.
+    pub battle_xa_busy_frames: u16,
+    /// The battle's runtime SFX descriptor bank - `bse.dat` (PROT 888), the
+    /// rows behind ring ids `>= 0x200` while a battle is on screen
+    /// (`docs/formats/bse-dat.md`). A fresh copy is installed at every battle
+    /// entry (retail reloads it in battle init `FUN_800513F0`), and the cue
+    /// router writes each enqueued row's `+4` category through it
+    /// (`gp+0x678`, [`legaia_engine_battle::sfx_cue::route_sfx_cue`]'s `element_write`), so
+    /// a host resolving a runtime ring id reads the category the firing actor
+    /// chose. `None` outside battle or on a disc-free boot.
+    pub battle_sfx_bank: Option<Vec<u8>>,
+    /// CD-XA one-shot clip requests the **field** raised this tick - the
+    /// field VM's op `0x36` bit-15-clear arm (`FUN_8003D53C(arg >> 3,
+    /// arg & 7, sel)` at `0x801E0420`) and the scripted-scene programs' voice
+    /// leg. Drained by both hosts' field SFX routing
+    /// ([`crate::world::World::drain_field_xa_cues`]); see
+    /// [`crate::world::World::push_field_xa_cue`].
+    pub(crate) field_xa_cues: Vec<legaia_engine_system::sound_state::XaVoiceClip>,
+    /// Every CD-XA one-shot the loaded scene's field scripts can start,
+    /// listed at scene load so a host whose clip decode is asynchronous can
+    /// have them resident before the op fires
+    /// ([`crate::world::World::drain_field_xa_prestage`], filled by
+    /// [`crate::world::field_xa::scene_xa_prestage`], and extended with a
+    /// minigame chrome's announcer lines by
+    /// [`crate::world::World::queue_xa_prestage`]). Advisory, like
+    /// [`Self::battle_xa_prestage`]: the op still raises its clip on
+    /// [`Self::field_xa_cues`].
+    pub field_xa_prestage: Vec<legaia_engine_system::sound_state::XaVoiceClip>,
+    /// Vsyncs the modelled drive stays busy after a field clip start - the
+    /// field's reading of `_DAT_8007BC20 != 0`, which a one-shot holds at `2`
+    /// until the callback ring's end-of-clip teardown. Same `dur`-vsyncs span
+    /// as [`Self::battle_xa_busy_frames`]; counted down once per
+    /// `World::tick`.
+    pub(crate) field_xa_busy_frames: u16,
+    /// The static `SCUS_942.54` XA cue duration table (`DAT_800788B8`) the
+    /// voice legs read (`legaia_game_tables::xa_cue_table`); installed at boot,
+    /// `None` on a disc-free build (a voice cue then requests no span and
+    /// is dropped).
+    pub xa_cue_durations: Option<Vec<u16>>,
+    /// Tactical-Arts **shout** cues queued this frame - one per executed
+    /// party art carrying a real action constant, pushed on the art's
+    /// animation-start frame (see [`legaia_engine_battle::battle_events::BattleShoutCue`]).
+    /// Cosmetic: the host resolves each against the arts-voice tables + XA
+    /// clip banks and plays the CD-XA shout; nothing here mutates gameplay
+    /// state. Drained via [`crate::world::World::drain_battle_shout_cues`]; cleared on
+    /// battle exit.
+    pub battle_shout_cues: Vec<legaia_engine_battle::battle_events::BattleShoutCue>,
+    /// Last BGM the field VM started (op 0x35 sub-1 / sub-9). `None` until
+    /// a scene starts one. Updated synchronously when the VM emits the
+    /// corresponding `Bgm` event.
+    pub current_bgm: Option<u16>,
+    /// BGM id to swap to when a live-loop encounter begins, restored to the
+    /// field track when the battle ends. `None` (the default) leaves music
+    /// untouched across the Battle transition - set it via
+    /// [`crate::world::World::set_battle_bgm`] to enable the swap. The swap is routed as an
+    /// ordinary `FieldEvent::Bgm` start (sub-op 1), so the host's existing
+    /// BGM director resolves the SEQ and cross-fades exactly like a field
+    /// op-`0x35` start.
+    pub(crate) battle_bgm: Option<u16>,
+    /// `_DAT_8007B880` - the **battle sound set** the field script selects
+    /// for the next fight: op-`0x35` sub-op `7` stores its operand, or `-1`
+    /// for an operand byte of `0xFF` (`0x801E01DC..0x801E0208`); the scene
+    /// map-init `FUN_8003AEB0` zeroes it on every scene entry
+    /// (`0x8003B4F8`). The battle intro reads it: `-1` loads no battle
+    /// track and the field score plays through the fight (a scripted boss
+    /// whose theme the event already started), `0` the configured default
+    /// theme, `N > 0` battle bundle `0x36F + N`
+    /// ([`legaia_engine_system::music_labels::battle_bank_bgm_id`]).
+    pub battle_sound_set: i32,
+    /// Field track stashed at battle entry so `World::restore_field_bgm`
+    /// can resume it after the encounter. Managed by the swap helpers; not
+    /// meant to be set directly.
+    pub field_bgm_resume: Option<u16>,
+    /// `true` while the battle track is playing (set by
+    /// `World::swap_to_battle_bgm`, cleared by
+    /// `World::restore_field_bgm`). Guards against double-swap / spurious
+    /// restore.
+    pub battle_bgm_active: bool,
+    /// Field track stashed when an in-world minigame's overlay init took the
+    /// score over with its own global-pool track
+    /// ([`crate::world::World::swap_to_minigame_bgm`]), resumed by
+    /// [`crate::world::World::restore_minigame_bgm`] on the mode-24 return
+    /// warp. Managed by that pair; not meant to be set directly.
+    pub(crate) minigame_bgm_resume: Option<u16>,
+    /// `true` while a minigame's own track owns the director. Guards the
+    /// restore so a minigame that started no track of its own (the slot
+    /// machine, fishing - both inherit the host scene's BGM) does not
+    /// re-emit the field track on exit.
+    pub(crate) minigame_bgm_active: bool,
+    /// Retail's timed sound-source auto-release (`gp+0x808`/`0x814`/`0x81C`),
+    /// serviced by the frame-begin driver. Advanced by [`crate::world::World::tick`] on the
+    /// sim ticks that map to a retail vsync, by [`legaia_engine_vm::frame_clock::FrameClock::frame_step`] - the
+    /// same cadence-invariant clock every other retail duration uses.
+    ///
+    /// REF: FUN_800267FC, FUN_8001698C
+    pub(crate) sound_release: legaia_engine_system::sound_state::SoundReleaseTimer,
+    /// Set by [`crate::world::World::tick`] on the frame [`crate::world::AudioState::sound_release`] expires;
+    /// hosts drain it with [`crate::world::World::take_pending_sound_release`] and stop the
+    /// bound voice. Retail does the stop inline through libsnd
+    /// (`FUN_8002657C` + `FUN_80064370`), which the engine replaces with its
+    /// own voice pool - so the port surfaces the *event*, not the teardown.
+    pub(crate) pending_sound_release: bool,
+    /// Retail's sound-flag bit 0 (`_DAT_8007B750`): a script-owned track
+    /// start is pending its commit. Op-`0x35` sub-op `9` raises it
+    /// (`0x801E0260`); the sub-op `0xA` commit and the scene loader
+    /// `FUN_8003AEB0` end it. While it is up the swap poller `FUN_800243F0`
+    /// leaves the **outgoing** track in the BGM slot, so a sub-op `5` timed
+    /// release that expires inside the window releases that outgoing track.
+    /// The port starts the incoming track at sub-op `9` already, so such an
+    /// expiry has nothing of the port's to release ([`crate::world::World::tick`]).
+    pub(crate) start_pending_commit: bool,
+    /// Bit 1 of the sound flags `_DAT_8007B750`: the script has paused the
+    /// BGM slot. Op-`0x35` sub-ops `2` / `3` raise it (`0x801E0150`,
+    /// `0x801E0174`); sub-ops `1`, `9`, `4` and `0xA` and the scene loader
+    /// end it. The engine keeps the bit so a host whose audio output arrives
+    /// after the pause (the browser page's gesture-gated one) can bring the
+    /// track up paused rather than sounding ([`Self::bgm_script_paused`]).
+    pub(crate) bgm_script_paused: bool,
+    /// The five `gp` cells retail's **arm** half writes alongside
+    /// [`crate::world::AudioState::sound_release`] (`gp+0x80C`/`0x810`), latched by
+    /// [`crate::world::World::arm_sound_release`]. `None` until the field VM's BGM op
+    /// sub-`5` arms the release.
+    ///
+    /// REF: FUN_800267A8
+    pub sound_arm: Option<legaia_engine_system::scus_leaf_kernels::TimedSoundArm>,
+    /// The per-slot SFX-cue delay table (`DAT_8007C338`) the field VM's op
+    /// `0x36` sub-`4` writes.
+    ///
+    /// REF: FUN_80035BAC
+    pub(crate) sfx_cue_delays: legaia_engine_system::scus_leaf_kernels::SfxCueDelays,
+    /// This frame's calls into the SFX cue ring's producer trio, in call
+    /// order, for the host's audio scheduler to replay onto its own ring
+    /// (`legaia_engine_audio::SfxScheduler`). Retail's producers write the
+    /// ring directly; the engine's ring lives with the SPU on the host side of
+    /// the crate boundary, so the calls cross it as data. Drained by
+    /// [`crate::world::World::take_sfx_ring_ops`].
+    pub(crate) sfx_ring_ops: Vec<SfxRingOp>,
+    /// The slot the SFX enqueue last parked (`gp+0x15A`) - the index
+    /// [`crate::world::AudioState::sfx_cue_delays`] is written through.
+    pub(crate) sfx_parked_slot: i16,
+    /// The enqueue's round-robin write cursor (`gp+0x158`), wrapping at
+    /// [`legaia_engine_system::scus_leaf_kernels::SFX_CUE_SLOTS`].
+    pub(crate) sfx_cue_cursor: i16,
+    /// The side-band sound-bank request / acknowledge pair
+    /// `_DAT_8007BABC` / `_DAT_8007BAA0`, which op `0x36`'s bit-15 subs
+    /// `1` and `2` drive and whose settled state gates sub `0` and the
+    /// whole bit-15-clear XA arm.
+    ///
+    /// REF: FUN_800243F0
+    pub(crate) sound_stream: legaia_engine_system::scus_leaf_kernels::SoundStreamRequest,
+    /// `_DAT_8007B868` - the dev/dual-mode gate. Retail boots it `0` and no
+    /// static writer ever sets it non-zero, so the engine keeps it `0`; the
+    /// field applies it as retail does (it *skips* op `0x36`'s whole
+    /// bit-15-set arm and *bypasses* the bit-15-clear arm's stream barrier).
+    pub(crate) dual_mode_gate: i32,
+    /// The one-shot sound-detach latch (`gp+0x804`). Idempotent: the mode-INIT
+    /// chain can call it repeatedly and only the first has any effect.
+    ///
+    /// REF: FUN_8002689C
+    pub(crate) sound_detach: legaia_engine_system::sound_state::SoundDetachLatch,
+    /// Which bank the SPU region VAB slots `2` and `6` share holds, and the
+    /// field-bank latch `0x8007BAFC` - see
+    /// [`crate::world::World::sync_sfx_residency`].
+    pub(crate) residency: legaia_engine_mode::sfx_residency::SfxBankResidency,
+    /// SPU voices a field-VM op asked the host to stop this tick (the
+    /// side-band teardown's `FUN_800653C8(0x17)` / `(0x16)`), drained by
+    /// [`crate::world::World::take_sfx_voice_stops`].
+    pub(crate) sfx_voice_stops: Vec<u8>,
+    /// SPU voices a minigame keyed directly this tick (`FUN_80065034` with
+    /// no ring descriptor - the slot machine's reel motor), drained by
+    /// [`crate::world::World::take_sfx_voice_keys`].
+    pub(crate) sfx_voice_keys: Vec<legaia_engine_minigames::other_game_overlay::VoiceAttrCue>,
+    /// The positional emitters' driver calls this tick (the part tick's
+    /// render-mode-5 arm, [`legaia_engine_vm::sfx_emitter`]), drained by
+    /// [`crate::world::World::take_sfx_emitter_ops`].
+    pub(crate) sfx_emitter_ops: Vec<legaia_engine_vm::sfx_emitter::EmitterOp>,
+    /// The camera focus as retail stores it (`_DAT_80089118` / `_DAT_80089120`,
+    /// X and Z negated) - the point the emitters measure their box against.
+    /// The session writes it each frame
+    /// ([`crate::world::World::set_sound_listener_focus`]).
+    pub(crate) listener_focus: (i32, i32),
+    /// The two audio-level words the live-state window (and so every save)
+    /// carries: the configured level `_DAT_8008457C` - the reference the MAN
+    /// loader resets the live level `_DAT_8007B910` to on every scene load
+    /// and the battle duck takes its percentage of - and the voice / SFX
+    /// volume `_DAT_80084580` each voice-attr key-on halves. Cold reset
+    /// `(0xD7, 200)`; `WorldSaveState::load_full` (`legaia-engine-save-state`) installs a save's
+    /// pair and `WorldSaveState::save_full` (`legaia-engine-save-state`) writes it back.
+    pub levels: legaia_save::card::RetailAudioLevels,
+    /// A field script's audio duck (op `4C 4D`, `_DAT_8007B910 =
+    /// (value * _DAT_8008457C) >> 12`) as a percentage of the configured
+    /// level, waiting for the session's audio frame
+    /// ([`crate::world::World::take_field_audio_duck`]).
+    pub(crate) field_duck_pct: Option<u8>,
+}
+
+impl AudioState {
+    /// Whether the field script holds the BGM slot paused (sound-flags bit
+    /// 1; see the field's doc).
+    pub fn bgm_script_paused(&self) -> bool {
+        self.bgm_script_paused
+    }
+
+    pub fn new() -> Self {
+        Self {
+            sound_bank_ready: true,
+            battle_sfx_cues: Vec::new(),
+            battle_xa_cues: Vec::new(),
+            battle_xa_prestage: Vec::new(),
+            battle_xa_busy_frames: 0,
+            battle_sfx_bank: None,
+            field_xa_cues: Vec::new(),
+            field_xa_prestage: Vec::new(),
+            field_xa_busy_frames: 0,
+            xa_cue_durations: None,
+            battle_shout_cues: Vec::new(),
+            current_bgm: None,
+            battle_bgm: None,
+            battle_sound_set: 0,
+            field_bgm_resume: None,
+            battle_bgm_active: false,
+            minigame_bgm_resume: None,
+            minigame_bgm_active: false,
+            sound_release: legaia_engine_system::sound_state::SoundReleaseTimer::default(),
+            pending_sound_release: false,
+            start_pending_commit: false,
+            bgm_script_paused: false,
+            sound_arm: None,
+            levels: legaia_save::card::RetailAudioLevels::COLD_RESET,
+            field_duck_pct: None,
+            sfx_cue_delays: legaia_engine_system::scus_leaf_kernels::SfxCueDelays::new(
+                legaia_engine_system::scus_leaf_kernels::SFX_CUE_SLOTS,
+            ),
+            sfx_ring_ops: Vec::new(),
+            sfx_parked_slot: 0,
+            sfx_cue_cursor: 0,
+            // Retail's field init writes `(8, -1)` (`0x801D6880`) and
+            // `FUN_800243F0` latches it settled on the next frame. The
+            // engine's bank loads are synchronous - there is no in-flight
+            // window - so the pair is born settled instead, the same way the
+            // BGM barrier is satisfied on arrival.
+            sound_stream: legaia_engine_system::scus_leaf_kernels::SoundStreamRequest::IDLE_PAIR,
+            dual_mode_gate: 0,
+            sound_detach: legaia_engine_system::sound_state::SoundDetachLatch::default(),
+            residency: legaia_engine_mode::sfx_residency::SfxBankResidency::default(),
+            sfx_voice_stops: Vec::new(),
+            sfx_voice_keys: Vec::new(),
+            sfx_emitter_ops: Vec::new(),
+            listener_focus: (0, 0),
+        }
+    }
+}
+
+impl Default for AudioState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// The SFX-ring producer ops, from `legaia_engine_system::sound_state`.
+use legaia_engine_system::sound_state::SfxRingOp;
+
+/// Where a side-band bank request lands: the VAB slot `FUN_800243F0` installs
+/// it into and the PROT entry (extraction index) it streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SideBandBank {
+    /// The request id (`_DAT_8007BABC`) this resolves.
+    pub request: i32,
+    /// VAB slot: `3` (the side-band slot) or `6` (the field bank's slot, which
+    /// a `>= 3000` request refills).
+    pub slot: u8,
+    /// Extraction-frame PROT index (raw TOC index `- 2`).
+    pub prot_entry: u32,
+}
+
+/// Raw in-RAM TOC index of the `vab_01` block, `*(0x8007BBE4)` - `1072`, the
+/// CDNAME `#define vab_01 1072`. Read as a runtime word from every catalogued
+/// mednafen state checked (field and battle alike).
+pub const VAB_01_RAW_BASE: u32 = 1072;
+
+/// The request id [`World::tail_side_band_bank`] tags the Muscle Dome arena's
+/// side bank with. The arena streams it without a request, so this is a tag
+/// no script can issue (`vab_01` rows are requested as `2000 + n`), only for
+/// a host's "is this the bank I already staged" test.
+pub const ARENA_SIDE_BAND_REQUEST: i32 = -0x977;
+
+/// The side-band request the field overlay seeds at init (`(8, -1)` at
+/// `0x801D6880`), which the driver settles on the next frame.
+pub const FIELD_INIT_SIDE_BAND_REQUEST: i32 = 8;
+
+/// The streaming slots' park sentinel: a `0x1000` request copies itself onto
+/// the acknowledge cell (`0x800244CC..0x800244F0`) and loads nothing, so the
+/// slot keeps whatever bank it held.
+pub const SIDE_BAND_PARK: i32 = 0x1000;
+
+/// Resolve a side-band bank request the way `FUN_800243F0`'s second streaming
+/// slot does (`0x800248B4..0x8002494C`, read off the disassembly).
+///
+/// The arms run in sequence and later ones overwrite earlier ones:
+///
+/// 1. `s0 = id + *(0x80084540)`, `s1 = 3` - a scene-local index;
+/// 2. `1000 <= id < 2000`: `s0 = id + base - 1000`, `s1 = 6`;
+/// 3. `2000 <= id < 3000`: `s0 = *(0x8007BBE4) + id - 2000`, `s1 = 3`;
+/// 4. `id >= 3000`: `s0 = *(0x8007BBE4) + id - 3000`, `s1 = 6`;
+/// 5. `id < 2000`: `s0 = *(0x8007BBE4) + 2`, and `gp+0x72C = id`.
+///
+/// Arm 5 overwrites both scene-local indices, so arms 1 and 2 survive only as
+/// the slot choice: every request below 2000 streams `vab_01 + 2`. The field
+/// init request `8` is one of those. The disc's scripts request only the two
+/// global arms (every op-`0x36` sub-`1` operand is `>= 2000`).
+///
+/// Returns `None` for the park sentinel and for a negative (idle) id.
+pub fn side_band_bank_for_request(id: i32) -> Option<SideBandBank> {
+    if id < 0 || id == SIDE_BAND_PARK {
+        return None;
+    }
+    let (raw, slot) = if id < 2000 {
+        let slot = if (1000..2000).contains(&id) { 6 } else { 3 };
+        (VAB_01_RAW_BASE + 2, slot)
+    } else if id < 3000 {
+        (VAB_01_RAW_BASE + (id - 2000) as u32, 3)
+    } else {
+        (VAB_01_RAW_BASE + (id - 3000) as u32, 6)
+    };
+    Some(SideBandBank {
+        request: id,
+        slot,
+        prot_entry: raw.checked_sub(2)?,
+    })
+}
+
+impl World {
+    /// Drain this frame's SFX ring producer calls ([`SfxRingOp`]), oldest
+    /// first. Both hosts replay them onto their `SfxScheduler` before its
+    /// per-frame tick, which is the order retail's frame runs them in
+    /// (producers inside the game-logic phase, the drainer after).
+    pub fn take_sfx_ring_ops(&mut self) -> Vec<SfxRingOp> {
+        std::mem::take(&mut self.audio.sfx_ring_ops)
+    }
+
+    /// Queue `FUN_80035B50(id)` - the push producer - for the host ring, and
+    /// advance the engine-core mirror of the cursor pair the way field-VM op
+    /// `0x36` sub `0` does: write the cursor's slot, park it, advance.
+    pub fn push_sfx_cue(&mut self, id: i16) {
+        let slot = self.audio.sfx_cue_cursor;
+        self.audio.sfx_cue_cursor = self.audio.sfx_cue_delays.park(slot);
+        self.audio.sfx_parked_slot = slot;
+        self.audio.sfx_ring_ops.push(SfxRingOp::Push(id));
+    }
+
+    /// Queue the sustained-cue teardown `FUN_80017910` for the host: the
+    /// held sustained run (voices `7 ..`) is keyed off ahead of the frame's
+    /// drain ([`SfxRingOp::ReleaseSustained`]). Retail's mode init
+    /// `FUN_8001DCF8` runs it on every mode entry (`0x8001DDA8`), which is
+    /// the seat a scene load takes.
+    ///
+    /// Back-to-back requests collapse into one: the teardown clears the held
+    /// count, so a second one keys nothing off, and a host that reloads the
+    /// scene it just loaded queues the same frame another host queues once.
+    pub fn release_sustained_sfx(&mut self) {
+        if self.audio.sfx_ring_ops.last() == Some(&SfxRingOp::ReleaseSustained) {
+            return;
+        }
+        self.audio.sfx_ring_ops.push(SfxRingOp::ReleaseSustained);
+    }
+
+    /// Queue `FUN_80035BD0(id)` - the overwrite producer - for the host ring.
+    /// The engine-core mirror of the cursor pair is unchanged by it (it
+    /// neither advances the cursor nor moves the parked slot); only the parked
+    /// slot's delay is zeroed, as retail's `sw zero` does.
+    pub fn replace_last_sfx_cue(&mut self, id: i16) {
+        let parked = self.audio.sfx_parked_slot;
+        self.audio.sfx_cue_delays.set_delay(parked, 0);
+        self.audio.sfx_ring_ops.push(SfxRingOp::ReplaceLast(id));
+    }
+
+    /// The runtime-bank descriptor row for ring id `id` (`>= 0x200`), out of
+    /// the current field scene's prescript bundle.
+    ///
+    /// `FUN_80016B6C` `0x80016C30..0x80016C70`: load the current-bundle
+    /// pointer `gp+0x5B8` (`_DAT_8007B8D0`), take the bundle header's `+2`
+    /// halfword (`offsets[0]`, rounded toward zero to even), and index
+    /// `(id - 0x200) * 8` past it. In the field that bundle is the scene's
+    /// prescript (`docs/formats/sfx-table.md`), which the engine holds as
+    /// [`crate::world::FieldPropState::stager_bytes`]. Returns `None` below
+    /// `0x200`, with no bundle, or past its end - retail reads whatever lies
+    /// there, the port declines to.
+    // REF: FUN_80016B6C
+    pub fn runtime_sfx_descriptor(&self, id: i16) -> Option<[u8; 8]> {
+        runtime_sfx_descriptor_in(self.runtime_sfx_bundle(), id)
+    }
+
+    /// The bundle the drainer resolves ring ids `>= 0x200` against - retail's
+    /// current-bundle slot `gp+0x5B8`. In battle that is `bse.dat`
+    /// ([`AudioState::battle_sfx_bank`], which battle init loads over the
+    /// slot), everywhere else the field scene's prescript record 0
+    /// ([`crate::world::FieldPropState::stager_bytes`]). Both hosts mirror
+    /// this into their runtime-row resolver every tick.
+    /// The slot machine overlay's init points the slot at the machine's own
+    /// `efect.dat` (extraction PROT 1199), which the scene host stages on the
+    /// warp ([`legaia_engine_minigame_scenes::minigame_state::MinigameState::slot_sfx_bundle`]); the Muscle
+    /// Dome's arena init points it at the arena's own bundle
+    /// ([`legaia_engine_minigame_scenes::minigame_state::MinigameState::muscle_sfx_bundle`]); the dance
+    /// overlay's init at its own `efect.dat`
+    /// ([`legaia_engine_minigame_scenes::minigame_state::MinigameState::dance_sfx_bundle`]).
+    // REF: FUN_8001FA88, FUN_8001F7C0
+    pub fn runtime_sfx_bundle(&self) -> &[u8] {
+        match (&self.mode, self.audio.battle_sfx_bank.as_deref()) {
+            (SceneMode::Battle, Some(bank)) => bank,
+            (SceneMode::SlotMachine, _) if !self.minigames.slot_sfx_bundle.is_empty() => {
+                &self.minigames.slot_sfx_bundle
+            }
+            (SceneMode::MuscleDome, _) if !self.minigames.muscle_sfx_bundle.is_empty() => {
+                &self.minigames.muscle_sfx_bundle
+            }
+            (SceneMode::Dance, _) if !self.minigames.dance_sfx_bundle.is_empty() => {
+                &self.minigames.dance_sfx_bundle
+            }
+            _ => &self.props.stager_bytes,
+        }
+    }
+
+    /// Install a fresh copy of the battle's runtime SFX bank (`bse.dat`) -
+    /// retail's per-battle reload in `FUN_800513F0` -> `FUN_8001FA88`, which
+    /// also discards the previous battle's `+4` category writes.
+    pub fn install_battle_sfx_bank(&mut self, bse_dat: &[u8]) {
+        self.audio.battle_sfx_bank = Some(bse_dat.to_vec());
+    }
+
+    /// Write a runtime row's `+4` category - the router's `gp+0x678` store
+    /// (`FUN_8004FE5C` `0x8004FFEC` / `0x80050084`). `ring_id` is the
+    /// enqueued id (`>= 0x200`); a row past the bank, or no bank, is skipped.
+    // REF: FUN_8004FE5C
+    pub(in crate::world) fn write_battle_sfx_category(&mut self, ring_id: u16, category: u8) {
+        let Some(bank) = self.audio.battle_sfx_bank.as_mut() else {
+            return;
+        };
+        let Some(row) = ring_id.checked_sub(0x200) else {
+            return;
+        };
+        let Some(hdr) = bank.get(2..4).map(|b| i16::from_le_bytes([b[0], b[1]])) else {
+            return;
+        };
+        let Ok(rec0) = usize::try_from((hdr / 2) * 2) else {
+            return;
+        };
+        let at = rec0 + usize::from(row) * 8 + 4;
+        if let Some(b) = bank.get_mut(at) {
+            *b = category;
+        }
+    }
+
+    /// The side-band bank the driver holds for the current request pair.
+    ///
+    /// The engine's loads are synchronous, so the acknowledged id is what the
+    /// slot holds. An idle pair in a field-family mode reads as the field
+    /// overlay's init request ([`FIELD_INIT_SIDE_BAND_REQUEST`]), which retail
+    /// settles one frame after field init - the engine's scene entry does not
+    /// replay that seed, so it is supplied here. A park leaves `None` (the
+    /// host keeps whatever bank it staged).
+    pub fn side_band_bank(&self) -> Option<SideBandBank> {
+        let pair = self.audio.sound_stream;
+        let id = if pair.acked == legaia_engine_system::scus_leaf_kernels::SoundStreamRequest::IDLE
+            && pair.requested == legaia_engine_system::scus_leaf_kernels::SoundStreamRequest::IDLE
+        {
+            if matches!(self.mode, SceneMode::Field | SceneMode::WorldMap) {
+                FIELD_INIT_SIDE_BAND_REQUEST
+            } else {
+                return None;
+            }
+        } else {
+            pair.acked
+        };
+        side_band_bank_for_request(id)
+    }
+
+    /// The bank the BGM region's free tail holds this tick, for the hosts'
+    /// tail stager: the field family's side-band request
+    /// ([`Self::side_band_bank`]), or - in the Muscle Dome - the arena's own
+    /// slot-`3` side bank, which its init streams directly rather than through
+    /// a request (`legaia_minigame_formats::minigame_sfx::ARENA_SIDE_BANK_PROT_INDEX`).
+    /// `None` everywhere else.
+    pub fn tail_side_band_bank(&self) -> Option<SideBandBank> {
+        match self.mode {
+            SceneMode::Field | SceneMode::WorldMap => self.side_band_bank(),
+            SceneMode::MuscleDome => Some(SideBandBank {
+                request: ARENA_SIDE_BAND_REQUEST,
+                slot: 3,
+                prot_entry: legaia_minigame_formats::minigame_sfx::ARENA_SIDE_BANK_PROT_INDEX,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// [`World::runtime_sfx_descriptor`] over an explicit bundle.
+pub fn runtime_sfx_descriptor_in(bundle: &[u8], id: i16) -> Option<[u8; 8]> {
+    if id < 0x200 {
+        return None;
+    }
+    let hdr = i16::from_le_bytes([*bundle.get(2)?, *bundle.get(3)?]);
+    // `sra 16; srl 31; addu; sra 1; sll 1` - round toward zero to even.
+    let rec0 = usize::try_from((hdr / 2) * 2).ok()?;
+    let at = rec0.checked_add(usize::from((id - 0x200) as u16) * 8)?;
+    bundle.get(at..at + 8)?.try_into().ok()
+}
+
+#[cfg(test)]
+mod sfx_ring_op_tests {
+    use super::*;
+    use legaia_engine_mode::mode::SceneMode;
+
+    #[test]
+    fn side_band_requests_resolve_through_the_vab_01_block() {
+        // town01's own request: raw 1074 = extraction 1072, slot 3.
+        let b = side_band_bank_for_request(2002).unwrap();
+        assert_eq!((b.slot, b.prot_entry), (3, 1072));
+        // >= 3000 refills slot 6 from the same block.
+        let b = side_band_bank_for_request(3001).unwrap();
+        assert_eq!((b.slot, b.prot_entry), (6, 1071));
+        // Below 2000 every id streams vab_01 + 2; only the slot varies.
+        assert_eq!(side_band_bank_for_request(8).unwrap().prot_entry, 1072);
+        assert_eq!(side_band_bank_for_request(8).unwrap().slot, 3);
+        assert_eq!(side_band_bank_for_request(1500).unwrap().slot, 6);
+        assert_eq!(side_band_bank_for_request(1500).unwrap().prot_entry, 1072);
+        // Park and idle load nothing.
+        assert!(side_band_bank_for_request(SIDE_BAND_PARK).is_none());
+        assert!(side_band_bank_for_request(-1).is_none());
+    }
+
+    #[test]
+    fn runtime_rows_index_past_record_zero() {
+        // [u16 count = 2][u16 offsets = 6, 0x16] then two rows.
+        let mut b = vec![2u8, 0, 6, 0, 0x16, 0];
+        b.extend_from_slice(&[1, 2, 60, 1, 3, 0, 0, 0]);
+        b.extend_from_slice(&[4, 5, 61, 2, 3, 0, 0, 0]);
+        assert_eq!(
+            runtime_sfx_descriptor_in(&b, 0x201),
+            Some([4, 5, 61, 2, 3, 0, 0, 0])
+        );
+        assert_eq!(runtime_sfx_descriptor_in(&b, 0x200).unwrap()[0], 1);
+        assert!(runtime_sfx_descriptor_in(&b, 0x1FF).is_none());
+        assert!(runtime_sfx_descriptor_in(&b, 0x202).is_none());
+        // An odd header word rounds toward zero, as `sra 1; sll 1` does.
+        let mut odd = b.clone();
+        odd[2] = 7;
+        assert_eq!(runtime_sfx_descriptor_in(&odd, 0x200).unwrap()[0], 1);
+    }
+
+    #[test]
+    fn the_idle_pair_reads_as_the_field_init_request_only_in_the_field() {
+        let mut w = World::new();
+        w.mode = SceneMode::Field;
+        assert_eq!(w.side_band_bank().unwrap().request, 8);
+        w.audio.sound_stream.request(2016);
+        w.audio.sound_stream.settle();
+        assert_eq!(w.side_band_bank().unwrap().prot_entry, 1070 + 16);
+        w.audio.sound_stream =
+            legaia_engine_system::scus_leaf_kernels::SoundStreamRequest::IDLE_PAIR;
+        w.mode = SceneMode::Battle;
+        assert!(w.side_band_bank().is_none());
+    }
+}

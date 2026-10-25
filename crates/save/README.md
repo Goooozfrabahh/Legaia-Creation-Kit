@@ -1,0 +1,229 @@
+# `legaia-save`
+
+Per-character record schema for Legend of Legaia.
+
+## Scope
+
+The 0x414-byte character record at runtime address `0x80084708 + n * 0x414` -
+typed accessors for every documented field, a round-trip-safe `parse` /
+`write` pair that preserves every untouched byte, and a `Party` wrapper for
+N-character rosters.
+
+## Format coverage
+
+| Offset | Field | Source |
+|---|---|---|
+| `+0xF4..0x100` | active-abilities bitfield | `FUN_80042558` |
+| `+0x104..0x110` | HP / MP / SP (`(max, cur)` u16 pairs - maxima at `+0x104/+0x108/+0x10C`, currents at `+0x106/+0x10A/+0x10E`) | `FUN_80042558` / `FUN_801D0B90` |
+| `+0x110..0x11C` | live stats (AGL/ATK/UDF/LDF/SPD/INT) | cheat-derived layout |
+| `+0x11C..0x12E` | record-side stats + `+0x120` cap constant (`stat_cap()`) | level-up writer |
+| `+0x13C..0x184` | spell list (count + IDs + levels, 36 entries) | `FUN_80042DBC` |
+| `+0x196..0x19D` | equipment slots (8 bytes) | inventory consumers |
+| `+0x2A7..0x2B0` | display name (NUL-padded ASCII, 9 bytes) | RAM captures (all 4 roster slots) |
+| `+0x2B0..0x380` | active-spell slots (stride 0x14) | `FUN_800432BC` |
+
+Untyped offsets pass through unchanged via [`CharacterRecord::raw`].
+
+## Composition
+
+```rust
+use legaia_save::{CharacterRecord, HpMpSp, STAT_CAP};
+
+let mut r = CharacterRecord::zeroed();
+r.set_hp_mp_sp(HpMpSp { hp_cur: 250, hp_max: 999, mp_cur: 30, mp_max: 80, sp_cur: 10, sp_max: 50 });
+r.set_stat_cap(STAT_CAP);
+let bytes = r.write();  // 0x414 bytes
+let r2 = CharacterRecord::parse(&bytes)?;
+assert_eq!(r.hp_mp_sp(), r2.hp_mp_sp());
+```
+
+## Retail SC-block bridges
+
+The retail save block stores party records, the story-flag window
+(`+0x14C0..+0x1818`, which carries the whole `0x200`-byte system-flag bank at
+its `+0x158`), the present party (count `+0x454`, leader `+0x457`, member list
+`+0x458`), the field position snapshot (`+0x428` / `+0x42C`) and the whole
+256-slot item array (`+0x1818`, `0x200` bytes) at fixed offsets. 72 is the size of the consumable **display page** a cheat device
+targets, not a bound - a played-through bag runs past it, and lifting only the
+page dropped every item above slot 71. The character-record
+array anchors at **SC block offset `0x5C8`** with the `0x414` stride
+(record `n` at `block + 0x5C8 + n*0x414`); the display name sits at
+record offset `+0x2A7`, so slot 0's name surfaces at SC `+0x86F` -
+`0x86F` is the *name field*, not the record start. `SaveFile` round-trips
+through both directions:
+
+```rust
+use legaia_save::{RETAIL_SC_PARTY_RECORDS, SaveFile};
+
+// Disc → engine state (all four records; `RETAIL_MAX_CHAR_RECORDS` is the
+// strictly non-overlapping walk and would drop the fourth)
+let parsed = SaveFile::from_retail_sc_block(&sc_block, RETAIL_SC_PARTY_RECORDS)?;
+
+// Engine state → disc
+let mut sc_block = vec![0u8; legaia_save::BLOCK_SIZE];
+parsed.write_into_retail_sc_block(&mut sc_block)?;
+```
+
+The companion helpers in [`card`](src/card.rs) (`read_retail_*` /
+`write_retail_*`) expose each region individually for callers that don't
+want the whole `SaveFile` - including the party gold
+(`RETAIL_GOLD_OFFSET` = SC `+0x45C`, RAM `0x8008459C`) and the casino
+coin bank (`RETAIL_COINS_OFFSET` = SC `+0x464`, RAM `0x800845A4` - the
+slot-machine cash-out global).
+
+The [`minigame_save`](src/minigame_save.rs) module (`MinigameSave`) carries the
+minigame purses and records as one unit: the coin bank, the Point Card bank
+(SC `+0x474`) and the fishing point record (pool, lure, rod, best catch, cast
+counter, one-time prize mask at SC `+0x30C..+0x32C`). It lifts from and writes
+back into the SC block, and rides in an LGSF file as the optional `LGX7` block,
+emitted only when non-zero.
+
+A lift reads the present party from the block's own count and member list
+(`read_retail_present_party` into `SaveExtV2::active_party`), never from the
+number of populated records - the New Game template populates all four - and
+the field position into `SaveExtV2::field_position`
+(`read_retail_field_position`; a never-written `(0, 0)` reads as `None`). The
+composer writes both back. In an LGSF file the position is the optional
+`LGX8` block, emitted only when present. The two audio-level words
+(configured level `+0x43C`, voice volume `+0x440`) lift into
+`SaveExtV2::audio_levels` (`read_retail_audio_levels`; an all-zero pair reads
+as `None`) and ride in the optional `LGX9` block. Why these words matter on a
+card load is in
+[`save-screen.md`](../../docs/subsystems/save-screen.md#what-a-card-load-restores).
+
+Two sibling writers complete a block the composer leaves alone:
+
+- `SaveResume` - the resume point (CDNAME scene label at SC `+0x408`,
+  banner / location name at `+0x200`, the two fields retail's loader and
+  info panel read). `SaveResume::from_retail_sc_block` /
+  `write_into_retail_sc_block`; in an LGSF file it is the optional `LGX5`
+  trailer (`SaveFile::write_with_resume` / `parse_with_resume`), appended
+  only when populated so `write()` bytes never change.
+- `SaveFile::write_engine_ext_into_retail_sc_block` - the `LGX2` / `LGX4`
+  bodies (play clock, party composition, per-character ext, chain library)
+  as an `LGXE` blob in the block's tail from `RETAIL_LIVE_STATE_SIZE`
+  (`0x1A18`) to the checksum word, the `0x5E4` bytes retail composes as
+  zeros and never copies back. `from_retail_sc_block` reads it magic-guarded,
+  so a retail block parses to `SaveExtV2::default()` apart from the two
+  fields retail itself carries (the present party and the field position).
+
+`SaveFile::leader_summary` (`displayed_level`) is the one info-panel
+derivation - name, level, HP, MP off the lead record - both the native
+window's slot scanner and the browser's card rack print.
+
+### The block checksum
+
+A card image carries **two** checksums, and an in-place SC edit has to
+keep both. The directory-frame XOR (frame byte `0x7F`) describes the
+frame and block-byte patches never touch it. The block itself ends in an
+additive word at `RETAIL_BLOCK_CHECKSUM_OFFSET` (SC `+0x1FFC`) summing
+every `u32` before it - retail stamps it when it composes a save
+(`FUN_801E1934`) and compares it when it loads one (`FUN_801DD35C` state
+5, the "Damaged data." arm). Every edit to the payload invalidates it.
+
+`sc_block_checksum` / `sc_block_checksum_valid` /
+`restamp_sc_block_checksum` are the kernel, and every `write_retail_*`
+helper restamps for its caller, so a targeted field write still yields a
+save the retail loader accepts. A caller poking block bytes directly has
+to restamp itself. `save-tool saves` prints each block's verdict.
+
+The [`emu`](src/emu.rs) module normalizes the containers emulators
+export: raw 128 KiB `.mcr`/`.mcd` card images, DexDrive `.gme`, and
+single-save `.mcs` (PS3 `.psv` is rejected - it is cryptographically
+signed, so an edited copy would not load). `emu::detect` + `CardView`
+give read and in-place-mutate views over the SC blocks while preserving
+every other byte, so an untouched export round-trips byte-identical.
+This is what the site's "import your emulator save, win casino coins in
+the browser minigames, export it back" flow is built on.
+
+`CardView` addresses both halves of a card, per container format, so
+callers never re-derive the layout: `sc_block` / `sc_block_mut` for a
+block's 8 KiB payload, `dir_frame` / `dir_frame_mut` for the 128-byte
+directory frame describing it, `block_is_save_start` to tell a save's
+first block from a free block or a mid-chain continuation, and
+`claim_block` to stamp a chosen block's frame as a single-block save.
+`claim_block` is the targeted counterpart to [`card::write_block`], which
+allocates the *lowest* free block - use it when the player picked the
+block (the retail save screen's 5x3 grid does exactly that).
+
+Story-flag rendering is the wide story-flag
+window mirroring RAM `0x80085600..0x80085958` - the engine carries it in
+[`SaveExt::story_flag_bits`] alongside the narrower 32-bit scratchpad
+word at `_DAT_1F800394`.
+
+The [`retail_inventory`](src/retail_inventory.rs) module is the memory-safe
+model of the retail item-inventory accessors (find / consume / normalize /
+add) over the physical slot array, bounded by the **active window**
+`[gp[+0x2D2], gp[+0x2D4])` that [`ItemWindow::select`] installs. It
+reproduces the full-bag out-of-bounds add primitive (`FUN_800421D4`) as data
+without performing any unsafe write, and `consume_returning_slot` carries
+retail's own return value - the `0x100` sentinel an id outside the window
+gets, having touched nothing.
+
+It is the engine's bag, not a model beside it: `engine-core`'s `ItemBag`
+holds one of these and exposes a map-shaped adapter over it, so the two share
+one copy of each accessor. `save-tool items` is the same model asked the same
+questions against a real card, read-only.
+
+**Two writers, because there are two shapes.** A caller holding a *list* has
+no slot coordinate, so `write_retail_inventory` lays it in through
+`compose_window` - retail's own add + normalize - which is what makes it
+representable: the engine's uncapped grants can bank more than the 99 retail
+clamps at, and nothing else folds two stacks of one id or drops an `id == 0`
+phantom. A caller holding the *array* has the slot order already, and
+`write_retail_item_window` writes it verbatim, holes included; running it
+through the composer would squeeze out exactly the holes PROT 0941's Steal
+samples over. `SaveFile` picks the second whenever [`SaveExt::item_slots`] is
+populated.
+
+## `save-tool` CLI
+
+The crate ships the `save-tool` binary for inspecting cards and saves.
+Numeric flags (`--offset`, `--block`) accept decimal or `0x`-hex; `dir`
+magic-checks the card image before printing.
+
+```bash
+save-tool dir <card.mcr>                 # directory entries of a memory card
+save-tool saves <card.mcr>               # active save blocks + product codes
+# First character record: SC anchor 0x5C8, stride 0x414 (2nd char: 0x9DC, ...)
+save-tool character <card.mcr> --block N --offset 0x5C8
+save-tool party <card.mcr> --block N --offset 0x5C8 --count 3   # records as JSON
+save-tool roundtrip <card.mcr> --block N --offset 0x5C8   # parse→write→parse
+save-tool rename <card.mcr> --set Vahn=Lu --set Noa=Gi --out <new.mcr>   # both name sites + checksum
+save-tool items <card.mcr> [--save-index N] [--consume ID:QTY]   # retail accessors
+save-tool write --card <card.mcr> --payload <raw.bin>    # into a free block chain
+save-tool sc-diff <a.mcr> <b.mcr>        # byte diff of two saves' SC blocks
+```
+
+`items` runs the **retail** fixed-window accessor family over a real SC block
+without writing anything back, so a dry-run consume shows which slot it
+empties and whether it leaves a hole.
+
+## What this is NOT
+
+- A drop-in replacement for the retail save format. The LGSF v2 / v3 / v4
+  extension blocks (party metadata, learned arts, saved chains) are the
+  engine's own layer; party records + story flags + inventory + gold cross
+  the retail-SC boundary through the composer, the resume point through
+  retail's own two fields, and the rest only as the engine-tagged `LGXE`
+  blob a retail console ignores.
+
+## Schema fixture
+
+[`tests/schema_fixture.rs`](tests/schema_fixture.rs) pins the byte-level
+layout of both `LGSF v2` and the retail SC block by snapshotting the
+writer output of a deterministic synthetic [`SaveFile`] into two golden
+fixture files under [`tests/fixtures/`](tests/fixtures/). Any change to
+either writer drifts the generated bytes and breaks the test loudly.
+[`tests/fixtures/schema.md`](tests/fixtures/schema.md) documents the
+field map and the engine-only fields (`play_time_seconds`,
+per-character ext, saved chains) that have no SC representation. To
+intentionally regenerate after a writer change:
+
+```bash
+LEGAIA_UPDATE_FIXTURES=1 cargo test -p legaia-save --test integration schema_fixture::
+```
+
+## Reference
+
+[`docs/subsystems/battle.md` - Character record layout](../../docs/subsystems/battle.md#character-record-layout).

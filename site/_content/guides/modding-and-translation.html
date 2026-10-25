@@ -1,0 +1,213 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; guides &middot; modding + translation</div>
+  <h1>Modding and translation</h1>
+  <p class="lede">A retail disc is a sealed box, but it can still be rewritten in place: shuffle what monsters drop, re-key doors, change a boss's stats, swap a texture, or put the whole script into another language. <code>legaia-patcher</code> does all of that against a disc image you supply and hands you a small, shareable patch file. Everything is built on same-size in-place sector edits with the EDC/ECC re-encoded, so patched images stay valid discs. Commands use the bare <code>./tool</code> form (source builds live at <code>target/release/</code>).</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <table>
+    <thead><tr><th>I want to...</th><th>Subcommand</th><th>Section</th></tr></thead>
+    <tbody>
+      <tr><td>Randomize a playthrough</td><td><code>legaia-patcher randomize</code></td><td><a href="#randomize">1</a></td></tr>
+      <tr><td>Apply a friend's patch</td><td><code>legaia-patcher verify</code></td><td><a href="#share-verify">3</a></td></tr>
+      <tr><td>Rebalance one monster by hand</td><td><code>legaia-patcher monster-block</code></td><td><a href="#monster-block">4</a></td></tr>
+      <tr><td>Replace a texture with my own PNG</td><td><code>legaia-patcher tim-list / tim-export / tim-replace</code></td><td><a href="#texture-replace">4b</a></td></tr>
+      <tr><td>Translate the game</td><td><code>legaia-patcher translate ...</code></td><td><a href="#translate">5</a></td></tr>
+      <tr><td>Read a memory-card save</td><td><code>save-tool</code></td><td><a href="#save-tool">6</a></td></tr>
+      <tr><td>Look up an item or an art without a disc</td><td><code>gamedata-tool</code></td><td><a href="#gamedata">7</a></td></tr>
+      <tr><td>Classify GameShark codes</td><td><code>cheat-tool</code></td><td><a href="#cheats">8</a></td></tr>
+    </tbody>
+  </table>
+  <div class="notice">
+    <div class="notice-title">Two safety properties to rely on</div>
+    <ul class="bullets">
+      <li><strong>The tool never writes to <code>--input</code>.</strong> The original image is opened read-only; output goes to the PPF patch and (optionally) a separate patched copy. Keep your original dump pristine anyway - it is your only source.</li>
+      <li><strong>Nothing shareable contains Sony bytes.</strong> The PPF patch and the manifest are safe to share; a patched <code>.bin</code> (<code>--output</code>) is for local play only, never redistribute it.</li>
+    </ul>
+  </div>
+  <p class="hint">No terminal? The <a href="../tooling/rom-patcher.html">browser ROM patcher</a> runs the randomizer, the language packs and the texture-replacement flow client-side - the same code compiled to WebAssembly; your disc never leaves the tab.</p>
+  <p>A patched USA image also boots in the port (<code>legaia-engine</code> accepts it like the retail disc). The port reads the disc's data, so data edits - drops, steals, encounters, chests, doors, shops, starting items - take effect there; mods that work by injecting MIPS code into the game's executable only run where that executable runs, on an emulator or a console.</p>
+</section>
+
+<section class="doc-section" id="randomize">
+  <h2>1 &middot; Randomize (onto a scratch copy)</h2>
+  <div class="cli"><code>./legaia-patcher randomize --input "/path/to/Legend of Legaia (USA).bin" --seed 12345 --patch legaia-12345.ppf --output legaia-12345.bin --manifest legaia-12345.toml</code></div>
+  <figure class="diagram">
+    <svg viewBox="0 0 760 170" role="img" aria-label="Randomize flow: your disc image is read-only input; the patcher writes a shareable PPF patch and manifest, and optionally a local patched bin plus cue">
+      <defs><marker id="mt-arrow" class="dg-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z"/></marker></defs>
+      <rect class="dg-node" x="10" y="55" width="190" height="56" rx="5"/>
+      <text class="dg-label" x="105" y="79">your disc .bin</text><text class="dg-sub" x="105" y="97">--input, opened read-only</text>
+      <rect class="dg-node-accent" x="275" y="55" width="200" height="56" rx="5"/>
+      <text class="dg-label" x="375" y="79">legaia-patcher</text><text class="dg-sub" x="375" y="97">--seed + feature flags</text>
+      <rect class="dg-node-ok" x="550" y="10" width="200" height="56" rx="5"/>
+      <text class="dg-label" x="650" y="34">.ppf + manifest</text><text class="dg-sub" x="650" y="52">no Sony bytes: share it</text>
+      <rect class="dg-node-warn" x="550" y="102" width="200" height="56" rx="5"/>
+      <text class="dg-label" x="650" y="126">patched .bin + .cue</text><text class="dg-sub" x="650" y="144">--output: local play only</text>
+      <path class="dg-edge" d="M200 83 L273 83" marker-end="url(#mt-arrow)"/>
+      <path class="dg-edge" d="M475 75 L548 42" marker-end="url(#mt-arrow)"/>
+      <path class="dg-edge" d="M475 91 L548 126" marker-end="url(#mt-arrow)"/>
+    </svg>
+    <figcaption>Your original image is never written to. What you share is the patch; the patched disc stays on your machine.</figcaption>
+  </figure>
+  <p>A few seconds on a modern machine. The run prints a <code>disc: &lt;label&gt;</code> line identifying the input build, the resolved numeric seed (so any run can be reproduced), and a spoiler-safe change summary. The same seed + options over the same disc is byte-deterministic: you and a friend get identical patches. <code>--output</code> also writes a <code>.cue</code> beside the <code>.bin</code> so emulators can open it directly. <code>--dry-run</code> plans without writing.</p>
+  <p><strong>Nothing is randomized unless asked.</strong> <code>--drops shuffle</code> re-rolls monster item drops; dozens of flags cover encounters, chests, steals, arts combos, doors, shops, monster stats, spell costs, equipment, and code-hook extras (<code>--equipment-drops</code>, <code>--flee-exp</code>, <code>--enemy-ally</code>, <code>--shiny-seru</code>, ...). Read-only preview subcommands - <code>drops</code>, <code>chests</code>, <code>steals</code>, <code>arts</code>, <code>doors</code>, <code>shops</code>, <code>monster-stats</code>, <code>spell-costs</code>, and more - list what a feature would touch before you commit.</p>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../tooling/randomizer.html">Randomizer / disc patcher</a>
+    <a href="../tooling/rom-patcher.html">ROM patcher (in browser)</a>
+    <a href="../writeups/disc-patching/index.html">Patching a sealed disc</a>
+  </div>
+</section>
+
+<section class="doc-section" id="region-guard">
+  <h2>2 &middot; The region guard</h2>
+  <p>The randomizer's offsets and injected code target the USA build (<code>SCUS-94254</code>). Running <code>randomize</code> or <code>verify</code> against any other disc - the PAL <code>SCES</code> builds included - stops with a region error, because a USA-built patch "applies" to a PAL disc yet produces a corrupt hybrid. <code>--allow-region-mismatch</code> overrides the guard; only pass it when you know the patch was built for that exact disc. The PAL discs themselves are documented in <a href="../tooling/pal-localizations.html"><code>tooling/pal-localizations.md</code></a>.</p>
+</section>
+
+<section class="doc-section" id="share-verify">
+  <h2>3 &middot; Share and verify a patch</h2>
+  <p>Share the <code>.ppf</code> (and the manifest). The recipient applies and checks it against their own dump in one step:</p>
+  <div class="cli"><code>./legaia-patcher verify --input "/path/to/their Legend of Legaia (USA).bin" --patch legaia-12345.ppf --output legaia-12345.bin</code></div>
+  <p><code>verify</code> applies the patch to a copy, confirms every record applied cleanly, and re-parses the result. The same region guard applies here - that is what catches "this patch was built against a different disc" before anyone plays a corrupt hybrid.</p>
+</section>
+
+<section class="doc-section" id="monster-block">
+  <h2>4 &middot; Hand-edit one monster (stats / element / name)</h2>
+  <p>The randomizer shuffles monster stats wholesale; for a curated rebalance you edit records directly. Every monster lives in the <code>battle_data</code> archive (PROT entry 867) as an LZS-compressed block - <code>monster-block</code> does the slot math and the compression for you, so the edit loop is dump &rarr; hex-edit &rarr; write:</p>
+  <ol class="steps">
+    <li><b>Dump</b><span><code>monster-block --id 10 --dump m10.bin</code> writes the decoded block (<code>monster-stats</code> lists the 1-based ids).</span></li>
+    <li><b>Hex-edit</b><span>Change fields in the stat record at the top of <code>m10.bin</code> (layout below).</span></li>
+    <li><b>Write back</b><span><code>monster-block --id 10 --write m10.bin --output edited.bin --patch m10.ppf</code></span></li>
+  </ol>
+  <div class="cli"><code>./legaia-patcher monster-block --input "/path/to/disc.bin" --id 10 --dump m10.bin</code></div>
+  <div class="cli"><code>./legaia-patcher monster-block --input "/path/to/disc.bin" --id 10 --write m10.bin --output edited.bin --patch m10.ppf</code></div>
+  <p>The stat record starts at <code>+0x00</code> of the dumped block; multi-byte fields are little-endian. The name is a NUL-terminated string elsewhere in the same block, at the block-relative offset the first word holds.</p>
+  <div class="byte-map">
+    <div class="bm-cell bm-dim" style="--w:4"><span class="bm-off">+0x00</span><span class="bm-name">name offset</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell bm-pad" style="--w:8"><span class="bm-off">+0x04</span><span class="bm-name">effect + resource pointers</span><span class="bm-size">2 &times; u32</span></div>
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+0x0C</span><span class="bm-name">HP</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+0x0E</span><span class="bm-name">AGL</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+0x10</span><span class="bm-name">MP</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+0x12</span><span class="bm-name">ATK</span><span class="bm-size">u16</span></div>
+  </div>
+  <div class="byte-map">
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+0x14</span><span class="bm-name">DEF A</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+0x16</span><span class="bm-name">DEF B</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+0x18</span><span class="bm-name">INT</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+0x1A</span><span class="bm-name">SPD</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell bm-pad" style="--w:1"><span class="bm-off">+0x1C</span><span class="bm-name">&nbsp;</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell bm-accent" style="--w:1"><span class="bm-off">+0x1D</span><span class="bm-name">element</span><span class="bm-size">u8</span></div>
+  </div>
+  <div class="byte-map">
+    <div class="bm-cell bm-accent" style="--w:1"><span class="bm-off">+0x3E</span><span class="bm-name">Seru id</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell bm-accent" style="--w:1"><span class="bm-off">+0x3F</span><span class="bm-name">catch %</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+0x44</span><span class="bm-name">gold</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell bm-accent" style="--w:2"><span class="bm-off">+0x46</span><span class="bm-name">EXP</span><span class="bm-size">u16</span></div>
+    <div class="bm-cell bm-accent" style="--w:1"><span class="bm-off">+0x48</span><span class="bm-name">drop item</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell bm-accent" style="--w:1"><span class="bm-off">+0x49</span><span class="bm-name">drop %</span><span class="bm-size">u8</span></div>
+  </div>
+  <p>The write is the same machinery as the randomizer - the block is recompressed (the encoder need not match Sony's bytes; the retail decoder accepts any valid stream), padded back into its fixed <code>0x14000</code>-byte slot, and the touched sectors get their EDC/ECC re-encoded. With <code>--output</code> the tool re-parses the patched image and confirms the record still decodes before declaring success. The equivalent flags on the extracted tree are <code>asset monster-archive --dump-block</code> / <code>--write-block</code> (<a href="extracting-assets.html">extracting assets</a>).</p>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../subsystems/battle.html">Battle system (record layout)</a>
+    <a href="../formats/battle-data-pack.html">Battle-data pack</a>
+    <a href="../formats/lzs.html">Legaia LZS</a>
+    <a href="../monsters.html">Monster viewer</a>
+  </div>
+</section>
+
+<section class="doc-section" id="texture-replace">
+  <h2>4b &middot; Replace a texture</h2>
+  <p>Any texture on the disc can be swapped for your own PNG - same loop, three subcommands:</p>
+  <ol class="steps">
+    <li><b>Find it</b><span><code>tim-list</code> prints coordinates, dimensions and curated labels (try grepping for "title").</span></li>
+    <li><b>Export</b><span><code>tim-export</code> writes it as an editable PNG.</span></li>
+    <li><b>Edit + replace</b><span>Keep the exact pixel size, then <code>tim-replace</code> patches it back.</span></li>
+  </ol>
+  <div class="cli"><code>./legaia-patcher tim-list --input "/path/to/disc.bin"</code></div>
+  <div class="cli"><code>./legaia-patcher tim-export --input "/path/to/disc.bin" --entry 890 --offset 0x14228 -o title.png</code></div>
+  <div class="cli"><code>./legaia-patcher tim-replace --input "/path/to/disc.bin" --entry 890 --offset 0x14228 --png title.png --output edited.bin --patch title.ppf</code></div>
+  <p>The replacement must keep the original's dimensions and fit its palette (the error names the offending pixels; <code>--quantize</code> folds extras to the nearest color), alpha becomes PSX transparency, and compressed (<code>lzs</code>-tier) textures apply only when the edit recompresses into the retail footprint. The same flow runs entirely in the browser on the <a href="../tooling/rom-patcher.html">ROM patcher</a> page (scan / thumbnails / preview).</p>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../formats/tim.html">TIM (PNG &rarr; TIM encoder rules)</a>
+    <a href="../tooling/randomizer.html">Randomizer (texture replacement)</a>
+  </div>
+</section>
+
+<section class="doc-section" id="translate">
+  <h2>5 &middot; Translate the game</h2>
+  <p>The <code>translate</code> family exports the disc's text as an editable YAML <strong>language pack</strong> and imports a filled pack back onto a copy of the disc. It has its own step-by-step guide, written for translators: <a href="translating.html">translating the game</a> covers the browser and command-line paths, how much room a line has, and why a line can stay English.</p>
+  <p>A language pack composes with every randomizer option: on the <a href="../tooling/rom-patcher.html">ROM patcher</a>, pick a language and any randomizer options and patch once. Owners of an official European or a fan-translated disc can lift its text onto the USA disc instead of translating from scratch (<code>translate lift-official</code>; <a href="../tooling/translation.html#official-pal">translations from another disc</a>).</p>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="translating.html">Guide: translating the game</a>
+    <a href="../tooling/translation.html">Translation / language packs</a>
+    <a href="../formats/dialog-font.html">Dialog font</a>
+  </div>
+</section>
+
+<section class="doc-section" id="save-tool">
+  <h2>6 &middot; Inspect saves</h2>
+  <p><code>save-tool</code> reads PSX memory-card images (<code>.mcr</code> and friends, e.g. from an emulator's card directory):</p>
+  <div class="cli"><code>./save-tool dir card.mcr</code></div>
+  <div class="cli"><code>./save-tool saves card.mcr</code></div>
+  <div class="cli"><code>./save-tool character card.mcr --block 1 --offset 0x5C8</code></div>
+  <div class="cli"><code>./save-tool party card.mcr --block 1 --offset 0x5C8 --count 3</code></div>
+  <p><code>dir</code> lists directory entries (magic-checked); <code>saves</code> lists active save blocks + product codes. In a retail Legaia save block the character-record array starts at block offset <code>0x5C8</code> with a <code>0x414</code>-byte stride: <code>0x5C8</code> is the first character, <code>0x9DC</code> the second, and so on. Each record's display name sits at record-relative <code>+0x2A7</code>. <code>--offset</code> / <code>--block</code> accept <code>0x</code>-hex or decimal. <code>sc-diff</code> diffs the save block of two cards to pin what a gameplay change wrote.</p>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../formats/save-record.html">Per-character save record</a>
+    <a href="../subsystems/save-screen.html">Save screen</a>
+  </div>
+</section>
+
+<section class="doc-section" id="gamedata">
+  <h2>7 &middot; Look things up without a disc</h2>
+  <p><code>gamedata-tool</code> bakes in the curated game-data tables (arts, magic, items, weapons, armor, accessories, enemies, shops, casino, fishing) - handy as ground truth beside the randomizer's read-only listings:</p>
+  <div class="cli"><code>./gamedata-tool find "Healing Leaf"</code></div>
+  <div class="cli"><code>./gamedata-tool list arts --character Vahn</code></div>
+  <div class="cli"><code>./gamedata-tool arts-by-command Vahn "Arms,Ra-Seru,High"</code></div>
+  <div class="cli"><code>./gamedata-tool shop "Rim Elm"</code></div>
+  <div class="cli"><code>./gamedata-tool dump-json enemies</code></div>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../reference/gamedata.html">Curated game-data tables</a>
+    <a href="../arts.html">Arts</a>
+    <a href="../shops.html">Shops</a>
+  </div>
+</section>
+
+<section class="doc-section" id="cheats">
+  <h2>8 &middot; Cheat databases</h2>
+  <p><code>cheat-tool</code> parses GameShark / Pro-Action-Replay cheat collections and classifies each code by the RAM region it targets. The community Legaia NTSC-U databases are embedded, so no input file is needed:</p>
+  <div class="cli"><code>./cheat-tool list</code></div>
+  <div class="cli"><code>./cheat-tool classify</code></div>
+  <div class="cli"><code>./cheat-tool extract-offsets</code></div>
+  <div class="cli"><code>./cheat-tool parse my-cheats.cht</code></div>
+  <p><code>list</code> names the built-in databases, <code>classify</code> rolls them up per category, <code>extract-offsets</code> pulls the codes that land in the character record, and <code>parse</code> points at your own file. A file that parses to zero entries warns on stderr rather than silently printing <code>[]</code>.</p>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../reference/cheats.html">Cheat databases</a>
+    <a href="../reference/memory-map.html">RAM map</a>
+  </div>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Guides</span>
+    <a href="getting-started.html">Getting started</a>
+    <a href="extracting-assets.html">Extracting assets</a>
+    <a href="playing-and-viewing.html">Playing + viewing</a>
+    <a href="translating.html">Translating the game</a>
+    <a href="vrchat-world.html">VRChat world</a>
+  </div>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="../tooling/randomizer.html">Randomizer / disc patcher</a>
+    <a href="../tooling/translation.html">Translation / language packs</a>
+    <a href="../formats/save-record.html">Save record layout</a>
+  </div>
+</section>

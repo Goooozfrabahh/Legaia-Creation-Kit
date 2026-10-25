@@ -1,0 +1,612 @@
+//! The battle backdrop's procedural ground grid.
+//!
+//! PORT: FUN_801D02C0
+//!
+//! The grass (or sand, or stone) under the combatants is not geometry from a
+//! file - it is a flat tiled plane the battle overlay rasterises every frame,
+//! and it is the sole draw call the mode-`0x15` render path makes for the
+//! floor. See [`docs/subsystems/battle.md`](../../../docs/subsystems/battle.md)
+//! for how it sits in the backdrop (grid + stage-TMD dome) and
+//! [`docs/reference/functions/battle.md`](../../../docs/reference/functions/battle.md)
+//! for the entry.
+//!
+//! Everything here is transcribed from the DISASSEMBLY in
+//! `ghidra/scripts/funcs/overlay_battle_action_801d02c0.txt`. That dump's C is
+//! unusable for this routine on its own - it renders the GTE `mtc2`/`cop2`/
+//! `swc2` traffic as `setCopReg`/`getCopReg` with raw immediates, carries an
+//! `Instruction at 0x801d06ec overlaps 0x801d06e8` warning where a branch
+//! delay slot doubles as a jump target, and drops which shifted scratchpad
+//! slot each store lands in.
+//!
+//! ## Shape
+//!
+//! A `width x height` cell grid on a flat plane, cell pitch `0x200`, centred on
+//! the world origin, drawn in two passes:
+//!
+//! * **Pass 1** projects one probe point per cell (`RTPS`) and writes a
+//!   three-valued visibility byte per cell into the `0x1000`-byte buffer at
+//!   `_DAT_8007B814` - hence the ~64x64 ceiling on the grid.
+//! * **Pass 2** walks the same cells, and for each *visible* one projects a
+//!   **3x3 lattice** of its corners and midpoints (`RTPT`, three rows of three)
+//!   and emits **four** `POLY_GT4` quads - the cell subdivided 2x2 at the
+//!   `0x100` sub-step.
+//!
+//! ## Y is the sign bit of X, not a height
+//!
+//! Every vertex load is `mtc2 <x_word>, VXY<n>`, so the GTE's `VY` half takes
+//! the **upper 16 bits of the same word** - which for a sign-extended `lh` of a
+//! world X is `0x0000` when X is non-negative and `0xFFFF` (= -1) when it is.
+//! The plane is therefore flat at `Y == 0` for the `X >= 0` half and `Y == -1`
+//! for the other, which is the exact sense in which the grid is "Y ~ 0". There
+//! is no height field and no per-cell Y at all.
+//!
+//! ## Sub-tiles
+//!
+//! The four sub-quads take the four `0x20 x 0x20` corners of the `(192..255)^2`
+//! window in order, so a single 64x64 texture spans one whole `0x200` cell -
+//! `tile = sub_row * 2 + sub_col`, u rising with the column and v with the row.
+//! Nothing about the choice is random and no cell picks a single sub-tile.
+//!
+//! ## Depth cue
+//!
+//! The emitter runs **`DPCS`** (`cop2 0x780010`) once per projected lattice
+//! vertex - four sites, `0x801d061c` / `0x801d063c` / `0x801d0654` /
+//! `0x801d0688` - and immediately before each it loads `IR0` by hand:
+//! `srl` of the vertex's `SZ` by 2, then `mtc2 .., IR0` (`0x801d0608..14`).
+//! So the grid's blend factor is [`grid_ir0_raw`]`= SZ >> 2` in the GTE's
+//! `0x1000 = 1.0` scale, **not** the `RTPS`-computed `IR0` the `DQA`/`DQB`
+//! pair would produce - and `mtc2` does not saturate, so past `SZ = 0x4000`
+//! the blend extrapolates beyond the far colour until the DPCS *output*
+//! clamp catches it.
+//!
+//! The far colour (`RFC`/`GFC`/`BFC`, control regs 21-23) is **not written
+//! here** - the function contains zero `ctc2` - so the grid draws with the
+//! battle backdrop's staged far colour: the word at `0x8007BB48`, times 16
+//! into the 28.4 control registers. Capture-pinned by exec breakpoints on
+//! the emitter entry + the first DPCS site
+//! (`scripts/pcsx-redux/autorun_grid_far_colour.lua`) across three battles:
+//! the settled value is `(0x40, 0x40, 0x40)` on ordinary stages and
+//! `(0xFE, 0xFE, 0xFE)` on the wide-open outdoor stages named by the SCUS
+//! table at `DAT_80078C1C` - exactly [`grid_far_colour`] of the neutral
+//! base `0x808080` through the two `FUN_80050120` derivation arms (`>> 1`
+//! indoor at `0x800507fc`, `(c - 0x010101) * 2` outdoor at `0x80050834`).
+//! The battle-intro fade ramps the staged word up from near-black over the
+//! first ~28 frames before it settles. The field never runs the emitter
+//! (zero entry hits on a field state - the negative control).
+//!
+//! # Wiring
+//!
+//! The drawn mesh is the shared builder `legaia_scene_formats::battle_backdrop::
+//! build_ground_grid_rgbc` (imported by `engine-shell`'s `play-window` as
+//! `build_battle_ground_grid` and drawn under the battle camera), coloured
+//! with [`battle_ambient_colour`] of the live base
+//! (`World::battle_ambient_base`, ramped by [`ambient_base_step`]) - the
+//! ambient word the emitter's `RGBC` holds; [`GRID_RGBC_SETTLED`] outside a
+//! cast.
+//! This module carries the emitter's *laws* the hosts consume: both battle
+//! draws fog the grid with [`grid_cue_far_z`] / [`grid_cue_max_ir0`]
+//! and the [`grid_far_colour`] resolved through [`OutdoorCueTable`]. The
+//! visibility culls ([`classify_cell`] / [`quad_on_screen`]) stay reference
+//! kernels: under a depth-buffered projection they are visually neutral,
+//! and applying them to the once-uploaded mesh would wrongly freeze the
+//! entry-pose cull (see `build_ground_grid`'s doc). The GTE half
+//! (`RTPS`/`RTPT` and the ordering-table link) stays outside this crate:
+//! `engine-vm` holds no projection matrix.
+
+/// World-space pitch of one grid cell (`0x200`).
+pub const CELL_PITCH: i32 = 0x200;
+
+/// World-space pitch of one sub-quad - the cell is subdivided 2x2 (`0x100`).
+pub const SUB_STEP: i32 = 0x100;
+
+/// Near bias added to the probe's projected depth before the sign test.
+pub const NEAR_BIAS: i32 = 0x200;
+
+/// Far cutoff on the biased depth: at or past this the cell is dropped.
+pub const FAR_LIMIT: i32 = 0x6700;
+
+/// Screen width the four-corner reject tests against (`0x140`).
+pub const SCREEN_W: i32 = 0x140;
+
+/// Screen height the four-corner reject tests against (`0xF0`).
+pub const SCREEN_H: i32 = 0xF0;
+
+/// CLUT base address word (`CBA`) the quads carry - CLUT at framebuffer
+/// `(0, 479)`, i.e. `(479 << 6) | (0 >> 4)`.
+pub const CLUT_ATTR: u16 = 0x77C0;
+
+/// Texture-page attribute word the quads carry (4bpp page at fb `(832, 0)`).
+pub const TPAGE_ATTR: u16 = 0x000D;
+
+/// Low corner of the shared `64 x 64` UV window: `(192, 192)`.
+pub const UV_WINDOW_ORIGIN: u8 = 0xC0;
+
+/// GPU command byte the emit loop stamps while the quads are being built
+/// (`0x3C`), restored to `0x2C` on the way out.
+pub const CODE_WHILE_EMITTING: u8 = 0x3C;
+
+/// GPU command byte the routine leaves behind (`0x2C`).
+pub const CODE_AFTER_EMITTING: u8 = 0x2C;
+
+/// Per-cell visibility class pass 1 writes into `_DAT_8007B814`.
+///
+/// Retail stores `-1` / `0` / `1`. Pass 2 emits for `Visible` only, so the
+/// distinction between the two rejects is not consumed inside this routine -
+/// it is preserved here because the buffer outlives the call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellVis {
+    /// Behind the near plane (`depth + 0x200 <= 0`) - stored as `-1`.
+    Behind,
+    /// Past the far cutoff (`depth + 0x200 > 0x6700`) - stored as `0`.
+    Far,
+    /// In range - stored as `1`, the only class pass 2 draws.
+    Visible,
+}
+
+impl CellVis {
+    /// The signed byte retail writes for this class.
+    pub const fn as_byte(self) -> i8 {
+        match self {
+            CellVis::Behind => -1,
+            CellVis::Far => 0,
+            CellVis::Visible => 1,
+        }
+    }
+}
+
+/// Pass 1's depth classifier.
+///
+/// `ir3` is the GTE `IR3` register after `RTPS` - the probe point's view-space
+/// depth. Retail adds `NEAR_BIAS` first and then subtracts `FAR_LIMIT` from the
+/// *biased* value inside a branch delay slot that both paths reach, so both
+/// comparisons run against `ir3 + 0x200`.
+pub fn classify_cell(ir3: i32) -> CellVis {
+    let depth = ir3.wrapping_add(NEAR_BIAS);
+    if depth <= 0 {
+        CellVis::Behind
+    } else if depth.wrapping_sub(FAR_LIMIT) > 0 {
+        CellVis::Far
+    } else {
+        CellVis::Visible
+    }
+}
+
+/// The grid's world-space minimum corner, as pass 1 computes it from the cell
+/// counts at `_DAT_1F8003F8` / `_DAT_1F8003FA`.
+///
+/// Note the asymmetry, which is in the bytes and not a transcription slip: X is
+/// `-(w/2) * 0x200` and Z is that minus a **whole extra cell**
+/// (`addi t1, t1, -0x200`), so the plane is centred in X and biased one cell
+/// toward the camera in Z.
+pub fn grid_origin(width: i16, height: i16) -> (i32, i32) {
+    let x_min = -(((width >> 1) as i32) << 9);
+    let z_min = (-(((height >> 1) as i32) << 9)) - CELL_PITCH;
+    (x_min, z_min)
+}
+
+/// Pass 1's probe point for cell `(col, row)` - the cell's centre in X and its
+/// near edge plus a half-step in Z.
+pub fn probe_point(width: i16, height: i16, col: i32, row: i32) -> (i32, i32) {
+    let (x_min, z_min) = grid_origin(width, height);
+    (
+        x_min + SUB_STEP + col * CELL_PITCH,
+        z_min + SUB_STEP + row * CELL_PITCH,
+    )
+}
+
+/// The world-space `3 x 3` lattice pass 2 projects for cell `(col, row)`,
+/// indexed `[z_index][x_index]` with both indices stepping by [`SUB_STEP`].
+///
+/// Retail feeds this to `RTPT` three vertices at a time (one lattice row per
+/// `cop2 0x280030`), storing `SXY0`/`SZ1`/`SXY1`/`SZ2`/`SXY2`/`SZ3` per row.
+pub fn cell_lattice(width: i16, height: i16, col: i32, row: i32) -> [[(i32, i32); 3]; 3] {
+    let (x_min, z_min) = grid_origin(width, height);
+    let x0 = x_min + col * CELL_PITCH;
+    let z0 = z_min + row * CELL_PITCH;
+    let mut out = [[(0, 0); 3]; 3];
+    for (zi, lattice_row) in out.iter_mut().enumerate() {
+        for (xi, slot) in lattice_row.iter_mut().enumerate() {
+            *slot = (x0 + xi as i32 * SUB_STEP, z0 + zi as i32 * SUB_STEP);
+        }
+    }
+    out
+}
+
+/// The GTE `VY` half a world X ends up supplying, given that retail packs the
+/// X word straight into `VXY<n>` and never writes a separate Y.
+pub fn implied_y(world_x: i32) -> i16 {
+    ((world_x as u32) >> 16) as u16 as i16
+}
+
+/// Pass 2's four-corner screen reject, run on the outer corners of the
+/// projected lattice - `[ (0,0), (0,2), (2,0), (2,2) ]` in `(x, y)` pairs.
+///
+/// Retail runs it as four "is any corner past this edge" scans, testing all
+/// four Y values against the top edge, then the bottom, then all four X values
+/// against the left edge, then the right; the conjunction is a screen-space AABB
+/// overlap with the `0x140 x 0xF0` viewport under strict inequalities.
+pub fn quad_on_screen(corners: [(i16, i16); 4]) -> bool {
+    let any_y_below_top = corners.iter().any(|c| c.1 as i32 > 0);
+    let any_y_above_bottom = corners.iter().any(|c| (c.1 as i32) - SCREEN_H < 0);
+    let any_x_right_of_left = corners.iter().any(|c| c.0 as i32 > 0);
+    let any_x_left_of_right = corners.iter().any(|c| (c.0 as i32) - SCREEN_W < 0);
+    any_y_below_top && any_y_above_bottom && any_x_right_of_left && any_x_left_of_right
+}
+
+/// The four UV corners of sub-tile `index` (`0..4`), in the quad's vertex order
+/// `uv0, uv1, uv2, uv3` = `(lo,lo), (hi,lo), (lo,hi), (hi,hi)`.
+///
+/// The tiles form a 2x2 layout inside the `(192..255)^2` window at a `0x20`
+/// pitch: `index & 1` selects the U half, `index >> 1` the V half.
+pub fn sub_tile_uv(index: usize) -> [(u8, u8); 4] {
+    let u_lo = UV_WINDOW_ORIGIN + ((index as u8 & 1) << 5);
+    let v_lo = UV_WINDOW_ORIGIN + ((index as u8 >> 1) << 5);
+    let u_hi = u_lo + 0x1F;
+    let v_hi = v_lo + 0x1F;
+    [(u_lo, v_lo), (u_hi, v_lo), (u_lo, v_hi), (u_hi, v_hi)]
+}
+
+/// Which sub-tile a `(sub_row, sub_col)` sub-quad of a cell takes.
+///
+/// Retail walks the row pair in the outer loop and the column pair in the
+/// inner, advancing the sub-tile row pointer by `0x10` per emit, so this is
+/// just scan order.
+pub const fn sub_tile_index(sub_row: usize, sub_col: usize) -> usize {
+    sub_row * 2 + sub_col
+}
+
+/// The lattice indices a sub-quad reads, in the quad's vertex order.
+///
+/// Vertex order matches the sub-tile UV order: `(z, x)` pairs
+/// `(row, col), (row, col+1), (row+1, col), (row+1, col+1)`.
+pub const fn sub_quad_lattice(sub_row: usize, sub_col: usize) -> [(usize, usize); 4] {
+    [
+        (sub_row, sub_col),
+        (sub_row, sub_col + 1),
+        (sub_row + 1, sub_col),
+        (sub_row + 1, sub_col + 1),
+    ]
+}
+
+/// The GTE `IR0` the emitter loads before each of its four `DPCS` sites:
+/// the vertex's projected `SZ` shifted right by [`GRID_IR0_SZ_SHIFT`]
+/// (`srl s5, s5, 0x2` + `mtc2 s5, IR0` at `0x801d0608..0x801d060c`).
+///
+/// The value is in the GTE's `0x1000 = 1.0` blend scale and is **not**
+/// saturated - `mtc2` writes the raw register, so depths past `0x4000`
+/// yield `IR0 > 0x1000` and the blend extrapolates past the far colour
+/// until the DPCS colour-FIFO clamp bounds the output.
+pub fn grid_ir0_raw(sz: i32) -> i32 {
+    sz >> GRID_IR0_SZ_SHIFT
+}
+
+/// Shift applied to `SZ` to form the grid's `IR0`.
+pub const GRID_IR0_SZ_SHIFT: u32 = 2;
+
+/// One (full blend) on the GTE's `IR0` scale.
+pub const GRID_IR0_ONE: i32 = 0x1000;
+
+/// [`grid_ir0_raw`] as a `0..` fraction of full blend: `sz / 0x4000`.
+/// Deliberately unclamped above 1 - see [`grid_ir0_raw`].
+pub fn grid_ir0(sz: i32) -> f32 {
+    grid_ir0_raw(sz) as f32 / GRID_IR0_ONE as f32
+}
+
+/// The view depth at which the grid's cue reaches exactly 1.0
+/// (`GRID_IR0_ONE << GRID_IR0_SZ_SHIFT`).
+pub const GRID_IR0_FULL_DEPTH: i32 = GRID_IR0_ONE << GRID_IR0_SZ_SHIFT;
+
+/// The deepest unbiased view depth a drawn cell can have - the far cull is
+/// on the biased depth ([`classify_cell`]), so the world-space cutoff is
+/// `FAR_LIMIT - NEAR_BIAS`.
+pub const GRID_CUE_FAR_Z: i32 = FAR_LIMIT - NEAR_BIAS;
+
+/// End point of the equivalent linear ramp a host stages: the ramp's far
+/// depth. With [`grid_cue_max_ir0`] at this depth, `ir0(z) = z / 0x4000`
+/// holds across the whole drawable range `0..=GRID_CUE_FAR_Z` - i.e. the
+/// per-vertex `SZ >> 2` law expressed as `(near_z, far_z, max_ir0) =
+/// (0, GRID_CUE_FAR_Z, GRID_CUE_FAR_Z / 0x4000)`.
+pub fn grid_cue_far_z() -> f32 {
+    GRID_CUE_FAR_Z as f32
+}
+
+/// `IR0` at [`grid_cue_far_z`] - above 1.0, because retail's manual `mtc2`
+/// load never saturates (the DPCS output clamp is what bounds the pixel).
+pub fn grid_cue_max_ir0() -> f32 {
+    GRID_CUE_FAR_Z as f32 / GRID_IR0_FULL_DEPTH as f32
+}
+
+/// The neutral far-colour *base* every capture shows an ordinary battle
+/// settling on (`ctx + 0x890` after the intro fade): `0x808080`.
+pub const GRID_FAR_BASE_NEUTRAL: [u8; 3] = [0x80; 3];
+
+/// The far colour the grid (and backdrop) draw with, per stage class:
+/// `FUN_80050120` derives the staged word at `0x8007BB48` from the base as
+/// `c >> 1` per channel on ordinary stages (`0x800507fc`) and
+/// `(c - 0x010101) * 2` per channel on the [`OutdoorCueTable`] stages
+/// (`0x80050834`); the GTE control regs get that word times 16.
+///
+/// Channel arithmetic saturates here; retail's packed-word form can borrow
+/// across channels when a channel is below the subtrahend, which the
+/// observed neutral base never exercises.
+pub fn grid_far_colour(base: [u8; 3], outdoor: bool) -> [u8; 3] {
+    base.map(|c| {
+        if outdoor {
+            c.saturating_sub(1).saturating_mul(2)
+        } else {
+            c >> 1
+        }
+    })
+}
+
+/// The ambient word `0x8007B7B0` the same `FUN_80050120` pass stores beside
+/// the far colour, on every stage class: the base plus `0x404040`
+/// (`lui v0,0x40; ori v0,v0,0x4040; addu v0,s2,v0; sw v0,-0x4850(at)` at
+/// `0x800507E0..0x800507F0`). `FUN_80026CE4` copies it into scratch
+/// `0x1F800398` every frame, and that word is the `RGBC` the grid emitter
+/// cues each vertex from (`lwc2` at `0x801d05f4`) - the floor's **near**
+/// colour. Channel arithmetic saturates, as [`grid_far_colour`]'s does.
+pub fn battle_ambient_colour(base: [u8; 3]) -> [u8; 3] {
+    base.map(|c| c.saturating_add(0x40))
+}
+
+/// The grid's pre-cue vertex colour once the intro fade has settled:
+/// [`battle_ambient_colour`] of the neutral base, `0xC0` per channel. A
+/// capture of a running map01 fight holds `0x8007B7B0 = 0xC0C0C0`.
+pub const GRID_RGBC_SETTLED: [u8; 3] = [0xC0; 3];
+
+// ---------------------------------------------------------------------------
+// The live base: `ctx + 0x890` and its per-frame ramp
+// ---------------------------------------------------------------------------
+
+/// `ctx + 0x890`'s floor, packed `10:10:10` (channel `c` at bits `2 + 10c`):
+/// base `0x20` per channel. The stage loader `FUN_800513F0` seeds it here (`lui v1,0x802;
+/// ori v1,v1,0x80; sw v1,0x890(v0)` at `0x80051C70..0x80051C84`), so every
+/// fight's floor fades in from dark, and a cast's ramp clamps down to it
+/// (`0x80050660..0x800506A4`).
+pub const AMBIENT_BASE_FLOOR: u32 = 0x0802_0080;
+
+/// `ctx + 0x890`'s ceiling: base `0x80` per channel, the settled neutral
+/// the ramp climbs back to (`0x80050714..0x8005075C`).
+pub const AMBIENT_BASE_CEIL: u32 = 0x2008_0200;
+
+/// The base the summon band's `0x37` exit (`0x801E4E8C..0x801E4EA4`) and the
+/// capture band's `0x71` exit (`0x801E5214..0x801E5248`) write while
+/// clearing `ctx + 0x243`: `0x21` per channel, one step above the floor, so
+/// the floor climbs back from dark after the creature leaves.
+pub const AMBIENT_BASE_CAST_EXIT: u32 = 0x0842_1084;
+
+/// One frame of `FUN_80050120`'s base ramp (`0x80050600..0x8005075C`).
+///
+/// While `ctx + 0x243` is set (`dimming`, `0x80050608`) the whole packed word
+/// drops by `dt * 0x20` per channel lane - `8 * dt` per 8-bit channel - and a
+/// result at or below [`AMBIENT_BASE_FLOOR`] (one unsigned word compare,
+/// `sltu v0,a0,s2`) is clamped to it; while it is clear the word rises by
+/// `dt * 8` per lane - `2 * dt` per channel - and a result above
+/// [`AMBIENT_BASE_CEIL`] is clamped to that. A word already sitting on the
+/// target is left alone (`beq s2,a0` at `0x80050668` / `0x8005071C`).
+///
+/// `dt` is the frame step `0x1F800393` - vsyncs per game frame. The port
+/// ticks once a vsync, so its callers pass `1`.
+pub fn ambient_base_step(base: u32, dimming: bool, dt: u8) -> u32 {
+    // `v1 = ((dt * 0x401) << 10 + dt) << k` - `dt` in every lane.
+    let lanes = u32::from(dt).wrapping_mul(0x0010_0401);
+    if dimming {
+        if base == AMBIENT_BASE_FLOOR {
+            return base;
+        }
+        let next = base.wrapping_sub(lanes << 5);
+        if next > AMBIENT_BASE_FLOOR {
+            next
+        } else {
+            AMBIENT_BASE_FLOOR
+        }
+    } else {
+        if base == AMBIENT_BASE_CEIL {
+            return base;
+        }
+        let next = base.wrapping_add(lanes << 3);
+        if next > AMBIENT_BASE_CEIL {
+            AMBIENT_BASE_CEIL
+        } else {
+            next
+        }
+    }
+}
+
+/// The backdrop pair's depth-cue weight at which `FUN_80050120` takes the
+/// pair off the draw: `+0x56 = 0` on both records when `+0x78` reads exactly
+/// `0x1000` (`0x80050850..0x80050880`), `+0x56 = 3` otherwise.
+pub const BACKDROP_CUE_FULL: u16 = 0x1000;
+
+/// The ceiling `FUN_80050120` clamps the backdrop pair's rising `+0x78` to
+/// (`0x800505B4..0x800505F4`): `0x800` indoors, `0xC00` on an outdoor stage
+/// (the `DAT_80078C1C` table byte `0x8007BDA8`), and the full
+/// [`BACKDROP_CUE_FULL`] whenever `ctx + 0x278` or `ctx + 0x243` is above `1`
+/// - a cast module that wants the stage gone (PROT 0903 stores `2` / `3`
+///   into `+0x278`).
+pub fn backdrop_cue_ceiling(outdoor: bool, latch_243: u8, ctx_278: u8) -> u16 {
+    if ctx_278 >= 2 || latch_243 >= 2 {
+        BACKDROP_CUE_FULL
+    } else if outdoor {
+        0xC00
+    } else {
+        0x800
+    }
+}
+
+/// One frame of the backdrop pair's depth-cue ramp, the block of
+/// `FUN_80050120` beside the ambient one (`0x80050600..0x80050714`).
+///
+/// While `ctx + 0x243` is set the weight `+0x78` rises by `dt << 6` and a
+/// result above [`backdrop_cue_ceiling`] stores the ceiling instead
+/// (`sltu v0,a2,v1`) - so a weight already above a lowered ceiling snaps down
+/// to it; while it is clear the weight falls by `dt << 6` and stops at `0`.
+/// The record's colour word `+0x74` is `0` from battle init, so the weight
+/// pulls the whole backdrop toward black (`FUN_8001ADA4` case 3 hands both to
+/// `FUN_80043390`).
+///
+/// PORT: FUN_80050120 (the backdrop pair's `+0x78` ramp)
+pub fn backdrop_cue_step(cue: u16, latch_243: u8, ctx_278: u8, outdoor: bool, dt: u8) -> u16 {
+    let step = u16::from(dt) << 6;
+    if latch_243 != 0 {
+        let ceiling = backdrop_cue_ceiling(outdoor, latch_243, ctx_278);
+        let next = cue.wrapping_add(step);
+        if ceiling < next { ceiling } else { next }
+    } else {
+        cue.saturating_sub(step)
+    }
+}
+
+/// The packed `10:10:10` base as three 8-bit channels
+/// (`srl 2 / srl 4 / srl 6` + masks at `0x80050764..0x8005078C`).
+pub fn ambient_base_rgb(base: u32) -> [u8; 3] {
+    [(base >> 2) as u8, (base >> 12) as u8, (base >> 22) as u8]
+}
+
+/// Whether this frame's pass **skips** the two colour stores
+/// (`0x80050790..0x800507D4`): only once the base sits on the floor
+/// (`0x202020`), and then when `ctx + 0x278` bit 0 is set or
+/// `ctx + 0x243 == 2`. The skip also clears the "draw the backdrop" bit 3 of
+/// scratch `0x1F800394`; the ambient `0x8007B7B0` and the far colour
+/// `0x8007BB48` keep whatever the last storing frame left.
+pub fn ambient_store_skipped(base_rgb: [u8; 3], ctx_243: u8, ctx_278: u8) -> bool {
+    base_rgb == [0x20; 3] && (ctx_278 & 1 != 0 || ctx_243 == 2)
+}
+
+/// Capture-pinned settled far colour on ordinary (indoor) stages.
+pub const GRID_FAR_INDOOR: [u8; 3] = [0x40; 3];
+
+/// Capture-pinned settled far colour on the outdoor-table stages.
+pub const GRID_FAR_OUTDOOR: [u8; 3] = [0xFE; 3];
+
+/// Virtual address of the outdoor depth-cue stage table in `SCUS_942.54` -
+/// the sibling of the mirror-X table, scanned at `0x80051c1c..0x80051c6c`
+/// into the flag byte `0x8007BDA8`.
+pub const OUTDOOR_CUE_TABLE_VA: u32 = 0x8007_8C1C;
+
+/// Byte offset of [`OUTDOOR_CUE_TABLE_VA`] inside the `SCUS_942.54` file
+/// image (same `va - 0x8000F800` mapping as
+/// `legaia_scene_formats::battle_backdrop::MIRROR_X_TABLE_SCUS_OFFSET`).
+pub const OUTDOOR_CUE_TABLE_SCUS_OFFSET: usize = 0x6_941C;
+
+/// Upper bound on the zero-terminated table walk, so a mis-aimed offset
+/// cannot scan the whole executable.
+const OUTDOOR_CUE_TABLE_MAX_SLOTS: usize = 64;
+
+/// The `SCUS_942.54` table of wide-open outdoor stages whose backdrop far
+/// colour takes the brightening `(c - 0x010101) * 2` arm (and whose
+/// backdrop cue ceiling is `0xC00` rather than `0x800`). 13 ids on the
+/// retail disc: the nine kingdom-overworld variants plus `retona`,
+/// `deene`, `kor5` and `rikuroa`.
+#[derive(Debug, Clone, Default)]
+pub struct OutdoorCueTable {
+    ids: Vec<u16>,
+}
+
+impl OutdoorCueTable {
+    /// Parse the zero-terminated `u16` table out of a `SCUS_942.54` image.
+    /// `None` when the buffer is short or unterminated - not the retail
+    /// USA executable; fall back to the indoor arm rather than trust a
+    /// garbage list.
+    pub fn from_scus(scus: &[u8]) -> Option<Self> {
+        let mut ids = Vec::new();
+        let mut off = OUTDOOR_CUE_TABLE_SCUS_OFFSET;
+        for _ in 0..OUTDOOR_CUE_TABLE_MAX_SLOTS {
+            let raw = scus.get(off..off + 2)?;
+            let v = u16::from_le_bytes([raw[0], raw[1]]);
+            if v == 0 {
+                return Some(Self { ids });
+            }
+            ids.push(v);
+            off += 2;
+        }
+        None
+    }
+
+    /// Table slots in file order.
+    pub fn ids(&self) -> &[u16] {
+        &self.ids
+    }
+
+    /// Whether this runtime stage id takes the outdoor (brightened) arm.
+    pub fn contains_runtime_id(&self, id: u16) -> bool {
+        self.ids.contains(&id)
+    }
+
+    /// [`Self::contains_runtime_id`] keyed by PROT extraction index
+    /// (`runtime id + 3`, the `battle_backdrop` mapping).
+    pub fn contains_prot_index(&self, prot_index: u32) -> bool {
+        legaia_scene_formats::battle_backdrop::runtime_stage_id(prot_index)
+            .is_some_and(|id| self.contains_runtime_id(id))
+    }
+
+    /// The settled far colour for the stage at this PROT extraction index.
+    pub fn far_colour_for_prot_index(&self, prot_index: u32) -> [u8; 3] {
+        grid_far_colour(GRID_FAR_BASE_NEUTRAL, self.contains_prot_index(prot_index))
+    }
+}
+
+/// Sub-quads emitted per visible cell (2x2).
+pub const SUB_QUADS_PER_CELL: usize = 4;
+
+/// Prim size in bytes retail advances the primitive cursor by per quad
+/// (`0x34` = a 13-word `POLY_GT4`, tag plus twelve).
+pub const QUAD_PRIM_BYTES: usize = 0x34;
+
+/// Ordering-table tag word length field the emit loop ORs in (`0x0C000000`).
+pub const QUAD_OT_TAG: u32 = 0x0C00_0000;
+
+/// A whole grid's cell visibility buffer plus the emit count, as the two passes
+/// produce them. `visible_cells * 4` is the quad count retail returns in `$v0`.
+#[derive(Clone, Debug, Default)]
+pub struct GroundGrid {
+    /// Cell columns (`_DAT_1F8003F8`).
+    pub width: i16,
+    /// Cell rows (`_DAT_1F8003FA`).
+    pub height: i16,
+    /// Row-major visibility bytes, `width * height` long.
+    pub vis: Vec<i8>,
+}
+
+impl GroundGrid {
+    /// Run pass 1 with a caller-supplied projector: `project(x, z) -> IR3`.
+    ///
+    /// The caller owns the GTE, so the projector is where retail's
+    /// `mtc2`/`RTPS`/`mfc2 IR3` triple lands. The Y each vertex implicitly
+    /// carries is [`implied_y`] of the X passed in.
+    pub fn classify(width: i16, height: i16, mut project: impl FnMut(i32, i32) -> i32) -> Self {
+        let mut vis = Vec::with_capacity((width.max(0) as usize) * (height.max(0) as usize));
+        for row in 0..height.max(0) as i32 {
+            for col in 0..width.max(0) as i32 {
+                let (x, z) = probe_point(width, height, col, row);
+                vis.push(classify_cell(project(x, z)).as_byte());
+            }
+        }
+        Self { width, height, vis }
+    }
+
+    /// The visibility class stored for a cell, or `None` when out of range.
+    pub fn cell(&self, col: i32, row: i32) -> Option<i8> {
+        if col < 0 || row < 0 || col >= self.width as i32 || row >= self.height as i32 {
+            return None;
+        }
+        self.vis
+            .get(row as usize * self.width as usize + col as usize)
+            .copied()
+    }
+
+    /// Cells pass 2 emits for - the `1` class only.
+    pub fn visible_cells(&self) -> usize {
+        self.vis.iter().filter(|&&b| b == 1).count()
+    }
+
+    /// Quads pass 2 emits, before the screen-space reject: four per visible
+    /// cell. This is the upper bound on retail's `$v0`.
+    pub fn max_quads(&self) -> usize {
+        self.visible_cells() * SUB_QUADS_PER_CELL
+    }
+}
+
+#[cfg(test)]
+mod tests;

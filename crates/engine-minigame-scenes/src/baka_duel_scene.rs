@@ -1,0 +1,1088 @@
+//! The Baka Fighter duel as a **3D surface**: the two fighters' meshes posed
+//! by the duel's own clip clocks, the special's afterimage ghosts, the arena
+//! walls and floor, and the arena camera - one kernel every host draws.
+//!
+//! Three layers, each from the overlay's own code (PROT 0976, base
+//! `0x801CE818`; `see ghidra/scripts/funcs/overlay_baka_fighter_801cf388.txt`
+//! for the cabinet and `overlay_baka_fighter_801d3f44.txt` for the combat
+//! tick):
+//!
+//! * **[`DuelCamera`]** - the arena camera. The round setup (cabinet state
+//!   `0x32`, `0x801CFF34..0x801CFF7C`) snaps the ten camera globals to
+//!   [`ROUND_SETUP_CAMERA`]; state `0x35` (`0x801D0324..0x801D0454`) spins the
+//!   yaw by `dt << 6` a frame while raising the eye trio's Y by `dt << 2` and
+//!   Z by `dt << 5`, and once the yaw passes `0x1000` it zeroes the yaw and
+//!   hands the eye to a camera-relative glide ([`SWEEP_GLIDE`]) that settles
+//!   it at `(_, 0x898, 0x3520)`. That settled pose is the camera the duel
+//!   (state `0x64`) fights under - nothing in the duel state writes a camera
+//!   global. A special commit arms a second glide from the combat tick
+//!   (`0x801D4644..0x801D4740`): the player's row of the table at
+//!   [`SPECIAL_CAMERA_TABLE_VA`], or [`OPPONENT_SPECIAL_GLIDE`] for the
+//!   opponent. Both glides are the SCUS camera-relative glide family
+//!   (`FUN_80021248` normalizes, `FUN_8002149C` walks), run here through
+//!   [`legaia_engine_camera::camera_rel_actor`] and [`legaia_engine_camera::camera_rel_glide`].
+//!   The world is drawn through the field view build `FUN_800172C0` with the
+//!   base matrix at `0x6000` (6x, captured in the parked `minigame_baka_fighter`
+//!   state along with `H = 512`), so [`DuelCamera::view`] divides the eye trio
+//!   by [`DUEL_WORLD_SCALE`] - the rule `renderer.md` derives.
+//! * **[`FighterMotion`]** - each fighter's display clip: the action record
+//!   the actor's `+0x5C` names and the cursor `+0x68` the clip selector
+//!   `FUN_800204F8` advances. [`legaia_engine_minigames::baka_fighter::BakaFight`] owns one per
+//!   seat and steps it every tick.
+//! * **[`BakaDuelScene`]** - the combined vertex buffers (fighters, two ghost
+//!   copies per fighter, the four arena walls, the floor grid) and the
+//!   per-frame pose into world space. [`BakaDuelSurface`] is the per-host
+//!   cache that loads the assets once, rebuilds the buffers when a rung seats
+//!   a new opponent, and poses them each frame.
+//!
+//! The impact pair's effect parts ([`legaia_engine_minigames::baka_impact_fx`]) draw into
+//! reserved ranges of the same buffers: the flip-book flash as sprite-arm
+//! quads and the two prop flashes as copies of PROT 1203 stage TMDs `1` / `2`.
+//! Their UVs and colours change frame to frame, which
+//! [`BakaDuelScene::attr_generation`] announces to a host that uploads
+//! attributes only on change. What stays outside: the actor drop shadow
+//! `FUN_801D6BB8`.
+
+use std::ops::Range;
+use std::sync::Arc;
+
+use legaia_engine_camera::psx_camera::{FieldCameraView, camera_rotation};
+use legaia_engine_minigames::baka_fighter::BakaFight;
+use legaia_minigame_formats::baka_opponents as bo;
+
+/// The duel's camera and fighter-clip kernels live in the minigame crate.
+use legaia_engine_minigames::baka_duel::*;
+
+// ---------------------------------------------------------------- assets
+
+/// One roster fighter's mesh and clip bank.
+#[derive(Debug, Clone)]
+pub struct DuelFighterAsset {
+    pub tmd: legaia_tmd::Tmd,
+    pub raw: Vec<u8>,
+    pub bank: legaia_actor_formats::player_anm::PlayerAnmBundle,
+    /// Bank record of action `0` (party fighters share one bank, nine
+    /// records each; a ladder fighter's own bank starts at `0`).
+    pub first_record: usize,
+}
+
+/// Everything the duel draws, decoded off the disc once per visit.
+#[derive(Debug, Clone, Default)]
+pub struct BakaDuelAssets {
+    /// Indexed by roster id ([`bo::OPPONENT_COUNT`] entries).
+    pub fighters: Vec<Option<DuelFighterAsset>>,
+    /// Stage-pack TMD `0` (PROT 1203 descriptor 1) - the wall piece the
+    /// epilogue places four times.
+    pub wall: Option<(legaia_tmd::Tmd, Vec<u8>)>,
+    /// PROT 1203 descriptor 0's TIM pack (HUD sheets, the floor cells).
+    pub art: Vec<legaia_tim::Tim>,
+    /// PROT 1205's party atlases.
+    pub party_atlases: Vec<legaia_tim::Tim>,
+    /// Each ladder fighter's own atlas, by roster id.
+    pub fighter_tims: Vec<Option<legaia_tim::Tim>>,
+    /// Stage-pack TMD `3` - the round-start cameo's ring girl
+    /// ([`legaia_engine_minigames::baka_fighter_chrome::CAMEO_SCENE_MODEL`]).
+    pub cameo: Option<(legaia_tmd::Tmd, Vec<u8>)>,
+    /// The PROT 1203 clip bank the cameo's clips `0x1C` / `0x1D` resolve
+    /// into (display id `k` = record `k - 1`).
+    pub cameo_bank: Option<legaia_actor_formats::player_anm::PlayerAnmBundle>,
+    /// The overlay's two-record blit table (`&DAT_801DBE84`), the wink.
+    pub blit_rects: Vec<bo::BakaBlitRect>,
+    /// The overlay's 51-record HUD widget table (`DAT_801D7160`), which the
+    /// cabinet's and the round chrome's quads index
+    /// ([`legaia_engine_minigames::baka_fighter_chrome::hud_widget_quads`]).
+    pub hud_widgets: Vec<bo::BakaHudWidget>,
+    /// The duel HUD's VITAL bar frame cells (`0x801DBC34`), which
+    /// [`legaia_engine_minigames::baka_cabinet::duel_hud_packets`] lays out.
+    pub bar_frame: Vec<bo::BakaBarFrameCell>,
+    /// The stage pack's TMDs `1` and `2` - the impact pair's mesh parts
+    /// ([`legaia_engine_minigames::baka_impact_fx`] template B), by `model - 1`.
+    pub impact_models: [Option<(legaia_tmd::Tmd, Vec<u8>)>; 2],
+}
+
+impl BakaDuelAssets {
+    /// Decode the duel's assets through `read_prot` (extraction PROT index
+    /// -> raw entry bytes): the party pack (1204 + 1205), the art / stage /
+    /// party-bank container (1203) and the fourteen ladder packs
+    /// (1206..=1219). A piece that does not decode is left out.
+    pub fn load(read_prot: impl Fn(usize) -> Option<Vec<u8>>) -> Self {
+        let mut out = Self {
+            fighters: vec![None; bo::OPPONENT_COUNT],
+            fighter_tims: vec![None; bo::OPPONENT_COUNT],
+            ..Self::default()
+        };
+        let art_entry = read_prot(bo::BAKA_HUD_ART_PROT_INDEX);
+        if let Some(e) = art_entry.as_deref() {
+            out.art = legaia_minigame_formats::minigame_art::parse_art_pack(e).unwrap_or_default();
+            out.wall = stage_tmd(e, 0);
+            out.cameo = stage_tmd(
+                e,
+                usize::from(legaia_engine_minigames::baka_fighter_chrome::CAMEO_SCENE_MODEL),
+            );
+            out.impact_models = [stage_tmd(e, 1), stage_tmd(e, 2)];
+        }
+        let party_bank = art_entry.as_deref().and_then(|e| {
+            legaia_actor_formats::player_anm::find_in_entry(e, 4)
+                .into_iter()
+                .next()
+        });
+        out.cameo_bank = party_bank.clone();
+        if let Some(rec) = legaia_overlay_images::static_overlay::overlay_map()
+            .by_prot_index(bo::BAKA_OVERLAY_PROT_INDEX as u32)
+            && let Some(raw) = read_prot(bo::BAKA_OVERLAY_PROT_INDEX)
+            && let Ok(img) = legaia_overlay_images::static_overlay::as_loaded(&raw, rec)
+        {
+            out.blit_rects = bo::parse_blit_rects(&img).unwrap_or_default();
+            out.hud_widgets = bo::parse_baka_hud(&img).unwrap_or_default();
+            out.bar_frame = bo::parse_baka_bar_frame(&img)
+                .map(|c| c.to_vec())
+                .unwrap_or_default();
+        }
+        let party_slots =
+            read_prot(legaia_actor_formats::battle_char_pack::PROT_ENTRY_INDEX as usize)
+                .and_then(|raw| legaia_actor_formats::battle_char_pack::parse_slots(&raw).ok());
+        if let Some(raw) =
+            read_prot(legaia_actor_formats::battle_char_pack::ATLAS_PROT_ENTRY_INDEX as usize)
+            && let Ok(atlases) = legaia_actor_formats::battle_char_pack::parse_atlases(&raw)
+        {
+            out.party_atlases = atlases
+                .iter()
+                .filter_map(|a| legaia_tim::parse(&a.tim_bytes).ok())
+                .collect();
+        }
+        for roster in 0..bo::OPPONENT_COUNT {
+            if roster < bo::FIGHTER_PACK_FIRST_ROSTER_ID {
+                let (Some(slots), Some(bank)) = (party_slots.as_ref(), party_bank.as_ref()) else {
+                    continue;
+                };
+                let Some(slot) = slots.get(roster) else {
+                    continue;
+                };
+                if let Ok(tmd) = legaia_tmd::parse(&slot.tmd_bytes) {
+                    out.fighters[roster] = Some(DuelFighterAsset {
+                        tmd,
+                        raw: slot.tmd_bytes.clone(),
+                        bank: bank.clone(),
+                        first_record: roster * bo::ACTIONS_PER_FIGHTER,
+                    });
+                }
+            } else {
+                let Some(pack) = bo::fighter_pack_prot_index(roster)
+                    .and_then(&read_prot)
+                    .and_then(|e| bo::parse_fighter_pack(&e))
+                else {
+                    continue;
+                };
+                out.fighter_tims[roster] = legaia_tim::parse(&pack.tim_bytes).ok();
+                if let (Ok(tmd), Ok(bank)) = (
+                    legaia_tmd::parse(&pack.tmd_bytes),
+                    legaia_actor_formats::player_anm::parse(&pack.anim_bytes),
+                ) {
+                    out.fighters[roster] = Some(DuelFighterAsset {
+                        tmd,
+                        raw: pack.tmd_bytes,
+                        bank,
+                        first_record: 0,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// The duel's VRAM with `opponent` seated: the art pages, the party
+    /// atlases, then the opponent's own atlas last (the ladder packs past
+    /// the first two share one page, loaded one at a time).
+    pub fn vram(&self, opponent: usize) -> legaia_tim::Vram {
+        let mut vram = legaia_tim::Vram::new();
+        for tim in self.art.iter().chain(self.party_atlases.iter()) {
+            vram.upload_tim(tim);
+        }
+        if let Some(Some(tim)) = self.fighter_tims.get(opponent) {
+            vram.upload_tim(tim);
+        }
+        vram
+    }
+
+    /// Apply the cameo's blit for table row `index`
+    /// ([`legaia_engine_minigames::baka_fighter_chrome::sprite_blit`]): a `MoveImage` of the
+    /// stored eye cell into the live one. `false` when the table did not
+    /// decode or has no such row.
+    pub fn apply_wink(&self, vram: &mut legaia_tim::Vram, index: usize) -> bool {
+        let Some(rect) = self.blit_rects.get(index) else {
+            return false;
+        };
+        let raw = [
+            ((rect.src_x - legaia_engine_minigames::baka_fighter_chrome::BLIT_SRC_X_BASE as u16)
+                << 2) as u8,
+            (rect.src_y - legaia_engine_minigames::baka_fighter_chrome::BLIT_SRC_Y_BASE as u16)
+                as u8,
+        ];
+        let Some(b) = legaia_engine_minigames::baka_fighter_chrome::sprite_blit(0, raw) else {
+            return false;
+        };
+        vram.move_image(
+            b.src_x as u16,
+            b.src_y as u16,
+            b.size.0 as u16,
+            b.size.1 as u16,
+            b.dst_x as u16,
+            b.dst_y as u16,
+        );
+        true
+    }
+}
+
+/// One TMD out of the PROT 1203 stage pack (descriptor type `0x02`).
+fn stage_tmd(entry: &[u8], index: usize) -> Option<(legaia_tmd::Tmd, Vec<u8>)> {
+    use legaia_container_formats::{DecodeMode, decode, pack, parse_player_lzs};
+    let container = parse_player_lzs(entry, 4).ok()?;
+    let desc = container.descriptors.iter().find(|d| d.type_byte == 0x02)?;
+    let body = decode(entry, desc, DecodeMode::Lzs).ok()?;
+    let bodies = pack::extract_pack(&body).ok()?;
+    let raw = bodies.get(index)?.to_vec();
+    let tmd = legaia_tmd::parse(&raw).ok()?;
+    Some((tmd, raw))
+}
+
+// ---------------------------------------------------------------- arena
+
+/// A stage model's placement: origin and yaw.
+pub type StagePlacement = ([i16; 3], i16);
+
+/// Where the epilogue places stage model `0`: four copies, the model origin
+/// and the yaw (`FUN_801D6D60` calls at `0x801D2108` / `0x801D2130` /
+/// `0x801D215C` / `0x801D2184`).
+pub const WALL_PLACEMENTS: [StagePlacement; 4] = [
+    ([0, 0x64, 0x640], 0),
+    ([0x640, 0x64, 0], 0x400),
+    ([-0x640, 0x64, 0], -0x400),
+    ([0, 0x64, -0x640], 0x800),
+];
+
+/// `FUN_801D6D60` draws a wall only when its origin's eye depth is past
+/// this (`slti v0,v0,0x2711` at `0x801D6D98`) - the camera-side wall drops
+/// out.
+pub const WALL_CULL_DEPTH: f32 = 10001.0;
+
+// ---------------------------------------------------------------- scene
+
+/// The ghost passes' colour keep: the afterimage blends toward the black
+/// colour word by depth-cue level `0x800` then `0xC00`.
+const GHOST_KEEP: [f32; 2] = [0.5, 0.25];
+
+/// World units a ghost pass sits behind its thrower per pass. Retail sorts
+/// the ghosts `0x40` deeper in the ordering table; a depth-tested renderer
+/// gets the same by setting each a little further from the eye.
+const GHOST_SETBACK: f32 = 6.0;
+
+/// The duel's combined vertex buffers and their per-frame pose.
+///
+/// Positions are raw retail world coordinates (Y down) at 1x; a host
+/// multiplies them by [`DuelCamera::vp_raw`]. Every other attribute is
+/// static for the scene's life.
+#[derive(Debug, Clone)]
+pub struct BakaDuelScene {
+    roster: [usize; 2],
+    /// Posed positions, rewritten by [`Self::pose`].
+    pub positions: Vec<[f32; 3]>,
+    base: Vec<[f32; 3]>,
+    object_ids: Vec<u32>,
+    pub uvs: Vec<[u8; 2]>,
+    pub cba_tsb: Vec<[u16; 2]>,
+    /// Texture modulation colour (the prim's packet colour; `0x80` neutral).
+    pub colors: Vec<[u8; 3]>,
+    /// `[r, g, b, flag]` per vertex: flag `255` textured (modulate), `0`
+    /// untextured (fill) - `legaia_engine_field::packet_color::hybrid`'s layout.
+    pub flat_rgba: Vec<u8>,
+    /// Every triangle.
+    pub indices: Vec<u32>,
+    /// The textured triangles only.
+    pub textured_indices: Vec<u32>,
+    /// The untextured triangles only.
+    pub untextured_indices: Vec<u32>,
+    /// The build-time `colors` / `flat_rgba` / `cba_tsb`, the depth cue's
+    /// and colour word's source for the impact mesh instances.
+    base_colors: Vec<[u8; 3]>,
+    base_flat: Vec<u8>,
+    base_cba_tsb: Vec<[u16; 2]>,
+    fighter: [Range<usize>; 2],
+    ghost: [[Range<usize>; 2]; 2],
+    cameo: Range<usize>,
+    /// The three party fighters of the player-select lineup, by roster id.
+    lineup: Vec<Range<usize>>,
+    floor: Range<usize>,
+    walls: Vec<(Range<usize>, StagePlacement)>,
+    /// Sprite-arm quad instances, four vertices each.
+    impact_sprites: Vec<Range<usize>>,
+    /// Mesh-part instances: `(model, range)`.
+    impact_meshes: Vec<(usize, Range<usize>)>,
+    /// Bumped whenever a pose rewrote `uvs` / `cba_tsb` / `colors` /
+    /// `flat_rgba` (the impact parts animate them).
+    attr_generation: u32,
+}
+
+/// Sprite-arm quad instances the scene reserves. A decided exchange seats
+/// one flash, a draw two, and each lives about thirty ticks.
+pub const IMPACT_SPRITE_SLOTS: usize = 4;
+/// Mesh-part instances reserved per impact model.
+pub const IMPACT_MESH_SLOTS: usize = 2;
+
+impl BakaDuelScene {
+    /// Build the buffers for `player` vs `opponent` (roster ids).
+    pub fn build(assets: &BakaDuelAssets, player: usize, opponent: usize) -> Option<Self> {
+        let p = assets.fighters.get(player)?.as_ref()?;
+        let o = assets.fighters.get(opponent)?.as_ref()?;
+        let mut s = Self {
+            roster: [player, opponent],
+            positions: Vec::new(),
+            base: Vec::new(),
+            object_ids: Vec::new(),
+            uvs: Vec::new(),
+            cba_tsb: Vec::new(),
+            colors: Vec::new(),
+            flat_rgba: Vec::new(),
+            indices: Vec::new(),
+            textured_indices: Vec::new(),
+            untextured_indices: Vec::new(),
+            base_colors: Vec::new(),
+            base_flat: Vec::new(),
+            base_cba_tsb: Vec::new(),
+            fighter: [0..0, 0..0],
+            ghost: [[0..0, 0..0], [0..0, 0..0]],
+            cameo: 0..0,
+            lineup: Vec::new(),
+            floor: 0..0,
+            walls: Vec::new(),
+            impact_sprites: Vec::new(),
+            impact_meshes: Vec::new(),
+            attr_generation: 0,
+        };
+        s.fighter[0] = s.push_tmd(&p.tmd, &p.raw, 1.0);
+        s.fighter[1] = s.push_tmd(&o.tmd, &o.raw, 1.0);
+        for (k, keep) in GHOST_KEEP.iter().enumerate() {
+            s.ghost[0][k] = s.push_tmd(&p.tmd, &p.raw, *keep);
+            s.ghost[1][k] = s.push_tmd(&o.tmd, &o.raw, *keep);
+        }
+        if let Some((tmd, raw)) = assets.wall.as_ref() {
+            for placement in WALL_PLACEMENTS {
+                let r = s.push_tmd(tmd, raw, 1.0);
+                s.walls.push((r, placement));
+            }
+        }
+        if let Some((tmd, raw)) = assets.cameo.as_ref() {
+            s.cameo = s.push_tmd(tmd, raw, 1.0);
+        }
+        let floor_start = s.base.len();
+        s.push_floor();
+        s.floor = floor_start..s.base.len();
+        for roster in 0..SELECT_LINEUP.len() {
+            let r = match assets.fighters.get(roster).and_then(|a| a.as_ref()) {
+                Some(a) => s.push_tmd(&a.tmd, &a.raw, 1.0),
+                None => s.base.len()..s.base.len(),
+            };
+            s.lineup.push(r);
+        }
+        for _ in 0..IMPACT_SPRITE_SLOTS {
+            let r = s.push_quad();
+            s.impact_sprites.push(r);
+        }
+        for (k, m) in assets.impact_models.iter().enumerate() {
+            let Some((tmd, raw)) = m.as_ref() else {
+                continue;
+            };
+            for _ in 0..IMPACT_MESH_SLOTS {
+                let r = s.push_tmd(tmd, raw, 1.0);
+                s.impact_meshes.push((k + 1, r));
+            }
+        }
+        s.base_colors = s.colors.clone();
+        s.base_flat = s.flat_rgba.clone();
+        s.base_cba_tsb = s.cba_tsb.clone();
+        s.positions = s.base.clone();
+        Some(s)
+    }
+
+    /// The `(player, opponent)` roster pair the buffers hold.
+    pub fn roster(&self) -> [usize; 2] {
+        self.roster
+    }
+
+    /// Moves whenever a pose rewrote the per-vertex attributes (`uvs`,
+    /// `cba_tsb`, `colors`, `flat_rgba`) - the impact parts' flip-book cells
+    /// and fades. A host that re-uploads those only on a
+    /// [`BakaDuelSurface::generation`] change re-reads them on this one too.
+    pub fn attr_generation(&self) -> u32 {
+        self.attr_generation
+    }
+
+    /// One textured quad's worth of placeholder vertices (two triangles),
+    /// for an impact sprite instance; [`Self::pose_impact`] fills it.
+    fn push_quad(&mut self) -> Range<usize> {
+        let start = self.base.len();
+        for _ in 0..4 {
+            self.base.push([0.0; 3]);
+            self.object_ids.push(u32::MAX);
+            self.uvs.push([0, 0]);
+            self.cba_tsb.push([0, 0]);
+            self.colors.push([0x80; 3]);
+            self.flat_rgba.extend_from_slice(&[0x80, 0x80, 0x80, 255]);
+        }
+        let b = start as u32;
+        for t in [[b, b + 1, b + 2], [b + 1, b + 3, b + 2]] {
+            self.indices.extend_from_slice(&t);
+            self.textured_indices.extend_from_slice(&t);
+        }
+        start..self.base.len()
+    }
+
+    /// Place this frame's impact parts into their reserved ranges and drop
+    /// the unused ones; bumps [`Self::attr_generation`] when an attribute
+    /// changed.
+    ///
+    /// Each draw sits at the part's position turned by its yaw bank and
+    /// scaled by `+0x72 / 0x1000` - the kind-4 / mesh arm of the render
+    /// dispatcher (`FUN_8001ADA4` `0x8001B240..0x8001B2C4`). The X and Z
+    /// banks are not applied: no duel template writes them. Every prim takes
+    /// the part's colour word the way `FUN_80043390` applies it - the ABE
+    /// bit forced on, the ABR mode ORed into the tpage, and the packet colour
+    /// depth-cued toward the word's far colour
+    /// ([`legaia_render_kernels::sprite_arm::ColourWord::cue`]).
+    fn pose_impact(&mut self, fight: &BakaFight) {
+        use legaia_engine_minigames::baka_impact_fx::ImpactDraw;
+        let draws = fight.impact_fx().draws();
+        let mut sprite_used = 0;
+        let mut mesh_used = vec![false; self.impact_meshes.len()];
+        let mut changed = false;
+        for d in draws {
+            match d {
+                ImpactDraw::Sprite {
+                    quad,
+                    pos,
+                    rot,
+                    scale,
+                    colour,
+                } => {
+                    let Some(range) = self.impact_sprites.get(sprite_used).cloned() else {
+                        continue;
+                    };
+                    sprite_used += 1;
+                    let (sy, cy) = angle(i32::from(rot[1])).sin_cos();
+                    let k = f32::from(scale) / 4096.0;
+                    let rgb = colour.cue(quad.rgb);
+                    let tsb = impact_tsb(quad.tpage, colour);
+                    for (j, i) in range.enumerate() {
+                        let v = quad.verts[j].map(|c| f32::from(c) * k);
+                        self.positions[i] = [
+                            v[0] * cy + v[2] * sy + f32::from(pos[0]),
+                            v[1] + f32::from(pos[1]),
+                            -v[0] * sy + v[2] * cy + f32::from(pos[2]),
+                        ];
+                        changed |= set(&mut self.uvs[i], quad.uvs[j]);
+                        changed |= set(&mut self.cba_tsb[i], [quad.clut, tsb]);
+                        changed |= set(&mut self.colors[i], rgb);
+                        let flat = [rgb[0], rgb[1], rgb[2], 255];
+                        let dst: &mut [u8; 4] = (&mut self.flat_rgba[i * 4..i * 4 + 4])
+                            .try_into()
+                            .expect("four bytes");
+                        changed |= set(dst, flat);
+                    }
+                }
+                ImpactDraw::Mesh {
+                    model,
+                    pos,
+                    rot,
+                    scale,
+                    colour,
+                } => {
+                    let Some(slot) = self
+                        .impact_meshes
+                        .iter()
+                        .enumerate()
+                        .position(|(n, (m, _))| *m == model && !mesh_used[n])
+                    else {
+                        continue;
+                    };
+                    mesh_used[slot] = true;
+                    let range = self.impact_meshes[slot].1.clone();
+                    let (sy, cy) = angle(i32::from(rot[1])).sin_cos();
+                    let k = f32::from(scale) / 4096.0;
+                    for i in range {
+                        let v = self.base[i].map(|c| c * k);
+                        self.positions[i] = [
+                            v[0] * cy + v[2] * sy + f32::from(pos[0]),
+                            v[1] + f32::from(pos[1]),
+                            -v[0] * sy + v[2] * cy + f32::from(pos[2]),
+                        ];
+                        let [cba, tsb] = self.base_cba_tsb[i];
+                        changed |= set(&mut self.cba_tsb[i], [cba, impact_tsb(tsb, colour)]);
+                        changed |= set(&mut self.colors[i], colour.cue(self.base_colors[i]));
+                        let b = &self.base_flat[i * 4..i * 4 + 4];
+                        let c = colour.cue([b[0], b[1], b[2]]);
+                        let dst: &mut [u8; 4] = (&mut self.flat_rgba[i * 4..i * 4 + 4])
+                            .try_into()
+                            .expect("four bytes");
+                        changed |= set(dst, [c[0], c[1], c[2], b[3]]);
+                    }
+                }
+            }
+        }
+        for n in sprite_used..self.impact_sprites.len() {
+            let r = self.impact_sprites[n].clone();
+            self.collapse(r);
+        }
+        for (n, used) in mesh_used.iter().enumerate() {
+            if !used {
+                let r = self.impact_meshes[n].1.clone();
+                self.collapse(r);
+            }
+        }
+        if changed {
+            self.attr_generation = self.attr_generation.wrapping_add(1);
+        }
+    }
+
+    /// Append one TMD's hybrid mesh with its packet colours scaled by `keep`.
+    fn push_tmd(&mut self, tmd: &legaia_tmd::Tmd, raw: &[u8], keep: f32) -> Range<usize> {
+        let (mesh, oids, shading) = legaia_tmd::mesh::tmd_to_vram_mesh_field_hybrid(tmd, raw);
+        let flat = legaia_engine_field::packet_color::hybrid(&mesh, &shading);
+        let start = self.base.len();
+        let scale = |c: u8| (f32::from(c) * keep).round().clamp(0.0, 255.0) as u8;
+        self.base.extend_from_slice(&mesh.positions);
+        self.object_ids.extend_from_slice(&oids);
+        self.uvs.extend_from_slice(&mesh.uvs);
+        self.cba_tsb.extend_from_slice(&mesh.cba_tsb);
+        self.colors.extend(
+            mesh.colors
+                .iter()
+                .map(|c| [scale(c[0]), scale(c[1]), scale(c[2])]),
+        );
+        for px in flat.as_chunks::<4>().0 {
+            self.flat_rgba
+                .extend_from_slice(&[scale(px[0]), scale(px[1]), scale(px[2]), px[3]]);
+        }
+        for tri in mesh.indices.as_chunks::<3>().0 {
+            let t = [
+                tri[0] + start as u32,
+                tri[1] + start as u32,
+                tri[2] + start as u32,
+            ];
+            self.indices.extend_from_slice(&t);
+            let textured = shading.textured.get(tri[0] as usize).copied().unwrap_or(1) != 0;
+            if textured {
+                self.textured_indices.extend_from_slice(&t);
+            } else {
+                self.untextured_indices.extend_from_slice(&t);
+            }
+        }
+        start..self.base.len()
+    }
+
+    /// The floor grid `FUN_801CEB84` emits - the battle ground grid's own
+    /// routine relocated into the duel overlay, so the port is the same
+    /// builder ([`legaia_scene_formats::battle_backdrop::build_ground_grid_sized`])
+    /// over [`legaia_engine_system::mode_entry_init::duel_overlay_init`]'s window tiles (the
+    /// `0x1F8003F8` / `0x1F8003FA` pair the emitter loops over).
+    fn push_floor(&mut self) {
+        let (w, h) = legaia_engine_system::mode_entry_init::duel_overlay_init().window_tiles;
+        let grid = legaia_scene_formats::battle_backdrop::build_ground_grid_sized(
+            i32::from(w),
+            i32::from(h),
+        );
+        let start = self.base.len() as u32;
+        self.base.extend_from_slice(&grid.positions);
+        self.object_ids
+            .extend(std::iter::repeat_n(u32::MAX, grid.positions.len()));
+        self.uvs.extend_from_slice(&grid.uvs);
+        self.cba_tsb.extend_from_slice(&grid.cba_tsb);
+        self.colors.extend_from_slice(&grid.colors);
+        for c in &grid.colors {
+            self.flat_rgba.extend_from_slice(&[c[0], c[1], c[2], 255]);
+        }
+        for &i in &grid.indices {
+            self.indices.push(start + i);
+            self.textured_indices.push(start + i);
+        }
+    }
+
+    /// Pose every dynamic range for this frame of `fight`.
+    pub fn pose(&mut self, assets: &BakaDuelAssets, fight: &BakaFight) {
+        let state = fight.cabinet().state();
+        let arena = legaia_engine_minigames::baka_cabinet::draws_arena(state);
+        let floor = self.floor.clone();
+        if arena {
+            self.positions[floor.clone()].copy_from_slice(&self.base[floor]);
+        } else {
+            self.collapse(floor);
+        }
+        if legaia_engine_minigames::baka_cabinet::front_end(state) {
+            self.pose_front_end(assets, fight, arena);
+            return;
+        }
+        for i in 0..self.lineup.len() {
+            let r = self.lineup[i].clone();
+            self.collapse(r);
+        }
+        self.pose_duel(assets, fight);
+    }
+
+    /// The cabinet's front end: the attract card draws no 3D at all; the
+    /// player select draws the arena and the three-fighter lineup, the
+    /// cursor's fighter lit and the other two at half depth cue.
+    ///
+    /// REF: FUN_801D3390 (the lineup tick: `+0x78 = 0` on the cursor's
+    /// fighter, `0x800` otherwise; the idle clip `+0x5C` = `1 + 9 * roster`
+    /// stepped at its record's byte `+0x07`)
+    fn pose_front_end(&mut self, assets: &BakaDuelAssets, fight: &BakaFight, arena: bool) {
+        let mut dead: Vec<Range<usize>> = vec![self.fighter[0].clone(), self.fighter[1].clone()];
+        dead.extend(self.ghost.iter().flatten().cloned());
+        dead.push(self.cameo.clone());
+        dead.extend(self.impact_sprites.iter().cloned());
+        dead.extend(self.impact_meshes.iter().map(|(_, r)| r.clone()));
+        for r in dead {
+            self.collapse(r);
+        }
+        let camera = fight.duel_camera().clone();
+        for i in 0..self.walls.len() {
+            let (range, (pos, yaw)) = self.walls[i].clone();
+            if arena {
+                let (base, out) = (&self.base[range.clone()], &mut self.positions[range]);
+                place_stage_model(&camera, pos, yaw, base, out);
+            } else {
+                self.collapse(range);
+            }
+        }
+        let lineup = fight.select_lineup();
+        let mut changed = false;
+        for (roster, spot) in SELECT_LINEUP.iter().enumerate().take(self.lineup.len()) {
+            let range = self.lineup[roster].clone();
+            let (Some((cursor, clock)), Some(asset)) =
+                (lineup, assets.fighters.get(roster).and_then(|a| a.as_ref()))
+            else {
+                self.collapse(range);
+                continue;
+            };
+            let rec = asset.first_record;
+            let frame = asset
+                .bank
+                .record(rec)
+                .ok()
+                .map(|r| {
+                    let h = legaia_engine_minigames::baka_fighter::ClipHeader::from_record_words(
+                        r.a, r.b, r.flag,
+                    );
+                    let step = h.selector_step(i32::from(r.flag >> 8));
+                    let span = (i32::from(r.frame_count) * 16).max(1);
+                    (clock.wrapping_mul(step).rem_euclid(span) >> 4) as usize
+                })
+                .unwrap_or(0);
+            let [x, y, z] = *spot;
+            let origin = [f32::from(x), f32::from(y), f32::from(z)];
+            self.pose_range(
+                &asset.tmd,
+                &asset.bank,
+                rec,
+                frame,
+                range.clone(),
+                origin,
+                SELECT_YAW,
+            );
+            let keep = if roster == cursor {
+                1.0
+            } else {
+                SELECT_DIM_KEEP
+            };
+            let scale = |c: u8| (f32::from(c) * keep).round().clamp(0.0, 255.0) as u8;
+            for i in range {
+                let b = self.base_colors[i];
+                changed |= set(&mut self.colors[i], [scale(b[0]), scale(b[1]), scale(b[2])]);
+                let f = &self.base_flat[i * 4..i * 4 + 4];
+                let v = [scale(f[0]), scale(f[1]), scale(f[2]), f[3]];
+                let dst: &mut [u8; 4] = (&mut self.flat_rgba[i * 4..i * 4 + 4])
+                    .try_into()
+                    .expect("four bytes");
+                changed |= set(dst, v);
+            }
+        }
+        if changed {
+            self.attr_generation = self.attr_generation.wrapping_add(1);
+        }
+    }
+
+    /// The duel proper: both fighters, their ghosts, the cameo, the walls
+    /// and the impact parts.
+    fn pose_duel(&mut self, assets: &BakaDuelAssets, fight: &BakaFight) {
+        let camera = fight.duel_camera();
+        let view = camera.view();
+        // Eye-forward in world space, for the ghost setback.
+        let r = camera_rotation(view.pitch, view.yaw, view.roll);
+        let fwd = [r[2], r[6], r[10]];
+        for slot in 0..2 {
+            let Some(asset) = assets
+                .fighters
+                .get(self.roster[slot])
+                .and_then(|a| a.as_ref())
+            else {
+                continue;
+            };
+            let m = fight.motion(slot);
+            let origin = fight.fighter_position(slot);
+            let yaw = fight.fighter_yaw(slot);
+            let range = self.fighter[slot].clone();
+            let rec = asset.first_record + m.record;
+            self.pose_range(&asset.tmd, &asset.bank, rec, m.frame(), range, origin, yaw);
+            let mut drawn = [false; 2];
+            for (owner, frame) in fight.afterimages() {
+                if *owner != slot {
+                    continue;
+                }
+                for pass in frame.passes.iter().filter(|p| p.drawn) {
+                    let k = (pass.bit & 1) as usize;
+                    let back = GHOST_SETBACK * (k + 1) as f32;
+                    let o = [
+                        origin[0] + fwd[0] * back,
+                        origin[1] + fwd[1] * back,
+                        origin[2] + fwd[2] * back,
+                    ];
+                    let f = (i32::from(pass.cursor).max(0) >> 4) as usize;
+                    let range = self.ghost[slot][k].clone();
+                    let rec = asset.first_record + bo::ACTION_SPECIAL;
+                    self.pose_range(&asset.tmd, &asset.bank, rec, f, range, o, yaw);
+                    drawn[k] = true;
+                }
+            }
+            for (k, d) in drawn.iter().enumerate() {
+                if !d {
+                    let range = self.ghost[slot][k].clone();
+                    self.collapse(range);
+                }
+            }
+        }
+        self.pose_cameo(assets, fight, &view, &r);
+        for i in 0..self.walls.len() {
+            let (range, (pos, yaw)) = self.walls[i].clone();
+            let (base, out) = (&self.base[range.clone()], &mut self.positions[range]);
+            place_stage_model(camera, pos, yaw, base, out);
+        }
+        self.pose_impact(fight);
+    }
+
+    /// Pose the round-start cameo, or drop it when none is on stage. The
+    /// actor is camera-relative (`+0x52 & 0x400`): `FUN_8001CF50` loads the
+    /// base matrix alone (`0x8001D018`) instead of the camera rotation, so
+    /// its eye position is `6 * (Ry(yaw) . pose(v) + pos)`, which this maps
+    /// back into the world frame the scene's view-projection takes.
+    fn pose_cameo(
+        &mut self,
+        assets: &BakaDuelAssets,
+        fight: &BakaFight,
+        view: &FieldCameraView,
+        r: &[f32; 16],
+    ) {
+        let range = self.cameo.clone();
+        let (Some(actor), Some((tmd, _)), Some(bank)) = (
+            fight.cameo(),
+            assets.cameo.as_ref(),
+            assets.cameo_bank.as_ref(),
+        ) else {
+            self.collapse(range);
+            return;
+        };
+        let Some(pose) = actor.pose() else {
+            self.collapse(range);
+            return;
+        };
+        let record = (pose.clip.max(1) - 1) as usize;
+        let frames = bank
+            .record(record)
+            .map(|h| usize::from(h.frame_count))
+            .unwrap_or(1)
+            .max(1);
+        let raw = (actor.cursor.max(0) >> 4) as usize;
+        let frame = if pose.hold_last_frame {
+            raw.min(frames - 1)
+        } else {
+            raw % frames
+        };
+        let origin = [f32::from(pose.x), f32::from(pose.y), f32::from(pose.z)];
+        let yaw = i32::from(pose.yaw);
+        self.pose_range(tmd, bank, record, frame, range.clone(), origin, yaw);
+        // eye/6 -> world: p = focus + R^T (q - tr/6).
+        for p in &mut self.positions[range] {
+            let d = [
+                p[0] - view.tr_eye[0],
+                p[1] - view.tr_eye[1],
+                p[2] - view.tr_eye[2],
+            ];
+            let mut w = view.focus;
+            for (i, wi) in w.iter_mut().enumerate() {
+                for (j, dj) in d.iter().enumerate() {
+                    *wi += r[i * 4 + j] * dj;
+                }
+            }
+            *p = w;
+        }
+    }
+
+    fn collapse(&mut self, range: Range<usize>) {
+        for p in &mut self.positions[range] {
+            *p = [0.0; 3];
+        }
+    }
+
+    /// Pose one fighter range: per object `Rz.Ry.Rx . v + T` from the bank
+    /// record at `frame`, then the actor's yaw about Y and its position.
+    #[allow(clippy::too_many_arguments)]
+    fn pose_range(
+        &mut self,
+        tmd: &legaia_tmd::Tmd,
+        bank: &legaia_actor_formats::player_anm::PlayerAnmBundle,
+        record: usize,
+        frame: usize,
+        range: Range<usize>,
+        origin: [f32; 3],
+        yaw: i32,
+    ) {
+        let frames = bank
+            .record(record)
+            .map(|r| usize::from(r.frame_count))
+            .unwrap_or(0);
+        let frame = frame.min(frames.saturating_sub(1));
+        let parts = tmd.objects.len();
+        let xf: Vec<Option<[f32; 9]>> = (0..parts)
+            .map(|p| {
+                let t = bank.bone_transform(record, frame, p)?;
+                let (sx, cx) = angle(t.r_x).sin_cos();
+                let (sy, cy) = angle(t.r_y).sin_cos();
+                let (sz, cz) = angle(t.r_z).sin_cos();
+                Some([
+                    cx,
+                    sx,
+                    cy,
+                    sy,
+                    cz,
+                    sz,
+                    t.t_x as f32,
+                    t.t_y as f32,
+                    t.t_z as f32,
+                ])
+            })
+            .collect();
+        let (wsy, wcy) = angle(yaw).sin_cos();
+        for i in range {
+            let [mut x, mut y, mut z] = self.base[i];
+            if let Some(Some(t)) = xf.get(self.object_ids[i] as usize) {
+                let [cx, sx, cy, sy, cz, sz, tx, ty, tz] = *t;
+                let ny = y * cx - z * sx;
+                let nz = y * sx + z * cx;
+                y = ny;
+                z = nz;
+                let nx = x * cy + z * sy;
+                let nz = -x * sy + z * cy;
+                x = nx;
+                z = nz;
+                let nx = x * cz - y * sz;
+                let ny = x * sz + y * cz;
+                x = nx + tx;
+                y = ny + ty;
+                z += tz;
+            }
+            self.positions[i] = [
+                x * wcy + z * wsy + origin[0],
+                y + origin[1],
+                -x * wsy + z * wcy + origin[2],
+            ];
+        }
+    }
+}
+
+/// Place one stage model for this frame, or drop it: the model at `pos`
+/// turned `yaw` about Y, drawn only while the camera sees its origin past
+/// [`WALL_CULL_DEPTH`]. A dropped model's vertices collapse to a point.
+/// Returns whether it drew.
+///
+/// PORT: FUN_801D6D60
+///
+/// `FUN_8003D344` (`ApplyMatrix`) moves the position through the
+/// camera (`0x801D6D88`), the depth test rejects below `0x2711`
+/// (`0x801D6D98`), `FUN_8004629C` (`RotMatrixY`) turns the model by the
+/// rotation argument's `Y` (`0x801D6DB0`), and `FUN_80043390` draws scene
+/// model `DAT_8007C018[_DAT_8007B6F8]` (`0x801D6DE0`) - the model the
+/// epilogue's four calls place as the arena walls ([`WALL_PLACEMENTS`]).
+pub fn place_stage_model(
+    camera: &DuelCamera,
+    pos: [i16; 3],
+    yaw: i16,
+    model: &[[f32; 3]],
+    out: &mut [[f32; 3]],
+) -> bool {
+    let origin = [f32::from(pos[0]), f32::from(pos[1]), f32::from(pos[2])];
+    if camera.eye_depth(origin) < WALL_CULL_DEPTH {
+        out.iter_mut().for_each(|p| *p = [0.0; 3]);
+        return false;
+    }
+    let (sy, cy) = angle(i32::from(yaw)).sin_cos();
+    for (o, v) in out.iter_mut().zip(model) {
+        *o = [
+            v[0] * cy + v[2] * sy + origin[0],
+            v[1] + origin[1],
+            -v[0] * sy + v[2] * cy + origin[2],
+        ];
+    }
+    true
+}
+
+/// Store `v` into `dst`, reporting whether it changed.
+fn set<T: PartialEq + Copy>(dst: &mut T, v: T) -> bool {
+    let changed = *dst != v;
+    *dst = v;
+    changed
+}
+
+/// A prim's TSB word under an impact part's colour word: the ABE bit forced
+/// on when the word's bit 31 is set (`FUN_80043390` ORs it into every
+/// packet's code) and the word's ABR mode ORed into the tpage's bits 5..6.
+fn impact_tsb(tsb: u16, colour: legaia_render_kernels::sprite_arm::ColourWord) -> u16 {
+    let t = tsb | (u16::from(colour.abr) << 5);
+    if colour.semi {
+        legaia_tmd::mesh::pack_tsb_semi(t, true)
+    } else {
+        t
+    }
+}
+
+/// PSX 12-bit angle to radians.
+fn angle(a: i32) -> f32 {
+    a as f32 / 4096.0 * std::f32::consts::TAU
+}
+
+// ---------------------------------------------------------------- host cache
+
+/// The per-host cache every duel host drives once a frame: the assets
+/// (decoded on first use), the buffers for the seated pair, and a generation
+/// that moves whenever the static buffers or the VRAM change.
+#[derive(Debug, Default)]
+pub struct BakaDuelSurface {
+    assets: Option<Arc<BakaDuelAssets>>,
+    scene: Option<BakaDuelScene>,
+    generation: u32,
+    /// The blit row the cameo's cell last showed; a change is a VRAM edit
+    /// the host must re-upload (a new generation).
+    wink: Option<usize>,
+}
+
+impl BakaDuelSurface {
+    /// One frame. `None` - and the cached buffers dropped - when no duel is
+    /// live. The assets load once through `read_prot`; the buffers rebuild
+    /// when the seated roster pair changes (a rung install), which bumps
+    /// [`Self::generation`]; the pose runs every call.
+    pub fn frame(
+        &mut self,
+        read_prot: impl Fn(usize) -> Option<Vec<u8>>,
+        fight: Option<&BakaFight>,
+    ) -> Option<&BakaDuelScene> {
+        let Some(fight) = fight else {
+            if self.scene.take().is_some() {
+                self.generation = self.generation.wrapping_add(1);
+            }
+            return None;
+        };
+        let assets = self
+            .assets
+            .get_or_insert_with(|| Arc::new(BakaDuelAssets::load(read_prot)))
+            .clone();
+        let want = [fight.player_roster(), fight.opponent_roster()];
+        if self.scene.as_ref().map(|s| s.roster()) != Some(want) {
+            self.scene = BakaDuelScene::build(&assets, want[0], want[1]);
+            self.generation = self.generation.wrapping_add(1);
+        }
+        let wink = fight.cameo().and_then(|c| c.pose()).map(|p| p.blit_index);
+        if wink.is_some() && wink != self.wink {
+            self.wink = wink;
+            self.generation = self.generation.wrapping_add(1);
+        }
+        let scene = self.scene.as_mut()?;
+        scene.pose(&assets, fight);
+        Some(scene)
+    }
+
+    /// Bumped whenever the static buffers or the VRAM a host holds are stale.
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// The live scene, as the last [`Self::frame`] posed it.
+    pub fn scene(&self) -> Option<&BakaDuelScene> {
+        self.scene.as_ref()
+    }
+
+    /// Whether the duel VRAM ([`Self::vram`]) carries the HUD art the widget
+    /// table samples: a live scene, the PROT 1203 art pages decoded and the
+    /// overlay's widget table parsed. A host that draws against the duel
+    /// VRAM draws [`Self::hud_quads`] while this holds and its text labels
+    /// otherwise.
+    pub fn hud_art_resident(&self) -> bool {
+        self.scene.is_some()
+            && self
+                .assets
+                .as_ref()
+                .is_some_and(|a| !a.art.is_empty() && !a.hud_widgets.is_empty())
+    }
+
+    /// This frame's cabinet and round-chrome widget quads for `fight`
+    /// ([`legaia_engine_minigames::baka_fighter_chrome::hud_widget_quads`]), empty while the
+    /// art is not resident ([`Self::hud_art_resident`]). Both play hosts
+    /// turn them into screen primitives against the duel VRAM, which is
+    /// where the PROT 1203 pages the widgets index sit.
+    pub fn hud_quads(
+        &self,
+        fight: &BakaFight,
+    ) -> Vec<legaia_engine_minigames::baka_fighter::HudWidgetQuad> {
+        if !self.hud_art_resident() {
+            return Vec::new();
+        }
+        let Some(assets) = self.assets.as_ref() else {
+            return Vec::new();
+        };
+        legaia_engine_minigames::baka_fighter_chrome::hud_widget_quads(
+            &assets.hud_widgets,
+            &fight.chrome_frame().draws,
+            &fight.cabinet_cells(),
+        )
+    }
+
+    /// This frame's duel HUD packets for `fight`
+    /// ([`legaia_engine_minigames::baka_cabinet::duel_hud_packets`] over the
+    /// HUD frame the cabinet built, `FUN_801d2afc`): the VITAL bars and
+    /// frames, combo counters, round pips, attack icons, the top strip and
+    /// the high score. Empty on a frame the cabinet drew no HUD (outside the
+    /// duel band) and while the art is not resident.
+    pub fn duel_hud_packets(
+        &self,
+        fight: &BakaFight,
+    ) -> Vec<legaia_engine_minigames::baka_cabinet::DuelHudPacket> {
+        if !self.hud_art_resident() {
+            return Vec::new();
+        }
+        let (Some(assets), Some(hud)) = (self.assets.as_ref(), fight.cabinet_frame().hud.as_ref())
+        else {
+            return Vec::new();
+        };
+        legaia_engine_minigames::baka_cabinet::duel_hud_packets(
+            hud,
+            &assets.hud_widgets,
+            &assets.bar_frame,
+        )
+    }
+
+    /// The duel VRAM for the seated opponent.
+    pub fn vram(&self) -> Option<legaia_tim::Vram> {
+        let s = self.scene.as_ref()?;
+        let assets = self.assets.as_ref()?;
+        let mut vram = assets.vram(s.roster[1]);
+        if let Some(i) = self.wink {
+            assets.apply_wink(&mut vram, i);
+        }
+        Some(vram)
+    }
+}

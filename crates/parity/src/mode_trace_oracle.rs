@@ -1,0 +1,656 @@
+//! Mode-trace oracle plumbing shared between the `legaia-engine mode-trace`
+//! subcommand and the disc-gated `mode_trace_e3` integration test.
+//!
+//! Mirrors the shape of [`crate::vram_oracle`] but the diff axis is the
+//! engine's high-level dispatch state instead of VRAM bytes: per-frame
+//! `(game_mode, scene_mode, active_scene)`. The retail side reads a
+//! mednafen save state; the engine side ticks a [`NativeSession`] and
+//! samples each frame.
+//!
+//! **Both sides emit the mode word.** [`NativeSession`] holds a
+//! [`ModeSeat`](legaia_engine_mode::mode::ModeSeat) - the port's copy of
+//! `_DAT_8007B83C` - written where retail's code stores that word and
+//! reconciled with [`world.mode`](legaia_engine_mode::mode::SceneMode) once
+//! per tick, so every engine-sampled frame carries a `game_mode` and
+//! [`first_mode_trace_divergence`]'s `game_mode` compare is live rather than
+//! skipped. It used to be `None` for every frame except an open pause menu,
+//! which made the word a field the oracle transported but never checked.
+//!
+//! `SceneMode::Title` - the port's "no scene loaded" - is the one state with
+//! no retail mode at all, so the seat leaves the word where it was rather
+//! than inventing one.
+//!
+//! **The retail side reads two words, not one.** `SceneMode` is a finer
+//! partition than the retail mode word: all five warp minigames run under
+//! `0x19` (`OTHER MODE`) and only the sub-id register `_DAT_8007BA34`
+//! separates them. Deriving the retail `scene_mode` from the mode word alone
+//! made every minigame capture report `"Title"` against a correctly behaving
+//! engine, so the oracle manufactured divergences out of its own fallback arm
+//! rather than observing them - a false report, not a coarse one. See
+//! [`mode_trace_frame_from_ram`].
+//!
+//! JSONL is the wire format - one record per line, matching the
+//! Phase-E3 spec "engine emits JSONL of (frame, game_mode, scene_mode,
+//! active_scene, key_globals)".
+
+use std::path::Path;
+
+use anyhow::{Context, Result};
+
+use legaia_engine_session::mode_trace::ModeTraceFrame;
+use legaia_engine_session::native::NativeSession;
+use legaia_engine_session::session::BootConfig;
+
+/// Run a [`NativeSession`] on `scene_name`, sampling `(scene_mode,
+/// active_scene)` immediately after boot and again after every tick.
+/// Returns `frames + 1` records. No pad input is fed; the engine is
+/// effectively idle except for self-driving tick logic (e.g. field-VM
+/// scripts that run on their own without controller input). Callers
+/// that need to thread scripted pad input use
+/// [`build_engine_mode_trace_with_inputs`].
+pub fn build_engine_mode_trace(
+    scene_name: &str,
+    extracted_root: &Path,
+    disc: Option<&Path>,
+    frames: u64,
+) -> Result<Vec<ModeTraceFrame>> {
+    build_engine_mode_trace_with_inputs(scene_name, extracted_root, disc, frames, &[])
+}
+
+/// Variant of [`build_engine_mode_trace`] that drives the
+/// [`NativeSession`] with a scripted pad timeline. `pad_stream[i]` is
+/// installed onto `World.input` just before tick `i+1`; frame `0` is
+/// sampled pre-tick with an all-zeros pad. `frames + 1` records are
+/// returned, same shape as the no-input variant.
+///
+/// If `pad_stream` is shorter than `frames`, the tail is held at zero.
+/// If longer, only the first `frames` entries are consumed.
+///
+/// `World::tick` consumes `World.input` for the modes whose consumer
+/// lives in the engine tick today: the field-VM dialog-advance poll
+/// (`SceneMode::Field`) and the world-map controller
+/// (`SceneMode::WorldMap`). Modes whose input consumer is still
+/// host-side (battle command selection, field locomotion) evolve as
+/// they would with no input until those consumers move into the tick;
+/// the pad threading here keeps the contract end-to-end so each new
+/// consumer starts asserting real behavior the moment it lands.
+pub fn build_engine_mode_trace_with_inputs(
+    scene_name: &str,
+    extracted_root: &Path,
+    disc: Option<&Path>,
+    frames: u64,
+    pad_stream: &[u16],
+) -> Result<Vec<ModeTraceFrame>> {
+    let cfg = BootConfig {
+        scene: scene_name.to_string(),
+        enable_audio: false,
+    };
+    let mut session = match disc {
+        Some(p) => NativeSession::open_disc(p, &cfg)?,
+        None => NativeSession::open(extracted_root, &cfg)?,
+    };
+    let mut out = Vec::with_capacity((frames as usize).saturating_add(1));
+    out.push(sample_engine_frame(&session));
+    for i in 0..frames {
+        let pad = pad_stream.get(i as usize).copied().unwrap_or(0);
+        session.host.world.set_pad(pad);
+        let _ = session.tick()?;
+        out.push(sample_engine_frame(&session));
+    }
+    Ok(out)
+}
+
+/// Variant of [`build_engine_mode_trace_with_inputs`] that drops the
+/// session into a *live field scene* before sampling - it calls
+/// [`NativeSession::enter_field_live`] (run record 0, install the encounter
+/// table, arm the live loop) so the engine reaches `SceneMode::Field` the way
+/// the windowed host does, instead of sitting in `Title` like the plain
+/// `load_scene` path.
+///
+/// This is the v0.1 oracle's engine driver: from a cold boot it reaches
+/// Field/town01 immediately, which converges against the retail mode-trace
+/// snapshot of a field-phase save (`game_mode 0x03`). The scripted-encounter
+/// Battle leg (which needs the scene's story state seeded so the trigger is
+/// armed) is a separate milestone; this builder stops at Field.
+pub fn build_engine_mode_trace_field_live(
+    scene_name: &str,
+    extracted_root: &Path,
+    disc: Option<&Path>,
+    frames: u64,
+    pad_stream: &[u16],
+) -> Result<Vec<ModeTraceFrame>> {
+    let cfg = BootConfig {
+        scene: scene_name.to_string(),
+        enable_audio: false,
+    };
+    let mut session = match disc {
+        Some(p) => NativeSession::open_disc(p, &cfg)?,
+        None => NativeSession::open(extracted_root, &cfg)?,
+    };
+    session.enter_field_live(
+        scene_name,
+        &legaia_engine_session::session::FieldLiveOpts {
+            live_loop: true,
+            ..Default::default()
+        },
+    )?;
+    let mut out = Vec::with_capacity((frames as usize).saturating_add(1));
+    out.push(sample_engine_frame(&session));
+    for i in 0..frames {
+        let pad = pad_stream.get(i as usize).copied().unwrap_or(0);
+        session.host.world.set_pad(pad);
+        let _ = session.tick()?;
+        out.push(sample_engine_frame(&session));
+    }
+    Ok(out)
+}
+
+/// Drive a NEW GAME cold boot through the opening Rim Elm training-fight
+/// transition, sampling `(scene_mode, active_scene)` each frame so the
+/// resulting trace carries the Field → Battle flip.
+///
+/// This is the Battle-leg sibling of [`build_engine_mode_trace_field_live`]:
+/// where that builder stops at Field, this one mirrors the proven
+/// `v0_1_battle_leg_reaches_battle_from_new_game` test path so the v0.1
+/// oracle can assert a *literal* `[[expected]]` Battle row in the replay
+/// fixture, not just converge against the bracketing retail anchors. The
+/// sequence is:
+///
+/// 1. [`NativeSession::begin_new_game`] seeds the opening party (Vahn, the
+///    game's pre-Tetsu story state - there is no earlier save).
+/// 2. [`NativeSession::enter_field_live`] drops into `scene_name` with the live
+///    loop armed; the cold boot auto-installs the town's sparring carrier.
+/// 3. A real interaction on the carrier's slot opens its dialogue; a
+///    just-pressed confirm (Cross) advances/dismisses it, which engages the
+///    scripted lone-Tetsu encounter and flips Field → Battle.
+///
+/// Sampled through [`NativeSession::tick`] (so the trace is the same shape the
+/// other builders emit). The Field → Battle transition is a scene-*mode* flip
+/// on the same loaded scene, not a scene change, so `active_scene` stays
+/// `scene_name` across the boundary. Returns `frames + 1` records; ticking
+/// continues for the full budget after Battle is reached so a downstream
+/// `[[expected]]` row can pin any post-transition frame.
+pub fn build_engine_mode_trace_new_game_battle_leg(
+    scene_name: &str,
+    extracted_root: &Path,
+    disc: Option<&Path>,
+    frames: u64,
+) -> Result<Vec<ModeTraceFrame>> {
+    use legaia_engine_system::input::PadButton;
+
+    let cfg = BootConfig {
+        scene: scene_name.to_string(),
+        enable_audio: false,
+    };
+    let mut session = match disc {
+        Some(p) => NativeSession::open_disc(p, &cfg)?,
+        None => NativeSession::open(extracted_root, &cfg)?,
+    };
+    session.begin_new_game();
+    session.enter_field_live(
+        scene_name,
+        &legaia_engine_session::session::FieldLiveOpts {
+            live_loop: true,
+            ..Default::default()
+        },
+    )?;
+
+    // The cold boot installs exactly one scripted-encounter carrier slot
+    // (the sparring partner). Drive its dialogue-accept op.
+    let slot = {
+        let mut slots: Vec<u8> = session.host.world.carriers.slots.keys().copied().collect();
+        slots.sort_unstable();
+        slots.first().copied().context(
+            "scene installs no scripted-encounter carrier slot (cannot drive the Battle leg)",
+        )?
+    };
+
+    let mut out = Vec::with_capacity((frames as usize).saturating_add(1));
+    out.push(sample_engine_frame(&session));
+
+    // A real interaction on the carrier's slot (the talk probe's entry -
+    // op 0x3E with op0 < 100 is the scripted-battle install, not a talk),
+    // then the dialog-advance op (0x4C n5). Mirrors the battle-leg test.
+    session.host.world.trigger_field_interact(0, slot);
+    session.host.world.load_field_script(vec![0x4C, 0x54]);
+    let cross = PadButton::Cross.mask();
+    let down = PadButton::Down.mask();
+    for i in 0..frames {
+        // Tick 0 opens the dialogue (pad 0). The spar dialogue carries the
+        // faithful 4-option picker (`World::carriers.menu`), whose index-2
+        // "practice" option is the one that arms the fight - navigate the
+        // cursor Down twice (releases in between: the menu keys off
+        // just-pressed edges) before the Cross confirm. The transition
+        // resolves on the following frames at pad 0.
+        let pad = match i {
+            1 | 3 => down,
+            5 => cross,
+            _ => 0,
+        };
+        session.host.world.set_pad(pad);
+        let _ = session.tick()?;
+        out.push(sample_engine_frame(&session));
+        // Keep ticking after Battle is reached so the trace runs the full
+        // budget; the SceneMode stays Battle (no further input flips it).
+    }
+    Ok(out)
+}
+
+fn sample_engine_frame(session: &NativeSession) -> ModeTraceFrame {
+    // The engine's mode word, read off the session's seat at the mode table
+    // ([`NativeSession::mode_seat`]). Every frame carries one now: the seat is
+    // written where retail's code stores `_DAT_8007B83C` (field entry through
+    // `MAIN INIT`, the pause menu through `CARD INIT`) and reconciled with the
+    // world's `SceneMode` once per tick, so the field is no longer `None`
+    // outside the menu and the retail side's word has something to diff
+    // against.
+    let game_mode = Some(session.mode_seat.game_mode());
+    ModeTraceFrame {
+        frame: session.frames,
+        game_mode: game_mode.map(|gm| gm.as_index() as u8),
+        game_mode_name: game_mode.map(|gm| game_mode_label(gm).to_string()),
+        scene_mode: session.host.world.mode.name().to_string(),
+        active_scene: session.host.scene.as_ref().map(|s| s.name.clone()),
+    }
+}
+
+/// Lift a single mode-trace sample out of a mednafen `.mc{slot}` save.
+/// Reads main RAM via [`legaia_mednafen::SaveState::main_ram`] and
+/// pulls:
+///
+/// - `game_mode` from `_DAT_8007B83C`
+///   ([`capture_observations::cutscene_trigger_corpus::GAME_MODE_ADDR`](crate::capture_observations::cutscene_trigger_corpus::GAME_MODE_ADDR)).
+/// - `scene_mode` derived from the **pair** `(game_mode, warp sub-id)` via
+///   [`GameMode::scene_mode_with_warp`](legaia_engine_mode::mode::GameMode::scene_mode_with_warp),
+///   with the sub-id read from
+///   [`WARP_SUB_ID_ADDR`](legaia_engine_mode::mode::WARP_SUB_ID_ADDR).
+/// - `active_scene` from the scene-bundle pool slot 0 at `0x80084540`.
+///
+/// **The sub-id is not optional here.** The retail mode word alone cannot tell
+/// a fishing frame from a dance frame from the title screen: all five warp
+/// minigames run under mode `0x19` (`OTHER MODE`), and only `_DAT_8007BA34`
+/// separates them. Deriving the retail side's `scene_mode` from the mode word
+/// on its own made every minigame capture report `"Title"`, so
+/// [`first_mode_trace_divergence`] flagged a divergence against a correctly
+/// behaving engine - the oracle manufactured the failure out of its own `_ =>`
+/// arm rather than observing one.
+pub fn load_runtime_mode_trace_from_save(save: &Path) -> Result<ModeTraceFrame> {
+    use legaia_mednafen::SaveState;
+
+    let state = SaveState::from_path(save)
+        .with_context(|| format!("load mednafen save {}", save.display()))?;
+    let ram = state
+        .main_ram()
+        .with_context(|| format!("save state {} has no main RAM entry", save.display()))?;
+    Ok(mode_trace_frame_from_ram(ram))
+}
+
+/// The RAM-reading half of [`load_runtime_mode_trace_from_save`], split out so
+/// the `(game_mode, warp sub-id) -> scene_mode` resolution is testable without
+/// a save state (and therefore without Sony bytes).
+pub fn mode_trace_frame_from_ram(ram: &[u8]) -> ModeTraceFrame {
+    use crate::capture_observations::cutscene_trigger_corpus::read_game_mode;
+    use crate::capture_observations::field_pack_intra_transition::read_pool_slot_name;
+    use legaia_engine_mode::mode::{GameMode, read_warp_sub_id};
+
+    let game_mode = read_game_mode(ram);
+    let warp_sub_id = read_warp_sub_id(ram);
+    let resolved = game_mode.and_then(|b| GameMode::from_index(b as usize));
+    let game_mode_name = resolved.map(|gm| game_mode_label(gm).to_string());
+    let scene_mode = resolved
+        .map(|gm| gm.scene_mode_with_warp(warp_sub_id).name().to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+    let active_scene = read_pool_slot_name(ram, 0);
+    ModeTraceFrame {
+        frame: 0,
+        game_mode,
+        game_mode_name,
+        scene_mode,
+        active_scene,
+    }
+}
+
+fn game_mode_label(gm: legaia_engine_mode::mode::GameMode) -> &'static str {
+    legaia_engine_mode::mode::TABLE[gm.as_index()].name
+}
+
+/// Number of leading main-RAM bytes the manifest's `ram_fingerprint_sha256`
+/// hashes (the first 64 KiB - the scratch + low-globals window that settles
+/// deterministically after a save-state load).
+pub const RAM_FINGERPRINT_BYTES: usize = 0x10000;
+
+/// Lowercase-hex SHA-256 of the first [`RAM_FINGERPRINT_BYTES`] of a mednafen
+/// save state's main RAM. This is the same digest `scripts/manage-states.py`
+/// records as a scenario's `ram_fingerprint_sha256`, computed directly from
+/// the save state (no emulator re-run), so a live `.mc{slot}` can be checked
+/// against the catalogued fingerprint to detect that it has been overwritten
+/// and no longer holds the documented scenario.
+pub fn save_ram_fingerprint(save: &Path) -> Result<String> {
+    use legaia_mednafen::SaveState;
+    use sha2::{Digest, Sha256};
+
+    let state = SaveState::from_path(save)
+        .with_context(|| format!("load mednafen save {}", save.display()))?;
+    let ram = state
+        .main_ram()
+        .with_context(|| format!("save state {} has no main RAM entry", save.display()))?;
+    let window = ram.get(..RAM_FINGERPRINT_BYTES).unwrap_or(ram);
+    let digest = Sha256::digest(window);
+    Ok(hex_lower(&digest))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Serialise a list of frames as JSON Lines (`\n`-terminated JSON objects,
+/// one per frame). Round-trips through [`parse_mode_trace_jsonl`].
+pub fn mode_trace_to_jsonl(frames: &[ModeTraceFrame]) -> String {
+    let mut out = String::new();
+    for f in frames {
+        // `to_string` cannot fail for a flat owned struct with primitive
+        // + String fields; unwrap is safe here.
+        out.push_str(&serde_json::to_string(f).expect("ModeTraceFrame JSON serialise"));
+        out.push('\n');
+    }
+    out
+}
+
+/// Parse JSONL emitted by [`mode_trace_to_jsonl`]. Blank lines are
+/// skipped so concatenated streams parse cleanly.
+pub fn parse_mode_trace_jsonl(s: &str) -> Result<Vec<ModeTraceFrame>> {
+    let mut out = Vec::new();
+    for (i, line) in s.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let frame: ModeTraceFrame = serde_json::from_str(trimmed)
+            .with_context(|| format!("parse JSONL line {}: {trimmed}", i + 1))?;
+        out.push(frame);
+    }
+    Ok(out)
+}
+
+/// First field on which `engine` and `retail` disagree. Compares
+/// `scene_mode` + `active_scene` always, and `game_mode` whenever both
+/// emitters populate it (the engine fills it for the modes it models,
+/// e.g. `0x17` while the pause menu is open). `frame` is informational -
+/// retail snapshots are always `frame=0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeTraceDivergence {
+    pub kind: DivergenceKind,
+    pub engine: ModeTraceFrame,
+    pub retail: ModeTraceFrame,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DivergenceKind {
+    SceneMode,
+    ActiveScene,
+    /// Scene mode + active scene agree but the raw game-mode byte (emitted
+    /// by both sides) does not.
+    GameMode,
+}
+
+/// Walk `engine` left-to-right; return the first frame where the
+/// engine's `(scene_mode, active_scene)` disagrees with `retail`.
+/// Returns `None` when at least one engine frame matches.
+pub fn first_mode_trace_divergence(
+    engine: &[ModeTraceFrame],
+    retail: &ModeTraceFrame,
+) -> Option<ModeTraceDivergence> {
+    if engine.is_empty() {
+        return None;
+    }
+    // Any frame that matches retail counts as convergence - the engine
+    // settling later is fine. Surface the *last* frame's divergence if
+    // no frame ever matches; that's the actionable mismatch.
+    let matches = engine.iter().any(|e| frame_matches(e, retail));
+    if matches {
+        return None;
+    }
+    let last = engine.last().unwrap();
+    let kind = if last.scene_mode != retail.scene_mode {
+        DivergenceKind::SceneMode
+    } else if !active_scene_matches(last, retail) {
+        DivergenceKind::ActiveScene
+    } else {
+        DivergenceKind::GameMode
+    };
+    Some(ModeTraceDivergence {
+        kind,
+        engine: last.clone(),
+        retail: retail.clone(),
+    })
+}
+
+fn frame_matches(engine: &ModeTraceFrame, retail: &ModeTraceFrame) -> bool {
+    if engine.scene_mode != retail.scene_mode {
+        return false;
+    }
+    // Compare the raw game-mode byte when both sides observed one (the
+    // engine emits it only for the modes it models; retail always does).
+    if let (Some(e), Some(r)) = (engine.game_mode, retail.game_mode)
+        && e != r
+    {
+        return false;
+    }
+    active_scene_matches(engine, retail)
+}
+
+/// If retail has a scene name, the engine must have the same one. If retail
+/// didn't observe a name (unparseable pool slot), don't penalise the engine
+/// for filling it in.
+fn active_scene_matches(engine: &ModeTraceFrame, retail: &ModeTraceFrame) -> bool {
+    match (&engine.active_scene, &retail.active_scene) {
+        (_, None) => true,
+        (Some(e), Some(r)) => e == r,
+        (None, Some(_)) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(scene_mode: &str, active: Option<&str>) -> ModeTraceFrame {
+        ModeTraceFrame {
+            frame: 0,
+            game_mode: None,
+            game_mode_name: None,
+            scene_mode: scene_mode.to_string(),
+            active_scene: active.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn jsonl_roundtrip_engine_shape() {
+        let frames = vec![
+            ModeTraceFrame {
+                frame: 0,
+                game_mode: None,
+                game_mode_name: None,
+                scene_mode: "Field".into(),
+                active_scene: Some("town01".into()),
+            },
+            ModeTraceFrame {
+                frame: 1,
+                game_mode: None,
+                game_mode_name: None,
+                scene_mode: "Field".into(),
+                active_scene: Some("town01".into()),
+            },
+        ];
+        let jsonl = mode_trace_to_jsonl(&frames);
+        // One record per line, trailing newline.
+        assert_eq!(jsonl.lines().count(), 2);
+        let round = parse_mode_trace_jsonl(&jsonl).unwrap();
+        assert_eq!(frames, round);
+    }
+
+    #[test]
+    fn jsonl_roundtrip_retail_shape() {
+        let f = ModeTraceFrame {
+            frame: 0,
+            game_mode: Some(0x1A),
+            game_mode_name: Some("STR INIT".into()),
+            scene_mode: "Cutscene".into(),
+            active_scene: Some("map01".into()),
+        };
+        let jsonl = mode_trace_to_jsonl(std::slice::from_ref(&f));
+        let round = parse_mode_trace_jsonl(&jsonl).unwrap();
+        assert_eq!(round, vec![f]);
+    }
+
+    #[test]
+    fn parser_skips_blank_lines() {
+        let s = "\n{\"frame\":0,\"scene_mode\":\"Field\"}\n\n";
+        let out = parse_mode_trace_jsonl(s).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].scene_mode, "Field");
+    }
+
+    #[test]
+    fn divergence_returns_none_on_match() {
+        let engine = vec![frame("Field", Some("town01"))];
+        let retail = frame("Field", Some("town01"));
+        assert!(first_mode_trace_divergence(&engine, &retail).is_none());
+    }
+
+    #[test]
+    fn divergence_returns_none_on_retail_missing_scene_name() {
+        // Retail couldn't parse the pool slot; the engine still
+        // resolves it. Don't surface that as a divergence.
+        let engine = vec![frame("Field", Some("town01"))];
+        let retail = frame("Field", None);
+        assert!(first_mode_trace_divergence(&engine, &retail).is_none());
+    }
+
+    #[test]
+    fn divergence_surfaces_scene_mode_mismatch() {
+        let engine = vec![frame("Field", Some("map01"))];
+        let retail = frame("Cutscene", Some("map01"));
+        let d = first_mode_trace_divergence(&engine, &retail).unwrap();
+        assert_eq!(d.kind, DivergenceKind::SceneMode);
+    }
+
+    #[test]
+    fn divergence_surfaces_game_mode_mismatch() {
+        // Both sides emit a game-mode byte and disagree while the derived
+        // scene mode + scene name agree (e.g. CARD INIT vs CARD MODE).
+        let mut e = frame("Menu", Some("town01"));
+        e.game_mode = Some(0x17);
+        let mut r = frame("Menu", Some("town01"));
+        r.game_mode = Some(0x16);
+        let d = first_mode_trace_divergence(&[e], &r).unwrap();
+        assert_eq!(d.kind, DivergenceKind::GameMode);
+    }
+
+    #[test]
+    fn game_mode_compared_only_when_both_sides_emit_it() {
+        // Engine-side None (an unmodelled mode) must not penalise an
+        // otherwise-matching frame against a retail byte.
+        let e = frame("Field", Some("town01"));
+        let mut r = frame("Field", Some("town01"));
+        r.game_mode = Some(0x03);
+        assert!(first_mode_trace_divergence(&[e], &r).is_none());
+    }
+
+    #[test]
+    fn divergence_surfaces_active_scene_mismatch() {
+        let engine = vec![frame("Field", Some("town01"))];
+        let retail = frame("Field", Some("town0c"));
+        let d = first_mode_trace_divergence(&engine, &retail).unwrap();
+        assert_eq!(d.kind, DivergenceKind::ActiveScene);
+    }
+
+    #[test]
+    fn divergence_returns_none_when_any_engine_frame_matches() {
+        // Engine starts in Field, transitions to Cutscene; retail is
+        // Cutscene. The match at frame 1 satisfies the oracle.
+        let engine = vec![
+            frame("Field", Some("map01")),
+            frame("Cutscene", Some("map01")),
+        ];
+        let retail = frame("Cutscene", Some("map01"));
+        assert!(first_mode_trace_divergence(&engine, &retail).is_none());
+    }
+
+    #[test]
+    fn empty_engine_trace_returns_none() {
+        let retail = frame("Field", Some("town01"));
+        assert!(first_mode_trace_divergence(&[], &retail).is_none());
+    }
+
+    /// Synthesise a main-RAM image holding a `(game_mode, warp sub-id)` pair.
+    /// No Sony bytes - a zeroed buffer with two words poked in.
+    fn ram_at(game_mode: u8, warp_sub_id: i16) -> Vec<u8> {
+        use crate::capture_observations::cutscene_trigger_corpus::GAME_MODE_ADDR;
+        use legaia_engine_mode::mode::WARP_SUB_ID_ADDR;
+        let mut ram = vec![0u8; 0x20_0000];
+        ram[(GAME_MODE_ADDR - 0x8000_0000) as usize] = game_mode;
+        let off = (WARP_SUB_ID_ADDR - 0x8000_0000) as usize;
+        ram[off..off + 2].copy_from_slice(&warp_sub_id.to_le_bytes());
+        ram
+    }
+
+    /// The defect this pins: a capture taken at retail mode `0x19` used to
+    /// resolve to `"Title"`, because the resolution consulted the mode word
+    /// alone and every warp minigame shares that word. Against a correctly
+    /// behaving engine that produced a divergence report with no divergence in
+    /// it.
+    #[test]
+    fn a_retail_minigame_capture_resolves_to_its_minigame_not_to_title() {
+        for (sub_id, expect) in [
+            (0i16, "Fishing"),
+            (3, "SlotMachine"),
+            (4, "BakaFighter"),
+            (5, "MuscleDome"),
+            (6, "Dance"),
+        ] {
+            let f = mode_trace_frame_from_ram(&ram_at(0x19, sub_id));
+            assert_eq!(f.game_mode, Some(0x19));
+            assert_eq!(f.game_mode_name.as_deref(), Some("OTHER MODE"));
+            assert_eq!(f.scene_mode, expect, "sub_id {sub_id}");
+        }
+        // The mode word still decides on its own everywhere else - the sub-id
+        // register is stale data outside the OTHER pair and must be ignored.
+        let f = mode_trace_frame_from_ram(&ram_at(0x03, 6));
+        assert_eq!(f.scene_mode, "Field");
+        let f = mode_trace_frame_from_ram(&ram_at(0x17, 6));
+        assert_eq!(f.scene_mode, "Menu");
+    }
+
+    /// The oracle goes quiet on a *correct* engine and stays loud on a wrong
+    /// one. A quiet oracle that can no longer fail is worse than a noisy one.
+    #[test]
+    fn the_minigame_oracle_is_quiet_on_agreement_and_loud_on_a_real_divergence() {
+        let retail = mode_trace_frame_from_ram(&ram_at(0x19, 0));
+        assert_eq!(retail.scene_mode, "Fishing");
+
+        // Engine in the same minigame: no divergence. (The engine emits no
+        // game-mode byte for minigames, so only scene_mode + scene compare.)
+        let engine = vec![frame("Fishing", None)];
+        assert!(first_mode_trace_divergence(&engine, &retail).is_none());
+
+        // Engine in a DIFFERENT minigame - same retail mode word, different
+        // sub-id - still diverges. This is the case the mode word alone could
+        // never see, in either direction.
+        let engine = vec![frame("Dance", None)];
+        let d = first_mode_trace_divergence(&engine, &retail).expect("real divergence");
+        assert_eq!(d.kind, DivergenceKind::SceneMode);
+
+        // And the engine sitting in Title against a live minigame still
+        // diverges, which is what the old behaviour made indistinguishable
+        // from agreement.
+        let engine = vec![frame("Title", None)];
+        let d = first_mode_trace_divergence(&engine, &retail).expect("real divergence");
+        assert_eq!(d.kind, DivergenceKind::SceneMode);
+    }
+}

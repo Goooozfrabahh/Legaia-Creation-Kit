@@ -1,0 +1,352 @@
+# Save record (per-character runtime layout)
+
+The runtime per-character record is `0x414` bytes. Four records sit
+contiguously in main RAM at `0x80084708 + slot * 0x414`:
+
+| Slot | Base | Owner |
+|---:|---|---|
+| 0 | `0x80084708` | Vahn |
+| 1 | `0x80084B1C` | Noa |
+| 2 | `0x80084F30` | Gala |
+| 3 | `0x80085344` | Terra (New Game template's 4th roster entry; never a savable battle-party member) |
+
+The display name sits at record offset `+0x2A7` (9 bytes, NUL-padded),
+bounded by the summon-stash table at `+0x2B0`.
+
+Slot 3's `0x414` footprint ends exactly where the fourth flag bank
+begins (`0x80085344 + 0x414 = 0x80085758`); the item bag starts further
+up, at `0x80085958`. Neither overlaps the record. The cheat database's
+"story-flag" window starts at `0x80085600`, which is slot 3 `+0x2BC` -
+inside Terra's record, not inside the flag bank (see
+[`memory-map.md`](../reference/memory-map.md)).
+
+The on-disc save block (PSX memory-card record) is a verbatim dump of
+this resident region: record `n`'s base is `block + 0x5C8 + n*0x414`
+(`game_data + 0x3C8`), and the `+0x2A7` display name therefore surfaces
+at `block + 0x86F + n*0x414`. See
+[`docs/subsystems/save-screen.md`](../subsystems/save-screen.md)
+for the wrapper around it.
+
+Which records form the party is not a property of the records: all four are
+populated from the New Game template on. The present party is the member
+count at `0x80084594` and the roster-id list at `0x80084598` (SC `+0x454` /
+`+0x458`) - see
+[what a card load restores](../subsystems/save-screen.md#what-a-card-load-restores).
+
+"Verbatim dump" is true of the bytes and not of the whole block. Editing
+a record in place also invalidates the block's additive checksum at
+`block + 0x1FFC`, which retail's loader compares before it will accept
+the save - a stale word captions the slot "Damaged data." and the record
+never reaches RAM. `legaia_save::card::restamp_sc_block_checksum` is the
+fix-up, and `write_retail_char_records` applies it for its callers; see
+[the checksum section](../subsystems/save-screen.md#save-block-checksum-fun_801e38d8).
+
+Field offsets are pinned by a fusion of three sources:
+
+- decompiled function dumps under `ghidra/scripts/funcs/` (notably
+  `FUN_80042558` stat aggregator, `FUN_800431D0`
+  ability-bitmap reader, `FUN_80042DBC` spell-list pop, and the
+  level-up overlay applier);
+- captured save-state observations in
+  `parity::capture_observations::char_level_up` and the
+  `levelup::observations::{noa,gala}_4_level_jump` triplets;
+- the GameShark cheat database under [`data/cheats/`](../../data/cheats/)
+  whose every effect is a labelled `(addr, value)` write.
+
+## Top-level layout
+
+```text
++0x000  u32 LE   xp_cumulative            ; cumulative EXPERIENCE ("Max Exp" cheat
+                                           ; target). The displayed combat level
+                                           ; derives from this (vanilla New Game
+                                           ; leaves it 0 -> level 1). See note.
++0x004  u32 LE   xp_next_threshold        ; next-level XP threshold - the status
+                                           ; screen's "next" readout; the level-up
+                                           ; applier compares +0x0 against it. NOT
+                                           ; cumulative XP (a live randomized ROM
+                                           ; writing here showed it as "next level"
+                                           ; while experience stayed 0). Seeded per
+                                           ; char to reach(L2): Vahn 121, Noa 102,
+                                           ; Gala 140.
++0x008  u8[8]    header_tail              ; (function unmapped). Starts at +0x008:
+                                           ; +0x004 is a u32, so +0x006/+0x007 are
+                                           ; its high halfword, not tail bytes.
++0x010  u8[228]  stat_block_unmapped      ; (function partially mapped via
+                                           ; FUN_80042558; not all bytes named)
++0x0F4  u8[16]   ability_bits             ; OR'd into 0x80074358 by the
+                                           ; stat aggregator FUN_80042558
++0x104  u16 LE   hp_max_live              ; effective max, aggregator-rebuilt
++0x106  u16 LE   hp_curr_live             ; "Infinite HP" cheat target; walk-
+                                           ; regen bumps it clamping at +0x104
++0x108  u16 LE   mp_max_live              ; (each pair is (max, cur) - see
++0x10A  u16 LE   mp_curr_live             ;  legaia_save::HpMpSp provenance)
++0x10C  u16 LE   sp_max_live              ;
++0x10E  u16 LE   sp_curr_live             ; "100 AP" cheat target
++0x110  u16 LE   agl_live                 ; "Max AGL" target (live copy)
++0x112  u16 LE   atk_live                 ; "Max ATK"
++0x114  u16 LE   udf_live                 ; "Max UDF"
++0x116  u16 LE   ldf_live                 ; "Max LDF"
++0x118  u16 LE   spd_live                 ; "Max SPD"
++0x11A  u16 LE   int_live                 ; "Max INT" (`LiveStats::int`)
++0x11C  u16 LE   hp_max_record            ; "Max HP" target (record copy)
++0x11E  u16 LE   mp_max_record            ; "Max MP" target (record copy)
++0x120  u16 LE   stat_cap_constant        ; per-stat record cap, value `100`
+                                           ; in every captured save - see below
++0x122  u16 LE   agl_record               ; "Max AGL" (record copy)
++0x124  u16 LE   atk_record               ; "Max ATK"
++0x126  u16 LE   udf_record               ; "Max UDF"
++0x128  u16 LE   ldf_record               ; "Max LDF"
++0x12A  u16 LE   spd_record               ; "Max SPD"
++0x12C  u16 LE   int_record               ; "Max INT"
++0x12E  u16 LE   battle_status_flags      ; the packed ailment word, mirrored
+                                           ; from battle actor +0x16E. See note.
++0x130  u8       level                    ; "Level 99" cheat target. The crate
+                                           ; accessor is still named
+                                           ; `magic_rank()`; the byte is the
+                                           ; level. See note.
++0x131  u8[11]   post_level_unmapped      ; +0x131 is seeded to 1 and read by
+                                           ; nothing; +0x132..+0x13B untouched.
+                                           ; See note.
++0x13C  u8       learned_spell_count      ; "Magic Slot Activator" target,
+                                           ; cheat sets to 0x24 to enable
+                                           ; the spell list. Runtime role:
+                                           ; the length byte of the id list
+                                           ; below - see note.
++0x13D  u8[12]   magic_group_0            ; "Magic Modifier 1..12" hits
++0x149  u8[12]   magic_group_1            ; second copy of the slot
++0x155  u8[12]   magic_group_2            ; third copy of the slot
++0x161  u8[36]   spell_levels             ; per-spell level, parallel to the
+                                           ; ids at +0x13D ("All Summons
+                                           ; Level 9" target - summons are
+                                           ; list entries)
++0x185  u8       displayed_skill_count    ; menu-overlay skill roster count
++0x186  u8[16]   displayed_skill_ids      ; "Has all Arts" target. Ordered insert
+                                           ; on item-use spell-learn. Fifteen
+                                           ; arts per character, so +0x195 (the
+                                           ; sixteenth slot) is never reached
+                                           ; and nothing references it; the
+                                           ; patcher's --show-super-arts keeps
+                                           ; its performed-Super mask there.
++0x196  u8       armor_id                 ; "Armor Modifier" / "Best Equipment"
++0x197  u8       head_gear_id             ; "Head Gear Modifier"
++0x198  u8       weapon_id                ; "Weapon Modifier"
++0x199  u8       ra_seru_item_id          ; the Ra-Seru equipment byte for Vahn
+                                           ; and Gala. Noa's Ra-Seru is one byte
+                                           ; lower, at +0x198 (equipment index 2).
+                                           ; "Activate Meta at Lv9" writes item
+                                           ; 0x09 (final-form Ra-Seru Meta)
+                                           ; here; the grant scan in
+                                           ; FUN_80042558 then inserts spell
+                                           ; 0x9E
++0x19A  u8       leg_gear_id              ; "Leg Gear Modifier"
++0x19B  u8       accessory_1_id           ; "Accessory 1 Modifier"
++0x19C  u8       accessory_2_id           ; "Accessory 2 Modifier"
++0x19D  u8       accessory_3_id           ; "Accessory 3 Modifier"
++0x19E  u8[9]    post_equipment_unmapped_a
++0x1A7  u8[16]   auto_command_string_a   ; the Auto command string, primary AP band
++0x1B7  u8[16]   auto_command_string_b   ; the same, secondary band
++0x1C7  u8[233]  post_equipment_unmapped_b
++0x2B0  ...      summon_stash_slots[14]   ; 14 x 0x14-byte stash slots: the
+                                           ; level (+5) and u32 counter
+                                           ; (+1..+4) of an equipment-granted
+                                           ; summon while its item is
+                                           ; unequipped. Code addresses slots
+                                           ; 0..4 only. Accessor
+                                           ; `active_spell_slot()`
++0x380  u8[148]  tail_unmapped
+```
+
+## The two auto command strings (`+0x1A7` / `+0x1B7`)
+
+The pair is the battle command menu's **Auto** source: the 16-byte action
+queue the player last confirmed, parked between turns so the next attack can
+replay it without re-entering arrows. `FUN_801DA34C` loads one band into
+battle-actor `+0x1DF..+0x1EF` and `FUN_801DA59C` writes the live window back
+(`see ghidra/scripts/funcs/overlay_battle_action_801da34c.txt`,
+`overlay_battle_action_801da59c.txt`).
+
+Both routines address the strings off the live-state window rather than the
+record - `0x80084140 + slot*0x414 + 0x76F` and `+0x77F`. The record base sits
+`0x5C8` bytes into that window, which is what makes them record-relative
+`+0x1A7` and `+0x1B7`. The same delta puts the performed-Super mask's
+`+0x75D` at record `+0x195`, the sixteenth displayed-skill slot.
+
+Which band is read or written is decided by the acting actor's action gauge,
+not by a slot index: `sltu(+0x156, +0x154)` - base gauge strictly below live
+gauge takes the primary band, everything else the secondary one. So a combo
+recorded while the gauge was topped up is not replayed into a turn that
+cannot pay for it.
+
+The two legs are **asymmetric**, and a port that symmetrises them replays the
+wrong string. The primary leg copies `+0x1A7` when its head byte is non-zero
+and falls back to `+0x1B7` otherwise; the secondary leg reads `+0x1B7` and
+zero-fills on an empty head, with no fallback to `+0x1A7` (the empty-head
+branch at `0x801DA4CC` lands on the zero-fill loop). The write-back has no
+fallback at all: exactly one band is overwritten per call, and only for a live
+actor (`+0x14C != 0`) whose action category is the attack/arts band
+(`+0x1DE == 3`).
+
+`legaia_save` exposes them as `CharacterRecord::auto_command_string` /
+`set_auto_command_string` over an `AutoCommandBand` that `for_gauge` selects,
+and `engine-core` runs both leaves from the live battle flow - see
+[battle-action.md](../subsystems/battle-action.md#the-retail-queue-builder-fun_801eed1c-and-super-applier-fun_801ef9e4).
+
+## Cheat-database citations
+
+Every offset above is named after an empirical write target in the
+GameShark cheat database shipped at [`data/cheats/`](../../data/cheats/).
+The mapping from cheat description to record offset is:
+
+| Cheat | Address (Vahn) | Offset | Field |
+|---|---|---:|---|
+| `100 AP` | `0x80084816` | `+0x10E` | sp_curr_live |
+| `Max HP` | `0x8008480C` / `0x8008480E` / `0x80084824` | `+0x104` / `+0x106` / `+0x11C` | hp_max_live / hp_curr_live / hp_max_record |
+| `Max MP` | `0x80084810` / `0x80084812` / `0x80084826` | `+0x108` / `+0x10A` / `+0x11E` | mp_max_live / mp_curr_live / mp_max_record |
+| `Max AGL` | `0x80084818` / `0x8008482A` | `+0x110` / `+0x122` | agl_live / agl_record |
+| `Max ATK` | `0x8008481A` / `0x8008482C` | `+0x112` / `+0x124` | atk_live / atk_record |
+| `Max UDF` | `0x8008481C` / `0x8008482E` | `+0x114` / `+0x126` | udf_live / udf_record |
+| `Max LDF` | `0x8008481E` / `0x80084830` | `+0x116` / `+0x128` | ldf_live / ldf_record |
+| `Max SPD` | `0x80084820` / `0x80084832` | `+0x118` / `+0x12A` | spd_live / spd_record |
+| `Max INT` | `0x80084822` / `0x80084834` | `+0x11A` / `+0x12C` | int_live / int_record |
+| `Level 99` | `0x80084838` | `+0x130` | magic_rank |
+| `Magic Slot Activator` | `0x80084844` | `+0x13C` | magic_slot_activator |
+| `Magic Modifier 1` | `0x80084845` / `0x80084851` / `0x8008485D` | `+0x13D` / `+0x149` / `+0x155` | three magic-group copies |
+| `All Summons Level 9` | `0x80084869..0x80084886` | `+0x161..+0x178` | spell_levels (first 16 list positions) |
+| `Has all Arts` | `0x8008488D..0x8008489A` | `+0x185..+0x192` | displayed_skill_count + ids |
+| `Best Equipment` | `0x8008489E` / `0x800848A0` / `0x800848A2` | `+0x196` / `+0x198` / `+0x19A` | armor / weapon / leg gear |
+| `Activate Meta at Lv9` | `0x800848A1` | `+0x199` | ra_seru_item_id (value `0x09`, the final form; triggers the Meta grant) |
+| `Activate Terra at Lv9` / `Activate Ozma at Lv9` | `0x80084CB4` / `0x800850C9` | Noa `+0x198` / Gala `+0x199` | the Ra-Seru byte, but the values written (`0x12`, `0x1B`) are an unnamed item gap and the Ra-Seru Blade, not the final forms `0x11` / `0x19`, so neither reaches the grant scan |
+| `Accessory 1 Modifier` | `0x800848A3` | `+0x19B` | accessory_1_id |
+| `Max Exp` | `0x80084708` / `0x8008470A` | `+0x000` / `+0x002` | xp_cumulative (combined u32) |
+
+The Noa (`+0x414`) and Gala (`+0x828`) bases shift every address by
+one record stride; same offsets, same fields.
+
+## Fields that are easy to misread
+
+<a id="notes-on-contradictions-reconciled-by-this-document"></a>Each of these fields has a plausible wrong reading. The sections state what the field is and what rules the other reading out.
+
+### `+0x12E` is the battle status word.
+
+The halfword is the mirror of battle actor `+0x16E`, the packed ailment
+flags. `FUN_80047430` copies it verbatim every frame a party actor ticks
+(`lhu 0x16e(actor)` then `sh` at both `0x80047680` and `0x80048040`), so the
+record carries the live in-battle condition rather than a stat tail.
+
+The battle HUD reads the same halfword through a second base: the status
+element selector `FUN_8002C2E4` indexes `0x80084140 + slot * 0x414`, and
+`0x80084140 + 0x5C8 == 0x80084708`, so its `+0x6F6` is this `+0x12E`, its
+`+0x6CE` is `+0x106` (current HP) and its `+0x6F8` is `+0x130` below. The
+per-bit map, and the accessory-guard clear masks that pin it, are in
+[`accessory-passive-table.md`](accessory-passive-table.md#status-guard-clear-masks)
+and mirrored at `engine-battle-vm::status_effects::display_flags`.
+
+### `+0x130` is the displayed character level.
+
+The status screen reads `+0x130` as "LV" and the `Level 99` GameShark cheat sets it
+to `0x63` (99). **Boot-confirmed via the starting-level randomizer**: a New Game
+record with level-10 cumulative experience (`+0x0`), level-10 stats, and the correct
+next-level threshold (`+0x4`) but `+0x130 == 1` still displays **LV 1**, and setting
+`+0x130 = 10` makes it display **LV 10** - so the shown level is read from `+0x130`
+directly, *not* re-derived from cumulative XP at a New Game.
+
+The retail level-up applier maintains `+0x130` by incrementing it `+1` per level-up
+event (the captured `engine_battle::levelup::observations::{noa,gala}_4_level_jump`
+bumped it by one across a four-level grant, so it can momentarily lag the XP-derived
+level after a rare multi-level jump), but for single-level play and the new-game seed
+it equals the level. `+0x130` is not a "Magic Rank", and the adjacent `+0x131`
+is **not** a magic-rank byte either. `+0x131` is written once on the whole disc - the new-game seed's
+`sb $v0, 0x6f9($s0)` at `0x800561C8`, sharing its `li $v0, 0x1` with the `+0x130`
+store two instructions later - and read nowhere. A displacement sweep over
+`SCUS_942.54` and all 80 based overlay images for any `lb`/`lbu`/`sb` at `0x131`
+(record-relative) or at `0x6f9`/`0xb0d`/`0xf21`/`0x1335` (the four slots'
+displacements off the `0x80084140` block the menu overlay addresses records
+through) returns that single store, and no halfword or word access spans
+`+0x130..+0x131` either - every level reader in the corpus is a `lbu` at `+0x130`
+/ `0x6f8`. The magic-rank counter is a different byte, capture-pinned at record
+`+0x9C` ([battle.md](../subsystems/battle.md)). The runtime accessor
+`legaia_save::CharacterRecord::magic_rank()` reads this byte, so it is in fact the
+**level** byte under a legacy name, and `level()` / `set_level()` read and write the
+same byte. `+0x100` is not a level cell: it is word 3 of the ability bitfield
+`+0xF4..+0x103`, which the stat aggregator `FUN_80042558` zeroes (the four
+`sw zero` at `0x800425EC..0x800425F8`, the last one `sw zero,0x100(s0)`) and rebuilds
+from equipment ([`accessory-passive-table.md`](accessory-passive-table.md)), so a
+level kept there reads back as `0` after the next stat refresh.
+
+### `+0x4` is the *next-level threshold*, not cumulative XP.
+
+`+0x0` is the cumulative experience (the "Max Exp" cheat target and the "Experience"
+readout, and the value the level-up applier compares against the threshold); `+0x4`
+is the **next-level XP threshold** - the "next" readout on the status screen. (The
+displayed level itself is read from `+0x130`, above, not derived from `+0x0`.)
+Confirmed live: a randomized ROM that wrote a level-10 XP value into `+0x4` showed
+it as "next level: 11195" while *experience* stayed `0`, leaving the derived level
+at 1 (`+0x4` is the threshold the applier reads, `+0x0` the cumulative XP it
+compares against it). The
+starting-level randomizer therefore seeds `+0x0`, not `+0x4`.
+
+The runtime accessor in [`legaia_save::CharacterRecord`] is
+`magic_rank()` / `set_magic_rank()`. The `stat_cap()` /
+`set_stat_cap()` accessors read/write the `+0x120` cap constant
+(the same field as `RecordStats::cap_constant`); `+0x11A` is the
+live INT stat (`int_live`, typed as `LiveStats::int`), which the
+engine clamps at `0x3E7` and the cheat database calls `Max INT`.
+
+### `+0x13C` is the learned-spell **count**, and that is why the cheat works.
+
+The cheat database names it `Magic Slot Activator` and prescribes writing `0x24`,
+which reads as a magic enable byte. Two menu-overlay readers say it is a plain
+length: the per-character list screen `FUN_801DA2A0` reads `+0x13C` as the
+Ra-Seru-gated learned-spell count before walking the ids, and the window-7
+character prompt substitutes `record[+0x13D + sel]` - the `sel`-th entry of the
+list `+0x13C` counts - which is what identifies that prompt as a magic-side one
+([`field-menu.md`](../subsystems/field-menu.md)). So "activating" the spell list
+is just declaring it 36 entries long, and the ids the menu then shows are
+whatever `+0x13D..` already held. Treat `+0x13C` as a count when writing it: a
+value past the real id run displays uninitialised slots rather than granting
+spells.
+
+### `+0x161..` is the per-spell level array, parallel to the ids at `+0x13D..`.
+
+`+0x161 + i` is the level of the spell whose id is at `+0x13D + i`, with the u32 counter at
+`+0x08 + i * 4` as the third parallel array. The insert routine `FUN_800432BC` writes all three at
+index 0 (`sb t3,0x13d(t0)` at `0x80043378`, `sb t1,0x161(t0)` at `0x8004337C`, `sw t2,0x8(t0)` at
+`0x80043380`) after shifting all three up by one, and `FUN_80042DBC` compacts all three together.
+Summons are ordinary entries of this list (ids `0x99..0xA0`), which is why the GameShark
+`All Summons Level 9` code, stamping `0x09` across `+0x161..`, raises them: it raises every listed
+spell. There is no separate per-summon-id level array
+([battle.md](../subsystems/battle.md#the-three-parallel-spell-arrays)). The `legaia_save`
+accessor `summon_levels()` reads the first 16 bytes of this array.
+
+### Why a u16 XP field appeared to sit at `+0x004`.
+
+The captured Noa + Gala level-up triplets show a u16 at `+0x004`
+moving by an XP-shaped delta on every level-up event, which read as
+a second cumulative-XP cell alongside the u32 the GameShark
+`Max Exp` cheat writes at `+0x000..+0x003`. It is the **low half of
+the `+0x4` threshold word**: the applier rewrites the threshold each
+time the level changes, so it steps in exactly the places cumulative
+XP does. There is one XP total (`+0x0`, u32) and one threshold
+(`+0x4`, u32) - see the section above. `CharacterRecord::cumulative_xp`
+reads the u32 at `+0x000`, and no `xp_low_word_alt` field exists.
+
+## The `+0x120` cap constant
+
+Across every captured save, `+0x120` reads as `100`. The level-up
+overlay writes this constant on every level-up event regardless of
+character or stat. The interpretation is that this byte is the
+hard ceiling each individual record-side stat clamps against - the
+runtime then re-projects through `FUN_80042558`'s `0x3E7` clamp on
+the live copy, allowing equipment / buffs to push past the
+record-side cap up to `999` in battle.
+
+## See also
+
+- [`legaia_save::character::CharacterRecord`] for the typed Rust
+  accessors.
+- [`docs/subsystems/level-up.md`](../subsystems/level-up.md) for the
+  multi-frame write split during a level-up event.
+- [`docs/subsystems/battle-formulas.md`](../subsystems/battle-formulas.md)
+  for how the live stats feed damage / accuracy / RNG.
+- [`docs/reference/cheats.md`](../reference/cheats.md) for the
+  full cheat-database citation table and the runtime applier.

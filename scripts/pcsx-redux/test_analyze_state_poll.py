@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+"""Tests for analyze_state_poll.py.
+
+Dependency-free: importable by pytest (`test_*` functions) and runnable
+standalone (`python3 test_analyze_state_poll.py`) which executes every test and
+exits non-zero on the first failure. Uses only synthetic in-memory CSV rows, so
+it needs no capture on disk and no Sony bytes.
+"""
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+
+_spec = importlib.util.spec_from_file_location(
+    "analyze_state_poll", Path(__file__).with_name("analyze_state_poll.py")
+)
+asp = importlib.util.module_from_spec(_spec)
+sys.modules["analyze_state_poll"] = asp  # dataclass forward-ref resolution needs this
+_spec.loader.exec_module(asp)
+
+
+HEADER = "tick,kind,idx,value,delta,mode,scene,note"
+
+
+def _rows(*csv_lines):
+    return asp.parse_rows([HEADER, *csv_lines])
+
+
+def test_parse_skips_header_and_short_lines():
+    rows = asp.parse_rows([HEADER, "10,mode,3,3,0,0x03,town01,", "", "junk", "20,gold,0,500,500,0x03,town01,"])
+    assert len(rows) == 2
+    assert rows[0].kind == "mode" and rows[0].mode == 0x03
+    assert rows[1].kind == "gold" and rows[1].value == 500
+
+
+def test_scene_timeline_collapses_runs():
+    rows = _rows(
+        "10,mode,3,3,0,0x03,town01,",
+        "20,flagset,5,1,1,0x03,town01,",
+        "30,scene,0,0,0,0x03,vozz,",
+        "40,flagset,6,1,1,0x03,vozz,",
+        "50,scene,0,0,0,0x03,town01,",
+    )
+    tl = asp.scene_timeline(rows)
+    scenes = [(w.scene, w.enter_tick, w.exit_tick) for w in tl]
+    assert scenes == [("town01", 10, 30), ("vozz", 30, 50), ("town01", 50, 50)]
+    assert tl[0].duration == 20
+
+
+def test_battle_windows_bracket_by_mode_column():
+    rows = _rows(
+        "10,mode,3,3,0,0x03,vozz,",
+        "20,mode,20,20,0,0x14,vozz,",       # enter battle orbit
+        "25,flagclr,9,0,-1,0x15,vozz,",     # still in battle (mode col 0x15)
+        "30,mode,2,2,0,0x02,vozz,",         # leave
+        "40,mode,20,20,0,0x14,vozz,",       # second battle
+        "50,mode,3,3,0,0x03,vozz,",
+    )
+    bw = asp.battle_windows(rows)
+    assert len(bw) == 2
+    assert (bw[0].enter_tick, bw[0].exit_tick) == (20, 30)
+    assert (bw[1].enter_tick, bw[1].exit_tick) == (40, 50)
+
+
+def test_battle_starts_parse_formation_and_lone_flag():
+    rows = _rows(
+        # a lone boss: formation [4B,00,00,00], staging id captured (0x4B)
+        "82963,battle,75,75,0,0x16,garmel,form=4B000000 enter=0x16",
+        # a multi-enemy random: formation [1D,31,00,00], staging consumed (0)
+        "75161,battle,0,29,0,0x14,garmel,form=1D310000 enter=0x08",
+    )
+    bs = asp.battle_starts(rows)
+    assert len(bs) == 2
+    boss = bs[0]
+    assert boss.tick == 82963 and boss.scene == "garmel"
+    assert boss.formation == [0x4B, 0, 0, 0]
+    assert boss.staging_id == 75 and boss.enter_mode == 0x16
+    assert boss.is_lone is True
+    rnd = bs[1]
+    assert rnd.formation == [0x1D, 0x31, 0, 0]
+    assert rnd.staging_id == 0 and rnd.enter_mode == 0x08
+    assert rnd.is_lone is False
+
+
+def test_battle_starts_fallback_to_value_when_note_malformed():
+    # note missing form= -> formation[0] falls back to the value column (44).
+    rows = _rows("100,battle,0,44,0,0x14,vozz,enter=0x08")
+    bs = asp.battle_starts(rows)
+    assert len(bs) == 1
+    assert bs[0].formation == [44, 0, 0, 0]
+    assert bs[0].enter_mode == 0x08
+
+
+def test_battle_starts_in_json_and_report():
+    rows = _rows("82963,battle,75,75,0,0x16,garmel,form=4B000000 enter=0x16")
+    j = asp.build_json(rows, bulk_threshold=100)
+    assert j["battle_starts"][0]["formation"] == [0x4B, 0, 0, 0]
+    assert j["battle_starts"][0]["is_lone"] is True
+    txt = asp.render_report(rows, bulk_threshold=100, want={"battles"})
+    assert "form=4B000000" in txt
+    assert "*" in txt  # lone-enemy marker
+
+
+def test_flag_census_excludes_bulk_and_keeps_sticky():
+    # tick 100: a 3-flag bulk (threshold 3) => excluded, reported as bulk.
+    # tick 200: a lone story beat (sticky). tick 300: a flag set then cleared
+    # at 310 => not sticky, dropped.
+    lines = [
+        "100,flagset,1,1,1,0x03,opdeene,",
+        "100,flagset,2,1,1,0x03,opdeene,",
+        "100,flagset,3,1,1,0x03,opdeene,",
+        "200,flagset,50,1,1,0x03,garmel,",
+        "300,flagset,60,1,1,0x03,garmel,",
+        "310,flagclr,60,0,-1,0x03,garmel,",
+    ]
+    cen = asp.flag_census(_rows(*lines), bulk_threshold=3)
+    assert cen.bulk_ticks == [(100, "opdeene", 3)]
+    beat_idxs = [b.idx for b in cen.beats]
+    assert beat_idxs == [50]  # 60 dropped (ends cleared), bulk 1/2/3 excluded
+    assert cen.beats[0].scene == "garmel" and cen.beats[0].set_tick == 200
+
+
+def test_flag_census_churn_counted():
+    lines = [
+        "200,flagset,50,1,1,0x03,garmel,",
+        "210,flagclr,50,0,-1,0x03,garmel,",
+        "220,flagset,50,1,1,0x03,garmel,",  # ends set => sticky, churn 3
+    ]
+    cen = asp.flag_census(_rows(*lines), bulk_threshold=100)
+    assert len(cen.beats) == 1
+    assert cen.beats[0].churn == 3 and cen.beats[0].set_tick == 220
+
+
+def test_item_and_gold_and_party_changes():
+    rows = _rows(
+        "10,item,127,3,3,0x03,town01,slot0 id00->7F",
+        "20,item,127,3,0,0x03,town01,slot0",           # delta 0 => ignored
+        "30,gold,0,500,500,0x03,town01,",
+        "40,gold,0,500,0,0x03,town01,",                # delta 0 => ignored
+        "50,party,3,3,1,0x03,town01,ids=00010200",
+    )
+    items = asp.item_changes(rows)
+    assert len(items) == 1 and items[0].idx == 127 and items[0].delta == 3
+    golds = asp.gold_changes(rows)
+    assert len(golds) == 1 and golds[0].value == 500
+    parties = asp.party_changes(rows)
+    assert len(parties) == 1 and parties[0].note == "ids=00010200"
+
+
+def test_level_and_spell_changes():
+    rows = _rows(
+        "10,level,0,4,1,0x15,vozz,",                    # Vahn level-up 3->4
+        "20,spell,1,1,1,0x15,garmel,ids=81 lv=01",      # Noa Seru grant (Gimard)
+        "30,spell,1,1,0,0x03,garmel,ids=81 lv=02",      # spell level-up (count fixed)
+    )
+    lvls = asp.level_changes(rows)
+    assert len(lvls) == 1 and lvls[0].idx == 0 and lvls[0].value == 4
+    spells = asp.spell_changes(rows)
+    assert len(spells) == 2
+    assert spells[0].delta == 1 and spells[0].note == "ids=81 lv=01"  # grant
+    assert spells[1].delta == 0                                       # level-up
+    j = asp.build_json(rows, bulk_threshold=100)
+    assert j["levels"][0] == {"tick": 10, "scene": "vozz", "slot": 0, "level": 4, "delta": 1}
+    assert j["spells"][0]["note"] == "ids=81 lv=01"
+    txt = asp.render_report(rows, bulk_threshold=100, want={"progress"})
+    assert "level-ups" in txt and "slot 0  level=4 (+1)" in txt
+    assert "Seru grants" in txt and "ids=81 lv=01" in txt
+
+
+def test_json_shape():
+    rows = _rows(
+        "10,mode,3,3,0,0x03,town01,",
+        "20,mode,20,20,0,0x14,town01,",
+        "30,mode,3,3,0,0x03,town01,",
+        "40,flagset,50,1,1,0x03,town01,",
+    )
+    j = asp.build_json(rows, bulk_threshold=100)
+    assert j["rows"] == 4
+    assert j["tick_span"] == [10, 40]
+    assert any(s["scene"] == "town01" for s in j["scenes"])
+    assert len(j["battles"]) == 1
+    assert j["flag_beats"][0]["flag_hex"] == "0x32"
+
+
+def test_report_omits_boot_scene_and_respects_only():
+    rows = _rows(
+        "5,mode,0,0,0,0x00,?,",
+        "10,mode,3,3,0,0x03,town01,",
+        "20,flagset,50,1,1,0x03,town01,",
+    )
+    txt = asp.render_report(rows, bulk_threshold=100, want={"scenes"})
+    assert "town01" in txt
+    assert "\n  " in txt  # has a scene row
+    assert "flag 0x32" not in txt  # flags section not requested
+    # boot scene '?' suppressed from the scene timeline
+    for line in txt.splitlines():
+        assert not line.strip().endswith(" ?")
+
+
+def test_flag_census_treats_bulkload_note_as_bulk():
+    # tick 100 has only 2 flag events (below any threshold) but they carry the
+    # probe's note=bulkload -> excluded from beats and reported as a bulk frame.
+    lines = [
+        "100,flagset,10,1,1,0x08,town01,bulkload",
+        "100,flagset,11,1,1,0x08,town01,bulkload",
+        "200,flagset,50,1,1,0x03,garmel,",
+    ]
+    cen = asp.flag_census(_rows(*lines), bulk_threshold=100)
+    assert [t for (t, _s, _n) in cen.bulk_ticks] == [100]
+    assert [b.idx for b in cen.beats] == [50]  # bulkload rows dropped
+
+
+def test_flag_census_screens_sub_threshold_load_frame_by_signature():
+    # tick 100: a save-state LOAD below the bulk threshold - 3 sets + 2 clears
+    # (5 flips < threshold 20) but the poll re-keys the inventory in the same
+    # tick (12 item rows >= LOAD_ITEM_BURST) -> screened as a load frame.
+    # tick 200: a genuine multi-flag cutscene commit (4 sets, NO item rewrite,
+    # no clears) -> kept as beats.
+    load = [f"100,flagset,{i},1,1,0x03,retona," for i in (0x340, 0x341, 0x567)]
+    load += [f"100,flagclr,{i},0,-1,0x03,retona," for i in (0x35, 0x19D)]
+    load += [f"100,item,{i},1,1,0x03,retona," for i in range(12)]
+    beat = [f"200,flagset,{i},1,1,0x03,vozz," for i in (0x900, 0x901, 0x902, 0x903)]
+    cen = asp.flag_census(_rows(*load, *beat), bulk_threshold=20)
+    assert cen.bulk_ticks == [(100, "retona", 5)]
+    assert cen.load_ticks == [100]
+    assert sorted(b.idx for b in cen.beats) == [0x900, 0x901, 0x902, 0x903]
+    txt = asp.render_report(_rows(*load, *beat), bulk_threshold=20, want={"flags"})
+    assert "[load]" in txt
+
+
+def test_flag_census_honors_loadish_note_without_item_burst():
+    # newer probes tag sub-threshold load frames note=loadish; honored even
+    # with no item rows at that tick. A same-shape untagged tick (set+clr mix,
+    # no item burst) is NOT screened - the signature stays conservative.
+    lines = [
+        "100,flagset,10,1,1,0x03,kor5,loadish",
+        "100,flagclr,11,0,-1,0x03,kor5,loadish",
+        "300,flagset,12,1,1,0x03,kor5,",
+        "300,flagclr,13,0,-1,0x03,kor5,",
+    ]
+    cen = asp.flag_census(_rows(*lines), bulk_threshold=20)
+    assert cen.bulk_ticks == [(100, "kor5", 2)]
+    assert cen.load_ticks == [100]
+    assert [b.idx for b in cen.beats] == [12]  # tick-300 set kept (13 ends clear)
+    js = asp.build_json(_rows(*lines), 20)
+    assert js["flag_bulk_frames"] == [
+        {"tick": 100, "scene": "kor5", "flags": 2, "load_frame": True}
+    ]
+
+
+def test_flag_beat_tile_and_label_annotation():
+    # a pos crossing at tick 190 in garmel, then a KNOWN flag (0x142=322) and an
+    # unlabeled flag (99) both set at tick 200 -> tile attached to both, label
+    # only on 0x142.
+    lines = [
+        "190,pos,12,7,0,0x03,garmel,x=1600 z=960",
+        "200,flagset,322,1,1,0x03,garmel,",
+        "200,flagset,99,1,1,0x03,garmel,",
+    ]
+    cen = asp.flag_census(_rows(*lines), bulk_threshold=100)
+    by_idx = {b.idx: b for b in cen.beats}
+    assert by_idx[322].tile == (12, 7)
+    assert by_idx[322].label is not None and "Caruban" in by_idx[322].label
+    assert by_idx[99].tile == (12, 7)
+    assert by_idx[99].label is None  # unlabeled => a new lead
+    txt = asp.render_report(_rows(*lines), bulk_threshold=100, want={"flags"})
+    assert "@tile(12,7)" in txt
+    assert "[lead]" in txt  # the unlabeled beat surfaces as a lead
+
+
+def test_tile_at_is_scene_scoped():
+    # a warp: garmel tile at tick 10, then town01 tile at tick 30. A tick-40
+    # town01 query must NOT return the garmel tile.
+    track = asp.player_track(
+        _rows(
+            "10,pos,5,5,0,0x03,garmel,",
+            "30,pos,20,20,0,0x03,town01,",
+        )
+    )
+    assert asp.tile_at(track, 40, "town01") == (20, 20)
+    assert asp.tile_at(track, 40, "garmel") == (5, 5)
+    assert asp.tile_at(track, 5, "town01") is None  # no town01 sample yet
+
+
+def test_bgm_picks_snaps_and_walk():
+    rows = _rows(
+        "10,bgm,0,2015,15,0x03,town01,",
+        "20,pos,3,4,0,0x03,town01,x=448 z=576",
+        "25,pos,4,4,0,0x03,town01,x=576 z=576",
+        "30,input,14,1,0,0x03,town01,CROSS",
+        "31,pick,2,2,0,0x03,town01,CROSS",
+        "40,snap,1,0,0,0x03,garmel,boss4B -> snap_0000040_boss4B_garmel.sstate",
+    )
+    assert asp.bgm_changes(rows)[0].value == 2015
+    assert asp.picker_choices(rows)[0].idx == 2
+    assert asp.snapshots(rows)[0].note.startswith("boss4B")
+    assert len(asp.input_edges(rows)) == 1
+    j = asp.build_json(rows, bulk_threshold=100)
+    assert j["bgm"][0]["id"] == 2015
+    assert j["picks"][0]["choice"] == 2
+    assert j["snapshots"][0]["note"].startswith("boss4B")
+    assert j["walk"][0]["tile"] == [3, 4]
+    txt = asp.render_report(rows, bulk_threshold=100, want={"bgm", "picks", "snaps", "walk"})
+    assert "bgm=2015" in txt
+    assert "choice=2" in txt
+    assert "boss4B" in txt
+    assert "crossings=" in txt
+
+
+def test_xp_equip_and_counter_changes():
+    rows = _rows(
+        "10,xp,0,1200,64,0x03,garmel,",                       # Vahn battle grant
+        "20,equip,2,17,17,0x03,town01,slot0 eq2 id00->11",    # helmet equipped
+        "30,counter,0,45,5,0x03,sun01,fishing_points",
+        "40,counter,2,120,20,0x03,town01,point_card",
+    )
+    xps = asp.xp_changes(rows)
+    assert len(xps) == 1 and xps[0].idx == 0 and xps[0].delta == 64
+    eqs = asp.equip_changes(rows)
+    assert len(eqs) == 1 and eqs[0].idx == 2 and eqs[0].value == 17
+    cnts = asp.counter_changes(rows)
+    assert len(cnts) == 2 and cnts[0].note == "fishing_points"
+    j = asp.build_json(rows, bulk_threshold=100)
+    assert j["xp"][0] == {"tick": 10, "scene": "garmel", "slot": 0, "xp": 1200, "delta": 64}
+    assert j["equip"][0]["slot"] == 0 and j["equip"][0]["equip_slot"] == 2
+    assert j["counters"][1] == {
+        "tick": 40, "scene": "town01", "name": "point_card", "value": 120, "delta": 20,
+    }
+    txt = asp.render_report(rows, bulk_threshold=100, want={"progress", "counters"})
+    assert "XP grants" in txt and "xp=1200 (+64)" in txt
+    assert "id00->11" in txt
+    assert "fishing_points=45 (+5)" in txt
+
+
+def test_decode_status_names_bits_and_residue():
+    assert asp.decode_status(0) == "clear"
+    assert asp.decode_status(0x1) == "Venom"
+    assert asp.decode_status(0x2 | 0x1000) == "Toxic|Curse"
+    assert asp.decode_status(0x380) == "AI-delegated"
+    assert asp.decode_status(0x400) == "guard-disable[OPEN]"
+    # unknown residue bits surface rather than vanish
+    assert "0x4000?" in asp.decode_status(0x4000)
+    # a partial AI-delegation pattern is residue, not "AI-delegated"
+    assert asp.decode_status(0x80) == "0x80?"
+
+
+def test_status_and_hp_changes_and_0x400_leads():
+    rows = _rows(
+        # Venom inflicted on party slot 0 (0x0000 -> 0x0001)
+        "100,status,0,1,1,0x15,garmel,0x0000->0x0001 hp=196",
+        # guard-disable raised on monster slot 3 (0x0000 -> 0x0400) => a lead
+        "200,status,3,1024,1024,0x15,garmel,0x0000->0x0400 hp=76",
+        # 0x400 already set, another bit added => NOT a new lead
+        "210,status,3,1025,1,0x15,garmel,0x0400->0x0401 hp=76",
+        # per-hit damage on monster slot 3
+        "220,hp,3,40,-36,0x15,garmel,max=76",
+    )
+    sts = asp.status_changes(rows)
+    assert len(sts) == 3
+    leads = asp.status_leads(rows)
+    assert len(leads) == 1 and leads[0].tick == 200 and leads[0].idx == 3
+    hps = asp.hp_changes(rows)
+    assert len(hps) == 1 and hps[0].delta == -36
+    j = asp.build_json(rows, bulk_threshold=100)
+    assert j["status"][0]["decoded"] == "Venom"
+    assert j["status_leads_0x400"] == [
+        {"tick": 200, "scene": "garmel", "slot": 3, "note": "0x0000->0x0400 hp=76"}
+    ]
+    assert j["hp"][0]["hp"] == 40
+    txt = asp.render_report(rows, bulk_threshold=100, want={"status", "hp"})
+    assert "0x0000->0x0001  Venom" in txt
+    assert "0x400 guard-disable raised" in txt
+    assert "hp=40 (-36)" in txt
+
+
+def test_aq_changes_and_arts_commits():
+    # queue window hex is 20 bytes (40 hex chars); pad with zeros
+    def q(prefix_hex):
+        return "q=" + prefix_hex + "0" * (40 - len(prefix_hex))
+
+    rows = _rows(
+        # raw arts-input presses (direction bytes appended one per frame)
+        f"100,aq,0,15,1,0x15,garmel,{q('0F')}",
+        f"110,aq,0,14,1,0x15,garmel,{q('0F0E')}",
+        # ordinary art commit: starter form 0x19 but no 0x1A
+        f"200,aq,0,25,6,0x15,garmel,{q('19270F')}",
+        # Super-Art commit: 0x19 starters + the 0x1A special starter
+        f"300,aq,1,25,10,0x15,garmel,{q('19270F191F0E1A2B2B2B')}",
+        # a monster-side status row must not leak into aq views
+        "310,status,3,1,1,0x15,garmel,0x0000->0x0001 hp=76",
+    )
+    aq = asp.aq_changes(rows)
+    assert len(aq) == 4 and all(r.kind == "aq" for r in aq)
+    commits = asp.arts_commits(rows)
+    assert [(r.tick, s) for r, s in commits] == [(200, False), (300, True)]
+    j = asp.build_json(rows, bulk_threshold=100)
+    assert len(j["aq"]) == 4
+    assert j["arts_commits"] == [
+        {"tick": 200, "scene": "garmel", "slot": 0,
+         "queue_hex": "19270F" + "0" * 34, "is_super": False},
+        {"tick": 300, "scene": "garmel", "slot": 1,
+         "queue_hex": "19270F191F0E1A2B2B2B" + "0" * 20, "is_super": True},
+    ]
+    txt = asp.render_report(rows, bulk_threshold=100, want={"arts"})
+    assert "arts commits" in txt
+    assert "**SUPER" in txt
+    # the raw-press rows (no 0x19 in window) are not commit rows
+    assert txt.count("tick") >= 2 and "q=0F0" not in txt
+
+
+def test_aq_window_parse_tolerates_malformed_notes():
+    assert asp._aq_window_bytes("") == []
+    assert asp._aq_window_bytes("q=") == []
+    assert asp._aq_window_bytes("q=0F0") == []       # odd length
+    assert asp._aq_window_bytes("q=ZZ") == []        # non-hex
+    assert asp._aq_window_bytes("max=76") == []      # not an aq note
+    assert asp._aq_window_bytes("q=190C") == [0x19, 0x0C]
+
+
+def _run_all():
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    for t in tests:
+        t()
+        print(f"ok  {t.__name__}")
+    print(f"\n{len(tests)} passed")
+
+
+if __name__ == "__main__":
+    _run_all()

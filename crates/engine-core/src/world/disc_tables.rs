@@ -1,0 +1,286 @@
+//! Disc-parsed static tables installed at boot / scene load (items, spells, arts, monsters, formations, move power, equipment, thresholds, CDNAME map).
+//!
+//! One subsystem's state, held as a unit on the composite [`World`].
+//! Fields keep their retail provenance notes.
+
+use super::*;
+
+/// Disc-parsed static tables installed at boot / scene load (items, spells, arts, monsters, formations, move power, equipment, thresholds, CDNAME map).
+pub struct DiscTables {
+    /// The `SCUS_942.54` New Game starting-party template (`0x80078C4C`),
+    /// kept from [`crate::world::World::begin_new_game_seeded`]. Retail's
+    /// New Game seeds all four live records from it, so a member who joins
+    /// later (`0x3C` party add) arrives with its own row; the engine seeds
+    /// the record from here when the join names a slot the roster lacks.
+    pub starting_party: Option<legaia_game_tables::new_game::StartingParty>,
+    /// The static `SCUS_942.54` win-pose table (`0x800788A0`) the results
+    /// frame picks the leader's victory pose from. Installed at boot by the
+    /// shell (`legaia_game_tables::victory_pose`); `None` on a disc-free build,
+    /// where the pose actor simply keeps its idle.
+    pub victory_pose_table: Option<legaia_game_tables::victory_pose::VictoryPoseTable>,
+    /// The inline 8-byte names the dialog's `0xC7 XX` escape splices
+    /// (`0x80073F24 + XX * 8`, `FUN_80036044`): the Ra-Seru names Meta /
+    /// Terra / Ozma. Indexed by `XX`; read from the disc's executable at
+    /// boot ([`crate::world::World::install_retail_progression_tables`]).
+    pub inline_names: Vec<Vec<u8>>,
+    /// Item catalog used by item-action resolution. Populated at battle
+    /// init from [`legaia_engine_menus::items::ItemCatalog::vanilla`] (or a custom
+    /// catalog set by [`crate::world::World::set_item_catalog`]); empty by default so
+    /// the field VM doesn't trigger item effects in non-battle scenes.
+    pub item_catalog: legaia_engine_menus::items::ItemCatalog,
+    /// Real on-disc item-effect descriptor table ([`legaia_game_tables::item_effect`],
+    /// `DAT_800752C0`), if the boot source's `SCUS_942.54` was readable. When
+    /// present, [`crate::world::World::set_item_catalog`] applies its field/battle usability
+    /// flags onto the installed catalog so item-menu gating matches retail.
+    pub item_effects: Option<legaia_game_tables::item_effect::ItemEffectTable>,
+    /// Spell catalog used by the player-driven battle Magic submenu to resolve
+    /// spell ids → names / MP cost / effect. Populated at battle init from
+    /// [`legaia_engine_battle::spells::SpellCatalog::vanilla`] (or a custom catalog via
+    /// [`crate::world::World::set_spell_catalog`]); empty by default.
+    pub spell_catalog: legaia_engine_battle::spells::SpellCatalog,
+    /// Art-record catalog used by the player-driven battle Arts submenu to
+    /// resolve a saved chain → its real per-strike power profile. Keyed by
+    /// `(character, art constant)`; populated from disc art data (PROT entry
+    /// `0x05C4`) via [`crate::world::World::set_art_record`] when available. Empty by
+    /// default - the Arts submenu then falls back to a synthetic power profile
+    /// derived from the chain's directional commands
+    /// (see [`legaia_engine_battle::battle_arts::synthetic_power`]).
+    pub art_records: std::collections::HashMap<
+        (legaia_art::Character, legaia_art::ActionConstant),
+        legaia_art::ArtRecord,
+    >,
+    /// Per-actor character max MP. The retail `BattleActor` holds only
+    /// the running `mp` value (not the cap); the cap lives on the
+    /// character record at `+0x140`. Engines populate this from the
+    /// character record at battle init.
+    pub character_max_mp: Vec<u16>,
+    /// Optional formation table - engines install this at boot via
+    /// [`crate::world::World::set_formation_table`] so triggered encounters can resolve
+    /// their `formation_id` into concrete monster slot definitions.
+    pub formation_table: legaia_engine_battle::monster_catalog::FormationTable,
+    /// Optional monster catalog - paired with `formation_table`. Engines
+    /// look up [`legaia_engine_battle::monster_catalog::MonsterDef`] by id when seating
+    /// a battle.
+    pub monster_catalog: legaia_engine_battle::monster_catalog::MonsterCatalog,
+    /// Optional battle-action move-power table (PROT 0898, runtime VA
+    /// `0x801F4F5C`). When present, the monster special-attack damage path
+    /// resolves each move id to its real per-move power scalar and rolls
+    /// damage through the faithful arts/physical kernel
+    /// (`crate::world::World::enemy_move_predamage`); when `None` (disc-free /
+    /// synthetic battles) that path falls back to the MP-scaled placeholder, so
+    /// the RNG stream and determinism trace are unchanged. Installed lazily from
+    /// the disc by [`legaia_engine_scene_host::scene_host::SceneHost`].
+    pub move_power: Option<legaia_engine_battle::move_power::MovePowerCatalog>,
+    /// Raw bytes of the battle-action overlay (PROT 0898) the [`move_power`]
+    /// catalog was parsed from, retained so the move-FX render path can read the
+    /// `0x801f6324` prototype records' move-VM bytecode (the catalog holds only
+    /// the parsed tables). Installed alongside [`move_power`] by
+    /// [`legaia_engine_scene_host::scene_host::SceneHost`]; `None` in disc-free battles (move FX simply
+    /// don't spawn). `Arc` so cloning `World` stays cheap.
+    pub move_power_overlay: Option<Arc<[u8]>>,
+    /// The disc's own `SCUS_942.54`, kept for the move-VM records the
+    /// executable itself carries - the Mystic Shield's sphere and texture
+    /// scroller (`0x80078644` / `0x80078720`) that PROT 0940's arm 4 seats
+    /// ([`crate::world::World::raise_mystic_shield`]). Installed with the
+    /// progression tables ([`crate::world::World::install_retail_progression_tables`]);
+    /// `None` disc-free.
+    pub scus: Option<Arc<[u8]>>,
+    /// The bonus equipment drop's id pool (`World::bonus_drop_pool`), built
+    /// once from [`Self::scus`] on first use; `None` until then.
+    pub bonus_drop_pool: Option<Vec<u8>>,
+    /// Each player summon cast's attack name - the `rec[0]` string of its
+    /// `summon.dat` (PROT 0893) actor record, the text a summon module's
+    /// caption arm prints. Installed by [`legaia_engine_scene_host::scene_host::SceneHost`] with the
+    /// cast-effect pool; empty disc-free.
+    pub summon_attack_names: Arc<std::collections::BTreeMap<u8, String>>,
+    /// `summon.dat` (PROT 0893) itself, for the texture slots a player
+    /// summon's cast streams into the battle VRAM
+    /// ([`crate::battle_sideband_textures::record_cast_sideband_textures`]).
+    /// Installed with [`Self::summon_attack_names`]; `None` disc-free.
+    pub summon_dat: Option<Arc<[u8]>>,
+    /// The battle **VDF** morph pack `vdf.dat` (PROT 0872, the
+    /// `[u32 count][u32 offsets[count]][bodies]` layout of a scene's VDF).
+    /// Battle init loads it through the asset dispatcher's VDF case and
+    /// `FUN_8001FBCC` rebuilds the sub-entry table `0x80083E58` from index 0
+    /// (a mid-Spirit capture reads the append counter `0x8007B7EC` at the
+    /// pack's 32 and table entry 12 = this pack's entry 12), so a battle
+    /// effect part's op-`0x0A` morph lane indexes this pack, not the field
+    /// scene's. `None` disc-free: effect parts draw their rest mesh.
+    pub battle_vdf: Option<Arc<[u8]>>,
+    /// Battle **element-affinity** tables ([`legaia_game_tables::element_affinity`],
+    /// matrix `0x801F53E8` + per-character element table `0x801F5480`). When
+    /// present, the monster special-attack damage path scales the attacker roll
+    /// by `matrix[enemy_element][party_member_element]` (`FUN_801dd864`);
+    /// `None` (disc-free / synthetic battles) keeps the neutral 100% multiplier,
+    /// so the damage and determinism trace are unchanged. Installed lazily from
+    /// the same PROT 0898 overlay as [`crate::world::DiscTables::move_power`] by
+    /// [`legaia_engine_scene_host::scene_host::SceneHost`].
+    pub element_affinity: Option<legaia_game_tables::element_affinity::ElementAffinity>,
+    /// Per-character battle-camera height table
+    /// ([`legaia_game_tables::battle_camera_table`], runtime VA `0x801F4D2C`) - the
+    /// `TR.y` the submenu close-up framing (`FUN_801D5854` case `0`) reads for
+    /// whichever character is acting. Installed from the same PROT 0898
+    /// overlay as [`crate::world::DiscTables::move_power`] by [`legaia_engine_scene_host::scene_host::SceneHost`]; `None`
+    /// on disc-free hosts, which leaves the camera on its single traced
+    /// fallback height so an unpinned character frames like the measured case
+    /// instead of jumping.
+    pub battle_camera_heights: Option<legaia_game_tables::battle_camera_table::BattleCameraHeights>,
+    /// Seru-magic **side-effect** table
+    /// ([`legaia_game_tables::seru_side_effect`], runtime VA `0x801F6870`,
+    /// `[element][band]`): the percent a levelled player Seru cast's
+    /// secondary debuff shaves off the target's stat on every hit, and the
+    /// cure class light stages instead.
+    ///
+    /// Sibling static data in the same PROT 0898 overlay as
+    /// [`crate::world::DiscTables::move_power`], installed by
+    /// [`legaia_engine_scene_host::scene_host::SceneHost`]. `None` on a disc-free host, which is the
+    /// gate that keeps the stager
+    /// ([`crate::world::World::stage_seru_side_effect`]) from running at
+    /// all - so a synthetic battle stages nothing and draws no `rand()`.
+    pub seru_side_effects: Option<legaia_game_tables::seru_side_effect::SeruSideEffectTable>,
+    /// The Seru-absorb banner's caption pieces (PROT 0898 `0x801F4DFC` /
+    /// `0x801F4C28`), installed with the move-power table. `None` on a
+    /// disc-free host, where the banner shows the Seru's name alone.
+    pub absorb_caption: Option<legaia_game_tables::absorb_caption::AbsorbCaption>,
+    /// The loss window's two text pieces (PROT 0898 `0x801F4C78` /
+    /// `0x801F4C94`), installed with the move-power table. `None` on a
+    /// disc-free host, where the loss window opens empty.
+    pub defeat_text: Option<legaia_engine_battle_vm::battle_party_panel::DefeatText>,
+    /// The victory report's text pieces (PROT 0898 `0x801F4C2C` /
+    /// `0x801F4C38`), installed beside [`Self::defeat_text`]. `None` on a
+    /// disc-free host, where the report draws the port's English.
+    pub victory_text: Option<legaia_engine_battle_vm::battle_party_panel::VictoryText>,
+    /// The name-entry screen's prompts (PROT 0897's pointer table at
+    /// `0x801F3324`), installed at field scene entry. `None` on a disc-free
+    /// host, where the screen draws the port's English.
+    pub name_entry_prompts: Option<legaia_ui_formats::name_entry_prompts::NameEntryPrompts>,
+    /// Player Seru spell id (`0x81..=0x8B`) -> the **summon creature's**
+    /// record element (`+0x1D`), the byte the side-effect stager switches on
+    /// and the affinity scale reads as the attacker element.
+    ///
+    /// Resolved at scene entry from the monster archive through
+    /// [`legaia_engine_effects::summon::summon_creature_id`]. It is a separate table from the
+    /// monster catalog on purpose: the catalog only ever holds the *scene's*
+    /// own monsters, so a summon creature is absent from it in almost every
+    /// fight, and a catalog-by-name lookup answers `None` there. Empty on a
+    /// disc-free host.
+    pub summon_elements: std::collections::HashMap<u8, u8>,
+    /// Player Seru spell id (`0x81..=0x8B`) -> the **summon creature's** whole
+    /// record, as the catalog would hold it: the summon body the damage roll
+    /// reads its HP / INT / element from (`World::summon_creature_def`).
+    ///
+    /// Resolved alongside [`Self::summon_elements`] and kept apart from the
+    /// monster catalog for the same reason: the catalog holds only the
+    /// scene's own monsters, so a catalog-only lookup resolved a summon's
+    /// body only in the few scenes that also field that creature as an
+    /// enemy, and every other cast fell back to a placeholder roll. Empty on
+    /// a disc-free host.
+    pub summon_creatures:
+        std::collections::HashMap<u8, legaia_engine_battle::monster_catalog::MonsterDef>,
+    /// Static `SCUS_942.54` per-monster **steal** table
+    /// ([`legaia_game_tables::steal_table`], `DAT_80077828 + monster_id * 2`, fields
+    /// `[chance, item]`). Install via
+    /// [`crate::world::World::set_steal_table`]; `None` on a disc-free host,
+    /// which is what keeps a synthetic battle from granting a steal.
+    ///
+    /// Two consumers: [`crate::world::World::apply_steal`]'s no-argument
+    /// sibling, and PROT 0941's `0x51` Steal body, whose **monster-seat** leg
+    /// resolves off this table rather than off the bag
+    /// (`docs/formats/steal-table.md`; the table is NOT in the PROT 867
+    /// monster record).
+    pub(crate) steal_table: Option<legaia_game_tables::steal_table::StealTable>,
+    /// Per-item battle-stat modifier table (weapon / armor / accessory
+    /// bonuses). Empty by default; install via [`crate::world::World::set_equipment_table`]
+    /// so [`crate::world::World::seed_party_battle_stats`] folds equipped gear onto each
+    /// party combatant's attack / defense at battle entry.
+    pub equipment_table: legaia_engine_battle::battle_stats::EquipmentTable,
+    /// The **raw** static equipment stat-bonus table (`DAT_80074F68`, stride 8)
+    /// as parsed off `SCUS_942.54`, kept alongside the derived modifier table
+    /// because two retail readers want the record bytes rather than the
+    /// modifiers: the Throw Out list builder reads each record's `+7` flags
+    /// byte, and the item-detail window reads `+5`. Install via
+    /// [`crate::world::World::set_equip_stats`]; `None` on a disc-free load,
+    /// where the Throw Out list simply dims nothing.
+    pub equip_stats: Option<legaia_game_tables::equip_stats::EquipStatTable>,
+    /// Accessory ("Goods") passive-effect catalog: item id → passive index +
+    /// per-index party-wide scope, decoded from the executable. Empty by
+    /// default; install via [`crate::world::World::set_accessory_passives`].
+    /// [`crate::world::World::refresh_party_ability_bits`] derives each member's ability
+    /// bitfield from it, and
+    /// [`legaia_engine_battle::battle_stats::compute_battle_stats_with_passives`] applies the
+    /// percent stat boosts inside [`crate::world::World::seed_party_battle_stats`].
+    pub accessory_passives: legaia_engine_battle::accessory_passives::AccessoryPassives,
+    /// CDNAME `#define` map (raw in-RAM PROT TOC index → block name),
+    /// installed once by the scene host from the disc's `CDNAME.TXT`
+    /// ([`crate::world::World::install_scene_toc_names`]). This is the id space a
+    /// quick-travel placement record's `scene_id` lives in - the on-disc
+    /// values (`0x55` map01 / `0xF4` map02 / `0x187` map03 / `0x162` son /
+    /// `0x215` korout) are the destination scenes' own `#define` numbers,
+    /// the same words the world-map arrival kernel matches `0x80084628`
+    /// against (`FUN_801EE328`). Empty on a PROT.DAT-only load; the menu
+    /// warp drain then reports retail's `UNFIND MAP NUMBER` diagnostic
+    /// instead of warping.
+    pub scene_toc_names: legaia_prot::cdname::IndexMap,
+    /// Magic-XP threshold table from `SCUS_942.54` (`0x8007656C`, 8 ascending
+    /// u16 steps). Installed at boot via
+    /// [`crate::world::World::install_magic_xp_thresholds`]; while `None` (disc-free) summon
+    /// casts still accrue spell XP but never level the spell up.
+    pub magic_xp_thresholds: Option<[u16; legaia_engine_battle::magic_xp::THRESHOLD_STEPS]>,
+    /// Seru-trade config from the patched disc (the randomizer's `--seru-trade`
+    /// blob: enabled flag + master seed + offer cap). Installed at boot via
+    /// [`crate::world::World::install_seru_trade_config`]; `None` (or `enabled == false`)
+    /// disables vendor seru trading. See [`legaia_engine_battle::seru_trade`].
+    pub seru_trade_config: Option<legaia_game_tables::seru_trade::SeruTradeConfig>,
+    /// The battle draw's per-character Rot limb object ranges
+    /// (`SCUS_942.54` `0x80077998`, [`legaia_engine_battle_vm::battle_actor_draw`]).
+    /// Installed by [`crate::world::World::install_menu_text`]; while `None`
+    /// (disc-free) no rotted limb dims.
+    pub(crate) rot_limb_table: Option<legaia_engine_battle_vm::battle_actor_draw::RotLimbTable>,
+}
+
+impl DiscTables {
+    pub fn new() -> Self {
+        Self {
+            starting_party: None,
+            item_catalog: legaia_engine_menus::items::ItemCatalog::default(),
+            item_effects: None,
+            spell_catalog: legaia_engine_battle::spells::SpellCatalog::default(),
+            art_records: std::collections::HashMap::new(),
+            magic_xp_thresholds: None,
+            seru_trade_config: None,
+            bonus_drop_pool: None,
+            character_max_mp: Vec::new(),
+            formation_table: legaia_engine_battle::monster_catalog::FormationTable::new(),
+            monster_catalog: legaia_engine_battle::monster_catalog::MonsterCatalog::new(),
+            move_power: None,
+            move_power_overlay: None,
+            scus: None,
+            summon_attack_names: Default::default(),
+            summon_dat: None,
+            battle_vdf: None,
+            element_affinity: None,
+            battle_camera_heights: None,
+            seru_side_effects: None,
+            absorb_caption: None,
+            defeat_text: None,
+            victory_text: None,
+            name_entry_prompts: None,
+            summon_elements: std::collections::HashMap::new(),
+            summon_creatures: std::collections::HashMap::new(),
+            steal_table: None,
+            equipment_table: legaia_engine_battle::battle_stats::EquipmentTable::new(),
+            equip_stats: None,
+            accessory_passives: Default::default(),
+            scene_toc_names: legaia_prot::cdname::IndexMap::new(),
+            victory_pose_table: None,
+            inline_names: Vec::new(),
+            rot_limb_table: None,
+        }
+    }
+}
+
+impl Default for DiscTables {
+    fn default() -> Self {
+        Self::new()
+    }
+}

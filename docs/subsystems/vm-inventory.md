@@ -1,0 +1,267 @@
+# VM inventory
+
+Every VM-shaped subsystem in the retail runtime, with three independent facts
+for each: how completely it is decoded, whether the Rust port implements it,
+and whether a live (non-test) caller in the port reaches it.
+
+A subsystem is "VM-shaped" here if it walks a bytecode or record stream
+through a dispatcher, or advances a per-entity state byte through a `switch`
+each frame.
+
+Three things to keep apart when reading the table:
+
+- **"Five VMs" is an orientation, not a census.** The
+  [runtime VM family](move-vm.md#the-runtime-vm-family) table names the five
+  bytecode-and-state drivers that share the actor model. Several drivers
+  below - the `0x2F` extension dispatcher, the `0x4C` sub-dispatcher, the
+  battle-action, world-map and tile-board state machines - are separate
+  dispatchers with their own tables.
+- **"Ported" is not "live".** Port status and reachability are separate
+  columns. Every row below has a live caller today; the remaining exceptions
+  are support modules, listed under [Ported but inert](#ported-but-inert).
+- **Whether the disc uses an op is a third fact.** A ported, live handler can
+  still have no carrier - no shipped scene issuing that opcode. For the field
+  VM the [opcode census](../tooling/field-op-census.md) answers it per arm,
+  and its zeros separate "no fixture drives this" from "there is nothing to
+  drive".
+
+How the dispatchers nest at runtime:
+
+```mermaid
+flowchart TD
+    AT["per-actor anim dispatch<br/>FUN_80021DF4"] --> MV["move VM<br/>FUN_80023070"]
+    MV -->|"op 0x2F (0897 resident)"| EXT["0x2F extension<br/>FUN_801D362C"]
+    FV["field / event VM<br/>FUN_801DE840"] -->|"op 0x4C"| MC["MENU_CTRL<br/>16 outer nibbles"]
+    FV -->|"op 0x49"| TB["tile-board walk SM"]
+    BA["battle-action SM<br/>FUN_801E295C"] -->|"every frame until done"| CM["cast-module phase byte<br/>ctx+0x279"]
+    M1["motion VM<br/>FUN_8003774C"]
+    M2["scripted motion VM<br/>FUN_80038158"]
+    AV["actor VM (window widgets)<br/>FUN_801D6628"]
+```
+
+## The inventory
+
+Op/state spaces are structural invariants read off the dispatcher bound in the
+disassembly (`sltiu` immediate before the `jr`), not off the port.
+
+| Subsystem | Driver | Op / state space | RE status | Ported | Live caller |
+|---|---|---|---|---|---|
+| [Actor / sprite VM](actor-vm.md) | `FUN_801D6628` | 13 opcodes, JT `0x801CED70` | resolved | yes - `legaia_engine_vm` root | yes - shop widget choreography (`engine-menus::menu_widget`) |
+| [Move VM](move-vm.md) | `FUN_80023070` | 71 opcodes `0x00..0x46`, JT `0x80010778` | resolved | yes - `move_vm` | yes |
+| [Move-VM `0x2F` extension](move-vm-overlay-ext.md) | `FUN_801D362C` | 61 sub-opcodes `0x00..0x3C`, JT `0x801CE868` | resolved | yes - `move_vm::ext` | yes |
+| [Motion VM - pursue / patrol](motion-vm.md) | `FUN_8003774C` | 22-slot JT `0x80010EE0`, index `(op & 0x7F) - 0x37` | resolved | yes - `motion_vm` | yes |
+| [Motion VM - scripted](motion-vm.md#the-second-motion-vm---fun_80038158) | `FUN_80038158` | 32-slot JT `0x80010FE8`, ops `0x01..=0x20` | resolved | yes - `ambient_motion` + `ambient_motion_ops` | yes |
+| [Field / event VM](script-vm.md) | `FUN_801DE840` | 43 opcodes `0x21..0x4F` with gaps | resolved | yes - `field` | yes |
+| [Field VM `0x4C` MENU_CTRL](script-vm-menuctrl.md) | inline in `FUN_801DE840` | 16 outer nibbles; `B` and `F` reach retail's error printer, `F` sub-`F` excepted | resolved | yes - `field::step::menu_ctrl` | yes |
+| [Effect VM](effect-vm.md) | `FUN_801E0088` | **none** - see [No opcode space](#the-effect-vm-has-no-opcode-space) | resolved | yes - `effect_vm` | yes |
+| [Battle-action SM](battle-action.md) | `FUN_801E295C` | 256-slot JT `0x801CED44`, sparse handled bands, no default arm | partial | yes - `battle_action` | yes |
+| [World-map entity SM](world-map.md) | `FUN_801DA51C` | 5 states | resolved | yes - `engine-field::world_map_entity` | yes |
+| [Tile-board walk SM](tile-board.md) | `overlay_0897_801EF2B0` | 15 states, JT at `0x801CF65C` | resolved | yes - `engine-minigames::tile_board` | yes |
+| [Cast-module phase machine](cast-module.md#the-module-phase-byte-ctx--0x279) | one tick body per PROT 0903..0966 image, named by 0898's `0x801CF4EC` / `0x801CF56C` | per-image: the `ctx+0x279` phase byte through a word table or a `beq`/`slti` chain | resolved | yes - `cast_module_ticks` + `cast_arm_ticks` + `seru_magic_ticks` | yes - `World::run_cast_module_code` |
+| Per-actor anim dispatch | `FUN_80021DF4` | 7 dispatch bytes `0x01..=0x07` at `actor[+0x5A]` | resolved | yes - `anim_vm` / `actor_tick` | yes |
+| Ambient facing channel | `FUN_80038158` ops `0x04` / `0x0D` | 2 of the 32-slot table | resolved | yes - `ambient_motion` (the same interpreter as the row above) | yes |
+| [Title-screen tick](#one-function-two-ports) | `FUN_801DD35C` | 25-slot JT `0x801CF244`, sub-mode word `+0x204` | resolved | yes - `title_overlay` | yes - `TitleSession`; see [below](#one-function-two-ports) |
+| Per-prim render dispatch | `FUN_80043390` | 20 kind slots × 4 alpha banks | resolved | yes - `prim_dispatch` | yes |
+| Status-effect ticker | `FUN_801E752C` | per-actor condition set | resolved | yes - `status_effects` | yes |
+
+## The cast band is 64 dispatchers, and one row
+
+The [cast-module band](cast-module.md) is the one entry above whose "op space"
+column cannot name a single table, because there is no single dispatcher: each
+of the 64 slot-B images carries its own tick body, and each body switches on
+the same battle-ctx byte `+0x279` through whichever shape its module was
+compiled with - a word table at the image head for some, a `beq` / `slti`
+chain for others, and per-module bounds running from five arms to
+thirty-two. What makes it one row rather than 64 is that the **phase byte is
+shared**: one battle context, one byte, re-entered every frame by the action SM until the
+resident body reports done.
+
+Two properties follow, and both are why the band belongs in this census rather
+than under "battle". A module phase whose exit gate can never pass is a
+softlock, because the drive loop has no timer. And a body is only meaningful
+as an `(entry, VA)` pair - `0x801F69D8` alone is the tick body of six modules -
+so a dispatcher keyed on the address runs the wrong choreography for five of
+them.
+
+A third property is the one a disassembly cannot supply: **how long an arm
+holds**. The dwell is a module-resident countdown, and its drain is a per-arm
+multiplier of the scratchpad frame byte at `0x1F800393` - the product with
+`0x1F80037D`, twice that byte, or once it. So a drain measured on one arm
+describes that arm, and a run that stops short of expiry is indistinguishable
+from a gate firing. Measured per arm for the player-Seru half and for all
+fourteen trampoline-reached arms. Two of them, PROT 0943's `0x40` and PROT
+0944's `0x53`, read as faulting before their first tick until the caster was
+changed: the body does tick, and the unmapped read is SCUS walking a caster
+whose spell-entry array is shorter than the clip the arm stages. Tables in
+[`cast-module.md`](cast-module.md#frame-gating-measured).
+
+## The effect VM has no opcode space
+
+A low opcode count is not evidence of incomplete RE, and here the count is
+zero by construction. `FUN_801E0088` has no central switch on a per-slot
+opcode byte at all: the bytes that look like state tokens are 5.3 fixed-point
+**wait counters**, and the walker is a pair of countdown-driven cursor walks.
+Searching for its opcode table is the documented dead end.
+
+The port runs on the live path: `World::tick_effects` sweeps
+`Pool::tick_retail` once per retail frame from the per-frame tick.
+
+## The scripted motion VM has one interpreter and one static decoder
+
+`FUN_80038158` is the one entry above that reads as two rows, because its
+bytecode arrives as MAN tail-section 1 rather than through the actor tick's own
+buffer, so a *static* decode of the same bytes exists alongside the running VM.
+The two are not rival ports:
+
+- **The interpreter** is `legaia_engine_motion_vm::ambient_motion`, whose loop reaches
+  all twenty-four case bodies the table's twenty-six defined op bytes select.
+  The bodies are split across two files for length only - the facing ramps, the
+  walk ops, the waits and the ramp scheduler in `ambient_motion.rs`, the rest in
+  `ambient_motion_ops.rs` as further `impl` blocks on the same type. Nothing is
+  stepped over by width.
+- **The static decoder** is `legaia_engine_field::man_field_scripts::npc_motion`,
+  which answers questions about a stream without running it: which placement a
+  record binds to, what pace its walk ops carry, what its first `0x17`
+  default-move write is. The scene loader uses it to seed the channels the
+  interpreter then ticks.
+
+Several arms write state no engine mechanism consumes yet; they are named in
+[`motion-vm.md`](motion-vm.md#what-the-host-does-with-each-op), which is the
+page to read before assuming an op is missing rather than un-consumed.
+
+## One function, two ports
+
+`FUN_801DD35C` is a single 3026-instruction dispatcher, and the disassembly is
+**identical** across the `overlay_menu`, `overlay_title`, `overlay_save_ui_*`
+and `overlay_shop_save` dumps - the same one-resident-function-under-many-
+scenario-labels shape that settled the [`0x2F` residency
+question](move-vm-overlay-ext.md#overlay-residency---one-copy-in-the-field-overlay-only).
+
+Which overlay *owns* it is settled by a byte search: its 48-byte prologue
+occurs exactly once on the disc, inside PROT **0899** at file `+0xEB44`
+(`0x801CE818 + 0xEB44` reproduces the VA), and it is absent from
+`SCUS_942.54`. The many-labelled dumps are one resident copy under scenario
+labels; the short `overlay_801dd35c.txt` that reads differently is a 436-byte
+PROT 0897 routine `FUN_801DD310` at an aliased VA.
+
+**What it does is the title-screen tick.** It is hosted in the menu overlay's
+image, but it is not the menu overlay's top-level dispatcher; the routine's
+own operands show that:
+
+- Its 56 `sw ..,0x204(..)` sub-mode writes store only `0x02..=0x18`, inside
+  the jump table's `sltiu v0,s2,0x19` bound at `0x801DD7F8`. The pause-menu,
+  shop and inn screen bytes `menu.rs` enumerates are never written by it, and
+  the `0x70` literals in its body are the `y` argument of the centred-text
+  helper `FUN_801E1C1C`.
+- Its two master-mode stores into `0x8007B83C` are `0x1A` at `0x801DDCF0`
+  (attract -> STR) and `2` at `0x801DFC00` (NEW GAME -> field), and its only
+  caller is `FUN_801E36A0` (0899 `+0x14E88`), nine instructions that are
+  `jal 0x801dd35c` with both arguments zeroed, spawned by master mode 22.
+
+So `title_overlay.rs` carries the `PORT:` tag and `menu.rs` a `REF:`.
+
+### What of the tick runs on both hosts
+
+`TitleMenuState::step` is the executable half - the `AttractIdle` (`0x10`)
+block at `0x801DDB74..0x801DDCF4`, which is where every player-visible law of
+the title menu lives:
+
+| Law | Retail | Where it is now |
+|---|---|---|
+| Cursor step | `Down 0x4000` `+1` / `Up 0x1000` `-1`, cue `0x21` (`0x801DDB9C..0x801DDBE0`) | `TitleMenuState::step` |
+| Row space | `andi v1,v1,0x1` at `0x801DDC00` - two rows | `TITLE_MENU_ROWS` |
+| Confirm | `pad & 0x844` (Start / L1 / Cross), cue `0x20` (`0x801DDC04`) | `TitleMenuEvent::Confirmed` |
+| Input freeze | whole block skipped while countdown `< 0x11` (`0x801DDB84`) | `ATTRACT_INPUT_FREEZE_BELOW` |
+| Attract countdown | `0x5DC`, re-armed on any held pad, `-= frame scalar` (`0x801DDC74..0x801DDCC8`) | `TitleMenuState::countdown` |
+
+`engine-title::title::TitleSession` owns one and steps it every frame, so the
+native window and the browser play page share it without either host
+changing. One thing around it is still the port's own and says so in the
+module docs: the `continue_enabled` row skip, which retail does not have.
+
+The whole dispatcher is ported alongside it as
+`title_overlay::TitleTickState::step` - one arm per sub-mode plus the shared
+epilogue, over the state fields the handlers read. Its graph is the
+`STATE_204_WRITES` table, all 56 `state[+0x204]` stores with the handler and
+guard each belongs to, and `cold_boot_reachable_modes` walks it.
+
+The attract fire arm is wired on **both** hosts behind
+`TitleSession::attract_enabled`, which each host sets for itself because a
+host with no movie destination would freeze input for the last sixteen frames
+of every idle period and then do nothing. The native window plays retail's
+`fmv_id 0` through the same MDEC path the field-VM FMV trigger uses; the
+browser play page enters the same `TitlePhase::Attract` and plays it through
+its own movie lane (`play_fmv`: the page slices the STR segment out of the
+disc bytes it holds, the engine decodes it), counting a skip only when the
+page never installed the segment.
+
+The mode-graph question of which sub-mode a cold boot shows is settled: `0x10`
+always. See [`boot.md`](boot.md#a-cold-boot-always-shows-sub-mode-0x10-never-0x02).
+
+`menu.rs` remains the engine's own pause / shop / inn screen graph
+- state bytes engine-chosen, per-screen behaviour sourced from
+[`shop.md`](shop.md), [`inn.md`](inn.md) and
+[`field-menu.md`](field-menu.md) - it is simply not a port of this routine.
+
+## Ported but inert
+
+"Inert" is a reachability statement, not a correctness one: the port is
+faithful and tested, and nothing outside its own crate calls it.
+
+Still inert:
+
+- **`title_prim`** (`engine-title::title_prim`) - the SCUS sprite-emit
+  dispatcher `FUN_800198E0`, beside two forwarding shims for the libgpu
+  wrappers `FUN_80058298` / `FUN_80058490` that carry `REF:` only. No caller
+  outside its own module; tagged `REPLACED-BY:` the `engine-ui` title / save
+  draw-list builders, so no host is owed it.
+- **`move_vm_overlay_ext::step` / `walk`** - a standalone walker over
+  `FUN_801D362C`, and **no host is owed it**: a disc-wide five-form reference
+  scan for `0x801D362C` finds exactly one caller, the SCUS move-VM arm at
+  `0x80023AE0`, and the port hosts that caller live through
+  `move_vm::ext::ext_default_dispatch` (the default body of
+  `MoveHost::ext_dispatch`, inherited by `engine-core::world::vm_hosts`). The
+  module's `canonical_size` width table is live on its own account: it is the
+  disassembly-sourced mirror `move_vm::ext` is tested against, and the
+  VDF-pulse scanner (`engine-field::vdf_pulse`) reads it to skip `0x2F`
+  instructions.
+- **`World::run_actor_bytecode` / `FieldDemoHandler`** - a demo-only
+  field-actor host for the actor VM. The interpreter itself is live through
+  the menu widgets (below).
+
+Live, and worth knowing why:
+
+- **Actor / sprite VM** (`legaia_engine_vm::run`). Its programs are data
+  resident in the menu overlay
+  ([`window-script.md`](../formats/window-script.md), parser
+  `legaia_game_tables::widget_script`). `MenuRuntime::tick` runs the shop open /
+  Sell slide-away programs through the interpreter over `MenuWidgetState`
+  (`engine-menus::menu_widget`) on the transitions retail's `FUN_801DAFD4`
+  drives. Triage:
+  [`reach-triage.md`](../tooling/reach-triage.md#the-actor-vm-a-resolved-bytecode-source).
+- **`title_overlay`**. `TitleSession` (`engine-title::title`) owns both the
+  menu half ([`TitleMenuState`](#what-of-the-tick-runs-on-both-hosts)) and a
+  `TitleTickState`.
+- **`vram_rect_copy`** (called from `engine-core::world::vram_rect_fx`).
+
+Not a port at all: **`cutscene_trigger`** (`engine-system::movie::cutscene_trigger`)
+is a static catalogue of the three retail writers of the `StrInit` game mode,
+with no `PORT:` tag. Only tests and doc links read it; the trigger paths it
+names run through the field VM's op `0x4C` `0xE2` arm and `TitleSession`'s
+attract arm.
+
+Reading `port-catalog.py --live-audit`: `move_vm_overlay_ext`'s `step` and
+`walk` show as *live* there, and they are not. Both names collide with live
+free functions in the same crate (`motion_vm::step` among them), which is why
+neither carries a `NOT WIRED:` tag.
+
+## How many copies of `FUN_801D362C` exist
+
+One, in field overlay `0897`. Not one flavour per overlay: all seven dumps -
+six capture-derived and the `0897` static one - carry the same 1293
+instructions with a byte-identical disassembly section. The whole-file
+line-count spread between those dumps is header and decompiled-section noise.
+
+The consequence is a real constraint on the engine: op `0x2F` is executable
+only while `0897` is resident, so battle-side move records cannot reach the
+extension dispatcher at all.

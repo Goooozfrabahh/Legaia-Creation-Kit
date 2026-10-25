@@ -1,0 +1,89 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">formats</a> &middot; standalone tim-pack format</div>
+  <h1>Standalone TIM-pack format <span class="tag tag-done">Confirmed</span></h1>
+  <p class="lede">The &ldquo;TIM-pack&rdquo; is a reader, not a container of its own. The entries it opens - each scene's bundle of textures, and the two hidden entries at the head of <code>PROT.DAT</code> holding the cursor, menu glyphs and UI sprite sheets - are an ordinary <a href="pack.html">pack</a> sitting behind a 4-byte DATA_FIELD <code>TIM_LIST</code> chunk header. The reader skips that header, and its &ldquo;marker byte&rdquo; and <code>+4</code> offset math are simply the header seen from the inside.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>What it really is</dt><dd>chunk header <code>(0x01 &lt;&lt; 24) | payload_len</code> + an <a href="pack.html">container-formats::pack</a> of TIMs</dd>
+    <dt>Where on disc</dt><dd>each scene's texture pack at raw-TOC <code>+4</code> of its CDNAME block; raw TOC entries 0 and 1 (boot system UI, GAME OVER page)</dd>
+    <dt>Offset math</dt><dd><code>byte_offset = word_index * 4 + 4</code></dd>
+    <dt>Parser</dt><dd><code>legaia_prot::timpack</code> (<code>is_tim_pack</code>, <code>detected_ext</code>); boot bundle <code>legaia_ui_formats::system_ui_bundle</code></dd>
+    <dt>Confidence</dt><dd>Confirmed - retail uploader traced, layout pinned on the real disc</dd>
+    <dt>Used by</dt><dd><a href="../subsystems/boot.html">boot sequence</a>, <a href="../subsystems/field-menu.html">pause menu</a> glyphs, <a href="../viewer.html">asset viewer</a></dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="layout">
+  <h2>Layout</h2>
+  <p>Read as a TIM-pack, the first eight bytes are a discriminator and a member count; read as what they are, they are a chunk header whose top byte is the <code>TIM_LIST</code> type (<code>0x01</code>) and whose low 24 bits are the payload length, followed by the pack's own <code>u32 count</code>.</p>
+  <div class="byte-map">
+    <div class="bm-cell bm-dim" style="--w:3"><span class="bm-off">+0x00</span><span class="bm-name">payload_len (low 24 bits)</span><span class="bm-size">u8 &times; 3</span></div>
+    <div class="bm-cell bm-accent" style="--w:1"><span class="bm-off">+0x03</span><span class="bm-name">0x01</span><span class="bm-size">type</span></div>
+    <div class="bm-cell" style="--w:4"><span class="bm-off">+0x04</span><span class="bm-name">tim_num</span><span class="bm-size">u32</span></div>
+    <div class="bm-cell" style="--w:8"><span class="bm-off">+0x08</span><span class="bm-name">word_index[tim_num]</span><span class="bm-size">u32 each</span></div>
+    <div class="bm-cell bm-dim" style="--w:8"><span class="bm-off">&hellip;</span><span class="bm-name">members back to back</span><span class="bm-size">TIMs</span></div>
+  </div>
+  <ul class="bullets">
+    <li><strong>Detection</strong> (<code>is_tim_pack</code>): <code>byte[3] == 0x01</code> and <code>byte[2] &lt; 0x10</code> (the type byte, and the top of a payload length under 1&nbsp;MB), <code>tim_num</code> positive, and the offset table inside the blob. <code>byte[2]</code> is <em>not</em> the count.</li>
+    <li><strong>Offsets</strong> are word indices relative to the pack, which starts four bytes in - hence <code>byte_offset = word_index * 4 + 4</code>. The <a href="pack.html">pack</a> reader computes the same offsets from the pack's own start.</li>
+    <li><strong>Member typing</strong> (<code>detected_ext</code>): first byte <code>0x10</code> (TIM magic) &rarr; <code>"TIM"</code>, else <code>"BIN"</code>. The boot bundle below is why the &ldquo;else&rdquo; branch exists.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="boot-resident-system-ui-instance-raw-toc-entries-0-and-1">
+  <h2>Raw TOC entries 0 and 1: the boot system UI and the GAME OVER page</h2>
+  <p>The two entries at the head of <code>PROT.DAT</code>'s TOC are both TIM-packs. They sit in the region the extraction index space skips - the game's own TOC counts entries 2 higher than this project's extraction, so raw entry <code>p + 2</code> = extraction entry <code>p</code> (see <a href="prot.html#in-ram-toc">PROT TOC</a>). They are CDNAME's two head names, and they have different loaders. Raw entry 0 (<code>init_data</code>) is the <strong>system UI</strong>: the cursors, menu glyphs and sprite sheets that the boot image <code>init.pak</code> (PROT 0895) uploads once and never evicts, resident in video memory from the title screen through every scene and mode. Raw entry 1 (<code>gameover_data</code>) belongs to the GAME OVER screen and only that overlay loads it (<a href="../subsystems/boot-internals.html#system-ui-gap">loaders</a>).</p>
+  <p class="hint">The coordinates below are framebuffer positions in the PSX's 1024&times;512 video memory (VRAM), where images and palettes both live as pixels. A CLUT is such a palette: a 16- or 256-colour lookup table stored as a row of framebuffer pixels.</p>
+  <p>Raw entry 0 (sectors 3..55) declares 20 members:</p>
+  <table>
+    <thead><tr><th><code>PROT.DAT</code> offset</th><th>Member</th><th>VRAM placement</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x01858</code></td><td>boot cursor</td><td>-</td></tr>
+      <tr><td><code>0x018E0</code></td><td>system-UI sprite sheet</td><td>image <code>(896,256)</code> 64&times;192</td></tr>
+      <tr><td><code>0x07B00</code>, <code>0x07F40</code></td><td>UI elements</td><td>-</td></tr>
+      <tr><td>-</td><td>four small TIMs</td><td>CLUTs at <code>(896, 498..=501)</code></td></tr>
+      <tr><td><code>0x11218</code></td><td><strong>menu-glyph / interior-page atlas</strong> (extractors <code>legaia_ui_formats::interior_page</code> / <code>menu_glyph_atlas</code>)</td><td>image <code>(960,256)</code> 64&times;256, declared CLUT <code>(0,510,16,16)</code></td></tr>
+      <tr><td><code>0x19438</code></td><td>UI sprite strip</td><td>image <code>(960,400)</code> 60&times;24</td></tr>
+      <tr><td><code>0x1A018..0x1AA7C</code></td><td>six bare row-patch members (<a href="#deviating-shapes">below</a>)</td><td>rows 456..462 of the atlas</td></tr>
+      <tr><td><code>0x1AC90..0x1AED0</code></td><td>four cursor-part TIMs</td><td>images at <code>(976,256..)</code></td></tr>
+    </tbody>
+  </table>
+  <p>Raw entry 1's single TIM is the GAME OVER page at image <code>(640,0)</code> with a 256-entry CLUT declared <code>(0,480,256,1)</code>, followed by a pack of 29 TMDs. No retail field, battle or menu save state holds its palette.</p>
+  <p>Because the bundle never leaves VRAM, field environment meshes can reference palette cells on row 510 that no scene TIM ever uploads (<code>town01</code> env slots 21/26/74, <code>rikuroa</code> slots 50/51/63). In the port, the scene VRAM pre-pass uploads raw entry 0 the same way (<code>SceneResources</code> with <code>BuildOptions::system_ui</code>, through <code>upload_boot_resident_to_vram</code>), byte-exact against retail VRAM, and leaves raw entry 1 out.</p>
+  <details class="disclosure" id="deviating-shapes">
+    <summary>Two member shapes that deviate from a plain TIM list</summary>
+    <div class="disclosure-body">
+      <ul class="bullets">
+        <li><strong>Flat-strip CLUT upload.</strong> The retail per-TIM uploader writes every member TIM's CLUT block as a flattened <code>(clut_x, clut_y, w*h, 1)</code> strip, NOT the declared <code>w &times; h</code> rect - which for the row-510/511 banks would overflow VRAM at <code>y &gt;= 512</code>. The bundle's strips populate CLUT rows 510/511 (<code>fb_x</code> 0..320) plus the <code>(896, 498..=501)</code> / <code>(976, 304..=307)</code> side cells; raw entry 1's row-480 strip lands only when the GAME OVER overlay loads it. See <a href="npc-palette.html">npc-palette</a> for the row layout and capture evidence.</li>
+        <li><strong>Row-patch members.</strong> Six members carry no TIM magic: an 8-byte preamble followed by a bare TIM-style image block <code>[u32 bnum][u16 x][u16 y][u16 w][u16 h]</code> + halfword data (<code>bnum = 12 + w*h*2</code>). All six declare <code>(960, y, 256, 1)</code> for <code>y &isin; {456, 457, 458, 460, 461, 462}</code> - single rows patched over the atlas image, VRAM-edge-clipped to the visible 64 words. Live captures hold exactly these bytes over the disc atlas at those rows, in every phase.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <details class="disclosure"><summary>Provenance</summary>
+    <div class="disclosure-body">
+      <p>The retail per-TIM uploader <code>FUN_800198E0</code> (<code>ghidra/scripts/funcs/800198e0.txt</code>) walks the pack with the <code>word_index * 4 + 4</code> arithmetic and uploads each member's CLUT as a flat strip. Member offsets, VRAM placements and the six row-patch shapes are pinned on the real disc, and the engine's boot upload matches retail VRAM captures byte for byte.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="pack.html">container-formats::pack</a>
+    <a href="field-pack.html">field-pack</a>
+    <a href="prot.html">PROT.DAT TOC</a>
+    <a href="tim.html">TIM</a>
+    <a href="npc-palette.html">NPC palette rows</a>
+    <a href="../subsystems/boot.html">Boot sequence</a>
+    <a href="../subsystems/renderer.html">Renderer</a>
+    <a href="../viewer.html">Asset viewer</a>
+  </div>
+</section>

@@ -1,0 +1,256 @@
+//! Field VM control-flow opcode handlers extracted verbatim from `step`.
+
+use super::*;
+
+/// Field VM opcode `0x4E` (inventory compare-and-jump), extracted verbatim from `step`.
+pub(super) fn op_4e<H: FieldHost>(
+    host: &mut H,
+    bytecode: &[u8],
+    pc: usize,
+    opcode: u8,
+    header_size: usize,
+    operand: usize,
+) -> StepResult {
+    let Some(&page) = bytecode.get(operand) else {
+        return StepResult::Unknown { opcode, pc };
+    };
+    let Some(&mode_byte) = bytecode.get(operand + 1) else {
+        return StepResult::Unknown { opcode, pc };
+    };
+    let sub_op = mode_byte >> 4;
+    match sub_op {
+        0 | 1 => {
+            let Some(&arg_lo) = bytecode.get(operand + 2) else {
+                return StepResult::Unknown { opcode, pc };
+            };
+            let Some(&arg_hi) = bytecode.get(operand + 3) else {
+                return StepResult::Unknown { opcode, pc };
+            };
+            let Some(&skip_lo) = bytecode.get(operand + 4) else {
+                return StepResult::Unknown { opcode, pc };
+            };
+            let Some(&skip_hi) = bytecode.get(operand + 5) else {
+                return StepResult::Unknown { opcode, pc };
+            };
+            let arg = i32::from(u16::from_le_bytes([arg_lo, arg_hi]));
+            let (state, factor) = host.char_hp_mp_pair(page, sub_op);
+            let raw = factor.wrapping_mul(arg);
+            let scaled = if raw < 0 { (raw + 0xFF) >> 8 } else { raw >> 8 };
+            let cmp = mode_byte & 0x0F;
+            let taken = match cmp {
+                0 => state < scaled,
+                1 => scaled < state,
+                _ => false,
+            };
+            if taken {
+                StepResult::Advance {
+                    next_pc: rel_jump(pc + header_size + 4, skip_lo, skip_hi),
+                }
+            } else {
+                StepResult::Advance {
+                    next_pc: pc + header_size + 6,
+                }
+            }
+        }
+        // Sub-ops 2..=9 share the 7-byte compare-and-skip shape with 0/1,
+        // minus the `factor * arg >> 8` scaling. The raw jump table at
+        // 0x801CEE30 routes each to a value loader that joins the shared
+        // compare at 0x801E0B40; the earlier "absolute jump to u16" (and
+        // sub-4 "rand -> next PC") reading was the Ghidra decomp's
+        // collapsed bare-`break` switch arms - falsified by the raw
+        // loader bodies at 0x801E0AC0..0x801E0B34.
+        2..=9 => {
+            let Some(&arg_lo) = bytecode.get(operand + 2) else {
+                return StepResult::Unknown { opcode, pc };
+            };
+            let Some(&arg_hi) = bytecode.get(operand + 3) else {
+                return StepResult::Unknown { opcode, pc };
+            };
+            let Some(&skip_lo) = bytecode.get(operand + 4) else {
+                return StepResult::Unknown { opcode, pc };
+            };
+            let Some(&skip_hi) = bytecode.get(operand + 5) else {
+                return StepResult::Unknown { opcode, pc };
+            };
+            let scaled = i32::from(u16::from_le_bytes([arg_lo, arg_hi]));
+            let state: i32 = match sub_op {
+                // 0x801E0AC0: char record `page` level byte +0x130.
+                2 => host.char_level(page),
+                // 0x801E0AEC / 0x801E0B34: gold / coin bank (same globals
+                // as the 9-byte sub-10/11 forms, compared vs a u16 here).
+                3 => host.party_bank_value(10),
+                9 => host.party_bank_value(11),
+                // 0x801E0AFC: BIOS Rand() & 0xFF - a random-chance branch.
+                4 => host.bios_rand() & 0xFF,
+                // 0x801E0B0C: slot table 0x801C6460[sub - 5] (s16).
+                _ => i32::from(host.slot_table_read(sub_op - 5)),
+            };
+            let cmp = mode_byte & 0x0F;
+            let taken = match cmp {
+                0 => state < scaled,
+                1 => scaled < state,
+                _ => false,
+            };
+            if taken {
+                StepResult::Advance {
+                    next_pc: rel_jump(pc + header_size + 4, skip_lo, skip_hi),
+                }
+            } else {
+                StepResult::Advance {
+                    next_pc: pc + header_size + 6,
+                }
+            }
+        }
+        12..=15 => {
+            // sub-ops 12..=15 hit the dispatcher's default arm at
+            // `switchD_801e0a38_default`: with `uVar31 = uVar27 = 0`
+            // the boolean test is false either way, and the
+            // `(sub_op - 10) < 2` check fails for sub-op >= 12, so
+            // the original returns `param_2 + 7` (= PC += 7).
+            StepResult::Advance {
+                next_pc: pc + header_size + 6,
+            }
+        }
+        10 | 11 => {
+            // 9-byte party-bank comparison:
+            //   [4E, _, mode, lo1, hi1, skip_lo, skip_hi, lo2, hi2]
+            // Original packs `LE_u16(operand[2..4])` into the low half
+            // of a u32 and `LE_u16(operand[6..8])` into the high half,
+            // then compares it (signed) against the bank value.
+            let Some(&lo1) = bytecode.get(operand + 2) else {
+                return StepResult::Unknown { opcode, pc };
+            };
+            let Some(&hi1) = bytecode.get(operand + 3) else {
+                return StepResult::Unknown { opcode, pc };
+            };
+            let Some(&skip_lo) = bytecode.get(operand + 4) else {
+                return StepResult::Unknown { opcode, pc };
+            };
+            let Some(&skip_hi) = bytecode.get(operand + 5) else {
+                return StepResult::Unknown { opcode, pc };
+            };
+            let Some(&lo2) = bytecode.get(operand + 6) else {
+                return StepResult::Unknown { opcode, pc };
+            };
+            let Some(&hi2) = bytecode.get(operand + 7) else {
+                return StepResult::Unknown { opcode, pc };
+            };
+            let low = u16::from_le_bytes([lo1, hi1]) as u32;
+            let high = u16::from_le_bytes([lo2, hi2]) as u32;
+            let scaled = (low | (high << 16)) as i32;
+            let state = host.party_bank_value(sub_op);
+            let cmp = mode_byte & 0x0F;
+            let taken = match cmp {
+                0 => state < scaled,
+                1 => scaled < state,
+                _ => false,
+            };
+            if taken {
+                StepResult::Advance {
+                    next_pc: rel_jump(pc + header_size + 4, skip_lo, skip_hi),
+                }
+            } else {
+                StepResult::Advance {
+                    next_pc: pc + header_size + 8,
+                }
+            }
+        }
+        // `mode_byte >> 4` is at most 0xF; arms above cover every
+        // value, so this arm is dead code.
+        16..=u8::MAX => unreachable!("mode_byte >> 4 is at most 0xF"),
+    }
+}
+
+/// Field VM opcode `0x49` (STATE_RESUME), extracted verbatim from `step`.
+pub(super) fn op_49<H: FieldHost>(
+    host: &mut H,
+    ctx: &mut FieldCtx,
+    bytecode: &[u8],
+    pc: usize,
+    opcode: u8,
+    header_size: usize,
+    operand: usize,
+) -> StepResult {
+    let Some(&sub_op) = bytecode.get(operand) else {
+        return StepResult::Unknown { opcode, pc };
+    };
+    match host.op49_state() {
+        Op49State::Idle => {
+            if sub_op > 0xD {
+                return StepResult::Halt { final_pc: pc };
+            }
+            // Hand the host the instruction (opcode onward) so it can
+            // recognise an inline menu payload (e.g. a shop record) and
+            // open the right overlay before the op suspends. `operand`
+            // is `pc + header_size`, so `operand - 1` is the opcode byte
+            // (works for the extended-script header too).
+            host.op49_menu_request(sub_op, &bytecode[operand - 1..]);
+            host.op49_invoke_setup();
+            let captured = if sub_op == 1 { ctx.field_90 } else { 0 };
+            // Retail stores the *operand pointer* here (`sw s6,-0x4bb0(s0)`
+            // at `0x801e09a8`), and every consumer reads that pointer's
+            // first byte - the sub-op. The port has no RAM pointer, so the
+            // sub-op is handed over directly.
+            host.op49_arm(sub_op, pc, captured);
+            StepResult::Halt { final_pc: pc }
+        }
+        Op49State::Armed => StepResult::Halt { final_pc: pc },
+        Op49State::Done => {
+            host.op49_clear();
+            match sub_op {
+                // sub-0 in DONE state - embedded MES bytecode walker.
+                // Instruction: `[49, 0, x, length, ...length args...,
+                // ...mes_bytes]`. With `s6` the operand pointer (`s6[0]` is
+                // the sub-op the arm branches on at `0x801E08E4`), the arm
+                // reads `length = s6[2]` (`lbu a0,0x2(s6)` at `0x801E08EC`),
+                // walks the inline MES from `s6 + length + 3`
+                // (`FUN_8003CA38`: counts bytes > 0x1E, pair-extends 0xCx
+                // prefix bytes) and advances PC by `length + 5 + walked`.
+                // A shop record is this shape: `49 00 00 <count> <ids>
+                // <name\0>`, so `length` is the id count and the walk is
+                // the name, and the talk resumes on the line after it.
+                // `s6[1]` is not read here.
+                // REF: FUN_801DE840 (case 0x49 Done sub-0, 0x801E08DC..0x801E0910)
+                0 => {
+                    let Some(&length) = bytecode.get(operand + 2) else {
+                        return StepResult::Unknown { opcode, pc };
+                    };
+                    let mes_start = operand + 3 + length as usize;
+                    if mes_start > bytecode.len() {
+                        return StepResult::Unknown { opcode, pc };
+                    }
+                    let mes_count = walk_mes_bytecode(&bytecode[mes_start..]);
+                    StepResult::Advance {
+                        next_pc: pc + header_size + 4 + length as usize + mes_count,
+                    }
+                }
+                1 | 3 | 7 => StepResult::Advance {
+                    next_pc: pc + header_size + 2,
+                },
+                2 | 4 => StepResult::Advance {
+                    next_pc: pc + header_size + 6,
+                },
+                5 => StepResult::Advance {
+                    next_pc: pc + header_size + 13,
+                },
+                // sub-6/8/9/C/D in Done all jump through LAB_801df898
+                // which does `addiu s8, s8, 0x5; j 0x801df89c` -
+                // PC += 5 from the opcode (= header_size + 4 past
+                // the sub-op byte). The original reads
+                // `_DAT_8007babc` into a register but only
+                // sub-paths lower in the dispatch (e.g. the 0x4C
+                // sub-3 sub-C wrapper) consume it; in the 0x49 Done
+                // arm it's used purely as a side-effect register.
+                6 | 8 | 9 | 0xC | 0xD => StepResult::Advance {
+                    next_pc: pc + header_size + 4,
+                },
+                // sub-A / sub-B / any other byte > 0xD: the Done-side
+                // catch-all in `FUN_801de840 case 0x49` clears the
+                // resume slot and returns `param_2` (halt at PC).
+                // `op49_clear()` was already called above, so this is
+                // just the halt.
+                _ => StepResult::Halt { final_pc: pc },
+            }
+        }
+    }
+}

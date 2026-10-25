@@ -1,0 +1,192 @@
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">formats</a> &middot; item-effect table</div>
+  <h1>Item-effect descriptor table <span class="tag tag-done">Confirmed</span></h1>
+  <p class="lede">What does a Healing Leaf actually <em>do</em>, and why is a Door of Light greyed out in battle?
+  A small static table in <code>SCUS_942.54</code> answers both: for each consumable it records the <strong>kind</strong>
+  of effect - heal HP, restore MP, cure status, revive, raise a stat, escape a dungeon - its target shape (one ally
+  or the whole party) and where it may be used (field menu, battle, both, neither). What it does <strong>not</strong>
+  hold is the number: "restores 200 HP" lives in a separate tier-indexed table.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>In the game</dt><dd>every item use from the field menu or the battle Item command; which items are greyed out where</dd>
+    <dt>Magic / marker</dt><dd>none - a fixed table in <code>SCUS_942.54</code></dd>
+    <dt>Lives in</dt><dd>SCUS VA <code>DAT_800752C0</code> (file <code>0x65AC0</code>), 130 &times; 4-byte records, ending where the <a href="spell-table.html">spell table</a> begins; heal amounts at <code>0x8007655C</code></dd>
+    <dt>Retail readers</dt><dd>menu-usability gate, field list builder, apply handler (<a href="#how-we-know">how we know</a>)</dd>
+    <dt>Parser</dt><dd><code>legaia_game_tables::item_effect::ItemEffectTable</code> (<code>from_scus</code>, <code>heal_amounts</code>, <code>restore_amount</code>, <code>stat_effect</code>)</dd>
+    <dt>Confidence</dt><dd>Confirmed - Ghidra-traced readers; the parsed bytes cross-check against each item's on-disc description string</dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="overview">
+  <h2>What it is and is not</h2>
+  <div class="notice">
+    <div class="notice-title">The amounts are not here</div>
+    <p>This table holds <strong>class + tier + flags</strong>. "Healing Leaf restores 200 HP" is split in two: this table says <code>(class = heal-HP, tier = 0)</code>, and the <code>tier &rarr; 200</code> mapping is the separate, also-static <a href="#heal-amounts">heal-amount table</a>. Stat-up and buff magnitudes (classes 5/6/7) are inline immediates in the apply handler.</p>
+  </div>
+  <p>It is the sibling of the <a href="item-table.html">item-name table</a> and the <a href="spell-table.html">spell table</a>: the three are contiguous static data. The lookup is double-indirected - an item id resolves to a <em>subtype</em> byte in its name-table record, and the subtype picks a descriptor here - so many items share one descriptor, and "key items are unusable" is not a special case at all: a key item simply resolves to a descriptor with neither usability bit set.</p>
+  <ol class="steps">
+    <li><b>item id &rarr; subtype</b><span><code>item_name_table[id].byte(+1)</code> (<a href="item-table.html">item table</a>)</span></li>
+    <li><b>subtype &rarr; descriptor</b><span><code>DAT_800752C0[subtype * 4]</code> - class, tier, flags, passive index</span></li>
+    <li><b>descriptor &rarr; amount</b><span>HP / MP classes read the <a href="#heal-amounts">tier tables</a>; stat classes use handler immediates</span></li>
+  </ol>
+</section>
+
+<section class="doc-section" id="table-layout">
+  <h2>Record layout (4 bytes, 130 records)</h2>
+  <div class="byte-map" role="img" aria-label="Item-effect record: class, tier, flags, passive index, one byte each">
+    <div class="bm-cell bm-accent" style="--w:1"><span class="bm-off">+0</span><span class="bm-name">class</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell" style="--w:1"><span class="bm-off">+1</span><span class="bm-name">tier</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell bm-accent" style="--w:1"><span class="bm-off">+2</span><span class="bm-name">flags</span><span class="bm-size">u8</span></div>
+    <div class="bm-cell bm-dim" style="--w:1"><span class="bm-off">+3</span><span class="bm-name">passive index</span><span class="bm-size">u8</span></div>
+  </div>
+  <table class="layout">
+  <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><strong>class</strong></td><td>effect class - the action-validator arm (<a href="#class-map">table below</a>)</td></tr>
+    <tr><td><strong>tier</strong></td><td>per-class sub-case; heal-HP <code>0/1/2</code> = 200 / 800 / full, stat-up = which stat, arts book = the art id granted</td></tr>
+    <tr><td><strong>flags</strong></td><td>populated / info-panel / all-party / battle-usable / field-usable bits (below)</td></tr>
+    <tr><td>passive-effect index</td><td><code>0x00..=0x3F</code> for accessory / quest-item rows (the <a href="accessory-passive-table.html">accessory-passive table</a>); <code>0x41</code> = no-passive sentinel on consumable rows</td></tr>
+  </tbody>
+  </table>
+  <h3 id="flags">Flag byte (<code>+2</code>)</h3>
+  <table>
+  <thead><tr><th>Bit</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>0x80</code></td><td>populated - set on every descriptor that has an effect</td></tr>
+    <tr><td><code>0x40</code></td><td>target <strong>side</strong> is the enemy party (clear = the ally party); paired with <code>0x20</code> it selects one of four target modes - set on exactly five subtypes, the Point Card and two pairs for the summon flutes. Three consumables select them - the Point Card, the Lippian Flute (subtype <code>0x27</code>, <code>0xC4</code>) and the Spikefish Flute (subtype <code>0x28</code>, <code>0xE4</code>); the <code>0xC6</code> / <code>0xE6</code> rows (subtypes <code>0x23</code>, <code>0x24</code>) are selected by no consumable (see <a href="../subsystems/shop.html">shop</a>)</td></tr>
+    <tr><td><code>0x20</code></td><td><strong>all</strong> targets on the selected side (clear = one)</td></tr>
+    <tr><td><code>0x04</code></td><td>usable from the <strong>battle</strong> item menu</td></tr>
+    <tr><td><code>0x02</code></td><td>usable from the <strong>field</strong> item menu</td></tr>
+  </tbody>
+  </table>
+  <p>The <code>0x40</code>/<code>0x20</code> pair is read in exactly one place: the battle Item command in <code>FUN_801D0748</code> (PROT 0898) loads the flag byte at <code>0x801D18D8</code> and forks on <code>andi 0x40</code> / <code>andi 0x20</code> at <code>0x801D18E0</code>/<code>0x801D18E8</code> into phase <code>0x5B</code> (one enemy), <code>0x5D</code> (all enemies), <code>0x64</code> (one ally) or <code>0x66</code> (all allies). The magic arm runs the identical ladder on the spell table’s <code>+2</code> byte at <code>0x801D1C50</code>, and the two tables’ low nibbles agree - an item’s <code>0xC4</code> is the spell table’s “one enemy” <code>0x44</code> with the <code>0x80</code> bit added. Sweeping every image for a <code>+2</code> load followed by <code>andi 0x40</code> finds those two sites and nothing else; the item-info panel <code>FUN_801D0F1C</code> contains no <code>andi 0x40</code> at all, and its <code>slti 0x40</code> tests the record’s <code>+3</code> passive index against the no-passive sentinel, a different field.</p>
+  <p>Healers carry <code>0x04 | 0x02</code>; permanent stat-ups and field-utility items carry <code>0x02</code> only; status-cures and revive carry <code>0x04</code> only. Key items resolve to a descriptor with <strong>neither</strong> usability bit (e.g. flag <code>0x89</code>), which is how the menu greys them out. The class byte is meaningful only together with the usability flags - many key items funnel to class <code>0</code> with no usability bit, so "class 0" alone is not "an HP potion".</p>
+</section>
+
+<section class="doc-section" id="class-map">
+  <h2>Class byte (<code>+0</code>)</h2>
+  <p>Class labels are validated against the on-disc item description strings:</p>
+  <table>
+  <thead><tr><th>Class</th><th>Effect</th><th>Example item</th></tr></thead>
+  <tbody>
+    <tr><td><code>0</code> / <code>1</code></td><td>heal HP, one ally / whole party</td><td>Healing Leaf / Healing Bloom</td></tr>
+    <tr><td><code>2</code></td><td>restore MP</td><td>Magic Leaf</td></tr>
+    <tr><td><code>3</code> / <code>8</code></td><td>cure all status / cure single status</td><td>Medicine / Antidote</td></tr>
+    <tr><td><code>4</code></td><td>revive</td><td>Phoenix</td></tr>
+    <tr><td><code>5</code></td><td>extend action gauge (one battle)</td><td>Fury Boost</td></tr>
+    <tr><td><code>6</code></td><td>permanent stat-up (tier = which stat)</td><td>Miracle Water, the Water line</td></tr>
+    <tr><td><code>7</code></td><td>temporary stat buff (one battle, &times;6/5)</td><td>Power Elixir</td></tr>
+    <tr><td><code>11</code>/<code>12</code>/<code>13</code></td><td>arts book (Fire/Wind/Thunder; tier = the art id granted)</td><td>Fire Book I</td></tr>
+    <tr><td><code>14</code></td><td>Point Card strike - reached by item <code>0xFE</code> through an id test in the battle action state machine, not through a descriptor</td><td>Point Card</td></tr>
+    <tr><td><code>126</code>/<code>127</code></td><td>summon flute</td><td>Lippian Flute, Spikefish Flute</td></tr>
+    <tr><td><code>128</code> / <code>129</code></td><td>field escape (dungeon) / field warp (city)</td><td>Door of Light / Door of Wind</td></tr>
+    <tr><td><code>130</code></td><td>reduce encounter rate</td><td>Incense</td></tr>
+  </tbody>
+  </table>
+  <h3 id="arts-books">Arts books: the tier is an art id</h3>
+  <p>Classes <code>11</code>/<code>12</code>/<code>13</code> write the tier byte verbatim into a per-character learned-art list (kept sorted by id), so the tier <em>is</em> the art the book grants, not a book level. The character comes from the class alone - <code>class - 11</code> is the roster slot (0 / 1 / 2) - and the target the menu highlights is never read, so a Fire Book always lands on the same roster slot. The field VM's grant arm <code>4C C7</code> calls the same applier with the slot plus <code>0xB</code>. On disc the nine books carry tiers Fire <code>3/2/1</code>, Wind <code>5/4/1</code>, Thunder <code>3/2/1</code> for I/II/III, all with flag <code>0x83</code> (field use only).</p>
+  <details class="disclosure">
+    <summary>Class 14: the Point Card strike, reached by item id</summary>
+    <div class="disclosure-body">
+      <p>The class-14 arm of the apply handler takes <code>min(points_bank, 9999)</code> off the Point Card bank and applies it as battle damage - a strike scaling with how much the player has shopped. Decoding all 256 item records finds no item carrying class 14, but the arm is live: the battle action state machine tests for item <code>0xFE</code> at <code>0x801E4080</code> and forces the selector to <code>0x0E</code> at <code>0x801E40C0</code>, so the Point Card itself runs it.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="heal-amounts">
+  <h2>Heal-amount table</h2>
+  <p>The literal restore amounts the apply handler reads: two contiguous <code>u16[4]</code> sub-tables indexed by the descriptor tier (<code>base + tier*2</code>); only tiers <code>0..=2</code> are read flat.</p>
+  <table>
+  <thead><tr><th>VA</th><th>Sub-table</th><th>Tier 0</th><th>Tier 1</th><th>Tier 2</th><th>Read by</th></tr></thead>
+  <tbody>
+    <tr><td><code>0x8007655C</code> (file <code>0x66D5C</code>)</td><td>HP restore cap</td><td><code>200</code></td><td><code>800</code></td><td><code>9999</code></td><td>classes <code>0</code> / <code>1</code></td></tr>
+    <tr><td><code>0x80076564</code></td><td>MP restore cap</td><td><code>50</code></td><td><code>200</code></td><td><code>20</code></td><td>class <code>2</code></td></tr>
+  </tbody>
+  </table>
+  <ul class="bullets">
+    <li>Each restore is <strong>deficit-clamped</strong> (<code>applied = min(max - current, table[tier])</code>), so tier 2's <code>9999</code> is an effective full restore.</li>
+    <li>Tier <code>3+</code> HP heals do not read this table - they are character-relative, scaled off the per-character Seru-heal tables.</li>
+    <li>Revive (class <code>4</code>) is not a flat amount: tier 0 restores <code>max_hp&times;0.4 + rand()%(max_hp/8)</code>, higher tiers a full revive.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="stat-items">
+  <h2>Stat-up / buff items (classes 5/6/7)</h2>
+  <p>These classes read no data table - their magnitudes are inline immediates in the apply handler's <code>case 5/6/7</code>, so the <code>(class, tier) &rarr; effect</code> mapping is pinned to the disassembly while each item's <code>(class, tier)</code> is parsed from the descriptor. In brief: the Water line adds a flat permanent increment to one stat (tier selects which), the Elixirs multiply a battle-actor stat by <code>6/5</code> for the rest of the battle, and Fury Boost widens the action gauge. Parser: <code>stat_effect(id)</code> &rarr; <code>ActionGauge</code> / <code>Permanent</code> / <code>BuffOneBattle</code>.</p>
+  <details class="disclosure">
+    <summary>Full magnitude tables (Waters, Elixirs, Fury Boost)</summary>
+    <div class="disclosure-body">
+      <h4>Class 6 - permanent stat-up (field-use, flag <code>0x82</code>)</h4>
+      <p>Adds a flat increment to the <a href="save-record.html">character record</a>, <code>tier</code> selecting the stat:</p>
+      <table>
+      <thead><tr><th>Tier</th><th>Stat</th><th>Record offset</th><th>Delta</th><th>Cap</th><th>Item</th></tr></thead>
+      <tbody>
+        <tr><td>0</td><td>Max HP</td><td><code>+0x11C</code></td><td>+16</td><td>9999</td><td>Life Water (<code>0x82</code>)</td></tr>
+        <tr><td>1</td><td>ATK</td><td><code>+0x124</code></td><td>+4</td><td>999</td><td>Power Water (<code>0x83</code>)</td></tr>
+        <tr><td>2</td><td>DEF (both facets)</td><td><code>+0x126</code> / <code>+0x128</code></td><td>+4</td><td>999</td><td>Guardian Water (<code>0x84</code>)</td></tr>
+        <tr><td>3</td><td>SPD</td><td><code>+0x12A</code></td><td>+4</td><td>999</td><td>Swift Water (<code>0x85</code>)</td></tr>
+        <tr><td>4</td><td>INT</td><td><code>+0x12C</code></td><td>+4</td><td>999</td><td>Wisdom Water (<code>0x86</code>)</td></tr>
+        <tr><td>5</td><td>Max MP</td><td><code>+0x11E</code></td><td>+8</td><td>999</td><td>Magic Water (<code>0x87</code>)</td></tr>
+        <tr><td>6</td><td>all (AGL/HP/ATK/SPD/INT/MP/DEF)</td><td>-</td><td>+4 each</td><td>AGL 280, HP 9999, else 999</td><td>Honey (<code>0x65</code>), Miracle Water (<code>0x6D</code>)</td></tr>
+      </tbody>
+      </table>
+      <p id="stat-up-base-window">The handler writes the <strong>base</strong> window (<code>+0x11C..+0x12C</code>) and nothing else. The live window follows because the menu's use routine (<code>FUN_801D8308</code>) calls the stat aggregator straight after it. The aggregator copies each base value over its live one, adds the equipment's percent boosts off the base (ability bit 0 a tenth of base Max HP, bit 1 a quarter, bits 2 and 3 the same two for Max MP), clamps to <code>9999</code> / <code>999</code>, and lowers a current value that now exceeds its maximum. So a raised maximum is the base plus whatever boost is worn, and the gain is not refilled: current HP / MP stay where they were.</p>
+      <p>Port: <code>World::apply_stat_up_item</code> raises the base window and <code>World::rebuild_record_live_hp_mp</code> rebuilds the two maxima from it - the same rebuild <code>World::refresh_party_ability_bits</code> runs for every party member, so an equipment change moves the maxima with the accessory. The combat stats take the base raise and the same increment on the live value, which the battle seed re-derives from the base.</p>
+      <h4>Class 7 - one-battle buff (battle-use, flag <code>0x84</code>)</h4>
+      <p>Multiplies the <strong>battle-actor</strong> stat halfwords by <code>6/5</code> (the handler's <code>uVar + uVar/5</code>), clamped to <code>0xFFFF</code>, for the rest of the battle:</p>
+      <table>
+      <thead><tr><th>Tier</th><th>Stat(s)</th><th>Item</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>SPD (<code>+0x164/+0x166</code>)</td><td>Speed Elixir (<code>0x8D</code>)</td></tr>
+        <tr><td>2</td><td>DEF, both facets (<code>+0x15C/+0x15E</code>, <code>+0x160/+0x162</code>)</td><td>Shield Elixir (<code>0x8C</code>)</td></tr>
+        <tr><td>3</td><td>ATK (<code>+0x158/+0x15A</code>)</td><td>Power Elixir (<code>0x8B</code>)</td></tr>
+        <tr><td>4</td><td>all - SPD + DEF + ATK + INT (<code>+0x168/+0x16A</code>)</td><td>Wonder Elixir (<code>0x8E</code>)</td></tr>
+      </tbody>
+      </table>
+      <p><strong>Class 5 - Fury Boost</strong> (<code>0x81</code>) sets the actor <code>+0x1F9</code> gauge flag; the action-SM gauge-build phase then sizes the gauge as <code>gauge_stat * 7 / 5 + 8</code> (clamped to <code>0x120</code>). See the buff-selector table on the <a href="../subsystems/battle-formulas.html">battle-formulas page</a>.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <details class="disclosure">
+    <summary>The readers behind each field</summary>
+    <div class="disclosure-body">
+  <table>
+    <thead><tr><th>Function</th><th>Address</th><th>What it proves</th><th>Dump</th></tr></thead>
+    <tbody>
+      <tr><td>Menu-usability gate</td><td><code>FUN_8003043C</code></td><td>The subtype &rarr; descriptor index chain; the <code>&amp; 0x20</code> all-party test selecting the all-targets validator call; an item is offered only when at least one eligible target would benefit (walks the live party calling <code>FUN_8003fb10(class, tier, target)</code> per member).</td><td><code>funcs/8003043c.txt</code></td></tr>
+      <tr><td>Field list builder</td><td><code>FUN_80030628</code></td><td>Reads the <code>0x02</code> / <code>0x04</code> usability bits - the grey-out logic.</td><td><code>funcs/80030628.txt</code></td></tr>
+      <tr><td>Apply handler</td><td><code>FUN_800402F4</code>; HP arm <code>0x800404B8</code>, MP arm <code>0x80040DC0</code>, revive arm <code>0x80040F58</code></td><td>The tier-table reads, deficit clamp, revive formula, and the class 5/6/7 immediates. One handler serves field menu and battle (branching on <code>game_mode == 0x15</code>).</td><td><code>funcs/800402f4.txt</code></td></tr>
+      <tr><td>Jump-table callers</td><td>table at <code>0x80014FA0</code> (132 entries); callers <code>0x801D84B4</code>, <code>0x801D9280</code>, <code>0x801E40DC</code></td><td>What indexes the handler depends on the caller: descriptor class (field item use), the item record's own kind byte, or the battle actor's <code>+0x1E8</code>.</td><td>overlay dumps</td></tr>
+      <tr><td>Target-panel preview</td><td><code>FUN_801D6A54</code></td><td>Gates on <code>kind == 2</code> and <code>class == 6</code> before mapping tier to a preview mode - the sibling kind-byte selector.</td><td><code>funcs/overlay_menu_801d6a54.txt</code></td></tr>
+      <tr><td>Arts-book arm</td><td><code>0x80041FC0</code> (<code>class - 0xB</code>), <code>0x80042064</code> (<code>sb</code> tier at <code>+0x74E</code>)</td><td>Tier = art id; character = class-derived roster slot; picked target unused.</td><td><code>funcs/800402f4.txt</code></td></tr>
+    </tbody>
+  </table>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="parser">
+  <h2>In the port</h2>
+  <p><code>legaia_game_tables::item_effect::ItemEffectTable::from_scus</code> resolves both tables from a <code>SCUS_942.54</code> image; <code>engine-menus::items::ItemCatalog</code> installs the usability and all-party flags and seeds the stat-up, buff and Fury Boost items from it, and <code>engine-menus::inventory_use</code> mirrors the retail menu-usability gate (a heal greys out when nobody would benefit). Source of record: <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/formats/item-effect-table.md" target="_blank" rel="noopener"><code>docs/formats/item-effect-table.md</code></a>.</p>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="item-table.html">Item-name table</a>
+    <a href="accessory-passive-table.html">Accessory passives</a>
+    <a href="spell-table.html">Spell table</a>
+    <a href="save-record.html">Per-character save record</a>
+    <a href="../shops.html">Shops</a>
+    <a href="../subsystems/inventory.html">Inventory</a>
+    <a href="../subsystems/battle-formulas.html">Battle formulas</a>
+    <a href="../reference/gamedata.html">Game-data tables</a>
+  </div>
+</section>

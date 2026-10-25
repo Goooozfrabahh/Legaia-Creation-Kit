@@ -1,0 +1,435 @@
+# Extracting assets: step-by-step scenarios
+
+## Without a terminal: Legaia Studio
+
+The release archive's `legaia-studio` (`legaia-studio.exe` on Windows,
+`Legaia Studio.app` on macOS) does the common cases with buttons:
+
+1. **Open** your disc image - the `.bin` of a Mode2/2352 dump, or its `.cue` -
+   with *Open disc image...*, by typing its path, or by dropping it on the
+   window. A folder `legaia-extract` already wrote opens too. The app checks
+   the image before loading and reopens it next time. *Recent* in the top bar
+   (and the start screen, when nothing is open) lists the last eight discs and
+   folders you opened; *x* takes one off the list, and one that has been moved
+   or deleted drops off by itself.
+2. **Browse** the archive on the left: entries grouped under their CDNAME
+   names and the place each scene is (`town01 - Rim Elm`), each entry with
+   its category and size. The search (Ctrl+F) matches every word you type
+   against the CDNAME name, the place name, the category and the index
+   (`town tmd` finds the town meshes, `rim elm` every Rim Elm scene); the
+   arrow keys, Page Up / Down, Home and End walk the list.
+3. **Preview** the selected entry: *Textures* (with a palette slider - try a
+   few rows before deciding a texture is broken), *3D model* (drag to orbit,
+   scroll to zoom; *scene* textures a mesh against the VRAM its scene
+   builds), *Audio* (play samples, play a sequence with a sound bank),
+   *Text* (scene dialog and MES messages, with the accented letters of the
+   French, German and Italian discs), *Hex*.
+4. **Export** what you are looking at: PNG, OBJ or textured glTF (`.glb`),
+   WAV, the dialog as text, or the raw entry bytes. *Disc files* at the bottom
+   of the list saves any file of the disc's own file system. After an export,
+   *Show folder* on the status line opens the folder it went to.
+5. **Extract** the whole disc: switch to *Extract*, choose an output folder
+   (it proposes one beside the disc image), tick the same skip options the
+   command line offers, and start. The tab shows progress and the log, can be
+   cancelled, and offers *Open output folder* when it ends; the folder it writes is
+   exactly what the `legaia-extract` command below produces. Tick *Export
+   all textures as PNG* to also get every texture on the disc as a PNG under
+   `tim_scan/` (the same files as the two-command chain in the next section).
+6. **Characters & monsters**: the party in their battle form with any
+   equipment, and every monster by name (`Gimard Lv2`, with its element
+   badge), each with its battle animations - for Vahn, Noa and Gala also
+   every Tactical Art by name; export them as animated `.glb`.
+7. **Movies & voice**: the disc's six movies, played with their
+   soundtrack or stepped frame by frame (PNG export), and the CD-XA audio
+   files channel by channel (play, WAV export). These read raw CD sectors,
+   so they need the disc image rather than an extracted folder.
+
+8. **Play**: the button in the top bar starts the game (`legaia-engine`,
+   which ships in the same folder) on the open disc, at the title screen.
+   Saves, key bindings and options are the same ones the game uses when you
+   start it directly, and the disc is remembered for the game too: starting
+   it later by double-clicking goes straight to the title screen instead of
+   asking for the disc. It needs the USA disc image; when it is unavailable,
+   hovering over it says why. If the game stops with an error, the status line
+   shows the end of its log and where the full log is.
+
+Messages on the status line under the path: a confirmation (an export
+written, the game started) clears itself after a few seconds; an error stays
+until you press *Dismiss*, and *Copy* puts its text on the clipboard for a bug
+report. *View* chooses a light or dark theme (or follows the desktop) and
+zooms the whole window, as do Ctrl+= / Ctrl+- / Ctrl+0; both are remembered.
+
+The window remembers its size and the view you left it on. *About* (F1) shows
+the version and where the third-party license notices
+(`THIRD-PARTY-LICENSES.txt`) sit. The app ships no game data and uploads
+nothing; it reads the disc you choose and writes only where you tell it.
+Details: [`crates/studio`](../../crates/studio/README.md); a walkthrough with
+screenshots is the project site's [desktop apps guide](https://andrewaltimit.github.io/legend-of-legaia-re/guides/desktop-apps.html).
+
+## On the command line
+
+Every scenario below assumes the one-shot pipeline has run
+([getting-started.md](getting-started.md)):
+
+```bash
+./legaia-extract "/path/to/Legend of Legaia (USA).bin" --out extracted
+```
+
+Commands use the bare `./tool` form from a release archive; source builds live
+at `target/release/`. Paths like `extracted/...` resolve against the current
+directory - run from the same place each time.
+
+## Textures → PNG
+
+The bulk texture path is a two-command chain: sweep every PROT entry for TIM
+images (raw and inside LZS compression), then convert the hits.
+`legaia-extract --all-textures` (or the Studio's *Export all textures* box)
+runs both as one step and writes the same tree.
+
+```bash
+./asset tim-scan extracted/PROT --out extracted/tim_scan
+./tim convert-dir extracted/tim_scan
+```
+
+`tim_scan/` gets one directory per PROT entry, holding files named
+`<source>_off<OFFSET>_<W>x<H>_<BPP>bpp.tim`. `<source>` is `raw` (found in
+the entry's raw bytes) or `lzs<i>` (found inside LZS section `i`), and
+`<OFFSET>` is the byte offset in that source, upper-case hex zero-padded to
+six digits. `convert-dir` writes a `.png` next to each. For a single texture:
+
+```bash
+./tim convert extracted/tim_scan/<entry>/<tim-file> -o out.png
+./tim convert <file>.tim --all-cluts        # one PNG per palette row
+```
+
+The filename is how a texture-catalog label maps to a file on disk. A label
+like `PROT 46 · LZS sec 0 +0x13368 · 128×128 4bpp · foliage` reads as: PROT
+entry 46 (`0046_vell`), inside LZS section 0, at offset `0x13368`. Every one
+of those fields is in the name, so after the sweep it lands at
+`extracted/tim_scan/0046_vell/lzs0_off013368_128x128_4bpp.tim` - convert that
+one file. `tim-scan` does the LZS decompression itself, so this
+is the whole texture path; you never need to decompress sections by hand
+(the manual-chain section below is for the rarer non-texture cases).
+
+Many TIMs carry several palettes (CLUTs) - a character atlas decoded with the
+wrong row looks like static, so try `--all-cluts` before assuming a texture is
+broken. The strict per-texture inventories the pipeline already wrote
+(`prot_tim_catalog.tsv`, `prot_tim_deep_catalog.tsv`) map every TIM to its
+owning entry and offset. Format: [tim.md](../formats/tim.md).
+
+## 3D models → OBJ
+
+Legaia's meshes are a custom TMD variant ([tmd.md](../formats/tmd.md)). Sweep
+and export:
+
+```bash
+./asset tmd-scan extracted/PROT --out extracted/tmd_scan
+./tmd dump-obj extracted/tmd_scan/<entry>/raw_off<HEX>.tmd --out mesh.obj
+```
+
+`dump-obj` writes exactly one file, at the path you give it - no extension is
+appended, so name it `.obj` yourself. Every object in the TMD becomes an `o
+object_NNN_...` group inside that one file, carrying vertices *and* faces
+decoded through the Legaia-specific primitive walker. Note: `tmd info` prints a
+`psx-walk: FAIL` line on every valid Legaia TMD - that is the diagnostic
+confirming the file is the Legaia variant rather than a standard PsyQ TMD, not
+an error.
+
+## Monsters → glTF (opens in Blender)
+
+The monster archive (PROT entry `0867_battle_data`) carries each enemy's mesh,
+texture page, and battle animations. One command bundles all three into a
+`.glb`:
+
+```bash
+./asset monster-archive extracted/PROT/0867_battle_data.BIN          # list all 186
+./asset monster-archive extracted/PROT/0867_battle_data.BIN --id 1 --glb monster1.glb
+```
+
+The listing prints every monster's name and battle stats; the `.glb` drags
+straight into Blender (or any glTF viewer) with geometry, material, and
+animation tracks intact. `--obj` / `--texture-png` export the pieces
+separately; `--anim` lists the decoded actions. Formats:
+[battle-data-pack.md](../formats/battle-data-pack.md),
+[monster-animation.md](../formats/monster-animation.md).
+
+## Whole scenes → glTF (Unity / VRChat / Blender)
+
+`legaia-engine export-glb` bakes an entire scene - assembled world map with
+its VRAM-derived texture atlas, one animated `.glb` per NPC, animated props
+(windmills, doors), and a placement manifest:
+
+```bash
+./legaia-engine export-glb --scene town01 --out glb-export
+./legaia-engine export-glb --all-scenes --out glb-export
+./legaia-engine export-glb --items --out glb-export   # every equipment item
+./legaia-engine export-glb --party --out glb-export   # Vahn / Noa / Gala's field forms
+```
+
+The files open in Blender or import into Unity; a full VRChat-world kit +
+guide lives in [`scripts/vrchat-world/`](../../scripts/vrchat-world/README.md).
+Reference: [vrchat-world-export.md](../tooling/vrchat-world-export.md). As
+with everything on this page, the output is decoded from your disc - keep
+it local.
+
+Enemy stats are **not** LZS-compressible text you can spot in a hex editor,
+and they are **not** in the player-battle files `0865`/`0866`. A `.BIN` for
+either of those extracted before the entry-size expression was corrected ends
+in enemy names like `Evil Fly`; that tail is an *over-read* into `0867` (see
+below), not their real home, and a current extraction does not have it. Always
+read enemy data through `asset monster-archive` on entry `0867`, which starts each
+monster's LZS stream at the right slot base; a raw `lzs-decode` of the whole
+file only expands the first stream it meets.
+
+To *edit* a monster, `--dump-block` writes one monster's whole decoded block
+(stat record + name + mesh + animations) to a file and `--write-block` re-packs
+your edited copy into the archive in place - no slot-offset or LZS math. To do
+the same directly against a disc image (with a shareable PPF out the other
+end), use `legaia-patcher monster-block` instead
+([modding-and-translation.md](modding-and-translation.md)).
+
+## Streamed audio (voice + ambience) → WAV
+
+The pipeline already demuxes this into `extracted/XA_WAV/`. To run just that
+step - it reads the raw disc, not the extracted tree:
+
+```bash
+./xa demux-disc-all "/path/to/Legend of Legaia (USA).bin" --out extracted/XA_WAV
+```
+
+About three seconds on a modern machine for the disc's 34 `.XA` files → 316
+per-channel WAVs, each decoded at the true sample rate and stereo mode read
+from its CD-XA subheaders. Prefer this over `xa convert`, which operates on
+Form-1 dumps and has to guess the rate. Format: [xa.md](../formats/xa.md).
+
+## Sound banks (instruments + SFX) → WAV
+
+VAB banks hold the sampled instruments and sound effects
+([vab.md](../formats/vab.md)):
+
+```bash
+./vab list    extracted/PROT/<entry>.BIN
+./vab extract extracted/PROT/<entry>.BIN --out vab_out --wav
+```
+
+On the wrapped BGM entries (the `music_01` block) the scan warns about a
+truncated trailing header after the real banks extract - that is expected on
+those entries, and the exit code stays 0.
+
+## Background music (SEQ) - the wrapped-BGM story
+
+Retail BGM is not a bare SEQ file: each music PROT entry wraps it as
+`[chunk header][VAB][chunk header][SEQ]`, so the SEQ sits at a non-zero
+offset. `seq find` locates it:
+
+```bash
+./seq find extracted/PROT/0990_music_01.BIN
+./seq info extracted/PROT/0990_music_01.BIN --offset 0x<from-find>
+./seq events <file> --offset 0x<N>       # full event disassembly
+./seq json   <file> --offset 0x<N>       # machine-readable parse
+```
+
+`find` scans for `pQES` magics and reports each candidate offset with whether
+the full event stream parses. Without `--offset`, `info`/`events`/`json` try
+offset 0 and then fall back to the first parseable magic automatically - so
+`./seq info extracted/PROT/0990_music_01.BIN` alone also works; the explicit
+offset just makes the choice visible. Format: [seq.md](../formats/seq.md);
+which track is which: [music-tracks.md](../reference/music-tracks.md).
+
+## Movies → PNG frames
+
+The disc's FMVs land in `extracted/MOV/`. Decode them frame-by-frame:
+
+```bash
+./mdec scan-str   extracted/MOV/MV1.STR                  # list frames + dimensions
+./mdec decode-str extracted/MOV/MV1.STR -o frames/       # frame_0001.png, ...
+```
+
+PNG is the default output (`--format ppm` for the raw variant);
+`--max-frames N` stops early. To *watch* a movie with its audio instead, use
+`legaia-engine play-str` ([playing-and-viewing.md](playing-and-viewing.md)).
+Background: [cutscene.md](../subsystems/cutscene.md).
+
+## Game-data tables from the executable
+
+The game executable `extracted/SCUS_942.54` carries the static stat tables.
+The `asset` binary prints them as readable, joined listings:
+
+```bash
+./asset item-tables extracted/SCUS_942.54     # item names + effects/stat bonuses
+./asset spell-names extracted/SCUS_942.54     # spells/arts, MP cost, target
+./asset steal-table extracted/SCUS_942.54     # what each monster can have stolen
+./asset new-game    extracted/SCUS_942.54     # starting party + inventory
+```
+
+Siblings: `accessory-passive`, `sfx-table`, `level-up`, `worldmap-menu`.
+Formats: [item-table.md](../formats/item-table.md),
+[spell-table.md](../formats/spell-table.md),
+[steal-table.md](../formats/steal-table.md),
+[new-game-table.md](../formats/new-game-table.md).
+
+## Shop inventories - a table joined from two files
+
+A town's stock is **not** in a shop table. It is inline in that scene's MAN
+field-VM script (op `0x49`, sub-op `0`), in the same place the scene's chests
+and doors live. The item *names and prices* come from somewhere else entirely -
+the static item record table in `SCUS_942.54` (`DAT_80074368`, `0xC` stride,
+file offset `0x64B68`; the price is the `u16` at `+2`). `shop-stock` opens both
+and joins them:
+
+```bash
+./asset shop-stock --prot extracted/PROT.DAT --scus extracted/SCUS_942.54 \
+                   --cdname extracted/CDNAME.TXT             # every shop on the disc
+./asset shop-stock --prot extracted/PROT.DAT --scus extracted/SCUS_942.54 \
+                   --cdname extracted/CDNAME.TXT --scene bylon      # one scene
+```
+
+`--scene` matches the CDNAME block name; `--entry N` takes a single extraction
+index instead; `--json` emits the same data for scripting. Output:
+
+```text
+== bylon (entry 0053, MAN +0x406a) - "Morlang"  decodes 10 ids, sells 7
+    0. 0x22  Survival Knife            180
+    ...
+    6. 0x60  Electric Shoes            560
+    7. 0x01  Ra-Seru Meta $1             0   <- unsellable tail (record padding, not stock)
+```
+
+Three things to read carefully, because each has caught people out.
+
+**"decodes 10 ids, sells 7" is two different numbers on purpose.** The record's
+`count` byte over-counts: it includes a trailing run of price-`0` *template*
+ids - usually the "Ra-Seru Meta $N" placeholders `0x01/0x02/0x03`. The shop UI
+stops at the priced run, so that tail is structural padding, not stock. The
+listing flags it instead of truncating, because a reader shown only one of the
+two numbers will assume the other.
+
+**Sites are found by scanning, not by walking the script.** A shop's `0x49` is
+often gated behind a dialogue confirm-picker whose option-jump table desyncs a
+linear disassembler before it ever reaches the op. Biron Monastery's Corey
+vendor is the case that exposed this - a walk silently misses it and reports
+one shop too few, with no error. Do not "improve" the scan into a walk.
+
+**The entry column is in extraction-index space; the scene column is not.**
+CDNAME `#define <name> N` names the content at extraction entry `N − 2`, so the
+scene label is resolved through that shift and can disagree with the extraction
+*filename* near a block boundary. See
+[cdname.md](../formats/cdname.md#numbering-space).
+
+Subsystem page: [shop.md](../subsystems/shop.md). The curated walkthrough
+tables on the project site are the other half of this - when the decoded record
+and the human-readable table agree, both are confirmed.
+
+## The dialog font
+
+The pipeline's final step writes `extracted/font/` (atlas PNG, tile-page
+sheet, widths CSV, metadata) - the engine and asset-viewer load text from it.
+To rebuild it alone, no emulator needed:
+
+```bash
+./font-extract --disc "/path/to/Legend of Legaia (USA).bin" --out extracted/font
+```
+
+`--disc` also accepts an already-extracted `PROT.DAT`. The alternative
+`--save` mode reads a mednafen save state's live VRAM instead - exactly one of
+the two is required. Either way the *glyph bitmaps* are all that mode
+supplies: the width and escape tables come from the executable, read before
+the mode even branches, so `--scus` (default `extracted/SCUS_942.54`) has to
+resolve or the run fails on that file rather than on the disc. Format:
+[dialog-font.md](../formats/dialog-font.md).
+
+## The manual chain (when you want one stage at a time)
+
+`legaia-extract` is these stages composed; each also runs standalone. The
+first two build the `extracted/` tree; the rest operate on one PROT entry at
+a time:
+
+```bash
+./disc-extract extract "/path/to/disc.bin" extracted/
+./prot-extract extract extracted/PROT.DAT extracted/PROT --cdname extracted/CDNAME.TXT
+./asset categorize extracted/PROT                            # classify every entry (run this first)
+./lzs-decode probe     extracted/PROT/<entry>.BIN            # is it an LZS container?
+./lzs-decode container extracted/PROT/<entry>.BIN out_dir/   # decompress every section
+./asset decode  extracted/PROT/<entry>.BIN --type-size 0x.. --offset 0x.. --mode lzs  # one section
+./asset stream  extracted/PROT/<entry>.BIN                   # list a streaming container's chunks
+./asset extract extracted/PROT/<entry>.BIN --out out_dir/    # unpack a streaming container's sub-assets
+```
+
+### Which `<entry>` do I pass?
+
+`<entry>` is a filename from `extracted/PROT/`, and every file there is named
+`NNNN_<name>.BIN` where `NNNN` is the zero-padded PROT index. A catalog or
+site label that reads `PROT 46` means entry **46**, i.e. `0046_vell.BIN` -
+not `0446`. The four-digit prefix *is* the index; don't add or drop digits.
+When a label and a filename disagree on the `<name>` half, trust the number:
+CDNAME names are shifted +2 against the `#define` numbers
+([cdname.md](../formats/cdname.md#numbering-space)).
+
+### Which command for which entry?
+
+Run `asset categorize` first - it prints each entry's format class, so you
+know whether an entry is an LZS container, a streaming/pack bundle, a raw
+scene bundle, or overlay code before you pick a decoder. Then:
+
+- **LZS container** - `lzs-decode container` dumps *every* section to
+  `out_dir/`. `asset decode` pulls a *single* section instead: take the
+  `--type-size` and `--offset` from an `asset describe` row of the same
+  file, and pass `--mode raw` for the small uncompressed control sections
+  (`--mode lzs` for the compressed ones). Reach for `decode` when you want
+  one section, or when the container header table doesn't auto-walk cleanly.
+- **Streaming/pack bundle** - `asset stream` lists its chunks and
+  `asset extract` unpacks the TIM/TMD sub-assets. Both expect the DATA_FIELD
+  chunk format; pointed at a flat blob (e.g. a decompressed LZS section)
+  they misread the leading bytes as a chunk header and print
+  `magic MISMATCH` on every "chunk" - that means it is the wrong tool for
+  that input, not a corrupt file.
+- **Textures, in any container** - skip the section plumbing and use
+  `asset tim-scan` ([Textures → PNG](#textures--png)); it decompresses LZS
+  sections itself and names each hit for the section it came out of.
+
+One trap worth knowing: LZS "decompresses without error" is **not** a
+validity signal - the decoder's ring buffer initialises to zeros, so most
+random input decodes to plausible-looking bytes. Always check the *decoded*
+output for the expected magic ([lzs.md](../formats/lzs.md)). This is why
+`lzs-decode probe` reports `no plausible sections` on a non-container entry
+rather than emitting garbage - a clean "this isn't LZS" is the useful answer.
+
+### The over-read trap, and which file owns a byte offset
+
+An entry's real size is the sector gap to the next entry. Some entries also
+carry a *declared* TOC window far larger than that, and reading the declared
+window instead of the gap walks straight into the following entry's bytes.
+The clearest case is the battle-data cluster: entries `0865` (Gala) and
+`0866` (Terra) each declare ~16 MB but really own `0x6F000` / `0x17800`, and
+both declared windows run into the monster archive `0867`.
+
+`prot-extract extract` writes each `.BIN` as the entry's own sectors, so a
+freshly extracted tree does not carry the trap. It bites in two other places:
+a `.BIN` produced before the size expression was corrected, and any note or
+constant of the form "entry N, offset K" that was measured against one - the
+bytes are still on the disc where the note says, but the entry it names is
+the wrong owner.
+
+`prot-extract list` prints both numbers side by side, `size` (what the entry
+owns) next to `decl_span` (what it declares), and marks every row where they
+disagree with `OVR`. To resolve a specific offset - "which file really owns
+the bytes my hex editor is showing at `0x17855` of `0866`?" - use `locate`:
+
+```bash
+prot-extract locate extracted/PROT.DAT 0x17855 --in-entry 866 --cdname extracted/CDNAME.TXT
+```
+
+It translates the in-file offset to an absolute PROT.DAT offset, names the
+**true owning entry** (here `0867`), and says plainly when the offset runs
+past the entry you asked about. Drop `--in-entry` to pass an absolute
+PROT.DAT offset directly.
+
+`prot-extract extract` still accepts `--clamp-footprint`, so old invocations
+keep working, but it is a no-op that prints a note: there is no larger window
+left to trim.
+
+## Related docs
+
+- [docs/tooling/extraction.md](../tooling/extraction.md) - the full per-stage reference.
+- [docs/formats/overview.md](../formats/overview.md) - every format spec, with confidence levels.
+- [playing-and-viewing.md](playing-and-viewing.md) - browse what you extracted, interactively.

@@ -1,0 +1,429 @@
+//! Battle-camera fixed-point kernels: the angle-tween step-table builder and
+//! the LCG screen-shake jitter.
+//!
+//! Each address is tagged on the function that implements it; a module-level
+//! `PORT:` line would only add a second, coarser anchor for the same two.
+//!
+//! Both live in runtime overlays (`overlay_battle_action_801d829c.txt` /
+//! `overlay_dialog_801d9d30.txt` dumps) and are pure fixed-point math over the
+//! camera globals - the rotation trio at `DAT_8007B790/2/4`, the shake
+//! accumulator trio at `0x800840B8/BC/C0`, and the focus trio at
+//! `0x80089118/1C/20`. The ports below lift the global reads/writes into
+//! caller-owned parameters so the kernels are side-effect-free.
+//!
+//! REF: `engine-battle-vm::psx_camera::CutsceneCameraInterp` approximates the *field
+//! cutscene* camera ease (`FUN_801DB510`) with float lerps toward op-`0x45`
+//! keyframe targets. The retail battle tween here is a different mechanism:
+//! table-driven fixed-point stepping - `FUN_801D829C` precomputes a 9-record
+//! `{step, endpoint}` table (at battle-context `+0x118C` off `_DAT_8007BD24`)
+//! that `FUN_80021248` signs per component and a per-frame walker then adds
+//! until each component reaches its endpoint, with 12-bit wrapped angles.
+//! No float easing is involved in retail.
+//!
+//! Both are live. [`build_camera_angle_tween`] builds every arrive-together
+//! glide's rate table in `legaia_engine_battle_vm::battle_cam_script`; [`apply_shake`] is
+//! stepped by that same camera once per camera step, with its amplitude
+//! sourced from the field VM.
+//!
+//! ## Where the amplitude comes from, and where retail calls this
+//!
+//! [`apply_shake`]'s amplitude input is the global `_DAT_8007B630`, and its
+//! only retail writer is a **field-VM opcode**: `0x4C` outer-nibble `8`
+//! sub-`4`, a 3-byte instruction `[4C, 84, amplitude]` whose arm at
+//! `0x801E2134` (jump-table slot `0x801CEF58`) stores the operand byte and
+//! advances the PC by three
+//! (`overlay_0897_801de840.txt` `0x801E2134..0x801E2144`). The port models
+//! that opcode - `legaia_engine_vm::field::FieldCameraMotionHost::set_shake_amplitude` - and the
+//! engine host keeps the value on the world for the camera to read.
+//!
+//! Retail's own callers of `FUN_801D9D30` are all in the **field-family**
+//! slot-A overlay (the per-frame camera updater `0x801D1344` and its
+//! siblings, seen in the dialog / cutscene / world-map captures of that same
+//! image); the battle-action overlay replaces that image at the same base, so
+//! no shake caller is resident during a retail fight. The engine drives the
+//! kernel from its one camera anyway, because the accumulators
+//! `0x800840B8`/`0x800840BC` are that camera's translation pair either way -
+//! see `legaia_engine_battle_vm::battle_cam_script::BattleCamera::set_shake_amplitude`.
+//!
+//! ## The magic-exit camera snap is not this routine's caller
+//!
+//! Worth stating because the action SM once surfaced the snap as a
+//! `screen_shake` host event, and a triage verdict was written on that name. The action SM's magic-exit arm
+//! (`overlay_battle_action_801e295c.txt` `0x801E4938..0x801E497C`, gated on
+//! `ctx[+0x249] == 0`, the same gate the port's `magic_exit` reads) stamps the
+//! next action state and then does a **camera framing snap**, not a shake:
+//!
+//! ```text
+//!   lh   v0, -0x4870(v1)   ; DAT_8007B790 - camera pitch
+//!   slti v0, v0, 0x191     ; below 0x191? leave the framing alone
+//!   li   v0, 0x500
+//!   sh   zero, -0x4870(v1) ; pitch = 0
+//!   sw   v0, 0x40bc(v1)    ; translation Y = 0x500
+//! ```
+//!
+//! `0x500` is an **absolute** translation-Y value - it is the 1280 the
+//! close-up framings hold - written straight into the word, conditional on the
+//! pitch. [`apply_shake`]'s `amplitude` is a different quantity entirely: a
+//! `1..=0x15` shift count out of `_DAT_8007B630`, whose only retail writer is
+//! a field-VM opcode. Feeding one to the other is a category error: the snap is
+//! the battle camera's own write on the `0x2E -> 0x50` edge
+//! (`battle_cam_script::BattleCamera::observe_action_state`).
+
+// REF: FUN_80021248 (the arming routine that signs this builder's records
+// and hands them to the per-frame walker)
+use legaia_engine_system::rand::world_rand;
+
+/// The camera rotation/shake/focus trios `FUN_801D829C` tweens. Mirrors the
+/// nine 16-bit globals paired against the caller-provided targets:
+///
+/// - `rotation`: pitch/yaw/roll at `DAT_8007B790/2/4` - 12-bit angles
+///   (`0x1000` = full turn).
+/// - `shake`: the low halves of the shake accumulator words at
+///   `0x800840B8/BC/C0` (the same words [`apply_shake`] jitters).
+/// - `focus`: the focus trio at `0x80089118/1C/20`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CameraAngles {
+    /// Pitch/yaw/roll, 12-bit angle units.
+    pub rotation: [i16; 3],
+    /// Shake-offset trio.
+    pub shake: [i16; 3],
+    /// Focus trio.
+    pub focus: [i16; 3],
+}
+
+/// One record of the interpolation table at battle-context `+0x118C`:
+/// `{u16 step, u16 endpoint}` per tweened value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TweenSlot {
+    /// `ceil(|current - target| / duration)` - the **per-frame increment**
+    /// magnitude the walker adds until it reaches the endpoint. Zero when the
+    /// value is already at its target.
+    ///
+    /// The direction is not in this field: the arming routine `FUN_80021248`
+    /// signs it per component after the fact, negating it when the endpoint
+    /// lies below the live global (`0x800213D8..0x800213E4` for the
+    /// translation trio, `0x80021378..0x8002138C` for the rotation trio, where
+    /// the shortest-arc flip rides along). A signed count would be meaningless;
+    /// a signed increment is exactly what a per-frame `+=` walker wants, which
+    /// is what fixes [`build_camera_angle_tween`]'s fourth argument as a
+    /// *duration* rather than a speed.
+    pub step: u16,
+    /// Raw 16 bits of the (possibly wrap-adjusted) target value the walker
+    /// converges on.
+    pub target: u16,
+}
+
+/// Number of `{step, endpoint}` records the builder emits - one per
+/// (current, target) pair. NB the retail loop counter runs to `0x12` (18) in
+/// increments of 2 over the interleaved 18-pointer list, so this is **9
+/// slots**, not 18 (an earlier triage note miscounted the pointer list as the
+/// slot count).
+pub const TWEEN_SLOTS: usize = 9;
+
+/// PORT: FUN_801D829C - build the camera angle-tween increment table.
+///
+/// Faithful to the dump, in order:
+///
+/// 1. `target.shake[2]` (retail `param_2 + 4`) is pre-scaled **in place** by
+///    `(value << 8) / 0xA0` (signed, truncating toward zero) - the `0xA0`
+///    divide applies to this one field only, not the whole table. It converts
+///    a world distance into GTE projection units (`0xA0` = the PSX screen
+///    half-width, `<< 8` = `H = 256`), which is why the caller hands the
+///    translation-Z target in raw world units and the live global is already
+///    converted.
+/// 2. The **rotation trio only** (first 3 pairs) is normalized to 12 bits
+///    (`& 0xFFF` on both current and target, written back in place) with
+///    shortest-arc correction: when `current - target > 0x800` the target
+///    gains `+0x1000`; when `target - current > 0x800` the current side
+///    gains `+0x1000`. Shake and focus pairs are tweened linearly, unwrapped.
+/// 3. For all [`TWEEN_SLOTS`] pairs (rotation, shake, focus - in that order)
+///    the per-frame increment is the ceiling division
+///    `(|current - target| + duration - 1) / duration` (retail `divu`), with
+///    `duration == 0` coerced to `1`, and the endpoint is the target's raw
+///    16 bits.
+///
+/// **`duration` is a frame count, not a speed**, and the difference is
+/// invisible in this routine alone - `delta / param_4` reads either way. The
+/// arming routine `FUN_80021248` settles it: it signs each record's first
+/// halfword by comparing the endpoint against the live global, which is only
+/// meaningful for an increment. So every component shares one duration and
+/// they arrive together, each moving at its own rate.
+///
+/// Retail mutates both the globals and the caller's target buffer (masking,
+/// wrap adjust, the `0xA0` pre-scale), hence `&mut` on both sides here.
+///
+/// The consumer is `engine-shell`'s `window/battle_cam.rs`: `Glide::linear`
+/// builds its per-component rate table here, so the native battle camera's
+/// arrive-together glides step on retail's own integer increments. What is
+/// still absent is the *producer* - retail's `FUN_80021248` sources the
+/// endpoints from the arming path, and the engine's come from the traced phase
+/// framings instead.
+pub fn build_camera_angle_tween(
+    current: &mut CameraAngles,
+    target: &mut CameraAngles,
+    duration: u16,
+) -> [TweenSlot; TWEEN_SLOTS] {
+    // Step 1: pre-scale the third shake target by 256/160 (signed, trunc).
+    target.shake[2] = (((target.shake[2] as i32) << 8) / 0xA0) as i16;
+
+    // Step 2: 12-bit normalize + shortest-arc on the rotation trio.
+    for k in 0..3 {
+        let mut cur = current.rotation[k] & 0xFFF;
+        let mut tgt = target.rotation[k] & 0xFFF;
+        if (cur as i32) - (tgt as i32) > 0x800 {
+            tgt += 0x1000;
+        }
+        if (tgt as i32) - (cur as i32) > 0x800 {
+            cur += 0x1000;
+        }
+        current.rotation[k] = cur;
+        target.rotation[k] = tgt;
+    }
+
+    // Step 3: ceil-divide per-frame increments + endpoints for all nine pairs.
+    let duration = u32::from(duration).max(1);
+    let pairs: [(i16, i16); TWEEN_SLOTS] = [
+        (current.rotation[0], target.rotation[0]),
+        (current.rotation[1], target.rotation[1]),
+        (current.rotation[2], target.rotation[2]),
+        (current.shake[0], target.shake[0]),
+        (current.shake[1], target.shake[1]),
+        (current.shake[2], target.shake[2]),
+        (current.focus[0], target.focus[0]),
+        (current.focus[1], target.focus[1]),
+        (current.focus[2], target.focus[2]),
+    ];
+    let mut table = [TweenSlot::default(); TWEEN_SLOTS];
+    for (slot, &(cur, tgt)) in table.iter_mut().zip(pairs.iter()) {
+        let delta = ((cur as i32) - (tgt as i32)).unsigned_abs();
+        // Retail form: `(delta + duration - 1) divu duration` - identical to
+        // `div_ceil` for duration >= 1.
+        slot.step = delta.div_ceil(duration) as u16;
+        slot.target = tgt as u16;
+    }
+    table
+}
+
+/// PORT: FUN_801D9D30 - re-roll the two-axis LCG camera-shake jitter.
+///
+/// Image: these bytes are the **field overlay's** (PROT 0897,
+/// `dump-extent-attribution.csv` `unique field(897)`); the battle overlay
+/// 0898 carries no copy, and the context it shakes is the field camera's
+/// (`0x801C6EA4`). Stepping it from the battle camera script
+/// (`legaia_engine_battle_vm::battle_cam_script`) is a port choice; whether the battle
+/// overlay shakes its own camera by another routine is not settled here.
+///
+/// Retail state: `accum` is the shake accumulator pair at
+/// `0x800840B8/0x800840BC`, `offset` is the previously applied jitter pair
+/// held in the camera context (`DAT_801C6EA4 + 0x18/+0x1C`), `amplitude` is
+/// the shake-amplitude global `_DAT_8007B630`.
+///
+/// The previous offsets are first subtracted back out of the accumulators and
+/// zeroed. When `amplitude != 0`, two LCG samples are drawn (retail RNG
+/// `FUN_80056798`, the 15-bit BIOS `rand()`) and masked with
+/// `0xFFFFFF >> ((0x15 - amplitude) & 0x1F)` - i.e. `(1 << (amplitude + 3)) - 1`
+/// for `1 <= amplitude <= 0x15`. NB the dump uses this **right-shift-of-
+/// `0xFFFFFF`** form (`srav` of the `0xFFFFFF` constant); the
+/// `(1 << (0x15 - amplitude)) - 1` form quoted in `docs/reference/functions.md`
+/// row 662 does not match the disassembly (it would shrink with amplitude).
+///
+/// - X offset: `(rand & mask) - ((mask + 1) >> 1)` - centered around zero.
+/// - Y offset: `-(rand & (mask >> 1))` - half-range, upward only (negated).
+///
+/// `seed` is a lent copy of the world `rand()` stream ([`world_rand`]):
+/// retail draws both samples from the one process-wide seed, so a caller
+/// copies `World::rng_state` in and writes it back after the call. A rest
+/// state (`amplitude == 0`) draws nothing, so an un-shaken camera never moves
+/// the stream.
+///
+/// The fresh offsets are then added into the accumulators. `amplitude == 0`
+/// therefore clears the jitter contribution entirely.
+///
+/// REF: this routine is also duplicated verbatim as the tail of
+/// `FUN_801DB510` (the camera follow-ease) - one port covers both sites.
+///
+/// Stepped by `legaia_engine_battle_vm::battle_cam_script::BattleCamera` once per camera
+/// step; the amplitude reaches it from the field VM's `0x4C`/`8`/`4` opcode
+/// through the engine host. The action SM's magic-exit camera snap is **not**
+/// a caller of this routine; see the module note for why.
+pub fn apply_shake(accum: &mut [i32; 2], offset: &mut [i32; 2], amplitude: u32, seed: &mut u32) {
+    accum[0] -= offset[0];
+    accum[1] -= offset[1];
+    offset[0] = 0;
+    offset[1] = 0;
+    if amplitude != 0 {
+        let mask = 0xFF_FFFFu32 >> (0x15u32.wrapping_sub(amplitude) & 0x1F);
+        let r0 = world_rand(seed);
+        offset[0] = (r0 & mask) as i32 - ((mask as i32 + 1) >> 1);
+        let r1 = world_rand(seed);
+        offset[1] = -((r1 & (mask >> 1)) as i32);
+    }
+    accum[0] += offset[0];
+    accum[1] += offset[1];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn angles(rotation: [i16; 3], shake: [i16; 3], focus: [i16; 3]) -> CameraAngles {
+        CameraAngles {
+            rotation,
+            shake,
+            focus,
+        }
+    }
+
+    #[test]
+    fn shortest_arc_wraps_target_up_across_zero() {
+        // current 0xF80, target 0x010: raw delta 0xF70 > 0x800, so the
+        // target gains a full turn (0x1010) and the arc becomes 0x90.
+        let mut cur = angles([0xF80, 0, 0], [0; 3], [0; 3]);
+        let mut tgt = angles([0x010, 0, 0], [0; 3], [0; 3]);
+        let table = build_camera_angle_tween(&mut cur, &mut tgt, 1);
+        assert_eq!(tgt.rotation[0], 0x1010);
+        assert_eq!(cur.rotation[0], 0xF80);
+        assert_eq!(table[0].step, 0x90);
+        assert_eq!(table[0].target, 0x1010);
+    }
+
+    #[test]
+    fn shortest_arc_wraps_current_up_across_zero() {
+        // current 0x010, target 0xF80: target - current > 0x800, so the
+        // CURRENT side gains the full turn; the endpoint stays 0xF80.
+        let mut cur = angles([0x010, 0, 0], [0; 3], [0; 3]);
+        let mut tgt = angles([0xF80, 0, 0], [0; 3], [0; 3]);
+        let table = build_camera_angle_tween(&mut cur, &mut tgt, 1);
+        assert_eq!(cur.rotation[0], 0x1010);
+        assert_eq!(tgt.rotation[0], 0xF80);
+        assert_eq!(table[0].step, 0x90);
+        assert_eq!(table[0].target, 0xF80);
+    }
+
+    #[test]
+    fn rotation_masked_to_12_bits_both_sides() {
+        let mut cur = angles([0x1234, 0x2FFF, 0], [0; 3], [0; 3]);
+        let mut tgt = angles([0x1234, 0x2FFF, 0], [0; 3], [0; 3]);
+        let table = build_camera_angle_tween(&mut cur, &mut tgt, 4);
+        assert_eq!(cur.rotation[0], 0x234);
+        assert_eq!(tgt.rotation[0], 0x234);
+        assert_eq!(cur.rotation[1], 0xFFF);
+        assert_eq!(tgt.rotation[1], 0xFFF);
+        // Equal after masking: zero-delta slots emit no steps.
+        assert_eq!(table[0].step, 0);
+        assert_eq!(table[1].step, 0);
+    }
+
+    #[test]
+    fn step_count_is_ceiling_division() {
+        let mut cur = angles([0; 3], [0x90, 0x80, 0], [0; 3]);
+        let mut tgt = angles([0; 3], [0, 0, 0], [0; 3]);
+        let table = build_camera_angle_tween(&mut cur, &mut tgt, 0x20);
+        // 0x90 / 0x20 = 4.5 -> 5 steps; 0x80 / 0x20 = exact 4.
+        assert_eq!(table[3].step, 5);
+        assert_eq!(table[4].step, 4);
+    }
+
+    #[test]
+    fn zero_speed_coerced_to_one() {
+        let mut cur = angles([0; 3], [0; 3], [7, 0, 0]);
+        let mut tgt = angles([0; 3], [0; 3], [0, 0, 0]);
+        let table = build_camera_angle_tween(&mut cur, &mut tgt, 0);
+        assert_eq!(table[6].step, 7);
+    }
+
+    #[test]
+    fn zero_delta_slots_produce_no_steps() {
+        let mut cur = angles([0x100, 0x200, 0x300], [1, 2, 0], [4, 5, 6]);
+        let mut tgt = cur;
+        // shake[2] pre-scale keeps 0 at 0, so every pair stays equal.
+        let table = build_camera_angle_tween(&mut cur, &mut tgt, 8);
+        for slot in &table {
+            assert_eq!(slot.step, 0);
+        }
+    }
+
+    #[test]
+    fn shake_third_target_prescaled_by_0xa0_divide() {
+        // (0xA0 << 8) / 0xA0 = 0x100; negative values truncate toward zero
+        // ((-1 << 8) / 0xA0 = -1, not -2).
+        let mut cur = angles([0; 3], [0; 3], [0; 3]);
+        let mut tgt = angles([0; 3], [0, 0, 0xA0], [0; 3]);
+        let table = build_camera_angle_tween(&mut cur, &mut tgt, 1);
+        assert_eq!(tgt.shake[2], 0x100);
+        assert_eq!(table[5].step, 0x100);
+        assert_eq!(table[5].target, 0x100);
+
+        let mut tgt_neg = angles([0; 3], [0, 0, -1], [0; 3]);
+        build_camera_angle_tween(&mut cur, &mut tgt_neg, 1);
+        assert_eq!(tgt_neg.shake[2], -1);
+    }
+
+    #[test]
+    fn negative_deltas_use_absolute_value() {
+        let mut cur = angles([0; 3], [0; 3], [-0x40, 0, 0]);
+        let mut tgt = angles([0; 3], [0; 3], [0x40, 0, 0]);
+        let table = build_camera_angle_tween(&mut cur, &mut tgt, 0x10);
+        assert_eq!(table[6].step, 8); // |(-0x40) - 0x40| = 0x80 -> /0x10
+        assert_eq!(table[6].target, 0x40);
+    }
+
+    #[test]
+    fn shake_zero_amplitude_clears_previous_offset() {
+        let mut accum = [100, 200];
+        let mut offset = [30, -40];
+        let mut seed = 0x1234_5678u32;
+        apply_shake(&mut accum, &mut offset, 0, &mut seed);
+        assert_eq!(offset, [0, 0]);
+        assert_eq!(accum, [70, 240]); // previous jitter backed out, none added
+        assert_eq!(seed, 0x1234_5678); // no RNG draw at amp 0
+    }
+
+    #[test]
+    fn shake_seeded_rng_is_deterministic() {
+        let run = || {
+            let mut accum = [0, 0];
+            let mut offset = [0, 0];
+            let mut seed = 0xDEAD_BEEFu32;
+            apply_shake(&mut accum, &mut offset, 5, &mut seed);
+            (accum, offset, seed)
+        };
+        assert_eq!(run(), run());
+        // Two draws happen: the seed must have advanced twice.
+        let (accum, offset, seed) = run();
+        let mut check = 0xDEAD_BEEFu32;
+        world_rand(&mut check);
+        world_rand(&mut check);
+        assert_eq!(seed, check);
+        assert_eq!(accum, offset); // fresh offsets fold straight into accum
+    }
+
+    #[test]
+    fn shake_offsets_bounded_per_amplitude() {
+        for amp in 1u32..=10 {
+            let mask = 0xFF_FFFFu32 >> (0x15 - amp); // == (1 << (amp + 3)) - 1
+            let half = ((mask + 1) >> 1) as i32;
+            let mut seed = 0x0BAD_F00Du32.wrapping_add(amp);
+            for _ in 0..64 {
+                let mut accum = [0, 0];
+                let mut offset = [0, 0];
+                apply_shake(&mut accum, &mut offset, amp, &mut seed);
+                // X centered: [-half, mask - half]; Y negated half-mask: [-(mask>>1), 0].
+                assert!(offset[0] >= -half && offset[0] <= mask as i32 - half);
+                assert!(offset[1] <= 0 && offset[1] >= -((mask >> 1) as i32));
+                assert_eq!(accum, offset);
+            }
+        }
+    }
+
+    #[test]
+    fn shake_reroll_replaces_previous_offset() {
+        let mut accum = [500, -500];
+        let mut offset = [12, -34];
+        let mut seed = 42u32;
+        let base = [accum[0] - offset[0], accum[1] - offset[1]];
+        apply_shake(&mut accum, &mut offset, 3, &mut seed);
+        assert_eq!(accum, [base[0] + offset[0], base[1] + offset[1]]);
+        assert_ne!(offset, [12, -34]);
+    }
+}

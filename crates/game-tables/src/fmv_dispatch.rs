@@ -1,0 +1,360 @@
+//! STR FMV dispatch table - the per-`fmv_id` movie + frame range the cutscene
+//! play loop selects, decoded straight from the STR/MDEC overlay.
+//!
+//! ## How an FMV is triggered + dispatched
+//!
+//! The field VM's FMV-trigger op (`0x4C 0xE2 lo hi`, handler `FUN_801E30E4`)
+//! writes a signed `fmv_id` to `_DAT_8007BA78` and pokes game mode `0x1A` (26,
+//! STR INIT). The STR/MDEC overlay (PROT 0970, loaded at `0x801CE818`) then runs
+//! its master dispatch `FUN_801CEA3C`, whose selector at `0x801CEC9C`
+//! (`sll v0,v0,0x5`) indexes a **static table at VA `0x801D0A6C`** by
+//! `fmv_id * 0x20` and calls the play loop `FUN_801CF098` on the slot. Each
+//! 32-byte slot is one record:
+//!
+//! ```text
+//! +0x00  u32  path_ptr     ; -> a "\MOV\MVn.STR;1" path string in the overlay
+//! +0x04  u32  scale_flag   ; non-0 = 24-bit color (width * 3/2 in 16-bit px)
+//! +0x08  u32  start_frame  ; 1-based; the loop seeks (start-1)*10 sectors in
+//! +0x0C  u32  end_frame    ; the strNext frame-count bound
+//! +0x10  u32  fb_x         ; VRAM decode-target x (0 retail; dev slots vary)
+//! +0x14  u32  fb_y         ; VRAM decode-target y (8 retail; double-buffer
+//!                          ;   sibling rect sits at fb_y + height)
+//! +0x18  u32  width        ; frame width (320 retail; dev slots vary)
+//! +0x1C  u32  height       ; frame height (240)
+//! ```
+//!
+//! The path strings live at the very start of the overlay (the
+//! `\MOV\MVn.STR;1` + `\DATA\MOV*.STR;1` table at offset `0`), so the `path_ptr`
+//! resolves to `offset = path_ptr - base`.
+//!
+//! The 10-sectors-per-frame seek (`(start-1)*10`) is the 15 fps cadence every
+//! Legaia movie runs at; `start_frame`/`end_frame` are what let one `MVn.STR`
+//! file carry several distinct cutscenes (`MV3.STR` is split across four
+//! `fmv_id`s by frame range).
+//!
+//! ## Retail vs dev slots
+//!
+//! The table has 23 slots. The nine retail FMVs are `fmv_id 0..=8`
+//! (`MV1` / `MV2` / four `MV3` segments / `MV4` / `MV5` / `MV6` - every movie
+//! on the disc is dispatched); slots 9/10 reference `MV1A.STR` / `MOV15.STR`
+//! and 11..=22 are `MOV.STR` multi-window dev tests, all files absent from the
+//! released disc. [`FmvEntry::on_retail_disc`] flags the difference.
+//!
+//! (An earlier reading used a 64-byte stride - `sll v0,v0,6` - pairing wrong
+//! slot halves and concluding `MV2`/`MV5` were unreferenced; the disc bytes and
+//! the resident RAM capture both encode the 32-byte stride.)
+//!
+//! This is the read side that lets the engine source its `fmv_id -> MVn.STR`
+//! mapping from the user's own disc instead of a hard-coded table; the disc-gated
+//! `fmv_dispatch_real` test pins the nine retail entries.
+
+/// VA of the STR overlay's MDEC **quantisation-table command packet**: the
+/// header word `0x4000_0001` (MDEC command 2, "set quant table", colour bit
+/// set) then the 64-byte luma matrix at `0x801D0D5C` and the 64-byte chroma
+/// matrix at `0x801D0D9C`. `FUN_801CFCDC` copies the caller's two matrices in
+/// (sixteen words each, `addiu v1,zero,0xf` loop counts) and hands the packet
+/// to the MDEC upload `FUN_801CFFDC` with `a1 = 0x20` - thirty-two data words
+/// behind the header, so the packet is [`MDEC_PACKET_BYTES`] long.
+pub const MDEC_QUANT_PACKET_VA: u32 = 0x801D_0D58;
+/// VA of the MDEC **IDCT scale-table command packet**: header `0x6000_0000`
+/// (MDEC command 3) then the 64-halfword IDCT matrix at `0x801D0DE0`, handed
+/// to `FUN_801CFFDC` with `a1 = 0x20` right after the quant packet.
+pub const MDEC_IDCT_PACKET_VA: u32 = 0x801D_0DDC;
+/// Header word of the quant packet.
+pub const MDEC_QUANT_PACKET_HEADER: u32 = 0x4000_0001;
+/// Header word of the IDCT packet.
+pub const MDEC_IDCT_PACKET_HEADER: u32 = 0x6000_0000;
+/// Bytes per packet: the header word plus the `0x20` words the upload sends.
+pub const MDEC_PACKET_BYTES: usize = 4 + 0x20 * 4;
+
+/// Load base of the STR/MDEC overlay (PROT 0970), from the static-overlay map.
+pub const STR_OVERLAY_BASE_VA: u32 = legaia_overlay_images::static_overlay::SLOT_A_BASE;
+/// PROT entry index of the STR/MDEC cutscene overlay this table lives in.
+pub const STR_OVERLAY_PROT_INDEX: u32 = legaia_overlay_images::static_overlay::STR_OVERLAY_PROT;
+/// Sectors per STR video frame - the fixed 15 fps cadence (2x speed / 150
+/// sectors-per-second) every Legaia movie runs at. The play loop seeks
+/// `(start_frame - 1) * SECTORS_PER_FRAME` into the file.
+pub const SECTORS_PER_FRAME: u32 = 10;
+/// VA of the per-`fmv_id` dispatch table the play-loop selector indexes.
+pub const FMV_TABLE_VA: u32 = 0x801D_0A6C;
+/// Per-`fmv_id` slot stride (`fmv_id * 0x20` - the `sll v0,v0,0x5` selector at
+/// overlay VA `0x801CEC9C`).
+pub const SLOT_STRIDE: usize = 0x20;
+/// Number of `fmv_id` slots in the table (9 retail + 14 dev).
+pub const FMV_SLOT_COUNT: usize = 23;
+
+/// One decoded FMV dispatch entry: which movie file the `fmv_id` plays and over
+/// what frame range, plus the framebuffer dimensions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FmvEntry {
+    /// The `fmv_id` (table slot index) this entry is dispatched by.
+    pub fmv_id: u8,
+    /// Raw path string the record points at, e.g. `\MOV\MV1.STR;1`.
+    pub path: String,
+    /// `scale_flag`: non-zero = 24-bit color; the loop scales the VRAM
+    /// footprint by 3/2 (24bpp pixels over a 16bpp framebuffer).
+    pub scale_flag: u32,
+    /// 1-based start frame (the loop seeks `(start-1)*10` sectors into the file).
+    pub start_frame: u32,
+    /// End-frame bound for the per-frame read loop.
+    pub end_frame: u32,
+    /// Framebuffer width (320 for retail movies).
+    pub width: u16,
+    /// Framebuffer height (240).
+    pub height: u16,
+}
+
+impl FmvEntry {
+    /// Bare filename without directory or ISO9660 `;1` version, e.g. `MV1.STR`.
+    pub fn basename(&self) -> &str {
+        let no_ver = self.path.split(';').next().unwrap_or(&self.path);
+        no_ver.rsplit(['\\', '/']).next().unwrap_or(no_ver)
+    }
+
+    /// Engine-shape path: forward slashes, no version, no leading slash - e.g.
+    /// `MOV/MV1.STR`. Matches `legaia_engine_system::movie::cutscene::fmv_index_to_str_filename`.
+    pub fn engine_path(&self) -> String {
+        let no_ver = self.path.split(';').next().unwrap_or(&self.path);
+        no_ver.trim_start_matches(['\\', '/']).replace('\\', "/")
+    }
+
+    /// Whether this entry's movie is a file present on the released retail disc
+    /// (the six `MVn.STR` movies); the dev-only `MV1A.STR` / `MOV15.STR` /
+    /// `MOV.STR` slots are not.
+    pub fn on_retail_disc(&self) -> bool {
+        matches!(
+            self.basename(),
+            "MV1.STR" | "MV2.STR" | "MV3.STR" | "MV4.STR" | "MV5.STR" | "MV6.STR"
+        )
+    }
+}
+
+/// The decoded STR FMV dispatch table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FmvTable {
+    /// One entry per `fmv_id` slot, in slot order (`0..FMV_SLOT_COUNT`).
+    pub entries: Vec<FmvEntry>,
+}
+
+impl FmvTable {
+    /// Decode the dispatch table from the STR overlay loaded at its committed
+    /// base ([`STR_OVERLAY_BASE_VA`]). `overlay` is the raw PROT 0970 entry
+    /// (byte-identical to the as-loaded overlay - `form = raw`).
+    pub fn from_str_overlay(overlay: &[u8]) -> Option<Self> {
+        Self::from_overlay(overlay, STR_OVERLAY_BASE_VA)
+    }
+
+    /// Decode the dispatch table from an overlay loaded at `base_va`. Returns
+    /// `None` if the table region is out of range or the first slot doesn't
+    /// resolve to the expected intro movie (`MV1.STR`) - a base/offset-drift
+    /// guard.
+    pub fn from_overlay(overlay: &[u8], base_va: u32) -> Option<Self> {
+        let table_off = FMV_TABLE_VA.checked_sub(base_va)? as usize;
+        let mut entries = Vec::with_capacity(FMV_SLOT_COUNT);
+        for fmv_id in 0..FMV_SLOT_COUNT {
+            let rec = table_off + fmv_id * SLOT_STRIDE;
+            let w = |i: usize| -> Option<u32> {
+                let o = rec + i * 4;
+                Some(u32::from_le_bytes(overlay.get(o..o + 4)?.try_into().ok()?))
+            };
+            // Stop at the first slot that doesn't resolve to a path (end of
+            // table / trailing garbage); the slot-0 guard below rejects a
+            // wholesale base/offset miss.
+            let Some(path) = w(0)
+                .and_then(|ptr| ptr.checked_sub(base_va))
+                .and_then(|off| read_cstr(overlay, off as usize))
+            else {
+                break;
+            };
+            let (Some(scale_flag), Some(start), Some(end), Some(width), Some(height)) =
+                (w(1), w(2), w(3), w(6), w(7))
+            else {
+                break;
+            };
+            entries.push(FmvEntry {
+                fmv_id: fmv_id as u8,
+                path,
+                scale_flag,
+                start_frame: start,
+                end_frame: end,
+                width: width as u16,
+                height: height as u16,
+            });
+        }
+        // Drift guard: slot 0 is always the intro movie, and at least the
+        // first retail slots must decode.
+        if entries.len() < 5 || entries[0].basename() != "MV1.STR" {
+            return None;
+        }
+        Some(Self { entries })
+    }
+
+    /// The entry for `fmv_id`, or `None` if out of range / negative.
+    pub fn entry(&self, fmv_id: i16) -> Option<&FmvEntry> {
+        usize::try_from(fmv_id)
+            .ok()
+            .and_then(|i| self.entries.get(i))
+    }
+
+    /// Engine-shape movie path for `fmv_id`, restricted to retail-disc movies
+    /// (`None` for the dev-only `MOV*.STR` slots). Mirrors
+    /// `legaia_engine_system::movie::cutscene::fmv_index_to_str_filename`.
+    pub fn engine_path(&self, fmv_id: i16) -> Option<String> {
+        let e = self.entry(fmv_id)?;
+        e.on_retail_disc().then(|| e.engine_path())
+    }
+}
+
+/// Narrow a whole-`MVn.STR`-file sector span `(file_lba, file_sectors)` to the
+/// segment a single `fmv_id` plays, given that fmv's dispatch [`FmvEntry`]
+/// (`None` -> play the whole file). One movie file can carry several cutscenes
+/// by frame range (`MV3.STR` is split across four `fmv_id`s), and the retail
+/// play loop `FUN_801CF098` seeks `(start_frame - 1) * SECTORS_PER_FRAME`
+/// sectors in, so an `fmv_id` that starts mid-file must skip ahead or it plays
+/// the wrong frames. Returns `(start_lba, sector_count)`, clamped to the file.
+///
+/// Shared by every host that opens a movie off the disc image: the native
+/// window (`legaia_engine_shell::cutscene_av`) and the browser play page
+/// (`legaia_web_play::play_fmv`), so the seek is one implementation.
+pub fn fmv_segment_window(
+    entry: Option<&FmvEntry>,
+    file_lba: u32,
+    file_sectors: u32,
+) -> (u32, u32) {
+    let Some(entry) = entry else {
+        return (file_lba, file_sectors);
+    };
+    let start = entry.start_frame.saturating_sub(1) * SECTORS_PER_FRAME;
+    let frames = entry
+        .end_frame
+        .saturating_sub(entry.start_frame)
+        .saturating_add(1);
+    let count = (frames * SECTORS_PER_FRAME).min(file_sectors.saturating_sub(start));
+    if count == 0 {
+        // Degenerate range (or start past EOF) -> fall back to the whole file.
+        return (file_lba, file_sectors);
+    }
+    (file_lba + start, count)
+}
+
+/// Read a NUL-terminated ASCII string at `off`, or `None` if it runs off the end
+/// or isn't printable.
+fn read_cstr(buf: &[u8], off: usize) -> Option<String> {
+    let rest = buf.get(off..)?;
+    let end = rest.iter().position(|&b| b == 0)?;
+    let s = &rest[..end];
+    if s.is_empty() || !s.iter().all(|&b| (0x20..0x7f).contains(&b)) {
+        return None;
+    }
+    Some(s.iter().map(|&b| b as char).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal overlay: a path-string blob at offset 0, then the
+    /// dispatch table at `FMV_TABLE_VA`, and decode it.
+    #[test]
+    fn decodes_a_synthetic_table() {
+        let base = STR_OVERLAY_BASE_VA;
+        let table_off = (FMV_TABLE_VA - base) as usize;
+        let mut buf = vec![0u8; table_off + FMV_SLOT_COUNT * SLOT_STRIDE];
+
+        // Path strings near the start.
+        let p_mv1 = 0x10usize;
+        let p_mv3 = 0x20usize;
+        let p_mov = 0x30usize;
+        buf[p_mv1..p_mv1 + 14].copy_from_slice(b"\\MOV\\MV1.STR;1");
+        buf[p_mv3..p_mv3 + 14].copy_from_slice(b"\\MOV\\MV3.STR;1");
+        buf[p_mov..p_mov + 15].copy_from_slice(b"\\DATA\\MOV.STR;1");
+
+        let mut put = |slot: usize, words: [u32; 8]| {
+            let rec = table_off + slot * SLOT_STRIDE;
+            for (i, v) in words.iter().enumerate() {
+                buf[rec + i * 4..rec + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        };
+        // fmv 0 -> MV1 frames 1..0x53a, 320x240.
+        put(0, [base + p_mv1 as u32, 1, 1, 0x53a, 0, 8, 320, 240]);
+        // fmv 1 -> MV3 second segment, start 0x1a5, 320x240.
+        put(1, [base + p_mv3 as u32, 0, 0x1a5, 0x27b, 0, 8, 320, 240]);
+        // fmv 2..4 -> filler MV1 so the retail prefix (>=5) decodes.
+        for slot in 2..4 {
+            put(slot, [base + p_mv1 as u32, 0, 1, 0x10, 0, 8, 320, 240]);
+        }
+        // fmv 4 -> a dev MOV.STR slot (not on the retail disc).
+        put(4, [base + p_mov as u32, 0, 1, 0x64, 0, 8, 256, 240]);
+
+        let t = FmvTable::from_str_overlay(&buf).expect("decode");
+        assert_eq!(t.entries.len(), 5, "decode stops after the filled slots");
+        let e0 = t.entry(0).unwrap();
+        assert_eq!(e0.basename(), "MV1.STR");
+        assert_eq!(e0.engine_path(), "MOV/MV1.STR");
+        assert_eq!((e0.start_frame, e0.end_frame), (1, 0x53a));
+        assert_eq!((e0.width, e0.height), (320, 240));
+        assert!(e0.on_retail_disc());
+
+        let e1 = t.entry(1).unwrap();
+        assert_eq!(e1.basename(), "MV3.STR");
+        assert_eq!(e1.start_frame, 0x1a5);
+        assert_eq!(t.engine_path(1).as_deref(), Some("MOV/MV3.STR"));
+
+        // The dev MOV.STR slot decodes but isn't a retail movie.
+        let e4 = t.entry(4).unwrap();
+        assert!(!e4.on_retail_disc());
+        assert_eq!(t.engine_path(4), None);
+    }
+
+    /// A wrong base (slot 0 doesn't resolve to MV1.STR) is rejected.
+    #[test]
+    fn rejects_drifted_base() {
+        let buf =
+            vec![0u8; (FMV_TABLE_VA - STR_OVERLAY_BASE_VA) as usize + FMV_SLOT_COUNT * SLOT_STRIDE];
+        assert!(FmvTable::from_str_overlay(&buf).is_none());
+    }
+
+    fn fmv_entry(start: u32, end: u32) -> FmvEntry {
+        FmvEntry {
+            fmv_id: 0,
+            path: "\\MOV\\MV3.STR;1".to_string(),
+            scale_flag: 0,
+            start_frame: start,
+            end_frame: end,
+            width: 320,
+            height: 240,
+        }
+    }
+
+    #[test]
+    fn segment_window_none_plays_whole_file() {
+        assert_eq!(fmv_segment_window(None, 1000, 6800), (1000, 6800));
+    }
+
+    #[test]
+    fn segment_window_first_segment_is_whole_when_range_spans_file() {
+        // A single-segment movie: frames 1..N over the whole file is a no-op.
+        let e = fmv_entry(1, 680);
+        assert_eq!(fmv_segment_window(Some(&e), 1000, 6800), (1000, 6800));
+    }
+
+    #[test]
+    fn segment_window_seeks_into_a_mid_file_segment() {
+        // MV3.STR fmv_id 4: frames 0x1a5..0x27b -> skip 420 frames, play 215.
+        let e = fmv_entry(0x1a5, 0x27b);
+        let (lba, count) = fmv_segment_window(Some(&e), 1000, 6800);
+        assert_eq!(lba, 1000 + 420 * 10);
+        assert_eq!(count, (0x27b - 0x1a5 + 1) * 10);
+        // Stays within the file.
+        assert!(lba - 1000 + count <= 6800);
+    }
+
+    #[test]
+    fn segment_window_clamps_count_to_file_end() {
+        // End frame past the file -> clamp to what's left.
+        let e = fmv_entry(0x1a5, 0xfff);
+        let (lba, count) = fmv_segment_window(Some(&e), 1000, 6800);
+        assert_eq!(lba, 1000 + 420 * 10);
+        assert_eq!(count, 6800 - 420 * 10);
+    }
+}

@@ -1,0 +1,587 @@
+//! Software emulation of the PSX 1MB VRAM (1024×512 16-bit pixels).
+//!
+//! Used by the renderer to do faithful PSX texture lookups: each TMD
+//! primitive carries a CBA (CLUT base address) and TSB (texture sub-base /
+//! "tpage") that index into VRAM, not into any individual TIM. To resolve
+//! them we need every TIM in the scene placed at its canonical fb_x/fb_y
+//! position - which is exactly what the PSX BIOS does at boot when the
+//! game DMAs each TIM to its `fb_x/fb_y` slot.
+//!
+//! [`Vram::upload_tim`] writes both the image block and the CLUT block at
+//! the positions stored in the TIM header. Overlapping uploads use last-
+//! wins (matches the real hardware: later DMA writes overwrite earlier ones).
+//!
+//! Pixels are stored in raw 16-bit form (BGR555 + STP). Decoding to RGBA
+//! happens in the fragment shader so per-prim bit-depth + CLUT lookup
+//! decisions stay on the GPU.
+
+use crate::Tim;
+
+/// PSX VRAM is 1024 pixels wide × 512 pixels tall, 16 bits per pixel.
+pub const VRAM_WIDTH: usize = 1024;
+pub const VRAM_HEIGHT: usize = 512;
+pub const VRAM_PIXELS: usize = VRAM_WIDTH * VRAM_HEIGHT;
+
+/// Detailed verdict on whether a primitive's `(cba, tsb, uvs)` lookup will
+/// produce coherent pixels in the current VRAM. Returned by
+/// [`Vram::prim_texture_status`]; [`Vram::prim_has_texture_data`] is a thin
+/// wrapper that just checks for `Ok` here.
+///
+/// "Coherent" means: the entries the GPU would actually read for this
+/// prim's CLUT are populated, AND the UV bbox inside the texture page has
+/// non-zero data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimTextureStatus {
+    /// CLUT (if any) and texture page both populated and depth-matched.
+    Ok,
+    /// CLUT row sits in unfilled VRAM (no TIM has uploaded this row).
+    MissingClut { row: u16 },
+    /// **No longer produced.** Retained so the diagnostic surfaces that
+    /// tabulate drop reasons keep their column (it now always reads zero,
+    /// which is the true count).
+    ///
+    /// This was a width heuristic: measure how far the prim's CLUT
+    /// scanline is populated and reject a 4bpp prim whose row ran past 16
+    /// palettes' worth (256 entries), on the theory that a wide row meant
+    /// another TIM's image data had spilled onto it and the lookup would
+    /// index pixels instead of a palette.
+    ///
+    /// It is unsound, and the bound was the giveaway: a 4bpp CBA addresses
+    /// **64** distinct 16-entry palettes per row (`(cba & 0x3F) * 16` spans
+    /// `0..=1008`), so a fully legitimate row is populated across all 1024
+    /// pixels - four times the width the check called impossible. 8bpp has
+    /// the same property with 4 palettes. The GPU reads only the 16 (or
+    /// 256) entries at the prim's own CBA, so no measurement of the *rest*
+    /// of the scanline can say whether those entries are a palette; only
+    /// [`Self::MissingClut`], which reads exactly that window, can.
+    ///
+    /// In practice it deleted whole buildings: every one of `town0b`'s
+    /// placed-house prims sampling the densely-packed CLUT row 491 was
+    /// dropped, leaving a hole through to the clear colour where the house
+    /// should be. Do not re-add a width test here.
+    ClutDepthMismatch {
+        row: u16,
+        populated_width: u16,
+        expected_width: u16,
+    },
+    /// Texture page region (UV bbox) is empty - the TIM that should
+    /// supply the texels for this prim wasn't uploaded.
+    MissingTexturePage { tpage: u16 },
+}
+
+impl PrimTextureStatus {
+    /// True when the prim should be drawn (no missing/mismatched data).
+    pub fn ok(&self) -> bool {
+        matches!(self, PrimTextureStatus::Ok)
+    }
+}
+
+/// Software 1MB VRAM. Each cell is one 16-bit framebuffer word. Indexed
+/// row-major: `pixels[y * VRAM_WIDTH + x]`.
+#[derive(Clone)]
+pub struct Vram {
+    pixels: Vec<u16>,
+    /// One bit per cell: has any upload written it? Kept apart from the
+    /// pixel value because a written `0x0000` is real content - a 4bpp
+    /// word of four index-0 texels, the transparent background of every
+    /// caption TIM - and [`Self::underlay`] must not treat it as a hole.
+    written: Vec<u64>,
+}
+
+impl Default for Vram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Vram {
+    /// Fresh VRAM, all zeros.
+    pub fn new() -> Self {
+        Self {
+            pixels: vec![0u16; VRAM_PIXELS],
+            written: vec![0u64; VRAM_PIXELS.div_ceil(64)],
+        }
+    }
+
+    /// Raw pixel buffer in row-major order. Bytes are little-endian u16.
+    pub fn as_u16(&self) -> &[u16] {
+        &self.pixels
+    }
+
+    /// Same data, viewed as bytes - useful for GPU upload (R16Uint).
+    pub fn as_bytes(&self) -> &[u8] {
+        bytemuck::cast_slice(&self.pixels)
+    }
+
+    /// Upload a TIM's image block (and CLUT, if present) at the positions
+    /// stored in the TIM header. Out-of-bounds writes are clipped.
+    pub fn upload_tim(&mut self, tim: &Tim) {
+        self.upload_tim_partial(tim, true, true);
+    }
+
+    /// Like [`Self::upload_tim`] but lets the caller choose, per block,
+    /// whether to write it. Asset-viewer / web-viewer use this for
+    /// **targeted** uploads: when a TIM's image block would land on top
+    /// of a VRAM region another primitive uses as its CLUT, the caller
+    /// passes `upload_image = false` so the image bytes don't clobber a
+    /// palette row (the symptom otherwise is rainbow noise - the
+    /// paletted decode reads image data as BGR555 colours). The
+    /// symmetric case (`upload_clut = false`) covers CLUT blocks
+    /// landing on top of someone else's texture page.
+    pub fn upload_tim_partial(&mut self, tim: &Tim, upload_image: bool, upload_clut: bool) {
+        self.upload_tim_partial_opts(tim, upload_image, upload_clut, false);
+    }
+
+    /// Like [`Self::upload_tim_partial`] but with optional **merge** semantics
+    /// for the CLUT block: when `merge_clut_zeros` is set, CLUT halfwords
+    /// equal to `0x0000` skip the underlying VRAM cell instead of clobbering
+    /// it. Used by the targeted upload to handle scenes where multiple TIMs
+    /// target the same CLUT row but each only populates a subset of the
+    /// 16-color slots (the remaining entries on disc are filler zeros).
+    /// Without merge mode, the last TIM in iteration order wins and any
+    /// slot it leaves zero erases earlier uploads. Image blocks always
+    /// overwrite, since image data legitimately contains `0x0000` pixels.
+    pub fn upload_tim_partial_opts(
+        &mut self,
+        tim: &Tim,
+        upload_image: bool,
+        upload_clut: bool,
+        merge_clut_zeros: bool,
+    ) {
+        if upload_clut && let Some(clut) = tim.clut.as_ref() {
+            // A Legaia CLUT block lands as a **linear run** of `w * h`
+            // halfwords along row `fb_y`, NOT as a `w x h` rectangle: palette
+            // `i` of a multi-palette block goes to `(fb_x + 16*i, fb_y)`, the
+            // next 16-colour slot on the same row, not to `(fb_x, fb_y + i)`.
+            //
+            // Pinned byte-exactly against retail VRAM (the town0c field save
+            // state): of the 69 non-zero secondary palettes the scene's TIMs
+            // declare, 69 sit where the linear layout puts them and 0 sit
+            // where the rectangle would. It is also what the prims ask for -
+            // their CBAs index those odd 16-colour slots - and what makes the
+            // NPC-palette blocks legal at all: `parse_strict` notes CLUTs at
+            // `fb_y` 510..511 with `h` up to 16, which as a rectangle would
+            // run off the bottom of a 512-row framebuffer and as a linear run
+            // fits comfortably.
+            //
+            // Uploading these as rectangles left every odd CLUT slot empty, so
+            // the 4bpp prims indexing them decoded to `0x0000`, were discarded
+            // by the renderer, and left holes in the town ground.
+            let run = clut.w.saturating_mul(clut.h);
+            if merge_clut_zeros {
+                self.write_words_merge_zeros(clut.fb_x, clut.fb_y, run, 1, &clut.entries);
+            } else {
+                self.write_words(clut.fb_x, clut.fb_y, run, 1, &clut.entries);
+            }
+        }
+        if !upload_image {
+            return;
+        }
+        // Image block: data is `fb_w * h` 16-bit words.
+        let img = &tim.image;
+        let n_words = img.fb_w as usize * img.h as usize;
+        let mut words = Vec::with_capacity(n_words);
+        for i in 0..n_words {
+            let off = i * 2;
+            if off + 2 > img.data.len() {
+                break;
+            }
+            words.push(u16::from_le_bytes([img.data[off], img.data[off + 1]]));
+        }
+        self.write_words(img.fb_x, img.fb_y, img.fb_w, img.h, &words);
+    }
+
+    /// Write a single row of 16-bit words at `(fb_x, fb_y)` from raw bytes.
+    /// Bytes must come in little-endian halfword pairs (BGR555 + STP).
+    /// Pixels past `VRAM_WIDTH` / `VRAM_HEIGHT` are clipped silently.
+    ///
+    /// Used by engine consumers that source CLUT halfwords from a buffer
+    /// that doesn't carry the standard TIM CLUT header (e.g. the
+    /// `legaia_actor_formats::battle_data_pack` post-TMD pool, where palettes
+    /// live as a bare 32-byte run inside an LZS-decompressed record).
+    pub fn write_clut_row(&mut self, fb_x: u16, fb_y: u16, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let halfwords: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        self.write_words(fb_x, fb_y, halfwords.len() as u16, 1, &halfwords);
+    }
+
+    /// Write a `w_words` x `h` packed image block from raw little-endian
+    /// halfword bytes into VRAM at `(fb_x, fb_y)`. One VRAM cell holds one
+    /// halfword, so a 4bpp page that is `n` texels wide occupies `n / 4`
+    /// cells per row; the caller is responsible for that texel->word
+    /// conversion. Pixels falling outside VRAM are skipped.
+    ///
+    /// Used by engine consumers that inject a bare (header-less) image
+    /// block - e.g. the `legaia_actor_formats::monster_archive` battle texture
+    /// page, whose 4bpp pixel run lives after the CLUT region inside an
+    /// LZS-decompressed archive block.
+    pub fn write_block(&mut self, fb_x: u16, fb_y: u16, w_words: u16, h: u16, bytes: &[u8]) {
+        if bytes.is_empty() || w_words == 0 || h == 0 {
+            return;
+        }
+        let halfwords: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        self.write_words(fb_x, fb_y, w_words, h, &halfwords);
+    }
+
+    /// Fill every word of `self` that no upload has written from `base` -
+    /// i.e. layer a boot-resident upload *underneath* an already-built
+    /// scene VRAM. Scene words win wherever the scene build wrote
+    /// (matching the retail boot-first-then-scene DMA order, where a later
+    /// scene upload overwrites boot content); the boot content shows
+    /// through everywhere else. A filled word counts as written from then
+    /// on when `base` wrote it, so a second underlay stays beneath the
+    /// first.
+    ///
+    /// "Written" is tracked per cell, not read off a zero value: retail's
+    /// `LoadImage` replaces every word of the rect, zeros included. Keying
+    /// on the value let the effect-texture pool's kanji sheet at
+    /// `(320, 256..)` bleed through the transparent background of the
+    /// ending scenes' credit caption TIMs (`(320, 416)` 40x32 in
+    /// `edteien`), where retail's VRAM holds clean zeros.
+    pub fn underlay(&mut self, base: &Vram) {
+        for (i, (dst, &src)) in self.pixels.iter_mut().zip(base.pixels.iter()).enumerate() {
+            let (word, bit) = (i / 64, 1u64 << (i % 64));
+            if self.written[word] & bit == 0 {
+                *dst = src;
+                self.written[word] |= base.written[word] & bit;
+            }
+        }
+    }
+
+    /// Has any upload written the cell at `(x, y)`? `false` outside VRAM.
+    pub fn is_written(&self, x: usize, y: usize) -> bool {
+        if x >= VRAM_WIDTH || y >= VRAM_HEIGHT {
+            return false;
+        }
+        let i = y * VRAM_WIDTH + x;
+        self.written[i / 64] & (1u64 << (i % 64)) != 0
+    }
+
+    #[inline]
+    fn store(&mut self, i: usize, val: u16) {
+        self.pixels[i] = val;
+        self.written[i / 64] |= 1u64 << (i % 64);
+    }
+
+    /// VRAM-to-VRAM rectangle copy: `w x h` halfwords from `(src_x, src_y)`
+    /// to `(dst_x, dst_y)` - the libgpu `MoveImage` primitive. A zero `w` or
+    /// `h` is a no-op (the retail wrapper rejects those rects); cells falling
+    /// outside the 1024x512 framebuffer are skipped. The source rect is
+    /// snapshotted first, so overlapping copies behave like the GPU's
+    /// buffered transfer.
+    ///
+    /// Used by the engine's battle facial animator, which re-stamps the
+    /// current eye/mouth face frame from a member band's face-frame strip
+    /// onto its live face rows every frame (`legaia_actor_formats::face_anim`).
+    // PORT: FUN_80058490 - the MoveImage wrapper the per-frame facial
+    // animator FUN_8004C7B4 stamps through (skips rects with a zero
+    // width or height).
+    pub fn move_image(&mut self, src_x: u16, src_y: u16, w: u16, h: u16, dst_x: u16, dst_y: u16) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let mut snap = Vec::with_capacity(w as usize * h as usize);
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                snap.push(self.pixel(src_x as usize + col, src_y as usize + row));
+            }
+        }
+        self.write_words(dst_x, dst_y, w, h, &snap);
+    }
+
+    /// Write `w * h` 16-bit words into VRAM starting at `(x, y)`.
+    /// Pixels falling outside `[0..VRAM_WIDTH) × [0..VRAM_HEIGHT)` are skipped.
+    fn write_words(&mut self, x: u16, y: u16, w: u16, h: u16, src: &[u16]) {
+        let x0 = x as usize;
+        let y0 = y as usize;
+        for row in 0..h as usize {
+            let dy = y0 + row;
+            if dy >= VRAM_HEIGHT {
+                break;
+            }
+            for col in 0..w as usize {
+                let dx = x0 + col;
+                if dx >= VRAM_WIDTH {
+                    break;
+                }
+                let src_idx = row * w as usize + col;
+                if src_idx >= src.len() {
+                    return;
+                }
+                self.store(dy * VRAM_WIDTH + dx, src[src_idx]);
+            }
+        }
+    }
+
+    /// Like [`Self::write_words`] but `0x0000` source halfwords are skipped
+    /// instead of overwriting. Used by CLUT merge uploads where multiple
+    /// scene-pack TIMs share the same CLUT row but each only populates a
+    /// subset of the 16-color slots.
+    fn write_words_merge_zeros(&mut self, x: u16, y: u16, w: u16, h: u16, src: &[u16]) {
+        let x0 = x as usize;
+        let y0 = y as usize;
+        for row in 0..h as usize {
+            let dy = y0 + row;
+            if dy >= VRAM_HEIGHT {
+                break;
+            }
+            for col in 0..w as usize {
+                let dx = x0 + col;
+                if dx >= VRAM_WIDTH {
+                    break;
+                }
+                let src_idx = row * w as usize + col;
+                if src_idx >= src.len() {
+                    return;
+                }
+                let val = src[src_idx];
+                if val == 0 {
+                    continue;
+                }
+                self.store(dy * VRAM_WIDTH + dx, val);
+            }
+        }
+    }
+
+    /// Read one 16-bit pixel at `(x, y)`. Returns 0 outside VRAM.
+    pub fn pixel(&self, x: usize, y: usize) -> u16 {
+        if x >= VRAM_WIDTH || y >= VRAM_HEIGHT {
+            return 0;
+        }
+        self.pixels[y * VRAM_WIDTH + x]
+    }
+
+    /// True if any pixel in the rectangle `[x..x+w) × [y..y+h)` is non-zero.
+    /// Coordinates and dimensions outside VRAM are clipped silently. Used
+    /// by mesh builders to decide whether a primitive's CLUT / texture
+    /// page region was actually populated by the TIMs that have been
+    /// uploaded so far - empty regions render as solid `CLUT[0]` (commonly
+    /// a flat green or cyan), so it's better to drop those primitives at
+    /// build time than rasterise garbage over them.
+    pub fn region_has_data(&self, x: usize, y: usize, w: usize, h: usize) -> bool {
+        let x_end = (x + w).min(VRAM_WIDTH);
+        let y_end = (y + h).min(VRAM_HEIGHT);
+        if x >= x_end || y >= y_end {
+            return false;
+        }
+        for row in y..y_end {
+            let base = row * VRAM_WIDTH;
+            for col in x..x_end {
+                if self.pixels[base + col] != 0 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Predicate suitable for [`legaia_tmd::mesh::tmd_to_vram_mesh_filtered`]:
+    /// returns `true` when both the prim's CLUT row and the UV bbox inside
+    /// its texture page have non-zero VRAM data, AND the CLUT row's
+    /// occupied width is plausibly the right depth (a 4bpp prim sampling
+    /// a CLUT scanline that's clearly a 256-entry 8bpp palette is a
+    /// strong signal that the wrong TIM is supplying this row).
+    ///
+    /// Returns `false` when either side is empty or the depth mismatch is
+    /// large enough that rendering would produce rainbow noise (a 4bpp
+    /// prim indexing the first 16 entries of an 8bpp palette gives an
+    /// arbitrary slice of a 256-colour gradient, not a coherent 16-colour
+    /// scheme - usually the wrong TIM was loaded for the asset).
+    pub fn prim_has_texture_data(&self, cba: u16, tsb: u16, uvs: &[(u8, u8)]) -> bool {
+        self.prim_texture_status(cba, tsb, uvs).ok()
+    }
+
+    /// Like [`Self::prim_has_texture_data`] but returns a structured verdict.
+    /// Used by diagnostic surfaces that want to tell the user which prims
+    /// were dropped and why.
+    pub fn prim_texture_status(&self, cba: u16, tsb: u16, uvs: &[(u8, u8)]) -> PrimTextureStatus {
+        // CLUT row: 1 row of 16 (4bpp) or 256 (8bpp) BGR555 entries.
+        let cx = ((cba & 0x3F) * 16) as usize;
+        let cy = ((cba >> 6) & 0x1FF) as usize;
+        let depth_bits = match (tsb >> 7) & 0x3 {
+            0 => 4u8,
+            1 => 8,
+            _ => 16,
+        };
+        let clut_w = match depth_bits {
+            4 => 16usize,
+            8 => 256,
+            _ => 0,
+        };
+        if clut_w != 0 && !self.region_has_data(cx, cy, clut_w, 1) {
+            return PrimTextureStatus::MissingClut {
+                row: (cba >> 6) & 0x1FF,
+            };
+        }
+        // NO WIDTH-BASED DEPTH CHECK HERE - see
+        // [`PrimTextureStatus::ClutDepthMismatch`]. How much of the rest of
+        // the scanline is populated says nothing about whether *this* prim's
+        // palette is valid, because the CBA addresses 64 distinct 16-entry
+        // palettes per row (`(cba & 0x3F) * 16` spans `0..=1008`), so a
+        // legitimately packed row runs the full 1024. The sound test is the
+        // `MissingClut` one above, which reads exactly the 16 (or 256)
+        // entries the GPU would.
+
+        // Texture page region: hash the UV bbox into VRAM coords and check
+        // that some words are non-zero. UV byte layout matches the shader:
+        // 4bpp packs 4 pixels per word (u >> 2), 8bpp packs 2 (u >> 1),
+        // 15bpp uses one word per texel.
+        let tpage_x = ((tsb & 0xF) * 64) as usize;
+        let tpage_y = (((tsb >> 4) & 1) * 256) as usize;
+        let mut umin = u8::MAX;
+        let mut umax = 0u8;
+        let mut vmin = u8::MAX;
+        let mut vmax = 0u8;
+        for &(u, v) in uvs {
+            if u < umin {
+                umin = u;
+            }
+            if u > umax {
+                umax = u;
+            }
+            if v < vmin {
+                vmin = v;
+            }
+            if v > vmax {
+                vmax = v;
+            }
+        }
+        let (vram_u_lo, vram_u_hi) = match depth_bits {
+            4 => (umin as usize >> 2, umax as usize >> 2),
+            8 => (umin as usize >> 1, umax as usize >> 1),
+            _ => (umin as usize, umax as usize),
+        };
+        let page_w = vram_u_hi.saturating_sub(vram_u_lo) + 1;
+        let page_h = (vmax as usize).saturating_sub(vmin as usize) + 1;
+        if !self.region_has_data(tpage_x + vram_u_lo, tpage_y + vmin as usize, page_w, page_h) {
+            return PrimTextureStatus::MissingTexturePage { tpage: tsb & 0x1F };
+        }
+        PrimTextureStatus::Ok
+    }
+
+    /// Estimate of the fraction of OPAQUE texels across the prim's UV
+    /// bounding box, sampling up to an 8x8 grid and decoding each texel
+    /// exactly as the render shaders do (4/8bpp CLUT lookup, 15bpp
+    /// direct). A texel is transparent when its decoded BGR555 word is
+    /// `0x0000` (black + STP 0 - the shaders' cutout `discard`).
+    ///
+    /// The consumer is the camera-occlusion fade's visibility gate: a
+    /// prim that *draws* but whose texels are mostly the transparent word
+    /// (terrain-tile boundary skirts, foliage cutouts, grates) is see-
+    /// through on screen, so it must not count as an occluder. A bbox
+    /// sample overestimates the transparent share of diagonal-half prims,
+    /// which only ever makes the gate MORE conservative (less fading).
+    pub fn prim_opaque_fraction(&self, cba: u16, tsb: u16, uvs: &[(u8, u8)]) -> f32 {
+        if uvs.is_empty() {
+            return 0.0;
+        }
+        let cx = ((cba & 0x3F) * 16) as usize;
+        let cy = ((cba >> 6) & 0x1FF) as usize;
+        let tpage_x = ((tsb & 0xF) * 64) as usize;
+        let tpage_y = (((tsb >> 4) & 1) * 256) as usize;
+        let depth = (tsb >> 7) & 0x3;
+        let (mut umin, mut umax, mut vmin, mut vmax) = (u8::MAX, 0u8, u8::MAX, 0u8);
+        for &(u, v) in uvs {
+            umin = umin.min(u);
+            umax = umax.max(u);
+            vmin = vmin.min(v);
+            vmax = vmax.max(v);
+        }
+        let word_at = |x: usize, y: usize| -> u16 {
+            if x >= VRAM_WIDTH || y >= VRAM_HEIGHT {
+                return 0;
+            }
+            self.pixels[y * VRAM_WIDTH + x]
+        };
+        let steps = 8usize;
+        let mut opaque = 0usize;
+        let mut total = 0usize;
+        for si in 0..=steps {
+            for sj in 0..=steps {
+                let u = umin as usize + (umax as usize - umin as usize) * si / steps;
+                let v = vmin as usize + (vmax as usize - vmin as usize) * sj / steps;
+                let word = match depth {
+                    0 => {
+                        let w = word_at(tpage_x + (u >> 2), tpage_y + v);
+                        let pal = (w >> ((u & 3) * 4)) & 0xF;
+                        word_at(cx + pal as usize, cy)
+                    }
+                    1 => {
+                        let w = word_at(tpage_x + (u >> 1), tpage_y + v);
+                        let pal = (w >> ((u & 1) * 8)) & 0xFF;
+                        word_at(cx + pal as usize, cy)
+                    }
+                    _ => word_at(tpage_x + u, tpage_y + v),
+                };
+                total += 1;
+                if word != 0 {
+                    opaque += 1;
+                }
+            }
+        }
+        opaque as f32 / total as f32
+    }
+
+    /// Length (in pixels) of the populated run starting at `(x, y)` in
+    /// VRAM. Used to gauge how wide a CLUT row's contents are - 16 for a
+    /// 4bpp palette, 256 for an 8bpp one. `max_w` caps the search so the
+    /// scan is bounded.
+    pub fn row_populated_width(&self, x: usize, y: usize, max_w: usize) -> usize {
+        if y >= VRAM_HEIGHT || x >= VRAM_WIDTH {
+            return 0;
+        }
+        let end = (x + max_w).min(VRAM_WIDTH);
+        let mut last_nonzero: Option<usize> = None;
+        let base = y * VRAM_WIDTH;
+        for col in x..end {
+            if self.pixels[base + col] != 0 {
+                last_nonzero = Some(col);
+            }
+        }
+        last_nonzero.map(|c| c + 1 - x).unwrap_or(0)
+    }
+
+    /// Width (in pixels) of the *contiguous* populated run starting at
+    /// `(x, y)`, tolerating internal gaps of up to `max_gap` consecutive zero
+    /// pixels but stopping at the first larger gap. Unlike
+    /// [`Self::row_populated_width`] (which reports the distance to the last
+    /// non-zero pixel within the window, crossing arbitrary gaps), this keeps a
+    /// palette-row width measurement from leaking into an unrelated VRAM region
+    /// that merely shares the same scanline. `max_w` bounds the scan.
+    pub fn row_run_width(&self, x: usize, y: usize, max_w: usize, max_gap: usize) -> usize {
+        if y >= VRAM_HEIGHT || x >= VRAM_WIDTH {
+            return 0;
+        }
+        let end = (x + max_w).min(VRAM_WIDTH);
+        let base = y * VRAM_WIDTH;
+        let mut last_nonzero: Option<usize> = None;
+        let mut gap = 0usize;
+        for col in x..end {
+            if self.pixels[base + col] != 0 {
+                last_nonzero = Some(col);
+                gap = 0;
+            } else if last_nonzero.is_some() {
+                gap += 1;
+                if gap > max_gap {
+                    break;
+                }
+            }
+        }
+        last_nonzero.map(|c| c + 1 - x).unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests;

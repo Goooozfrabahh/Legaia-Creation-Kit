@@ -1,0 +1,655 @@
+//! The staged-anim commit's **clip-tag ladder** and the reaction chain it
+//! drives.
+//!
+//! Every path through the commit `FUN_8004AD80` converges at `0x8004BDD8`:
+//! the new entry is installed at node `+0x4C` and `+0x1D9 = +0x1DA`, then the
+//! routine tests the **new** entry's tag byte `+0x00` once
+//! (`0x8004BE30..0x8004BF4C`, `see ghidra/scripts/funcs/8004ad80.txt`):
+//!
+//! | tag | condition | writes |
+//! |---|---|---|
+//! | `2` | first monster `0xB3` / `0xB5`, committing actor at HP `0` | the entry's tag becomes `4` in place (then the tag-`4` row runs); for `0xB3` also entry `+0x56 += 1` |
+//! | `4` | HP not `0` | `+0x1DA = +0x1F2` (the get-up), `+0x1DC = 0` |
+//! | `4` | HP `0`, party seat | `+0x1DA = 7`, `+0x1DC = 0` |
+//! | `5` | - | `+0x1DC \|= 4` |
+//! | `7` | - | `+0x1DA = 8` |
+//! | `8` | - | `+0x1DC \|= 8` |
+//!
+//! `+0x1DA` is the next entry staged behind the playing one: the anim tick's
+//! natural-end path (`FUN_80047430` `0x80047B30..0x80047B58`) replaces it with
+//! `0` when `+0x1DC` bit `0x4` is set, masks `+0x1DC &= 0xF8` (bit `0x8`
+//! survives) and calls the commit again. So a downed party member's chain is
+//! knockdown, entry `7`, entry `8`, and entry `8` then re-commits itself at
+//! every natural end with the root-motion latch (`+0x1DC` bit `0x8`,
+//! `0x80047D20`) raised. Three catalogued battle states read a dead party
+//! member at current = queued = `8`, `+0x1DC = 8`.
+//!
+//! The monster-death arm earlier in the commit (`0x8004B094..0x8004B6A0`)
+//! fires when the **previous** entry carried tag `4`, the committing actor is
+//! a monster seat and its HP is `0`: it re-installs that entry held on its
+//! last frame, runs the death spoils (`battle_steal`), sets `+0x21C = 2` and
+//! `+0x1DC |= 8`, and - with a Seru staged in `ctx[+0x269]` - overwrites
+//! `+0x1DC = 4` and stages the get-up `+0x1F2` (`0x8004B688..0x8004B6A0`), so
+//! the fallen monster rises for the absorb. Captures read both arms: a dead
+//! monster held on its knockdown entry with `+0x1DC = 8`, and one on its
+//! get-up entry with `+0x1DC = 4` while `ctx[+0x269] = 1`.
+//!
+//! ## One channel, one timing seam
+//!
+//! The engine plays hit reactions on its own channel
+//! ([`crate::world::Actor::battle_reaction`] - the tag of the reaction-family
+//! clip playing - plus [`crate::world::Actor::battle_reaction_next`], the
+//! mirror of `+0x1DA` behind it) and keeps `+0x1DC` in
+//! `battle.flag_bits`. The ladder runs at the reaction's commit
+//! ([`World::commit_battle_reaction_entry`]) for every row except the tag-`4`
+//! HP test: the port stages the reaction inside the hit, ahead of the combo
+//! total's HP write (`World::apply_combo_total`), where retail's commit runs
+//! on the next anim tick with that write already landed. So the knockdown's
+//! row is evaluated at the clip's natural end on the live HP - the same value
+//! retail's commit saw, as long as nothing revives the actor mid-fall.
+
+use super::*;
+
+use legaia_engine_battle_vm::battle_action::ActorFlags;
+
+/// First monster ids whose flinch commit at HP `0` is rewritten into a
+/// knockdown (`li a1,0xb3` / `li v0,0xb5` at `0x8004BE44` / `0x8004BE54`).
+pub const TAG2_REWRITE_MONSTERS: [u8; 2] = [0xB3, 0xB5];
+
+/// The party's downed-chain entries: the tag-`4` commit at HP `0` stages
+/// entry `7` (`li v0,0x7` at `0x8004BED8`), whose own commit stages entry `8`
+/// (`li v0,0x8` at `0x8004BF20`).
+pub const PARTY_DOWNED_ENTRY: u8 = 7;
+/// See [`PARTY_DOWNED_ENTRY`].
+pub const PARTY_DOWNED_LOOP_ENTRY: u8 = 8;
+
+/// `+0x1DC` bit the tag-`5` commit raises: return to idle at the natural end
+/// (`ori v0,v0,0x4` at `0x8004BF04`; consumed at `0x80047B30`).
+pub const ANIM_FLAG_IDLE_AT_END: u8 = ActorFlags::EXIT;
+/// `+0x1DC` bit the tag-`8` commit and the monster-death arm raise: the
+/// root-motion latch (`0x80047D20`) - the same bit gates the effect-script
+/// walk (`FUN_801DEA50`).
+pub const ANIM_FLAG_ROOT_LATCH: u8 = ActorFlags::FX_SUPPRESSED;
+
+/// What the committing actor looks like to the ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LadderInputs {
+    /// The new entry's tag byte `+0x00`.
+    pub tag: u8,
+    /// The committing actor's HP `+0x14C` is `0`.
+    pub hp_zero: bool,
+    /// The committing actor is a party seat (`sltiu v0,s3,0x3`).
+    pub party: bool,
+    /// The battle's first monster id (`gp[+0x9F4]` = `0x8007BD0C`).
+    pub first_monster: u8,
+    /// The actor's get-up entry `+0x1F2`.
+    pub getup_entry: u8,
+}
+
+/// How the ladder leaves `+0x1DC`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnimFlagWrite {
+    Keep,
+    /// `sb zero,0x1dc` - the tag-`4` rows.
+    Clear,
+    /// `ori` of the given bits.
+    Or(u8),
+}
+
+/// The ladder's writes for one commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LadderWrites {
+    /// The entry's tag after the in-place tag-`2` rewrite.
+    pub tag: u8,
+    /// `entry[+0x56] += 1` (the `0xB3` half of the rewrite).
+    pub bump_entry_56: bool,
+    /// The new `+0x1DA`, when the ladder stages one.
+    pub next: Option<u8>,
+    pub flags: AnimFlagWrite,
+}
+
+/// The ladder `0x8004BE30..0x8004BF4C`, as a pure function of the committed
+/// entry's tag and the committing actor.
+///
+/// PORT: FUN_8004AD80 (`0x8004BE30..0x8004BF4C`, the per-commit tag ladder)
+pub fn commit_tag_ladder(i: LadderInputs) -> LadderWrites {
+    let mut w = LadderWrites {
+        tag: i.tag,
+        bump_entry_56: false,
+        next: None,
+        flags: AnimFlagWrite::Keep,
+    };
+    if w.tag == 2 && TAG2_REWRITE_MONSTERS.contains(&i.first_monster) && i.hp_zero {
+        w.tag = 4;
+        w.bump_entry_56 = i.first_monster == TAG2_REWRITE_MONSTERS[0];
+    }
+    match w.tag {
+        4 if !i.hp_zero => {
+            w.next = Some(i.getup_entry);
+            w.flags = AnimFlagWrite::Clear;
+        }
+        4 if i.party => {
+            w.next = Some(PARTY_DOWNED_ENTRY);
+            w.flags = AnimFlagWrite::Clear;
+        }
+        5 => w.flags = AnimFlagWrite::Or(ANIM_FLAG_IDLE_AT_END),
+        7 => w.next = Some(PARTY_DOWNED_LOOP_ENTRY),
+        8 => w.flags = AnimFlagWrite::Or(ANIM_FLAG_ROOT_LATCH),
+        _ => {}
+    }
+    w
+}
+
+/// The lowest first-cue id for which a monster's re-committed block entry
+/// skips its first cue (`lhu v0,0x56(v0)` / `sltiu v0,v0,0x64` at
+/// `0x8004B048..0x8004B050`).
+pub const BLOCK_RECOMMIT_CUE_FLOOR: u16 = 0x64;
+
+/// The cue-track cursor `+0x1F6` a commit seeds (`0x8004AFC0..0x8004B05C`).
+///
+/// Every commit stores `0` (`sb zero,0x1f6(s1)` in the delay slot at
+/// `0x8004AFD0`) and then stores `1` (`0x8004B05C`) when the staged entry
+/// `+0x1DA` is the clip already playing (`+0x1D9`, `bne` at `0x8004AFCC`)
+/// **and** the juggle byte `+0x1F7` is up (`0x8004AFD4`), for these entries:
+///
+/// - the light-flinch slots `+0x1EF` / `+0x1F0` (`0x8004AFE4..0x8004AFFC`);
+/// - the block slot `+0x1F3` (`0x8004B004`), on a party seat
+///   (`sltiu v0,s3,0x3` at `0x8004B010`) or when the entry's first cue id
+///   (`entry[+0x56]`, slot 0 of the `+0x54` track) is at least
+///   [`BLOCK_RECOMMIT_CUE_FLOOR`].
+///
+/// So a hit that re-stages the reaction inside its own juggle window
+/// restarts the clip without its first sound cue: the impact sound is not
+/// layered on top of the one still ringing. The knockdown `+0x1F1` and
+/// get-up `+0x1F2` always restart at `0`.
+///
+/// PORT: FUN_8004AD80 (`0x8004AFC0..0x8004B05C`, the cue-cursor seed)
+pub fn recommit_cue_cursor(
+    map: [u8; 5],
+    current: u8,
+    entry: u8,
+    window_open: bool,
+    party: bool,
+    first_cue: u16,
+) -> u8 {
+    if entry != current || !window_open {
+        return 0;
+    }
+    let skip = entry == map[0]
+        || entry == map[1]
+        || (entry == map[4] && (party || first_cue >= BLOCK_RECOMMIT_CUE_FLOOR));
+    u8::from(skip)
+}
+
+/// The party reaction map `FUN_80053CB8` hardcodes into `+0x1EF..+0x1F3`
+/// (the player files store the family identity-ordered).
+pub const PARTY_REACTION_MAP: [u8; 5] = [2, 3, 4, 5, 0x0B];
+
+/// The reaction-family tags, in `+0x1EF..+0x1F3` order.
+const REACTION_TAGS: [u8; 5] = [2, 3, 4, 5, 0x0B];
+
+/// A monster's `+0x1EF..+0x1F3` map from its entry tags, the way
+/// `FUN_80054CB0` builds it: one forward pass with no `break`, so a repeated
+/// tag resolves to its **last** entry; an absent tag stays `0`; and a zero
+/// knockdown slot takes the flinch slot (`0x80055428`).
+pub fn monster_reaction_map(tags: &[u8]) -> [u8; 5] {
+    let mut map = [0u8; 5];
+    for (entry, &t) in tags.iter().enumerate() {
+        for (k, &want) in REACTION_TAGS.iter().enumerate() {
+            if t == want {
+                map[k] = entry as u8;
+            }
+        }
+    }
+    if map[2] == 0 {
+        map[2] = map[0];
+    }
+    map
+}
+
+impl World {
+    /// The battle's first monster id as the one byte retail's
+    /// `0x8007BD0C` holds (`0` when there is none).
+    pub(in crate::world) fn battle_first_monster_byte(&self) -> u8 {
+        self.battle_monster_slots()
+            .into_iter()
+            .find(|&(_, _, slot)| slot == 0)
+            .map_or(0, |(_, id, _)| id as u8)
+    }
+
+    /// Actor `slot`'s current anim `+0x1D9`: the reaction channel's entry
+    /// while a reaction plays, else the action channel's id.
+    pub fn battle_current_anim(&self, slot: usize) -> u8 {
+        self.actors.get(slot).map_or(0, |a| {
+            a.battle_reaction_entry.unwrap_or(a.battle.current_anim)
+        })
+    }
+
+    /// Whether actor `slot` is on its knockdown `+0x1F1`, or on its get-up
+    /// `+0x1F2` when that is non-zero - the test the post-strike arms
+    /// `0x1F` / `0x20` fork the camera to case `8` on
+    /// (`0x801E3A88..0x801E3AC4` / `0x801E5660..0x801E5684`).
+    pub fn battle_on_knockdown(&self, slot: usize) -> bool {
+        let Some(map) = self.battle_reaction_map(slot) else {
+            return false;
+        };
+        let cur = self.battle_current_anim(slot);
+        cur == map[2] || (cur == map[3] && cur != 0)
+    }
+
+    /// Actor `slot`'s `+0x1EF..+0x1F3` reaction map; `None` without clips.
+    pub(in crate::world) fn battle_reaction_map(&self, slot: usize) -> Option<[u8; 5]> {
+        let actor = self.actors.get(slot)?;
+        let clips = actor.battle_action_clips.as_ref()?;
+        if actor.battle_monster_id.is_none() {
+            return Some(PARTY_REACTION_MAP);
+        }
+        let tags: Vec<u8> = clips
+            .iter()
+            .map(|c| {
+                c.as_ref().map_or(
+                    legaia_actor_formats::monster_archive::NO_ACTION_ENTRY,
+                    |c| c.action_id,
+                )
+            })
+            .collect();
+        Some(monster_reaction_map(&tags))
+    }
+
+    /// Commit action entry `entry` onto actor `slot`'s reaction channel: the
+    /// engine's half of the commit `FUN_8004AD80` for an entry the damage
+    /// primitive or the ladder staged. Runs the ladder on the entry's tag
+    /// (the tag-`4` HP row excepted - see the module docs). Returns `false`
+    /// when the entry holds no playable clip.
+    pub(in crate::world) fn commit_battle_reaction_entry(
+        &mut self,
+        slot: usize,
+        entry: u8,
+    ) -> bool {
+        let Some(clip) = self
+            .actors
+            .get(slot)
+            .and_then(|a| a.battle_action_clips.as_ref())
+            .and_then(|c| c.get(usize::from(entry)))
+            .and_then(|c| c.clone())
+        else {
+            return false;
+        };
+        let Some(player) =
+            legaia_engine_battle::battle_anim::MonsterAnimPlayer::new_one_shot(&clip)
+        else {
+            return false;
+        };
+        let first_monster = self.battle_first_monster_byte();
+        // The cue-cursor seed reads the clip still playing (`+0x1D9`) and its
+        // juggle byte `+0x1F7` as the last tick left them, before the
+        // install below replaces either.
+        let cue_cursor = self.battle_reaction_map(slot).map_or(0, |map| {
+            let a = &self.actors[slot];
+            let first_cue = clip
+                .effect_script
+                .get(0x56..0x58)
+                .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+            recommit_cue_cursor(
+                map,
+                self.battle_current_anim(slot),
+                entry,
+                a.battle_juggle_window,
+                a.battle_monster_id.is_none(),
+                first_cue,
+            )
+        });
+        let actor = &mut self.actors[slot];
+        let inputs = LadderInputs {
+            tag: clip.action_id,
+            hp_zero: actor.battle.hp == 0,
+            party: actor.battle_monster_id.is_none(),
+            first_monster,
+            getup_entry: 0,
+        };
+        let w = commit_tag_ladder(inputs);
+        // The commit's unconditional rate decay runs for a reaction install
+        // too (`0x8004B080..0x8004B090`, ahead of the staged-id arms): a
+        // body slowed or frozen when its reaction commits plays it at half
+        // speed. PROT 0912's damage arm stages the knockdown and drops the
+        // victim to `2` in one pass; the commit lifts it to `4`, which
+        // retail's RAM holds through the knockdown.
+        actor.battle.anim_rate =
+            legaia_engine_battle_vm::battle_anim_rate::commit_rate_decay(actor.battle.anim_rate);
+        actor.battle_animation = Some(player);
+        actor.battle_reaction = Some(w.tag);
+        actor.battle_reaction_entry = Some(entry);
+        actor.battle_reaction_next = None;
+        actor.battle_pose = None;
+        // Tag 4's staging waits for the natural end (module docs); every
+        // other row lands now.
+        if w.tag != 4 {
+            actor.battle_reaction_next = w.next;
+            match w.flags {
+                AnimFlagWrite::Keep => {}
+                AnimFlagWrite::Clear => actor.battle.flag_bits = ActorFlags::empty(),
+                AnimFlagWrite::Or(bits) => actor.battle.flag_bits.set(bits),
+            }
+        }
+        // Record committed: swap in its effect script + zero the cursor
+        // (retail `sb zero,0x1f5` on every commit).
+        actor.battle_effect_script = Some(clip.effect_script).filter(|s| !s.is_empty());
+        actor.battle_effect_cursor = 0;
+        actor.battle_anim_cue_cursor = cue_cursor;
+        actor.battle_clip_commits = actor.battle_clip_commits.wrapping_add(1);
+        true
+    }
+
+    /// Actor `slot`'s reaction clip reached its natural end: the
+    /// `FUN_80047430` natural-end path followed by the next commit's two
+    /// reaction-relevant arms (the monster-death arm and the tag ladder's
+    /// staged `+0x1DA`). `playing` is the tag of the finished clip.
+    pub(in crate::world) fn finish_battle_reaction(&mut self, slot: usize, playing: u8) {
+        let party = usize::from(self.party.party_count);
+        let first_monster = self.battle_first_monster_byte();
+        let seru_staged = self.battle_ctx.absorbed_seru != 0;
+        let Some(map) = self.battle_reaction_map(slot) else {
+            Self::end_battle_reaction(&mut self.actors[slot]);
+            return;
+        };
+        let a = &mut self.actors[slot];
+        let hp_zero = a.battle.hp == 0;
+        let is_party = a.battle_monster_id.is_none();
+        // The knockdown's own ladder row, evaluated on the landed HP.
+        if playing == 4 {
+            let w = commit_tag_ladder(LadderInputs {
+                tag: 4,
+                hp_zero,
+                party: is_party,
+                first_monster,
+                getup_entry: map[3],
+            });
+            a.battle_reaction_next = w.next;
+            if w.flags == AnimFlagWrite::Clear {
+                a.battle.flag_bits = ActorFlags::empty();
+            }
+        }
+        // Natural end (`0x80047B30..0x80047B58`).
+        let idle = a.battle.flag_bits.has(ANIM_FLAG_IDLE_AT_END);
+        a.battle.flag_bits = ActorFlags(a.battle.flag_bits.0 & 0xF8);
+        // The monster-death arm: previous entry tagged 4, monster seat, HP 0.
+        // It runs whatever bit 2 staged - it re-installs the entry itself.
+        if playing == 4 && hp_zero && !is_party {
+            a.battle.flag_bits.set(ANIM_FLAG_ROOT_LATCH);
+            // `sb v1,0x21c(s1)` with `v1 = 2` at `0x8004B66C`: the body enters
+            // the defeat fade, whose lanes step to black while the actor holds
+            // its knockdown (or idle) frame - after the get-up, when a Seru is
+            // staged. The engine's resting colour word is `0` for neutral, so
+            // the fade starts from the neutral word it stands for - on
+            // **entry** only. The arm re-runs on every pass the finished
+            // knockdown holds, and a body the fade has already walked to
+            // black reads the same `0`: re-stamping it there restarted the
+            // fade, so the body never went and state `0x20`'s reaction hold
+            // never let go.
+            if a.battle.render_flag != legaia_engine_battle_vm::battle_formulas::STATE_DEFEAT_FADE
+                && a.battle.render_color == 0
+            {
+                a.battle.render_color = legaia_engine_battle_vm::battle_formulas::TINT_NEUTRAL;
+            }
+            a.battle.render_flag = legaia_engine_battle_vm::battle_formulas::STATE_DEFEAT_FADE;
+            if slot >= party {
+                self.resolve_monster_death_spoils(slot);
+            }
+            if seru_staged {
+                // `0x8004B688..0x8004B6A0`: the fallen monster rises.
+                self.actors[slot].battle.flag_bits = ActorFlags(ANIM_FLAG_IDLE_AT_END);
+                if !self.commit_battle_reaction_entry(slot, map[3]) {
+                    self.actors[slot].battle_reaction = Some(4);
+                }
+            }
+            // Otherwise the knockdown holds its final keyframe.
+            return;
+        }
+        if idle {
+            Self::end_battle_reaction(&mut self.actors[slot]);
+            return;
+        }
+        match self.actors[slot].battle_reaction_next.take() {
+            // `+0x1DA = 0` is the idle loop (an actor whose `+0x1F2` names
+            // no get-up entry): the reaction channel lets go.
+            Some(0) => Self::end_battle_reaction(&mut self.actors[slot]),
+            Some(next) => {
+                if !self.commit_battle_reaction_entry(slot, next) {
+                    // No playable clip (Terra's empty `7` / `8` streams): the
+                    // downed actor keeps the finished frame it has.
+                    if !(playing == 4 && hp_zero) {
+                        Self::end_battle_reaction(&mut self.actors[slot]);
+                    }
+                }
+            }
+            // Entry 8 re-commits itself: `+0x1DA` still reads 8.
+            None if playing == 8 => {
+                self.commit_battle_reaction_entry(slot, PARTY_DOWNED_LOOP_ENTRY);
+            }
+            // A dead actor whose chain has nowhere to go holds its frame.
+            None if playing == 4 && hp_zero => {}
+            None => Self::end_battle_reaction(&mut self.actors[slot]),
+        }
+    }
+
+    /// Stand a revived party member back up: release the downed chain
+    /// (`4 -> 7 -> 8`, whose entry `8` re-commits itself for as long as
+    /// `+0x1DA` reads 8) and drop the tag-8 root latch, so the idle restore
+    /// resumes the loop on the next anim tick.
+    ///
+    /// **Engine choice.** The retail restore primitive `FUN_800402F4` writes
+    /// the HP halfword and the readout seed and then spawns the item's cue
+    /// group (`jal 0x801E22C8` at `0x800408F8`); nothing on that path writes
+    /// `+0x1DA`, and which later write ends the kneel is not traced. What is
+    /// measured is the cost of leaving it: the kneel's pose centroid puts the
+    /// member's body pair (`+0x3C`/`+0x40`, what the range law measures) some
+    /// 300 units off its live pair, a monster's attack short step `0x19`
+    /// walks at the live pair and never comes in range, and `0x19` has no
+    /// timeout - the round never ends. A no-op for a monster, a living actor
+    /// that is not kneeling, or an actor still at zero HP.
+    ///
+    /// REF: FUN_800402F4, FUN_8004AD80 (the chain this releases)
+    pub(in crate::world) fn stand_revived_party_member(&mut self, slot: usize) {
+        let Some(a) = self.actors.get_mut(slot) else {
+            return;
+        };
+        if a.battle_monster_id.is_some() || a.battle.hp == 0 {
+            return;
+        }
+        let downed = matches!(
+            a.battle_reaction,
+            Some(4 | PARTY_DOWNED_ENTRY | PARTY_DOWNED_LOOP_ENTRY)
+        );
+        if !downed && !a.battle.flag_bits.has(ANIM_FLAG_ROOT_LATCH) {
+            return;
+        }
+        Self::end_battle_reaction(a);
+        a.battle.flag_bits.clear(ANIM_FLAG_ROOT_LATCH);
+        // The kneel played on the reaction channel, so the pose byte may
+        // still name idle; forget it so the idle loop is re-installed.
+        a.battle_pose = None;
+        if a.battle_action_clips.is_some() {
+            self.apply_battle_pose(
+                slot,
+                legaia_engine_battle_vm::battle_action::Pose::Idle as u8,
+            );
+        }
+    }
+
+    /// Release the reaction channel; the idle restore resumes the loop.
+    fn end_battle_reaction(a: &mut Actor) {
+        a.battle_reaction = None;
+        a.battle_reaction_entry = None;
+        a.battle_reaction_next = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inputs(tag: u8) -> LadderInputs {
+        LadderInputs {
+            tag,
+            hp_zero: false,
+            party: true,
+            first_monster: 0x10,
+            getup_entry: 5,
+        }
+    }
+
+    /// `0x8004AFC0..0x8004B05C`: only a same-entry re-commit inside the
+    /// juggle window of a flinch, or of a block under the party / first-cue
+    /// gate, skips the first cue.
+    #[test]
+    fn a_juggled_flinch_recommit_skips_its_first_cue() {
+        let map = [2, 3, 4, 5, 0x0B];
+        // Light flinches re-staged inside the window.
+        assert_eq!(recommit_cue_cursor(map, 2, 2, true, false, 0), 1);
+        assert_eq!(recommit_cue_cursor(map, 3, 3, true, false, 0), 1);
+        // Window down, or a different clip playing: the cursor starts at 0.
+        assert_eq!(recommit_cue_cursor(map, 2, 2, false, false, 0), 0);
+        assert_eq!(recommit_cue_cursor(map, 0, 2, true, false, 0), 0);
+        // Knockdown and get-up always restart at 0.
+        assert_eq!(recommit_cue_cursor(map, 4, 4, true, false, 0x200), 0);
+        assert_eq!(recommit_cue_cursor(map, 5, 5, true, true, 0x200), 0);
+        // Block: every party seat, a monster only from cue 0x64 up.
+        assert_eq!(recommit_cue_cursor(map, 0x0B, 0x0B, true, true, 0), 1);
+        assert_eq!(recommit_cue_cursor(map, 0x0B, 0x0B, true, false, 0x63), 0);
+        assert_eq!(recommit_cue_cursor(map, 0x0B, 0x0B, true, false, 0x64), 1);
+    }
+
+    #[test]
+    fn a_living_knockdown_stages_its_getup_and_clears_the_flags() {
+        let w = commit_tag_ladder(inputs(4));
+        assert_eq!(w.next, Some(5));
+        assert_eq!(w.flags, AnimFlagWrite::Clear);
+    }
+
+    #[test]
+    fn a_downed_party_member_chains_seven_then_eight_then_latches() {
+        let w = commit_tag_ladder(LadderInputs {
+            hp_zero: true,
+            ..inputs(4)
+        });
+        assert_eq!(w.next, Some(7));
+        assert_eq!(commit_tag_ladder(inputs(7)).next, Some(8));
+        let eight = commit_tag_ladder(inputs(8));
+        assert_eq!(eight.next, None);
+        assert_eq!(eight.flags, AnimFlagWrite::Or(0x08));
+    }
+
+    /// The monster-death arm puts the body into the defeat fade
+    /// (`+0x21C = 2` at `0x8004B66C`), from the neutral word the engine's
+    /// resting `0` stands for, so the tint SM walks it to black and the
+    /// body drops - the "node gone" retail's case 8 tests.
+    #[test]
+    fn a_dead_monster_enters_the_defeat_fade() {
+        let mut world = World {
+            party: legaia_engine_menus::party_state::PartyState {
+                party_count: 1,
+                ..Default::default()
+            },
+            ..World::default()
+        };
+        let m = &mut world.actors[1];
+        m.active = true;
+        m.battle_monster_id = Some(10);
+        m.battle_action_clips = Some(std::sync::Arc::new(vec![None; 8]));
+        m.battle.hp = 0;
+        world.finish_battle_reaction(1, 4);
+        let b = &world.actors[1].battle;
+        assert_eq!(
+            b.render_flag,
+            legaia_engine_battle_vm::battle_formulas::STATE_DEFEAT_FADE
+        );
+        assert_eq!(
+            b.render_color,
+            legaia_engine_battle_vm::battle_formulas::TINT_NEUTRAL
+        );
+        // A living monster's knockdown end does not.
+        world.actors[1].battle.render_flag = 0;
+        world.actors[1].battle.hp = 5;
+        world.finish_battle_reaction(1, 4);
+        assert_eq!(world.actors[1].battle.render_flag, 0);
+    }
+
+    /// The arm re-runs on every pass a finished knockdown holds; a body the
+    /// fade has walked to black stays black instead of re-entering at
+    /// neutral (which restarted the fade forever).
+    #[test]
+    fn a_faded_monster_is_not_restamped_neutral() {
+        let mut world = World {
+            party: legaia_engine_menus::party_state::PartyState {
+                party_count: 1,
+                ..Default::default()
+            },
+            ..World::default()
+        };
+        let m = &mut world.actors[1];
+        m.active = true;
+        m.battle_monster_id = Some(10);
+        m.battle_action_clips = Some(std::sync::Arc::new(vec![None; 8]));
+        m.battle.hp = 0;
+        world.finish_battle_reaction(1, 4);
+        world.actors[1].battle.render_color = 0;
+        world.finish_battle_reaction(1, 4);
+        assert_eq!(world.actors[1].battle.render_color, 0);
+    }
+
+    #[test]
+    fn a_dead_monster_knockdown_stages_nothing() {
+        let w = commit_tag_ladder(LadderInputs {
+            hp_zero: true,
+            party: false,
+            ..inputs(4)
+        });
+        assert_eq!(w.next, None);
+        assert_eq!(w.flags, AnimFlagWrite::Keep);
+    }
+
+    #[test]
+    fn the_songi_flinch_at_zero_hp_becomes_a_knockdown() {
+        for (first, bump) in [(0xB3, true), (0xB5, false)] {
+            let w = commit_tag_ladder(LadderInputs {
+                hp_zero: true,
+                first_monster: first,
+                ..inputs(2)
+            });
+            assert_eq!(w.tag, 4);
+            assert_eq!(w.bump_entry_56, bump);
+            assert_eq!(w.next, Some(7));
+        }
+        // Any other formation, or a living actor, keeps the flinch.
+        assert_eq!(
+            commit_tag_ladder(LadderInputs {
+                hp_zero: true,
+                first_monster: 0xB4,
+                ..inputs(2)
+            })
+            .tag,
+            2
+        );
+        assert_eq!(
+            commit_tag_ladder(LadderInputs {
+                first_monster: 0xB3,
+                ..inputs(2)
+            })
+            .tag,
+            2
+        );
+    }
+
+    #[test]
+    fn the_getup_raises_idle_at_end() {
+        assert_eq!(commit_tag_ladder(inputs(5)).flags, AnimFlagWrite::Or(0x04));
+    }
+
+    #[test]
+    fn the_monster_map_takes_the_last_match_and_the_flinch_fallback() {
+        // Knockdown absent: slot 2 takes the flinch entry.
+        assert_eq!(monster_reaction_map(&[0, 1, 2, 5]), [2, 0, 2, 3, 0]);
+        // Repeated get-up: the last one wins.
+        assert_eq!(monster_reaction_map(&[0, 4, 5, 2, 5]), [3, 0, 1, 4, 0]);
+    }
+}

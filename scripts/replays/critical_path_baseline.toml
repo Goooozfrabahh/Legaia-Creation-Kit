@@ -1,0 +1,228 @@
+# Critical-path replay baseline.
+#
+# The highest rung `crates/engine-shell/tests/critical_path_replay.rs` has
+# reached driving the chapter-1 spine with the PAD only - no seating, no
+# teleports. The test asserts `score >= reached` so the number is a ratchet:
+# it may go up in a reviewed edit, and a drop fails the run.
+#
+# Rungs (see the test's module docs for the full table):
+#   1  town01 loads into free-roam Field, entry script running
+#   2  pad-walk town01 south gate -> map01
+#   3  pad-walk map01 across the continent (>= 24 tiles, >= 1 encounter fought)
+#   4  pad-walk map01 -> suimon -> map01 -> keikoku (Ravine)
+#   5  pad-walk the Ravine interior out of a *different* door (>= 12 tiles)
+#
+# Unlike the other progression oracles, this number is denominated in what a
+# player can do, not in what the disc decodes. Raise it only when the run
+# actually clears the rung - never to make a red test green.
+#
+# The baseline is measured with a LIVING party. The run seeds the retail New
+# Game roster (Vahn, the SCUS `0x80078C4C` template - `open_host`), fights its
+# random encounters, and scores a party wipe AS a wipe: `drain_battle` reads
+# the game-over hold (`World::game_over_hold`, the wipe arm that freezes the
+# scene in Battle mode) and the leg reports `PARTY WIPED`. An earlier baseline
+# of 5 predates both halves: the host seeded no roster, every party slot was a
+# hollow actor the first hit "killed", and the pre-hold engine returned the
+# wiped party to the field - which `drain_battle` scored as `Fight::Survived`,
+# so rungs 3-5 were walked with a dead party. That 5 was an instrument
+# artifact, not a pad-walk score. This one is not the same number twice.
+#
+# ---------------------------------------------------------------------------
+# What was behind the wipe
+# ---------------------------------------------------------------------------
+#
+# A previous baseline of 3 ended in an honest party wipe on the
+# `map01 -> suimon` leg and read that as "a finding about the ladder's fighting
+# model (no commands, no items, no rest)". Two thirds of that diagnosis were
+# wrong, and the run says which third was not.
+#
+# The fighter now drives `World::battle_command` - the same command session the
+# windowed host binds its keyboard to - with pad presses only: Left on the
+# round prompt (`Begin`), Left / Up on the command ring (`Attack` / `Item`),
+# Left on the attack-mode prompt (`Auto`), Cross on the target cursor, and
+# Cross / Down through the bag's item and target rows. Two contrast controls
+# separate what that bought:
+#
+#   LEGAIA_CPR_NEUTRAL_FIGHT=1   neutral pad, engine auto-resolve   -> score 3
+#   LEGAIA_CPR_NO_BAG=1          full command ring, empty bag       -> score 3
+#   (default)                    command ring + 5 Healing Leaves    -> score 5
+#
+# The first two die in the *same fight* with the *same* HP trajectory
+# (180 -> 108 -> 27 -> 0 across three map01 encounters). Command selection
+# changes nothing, because `Attack -> Auto` seeds the same two-swing queue
+# `arm_party_physical` does (`seed_basic_attack_queue`, retail
+# `FUN_801EED1C`'s no-input arm). What was behind the wipe was **no recovery**,
+# full stop - a solo level-1 Vahn has 180 HP and a map01 encounter costs him
+# 70-80 of it.
+#
+# So the bag is the model's one non-pad input, and it is grounded rather than
+# picked: a New Game grants 500 gold (`NEW_GAME_STARTING_GOLD`, the literal in
+# retail's data-init `FUN_80034A6C`) and Rim Elm's Variety Shop sells the
+# Healing Leaf at 100, so five leaves is the entire starting purse spent on
+# healing before stepping out of the gate - the most a player could carry out
+# of Rim Elm. The gold is deducted. Buying them by pad would mean adding an
+# interact-and-shop-menu leg to a ladder that scores locomotion; the seed
+# stands in for the town's beats exactly as `GATE_OPEN_FLAGS` stands in for its
+# story flags. Everything else in a battle is a `set_pad` call.
+#
+# The margin is thin and that is the point: the crossing ends at 14/190 HP
+# with an empty bag, having fought six encounters and levelled once.
+#
+# ---------------------------------------------------------------------------
+# What the run stopped leaning on
+# ---------------------------------------------------------------------------
+#
+# The first pad-driven run cleared all five rungs at 76/190 HP, and part of
+# that margin was not the player's: every level-up restored current HP and MP
+# to the new maximum. Retail's applier `FUN_801E9504` stores to eleven
+# addresses and not one of them is a current-pool cell, and the single-level
+# `noa_levelup_*` capture triplet agrees - Noa settles at 164/221 HP after an
+# L2 -> L3 level-up, exactly where the fight left her. Removing the free heal
+# cost this run 62 HP and changed no rung.
+#
+# ---------------------------------------------------------------------------
+# Route notes for rungs 4-5
+# ---------------------------------------------------------------------------
+#
+# Verified when the legs were first walked, and re-confirmed by the run that
+# completed them before record 7's pushback was played (see the next section
+# for why rung 5 no longer clears):
+#
+# - map01's wall bits split the kingdom into two walk components (the arrival
+#   `(96, 25)` north, all six `keikoku` mouths south); the crossing is the
+#   `suimon` scene, not a pass; which of suimon's two chambers the crossing
+#   lands in is selected by story flag `0x27B`. See
+#   `docs/subsystems/world-map.md`.
+# - keikoku's interior: from every one of the four mouths the unhazarded
+#   flood covers the whole canyon and reaches 93 of the scene's 100 gate-1
+#   trigger tiles. Its 100 gate-1 tiles are three populations: four
+#   scene-change records (0..3, returning to map01 (52,94) / (64,67) /
+#   (77,68) / (82,83)), four single-tile arrival beats, and one 27-tile
+#   shared beat record across the chambers' inner doorways - so the goal
+#   picker keys by RECORD, never by radius, and `plan_path`'s hazard test
+#   compares source and destination tiles (retail's dispatcher fires on a
+#   tile *change*, so occupying a hazard tile is safe, entering one is not).
+#   keikoku record 7 is a story cutscene with narration pages, so
+#   `drain_scripted` pulses Cross rather than holding neutral.
+#   `cargo run -p legaia-engine-shell --example keikoku_reach_probe`
+#   re-measures the four floods per mouth.
+#   The completing run enters at tile `(58, 24)` through record 1 and leaves
+#   65 tiles later through record 0's band, landing on map01 `(52, 94)`.
+#
+# Rung 5 does not cover the dungeon's own encounter table, and that is a gap in
+# the rung rather than a defect: `keikoku` authors ONE region group, one
+# whole-map region, `rate 0`. The Ravine is silent by authorship. A rate-0
+# whole-map row is not dead data - `region[8] & 0x1F` selects the battle
+# backdrop for the scene's scripted fights - so the row does work even though
+# it never rolls. `LEGAIA_CPR_FIGHT=1` prints the region set at the rung's
+# start.
+#
+# The region array is not a flat list. `FUN_801D9E1C` partitions it into
+# consecutive story-flag-gated groups and searches exactly one: it skips each
+# group whose gate flag is clear and stops at the first flag that IS set, or at
+# the `0xFFFF` unconditional tail. Falling off the end of the condition list
+# returns "no encounter this step" rather than falling back to the whole array.
+# So which regions a scene offers is a function of the live story-flag bank,
+# and a scene can be legitimately silent on a fresh save and loud later
+# (`cave01` is gated on `0x0142` / `0x015E`) or silent in every reachable state
+# (the opening/ending stages, the Sol Tower sub-rooms, and `keikoku`).
+# `legaia_scene_formats::man_section` carries the group model; `asset man
+# --with-encounter` prints regions under the group that owns them and marks the
+# live one.
+#
+# ---------------------------------------------------------------------------
+# Why rung 5 does not clear: the inner doorways push the player back
+# ---------------------------------------------------------------------------
+#
+# The completing route above crosses keikoku record 7's inner-doorway band,
+# and that record does not only talk. Its first-visit arm (system flag 0x2BB
+# clear, taken while 0x142 and 0x2BC are clear) ends in `B7 F8 00 C1` at
+# +0x12D: op 0x37 against the player, which the walk kernel FUN_8003774C
+# (arm 0x8003789C) plays as one tile along -Z over 32 vsyncs - back out of the
+# doorway. The 0x2BB-set arm at +0x13B is the repeat visit of the same beat.
+# The port played that op as a one-tick yield that moved nobody, so the pad
+# walked straight through a band retail turns the player round at, and rung 5
+# cleared on that. With the compass walk played
+# (`CutsceneTimeline::player_glide`), the run is shoved back one tile at the
+# band on every approach and stalls at (56, 28), which is what a player at this
+# story state gets. The earlier baseline of 5 was a missing-pushback
+# artifact, not a pad-walk score.
+#
+# Neither way of re-opening it exists on this MAN:
+#
+# - No route avoids the band. `keikoku_reach_probe`'s fifth flood avoids the
+#   arrival band plus every beat band (record 7's 27 doorway tiles and the four
+#   single-tile arrival beats, the seat itself excepted). From each of the four
+#   mouths it covers 82-110 tiles - the arrival chamber - and reaches no other
+#   door record; with only the arrival band avoided the same floods reach every
+#   other door.
+# - No flag opens the doorways. Every arm of record 7 ends in a compass walk
+#   back out: the first visit (`0x2BB` clear) and the repeat (`+0x13B`) with
+#   `B7 F8 00 C1`, the third (`0x2BC` set, `+0x344`) with `C1 F8 00 02`, and all
+#   three post-`0x142` arms (`+0x4B7`, `+0x62C`, `+0x72D`) with `B7 F8 00 81`.
+#   The companion's line on the first visit says why: the Mist is ahead, and
+#   the goal is Mt. Rikuroa.
+#
+# So rung 5 as written - leave the Ravine by a different door - has no pad-only
+# answer at any story state this MAN covers. Whether a later variant MAN
+# replaces keikoku's record 7 was not checked.
+#
+# ---------------------------------------------------------------------------
+# What rung 1 does and does not say
+# ---------------------------------------------------------------------------
+#
+# It used to read "town01 free-roam, input released", which sounds like the
+# cold boot's opening choreography running and handing control over. It is not
+# that. Under `SceneHost::enter_field_scene("town01", 0)` the opening holds
+# input for **zero** frames: no cutscene-timeline frame, no `current_dialog`
+# frame, no `inline_dialogue` frame, neither during the wait nor across a
+# further 1200 idle ticks. Nothing runs, so "control was released" is
+# trivially true - and a rung that only asks whether input is free now cannot
+# tell that apart from an opening that played and finished.
+#
+# Zero is the RIGHT number for this door, and that is now settled rather than
+# suspected. Rim Elm's opening is not a property of loading `town01`: it is the
+# scene's partition-2 record 3, whose header gate is "system flag 0x225 is
+# clear", and the engine installs it only on the New Game hand-off
+# (`World::entering_town01_opening` / `opening_chain_active`). Retail's own
+# `town01` P1[0] reads the same 0x225 and skips its first-visit arms once it is
+# set. This ladder walks a route, so it enters Rim Elm the way a returning
+# player does, and a returning player gets no opening. The opening's own ladder
+# is the browser `play_compose` rung 2, which enters through the hand-off and
+# asserts the timeline played for a positive number of frames.
+#
+# What the rung asserts is therefore two facts, not one: the scene loads into
+# Field with a controllable player, AND its scene-entry system script (`P1[0]`,
+# retail ctx 0xFB) is resident and executing. The second was added because
+# "input is free" is a statement about what is NOT happening - a scene that
+# loaded nothing at all satisfies it perfectly, which is how this rung came to
+# be read as evidence the opening played. The system script is what raises the
+# scene's story flags, cues its BGM, arms the arrival fade and drives the
+# per-frame camera-zone tests; if it stopped running, every one of those would
+# go with it while every rung below still passed. The held-frame count and the
+# script's PC are both printed on the row.
+#
+# ---------------------------------------------------------------------------
+# Controls
+# ---------------------------------------------------------------------------
+#
+# Non-vacuity of the rung-5 door clause: `LEGAIA_CPR_RUNG5_BACKOUT=1` re-aims
+# the leg at the arrival record's own band and hazards nothing; under that
+# flag the rung must read `[--]` (score 4). While rung 5 does not clear by
+# default this control reads the same as the default run, so it only
+# discriminates again once the rung is re-opened. The door clause is
+# exercised on its own by the disc-free
+# `a_door_is_only_different_when_both_ends_are_known`.
+#
+# Non-vacuity of the fighting model: the two flags in the table above must
+# still score 3. If either ever clears rung 4, the route got easier and the
+# wipe diagnosis above needs re-taking.
+#
+# All three control flags therefore make the test FAIL its own ratchet, which
+# is what a control is for - they are run by hand to read the score they
+# print, never as a CI configuration.
+#
+# The run is deterministic: two consecutive default runs produce byte-identical
+# per-encounter HP trajectories and the same rung details.
+
+reached = 4

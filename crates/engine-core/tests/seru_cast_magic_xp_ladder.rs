@@ -1,0 +1,290 @@
+//! A Seru-magic cast crossing its **magic-XP threshold mid-battle** - the
+//! ladder for the reach-triage `magic_xp.rs` row (`FUN_801F452C`, the
+//! "magic level increased" banner) and the summon-cast request the same cast
+//! stages.
+//!
+//! The chain under test is the live player path end to end: pad -> round
+//! prompt -> command ring (Magic arm) -> spell submenu -> target ->
+//! `World::cast_spell_on_slots` -> per-hit accrual
+//! (`battle_formulas::summon_spell_xp_gain`, the `FUN_801DDB30` tail) ->
+//! `World::accrue_summon_spell_xp` (`FUN_801E70BC` threshold walk over the
+//! `0x8007656C` table) -> the level byte bump + the `FUN_801F452C` banner on
+//! the world's banner channel -> the summon-spawn request the render hosts
+//! consume (`take_pending_summon_spawn`).
+//!
+//! Disc-free: the port's Seru-magic catalog (`retail_magic`), a synthetic
+//! threshold table in the retail shape, and the vanilla monster tables. Runs
+//! in CI unconditionally.
+
+use legaia_engine_battle::monster_catalog::{vanilla_formation_table, vanilla_monster_catalog};
+use legaia_engine_core::world::{Actor, World};
+use legaia_engine_mode::mode::SceneMode;
+use legaia_engine_system::input::{InputState, PadButton};
+
+fn build_world() -> World {
+    let mut w = World::new();
+    while w.actors.len() < 8 {
+        w.actors.push(Actor::default());
+    }
+    w.party.party_count = 3;
+    // The zeroed records seed HP 0 / no seat, so they go in FIRST: retail's
+    // member walk (`FUN_801DB81C`) hands no ring to a member with no HP.
+    w.load_party(legaia_save::Party::zeroed(3));
+    for i in 0..3 {
+        w.actors[i].active = true;
+        w.actors[i].battle.hp = 100;
+        w.actors[i].battle.max_hp = 100;
+        w.actors[i].battle.liveness = 1;
+        w.set_battle_attack(i as u8, 60);
+    }
+    w.set_formation_table(vanilla_formation_table(), vanilla_monster_catalog());
+
+    w.player_actor_slot = Some(0);
+    w.actors[0].move_state.world_x = 300;
+    w.actors[0].move_state.world_z = 300;
+    w.actors[0].move_state.field_72 = 4096;
+    w.locomotion.camera_azimuth = 0;
+
+    use legaia_engine_battle::encounter::{
+        EncounterEntry, EncounterSession, EncounterTable, EncounterTracker,
+    };
+    let mut table = EncounterTable::new("magic_xp_ladder_test");
+    table.set_trigger_rate(0xFF);
+    table.push(EncounterEntry::new(1, 1));
+    let mut session = EncounterSession::new(EncounterTracker::new(table));
+    session.transition_frames = 2;
+    session.grace_frames = 2;
+    w.set_encounter_session(Some(session));
+
+    w.mode = SceneMode::Field;
+    w.toggles.live_gameplay_loop = true;
+    w.battle.player_driven = true;
+    w
+}
+
+fn enter_battle(w: &mut World) {
+    let up = InputState::mask_of([PadButton::Up]);
+    for _ in 0..6000 {
+        w.set_pad(up);
+        let _ = w.tick();
+        if w.mode == SceneMode::Battle {
+            return;
+        }
+    }
+    panic!("no encounter triggered in 6000 field ticks");
+}
+
+/// Tick until the command session reopens, draining the summon-creature
+/// spawn request the cast band's stager raises mid-band (its `0x34` entry)
+/// into `spawn_requests`.
+fn wait_for_prompt(w: &mut World, spawn_requests: &mut usize) -> bool {
+    for _ in 0..0x400 {
+        if w.take_pending_summon_spawn().is_some() {
+            *spawn_requests += 1;
+        }
+        if w.battle.command.is_some() {
+            return true;
+        }
+        w.set_pad(0);
+        let _ = w.tick();
+    }
+    false
+}
+
+fn press(w: &mut World, b: PadButton) {
+    // The menu SM reads no pad while the prompt's glide is in flight
+    // (`World::battle_command_pad_held`): wait it out, as a player does.
+    for _ in 0..64 {
+        if !w.battle_command_pad_held() {
+            break;
+        }
+        w.set_pad(0);
+        let _ = w.tick();
+    }
+    w.set_pad(InputState::mask_of([b]));
+    let _ = w.tick();
+    w.set_pad(0);
+    let _ = w.tick();
+}
+
+#[test]
+fn seru_cast_accrues_xp_and_crosses_its_level_threshold() {
+    let mut w = build_world();
+    // The port's Seru-magic catalog: id 0x81 = Gimard, a damage spell.
+    w.tables.spell_catalog = legaia_engine_battle::retail_magic::retail_seru_magic_catalog();
+    // The retail-shaped threshold curve (strictly ascending, level 1 needs
+    // the total to EXCEED entry [0]).
+    w.tables.magic_xp_thresholds = Some([17, 50, 92, 144, 208, 288, 392, 536]);
+    // Teach the acting character Gimard at level 1.
+    {
+        let rec = &mut w.party.roster.members[0];
+        let mut list = rec.spell_list();
+        list.count = 1;
+        list.ids[0] = 0x81;
+        list.levels[0] = 1;
+        rec.set_spell_list(list);
+    }
+
+    enter_battle(&mut w);
+    // Post-entry re-seat: caster MP + magic power, and a monster tanky enough
+    // to survive several casts (a killed target ends the ladder early).
+    for i in 0..3 {
+        w.actors[i].battle.max_hp = 100;
+        w.actors[i].battle.hp = 100;
+        w.actors[i].battle.liveness = 1;
+        w.actors[i].battle.mp = 99;
+    }
+    w.battle.magic[0] = 80;
+    // Monster sizing matters to the accrual, and the shape is faithful: the
+    // partial-hit gain is `damage * 12 / max_hp` (integer), so a huge target
+    // accrues 0 per cast exactly as in retail. 300 max HP puts the ~195-damage
+    // placeholder cast at ~7 XP for the first hit and the full 12 for the
+    // kill hit - two casts cross the 17 threshold strictly.
+    let ms = w.party.party_count as usize;
+    w.actors[ms].battle.max_hp = 300;
+    w.actors[ms].battle.hp = 300;
+    // The enemy-side flee checkpoint (FUN_801EC0DC) can remove the monster on
+    // its first pick under an unlucky seed; the scripted no-escape flag is
+    // retail's own gate for it (ctx+0x287, tested at the roll's head).
+    w.battle.no_escape = true;
+
+    let rec_xp =
+        |w: &World| legaia_engine_battle::magic_xp::spell_xp(&w.party.roster.members[0], 0usize);
+    assert_eq!(rec_xp(&w), 0);
+
+    let mut leveled: Vec<(u8, u8, u8)> = Vec::new();
+    let mut casts = 0usize;
+    let mut summon_requests = 0usize;
+    let mut seen_banner: Option<legaia_engine_core::world::BattleMessageBanner> = None;
+    for _ in 0..12 {
+        if !wait_for_prompt(&mut w, &mut summon_requests) {
+            panic!(
+                "command session never reopened (cast {casts}); active={} state={:02X} spell_menu={} item_menu={} arts={} mode={:?} monster_hp={}",
+                w.battle_ctx.active_actor,
+                w.battle_ctx.action_state,
+                w.battle.spell_menu.is_some(),
+                w.battle.item_menu.is_some(),
+                w.battle.arts_menu.is_some(),
+                w.mode,
+                w.actors[w.party.party_count as usize].battle.hp,
+            );
+        }
+        // A round-open session sits on the `Begin | Run` prompt; a mid-round
+        // one opens straight on the ring - dismiss the prompt when it is up.
+        if matches!(
+            w.battle.command.as_ref().map(|s| &s.phase),
+            Some(legaia_engine_battle_menus::battle_input::CommandPhase::RoundPrompt { .. })
+        ) {
+            press(&mut w, PadButton::Cross); // Begin -> the command ring
+        }
+        // Only the caster's turn opens on slot 0; other members Spirit (the
+        // ring's down arm - no damage) so the monster's HP budget is spent by
+        // the casts alone and the accrual arithmetic stays deterministic.
+        if w.battle_ctx.active_actor != 0 {
+            press(&mut w, PadButton::Down); // ring: Spirit arm (turn consumed)
+            continue;
+        }
+        press(&mut w, PadButton::Right); // ring: Magic arm
+        assert!(
+            w.battle.spell_menu.is_some(),
+            "the Magic arm should open the spell submenu (cast {casts})"
+        );
+        press(&mut w, PadButton::Cross); // spell row 0 (Gimard) -> target
+        press(&mut w, PadButton::Cross); // target confirm -> the commit
+        casts += 1;
+        // The cast lands at the caster's dispatch, after the last member
+        // commits (retail `0x6E -> 0xFE`): the other members Spirit, the
+        // party's Begin | Reselect takes Cross (Begin), and with flat turn
+        // tokens slot 0 dispatches first.
+        for _ in 0..4 {
+            match w.battle.command.as_ref().map(|c| &c.phase) {
+                None => break,
+                Some(legaia_engine_battle_menus::battle_input::CommandPhase::CommitConfirm {
+                    ..
+                }) => {
+                    press(&mut w, PadButton::Cross) // Begin
+                }
+                Some(_) => press(&mut w, PadButton::Down), // ring: Spirit arm
+            }
+        }
+        assert!(
+            w.battle.command.is_none(),
+            "the last commit begins the round (cast {casts})"
+        );
+        // The outcome (and its XP) folds at the stager's strike, inside the
+        // summon band - run the band out before reading the record.
+        for _ in 0..0x400 {
+            if w.casting.pending_cast.is_none() {
+                break;
+            }
+            if w.take_pending_summon_spawn().is_some() {
+                summon_requests += 1;
+            }
+            w.set_pad(0);
+            let _ = w.tick();
+            if let Some(b) = &w.battle.message_banner {
+                seen_banner = Some(b.clone());
+            }
+        }
+        if let Some(b) = &w.battle.message_banner {
+            seen_banner = Some(b.clone());
+        }
+        assert!(
+            w.casting.pending_cast.is_none(),
+            "cast {casts} never folded"
+        );
+        leveled.extend(w.drain_magic_level_ups());
+        if !leveled.is_empty() {
+            break;
+        }
+        assert!(
+            rec_xp(&w) > 0,
+            "cast {casts} accrued no spell XP (record +0x8 array untouched)"
+        );
+    }
+
+    assert!(
+        !leveled.is_empty(),
+        "no level-up after {casts} casts; xp = {}",
+        rec_xp(&w)
+    );
+    assert_eq!(leveled[0].0, 0, "caster ordinal");
+    assert_eq!(leveled[0].1, 0x81, "the leveled spell");
+    assert_eq!(leveled[0].2, 2, "level 1 -> 2");
+    assert_eq!(
+        w.party.roster.members[0].spell_list().levels[0],
+        2,
+        "the record's +0x161 level byte was bumped"
+    );
+    assert!(
+        rec_xp(&w) > 17,
+        "the accrued total strictly exceeded the level-1 threshold"
+    );
+    // Every cast requested the summon-creature spawn the render hosts consume.
+    assert_eq!(
+        summon_requests, casts,
+        "each Seru cast stages exactly one summon spawn request"
+    );
+    // The FUN_801F452C banner: "<spell name>'s magic level increased." on the
+    // battle message banner (screen element 0x65), composed through the spell-name table.
+    let name = w
+        .tables
+        .spell_catalog
+        .get(0x81)
+        .map(|d| d.name.clone())
+        .unwrap();
+    let banner = seen_banner.expect("the level-up raised the retail banner (element 0x65)");
+    assert_eq!(
+        banner.element,
+        legaia_engine_core::world::MAGIC_LEVEL_BANNER_ELEMENT
+    );
+    // The line opens with the name's element plate when the spell table
+    // carries one (`^A Gimard...`), which the banner layout draws.
+    assert!(
+        banner
+            .text
+            .ends_with(&legaia_engine_battle::magic_xp::magic_level_increased_message(&name)),
+        "{:?}",
+        banner.text
+    );
+}

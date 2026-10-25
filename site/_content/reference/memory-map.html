@@ -1,0 +1,537 @@
+<!--HEAD: <style>
+/* Address-space map (page-local). Segment widths are KB of RAM. */
+.amap { margin: 1.5rem 0; border: 1px solid var(--border); background: var(--bg-raised); border-radius: 6px; padding: 1rem 1rem 0.75rem; }
+.amap-title { font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-muted); display: flex; justify-content: space-between; gap: 1rem; margin: 0 0 0.35rem; }
+.amap-bar { display: flex; height: 54px; border: 1px solid var(--border-hi); border-radius: 4px; overflow: hidden; }
+.amap-seg { flex: var(--kb) 0 0; min-width: 4px; display: flex; align-items: center; justify-content: center; text-decoration: none; color: var(--text-bright); font-size: 0.72rem; font-family: var(--font-mono); white-space: nowrap; overflow: hidden; border-right: 1px solid var(--bg); background: var(--c); transition: filter var(--transition); }
+.amap-seg:last-child { border-right: 0; }
+.amap-seg:hover, .amap-seg:focus-visible { filter: brightness(1.35); color: var(--text-bright); }
+.amap-seg span { padding: 0 0.3rem; overflow: hidden; text-overflow: ellipsis; }
+.amap-legend { list-style: none; margin: 0.8rem 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); gap: 0.25rem 1rem; font-size: 0.82rem; }
+.amap-legend li { display: flex; gap: 0.5rem; align-items: baseline; min-width: 0; }
+.amap-legend i { flex: 0 0 0.75rem; height: 0.75rem; border-radius: 2px; background: var(--c); position: relative; top: 0.1rem; }
+.amap-legend a { color: var(--text); }
+.amap-legend code { color: var(--text-muted); font-size: 0.74rem; }
+.amap-zoom { margin-top: 1.25rem; }
+.amap-lanes { display: grid; grid-template-columns: minmax(6.5rem, 9rem) 1fr; gap: 3px 0.6rem; align-items: center; font-size: 0.75rem; }
+.amap-lane-label { font-family: var(--font-mono); color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.amap-lane-label a { color: var(--text); }
+.amap-track { position: relative; height: 18px; background: var(--bg-code); border-radius: 3px; }
+.amap-track a, .amap-track span { position: absolute; top: 0; bottom: 0; left: var(--l); width: var(--w); background: var(--c); border-radius: 3px; display: block; }
+.amap-track a:hover { filter: brightness(1.35); }
+.amap-guide { position: relative; height: 1.1rem; font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-dim); }
+.amap-guide b { position: absolute; left: var(--l); transform: translateX(-50%); font-weight: 400; white-space: nowrap; }
+.amap-guide b.end { transform: translateX(-100%); }
+.amap-guide b.start { transform: none; }
+.amap figcaption { margin-top: 0.75rem; padding-top: 0.5rem; border-top: 1px solid var(--border); color: var(--text-muted); font-size: 0.85rem; line-height: 1.5; }
+#region-map table td:nth-child(2) { white-space: nowrap; }
+.doc-section .table-wrap td:first-child, .doc-section .table-wrap td:first-child code { white-space: nowrap; }
+.doc-section .table-wrap td:nth-child(2) { min-width: 4.5rem; }
+.c-kernel { --c: color-mix(in srgb, var(--planned) 55%, transparent); }
+.c-scus   { --c: color-mix(in srgb, var(--accent) 55%, transparent); }
+.c-work   { --c: color-mix(in srgb, var(--ok) 45%, transparent); }
+.c-heap   { --c: color-mix(in srgb, var(--border-hi) 85%, transparent); }
+.c-res    { --c: color-mix(in srgb, var(--warn) 55%, transparent); }
+.c-slota  { --c: color-mix(in srgb, var(--acc) 70%, transparent); }
+.c-slotb  { --c: color-mix(in srgb, var(--partial) 75%, transparent); }
+.c-stack  { --c: color-mix(in srgb, var(--text-dim) 45%, transparent); }
+.c-sp     { --c: color-mix(in srgb, var(--open) 60%, transparent); }
+@media (max-width: 620px) {
+  .amap { padding: 0.75rem 0.6rem 0.6rem; }
+  .amap-bar { height: 40px; }
+  .amap-seg span { display: none; }
+  .amap-lanes { grid-template-columns: minmax(0, 5.5rem) 1fr; }
+}
+</style>-->
+
+<header class="page-header">
+  <div class="breadcrumb"><a href="../index.html">home</a> &middot; <a href="index.html">reference</a> &middot; PSX RAM map</div>
+  <h1>PSX RAM map</h1>
+  <p class="lede">The PlayStation has exactly 2 MB of main RAM, and everything the running game <em>is</em> - its code, the party's stats, the loaded scene, the story flags, the item bag - lives somewhere in that window. This page walks it bottom to top: the executable, the save block, the heap, the two overlay slots the per-mode code is streamed into, and the stack at the very top - then the 1 KB scratchpad that sits outside the 2 MB altogether.</p>
+</header>
+
+<section class="doc-section" id="at-a-glance">
+  <h2>At a glance</h2>
+  <dl class="kv">
+    <dt>Main RAM</dt><dd>2 MB at <code>0x80000000..0x801FFFFF</code>. Nothing above it: <code>0x80200000+</code> only mirrors RAM on a retail console.</dd>
+    <dt>Executable</dt><dd><code>SCUS_942.54</code> loads at <code>0x80010000</code> and is <code>0x6B800</code> bytes (430 KB): tables, then code from <code>main()</code> at <code>0x80015E90</code>, then data. It ends at <code>0x8007B800</code>.</dd>
+    <dt><code>gp</code></dt><dd><code>0x8007B318</code> - most globals are reached as <code>imm(gp)</code>, which an absolute-address search never sees.</dd>
+    <dt>Save block</dt><dd><code>0x80084140..0x80085B57</code>, the <code>0x1A18</code> bytes a save copies: character records at <code>0x80084708 + n*0x414</code>, flag bank <code>0x80085758</code>, item bag <code>0x80085958</code>.</dd>
+    <dt>Heap</dt><dd><code>0x80091800..0x801C5FFF</code> (<code>InitHeap(0x80091800, 0x134800)</code>): scene bundles, models, the battle context and actor pool.</dd>
+    <dt>Overlays</dt><dd>Slot A at <code>0x801CE818</code> (field, battle, menu, minigames - one at a time); slot B at <code>0x801F69D8</code> (summon / cast modules, world-map render).</dd>
+    <dt>Stack</dt><dd>Starts at <code>0x801FFFF0</code> and grows down.</dd>
+    <dt>Full table</dt><dd><a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/reference/memory-map.md" target="_blank" rel="noopener"><code>docs/reference/memory-map.md</code></a> - every row, in the same region order; grep it for your address</dd>
+  </dl>
+</section>
+
+<section class="doc-section" id="region-map">
+  <h2>The address space</h2>
+  <p>Drawn to scale, low addresses on the left. Click a region to jump to its section.</p>
+  <figure class="amap" aria-labelledby="amap-cap">
+    <p class="amap-title"><span>0x80000000</span><span>2 MB main RAM</span><span>0x801FFFFF</span></p>
+    <nav class="amap-bar" aria-label="Main RAM regions, proportional to size">
+      <a class="amap-seg c-kernel" style="--kb:64" href="#kernel" title="Kernel RAM, 64 KB"><span></span></a>
+      <a class="amap-seg c-scus" style="--kb:24" href="#scus" title="SCUS_942.54 image head, 24 KB"><span></span></a>
+      <a class="amap-seg c-scus" style="--kb:357" href="#scus" title="SCUS_942.54 code, 357 KB"><span>SCUS code</span></a>
+      <a class="amap-seg c-scus" style="--kb:50" href="#scus-data" title="SCUS_942.54 data segment, 50 KB"><span></span></a>
+      <a class="amap-seg c-work" style="--kb:88" href="#work-area" title="Static work area incl. save block, 88 KB"><span></span></a>
+      <a class="amap-seg c-heap" style="--kb:1234" href="#heap" title="Heap, 1234 KB"><span>heap</span></a>
+      <a class="amap-seg c-res" style="--kb:34" href="#resident" title="Resident buffers, 34 KB"><span></span></a>
+      <a class="amap-seg c-slota" style="--kb:160" href="#overlays" title="Overlay slot A, up to 162 KB"><span></span></a>
+      <a class="amap-seg c-slotb" style="--kb:16" href="#slot-b" title="Overlay slot B, up to 16 KB"><span></span></a>
+      <a class="amap-seg c-stack" style="--kb:22" href="#stack" title="Free RAM and stack, 22 KB"><span></span></a>
+    </nav>
+    <ul class="amap-legend">
+      <li><i class="c-kernel"></i><a href="#kernel">Kernel RAM</a> <code>0x80000000</code></li>
+      <li><i class="c-scus"></i><a href="#scus"><code>SCUS_942.54</code> head + code</a> <code>0x80010000</code></li>
+      <li><i class="c-scus"></i><a href="#scus-data">Data segment</a> <code>0x8006F180</code></li>
+      <li><i class="c-work"></i><a href="#work-area">Static work area + save block</a> <code>0x8007B800</code></li>
+      <li><i class="c-heap"></i><a href="#heap">Heap</a> <code>0x80091800</code></li>
+      <li><i class="c-res"></i><a href="#resident">Resident buffers</a> <code>0x801C6000</code></li>
+      <li><i class="c-slota"></i><a href="#overlays">Overlay slot A</a> <code>0x801CE818</code></li>
+      <li><i class="c-slotb"></i><a href="#slot-b">Overlay slot B</a> <code>0x801F69D8</code></li>
+      <li><i class="c-stack"></i><a href="#stack">Free RAM + stack</a> <code>0x801FA9D8</code></li>
+      <li><i class="c-sp"></i><a href="#scratchpad">Scratchpad (not main RAM)</a> <code>0x1F800000</code></li>
+    </ul>
+
+    <div class="amap-zoom">
+      <p class="amap-title"><span>0x801C6000</span><span>top 232 KB, zoomed</span><span>0x80200000</span></p>
+      <div class="amap-lanes" role="list">
+        <div class="amap-lane-label" role="listitem"><a href="#resident">resident</a></div>
+        <div class="amap-track"><a class="c-res" style="--l:0%;--w:14.66%" href="#resident" title="0x801C6000..0x801CE817 resident buffers"></a></div>
+        <div class="amap-lane-label"><a href="#ov-field">0897 field</a></div>
+        <div class="amap-track"><a class="c-slota" style="--l:14.66%;--w:63.79%" href="#ov-field" title="PROT 0897 field, to 0x801F3817"></a></div>
+        <div class="amap-lane-label"><a href="#ov-battle">0898 battle</a></div>
+        <div class="amap-track"><a class="c-slota" style="--l:14.66%;--w:69.83%" href="#ov-battle" title="PROT 0898 battle, to 0x801F7017"></a></div>
+        <div class="amap-lane-label"><a href="#ov-menu">0899 menu / title</a></div>
+        <div class="amap-track"><a class="c-slota" style="--l:14.66%;--w:63.79%" href="#ov-menu" title="PROT 0899 menu, title, save, shop, to 0x801F3817"></a></div>
+        <div class="amap-lane-label"><a href="#ov-boot">0895 boot</a></div>
+        <div class="amap-track"><a class="c-slota" style="--l:14.66%;--w:64.66%" href="#ov-boot" title="PROT 0895 init.pak, to 0x801F4017"></a></div>
+        <div class="amap-lane-label"><a href="#ov-str">0970 movies</a></div>
+        <div class="amap-track"><a class="c-slota" style="--l:14.66%;--w:62.93%" href="#ov-str" title="PROT 0970 STR / MDEC, to 0x801F3017"></a></div>
+        <div class="amap-lane-label"><a href="#ov-minigames">minigames</a></div>
+        <div class="amap-track"><a class="c-slota" style="--l:14.66%;--w:24.14%" href="#ov-minigames" title="PROT 0972..0980 minigames, the largest (Baka Fighter) to 0x801DC817"></a></div>
+        <div class="amap-lane-label"><a href="#slot-b">slot B</a></div>
+        <div class="amap-track"><a class="c-slotb" style="--l:83.82%;--w:6.90%" href="#slot-b" title="0x801F69D8..0x801FA9D7 slot-B modules"></a></div>
+        <div class="amap-lane-label"><a href="#stack">stack</a></div>
+        <div class="amap-track"><a class="c-stack" style="--l:90.72%;--w:9.28%" href="#stack" title="0x801FA9D8..0x801FFFFF free RAM, stack from 0x801FFFF0"></a></div>
+      </div>
+      <div class="amap-lanes" aria-hidden="true">
+        <div></div>
+        <div class="amap-guide"><b class="start" style="--l:14.66%">0x801CE818</b><b style="--l:83.82%">0x801F69D8</b></div>
+      </div>
+    </div>
+    <figcaption id="amap-cap">The heap dominates the machine; the executable is about a fifth of it. In the zoom, every slot-A image starts at the same <code>0x801CE818</code>, which is why an address there means nothing without the mode - and the battle image's extent runs <code>0x640</code> bytes into slot B, so a module paged during battle and the battle overlay share that sliver.</figcaption>
+  </figure>
+
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Starts at</th><th>Size</th><th>Holds</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x80000000</code></td><td>64 KB</td><td>Kernel RAM: exception vectors and the BIOS's own tables. The game never addresses it.</td></tr>
+      <tr><td><code>0x80010000</code></td><td>24 KB</td><td><code>SCUS_942.54</code> image head: jump tables, constant matrices, strings - no code.</td></tr>
+      <tr><td><code>0x80015E90</code></td><td>357 KB</td><td><code>SCUS_942.54</code> code: the game plus the statically linked PsyQ libraries.</td></tr>
+      <tr><td><code>0x8006F180</code></td><td>50 KB</td><td><code>SCUS_942.54</code> data segment: static game tables, then the <code>gp</code> small-data block.</td></tr>
+      <tr><td><code>0x8007B800</code></td><td>88 KB</td><td>Static work area: uninitialised globals, the save block, the sound-driver work area.</td></tr>
+      <tr><td><code>0x80091800</code></td><td>1234 KB</td><td>Heap.</td></tr>
+      <tr><td><code>0x801C6000</code></td><td>34 KB</td><td>Resident buffers: PROT TOC, XA clip table, libcd / SsAPI state, battle actor table.</td></tr>
+      <tr><td><code>0x801CE818</code></td><td>&le; 162 KB</td><td>Overlay slot A - one per-mode image at a time.</td></tr>
+      <tr><td><code>0x801F69D8</code></td><td>&le; 16 KB</td><td>Overlay slot B - small paged modules.</td></tr>
+      <tr><td><code>0x801FA9D8</code></td><td>22 KB</td><td>Free RAM, then the stack from <code>0x801FFFF0</code> down.</td></tr>
+      <tr><td><code>0x1F800000</code></td><td>1 KB</td><td>Scratchpad - separate on-chip RAM.</td></tr>
+      <tr><td><code>0x1F801000+</code></td><td>-</td><td>Hardware I/O registers.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <details class="disclosure">
+    <summary>Where these boundaries come from</summary>
+    <div class="disclosure-body">
+      <p>The executable's own header fixes the bottom half: <code>t_addr = 0x80010000</code>, <code>t_size = 0x6B800</code>, initial PC <code>0x80026C28</code>, initial <code>sp = 0x801FFFF0</code>, and <strong>no BSS</strong> (<code>b_addr = b_size = 0</code>) - so nothing above the image end is cleared by the loader. The first <code>jr ra</code> in the image is at <code>0x80016228</code> and the last at <code>0x8006F178</code>, which is what places the code between the table head and the data. <code>main()</code> sets the heap from <code>DAT_8007B414 = 0x80091800</code> with size <code>0x134800</code> (<code>0x200000</code> on the 8 MB development console), so the heap ends at <code>0x801C6000</code>. The overlay bases are recovered from each image's own call graph (<a href="../tooling/static-overlay-pipeline.html">static overlay pipeline</a>).</p>
+      <p>The previous version of this map split the executable at <code>0x80060000</code>, gave it ~960 KB, placed a 256 KB overlay window at <code>0x801C0000</code> with a title overlay at its base and an "extended overlay region" past <code>0x80200000</code>. None of that survives the header and the overlay bases: the title screen is PROT 0899 code at <code>0x801CE818</code>, <code>0x801C0000..0x801C5FFF</code> is heap, and there is no RAM past <code>0x801FFFFF</code>.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="how-to-read">
+  <h2>How to read an address</h2>
+  <ul class="bullets">
+    <li><strong>Every address is a PSX virtual address.</strong> Main RAM starts at <code>0x80000000</code>, so <code>0x80084708</code> is byte <code>0x84708</code> into the 2 MB. <code>DAT_8007B83C</code> is Ghidra's automatic label for data at that address, the way <code>FUN_8003E4E8</code> labels a function (<a href="functions.html">key functions</a>).</li>
+    <li><strong>The executable is only the bottom of the picture.</strong> Its data holds the persistent state, but most game <em>logic</em> lives in overlays streamed off the disc per game mode.</li>
+    <li><strong>An overlay address is ambiguous on its own.</strong> Every slot-A image links at <code>0x801CE818</code> and only one is resident, so the same address means different things in field, battle and menu mode. The overlay rows below say which image they belong to.</li>
+    <li><strong>A heap address is a snapshot.</strong> It depends on the allocation order; the ones listed are those that stay put across the captured states.</li>
+    <li><strong><code>0x1F800000</code> is not main RAM.</strong> It is the scratchpad, and a flag a script tests may live there.</li>
+  </ul>
+</section>
+
+<section class="doc-section" id="kernel">
+  <h2>Kernel and executable</h2>
+  <p>The first 64 KB belong to the BIOS - exception vectors at <code>0x80000080</code>, the kernel's tables and work area - and the game only reaches them through the BIOS call vectors. One kernel word is game state all the same: <code>0x80009010</code> is the BIOS <code>rand()</code> seed every random draw in the game steps, so a save state's word there is where the game's one random stream stands. <code>SCUS_942.54</code> follows at <code>0x80010000</code>: 24 KB of tables, the code from <code>main()</code> up, then the data segment.</p>
+  <div class="table-wrap" id="scus">
+  <table>
+    <thead><tr><th>Address</th><th>Type</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x80010778</code></td><td>u32[71]</td><td>Move-VM opcode jump table (<a href="../subsystems/move-vm.html">move VM</a>).</td></tr>
+      <tr><td><code>0x80010B84</code></td><td>MATRIX</td><td>The constant base matrix the non-field view build folds in: <code>16384 * I</code>, a 4x scale (the field uses <code>0x8007BF10</code>, 6x).</td></tr>
+      <tr><td><code>0x800111C4</code></td><td>u32</td><td>CD / XA transport state word - the 11 states <code>FUN_8003D764</code> walks.</td></tr>
+      <tr><td><code>0x80014FA0</code></td><td>u32[132]</td><td>Battle-applier selector jump table: 116 of 132 slots point at the shared epilogue; slot <code>0x82</code> is the Incense top-up.</td></tr>
+      <tr><td><code>0x80015E90</code></td><td>code</td><td><code>main()</code> - the first function in the image; the entry stub <code>FUN_80026C28</code> sets <code>gp</code> and calls it.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <details class="disclosure">
+    <summary>Cheat-code patch sites in the code</summary>
+    <div class="disclosure-body">
+      <p>A GameShark code that writes <code>0x2400</code> to an instruction's <strong>upper</strong> halfword (address <code>% 4 == 2</code>) turns it into <code>addiu $zero, $zero, imm</code> - a no-op. These make useful Ghidra anchors.</p>
+      <table class="layout">
+        <thead><tr><th>Address</th><th>Effect</th><th>Cheat</th></tr></thead>
+        <tbody>
+          <tr><td><code>0x800422F4</code></td><td>Writes <code>0001</code> over the branch inside the inventory-add clamp, shortening it so the clamp always runs: every add stores 99</td><td>Bought Any Item / Find Items You Will Get 99 Quantity</td></tr>
+          <tr><td><code>0x8004309E</code></td><td>No-ops the inventory count decrement</td><td>Infinite Items All Slots</td></tr>
+          <tr><td><code>0x8004390E</code></td><td>No-ops a draw-call site</td><td>Remove Vahn's Chest</td></tr>
+        </tbody>
+      </table>
+      <p>The fourth code-patch-shaped cheat, <em>Maxed HP for All Characters</em>, writes <code>0x2400</code> to <code>0x8007EA96</code> - past the image's end, so whatever it patches is not executable code. The field overlay's <em>Walk Thru Walls</em> sites are <a href="#ov-field">below</a>.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="scus-data">
+  <h2>Data segment and <code>gp</code> block</h2>
+  <p>The executable's initialised data: the static game tables, then the <code>gp</code> small-data block from <code>0x8007B318</code>, which runs past the image end into the work area. These mean the same thing in every mode.</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Address</th><th>Type</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x8006F4C8</code></td><td>i16[2049]</td><td>Arctangent table for the bearing resolver <code>FUN_80019B28</code>.</td></tr>
+      <tr><td><code>0x8007050C</code></td><td>char[]</td><td>Resident scene-name string - an <em>output</em> of the scene loader, not an input.</td></tr>
+      <tr><td><code>0x8007078C</code></td><td>24 B &times; 28</td><td>Game-mode dispatch table (<a href="../subsystems/boot.html">boot</a>).</td></tr>
+      <tr><td><code>0x80070A2C</code></td><td>i16[5120]</td><td>Shared trig LUT, <code>4096 * sin</code> - one revolution plus the quarter turn the cosine view needs.</td></tr>
+      <tr><td><code>0x8007326C</code></td><td>8 B &times; 6</td><td>TMD per-mode descriptor table (<a href="../formats/tmd.html">TMD</a>).</td></tr>
+      <tr><td><code>0x80073F00</code></td><td>i16</td><td>Dialog pager auto-press countdown: op <code>4C 89</code> sets it, and the waiting box presses confirm when it runs out.</td></tr>
+      <tr><td><code>0x80073F14</code></td><td>u8[8]</td><td>Compass axis <strong>bitmasks</strong> for the motion VM's eight-direction walk: <code>1</code> +Z, <code>2</code> -Z, <code>4</code> +X, <code>8</code> -X, combined for diagonals.</td></tr>
+      <tr><td><code>0x80074358</code></td><td>u32[4]</td><td>Global ability bitmask; the party's per-character ability blocks are ORed into it.</td></tr>
+      <tr><td><code>0x80076C10</code></td><td>u8[0x18] &times; 103</td><td><strong>Screen-element placement table</strong> - the content boxes every battle plate, party panel and Muscle Dome layout derives its chrome from. <a href="#one-table">One table, three names.</a></td></tr>
+      <tr><td><code>0x80077828</code></td><td>u8[2] per monster</td><td><strong>Per-monster steal table</strong>, 1-based id, each entry <code>[chance, item]</code> - chance first. Not in the monster record (<a href="../formats/steal-table.html">steal table</a>).</td></tr>
+      <tr><td><code>0x80077998</code></td><td>u8[5] per character</td><td>Rot limb object ranges: which mesh objects the battle draw dims for each Rot bit.</td></tr>
+      <tr><td><code>0x800788B8</code></td><td>u16[0x110]</td><td>Streamed-voice clip durations (arts shout, Seru cast voice); neither reader bounds the index.</td></tr>
+      <tr><td><code>0x8007B450</code></td><td>ptr / u32</td><td><strong>Op-<code>0x49</code> submode cell</strong>: <code>0</code> idle, <code>1</code> done, otherwise the active submode descriptor's address. The cheat database's "menu-request register" - poking a record pointer opens a submode.</td></tr>
+      <tr><td><code>0x8007B5FC</code></td><td>u32</td><td>Encounter step counter, one word across doors. Outside the saved window: it holds its <code>SCUS_942.54</code> file value <code>0x3CE</code> (974) after power-on and a card load, so the first battle after a cold load in a rate-18 region is rolled on step 55.</td></tr>
+      <tr><td><code>0x8007B6A8</code></td><td>u8</td><td>Save-anywhere allow flag (scene header bit); the same bit raises the field-fog cap on every overworld.</td></tr>
+      <tr><td><code>0x8007B6F4</code></td><td>u16</td><td>GTE <code>H</code> projection register (focal length / zoom). The cheat database's "small maps" / "camera mode" labels are this word.</td></tr>
+      <tr><td><code>0x8007B790</code></td><td>u16[3]</td><td>Live camera rotation trio - pitch, yaw, roll (12-bit angles).</td></tr>
+      <tr><td><code>0x8007B7C0</code></td><td>u32</td><td>Previous frame's held pad mask (the pad reader keeps it to form the edge masks).</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <details class="disclosure">
+    <summary id="one-table"><code>0x80076C10</code> - one table, three names</summary>
+    <div class="disclosure-body">
+      <p>Three subsystems index this array and each named it after itself - a battle "pose-slot array", the party-panel "publish target", the Muscle Dome "element layout table". They cite the same base and the same <code>0x18</code> stride; a record is a <strong>screen-element placement</strong>. The clone helper <code>FUN_801D5778</code> writes <code>dst[+0xA] = src[+0xA] - 0x140</code>, and <code>0x140</code> is 320, the display width: the field is a screen X and the operation is "stage this element one screen to the left".</p>
+      <table class="layout">
+        <thead><tr><th>Offset</th><th>Field</th></tr></thead>
+        <tbody>
+          <tr><td><code>+0x00</code> / <code>+0x01</code></td><td>element id, seat A / seat B (usually equal; records 41 / 42 carry them byte-swapped)</td></tr>
+          <tr><td><code>+0x02</code> / <code>+0x04</code></td><td>seat A x / y</td></tr>
+          <tr><td><code>+0x06</code> / <code>+0x08</code></td><td>content width / box height, shared by both seats (<code>0x0C</code> for the plate-run family; roster panels 50, framed windows 120 / 42 / 28 / 26)</td></tr>
+          <tr><td><code>+0x0A</code> / <code>+0x0C</code></td><td>seat B x / y - the pair <code>FUN_801D5778</code> pushes by a screen width; which seat is parked is per record, so "from / to" is the safe name</td></tr>
+          <tr><td><code>+0x0E</code> / <code>+0x0F</code></td><td>kind, seat A / seat B</td></tr>
+          <tr><td><code>+0x10</code> / <code>+0x12</code></td><td><code>13</code> on the framed-window and roster rows, else <code>0</code>, and no spawn arm reads it / zero in all 103 records</td></tr>
+          <tr><td><code>+0x14</code></td><td>content <strong>string</strong> pointer, measured by the rendered-width kernel <code>FUN_80035F04</code> into <code>+0x06</code>; the battle name plaque points it at the actor's display-name buffer <code>actor+0x1BC</code></td></tr>
+        </tbody>
+      </table>
+      <p>103 initialised records run <code>0x80076C10..0x800775B8</code>; index 129 would be the steal table, and the placement shape stops at 103 (every coordinate within &plusmn;416). A record is a content box; the chrome is derived, not stored - <code>pen = (x, y - 2)</code>, <code>plate = (x - 8, y - 6)</code> sized <code>(w + 16, 20)</code>. Parser <code>legaia_ui_formats::screen_elements</code>; packet evidence on <a href="../subsystems/battle.html">battle</a>.</p>
+    </div>
+  </details>
+</section>
+
+<section class="doc-section" id="work-area">
+  <h2>Static work area and the save block</h2>
+  <p>From the image end at <code>0x8007B800</code> to the heap base is uninitialised global storage - the executable declares no BSS, so a cell here holds only what the code stores. It holds, in order, the rest of the <code>gp</code> block, the actor and mesh tables, the <strong>save block</strong> and the work buffers above it.</p>
+
+  <h3 id="game-mode">Mode, pad and battle globals</h3>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Address</th><th>Type</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x8007B83C</code></td><td>u16</td><td><strong>Next game-mode index</strong>, the master mode selector: <code>0x02</code>/<code>0x03</code> field INIT/MAIN, <code>0x14</code>/<code>0x15</code> battle, <code>0x16</code>/<code>0x17</code> the menu and title (<code>CARD</code>), <code>0x1A</code> STR FMV. The front end writes it six times on the way from the logo to the field, each store in the handler that hands off.</td></tr>
+      <tr><td><code>0x8007B850</code></td><td>u32</td><td>Per-frame held button mask, packed (face/shoulder byte in bits 0-7, d-pad/system byte in bits 8-15).</td></tr>
+      <tr><td><code>0x8007B868</code></td><td>u32</td><td>Dev/dual-mode gate (retail <code>0</code>); the developer screens it gates are unreachable on a retail disc.</td></tr>
+      <tr><td><code>0x8007B874</code></td><td>u32</td><td>Newly-pressed edge mask, <code>held &amp; ~prev</code> - what most menus test.</td></tr>
+      <tr><td><code>0x8007B8A0</code></td><td>s16</td><td><strong>Failed actor-spawn counter</strong> behind <code>WORK ERR%d</code>: cleared by the per-stage init, incremented when the actor pool is empty, printed every frame it is non-zero (<a href="../writeups/glitches/field-oddities.html#work-err-rikuroa">WORK ERR on Mt. Rikuroa</a>).</td></tr>
+      <tr><td><code>0x8007B8C2</code></td><td>u16</td><td>Dev/retail loader-path selector: 40 reads, written once at cold boot to <code>1</code>. <a href="#build-mode">Details.</a></td></tr>
+      <tr><td><code>0x8007B98F</code></td><td>u8</td><td>In-game debug menu enable - byte 3 of the debug-mode word <code>0x8007B98C</code>. Poking it to <code>1</code> brings up the debug menu on SELECT+Triangle.</td></tr>
+      <tr><td><code>0x8007BAC0</code></td><td>u32</td><td>Special-battle restriction word: bit <code>0x100</code> bars Item, <code>0x200</code> forbids Ra-Seru; any set bit suppresses the spoils.</td></tr>
+      <tr><td><code>0x8007BAC8</code></td><td>u16</td><td>BGM request id; the scene loader clears it and the script installs it (<a href="../subsystems/audio.html">audio</a>).</td></tr>
+      <tr><td><code>0x8007BD0C</code></td><td>u8[4]</td><td><strong>Formation cell</strong> - per-slot monster id (monster <code>m</code> is actor slot <code>m + 3</code>); the AI picker switches on it.</td></tr>
+      <tr><td><code>0x8007BD10</code></td><td>u8[]</td><td><strong>Per-seat character id</strong>, 1-based (<code>1</code> Vahn, <code>2</code> Noa, <code>3</code> Gala, <code>4</code> the AI companion).</td></tr>
+      <tr><td><code>0x8007BD24</code></td><td>ptr</td><td>Battle context pointer (<code>0x800EB654</code> in battle, <code>0</code> in the field): <code>+0x07</code> action-state cursor, <code>+0x13</code> active slot, <code>+0x276</code> the side-band applier's stage byte, <code>+0x279</code> cast-module phase, <code>+0x28A</code> battle-mode counter.</td></tr>
+      <tr><td><code>0x8007BD71</code></td><td>u8</td><td>Battle run state: <code>0xFF</code> running, <code>0xFE</code> ending, low values the loader's step counter.</td></tr>
+      <tr><td><code>0x8007BD74</code></td><td>ptr</td><td>Side-band streaming buffer: one <code>summon.dat</code> / <code>readef.DAT</code> slot at a time (<a href="../formats/summon-readef.html">summon / readef</a>).</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <details class="disclosure" id="debug-flags">
+    <summary id="build-mode"><code>0x8007B8C2</code> - the build-mode selector</summary>
+    <div class="disclosure-body">
+      <p>Every one of its 40 read sites splits the same way: <strong>non-zero</strong> opens assets by PROT-TOC index through the in-RAM table; <strong>zero</strong> opens by filename through <code>FUN_800608F0</code>, whose whole body is <code>break 0x103</code> - a PsyQ dev-station host trap retail hardware cannot service. <code>main()</code> writes the halfword once at cold boot:</p>
+<pre><code>80015f00  jal  0x8003F084      ; two-instruction leaf: returns 1
+80015f04  nop
+80015f08  sh   v0,0x5aa(gp)    ; gp = 0x8007B318, so EA = 0x8007B8C2</code></pre>
+      <p>The store is <code>gp</code>-relative, which is why sweeps for the absolute <code>lui 0x8008</code> form reported no writer. BSS zero-init does not establish it - the header declares no BSS. The field-VM flag ops cannot reach it either: their index window is <code>[0x80085758, 0x80086957]</code> and the move VM's signed operand reaches down only to <code>0x80084758</code>, both above it. A from-scratch engine treats both flags as build-time constants. JP retail uses build-shifted addresses (<code>+0x1B90</code> for the debug-menu enable).</p>
+    </div>
+  </details>
+
+  <h3 id="asset-chain">Actor and mesh tables</h3>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Address</th><th>Type</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x8007C018</code></td><td>ptr[N]</td><td><strong>Global TMD pointer table</strong>, one writer. Entries <code>[0..4]</code> are the five character meshes; the rest is the scene's TMD pack. <a href="#tmd-table">Details.</a> Its counters and bases (<code>0x8007B774</code>, <code>0x8007BB38</code>, <code>0x8007B824</code>, <code>0x8007B6F8</code>) sit in the <code>gp</code> block.</td></tr>
+      <tr><td><code>0x8007C348</code></td><td>u32</td><td>Actor allocator free-stack top; seven list sentinels follow.</td></tr>
+      <tr><td><code>0x8007C34C</code></td><td>u32[7]</td><td>Actor-list heads the per-frame walk dispatches through <code>node[+0x0C]</code>; five are separate render passes.</td></tr>
+      <tr><td><code>0x8007C364</code></td><td>ptr</td><td><strong>Player field ctx pointer</strong> (<code>0x80083794</code> in the captures; <code>+0x10</code> carries the encounter-active flag).</td></tr>
+      <tr><td><code>0x80083E58</code></td><td>ptr[N]</td><td>VDF sub-entry pointer table, consumed for actor bring-up.</td></tr>
+      <tr><td><code>0x800840B8</code></td><td>i32[3]</td><td>Camera eye-space translation trio, uploaded as the GTE <code>TR</code>.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <details class="disclosure">
+    <summary id="tmd-table">The global TMD pointer table</summary>
+    <div class="disclosure-body">
+      <p>Every populated entry <code>[0..DAT_8007BB38]</code> is a post-fixup Legaia TMD (magic <code>0x80000002</code>, group descriptors at <code>+0xC</code>, stride <code>0x1C</code>). The sole writer is the installer at <code>FUN_80026B4C @ 0x80026BA8</code>; its store through <code>gp[+0x820]</code> is what hides the walker counter from Ghidra's xref database. A settled field-scene snapshot (<code>dolk</code>) holds 143 entries: five character meshes from PROT 0874 section 0, then a contiguous 138-entry scene pack installed by the single descriptor walk. Type-<code>0x05</code> slot-4 bodies never install here - only dispatcher cases <code>0x02</code> / <code>0x09</code> reach the installer. Consumers: the world-map top-view renderer, the SCUS and overlay actor allocators, the table walker and the per-party-member equipment-conditional group patch (<a href="../formats/character-mesh.html">character mesh</a>).</p>
+    </div>
+  </details>
+
+  <h3 id="static-globals">The save block (<code>0x80084140..0x80085B57</code>)</h3>
+  <p>The live game state a save is composed from - the save write copies these <code>0x1A18</code> bytes, so a save-block offset is <code>VA - 0x80084140</code> (<a href="../subsystems/save-screen.html">save screen</a>).</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Address</th><th>Type</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x8008444C</code></td><td>u32</td><td>Persistent fishing points; the lure row, rod stat and point-exchange purchase mask sit beside it.</td></tr>
+      <tr><td><code>0x80084540</code></td><td>u16</td><td>The loaded scene's raw CDNAME define - two above the extraction-frame index (<code>town01</code> 3). The cheat database's "Map Modifier".</td></tr>
+      <tr><td><code>0x80084570</code></td><td>u32</td><td>Play-time counter - advances per frame (~60/s), <em>not</em> per second.</td></tr>
+      <tr><td><code>0x80084594</code> / <code>0x80084598</code></td><td>u8 / u8[]</td><td>Party member count / member ids (sorted insertion, cap 4).</td></tr>
+      <tr><td><code>0x8008459C</code> / <code>0x800845A4</code></td><td>u32</td><td>Party gold / casino coin bank.</td></tr>
+      <tr><td><code>0x800845A0</code></td><td>u32</td><td><code>4C D3</code> clock, <strong>remaining</strong> ticks; its duration (<code>0x800845B8</code>, non-zero = running), threshold (<code>0x800845BC</code>) and flag pair (<code>0x800845C0</code>: expiry flag high half, below-threshold flag low half) follow (<a href="../subsystems/script-vm-menuctrl.html">MENU_CTRL</a>).</td></tr>
+      <tr><td><code>0x800845B4</code></td><td>u32</td><td><strong>Point Card counter</strong> (unmapped by every public cheat archive): the shop buy commit accrues <code>price/20 * qty</code> while the card is held, capped at 9,999,999.</td></tr>
+      <tr><td><code>0x800846D0</code></td><td>u32[4]</td><td>Button-mask config words; <code>0x48</code> (Cross | R1) is the field run button.</td></tr>
+      <tr><td><code>0x80084708 + n*0x414</code></td><td>u8[0x414]</td><td>Character records, four slots; display name at <code>+0x2A7</code>. Slot 3 (Terra) ends exactly where the flag bank begins (<a href="../formats/save-record.html">save record</a>).</td></tr>
+      <tr><td><code>0x80085758</code></td><td>bits</td><td><strong>Fourth flag bank</strong> (save block <code>+0x1618</code>) - the bitfield field-VM SET / CLEAR / TEST address as <code>(idx &gt;&gt; 3, 0x80 &gt;&gt; (idx &amp; 7))</code>; indices run past 256, so it is not a fixed 256-bit array.</td></tr>
+      <tr><td><code>0x80085958</code></td><td>(id, count)[256]</td><td><strong>Item bag</strong> (save block <code>+0x1818</code>); the active window is 128 or 256 slots - never 72, which is a cheat's page span (<a href="../subsystems/inventory.html">inventory</a>).</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3 id="work-buffers">Work buffers</h3>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Address</th><th>Type</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x80085B58</code></td><td>buffer</td><td>libsnd sound-driver work area, handed over at boot - the first byte past the save block.</td></tr>
+      <tr><td><code>0x80088758</code></td><td>record[]</td><td>Resident CDNAME define table (16-byte records), what the travel arts scan for a destination.</td></tr>
+      <tr><td><code>0x80089118</code></td><td>i32[3]</td><td>Camera focus trio, stored negated; in the field only X and Z are written.</td></tr>
+      <tr><td><code>0x80089128</code></td><td>u32[32]</td><td>Held-mask history ring, one entry per vsync; its AND drives the menus' auto-repeat.</td></tr>
+      <tr><td><code>0x800917B0</code></td><td>u32 per VAB id</td><td>The fixed SPU address each VAB slot opens at (<a href="../subsystems/audio.html">audio</a>).</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section class="doc-section" id="heap">
+  <h2>Heap</h2>
+  <p><code>main()</code> hands <code>0x80091800..0x801C5FFF</code> to <code>InitHeap</code>, and the allocator serves scene bundles, model packs, sound banks and the battle structures out of it. A heap address belongs to the allocation order, not to the program; these are the ones that stay put across the captured states.</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Address</th><th>Type</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x800EB654</code></td><td>struct</td><td>The battle context <code>0x8007BD24</code> points at while a battle is resident.</td></tr>
+      <tr><td><code>0x800EC9E8 + n*0x2D4</code></td><td>u8[0x2D4]</td><td>Battle actor pool; HP at <code>+0x14C</code>. The actors are reached through the pointer table at <code>0x801C9370</code> (<a href="cheats.html">cheat citations</a>).</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section class="doc-section" id="resident">
+  <h2>Resident buffers</h2>
+  <p>The 34 KB between the heap and the overlay base are fixed buffers that survive every mode change - which is why an overlay can hand data to its successor here.</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Address</th><th>Type</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x801C6220</code></td><td>rows</td><td>Shop buy-list staging array, written by the SCUS row builder; the hoisted band is the Platinum Card stock (<a href="../subsystems/shop.html">shop</a>).</td></tr>
+      <tr><td><code>0x801C6EA4</code></td><td>ptr</td><td>Current world / scene struct pointer; <code>+0x40</code> is a write-only parked return state.</td></tr>
+      <tr><td><code>0x801C6ED8</code></td><td>[CdlLOC, u32] &times; 34</td><td>CD-XA clip table, slot <code>i</code> = file <code>XA&lt;i+1&gt;.XA</code>; built at boot by ISO9660 lookup, so it survives disc relayout (<a href="../subsystems/cutscene.html">cutscene</a>).</td></tr>
+      <tr><td><code>0x801C70F0</code></td><td>TOC</td><td>In-RAM <code>PROT.DAT</code> TOC, filled at boot (<a href="../formats/prot.html">PROT.DAT</a>).</td></tr>
+      <tr><td><code>0x801C8980</code></td><td>table</td><td>Resident <code>monster.snd</code> bank index (PROT 0891), staged by <code>init.pak</code>.</td></tr>
+      <tr><td><code>0x801C8FE0</code></td><td>u32[]</td><td>Steal result band and element-cycling counter - scratch two slot-B cast modules address independently.</td></tr>
+      <tr><td><code>0x801C9370</code></td><td>ptr[8]</td><td><strong>Battle actor pointer table</strong>: party in slots 0-2, monsters in 3-7.</td></tr>
+      <tr><td><code>0x801CB408</code></td><td>record[128]</td><td>libcd directory-entry cache.</td></tr>
+      <tr><td><code>0x801CD2B8</code> / <code>0x801CD2C0</code></td><td>u16 / ptr[16]</td><td>SsAPI slot-allocation bitmap / per-slot sequence-state pointers.</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section class="doc-section" id="overlays">
+  <h2>Overlay slot A (<code>0x801CE818</code>)</h2>
+  <p>The per-mode code window. Every image links at <code>0x801CE818</code>, each mode's INIT handler streams its PROT entry in, and only one is resident - the same address is a dialog routine in the field and the battle state machine in battle. The pause menu replaces the field overlay at the same base.</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>PROT</th><th>Ends at</th><th>Image</th><th>Loaded by</th></tr></thead>
+    <tbody>
+      <tr><td>0895</td><td><code>0x801F4017</code></td><td>Boot <code>init.pak</code> - publisher logos, front-end hand-off</td><td>boot, mode 16</td></tr>
+      <tr><td>0897</td><td><code>0x801F3817</code></td><td>Field / town / dialog / world map</td><td>mode 2</td></tr>
+      <tr><td>0898</td><td><code>0x801F7017</code></td><td>Battle</td><td>mode 20</td></tr>
+      <tr><td>0899</td><td><code>0x801F3817</code></td><td>Menu: title screen, pause menu, save, shop, casino prizes</td><td>mode 22</td></tr>
+      <tr><td>0970</td><td><code>0x801F3017</code></td><td>STR / MDEC movie player</td><td>mode 26</td></tr>
+      <tr><td>0971</td><td><code>0x801D0017</code></td><td>Debug menu</td><td>mode 0</td></tr>
+      <tr><td>0972..0980</td><td>&le; <code>0x801DC817</code></td><td>Minigames: fishing, slot machine, Baka Fighter, Muscle Dome hub, dance; dev modules</td><td>mode 24 warp</td></tr>
+      <tr><td>0902 / 0979 / 0981</td><td>small</td><td>Game over (unreachable), field-to-battle intro, world-map top-view debug</td><td>modes 18 / 8 / 12</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3 id="ov-field">Field overlay (PROT 0897)</h3>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Address</th><th>Type</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x801D065C</code> &hellip; <code>0x801D078C</code></td><td>code</td><td><em>Walk Thru Walls</em> cheat sites: four <code>beq</code> instructions in the player movement controller's collision path, whose branch displacement the cheat rewrites - a code patch, not collision-state bytes.</td></tr>
+      <tr><td><code>0x801F21B4</code></td><td>tables</td><td>Head of the overlay's data: the actor-collision, wall and interact-facing probe tables.</td></tr>
+      <tr><td><code>0x801F2738</code></td><td>cells</td><td>The dialog pager's row window - scroll, reveal, collapse, rows on the page, pending text (<a href="../formats/mes.html">MES</a>).</td></tr>
+      <tr><td><code>0x801F2B98</code></td><td>record[17]</td><td>Panel-window descriptors the world-map panel sizer and dev-menu panels index.</td></tr>
+      <tr><td><code>0x801F3518</code></td><td>u32</td><td>World-map batch emitter state: running angle, one-shot gate <code>0x801F351C</code>, scale, step, OT layer. Field-overlay data - reloaded with the overlay, not preserved across a swap (<a href="../subsystems/world-map.html#render-pipeline">world map</a>).</td></tr>
+      <tr><td><code>0x801F3580</code></td><td>struct</td><td>Camera staging descriptor - the composer's output and the ease's input.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3 id="ov-battle">Battle overlay (PROT 0898)</h3>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Address</th><th>Type</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x801CED44</code></td><td>u32[]</td><td>Battle action-SM jump table, indexed by <code>ctx[+0x07]</code> (<a href="../subsystems/battle-action.html">battle action</a>).</td></tr>
+      <tr><td><code>0x801F6950</code></td><td>u32</td><td>Overlay PRNG state - its draws never perturb the SCUS <code>rand()</code> stream.</td></tr>
+      <tr><td><code>0x801F6980</code></td><td>u8[8]</td><td>Multi-cast value-readout window; PROT 0915 writes it from slot B, reaching down into the battle image.</td></tr>
+      <tr><td><code>0x801F6990</code></td><td>u32[16]</td><td>The arts queue-builder's per-token marks (accepted starter, Super tail-replace).</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3 id="ov-menu">Menu and title overlay (PROT 0899)</h3>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Address</th><th>Type</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x801E46B0</code></td><td>i32</td><td>Selected item id for the description box (<code>&lt;= 0</code> draws nothing).</td></tr>
+      <tr><td><code>0x801E46B4</code> / <code>0x801E46B8</code></td><td>u32</td><td>Shop quantity under edit and its cap, <code>min(gold / price, 99, 99 - held)</code>.</td></tr>
+      <tr><td><code>0x801E46D0</code></td><td>u32</td><td>Packed toggle-state word for the options window.</td></tr>
+      <tr><td><code>0x801EF018</code></td><td>struct</td><td>Title state: <code>+0x154</code> attract countdown (underflow &rarr; mode <code>0x1A</code> &rarr; <code>MV1.STR</code>), <code>+0x158</code> frame counter; <code>+0x204</code> / <code>+0x208</code> the sub-mode and previous sub-mode.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3 id="ov-boot">Boot, movies and minigames</h3>
+  <div class="table-wrap" id="ov-minigames">
+  <table>
+    <thead><tr><th>Address</th><th>Image</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x801F369C</code></td><td>0895 boot</td><td><code>init.pak</code>'s own globals: logo sprite descriptors, memory-card driver state, fade level.</td></tr>
+      <tr><td id="ov-str"><code>0x801D0D58</code> / <code>0x801D0E60</code></td><td>0970 movies</td><td>The two MDEC command packets and the hardware-register pointer block (DMA, MDEC, DPCR).</td></tr>
+      <tr><td><code>0x801D9168</code> / <code>0x801D9298</code></td><td>0972 fishing</td><td>Tension gauge / fish life (cheat-pinned); the lure triple is at <code>0x801D9174</code>.</td></tr>
+      <tr><td><code>0x801D3CAC</code></td><td>0975 slot machine</td><td>Punch-mode unlock (cheat-pinned).</td></tr>
+      <tr><td><code>0x801DBFC4</code> / <code>0x801DC06C</code></td><td>0976 Baka Fighter</td><td>Player / computer life (cheat-pinned).</td></tr>
+      <tr><td><code>0x801D1A78</code> / <code>0x801D1AE0</code></td><td>0977 Muscle Dome</td><td>Contest hub arm word / ringside-still latch.</td></tr>
+      <tr><td><code>0x801D53CC</code></td><td>0980 dance</td><td>Dance-points counter (cheat-pinned).</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>PROT 0896 links at <code>0x801D4DF0</code>, not at the slot base, and nothing on this disc loads it.</p>
+</section>
+
+<section class="doc-section" id="slot-b">
+  <h2>Overlay slot B (<code>0x801F69D8</code>)</h2>
+  <p>One small module at a time above slot A: PROT 0900 (screen-effect widgets), 0901 (world-map render), 0967..0969 (battle tutorial and boss stages), 0978 (the staged background loader) and the 64 summon / cast images 0903..0966, the largest <code>0x4000</code> bytes. The band starts inside the battle image's extent, so a module loaded in the field has its head overwritten when the battle overlay comes in (<a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/subsystems/cast-module.md">cast module</a>).</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Address</th><th>Type</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x801F69D8</code></td><td>u32 + code</td><td>Slot-B link base: the resident module's first word (<code>0x001000E2</code> when empty).</td></tr>
+      <tr><td><code>0x801F6AA8</code> / <code>0x801F6AD8</code></td><td>tables</td><td>PROT 0978's two dispatchers - field restore and <code>int.tim</code> panel still.</td></tr>
+      <tr><td><code>0x801F7A9C</code></td><td>code</td><td>PROT 0900's sprite, iris-mask and letterbox widgets that field-VM op <code>0x43</code> drives (<a href="../subsystems/move-vm.html">move VM</a>).</td></tr>
+      <tr><td><code>0x801F9D28</code></td><td>u32</td><td>PROT 0955's per-arm frame countdown - one example of the module-local cells each cast image keeps.</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section class="doc-section" id="stack">
+  <h2>Free RAM and the stack</h2>
+  <p>Above the largest slot-B image nothing is loaded. The stack starts at <code>0x801FFFF0</code> and grows down; the deepest use seen across the save-state library is <code>0x801FE420</code>, and <code>0x801FD000..0x801FE000</code> reads all-zero in every state - which is why the disc patcher parks injected code there (<a href="../tooling/randomizer.html">randomizer</a>).</p>
+  <p>No code on the disc builds an address from <code>0x801FA9D8</code> up, apart from the initial stack pointer. The loader reads exactly as many sectors as the PROT table of contents gives, so a larger PROT 0900 / 0901 would carry its extra bytes into this space on every field load, and they would stay until power-off. The catch is that those two entries have no spare room on the disc, so growing them means moving every later PROT entry, which a same-size patch cannot do. In the same way, while the field or menu overlay is loaded, the range <code>0x801F3818..0x801F69D7</code> only holds leftovers from whichever image last used it.</p>
+</section>
+
+<section class="doc-section" id="scratchpad">
+  <h2>Scratchpad (<code>0x1F800000..0x1F8003FF</code>)</h2>
+  <p>1 KB of fast on-chip RAM outside the 2 MB. Most cells from <code>0x1F80035C</code> up are displacements off <code>0x1F800314</code> (<code>lui 0x1F80; ori 0x314</code>), so an absolute-address scan never sees them.</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Address</th><th>Type</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>0x1F800038</code></td><td>u32</td><td><code>IR0</code> the world-map decoration handlers load before their depth cue.</td></tr>
+      <tr><td><code>0x1F800314</code></td><td>base</td><td>Base the cells below are reached from.</td></tr>
+      <tr><td><code>0x1F80035C</code></td><td>i16[16]</td><td><strong>Scene floor-elevation ladder</strong> - the sixteen heights a collision byte's low nibble indexes (<a href="../subsystems/field-locomotion.html">field locomotion</a>).</td></tr>
+      <tr><td><code>0x1F80037C</code></td><td>u8</td><td>Current walk-region kind; <code>0</code> disables the camera scroll clamp. The region's AABB follows at <code>0x1F800384..87</code>.</td></tr>
+      <tr><td><code>0x1F80037D</code></td><td>u8</td><td>Game-speed rate scalar; elapsed time is always the product of this and the tick byte.</td></tr>
+      <tr><td><code>0x1F80037E</code></td><td>u16</td><td>Near cutoff - primitives with an <code>OTZ</code> below it are dropped.</td></tr>
+      <tr><td><code>0x1F800388</code></td><td>u16[4]</td><td>Draw-context 2-D clip rect.</td></tr>
+      <tr><td><code>0x1F800393</code></td><td>u8</td><td>Per-frame tick byte - how many display frames the last loop took; every timer subtracts it.</td></tr>
+      <tr><td><code>0x1F800394</code></td><td>u32</td><td><strong>Field-VM transient flag word</strong> - not persisted. Ops <code>0x2E</code>/<code>0x2F</code>/<code>0x30</code> set/clear/test it; the low 16 bits are re-seeded on every mode switch. Bit <code>0x40</code> is scene-transition-pending; bit 0 is set exactly on the kingdom overworlds.</td></tr>
+      <tr><td><code>0x1F8003A0</code></td><td>ptr</td><td>Active primitive / packet write cursor the <code>POLY_*</code> emitters allocate from.</td></tr>
+      <tr><td><code>0x1F8003E8..EB</code></td><td>i8[4]</td><td>Camera <strong>visible tile window</strong> <code>[nearX, nearZ, farX, farZ]</code>, set per camera region and by op <code>0x46</code>.</td></tr>
+      <tr><td><code>0x1F8003EC</code></td><td>ptr</td><td>Tile-flag bitmap base; the walkability grid is at <code>+0x4000</code>.</td></tr>
+      <tr><td><code>0x1F8003F4</code></td><td>ptr</td><td>Ordering-table base the overworld ground and fog emitters index.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p id="io">Above the scratchpad are the hardware registers - DMA at <code>0x1F801080..0x1F8010F0</code>, GPU at <code>0x1F801810</code>, MDEC at <code>0x1F801820</code>, SPU from <code>0x1F801C00</code>. The game reaches them through the PsyQ libraries; only the movie player keeps a pointer block to them in its own data.</p>
+</section>
+
+<section class="doc-section" id="how-we-know">
+  <h2>How we know</h2>
+  <p>Ghidra's reference manager does not resolve MIPS <code>lui</code>+<code>addiu</code> pairs or <code>gp</code>-relative stores, so most rows were pinned by a writer hunt (<a href="../tooling/ghidra.html">Ghidra tooling</a>), a save-state diff, or a cheat code that names the cell. The region boundaries come from the executable's header and the overlays' own call graphs.</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Evidence</th><th>Where</th><th>What it proves</th></tr></thead>
+    <tbody>
+      <tr><td>PS-X EXE header</td><td><code>SCUS_942.54</code> <code>+0x10</code></td><td>Load address, image size, initial PC and <code>sp</code>, no BSS</td></tr>
+      <tr><td>Heap init</td><td><code>FUN_8002B3D4(2, 0x80091800, 0x134800)</code></td><td>The heap's base and end</td></tr>
+      <tr><td>Static overlay map</td><td><code>crates/asset/data/static-overlays.toml</code></td><td>Every overlay's base and extent, recovered from its own <code>jal</code> graph</td></tr>
+      <tr><td><code>main()</code></td><td><code>FUN_80015E90</code> @ <code>0x80015F08</code></td><td>The one <code>gp</code>-relative store that sets the build-mode selector to 1</td></tr>
+      <tr><td>Pad reader</td><td><code>FUN_8001822C</code></td><td>The held / previous / changed / edge masks</td></tr>
+      <tr><td>Mode-switch prologue</td><td><code>FUN_8001DCF8</code> @ <code>0x8001E17C</code></td><td>Sole non-RMW writer of the field-VM flag word's low 16 bits</td></tr>
+      <tr><td>TMD installer</td><td><code>FUN_80026B4C</code> @ <code>0x80026BA8</code></td><td>Sole writer of the global TMD table</td></tr>
+      <tr><td>Flag ops</td><td><code>FUN_8003CE08</code> / <code>_CE34</code> / <code>_CE64</code></td><td>The flag bank's addressing</td></tr>
+      <tr><td>Bag window installer</td><td><code>FUN_8004313C</code></td><td>The only writer of the bag's active window</td></tr>
+      <tr><td>Save write</td><td><code>0x801DFA98</code></td><td>The save block is <code>0x1A18</code> bytes from <code>0x80084140</code></td></tr>
+      <tr><td>Cheat corpus</td><td>557 GameShark / PAR codes</td><td>Names the game-state cells directly (<a href="cheats.html">cheats</a>)</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section class="doc-section" id="see-also">
+  <h2>See also</h2>
+  <div class="see-also">
+    <span class="see-also-label">Reference</span>
+    <a href="functions.html">Key functions</a>
+    <a href="cheats.html">Cheat databases</a>
+    <a href="../subsystems/boot.html">Boot sequence</a>
+    <a href="../formats/save-record.html">Save record</a>
+    <a href="../tooling/static-overlay-pipeline.html">Static overlay pipeline</a>
+    <a href="../tooling/ghidra.html">Ghidra tooling</a>
+    <a href="https://github.com/AndrewAltimit/legend-of-legaia-re/blob/main/docs/reference/overlay-va-aliases.md">Overlay VA aliases</a>
+  </div>
+</section>

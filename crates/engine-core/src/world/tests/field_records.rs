@@ -1,0 +1,346 @@
+use super::*;
+use legaia_engine_mode::mode::SceneMode;
+
+#[test]
+fn collect_sprite_requests_emits_one_per_active_actor_with_frame() {
+    let mut world = World::default();
+    // Slot 0: active + sprite frame at (10, 20) world coords.
+    world.actors[0].active = true;
+    world.actors[0].move_state.world_x = 100;
+    world.actors[0].move_state.world_z = 200;
+    world.set_actor_sprite(
+        0,
+        Some(SpriteFrame {
+            atlas_src: (0, 0, 16, 24),
+            tint: [1.0, 1.0, 1.0, 1.0],
+            anchor_y: -8,
+        }),
+    );
+    // Slot 1: active but no frame - shouldn't emit.
+    world.actors[1].active = true;
+    // Slot 2: frame but inactive - shouldn't emit.
+    world.set_actor_sprite(
+        2,
+        Some(SpriteFrame {
+            atlas_src: (16, 0, 16, 24),
+            tint: [1.0; 4],
+            anchor_y: 0,
+        }),
+    );
+
+    let requests = world.collect_sprite_requests();
+    assert_eq!(requests.len(), 1);
+    let r = &requests[0];
+    assert_eq!(r.actor_slot, 0);
+    assert_eq!(r.world_x, 100);
+    // anchor_y subtracts from world_z (z + (-8)) = 192.
+    assert_eq!(r.world_y, 192);
+    assert_eq!(r.atlas_src, (0, 0, 16, 24));
+}
+
+#[test]
+fn set_actor_sprite_with_none_clears_existing_frame() {
+    let mut world = World::default();
+    world.actors[0].active = true;
+    world.set_actor_sprite(
+        0,
+        Some(SpriteFrame {
+            atlas_src: (0, 0, 8, 8),
+            ..Default::default()
+        }),
+    );
+    assert!(world.actors[0].sprite_frame.is_some());
+    world.set_actor_sprite(0, None);
+    assert!(world.actors[0].sprite_frame.is_none());
+}
+
+#[test]
+fn load_field_record_skips_frame_divider_sentinel() {
+    let mut world = World::new();
+    // Record opens with FFFF 0000 frame divider.
+    let record = vec![0xFF, 0xFF, 0x00, 0x00, 0x37, 0x00];
+    world.load_field_record(&record);
+    assert_eq!(world.field_pc, 4, "frame divider should bump pc to 4");
+    assert_eq!(world.field_bytecode.len(), 6);
+}
+
+#[test]
+fn load_field_record_without_sentinel_starts_at_zero() {
+    let mut world = World::new();
+    let record = vec![0x37, 0x00];
+    world.load_field_record(&record);
+    assert_eq!(world.field_pc, 0);
+}
+
+/// Field VM op 0x3E with `op0 >= 100` is the **mode-24 minigame door-warp**,
+/// not a scene change: `sub_id = op0 - 100` selects a code overlay, and the
+/// retail arm calls no scene-change packet at all (`FUN_801DE840` case `0x3e`
+/// at `0x801E078C` stores game mode `0x18` and the sub-id, zeroes the winnings
+/// accumulator, and clears the player flag - nothing else).
+///
+/// The world's `FieldHostImpl` arms the round trip and records the request in
+/// `pending_minigame_warp` for `SceneHost::tick` to drain. It must **not**
+/// touch `pending_scene_transition`: routing the sub-id through the map-id
+/// resolver is what used to warp a player who used a casino cabinet to an
+/// unrelated scene. See `legaia_engine_mode::minigame_entry`.
+#[test]
+fn field_op_3e_warp_arms_the_minigame_door_not_a_scene_change() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    // Bytecode: opcode 0x3E, op0 = 105 (sub_id 5 = the Muscle Dome arena),
+    // then 4 trailing operand bytes per the dispatcher math.
+    let bytecode = vec![0x3E, 105, 0, 0, 0, 0];
+    world.load_field_script(bytecode);
+    let _ = world.tick();
+    assert_eq!(world.minigames.pending_warp, Some(5));
+    assert_eq!(
+        world.pending_scene_transition, None,
+        "the door-warp sub-id must not reach the map-id resolver"
+    );
+    // The arm's other retail half: the winnings accumulator is zeroed and the
+    // departure scene is backed up for the return trip.
+    assert_eq!(world.minigames.winnings, 0);
+    assert!(world.minigames.scene_backup.is_some());
+}
+
+/// `op0 < 100` is the scripted-battle install, not an interaction: it
+/// requests neither a scene transition nor a door-warp, opens no dialogue
+/// even on a slot that has inline text, and installs formation-table row
+/// `op1` exactly as `op0 == 0xFF` does (`FUN_801DE840` `0x801E06FC..0x801E0788`:
+/// the arm never reads `op0` past the `0xFF` / `< 100` test).
+#[test]
+fn field_op_3e_low_op0_installs_scripted_battle_row() {
+    for op0 in [0x00u8, 0x01, 50, 0xFF] {
+        let mut world = World::new();
+        world.set_formation_table(
+            legaia_engine_battle::monster_catalog::vanilla_formation_table(),
+            legaia_engine_battle::monster_catalog::vanilla_monster_catalog(),
+        );
+        world.mode = SceneMode::Field;
+        world.npcs.dialog.insert(1, vec![0x1F, b'h', b'i', 0x00]);
+        world.load_field_script(vec![0x3E, op0, 1]);
+        let _ = world.tick();
+        assert_eq!(world.pending_scene_transition, None, "op0 {op0:#x}");
+        assert_eq!(world.minigames.pending_warp, None, "op0 {op0:#x}");
+        assert!(
+            world.dialog.current.is_none(),
+            "op0 {op0:#x}: the op opens no dialogue"
+        );
+        assert_eq!(world.dialog.last_field_interact, None, "op0 {op0:#x}");
+        // The install arms the field-to-battle intro; the flip lands once
+        // its display frames elapse.
+        for _ in 0..200 {
+            if world.mode == SceneMode::Battle {
+                break;
+            }
+            let _ = world.tick();
+        }
+        assert_eq!(
+            world.mode,
+            SceneMode::Battle,
+            "op0 {op0:#x}: formation row 1 installed and entered"
+        );
+    }
+}
+
+/// Field-VM op `0x4C 0xE2` (FMV trigger) records the FMV index in
+/// `World::cutscene.pending_fmv_trigger` AND emits a `FieldEvent::FmvTrigger`
+/// for engines to drain. Retail handler at `0x801E30E4` writes the
+/// s16 to `_DAT_8007BA78` and pokes next-game-mode = 0x1A; the
+/// world mirrors the request via these two channels.
+#[test]
+fn field_op_4c_e2_records_pending_fmv_trigger() {
+    use legaia_engine_field::field_events::FieldEvent;
+    use legaia_engine_system::movie::cutscene::{STR_INIT_GAME_MODE, fmv_index_to_str_filename};
+
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    // `[0x4C, 0xE2, 0x03, 0x00, 0, 0]` → fmv_id 3 → MV3.STR segment 2
+    // (the deroa/chitei2 clip; dispatch table `0x801D0A6C`, 32-byte
+    // slots).
+    let bytecode = vec![0x4C, 0xE2, 0x03, 0x00, 0, 0];
+    world.load_field_script(bytecode);
+    let _ = world.tick();
+    assert_eq!(world.cutscene.pending_fmv_trigger, Some(3));
+    let events = world.drain_field_events();
+    assert!(events.contains(&FieldEvent::FmvTrigger { fmv_id: 3 }));
+    assert_eq!(fmv_index_to_str_filename(3), Some("MOV/MV3.STR"));
+    assert_eq!(STR_INIT_GAME_MODE, 26);
+}
+
+/// The FMV trigger transitions Field → Cutscene one frame later (retail's
+/// main dispatcher reads the next-game-mode global the frame after the
+/// field-VM op writes it), exposes the active FMV + its `MV*.STR` path,
+/// and suspends the field VM while it plays. `finish_cutscene` returns to
+/// the field.
+#[test]
+fn field_fmv_trigger_drives_field_cutscene_field_flow() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    // fmv_id 3 → MV3.STR segment 2 (a playable retail slot).
+    world.load_field_script(vec![0x4C, 0xE2, 0x03, 0x00, 0, 0]);
+
+    // Frame 1: op fires, records the pending trigger; still in Field.
+    let _ = world.tick();
+    assert_eq!(world.mode, SceneMode::Field);
+    assert_eq!(world.cutscene.pending_fmv_trigger, Some(3));
+    assert_eq!(world.active_fmv(), None);
+
+    // Frame 2: the pending trigger is consumed at the top of the tick and
+    // the world flips into the cutscene mode for the resolved FMV.
+    let _ = world.tick();
+    assert_eq!(world.mode, SceneMode::Cutscene);
+    assert_eq!(world.cutscene.pending_fmv_trigger, None);
+    assert_eq!(world.active_fmv(), Some(3));
+    assert_eq!(world.active_fmv_str_filename(), Some("MOV/MV3.STR"));
+
+    // While the FMV plays the field VM is suspended (no further field
+    // stepping); ticking keeps the world in Cutscene until the host ends
+    // playback.
+    let _ = world.tick();
+    assert_eq!(world.mode, SceneMode::Cutscene);
+    assert_eq!(world.active_fmv(), Some(3));
+
+    // Host signals playback complete → back to the field.
+    world.finish_cutscene();
+    assert_eq!(world.mode, SceneMode::Field);
+    assert_eq!(world.active_fmv(), None);
+}
+
+/// An FMV id whose runtime slot points at a cut/missing path is drained
+/// without entering the cutscene mode - the engine treats it as a no-op
+/// and the field keeps running.
+#[test]
+fn field_fmv_trigger_cut_path_is_a_noop() {
+    let mut world = World::new();
+    world.mode = SceneMode::Field;
+    // fmv_id 10 → slots 9..=22 are dev-only cut paths (no retail STR;
+    // retail ids run 0..=8, dispatch table `0x801D0A6C` stride 0x20).
+    world.load_field_script(vec![0x4C, 0xE2, 0x0A, 0x00, 0, 0]);
+
+    let _ = world.tick(); // op fires
+    assert_eq!(world.cutscene.pending_fmv_trigger, Some(10));
+    let _ = world.tick(); // pending consumed
+    assert_eq!(
+        world.mode,
+        SceneMode::Field,
+        "cut path does not enter cutscene"
+    );
+    assert_eq!(
+        world.cutscene.pending_fmv_trigger, None,
+        "pending still drained"
+    );
+    assert_eq!(world.active_fmv(), None);
+}
+
+/// A scene whose MAN has `.MAP` object binds but ZERO partition-1
+/// placements still seeds its object-bind channels: retail's scene-init
+/// object walk (`FUN_8003A55C`) binds every trigger'd object regardless of
+/// whether partition 1 placed any actors, and the walk-on partition-2
+/// installer executes out of the same retained MAN buffer. The regression
+/// this pins: `seed_field_channels` used to drop the MAN Arc whenever the
+/// placement channel set came back empty, so `seed_object_channels`
+/// early-returned and the scene's door/prop pokes had no target context.
+#[test]
+fn object_channels_seed_without_partition1_placements() {
+    use legaia_scene_formats::man_section::{ManFile, ManHeader, SectionRef};
+
+    // One partition-0 record (flat index 0), zero placements.
+    let data_region_offset = 0x40usize;
+    let mut man = vec![0u8; data_region_offset];
+    man.push(0x00); // N = 0 local entries
+    man.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // 4-byte header
+    man.push(0x21); // pc0: a NOP the bind prologue pre-run stops on
+    man.push(0x00);
+    let header = ManHeader {
+        status_flags: 0,
+        low_flag: false,
+        depth_lut: [0; 16],
+        partition_counts: [1, 0, 0],
+        u24_at_28: 0,
+    };
+    let man_file = ManFile {
+        header,
+        partitions: [vec![0u32], vec![], vec![]],
+        data_region_offset,
+        sections: std::array::from_fn(|_| SectionRef {
+            offset: man.len(),
+            length: 0,
+        }),
+    };
+
+    let mut world = World::default();
+    world.seed_field_channels(&man_file, &man);
+    assert!(
+        world.field_vm.channels.is_empty(),
+        "no placements -> no placement channels"
+    );
+    world.seed_object_channels(&man_file, &man, &[(0usize, (100i16, 200i16))]);
+    let obj = world
+        .field_vm
+        .channels
+        .iter()
+        .find(|c| c.object_bind)
+        .expect("the object bind seeds a channel even with zero placements");
+    assert_eq!(obj.ctx.script_id, 0);
+    assert_eq!((obj.ctx.world_x, obj.ctx.world_z), (100, 200));
+}
+
+/// An object-bind context starts at its `.MAP` angles and turns with op
+/// `0x38`: `town0c`'s exit-rock prologue `25 .. 38 83 00` leaves the actor at
+/// compass 3 (`0x600`) where the record authored `320`, and the draw follows
+/// the actor (`World::object_draw_turns`).
+#[test]
+fn an_object_bind_prologue_turn_reaches_the_draw() {
+    use legaia_scene_formats::man_section::{ManFile, ManHeader, SectionRef};
+
+    let data_region_offset = 0x40usize;
+    let mut man = vec![0u8; data_region_offset];
+    // `[u8 n = 0][u8 attr]`, the partition-0 record header.
+    man.extend_from_slice(&[0x00, 0x00]);
+    // pc0: the bind prologue - NOP-open, face compass 3, then idle.
+    man.extend_from_slice(&[0x25, 0x38, 0x83, 0x00, 0x21, 0x00]);
+    let man_file = ManFile {
+        header: ManHeader {
+            status_flags: 0,
+            low_flag: false,
+            depth_lut: [0; 16],
+            partition_counts: [1, 0, 0],
+            u24_at_28: 0,
+        },
+        partitions: [vec![0u32], vec![], vec![]],
+        data_region_offset,
+        sections: std::array::from_fn(|_| SectionRef {
+            offset: man.len(),
+            length: 0,
+        }),
+    };
+
+    let mut world = World::default();
+    world.seed_field_channels(&man_file, &man);
+    world.set_object_bind_rots([(0usize, [0u16, 320, 0])].into_iter().collect());
+    world.seed_object_channels(&man_file, &man, &[(0usize, (100i16, 200i16))]);
+    let turns = world.object_draw_turns();
+    assert_eq!(turns.get(&0), Some(&[0, 0x600, 0]));
+
+    // The draw turns by the difference, about its own origin.
+    let m = world.object_draw_turn_matrices()[&0];
+    let model: [f32; 16] = [
+        1.0, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 1.0, 0.0, //
+        5.0, 6.0, 7.0, 1.0,
+    ];
+    let turned = legaia_engine_scene::field_env::turn_placed_model(&model, &m);
+    assert_eq!(&turned[12..16], &[5.0, 6.0, 7.0, 1.0], "origin kept");
+    let a = f32::from(0x600u16 - 320) * std::f32::consts::TAU / 4096.0;
+    assert!((turned[0] - a.cos()).abs() < 1e-5);
+    assert!(
+        (turned[8] - a.sin()).abs() < 1e-5,
+        "Ry: local +Z leans to +X"
+    );
+
+    // A context left at its bind angles is not listed.
+    world.set_object_bind_rots([(0usize, [0u16, 0x600, 0])].into_iter().collect());
+    assert!(world.object_draw_turns().is_empty());
+}

@@ -1,0 +1,800 @@
+//! Sony VAB instrument-bank parser + VAG sample extractor.
+//!
+//! Layout (Sony PsyQ docs, version 7):
+//!
+//! ```text
+//! 0x00 u32  magic   = 'pBAV'  (0x70424156 LE)
+//! 0x04 u32  version (typically 7)
+//! 0x08 u32  vab_id
+//! 0x0C u32  fsize           total bank size in bytes
+//! 0x10 u16  reserved
+//! 0x12 u16 ps               number of programs in use
+//! 0x14 u16 ts               total number of tones in use
+//! 0x16 u16 vs               number of VAG samples
+//! 0x18 u8   mvol            master volume
+//! 0x19 u8   pan
+//! 0x1A u8   attr1
+//! 0x1B u8   attr2
+//! 0x1C u32  reserved
+//!
+//! 0x20         ProgAtr[128]   16 bytes each = 2048 bytes (regardless of `ps`)
+//! 0x820        VagAtr[16][ps] 32 bytes each, 16 tones per program slot
+//!              -> tones section size = 512 * ps
+//! +(2048+512*ps) u16 vag_table[256]
+//!                entry 0 is a reserved spacer (the table is 1-indexed)
+//!                entries 1..=vs hold per-sample VAG sizes / 8 (8-byte units)
+//! + 0x200 (after table) VAG bodies (raw SPU ADPCM, 16-byte blocks)
+//! ```
+//!
+//! Entries past `vs` in `vag_table` are zero. The decoder treats `vag_table[i+1]`
+//! (in 8-byte units) as the *size* of sample `i`; samples are concatenated
+//! immediately after the table. The table is **1-indexed**, so `vag_table[0]`
+//! is a reserved leading spacer - universally `0` across the retail corpus
+//! (986 / 986 VABs), surfaced as [`VabReport::vag_table_spacer`]. It is **not**
+//! a master pitch / sample-rate shift: that hypothesis is falsified by the
+//! all-zero corpus, so nothing derives a pitch offset from it.
+//!
+//! VAG body = stream of 16-byte SPU ADPCM blocks:
+//! ```text
+//! byte 0: (filter << 4) | shift   (filter in 0..=4)
+//! byte 1: flag                    (1 = loop end+jump, 2 = loop sustain, 4 = loop start)
+//! bytes 2..16: 14 nibble pairs, low nibble first = 28 4-bit samples
+//! ```
+//!
+//! ## On disc a VAB is two chunks, not one blob
+//!
+//! Every VAB on this disc is carried inside a DATA_FIELD chunk stream, and the
+//! two halves above are **separate chunks**:
+//!
+//! ```text
+//! [u32 (0x00 << 24) | header_part_len]   chunk 0 header
+//! [VabHdr .. VAG size table]             chunk 0 payload = the header part
+//! [u32 (type << 24) | body_len]          chunk 1 header  <-- 4 bytes, in the middle of the VAB
+//! [VAG bodies]                           chunk 1 payload
+//! ```
+//!
+//! `header_part_len + body_len == fsize`, and `header_part_len` is exactly
+//! `0x20 + 0x800 + 0x200 * ps + 0x200` in all 424 retail VABs. The layout
+//! matters because [`parse`] walks straight on from the size table, so the
+//! spans it reports for VAG bodies are off by that intervening chunk header -
+//! see [`vag_body_origin`], which reads the real origin off the stream.
+//!
+//! Three entry points, and which one to reach for:
+//!
+//! | Function | Spans it reports | Use it when |
+//! |---|---|---|
+//! | [`parse`] | walked straight on from the size table | the VAB is standalone, or the caller compensates itself |
+//! | [`parse_in_stream`] | resolved through the body chunk | the containing stream is in hand |
+//! | [`vag_body_origin_at`] | (an offset, not a report) | only the bank is in hand, starting at `pBAV` |
+//!
+//! [`parse`]'s spans are deliberately left alone: several consumers index them
+//! with a hard-coded `+4` of their own, so moving them would move those
+//! compensations too.
+//!
+//! The [`ADPCM_F0`] / [`ADPCM_F1`] filter constants are the same five-entry
+//! tables XA-ADPCM uses (`legaia_xa::F0` / `F1`) - the algorithm is identical,
+//! only the block packaging differs. This crate carries its own copy so a
+//! sound-bank reader does not link the disc reader `legaia-xa` sits on; a
+//! test pins the two copies equal.
+
+use anyhow::{Context, Result, bail};
+use serde::Serialize;
+
+/// On-disk bytes are `p B A V` (`0x70 0x42 0x41 0x56`); read as a little-endian
+/// u32 that's `0x56414270`. The PsyQ macro `VABp` makes the byte order obvious.
+pub const VAB_MAGIC: u32 = 0x5641_4270;
+pub const VAB_HEADER_SIZE: usize = 0x20;
+pub const PROGRAMS_TABLE_SIZE: usize = 16 * 128; // 2048
+pub const TONE_SIZE: usize = 32;
+pub const TONES_PER_PROGRAM: usize = 16;
+pub const VAG_TABLE_ENTRIES: usize = 256;
+pub const VAG_BLOCK_BYTES: usize = 16;
+pub const SAMPLES_PER_BLOCK: usize = 28;
+/// SPU-ADPCM prediction filter, first coefficient (x/64), by filter index.
+/// Identical to `legaia_xa::F0`.
+pub const ADPCM_F0: [i32; 5] = [0, 60, 115, 98, 122];
+/// SPU-ADPCM prediction filter, second coefficient (x/64), by filter index.
+/// Identical to `legaia_xa::F1`.
+pub const ADPCM_F1: [i32; 5] = [0, 0, -52, -55, -60];
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct VabHeader {
+    pub magic: u32,
+    pub version: u32,
+    pub vab_id: u32,
+    pub fsize: u32,
+    pub ps: u16,
+    pub ts: u16,
+    pub vs: u16,
+    pub mvol: u8,
+    pub pan: u8,
+    pub attr1: u8,
+    pub attr2: u8,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ProgAtr {
+    pub tones: u8, // number of tones used in this program
+    pub mvol: u8,
+    pub prior: u8,
+    pub mode: u8,
+    pub mpan: u8,
+    pub reserved0: u8,
+    pub attr: u16,
+    pub reserved1: u32,
+    pub reserved2: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct VagAtr {
+    pub prior: u8,
+    pub mode: u8,
+    pub vol: u8,
+    pub pan: u8,
+    pub center: u8,
+    pub shift: u8,
+    pub min: u8,
+    pub max: u8,
+    pub vibw: u8,
+    pub vibt: u8,
+    pub porw: u8,
+    pub port: u8,
+    pub pbmin: u8,
+    pub pbmax: u8,
+    pub reserved1: u8,
+    pub reserved2: u8,
+    pub adsr1: u16,
+    pub adsr2: u16,
+    pub prog: i16,
+    pub vag: i16,
+    pub reserved3: [u16; 4],
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VabReport {
+    pub header: VabHeader,
+    pub header_offset: usize,
+    pub programs: Vec<ProgAtr>,
+    pub tones: Vec<Vec<VagAtr>>,
+    /// Byte offset (within input buffer) + size of each VAG sample body.
+    pub vag_samples: Vec<VagSampleSpan>,
+    /// `vag_table[0]` - the reserved leading entry of the VAG size table. The
+    /// table is **1-indexed**: `vag_table[1..=vs]` hold the sample sizes, so
+    /// entry 0 is a spacer that is universally `0` across the retail corpus
+    /// (986 / 986 VABs). It is **not** a master pitch / sample-rate shift (that
+    /// hypothesis is falsified by the all-zero corpus); nothing should derive a
+    /// pitch offset from it. Kept on the report only to surface the raw byte.
+    pub vag_table_spacer: u16,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct VagSampleSpan {
+    pub index: usize,
+    pub byte_offset: usize,
+    pub size: usize,
+}
+
+/// Parse a VAB header at `offset` in `buf`. Returns `Err` if magic mismatches
+/// or fields are out of range.
+pub fn parse_header(buf: &[u8], offset: usize) -> Result<VabHeader> {
+    let h = buf
+        .get(offset..offset + VAB_HEADER_SIZE)
+        .ok_or_else(|| anyhow::anyhow!("offset 0x{:X} + header size past buffer end", offset))?;
+    let magic = u32::from_le_bytes(h[0..4].try_into().unwrap());
+    if magic != VAB_MAGIC {
+        bail!(
+            "magic mismatch at 0x{:X}: got 0x{:08X}, expected 0x{:08X} ('pBAV')",
+            offset,
+            magic,
+            VAB_MAGIC
+        );
+    }
+    let version = u32::from_le_bytes(h[4..8].try_into().unwrap());
+    let vab_id = u32::from_le_bytes(h[8..12].try_into().unwrap());
+    let fsize = u32::from_le_bytes(h[12..16].try_into().unwrap());
+    let ps = u16::from_le_bytes(h[18..20].try_into().unwrap());
+    let ts = u16::from_le_bytes(h[20..22].try_into().unwrap());
+    let vs = u16::from_le_bytes(h[22..24].try_into().unwrap());
+    let mvol = h[24];
+    let pan = h[25];
+    let attr1 = h[26];
+    let attr2 = h[27];
+
+    if version > 10 {
+        bail!("implausible VAB version {}", version);
+    }
+    if ps == 0 || ps > 128 {
+        bail!("VAB programs count out of range: {}", ps);
+    }
+    // `vs` indexes `vag_table[1..=vs]`, so the last entry read is index
+    // `vs`. The table has exactly `VAG_TABLE_ENTRIES` (256) slots, indices
+    // `0..=255`, so `vs` must be strictly less than the table size or the
+    // sample-size lookup would read past the table.
+    if vs == 0 || vs as usize >= VAG_TABLE_ENTRIES {
+        bail!("VAB samples count out of range: {}", vs);
+    }
+    Ok(VabHeader {
+        magic,
+        version,
+        vab_id,
+        fsize,
+        ps,
+        ts,
+        vs,
+        mvol,
+        pan,
+        attr1,
+        attr2,
+    })
+}
+
+/// Parse a complete VAB at `offset`: header, programs, tones, VAG sample table.
+pub fn parse(buf: &[u8], offset: usize) -> Result<VabReport> {
+    let header = parse_header(buf, offset)?;
+    let ps = header.ps as usize;
+    let vs = header.vs as usize;
+
+    // Compute every section offset with checked arithmetic so a hostile
+    // header can't overflow into a small (and thus passing) value. `ps` is
+    // bounded to <=128 by `parse_header`, so these products are tiny, but
+    // keeping the math checked is cheap and defends against future bound
+    // changes.
+    let overflow = || anyhow::anyhow!("VAB section offsets overflow usize");
+    let prog_off = offset.checked_add(VAB_HEADER_SIZE).ok_or_else(overflow)?;
+    let tone_off = prog_off
+        .checked_add(PROGRAMS_TABLE_SIZE)
+        .ok_or_else(overflow)?;
+    let tones_bytes = TONE_SIZE
+        .checked_mul(TONES_PER_PROGRAM)
+        .and_then(|n| n.checked_mul(ps))
+        .ok_or_else(overflow)?;
+    let table_off = tone_off.checked_add(tones_bytes).ok_or_else(overflow)?;
+    let vag_bodies_off = table_off
+        .checked_add(2 * VAG_TABLE_ENTRIES)
+        .ok_or_else(overflow)?;
+
+    // The declared `fsize` must fit, AND the fixed-layout sections
+    // (programs + tones + VAG table) must themselves fit within the buffer.
+    // `fsize` is attacker-controlled and can be smaller than the layout
+    // demands, so checking it alone is not enough to make the section
+    // slices below safe.
+    let vab_end = offset
+        .checked_add(header.fsize as usize)
+        .ok_or_else(overflow)?;
+    if vab_end > buf.len() {
+        bail!(
+            "VAB at 0x{:X} claims fsize {} but only {} bytes remain",
+            offset,
+            header.fsize,
+            buf.len().saturating_sub(offset)
+        );
+    }
+    if vag_bodies_off > buf.len() {
+        bail!(
+            "VAB at 0x{:X} header/tone/table sections ({} bytes) overrun buffer ({} bytes)",
+            offset,
+            vag_bodies_off.saturating_sub(offset),
+            buf.len()
+        );
+    }
+
+    // Programs: 128 fixed slots even though only `ps` are in use.
+    let mut programs = Vec::with_capacity(128);
+    for i in 0..128 {
+        let p = prog_off + i * 16;
+        let s = &buf[p..p + 16];
+        programs.push(ProgAtr {
+            tones: s[0],
+            mvol: s[1],
+            prior: s[2],
+            mode: s[3],
+            mpan: s[4],
+            reserved0: s[5],
+            attr: u16::from_le_bytes(s[6..8].try_into().unwrap()),
+            reserved1: u32::from_le_bytes(s[8..12].try_into().unwrap()),
+            reserved2: u32::from_le_bytes(s[12..16].try_into().unwrap()),
+        });
+    }
+
+    // Tones: 16 per program × ps programs.
+    let mut tones = Vec::with_capacity(ps);
+    for prog_idx in 0..ps {
+        let mut row = Vec::with_capacity(TONES_PER_PROGRAM);
+        for tone_idx in 0..TONES_PER_PROGRAM {
+            let p = tone_off + (prog_idx * TONES_PER_PROGRAM + tone_idx) * TONE_SIZE;
+            let s = &buf[p..p + TONE_SIZE];
+            row.push(VagAtr {
+                prior: s[0],
+                mode: s[1],
+                vol: s[2],
+                pan: s[3],
+                center: s[4],
+                shift: s[5],
+                min: s[6],
+                max: s[7],
+                vibw: s[8],
+                vibt: s[9],
+                porw: s[10],
+                port: s[11],
+                pbmin: s[12],
+                pbmax: s[13],
+                reserved1: s[14],
+                reserved2: s[15],
+                adsr1: u16::from_le_bytes(s[16..18].try_into().unwrap()),
+                adsr2: u16::from_le_bytes(s[18..20].try_into().unwrap()),
+                prog: i16::from_le_bytes(s[20..22].try_into().unwrap()),
+                vag: i16::from_le_bytes(s[22..24].try_into().unwrap()),
+                reserved3: [
+                    u16::from_le_bytes(s[24..26].try_into().unwrap()),
+                    u16::from_le_bytes(s[26..28].try_into().unwrap()),
+                    u16::from_le_bytes(s[28..30].try_into().unwrap()),
+                    u16::from_le_bytes(s[30..32].try_into().unwrap()),
+                ],
+            });
+        }
+        tones.push(row);
+    }
+
+    // VAG size table: 256 u16 entries; the table is 1-indexed, so entry 0 is a
+    // reserved spacer (universally 0 across the retail corpus, not a pitch /
+    // sample-rate shift) and entries 1..=vs are sample sizes in 8-byte units.
+    // Sample bodies start at vag_bodies_off.
+    let table = &buf[table_off..table_off + 2 * VAG_TABLE_ENTRIES];
+    let entries: Vec<u16> = (0..VAG_TABLE_ENTRIES)
+        .map(|i| u16::from_le_bytes(table[i * 2..i * 2 + 2].try_into().unwrap()))
+        .collect();
+    let vag_table_spacer = entries[0];
+
+    let mut samples = Vec::with_capacity(vs);
+    let mut cursor = vag_bodies_off;
+    for i in 0..vs {
+        // `vs < VAG_TABLE_ENTRIES` (checked in parse_header) guarantees
+        // `i + 1 <= vs < 256`, so this index is always in `entries`.
+        let size_units = entries[i + 1] as usize;
+        let size = size_units * 8;
+        let sample_end = cursor.checked_add(size).ok_or_else(overflow)?;
+        if sample_end > vab_end {
+            bail!(
+                "VAG sample {} (size {}) overruns VAB region (vab end = 0x{:X}, sample end = 0x{:X})",
+                i,
+                size,
+                vab_end,
+                sample_end
+            );
+        }
+        samples.push(VagSampleSpan {
+            index: i,
+            byte_offset: cursor,
+            size,
+        });
+        cursor = sample_end;
+    }
+
+    Ok(VabReport {
+        header,
+        header_offset: offset,
+        programs,
+        tones,
+        vag_samples: samples,
+        vag_table_spacer,
+    })
+}
+
+/// Byte length of the VAB's header part: `VabHdr`, the 128-slot program
+/// table, `ps` rows of tone attributes, and the 256-slot VAG size table.
+///
+/// This is the number the DATA_FIELD chunk header in front of every retail VAB
+/// carries as its payload length, in all 424 VABs on the disc.
+pub fn header_part_size(ps: usize) -> usize {
+    VAB_HEADER_SIZE
+        + PROGRAMS_TABLE_SIZE
+        + TONE_SIZE * TONES_PER_PROGRAM * ps
+        + 2 * VAG_TABLE_ENTRIES
+}
+
+/// Where the first VAG body really starts, for a VAB carried in a DATA_FIELD
+/// chunk stream that begins at `stream_start`.
+///
+/// **Why this is not `offset + header_part_size(ps)`.** A retail VAB is stored
+/// as two chunks of the same stream, not as one contiguous blob: chunk 0's
+/// payload is the header part and a *later* chunk's payload is the VAG bodies,
+/// with that chunk's own 4-byte header in between. `parse`'s
+/// [`VagSampleSpan::byte_offset`] walks straight on from the size table, so it
+/// lands on the intervening chunk header - four bytes early where the body
+/// chunk comes next, and further when another chunk intervenes.
+///
+/// The body chunk is identified by a length the container states rather than
+/// by a magic: its payload is exactly `fsize - header_part_size(ps)` bytes,
+/// because the two payloads sum to the VAB's declared `fsize`.
+///
+/// Six retail entries (`0886`, `1058`, `1059`, `1063`, `1064`, `1065`) put the
+/// SEQ chunk *before* the body chunk, so for them the skew is thousands of
+/// bytes and an alignment probe over `{0, 4}` cannot recover it. Everything
+/// that indexes a VAG body out of a stream entry should come through here.
+pub fn vag_body_origin(buf: &[u8], stream_start: usize) -> Result<usize> {
+    let head = read_u32(buf, stream_start).context("stream head word")?;
+    if head >> 24 != 0 {
+        bail!(
+            "chunk 0 at {stream_start:#x} is type {:#x}, not the VAB header part",
+            head >> 24
+        );
+    }
+    let header_len = (head & 0x00FF_FFFF) as usize;
+    let vab = stream_start + 4;
+    let header = parse_header(buf, vab)?;
+    if header_len != header_part_size(header.ps as usize) {
+        bail!(
+            "chunk 0 payload {header_len} != the header part for {} program(s)",
+            header.ps
+        );
+    }
+    vag_body_origin_at(buf, vab)
+}
+
+/// The same resolution anchored on the **VAB** instead of on the stream head.
+///
+/// [`vag_body_origin`] needs chunk 0's header, which sits four bytes *before*
+/// the VAB - so a caller holding a buffer that begins at the `pBAV` magic
+/// cannot use it, and that is the common shape (a bank sliced out of its entry
+/// and handed on for upload). Nothing about the resolution actually needs
+/// chunk 0: the body chunk is found by walking **forward** from the end of the
+/// header part, and the length it is recognised by comes from the VAB's own
+/// `fsize`.
+///
+/// Returns the offset, in `buf`, of the first VAG body. Errors when no chunk
+/// within the next eight carries a payload of `fsize - header_part_size(ps)` -
+/// which is the standalone case (no chunk stream at all), and the signal to
+/// keep using the straight-on walk.
+///
+/// The length is what identifies the chunk, so an intervening chunk of exactly
+/// the body's length would be taken for it. No retail carrier has one (the
+/// six that put a SEQ between the halves are asserted by
+/// `crates/vab/tests/corpus_chunk_carriage.rs` to resolve onto a clean ADPCM
+/// grid), but the ambiguity is in the method, not in the disc.
+pub fn vag_body_origin_at(buf: &[u8], vab_offset: usize) -> Result<usize> {
+    let header = parse_header(buf, vab_offset)?;
+    let header_len = header_part_size(header.ps as usize);
+    let want = (header.fsize as usize)
+        .checked_sub(header_len)
+        .context("VAB fsize is shorter than its own header part")?;
+    let mut p = vab_offset
+        .checked_add(header_len)
+        .context("VAB header part overflows usize")?;
+    for _ in 0..8 {
+        let h = read_u32(buf, p).with_context(|| format!("chunk header at {p:#x}"))?;
+        if h == 0 {
+            break;
+        }
+        let len = (h & 0x00FF_FFFF) as usize;
+        if len == want {
+            return Ok(p + 4);
+        }
+        p = p
+            .checked_add(4 + ((len + 3) & !3))
+            .context("chunk walk overflowed")?;
+        if p >= buf.len() {
+            break;
+        }
+    }
+    bail!("no chunk in this stream carries the {want}-byte VAG body")
+}
+
+/// Parse a VAB that is carried in a DATA_FIELD chunk stream beginning at
+/// `stream_start`, with every [`VagSampleSpan::byte_offset`] resolved through
+/// [`vag_body_origin`] instead of walked straight on from the size table.
+///
+/// [`parse`] is left as it is on purpose: its spans are what every existing
+/// consumer indexes with, several of them compensating with a hard-coded `+4`
+/// (`crates/patcher`), so moving them would move those compensations too. Use
+/// this entry point wherever the containing stream is in hand and the spans are
+/// meant to name real ADPCM.
+pub fn parse_in_stream(buf: &[u8], stream_start: usize) -> Result<VabReport> {
+    let origin = vag_body_origin(buf, stream_start)?;
+    let mut report = parse(buf, stream_start + 4)?;
+    relocate_bodies(&mut report, origin);
+    Ok(report)
+}
+
+/// Move a report's VAG spans so the first body starts at `origin`, keeping the
+/// sizes and their order. The bodies are contiguous, so one delta covers them.
+fn relocate_bodies(report: &mut VabReport, origin: usize) {
+    let Some(first) = report.vag_samples.first().map(|s| s.byte_offset) else {
+        return;
+    };
+    for s in &mut report.vag_samples {
+        s.byte_offset = s.byte_offset + origin - first;
+    }
+}
+
+fn read_u32(buf: &[u8], at: usize) -> Option<u32> {
+    let b = buf.get(at..at + 4)?;
+    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Find every standalone VAB header in `buf`. Walks for the magic byte
+/// pattern and validates each candidate by trying [`parse_header`].
+pub fn find_vabs(buf: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let pattern = VAB_MAGIC.to_le_bytes();
+    let mut i = 0;
+    while i + 4 <= buf.len() {
+        if buf[i..i + 4] == pattern && parse_header(buf, i).is_ok() {
+            out.push(i);
+            i += VAB_HEADER_SIZE;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Decode one VAG sample body (a stream of 16-byte SPU ADPCM blocks) into
+/// signed 16-bit PCM. Stops at end-of-buffer or at a block whose flag byte
+/// has the loop-end bit (bit 0) set.
+/// How many 16-byte blocks starting at `align` carry a **legal** SPU-ADPCM
+/// filter index (`0..=4`). The probe behind [`decode_vag_aligned`].
+fn legal_filter_blocks(buf: &[u8], align: usize) -> (usize, usize) {
+    if align >= buf.len() {
+        return (0, 0);
+    }
+    let blocks = (buf.len() - align) / VAG_BLOCK_BYTES;
+    let good = (0..blocks)
+        .filter(|b| ((buf[align + b * VAG_BLOCK_BYTES] >> 4) & 0x0F) <= 4)
+        .count();
+    (good, blocks)
+}
+
+/// Decode a VAG body whose ADPCM block grid may not start at byte 0.
+///
+/// **Why this exists.** The sample spans [`parse`] reports start **4 bytes
+/// before** the real ADPCM grid on most VABs in the retail corpus, and the four
+/// bytes are a DATA_FIELD chunk header: the bodies are a chunk of their own, so
+/// its header sits between the VAG size table and the first block (see the
+/// module docs and [`vag_body_origin`]). Feeding such a body straight to
+/// [`decode_vag`] decodes nothing at all - the misaligned first block reads as a
+/// filter index of 8 (or an end flag), and the decoder stops on the sentinel.
+///
+/// The probe below is therefore a fallback, not the rule, and it is one-sided:
+/// six retail entries put another chunk between the two halves, so their skew is
+/// thousands of bytes and no `{0, 4}` probe recovers it. Prefer
+/// [`vag_body_origin`] wherever the containing stream is in hand.
+///
+/// The skew is not a guess. An SPU-ADPCM block header's high nibble is the
+/// filter index and only `0..=4` are legal, which makes the alignment
+/// **measurable**: across the retail VABs, the grid at `+4` yields legal filters
+/// in *100%* of blocks while every other alignment sits at chance (~55%). This
+/// decoder probes the alignment, requires one to be unambiguously clean, and
+/// decodes from there - so a body that does *not* have a self-consistent grid
+/// fails loudly instead of returning plausible noise.
+///
+/// [`decode_vag`] and [`parse`] are left alone: their `byte_offset` is what
+/// every existing consumer already indexes with, several of them with a
+/// hard-coded `+4` of their own, so moving it would move those compensations
+/// too. The corrected origin lives beside them instead - [`parse_in_stream`]
+/// where the containing stream is in hand and [`vag_body_origin_at`] where only
+/// the bank is - and the SPU upload path resolves it there.
+pub fn decode_vag_aligned(buf: &[u8]) -> Result<Vec<i16>> {
+    // Only 0 and 4 are plausible origins (a block is 16 bytes and the skew is a
+    // whole number of words); probe both and demand a clean winner.
+    let mut best: Option<(usize, f64)> = None;
+    for align in [0usize, 4] {
+        let (good, blocks) = legal_filter_blocks(buf, align);
+        if blocks == 0 {
+            continue;
+        }
+        let score = good as f64 / blocks as f64;
+        if best.map(|(_, s)| score > s).unwrap_or(true) {
+            best = Some((align, score));
+        }
+    }
+    let (align, score) = best.context("VAG body too small to hold an ADPCM block")?;
+    if score < 0.99 {
+        bail!(
+            "no self-consistent ADPCM block grid in this VAG body (best alignment +{align} scores {:.0}% legal filters)",
+            score * 100.0
+        );
+    }
+    // Trim to a whole number of blocks - the 4-byte lead-in leaves a partial
+    // block's worth of the *next* sample dangling off the end of the span.
+    let body = &buf[align..];
+    let whole = body.len() / VAG_BLOCK_BYTES * VAG_BLOCK_BYTES;
+    decode_vag(&body[..whole])
+}
+
+pub fn decode_vag(buf: &[u8]) -> Result<Vec<i16>> {
+    if !buf.len().is_multiple_of(VAG_BLOCK_BYTES) {
+        bail!(
+            "VAG body length {} is not a multiple of {} (block size)",
+            buf.len(),
+            VAG_BLOCK_BYTES
+        );
+    }
+    let n_blocks = buf.len() / VAG_BLOCK_BYTES;
+    let mut out: Vec<i16> = Vec::with_capacity(n_blocks * SAMPLES_PER_BLOCK);
+    let mut prev1: i32 = 0;
+    let mut prev2: i32 = 0;
+
+    for b in 0..n_blocks {
+        let block = &buf[b * VAG_BLOCK_BYTES..(b + 1) * VAG_BLOCK_BYTES];
+        let header_byte = block[0];
+        let filter = ((header_byte >> 4) & 0x0F) as usize;
+        let shift = (header_byte & 0x0F) as i32;
+        let flag = block[1];
+
+        // End-of-stream sentinel: many Legaia VAB samples mark end with
+        // `flag & 0x01` AND fill the header byte with garbage (filter > 4).
+        // Treat both signals as "stop here, don't decode the sentinel".
+        if flag & 0x01 != 0 || filter > 4 {
+            break;
+        }
+
+        let f0 = ADPCM_F0[filter];
+        let f1 = ADPCM_F1[filter];
+
+        // Decode 14 bytes = 28 nibble samples (low nibble first).
+        for &byte in &block[2..16] {
+            for nibble_idx in 0..2 {
+                let nibble = if nibble_idx == 0 {
+                    byte & 0x0F
+                } else {
+                    (byte >> 4) & 0x0F
+                };
+                // Sign-extend 4-bit signed nibble.
+                let s = ((nibble as i8) << 4) >> 4;
+                // Canonical SPU-ADPCM gain: `(s << 12) >> shift`. Written
+                // this way (rather than `s << (12 - shift)`) so a hostile
+                // `shift > 12` can't trigger a negative/oversized shift
+                // panic. For the valid range (shift <= 12) the two forms
+                // are identical. `shift` is `header_byte & 0x0F` so it is
+                // always in `0..=15`; clamp the degenerate `>= 16` case the
+                // same way the XA decoder does for safety.
+                let shifted: i32 = if shift >= 16 {
+                    0
+                } else {
+                    ((s as i32) << 12) >> shift
+                };
+                let mut sample = shifted;
+                sample += (prev1 * f0 + prev2 * f1 + 32) >> 6;
+                let clamped = sample.clamp(i16::MIN as i32, i16::MAX as i32);
+                out.push(clamped as i16);
+                prev2 = prev1;
+                prev1 = clamped;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Write samples as a mono 16-bit PCM WAV.
+pub fn write_wav<W: std::io::Write>(
+    mut w: W,
+    samples: &[i16],
+    sample_rate: u32,
+) -> std::io::Result<()> {
+    let n_bytes = (samples.len() * 2) as u32;
+    let total_size = 36 + n_bytes;
+    w.write_all(b"RIFF")?;
+    w.write_all(&total_size.to_le_bytes())?;
+    w.write_all(b"WAVE")?;
+    w.write_all(b"fmt ")?;
+    w.write_all(&16u32.to_le_bytes())?; // fmt chunk size
+    w.write_all(&1u16.to_le_bytes())?; // PCM
+    w.write_all(&1u16.to_le_bytes())?; // 1 channel
+    w.write_all(&sample_rate.to_le_bytes())?;
+    let byte_rate = sample_rate * 2;
+    w.write_all(&byte_rate.to_le_bytes())?;
+    w.write_all(&2u16.to_le_bytes())?; // block align
+    w.write_all(&16u16.to_le_bytes())?; // bits per sample
+    w.write_all(b"data")?;
+    w.write_all(&n_bytes.to_le_bytes())?;
+    for s in samples {
+        w.write_all(&s.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// The filter tables are a copy of the XA decoder's; they must not drift.
+    #[test]
+    fn adpcm_filter_tables_match_xa() {
+        assert_eq!(super::ADPCM_F0, legaia_xa::F0);
+        assert_eq!(super::ADPCM_F1, legaia_xa::F1);
+    }
+
+    use super::*;
+
+    fn synthetic_vab(ps: u16, vs: u16, vag_sizes_8b: &[u16]) -> Vec<u8> {
+        assert_eq!(vag_sizes_8b.len(), vs as usize);
+        let total_vag = vag_sizes_8b.iter().map(|&s| s as usize * 8).sum::<usize>();
+        let header_size = VAB_HEADER_SIZE
+            + PROGRAMS_TABLE_SIZE
+            + TONE_SIZE * TONES_PER_PROGRAM * ps as usize
+            + 2 * VAG_TABLE_ENTRIES;
+        let fsize = header_size + total_vag;
+        let mut buf = vec![0u8; fsize];
+
+        // Header
+        buf[0..4].copy_from_slice(&VAB_MAGIC.to_le_bytes());
+        buf[4..8].copy_from_slice(&7u32.to_le_bytes());
+        buf[12..16].copy_from_slice(&(fsize as u32).to_le_bytes());
+        buf[18..20].copy_from_slice(&ps.to_le_bytes());
+        buf[20..22].copy_from_slice(&0u16.to_le_bytes()); // ts
+        buf[22..24].copy_from_slice(&vs.to_le_bytes());
+
+        // VAG offset table
+        let table_off =
+            VAB_HEADER_SIZE + PROGRAMS_TABLE_SIZE + TONE_SIZE * TONES_PER_PROGRAM * ps as usize;
+        for (i, &sz) in vag_sizes_8b.iter().enumerate() {
+            let p = table_off + (i + 1) * 2;
+            buf[p..p + 2].copy_from_slice(&sz.to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn parse_synthetic() {
+        let buf = synthetic_vab(2, 3, &[10, 20, 5]);
+        let report = parse(&buf, 0).unwrap();
+        assert_eq!(report.header.ps, 2);
+        assert_eq!(report.header.vs, 3);
+        assert_eq!(report.vag_samples.len(), 3);
+        assert_eq!(report.vag_samples[0].size, 80);
+        assert_eq!(report.vag_samples[1].size, 160);
+        assert_eq!(report.vag_samples[2].size, 40);
+        // sample[0] starts right after the table
+        let expected = VAB_HEADER_SIZE
+            + PROGRAMS_TABLE_SIZE
+            + TONE_SIZE * TONES_PER_PROGRAM * 2
+            + 2 * VAG_TABLE_ENTRIES;
+        assert_eq!(report.vag_samples[0].byte_offset, expected);
+    }
+
+    #[test]
+    fn find_in_padded_buffer() {
+        let vab = synthetic_vab(2, 1, &[1]);
+        let mut padded = vec![0xCDu8; 100];
+        padded.extend_from_slice(&vab);
+        padded.extend_from_slice(&[0xCDu8; 200]);
+        let hits = find_vabs(&padded);
+        assert_eq!(hits, vec![100]);
+    }
+
+    #[test]
+    fn header_rejects_bad_magic() {
+        let mut buf = vec![0u8; 0x100];
+        buf[0..4].copy_from_slice(b"FAIL");
+        assert!(parse_header(&buf, 0).is_err());
+    }
+
+    #[test]
+    fn decode_vag_silence_block_yields_zeros() {
+        // One block: filter=0 shift=0, all-zero samples, no end flag.
+        // Loop runs to natural end of buffer.
+        let block = vec![0u8; VAG_BLOCK_BYTES];
+        let pcm = decode_vag(&block).unwrap();
+        assert_eq!(pcm.len(), SAMPLES_PER_BLOCK);
+        assert!(pcm.iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn decode_vag_treats_bad_filter_as_eos() {
+        // First block: filter=0 silence; second block: filter=7 garbage =>
+        // decoder should stop after block 0 rather than erroring.
+        let mut buf = vec![0u8; VAG_BLOCK_BYTES * 2];
+        buf[VAG_BLOCK_BYTES] = 0x70; // filter=7 in second block
+        let pcm = decode_vag(&buf).unwrap();
+        assert_eq!(pcm.len(), SAMPLES_PER_BLOCK);
+    }
+
+    #[test]
+    fn decode_vag_honors_end_flag() {
+        // Block 0 with end-flag should NOT be decoded (Legaia convention:
+        // end-marker block carries no playable data, often garbage filter).
+        let mut block = vec![0u8; VAG_BLOCK_BYTES];
+        block[0] = 0xF0; // filter=15 -- garbage
+        block[1] = 0x01; // end flag
+        let pcm = decode_vag(&block).unwrap();
+        assert!(pcm.is_empty());
+    }
+}

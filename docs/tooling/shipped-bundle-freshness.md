@@ -1,0 +1,163 @@
+# Local wasm bundle freshness
+
+`site/wasm/` is **build output and is not committed**. Two things produce it:
+
+- [`scripts/ci/build-wasm.sh`](../../scripts/ci/build-wasm.sh), for browsing
+  `site/` locally (~9 min cold).
+- The `deploy-pages` job in `main-ci.yml`, which runs its own `wasm-pack build`
+  into that path before publishing. **The deployed site is always built from
+  source** and has never loaded a committed bundle.
+
+So there is nothing to keep in sync in the repository. What remains is a question
+about your working copy: *does the bundle I built still match the code I am
+looking at?*
+
+Checker: [`scripts/ci/check-wasm-freshness.py`](../../scripts/ci/check-wasm-freshness.py).
+Stamp writer: `build-wasm.sh`. Both the pre-commit hook and the `gates` job of
+[`.github/workflows/main-ci.yml`](../../.github/workflows/main-ci.yml) run the
+checker **advisory** - it reports and can never fail a commit or a build,
+because there is no committed artifact to gate and the stamp is untracked local
+state. The hook runs it only when the staged set touches `crates/`, `site/`,
+`Cargo.toml` or `Cargo.lock` *and* a bundle is already built; with no bundle on
+disk it stays silent.
+
+## Why the question needs a tool
+
+The bundle's source closure is not the `web-viewer` crate. `legaia-web-viewer`
+transitively compiles most of the workspace - the format crates, `engine-core`,
+`engine-ui`, `engine-audio`. Editing a PROT reader or an audio kernel therefore
+changes what the play page does, with nothing in the diff to suggest the web
+target is involved. The closure is derived per run from `cargo metadata`'s
+resolve graph and the checker prints how many source files it hashed, so no
+list written down here could stay true against it.
+
+`engine-render` is deliberately **outside** the closure: it hard-links wgpu, which
+is why `engine-ui` exists as the wgpu-free leaf both hosts share. An edit there is
+correctly not a staleness signal.
+
+This has real consequences. A fix can be correct in the sources, correct on the
+deployed page, and absent from the build someone is testing - which is how a fix
+gets reported as live twice while the reporter keeps seeing the old behaviour. The
+symptom is not a wrong fix; it is a right fix nobody is running.
+
+## The two ways of guessing that don't work
+
+Both were tried, and each returned "in sync" for a bundle that was not.
+
+- **File mtimes.** Build output is newer than sources in the normal case, so
+  "bundle newer than every source" looks like proof. It isn't: a checkout, a
+  `cp`, or a cherry-pick rewrites source mtimes without touching the bundle.
+- **`git log` last-touched.** Comparing the commit that last built the bundle
+  against the commits that last modified its sources looks airtight. It fails on
+  rebase: a branch can build the bundle and then be rebased onto a different
+  tree, so the bundle is a *descendant* of its build inputs in commit order while
+  having compiled against sources that are no longer present.
+
+Both failures share a shape - they infer content agreement from history or
+timestamps. So the stamp is **content-addressed**: a hash of every source input,
+recorded at build time and recomputed on demand.
+
+## What is hashed
+
+Every file the index knows about, **plus every untracked file `.gitignore` does
+not exclude**. That is narrower than "everything on disk" and wider than
+"everything committed": build output, editor scratch and `target/` stay out
+because they are ignored, and a module that has not been `git add`ed stays in,
+because the compiler reads it either way.
+
+The crate list comes from `cargo metadata`'s own resolve graph rather than a
+hand-kept list - a hand-kept list's failure mode is a checker that reports fresh
+while the bundle is stale, which is worse than no checker.
+
+Excluded on purpose: `*.md`, `tests/`, `benches/`. Retargeting a test must not
+read as a stale bundle.
+
+### "Tracked files only" was a third way of guessing wrong
+
+The enumeration was a plain `git ls-files`, which is the index and nothing else.
+A branch that added three modules to `web-viewer` and built the bundle from them
+therefore produced a stamp identical to the one from before those modules
+existed - two different bundles, one hash, and the gate answering *in sync*.
+
+It belongs beside the two guesses above because it fails the same way and from
+the opposite direction: mtime and `git log` both answer about *when*, and this
+answered about *what*, and all three said fresh about a bundle that was not. A
+stamp that cannot see a file the build compiles is worse than no stamp, because
+it is believed. The stamp version was bumped with the fix, so every stamp
+computed under the old set is treated as unreliable rather than merely old.
+
+## Running it
+
+```bash
+scripts/ci/build-wasm.sh                              # build + stamp
+python3 scripts/ci/check-wasm-freshness.py            # warn, exit 0
+python3 scripts/ci/check-wasm-freshness.py --strict   # fail, exit 1
+scripts/ci/check-wasm.sh --full                       # wasm-pack build + strict
+```
+
+Run it before believing a locally served play page, and especially before telling
+anyone a play-page fix is live. When stale it names the drifted files, because
+"the bundle is stale" alone doesn't say whether the drift is web-visible.
+
+## What a stale engine against fresh pages costs
+
+The stamp answers "is the bundle on disk built from this tree?". A *served*
+bundle has a second staleness axis the stamp cannot see: the browser's own HTTP
+cache. `site/js/wasm-loader.js` versions both `site/wasm/` URLs with a content hash
+of the bundle (see
+[`site-shell.md`](site-shell.md#script-cache-busting-is-content-addressed)), so
+a rebuild changes the URLs - but only once `_gen.py` regenerates the pages
+that carry the hash. A rebuilt bundle served under pages generated before it
+keeps the old URLs, and then the headers decide how long the old engine wins:
+
+| Host | Headers on `wasm/*` | Stale window after a rebuild |
+|---|---|---|
+| `python3 -m http.server` (local) | `Last-Modified` only, no `Cache-Control`, no `ETag` | Chrome's heuristic freshness - 10% of the file's age, so **hours** for a bundle last built days ago |
+| GitHub Pages | `Cache-Control: max-age=600` + `ETag` | **10 minutes**, then revalidated |
+
+What that skew costs in practice was measured rather than assumed, in both
+directions, against an engine 76 commits apart: current pages on the old
+engine, and old pages on the new engine. Both boot, both render textured, on
+SwiftShader and on a real driver. The reason is that every page-side call into
+an engine export added by that span is `typeof rt.x === 'function'`-guarded, so
+a missing export degrades a feature instead of throwing. That is a property of
+the current call sites, not a guarantee: an unguarded call to a newly added
+export would turn the same window into a hard failure.
+
+## A play-page report that contradicts a green oracle
+
+When a runtime oracle over the page is green and a person watching the page
+reports the opposite, suspect the bundle **first**. The oracle links the engine
+out of the tree; the page runs whatever `site/wasm/` was built from. The two
+answer different questions, and only one of them moves when you edit the engine.
+
+The case that named this section: the play page's d-pad was reported as not
+camera-relative while `play_camera_parity_disc` passed. The page's compass was
+in fact fed by the debug-orbit camera only while F3 was held, so the engine was
+right and the page was a version behind on the half that mattered. Two things
+made the stale bundle easy to miss:
+
+- **Every other freshness signal says "in sync".** The bundle's mtime is newer
+  than the last engine edit if you rebuilt at any point since, and the revision
+  history has nothing to say about an untracked build artifact at all.
+- **The checker itself can be the stale party.** When the stamp format changes,
+  a stale bundle reports `stamp is format v1, checker v2 - rebuild` rather than
+  naming drifted files. That line is the answer, not a tooling complaint: it
+  means the stamp predates the fix to what the stamp hashes.
+
+So the order is: run the checker, read its own exit line, rebuild if it says
+anything at all, reload past the cache window in the table above, and only then
+treat the report as a claim about the engine.
+
+## Why the bundle is no longer committed
+
+It was, for 87 commits. A 4.6 MB binary rebuilt that often came to roughly
+**223 MB - about 86% of the repository's history** - for an artifact the deployed
+site never reads. Its only benefit was letting a contributor browse `site/` with
+no Rust toolchain, against a standing cost in clone size and a recurring one in
+false "it's fixed" reports.
+
+Note what the removal does and does not fix. It stops the history growing and
+removes the *committed* staleness hazard. It does **not** remove the local one -
+that is what the checker above is for. Deleting the artifact was the better fix;
+building a gate for it first was treating the symptom.

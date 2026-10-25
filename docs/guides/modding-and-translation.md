@@ -1,0 +1,240 @@
+# Modding and translation
+
+`legaia-patcher` patches a disc image you supply: randomizer features, code-hook
+extras, and a full community-translation toolchain. Everything is built on
+same-size in-place sector edits with the EDC/ECC re-encoded, so patched images
+stay valid discs. Commands use the bare `./tool` form (source builds live at
+`target/release/`). The randomizer and the language packs also run in the
+browser, on the project site's ROM patcher page - same code, compiled to
+WebAssembly, and nothing is uploaded.
+
+```mermaid
+flowchart LR
+    src["Your USA .bin<br/>(read-only)"]
+    tool["legaia-patcher<br/>randomize / translate import / tim-replace / monster-block"]
+    ppf["PPF patch + manifest<br/>(safe to share)"]
+    bin["Patched .bin + .cue<br/>(local play only)"]
+    check["legaia-patcher verify<br/>on the recipient's own dump"]
+    play["An emulator, a console, or the port"]
+
+    src --> tool
+    tool --> ppf
+    tool --> bin
+    ppf --> check --> play
+    bin --> play
+```
+
+| Task | Section |
+|---|---|
+| Randomize a disc and share the seed | [1](#1-randomize-onto-a-scratch-copy), [2](#2-the-region-guard), [3](#3-share-and-verify-a-patch) |
+| Rebalance one monster by hand | [4](#4-hand-edit-one-monster-stats--element--name) |
+| Replace a texture | [4b](#4b-replace-a-texture) |
+| Translate the game | [5](#5-translate-the-game) |
+| Read a memory-card save | [6](#6-inspect-saves) |
+| Look up game data or cheat codes | [7](#7-look-things-up-without-a-disc), [8](#8-cheat-databases) |
+
+A patched USA image also boots in the port (`legaia-engine` accepts it like
+the retail disc). The port reads the disc's data, so data edits - drops,
+steals, encounters, chests, doors, shops, starting items - take effect there; mods that work by injecting
+MIPS code into the game's executable only run where that executable runs, on
+an emulator or a console.
+
+Two safety properties to rely on:
+
+- **The tool never writes to `--input`.** The original image is opened
+  read-only; output goes to the PPF patch and (optionally) a separate patched
+  copy. Keep your original dump pristine anyway - it is your only source.
+- **Nothing shareable contains Sony bytes.** The PPF patch and the manifest
+  are safe to share; a patched `.bin` (`--output`) is for local play only,
+  never redistribute it.
+
+## 1. Randomize (onto a scratch copy)
+
+```bash
+./legaia-patcher randomize \
+    --input "/path/to/Legend of Legaia (USA).bin" \
+    --seed 12345 \
+    --patch legaia-12345.ppf \
+    --output legaia-12345.bin \
+    --manifest legaia-12345.toml
+```
+
+A few seconds on a modern machine. The run prints a `disc: <label>` line
+identifying the input build, the resolved numeric seed (so any run can be
+reproduced), and a spoiler-safe change summary. The same seed + options over
+the same disc is byte-deterministic: you and a friend get identical patches.
+`--output` also writes a `.cue` beside the `.bin` so emulators can open it
+directly. `--dry-run` plans without writing.
+
+Nothing is randomized unless asked: `--drops shuffle` re-rolls monster item
+drops; dozens of flags
+cover encounters, chests, steals, arts combos, doors, shops, monster stats,
+spell costs, equipment, and code-hook extras (`--equipment-drops`,
+`--flee-exp`, `--enemy-ally`, `--shiny-seru`, ...). Read-only preview
+subcommands - `drops`, `chests`, `steals`, `arts`, `doors`, `shops`,
+`monster-stats`, `spell-costs`, and more - list what a feature would touch
+before you commit. Full feature reference:
+[randomizer.md](../tooling/randomizer.md).
+
+## 2. The region guard
+
+The randomizer's offsets and injected code target the USA build
+(`SCUS-94254`). Running `randomize` or `verify` against any other disc - the
+PAL `SCES` builds included - stops with a region error, because a USA-built
+patch "applies" to a PAL disc yet produces a corrupt hybrid.
+`--allow-region-mismatch` overrides the guard; only pass it when you know the
+patch was built for that exact disc. The PAL discs themselves are documented
+in [pal-localizations.md](../tooling/pal-localizations.md).
+
+## 3. Share and verify a patch
+
+Share the `.ppf` (and the manifest). The recipient applies and checks it
+against their own dump in one step:
+
+```bash
+./legaia-patcher verify \
+    --input "/path/to/their Legend of Legaia (USA).bin" \
+    --patch legaia-12345.ppf \
+    --output legaia-12345.bin
+```
+
+`verify` applies the patch to a copy, confirms every record applied cleanly,
+and re-parses the result. The same region guard applies here - that is what
+catches "this patch was built against a different disc" before anyone plays a
+corrupt hybrid.
+
+## 4. Hand-edit one monster (stats / element / name)
+
+The randomizer shuffles monster stats wholesale; for a curated rebalance you
+edit records directly. Every monster lives in the `battle_data` archive (PROT
+entry 867) as an LZS-compressed block - `monster-block` does the slot math and
+the compression for you, so the edit loop is dump → hex-edit → write:
+
+```bash
+# 1. Dump the decoded block (monster-stats lists the 1-based ids).
+./legaia-patcher monster-block --input "/path/to/disc.bin" --id 10 --dump m10.bin
+
+# 2. Edit m10.bin in any hex editor. The stat record starts at +0x00:
+#    HP +0x0C, AGL +0x0E, MP +0x10, ATK +0x12, DEF +0x14/+0x16, INT +0x18,
+#    SPD +0x1A (u16 little-endian each), element +0x1D (u8), gold +0x44,
+#    exp +0x46, drop item/chance +0x48/+0x49. The name string is in the same
+#    block at the offset the u32 at +0x00 points to.
+
+# 3. Re-pack onto a copy (and emit a shareable PPF).
+./legaia-patcher monster-block --input "/path/to/disc.bin" --id 10 \
+    --write m10.bin --output edited.bin --patch m10.ppf
+```
+
+The write is the same machinery as the randomizer - the block is recompressed
+(the encoder need not match Sony's bytes; the retail decoder accepts any valid
+stream), padded back into its fixed `0x14000`-byte slot, and the touched
+sectors get their EDC/ECC re-encoded. With `--output` the tool re-parses the
+patched image and confirms the record still decodes before declaring success.
+Full record layout: [battle.md](../subsystems/battle.md); the equivalent flags
+on the extracted tree are `asset monster-archive --dump-block` /
+`--write-block` ([extracting-assets.md](extracting-assets.md)).
+
+## 4b. Replace a texture
+
+Any texture on the disc can be swapped for your own PNG - same loop, three
+subcommands:
+
+```bash
+# 1. Find it (coordinates + dimensions + curated labels; try grepping "title").
+./legaia-patcher tim-list --input "/path/to/disc.bin"
+
+# 2. Export it as an editable PNG.
+./legaia-patcher tim-export --input "/path/to/disc.bin" --entry 890 --offset 0x14228 -o title.png
+
+# 3. Edit it (keep the exact pixel size), then patch it back.
+./legaia-patcher tim-replace --input "/path/to/disc.bin" --entry 890 --offset 0x14228 \
+    --png title.png --output edited.bin --patch title.ppf
+```
+
+The replacement must keep the original's dimensions and fit its palette (the
+error names the offending pixels; `--quantize` folds extras to the nearest
+color), alpha becomes PSX transparency, and compressed (`lzs`-tier) textures
+apply only when the edit recompresses into the retail footprint. The same
+flow runs entirely in the browser on the site's ROM-patcher page (scan /
+thumbnails / preview). Full reference:
+[randomizer.md](../tooling/randomizer.md#texture-replacement); encoder rules:
+[tim.md](../formats/tim.md#encoding-png---tim-texture-replacement).
+
+## 5. Translate the game
+
+The `translate` family exports the disc's text as an editable YAML **language
+pack** and imports a filled pack back onto a copy of the disc. It has its own
+step-by-step guide, written for translators:
+[translating.md](translating.md) - the browser and command-line paths, how
+much room a line has, and why a line can stay English. The full reference is
+[`tooling/translation/`](../tooling/translation/index.md).
+
+A language pack composes with every randomizer option: on the site's ROM
+patcher page, pick a language and any randomizer options and patch once. The
+dialog is applied before the randomizer passes and the names after them
+([ordering](../tooling/translation/dialog-import.md#ordering-dialog-before-the-randomizer-names-after)).
+
+Owners of an official PAL disc, or of a fan-translated disc, can lift its text
+onto USA coordinates instead of translating from scratch
+(`translate lift-official`); see
+[pal-localizations.md](../tooling/pal-localizations.md).
+
+## 6. Inspect saves
+
+`save-tool` reads PSX memory-card images (`.mcr` and friends, e.g. from an
+emulator's card directory):
+
+```bash
+./save-tool dir   card.mcr                 # directory entries (magic-checked)
+./save-tool saves card.mcr                 # active save blocks + product codes
+./save-tool character card.mcr --block 1 --offset 0x5C8
+./save-tool party     card.mcr --block 1 --offset 0x5C8 --count 3
+```
+
+In a retail Legaia save block the character-record array starts at block
+offset `0x5C8` with a `0x414`-byte stride: `0x5C8` is the first character,
+`0x9DC` the second, and so on. Each record's display name sits at
+record-relative `+0x2A7`. `--offset` / `--block` accept `0x`-hex or decimal.
+`sc-diff` diffs the save block of two cards to pin what a gameplay change
+wrote. Record layout: [save-record.md](../formats/save-record.md).
+
+## 7. Look things up without a disc
+
+`gamedata-tool` bakes in the curated game-data tables (arts, magic, items,
+weapons, armor, accessories, enemies, shops, casino, fishing) - handy as
+ground truth beside the randomizer's read-only listings:
+
+```bash
+./gamedata-tool find "Healing Leaf"
+./gamedata-tool list arts --character Vahn
+./gamedata-tool arts-by-command Vahn "Arms,Ra-Seru,High"
+./gamedata-tool shop "Rim Elm"
+./gamedata-tool dump-json enemies
+```
+
+Sources and caveats: [gamedata.md](../reference/gamedata.md).
+
+## 8. Cheat databases
+
+`cheat-tool` parses GameShark / Pro-Action-Replay cheat collections and
+classifies each code by the RAM region it targets. The community Legaia
+NTSC-U databases are embedded, so no input file is needed:
+
+```bash
+./cheat-tool list                    # every entry of the built-in databases
+./cheat-tool classify                # per-category roll-up
+./cheat-tool extract-offsets         # codes that land in the character record
+./cheat-tool parse my-cheats.cht     # or point it at your own file
+```
+
+A file that parses to zero entries warns on stderr rather than silently
+printing `[]`. Background + pinned offsets: [cheats.md](../reference/cheats.md).
+
+## Related docs
+
+- [randomizer.md](../tooling/randomizer.md) - every randomizer feature + how the code hooks work.
+- [translating.md](translating.md) - the translator's guide.
+- [translation/](../tooling/translation/index.md) - pack schema, markup, budgets, what may be committed.
+- [pal-localizations.md](../tooling/pal-localizations.md) - the official PAL text and how it lifts.
+- [save-record.md](../formats/save-record.md) - the character-record byte layout.
+- [getting-started.md](getting-started.md) - back to the tool index.
