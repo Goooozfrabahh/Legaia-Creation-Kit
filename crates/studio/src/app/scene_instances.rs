@@ -365,8 +365,31 @@ pub(super) fn parse(text: &str, scene_name: &str, world: &WorldModel) -> Result<
     Ok(doc)
 }
 
+/// Legacy offset documents obey the same all-or-nothing rule as full overlays.
+pub(super) fn apply_offsets(world:&mut WorldModel, edits:&[((bool,usize),[f32;3])]) -> Result<(),String> {
+    let mut staged=world.clone();
+    let keys=staged.draws.iter().filter(|d|d.offset!=[0.0;3])
+        .map(|d|(d.terrain,d.index)).collect::<Vec<_>>();
+    for key in keys {
+        if !staged.set_offset(key.0,key.1,[0.0;3]) {return Err("Cannot reset layout position".into());}
+    }
+    for &(key,offset) in edits {
+        if !staged.set_offset(key.0,key.1,offset) {return Err("Invalid layout target or position".into());}
+    }
+    *world=staged;
+    Ok(())
+}
+
 pub(super) fn apply(doc: &SceneDocument, world: &mut WorldModel, native_placements: usize,
     index:&legaia_engine_scene::scene::ProtIndex) -> Result<(), String> {
+    let mut staged=world.clone();
+    apply_staged(doc,&mut staged,native_placements,index)?;
+    *world=staged;
+    Ok(())
+}
+
+fn apply_staged(doc:&SceneDocument, world:&mut WorldModel, native_placements:usize,
+    index:&legaia_engine_scene::scene::ProtIndex) -> Result<(),String> {
     // Resolve and validate every donor BEFORE discarding the current overlay.
     // An absent source cell must not silently wipe the user's edited world.
     let donors=doc.foreign.iter().map(|entry|{
@@ -381,7 +404,9 @@ pub(super) fn apply(doc: &SceneDocument, world: &mut WorldModel, native_placemen
     // hidden-triangle offsets otherwise refer to the previous index stream.
     for key in world.draws.iter().filter(|d|d.editor_uid.is_none())
         .map(|d|(d.terrain,d.index)).collect::<Vec<_>>() {
-        world.set_hidden(key,false);
+        if world.at(key.0,key.1).is_some_and(|d|d.hidden) && !world.set_hidden(key,false) {
+            return Err("Could not restore hidden native triangles".into());
+        }
     }
     // Reset the preview clips to original first frames, so loading or undoing
     // an older .lckscene deterministically restores the original poses.
@@ -393,18 +418,27 @@ pub(super) fn apply(doc: &SceneDocument, world: &mut WorldModel, native_placemen
             let default_model=npc.original_model_index;
             if npc.model_index!=default_model {world.set_npc_model(key,default_model)?;}
         }
-        let _ = world.set_npc_animation(key,clip,0);
+        if world.npc(key).is_some_and(|npc|npc.clip!=clip || npc.frame!=0) {
+            world.set_npc_animation(key,clip,0)?;
+        }
     }
     let keys: Vec<_> = world.draws.iter().map(|d|(d.terrain,d.index)).collect();
     for key in keys {
         world.set_hidden(key,false);
         world.set_display_name(key,None);
-        // reset rotation before reverting offsets; rest geometry is immutable.
-        if world.at(key.0,key.1).is_some_and(|d| d.vertex_start < d.vertex_end && !d.hidden) {
-            world.set_scale(key.0,key.1,[1.0;3]);
-            world.set_rotation(key.0,key.1,[0.0;3]);
+        // Only changed fields need resetting; missing/unrenderable original
+        // catalog entries do not require fabricated geometry.
+        let draw=world.at(key.0,key.1).ok_or("Original instance disappeared")?;
+        let (scale,rotation,offset)=(draw.scale,draw.rotation,draw.offset);
+        if scale!=[1.0;3] && !world.set_scale(key.0,key.1,[1.0;3]) {
+            return Err("Could not reset native scale".into());
         }
-        world.set_offset(key.0,key.1,[0.0;3]);
+        if rotation!=[0.0;3] && !world.set_rotation(key.0,key.1,[0.0;3]) {
+            return Err("Could not reset native rotation".into());
+        }
+        if offset!=[0.0;3] && !world.set_offset(key.0,key.1,[0.0;3]) {
+            return Err("Could not reset native position".into());
+        }
     }
     for &(key,offset) in &doc.moves {
         if !world.set_offset(key.0,key.1,offset) { return Err("Could not apply a native move".into()); }
@@ -482,6 +516,46 @@ mod tests {
                 display_name:None, hidden:false, hidden_triangles:Vec::new(),
             }],
         }
+    }
+
+    #[test]
+    fn late_restore_failure_preserves_instances_donors_geometry_and_document() {
+        let mut world=test_world();
+        world.model=Some(crate::raster::Model {
+            positions:vec![[1.0,2.0,3.0];3],rest:vec![[1.0,2.0,3.0];3],
+            object_ids:vec![0;3],uvs:vec![[0,0];3],cba_tsb:vec![[0,0];3],
+            modulation:vec![[128;3];3],fill:vec![[0;3];3],textured:vec![0;3],
+            indices:vec![0,1,2],center:[0.0;3],radius:1.0,
+        });
+        world.set_offset(false,0,[20.0,0.0,0.0]);
+        world.duplicate_native((false,0),1,9,[40.0,0.0,0.0]).unwrap();
+        world.foreign.push(super::super::world_view::ForeignRef {
+            uid:9,source:"donor".into(),kind:"mesh".into(),record:2,
+            raw_tmd:vec![1,2,3],native_record:Some([7;32]),donor_wall_bits:vec![(2,3)],donor_center:[0.0;3],
+        });
+        let texture=std::sync::Arc::new(legaia_tim::Vram::new());
+        world.foreign_vram.insert(1,texture.clone());
+        let overlay=serialize("test",&world);
+        let positions=world.model.as_ref().unwrap().positions.clone();
+        let refs=world.foreign.clone();
+        let index=legaia_engine_scene::scene::ProtIndex::from_bytes(
+            legaia_disc_patch::disc::synth::synth_prot(&[]),None).unwrap();
+        // Reset and a valid movement occur before an invalid name target fails.
+        let doc=SceneDocument {moves:vec![((false,0),[100.0,0.0,0.0])],
+            names:vec![(NameTarget::Created(999),"bad".into())],..Default::default()};
+        assert!(apply(&doc,&mut world,1,&index).is_err());
+        assert_eq!(serialize("test",&world),overlay);
+        assert_eq!(world.instances,2);
+        assert_eq!(world.foreign,refs);
+        assert!(std::sync::Arc::ptr_eq(&world.foreign_vram[&1],&texture));
+        assert_eq!(world.model.as_ref().unwrap().positions,positions);
+        assert!(apply_offsets(&mut world,&[((false,0),[80.0,0.0,0.0]),((false,999),[0.0;3])]).is_err());
+        assert_eq!(serialize("test",&world),overlay);
+        assert_eq!(world.model.as_ref().unwrap().positions,positions);
+        let valid=SceneDocument {moves:vec![((false,0),[100.0,0.0,0.0])],..Default::default()};
+        apply(&valid,&mut world,1,&index).unwrap();
+        assert_eq!(world.draws[0].offset,[100.0,0.0,0.0]);
+        assert!(world.foreign.is_empty());
     }
 
     #[test]

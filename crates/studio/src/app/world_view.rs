@@ -16,6 +16,7 @@ pub(super) use npcs::NpcInfo;
 pub(super) const NPC_KEY_BASE: usize = 1_000_000_000;
 
 
+#[derive(Clone)]
 pub(super) struct WorldModel {
     pub model: Option<Model>,
     pub instances: usize,
@@ -54,6 +55,7 @@ pub(super) struct ForeignRef {
     pub donor_center: [f32; 3],
 }
 
+#[derive(Clone)]
 pub(super) struct DrawInfo {
     pub id: u32,
     pub terrain: bool,

@@ -11,6 +11,7 @@
 use legaia_tim::Vram;
 
 /// A triangulated TMD ready to draw.
+#[derive(Clone)]
 pub struct Model {
     /// Drawn positions: the rest pose, or the last [`Model::pose`].
     pub positions: Vec<[f32; 3]>,

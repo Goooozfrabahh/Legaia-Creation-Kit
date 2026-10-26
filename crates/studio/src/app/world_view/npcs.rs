@@ -194,6 +194,18 @@ fn compatible_clips(bank: Option<&legaia_actor_formats::player_anm::PlayerAnmBun
 }
 
 impl NpcInfo {
+    #[cfg(test)]
+    pub(crate) fn synthetic_export_actor() -> Self {
+        Self {
+            key:NPC_KEY_BASE+1, record:1, model_index:0, original_model_index:0,
+            nobj:1, model_pool:Arc::new(vec![Some((Arc::from([]),1)),Some((Arc::from([]),1))]),
+            anim_id:0, kind:"npc", dialog:None, conditional:false, posed:false,
+            drawable:true, is_copy:false, clip:0, frame:0, clips:vec![(1,2)],
+            raw_tmd:None, anm_bank:None, animation_cache:Arc::new(Mutex::new(HashMap::new())),
+            psx_position:[128.0,0.0,256.0],
+        }
+    }
+
     fn action(&self, clip: u8) -> Result<Arc<legaia_actor_formats::monster_archive::MonsterAnimation>,String> {
         if clip==0 {return Err("Zero is rest, not an ANM clip".into());}
         let mut cache=self.animation_cache.lock().map_err(|_|"Animation cache lock was poisoned")?;

@@ -105,29 +105,24 @@ pub(super) fn scan_disc(index:Arc<ProtIndex>, names:Vec<String>, tx:Sender<Batch
     }
 }
 
-/// Return a legal *destination-local* source. Never substitute a different
-/// model based on a name or slot number: only exact original TMD bytes may
-/// cross cells without a separate native asset-import/repacking pipeline.
-pub(super) fn destination_fingerprints(scene:&AssembledScene)->Vec<(u64,usize)> {
-    scene.env_tmds.iter().enumerate().filter_map(|(slot,&resource)|
-        mesh_hash(scene,resource).map(|h|(h,slot))).collect()
+/// Only same-cell assets are local editor sources. Identical TMD bytes do not
+/// establish identical TIM/CLUT contents, placement transforms or collision.
+/// Foreign assets must retain their donor identity through insert_foreign;
+/// verified native resource reuse belongs exclusively to export preparation.
+pub(super) fn local_source(scene:&AssembledScene,asset:&Asset)->Option<EditorCatalogItem> {
+    local_source_in(&scene.name, asset, scene.placements.len(), scene.terrain.len(), scene.env_tmds.len())
 }
 
-pub(super) fn compatible_source_with_index(scene:&AssembledScene,asset:&Asset,
-    destination:&[(u64,usize)])->Option<EditorCatalogItem> {
-    if scene.name==asset.source {
-        return match asset.kind {
-            Kind::Placement(i)=>(i<scene.placements.len()).then_some(EditorCatalogItem::Draw(false,i)),
-            Kind::Terrain(i)=>(i<scene.terrain.len()).then_some(EditorCatalogItem::Draw(true,i)),
-            Kind::Mesh(i)=>(i<scene.env_tmds.len()).then_some(EditorCatalogItem::Mesh(i)),
-            Kind::Npc(record)=>Some(EditorCatalogItem::Draw(false,
-                world_view::NPC_KEY_BASE.checked_add(record)?)),
-        };
+fn local_source_in(name:&str, asset:&Asset, placements:usize, terrain:usize, meshes:usize)
+    ->Option<EditorCatalogItem> {
+    if name != asset.source { return None; }
+    match asset.kind {
+        Kind::Placement(i)=>(i<placements).then_some(EditorCatalogItem::Draw(false,i)),
+        Kind::Terrain(i)=>(i<terrain).then_some(EditorCatalogItem::Draw(true,i)),
+        Kind::Mesh(i)=>(i<meshes).then_some(EditorCatalogItem::Mesh(i)),
+        Kind::Npc(record)=>Some(EditorCatalogItem::Draw(false,
+            world_view::NPC_KEY_BASE.checked_add(record)?)),
     }
-    if matches!(asset.kind,Kind::Npc(_)) {return None;}
-    let hash=asset.mesh_fingerprint?;
-    destination.iter().find(|(h,_)|*h==hash)
-        .map(|(_,slot)|EditorCatalogItem::Mesh(*slot))
 }
 
 /// Identifications are from data/gamedata/scenes.toml, cross-checked against
@@ -140,6 +135,23 @@ pub(super) fn is_verified_town(source: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn foreign_geometry_fingerprint_never_substitutes_a_local_source() {
+        let mut asset=Asset { source:"donor".into(), source_label:"donor".into(),
+            label:"object".into(), key:"cell:donor|placed:0".into(),
+            kind:Kind::Placement(0), mesh_fingerprint:fingerprint(&[1,2,3]) };
+        // Geometry equality cannot prove equality of the external TIM/CLUT,
+        // native placement record or collision resource. Every foreign kind
+        // must use the donor-aware path even with a valid matching fingerprint.
+        for kind in [Kind::Placement(0),Kind::Terrain(0),Kind::Mesh(0),Kind::Npc(1)] {
+            asset.kind=kind;
+            assert!(local_source_in("destination",&asset,1,1,1).is_none());
+            assert!(local_source_in("donor",&asset,1,1,1).is_some());
+        }
+        asset.kind=Kind::Placement(1);
+        assert!(local_source_in("donor",&asset,1,1,1).is_none());
+    }
+
     #[test]
     fn fingerprint_is_stable_and_empty_is_rejected(){
         assert_eq!(fingerprint(&[1,2,3]),fingerprint(&[1,2,3]));

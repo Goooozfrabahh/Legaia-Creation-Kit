@@ -13,7 +13,6 @@ mod collision_wire;
 mod object_collision;
 mod global_repository;
 
-use anyhow::Context;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -723,6 +722,7 @@ pub struct App {
     mode: Mode,
     tab: Tab,
     native_scene: Option<(String, NativeSceneSlot)>,
+    pending_native_scene: Option<(String, CellSelection, NativeSceneSlot)>,
     native_selected: Option<(bool, usize)>, // false = placement; true = terrain
     native_view: Viewport,
     native_ground_visible: bool,
@@ -774,8 +774,6 @@ pub struct App {
     global_name_edit_key: Option<String>,
     global_name_draft: Record,
     global_name_status: Option<String>,
-    global_repository_target: Option<String>,
-    global_repository_tmd_hashes: Vec<(u64,usize)>,
     /// Explicit single-open accordion. Nothing expanded when LCK starts.
     global_open_category: Option<usize>,
     global_open_branch: Option<bool>, // world objects: towns or other scenes
@@ -923,6 +921,7 @@ impl App {
             mode,
             tab,
             native_scene: None,
+            pending_native_scene: None,
             native_selected: None,
             native_view: Viewport::new(Shading::Textured),
             native_ground_visible: true,
@@ -963,8 +962,6 @@ impl App {
             global_name_edit_key: None,
             global_name_draft: Record::default(),
             global_name_status: None,
-            global_repository_target: None,
-            global_repository_tmd_hashes: Vec::new(),
             global_open_category: None,
             global_open_branch: None,
             global_open_scene: None,
@@ -1077,12 +1074,11 @@ impl App {
         self.global_repository_preview = None;
         self.global_name_edit_key = None;
         self.global_name_status = None;
-        self.global_repository_target = None;
-        self.global_repository_tmd_hashes.clear();
         self.global_open_category = None;
         self.global_open_branch = None;
         self.global_open_scene = None;
         self.native_scene = None;
+        self.pending_native_scene = None;
         self.native_collision_preview_cache = None;
         self.native_selected = None;
         self.native_drag = None;
@@ -1329,7 +1325,7 @@ impl App {
     }
 
     /// Start assembling the original game scene directly from the loaded PROT index.
-    fn load_native_scene(&mut self, scene_name: String) {
+    fn load_native_scene(&mut self, scene_name: String, cell:CellSelection) {
         let Some(lib) = self.studio.library.as_ref() else { return };
         let index = Arc::clone(&lib.index);
         let requested_name = scene_name.clone();
@@ -1343,7 +1339,53 @@ impl App {
             });
             let _ = tx.send(result);
         });
-        self.native_scene = Some((scene_name, NativeSceneSlot::Loading(rx)));
+        self.pending_native_scene = Some((scene_name,cell,NativeSceneSlot::Loading(rx)));
+    }
+
+    fn poll_native_scene_load(&mut self, ctx:&egui::Context) {
+        let completed = self.pending_native_scene.as_ref().and_then(|(_,_,s)| match s {
+            NativeSceneSlot::Loading(rx) => match rx.try_recv() {
+                Ok(result)=>Some(result),
+                Err(std::sync::mpsc::TryRecvError::Disconnected)=>Some(Err("Scene loader disconnected".into())),
+                Err(std::sync::mpsc::TryRecvError::Empty)=>None,
+            },
+            _ => None,
+        });
+        if let Some(result) = completed {
+            let (source,cell,_)=self.pending_native_scene.take().expect("completed pending load");
+            let restored=result.and_then(|(scene,mut world)| {
+                if let CellSelection::Copy(id)=&cell {
+                    let text=self.editor_cells.read_overlay(*id)?;
+                    let doc=scene_instances::parse(&text,&source,&world)?;
+                    let index=self.studio.library.as_ref().ok_or("Original disc index unavailable")?;
+                    scene_instances::apply(&doc,&mut world,scene.placements.len(),&index.index)?;
+                }
+                Ok((scene,world))
+            });
+            match restored {
+                Ok((scene,world))=>{
+                    self.save_active_editor_cell();
+                    self.native_scene=Some((source,NativeSceneSlot::Ready(Arc::new(scene),Arc::new(world))));
+                    self.editor_cell_active=Some(cell);
+                    self.finish_native_scene_load();
+                },
+                Err(error)=>{
+                    self.editor_cell_selected=self.editor_cell_active.clone();
+                    self.studio.error=Some(format!("Scene load failed; previous document preserved: {error}"));
+                    if self.native_scene.is_none() {
+                        self.native_scene=Some((source,NativeSceneSlot::Failed(error)));
+                    }
+                },
+            }
+            ctx.request_repaint();
+        }
+        if self.pending_native_scene.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(75));
+        }
+    }
+
+    /// Reset document-local UI only after a replacement scene is ready.
+    fn finish_native_scene_load(&mut self) {
         self.native_collision_preview_cache = None;
         self.native_selected = None;
         self.native_drag = None;
@@ -1579,6 +1621,7 @@ impl App {
     fn select_editor_cell(&mut self, cell: CellSelection) {
         if self.editor_cell_active.as_ref()==Some(&cell) &&
             self.native_scene.as_ref().is_some_and(|(_,slot)|matches!(slot,NativeSceneSlot::Ready(..)|NativeSceneSlot::Loading(..))) {
+            self.pending_native_scene=None;
             return;
         }
         let Some(source)=self.editor_cells.source(&cell).map(str::to_owned) else {
@@ -1587,8 +1630,7 @@ impl App {
         };
         self.save_active_editor_cell();
         self.editor_cell_selected=Some(cell.clone());
-        self.editor_cell_active=Some(cell);
-        self.load_native_scene(source);
+        self.load_native_scene(source,cell);
     }
 
     fn duplicate_editor_cell(&mut self, selected: CellSelection) {
@@ -1854,14 +1896,9 @@ impl App {
         ui.add(egui::TextEdit::singleline(&mut self.editor_search)
             .hint_text("Search any source cell, object ID or identified name..."));
         ui.small("Select for details · RMB for Preview / Properties · drag ↳ to place");
-        ui.small("↳ native match  |  ⇢ foreign geometry preview  |  ◇ foreign MAN actor (not imported)");
+        ui.small("↳ same-cell source  |  ⇢ donor-textured preview  |  ◇ foreign MAN actor (not imported)");
         if let Some(error)=&self.editor_catalog_error {
             ui.colored_label(Color32::LIGHT_RED,format!("Identification catalog: {error}"));
-        }
-        let wanted=scene.map(|s|s.name.as_str());
-        if self.global_repository_target.as_deref()!=wanted {
-            self.global_repository_tmd_hashes=scene.map(global_repository::destination_fingerprints).unwrap_or_default();
-            self.global_repository_target=wanted.map(str::to_owned);
         }
         if let Some(id)=self.global_repository_selected {
             if let Some(asset)=self.global_repository.get(id) {
@@ -1948,8 +1985,7 @@ impl App {
                     }
                     for &id in items.iter().take(125) {
                         let asset=&self.global_repository[id];
-                        let usable=scene.is_some_and(|s|global_repository::compatible_source_with_index(
-                            s,asset,&self.global_repository_tmd_hashes).is_some());
+                        let usable=scene.is_some_and(|s|global_repository::local_source(s,asset).is_some());
                         let symbol=if usable {"↳"}else if matches!(asset.kind,global_repository::Kind::Npc(_)) {"◇"} else {"⇢"};
                         let name=self.editor_names.get(&asset.key).unwrap_or(&asset.label);
                         let text=format!("{symbol} [{}] {name}",asset.source_label);
@@ -2938,41 +2974,32 @@ impl App {
                     if ui.button("Check IMG")
                         .on_hover_text("Run the SAME strict PS1-native export preparation, but do not open a save dialog or write any file. Passing preflight is not proof of PS1 runtime behavior.")
                         .clicked() {
-                        let result = (|| -> anyhow::Result<()> {
+                        let result = (|| -> anyhow::Result<String> {
                             let lib = self.studio.library.as_ref()
                                 .ok_or_else(||anyhow::anyhow!("No disc image loaded"))?;
-                            if !matches!(&lib.source, Source::Disc(_)) {
-                                anyhow::bail!("Open the native PS1 .img disc source first");
-                            }
-                            let original = legaia_engine_scene::scene::Scene::load(lib.index.as_ref(), &scene.name)
-                                .context("Resolve original game cell")?;
-                            if original.field_map_index(lib.index.as_ref()).is_none() {
-                                anyhow::bail!("Selected cell has no native field MAP");
-                            }
-                            let _validated = ps1_export::prepare_cross_cell(scene, world, lib.index.as_ref())?;
-                            Ok(())
+                            let Source::Disc(source)=&lib.source else {
+                                anyhow::bail!("Open the native PS1 disc source first");
+                            };
+                            let plan=ps1_export::plan_export(source,scene,world,lib.index.as_ref())?;
+                            Ok(plan.summary())
                         })();
                         match result {
-                            Ok(()) => self.studio.status = Some(format!(
-                                "PS1 export preflight PASSED for {}. No IMG was written. Confirm actual changes in DuckStation after exporting.", scene.name)),
+                            Ok(summary) => self.studio.status = Some(format!(
+                                "PS1 serialization preflight PASSED for {}: {summary}. No IMG written; PS1 runtime behavior remains unverified.", scene.name)),
                             Err(e) => self.studio.error = Some(format!(
                                 "PS1 export preflight BLOCKED for {}: {e:#}", scene.name)),
                         }
                     }
                     if ui.add_enabled(self.ps1_export_job.is_none(), egui::Button::new("Export PS1 test IMG..."))
-                        .on_hover_text("Stage M3 experimental: move/copy native static collider and authored 64-unit wall-grid footprint, up to 16 copies. Floor height, terrain records and scripts are preserved.")
+                        .on_hover_text("Compile and validate native record allocation, resources and MAN changes. Unresolved wall ownership blocks export; original walls and floors are preserved.")
                         .clicked() {
-                        let prepared = (|| -> anyhow::Result<(PathBuf,usize,ps1_export::ExportEdits,String)> {
+                        let prepared = (|| -> anyhow::Result<(PathBuf,ps1_export::NativeExportPlan,String)> {
                             let lib=self.studio.library.as_ref().ok_or_else(||anyhow::anyhow!("No disc image loaded"))?;
                             let source=match &lib.source {
                                 Source::Disc(path) => path.clone(),
                                 Source::Extracted(_) => anyhow::bail!("Open the actual 2352-byte test .img, not extracted assets"),
                             };
                             let name=&scene.name;
-                            let catalog=legaia_engine_scene::scene::Scene::load(lib.index.as_ref(),name)
-                                .context("Resolve original game cell")?;
-                            let map=catalog.field_map_index(lib.index.as_ref())
-                                .ok_or_else(||anyhow::anyhow!("Cell {name} has no native field .MAP"))? as usize;
                             // Integration V1: capture the COMPLETE editor change manifest
                             // before native preflight. Names remain editor-side metadata.
                             let overlay=scene_instances::serialize(name,world);
@@ -2983,7 +3010,7 @@ impl App {
                                     .map(|p|p.display().to_string()).unwrap_or_else(|e|e);
                                 anyhow::bail!("{note} Integration V1 log: {log_path}");
                             }
-                            let edits=ps1_export::prepare_cross_cell(scene,world,lib.index.as_ref())
+                            let plan=ps1_export::plan_export(&source,scene,world,lib.index.as_ref())
                                 .map_err(|error| {
                                     let report=export_integration::render_report(name,&overlay,Some(&source));
                                     let cause=format!("NATIVE PREFLIGHT FAILED: {error:#}");
@@ -2991,10 +3018,10 @@ impl App {
                                         .map(|p|p.display().to_string()).unwrap_or_else(|e|e);
                                     anyhow::anyhow!("{cause}. Integration V1 log: {log_path}")
                                 })?;
-                            Ok((source,map,edits,name.to_string()))
+                            Ok((source,plan,name.to_string()))
                         })();
                         match prepared {
-                            Ok((source,map,edits,cell_name)) => {
+                            Ok((source,plan,cell_name)) => {
                                 let suggestion=format!("{}_LCK_{}.img",
                                     source.file_stem().and_then(|s|s.to_str()).unwrap_or("LegaiaTest"),cell_name);
                                 let mut dialog=rfd::FileDialog::new().set_file_name(&suggestion)
@@ -3006,7 +3033,7 @@ impl App {
                                     let (tx,rx)=std::sync::mpsc::channel();
                                     let repaint=ctx.clone();
                                     std::thread::spawn(move|| {
-                                        let result=ps1_export::export(&source,&destination,map,&edits);
+                                        let result=ps1_export::export(plan,&destination);
                                         let outcome=match &result {
                                             Ok(done)=>format!("NATIVE EXPORT SUCCESS: {}\nPatched: {}\nSkipped: {}",
                                                 done.path.display(),done.patched.join(" | "),done.skipped.join(" | ")),
@@ -3019,7 +3046,7 @@ impl App {
                                         repaint.request_repaint();
                                     });
                                     self.ps1_export_job=Some(rx);
-                                    self.studio.status=Some("Building Stage N experimental test IMG: static wall collisions + native MAN NPC spawn/model/clip edits and script-bearing NPC copies. Actor scripts may still override placements; verify in DuckStation...".into());
+                                    self.studio.status=Some("Writing validated native export plan. PS1 runtime behavior remains unverified.".into());
                                 }
                             }
                             Err(error) => {
@@ -3276,15 +3303,14 @@ impl App {
                         let hovering=ui.input(|i|i.pointer.latest_pos())
                             .filter(|p|view_rect.contains(*p));
                         if let Some(asset)=self.global_repository.get(global_id) {
-                            let compatible=global_repository::compatible_source_with_index(scene,asset,
-                                &self.global_repository_tmd_hashes)
+                            let compatible=global_repository::local_source(scene,asset)
                                 .and_then(|local| placement_drop::native_source_key(scene,world,local).map(|_|local));
                             if let Some(pointer)=hovering {
                                 ui.painter().text(pointer+egui::vec2(12.0,15.0),
                                     egui::Align2::LEFT_TOP,
                                     if compatible.is_some() {"Release: create destination-native instance"}
                                     else if !matches!(asset.kind,global_repository::Kind::Npc(_)) {
-                                        "Release: stage foreign TMD mesh (untextured editor preview only)"
+                                        "Release: stage donor geometry and textures (native export requires validation)"
                                     } else {"Foreign MAN actors need script/animation importing"},
                                     egui::FontId::proportional(14.0),Color32::YELLOW);
                             }
@@ -3700,13 +3726,9 @@ impl App {
         if let Some(edits) = pending_import {
             if let Some((_, NativeSceneSlot::Ready(_, world))) = self.native_scene.as_mut() {
                 if let Some(world) = Arc::get_mut(world) {
-                    // Restore every original anchor first; absent rows mean zero offset.
-                    for draw in world.draws.iter().map(|d|(d.terrain,d.index)).collect::<Vec<_>>() {
-                        world.set_offset(draw.0, draw.1, [0.0;3]);
-                    }
-                    for (key, offset) in edits {
-                        world.set_offset(key.0, key.1, offset);
-                    }
+                    if let Err(error)=scene_instances::apply_offsets(world,&edits) {
+                        self.studio.error=Some(format!("Could not restore layout: {error}"));
+                    } else {
                     self.native_undo.clear();
                     self.native_redo.clear();
                     self.native_drag = None;
@@ -3715,6 +3737,7 @@ impl App {
                     self.native_view.version = self.native_view.version.wrapping_add(1);
                     ctx.request_repaint();
                     self.studio.status = Some("Preview layout offsets loaded; the PS1 disc remains untouched.".into());
+                    }
                 }
             }
         }
@@ -5483,36 +5506,7 @@ impl eframe::App for App {
             if done {self.global_repository_rx=None;}
             else {ctx.request_repaint_after(std::time::Duration::from_millis(180));}
         }
-        let completed = self.native_scene.as_ref().and_then(|(_, s)| match s {
-            NativeSceneSlot::Loading(rx) => rx.try_recv().ok(),
-            _ => None,
-        });
-        if let Some(result) = completed {
-            let index=self.studio.library.as_ref().map(|lib|Arc::clone(&lib.index));
-            if let Some((source, slot)) = &mut self.native_scene {
-                *slot = match result {
-                    Ok((scene, mut world)) => {
-                        let restored=if let Some(CellSelection::Copy(id))=&self.editor_cell_active {
-                            self.editor_cells.read_overlay(*id)
-                                .and_then(|text|scene_instances::parse(&text,source,&world))
-                                .and_then(|doc|index.as_ref()
-                                    .ok_or("Original disc index unavailable".to_string())
-                                    .and_then(|index|scene_instances::apply(&doc,&mut world,scene.placements.len(),index)))
-                        } else { Ok(()) };
-                        match restored {
-                            Ok(()) => NativeSceneSlot::Ready(Arc::new(scene),Arc::new(world)),
-                            Err(error) => NativeSceneSlot::Failed(format!(
-                                "Copy overlay failed to restore: {error}. Saved copy data was preserved.")),
-                        }
-                    },
-                    Err(e) => NativeSceneSlot::Failed(e),
-                };
-            }
-            ctx.request_repaint();
-        }
-        if matches!(self.native_scene.as_ref(), Some((_, NativeSceneSlot::Loading(_)))) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(75));
-        }
+        self.poll_native_scene_load(ctx);
         if self.studio.loading().is_some() || self.studio.is_analyzing() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
@@ -5932,6 +5926,40 @@ mod catalog_ui_tests {
         let result = ctx.run(input, |ctx| app.editor_workspace(ctx));
         assert!(!result.shapes.is_empty());
     }
+    #[test]
+    fn failed_scene_switch_preserves_document_selection_camera_and_history() {
+        let mut app=app();
+        let (scene,world)=ps1_export::tests::actor_fixture();
+        let world=Arc::new(world);
+        app.native_scene=Some(("synthetic".into(),NativeSceneSlot::Ready(Arc::new(scene),world.clone())));
+        app.native_selected=Some((false,world_view::NPC_KEY_BASE+1));
+        app.editor_undo.push(EditorSceneHistory{overlay:"undo".into(),selected:None});
+        app.editor_redo.push(EditorSceneHistory{overlay:"redo".into(),selected:None});
+        let version=app.native_view.version;
+        let camera=app.native_view.cam;
+        let (tx,rx)=std::sync::mpsc::channel();
+        tx.send(Err("synthetic load failure".into())).unwrap();
+        app.pending_native_scene=Some(("missing".into(),CellSelection::Copy(999),NativeSceneSlot::Loading(rx)));
+        app.poll_native_scene_load(&egui::Context::default());
+        let Some((name,NativeSceneSlot::Ready(_,current)))=&app.native_scene else {panic!("lost document")};
+        assert_eq!(name,"synthetic");
+        assert!(Arc::ptr_eq(current,&world));
+        assert_eq!(app.native_selected,Some((false,world_view::NPC_KEY_BASE+1)));
+        assert_eq!(app.editor_undo[0].overlay,"undo");
+        assert_eq!(app.editor_redo[0].overlay,"redo");
+        assert_eq!(app.native_view.version,version);
+        assert_eq!(format!("{camera:?}"),format!("{:?}",app.native_view.cam));
+        let (tx,rx)=std::sync::mpsc::channel();
+        tx.send(Ok(ps1_export::tests::actor_fixture())).unwrap();
+        app.pending_native_scene=Some(("synthetic".into(),CellSelection::Copy(999),NativeSceneSlot::Loading(rx)));
+        app.poll_native_scene_load(&egui::Context::default());
+        let Some((_,NativeSceneSlot::Ready(_,current)))=&app.native_scene else {panic!("lost document on overlay failure")};
+        assert!(Arc::ptr_eq(current,&world));
+        assert_eq!(app.editor_undo[0].overlay,"undo");
+        assert_eq!(app.editor_redo[0].overlay,"redo");
+        assert!(app.pending_native_scene.is_none());
+    }
+
     #[test]
     fn history_selection_uses_stable_created_uid_not_transient_index() {
         let source = scene_instances::NameTarget::Created(7);

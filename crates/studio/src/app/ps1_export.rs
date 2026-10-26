@@ -1,15 +1,10 @@
-//! Stage M3 experimental: native object insertion + MOVE/COPY collision stencil.
-//! The PS1 uses TWO different collision sources: per-object static collider
-//! offsets (32-byte MAP records) AND the *separate* walk-wall nibble grid at
-//! MAP +0x4000. Stage M2 only touched the record; the wall grid never moved.
-//! This stage conservatively infers original object collision walls by
-//! intersecting the retail wall grid with the object's original X/Z geometry
-//! bounding box, then translates that original stencil for moved and copied
-//! objects. The collision grid's floor nibble is NEVER touched.
-//! Ownership is inferred, not stored on disc: a stencil shared with terrain,
-//! buildings or scripted wall painting cannot be separated perfectly.
-//! Native 64-unit wall resolution limits sub-tile placement precision.
-//! No native arbitrary TMD scaling or cloned door/script bindings.
+//! Native MAP/MAN export planning and serialization.
+//! Record-local colliders are distinct from the MAP wall/floor grid. Wall
+//! ownership is not encoded there: geometry bounds only identify potential
+//! conflicts, never authorize clearing or copying wall bits. Ambiguous edits
+//! fail closed; floor tiers and unrelated walls remain byte-for-byte intact.
+//! Native arbitrary scale, general TMD/TIM relocation and script-bound static
+//! object duplication remain unsupported.
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -38,8 +33,8 @@ const EPS: f32 = 0.02;
 #[derive(Clone, Debug)]
 pub(super) struct MoveEdit {
     /// Original drawable's horizontal bounds in untouched game world units.
-    /// None when no native mesh vertices could be resolved; then the
-    /// record-local collider still moves but NO wall stencil is inferred.
+    /// Diagnostic search area only, never an ownership claim. Missing bounds
+    /// require a wall-free map before the record-local collider can move.
     pub collision_bounds: Option<[i32;4]>, // minX,maxX,minZ,maxZ
     pub cell: (u8, u8),
     pub source_position: (i32, i32),
@@ -125,7 +120,7 @@ fn has_unhandled_native_transforms(doc: &scene_instances::SceneDocument, collisi
 /// Preflight the complete LCK editor state. Never silently ignore an
 /// unsupported physical change that the user expects to see in-game.
 pub(super) fn prepare(scene: &AssembledScene, world: &WorldModel) -> Result<ExportEdits> {
-    prepare_with_mode(scene, world, false)
+    prepare_with_mode(scene, world, PreparationMode::NativeExport)
 }
 
 /// Build a read-only collision overlay from native MAP edits even if the user
@@ -133,7 +128,7 @@ pub(super) fn prepare(scene: &AssembledScene, world: &WorldModel) -> Result<Expo
 /// collision and are deliberately ignored; the strict IMG exporter above still
 /// rejects the same scene until foreign resource relocation is implemented.
 pub(super) fn prepare_collision_preview(scene: &AssembledScene, world: &WorldModel) -> Result<ExportEdits> {
-    prepare_with_mode(scene, world, true)
+    prepare_with_mode(scene, world, PreparationMode::CollisionPreview)
 }
 
 /// Copy only data we can verify at original object placement time.
@@ -244,12 +239,11 @@ pub(super) fn prepare_cross_cell(scene: &AssembledScene, world: &WorldModel,
     if doc.foreign.is_empty() { return prepare(scene,world); }
     ensure!(doc.rotations.is_empty() && doc.scales.is_empty(),
         "Cross-cell IMG export cannot yet represent rotations or scales. Reset transforms or save .lckscene");
-    // Reuse the M3 exporter and its strict checks for all destination-native
-    // edits. The preview mode only skips the foreign-asset guard; every foreign
-    // item is validated below before the result is permitted to export.
+    // Keep all destination-native edits and checks, including MAN actors.
+    // Foreign dependencies are validated below before export is permitted.
     ensure!(!doc.created.iter().any(|created|world.npc(created.source).is_some()),
         "Native MAN NPC cloning alongside foreign resource imports needs a separate export preflight");
-    let mut edits = prepare_with_mode(scene,world,true)?;
+    let mut edits = prepare_with_mode(scene,world,PreparationMode::CrossCellExport)?;
     let target_scene=Scene::load(index,&scene.name)
         .context("Resolve destination retail MAP for cross-cell import")?;
     let target_map_index=target_scene.field_map_index(index)
@@ -330,6 +324,8 @@ pub(super) fn prepare_cross_cell(scene: &AssembledScene, world: &WorldModel,
         let dsz=collision_step(foreign.center[2]-src_center[2],"Donor wall Z")?;
         let bounds=point_horizontal_bounds(&points)
             .context("Donor geometry has no provable collision bounds")?;
+        require_no_unowned_walls(&donor_map,Some(bounds))
+            .with_context(||format!("Foreign UID {} donor collision",foreign.uid))?;
         let donor_bits=source_stencil(&donor_map,Some(bounds));
         let translated=donor_bits.into_iter().map(|(x,z)|(x+dsx,z+dsz))
             .collect::<Vec<_>>();
@@ -450,21 +446,25 @@ fn vram_texel(vram:&legaia_tim::Vram,cba:u16,tsb:u16,u:usize,v:usize)->u16 {
     }
 }
 
-/// `collision_preview` relaxes only irrelevant editor-preview restrictions;
-/// native IMG writing ALWAYS goes through the strict prepare() path.
-fn prepare_with_mode(scene: &AssembledScene, world: &WorldModel, collision_preview: bool) -> Result<ExportEdits> {
+/// Export modes always preserve NPC edits. Only wall visualization may omit
+/// actors and relax foreign transforms; cross-cell export resolves donors later.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PreparationMode { NativeExport, CrossCellExport, CollisionPreview }
+
+fn prepare_with_mode(scene: &AssembledScene, world: &WorldModel, mode: PreparationMode) -> Result<ExportEdits> {
+    let collision_preview = mode == PreparationMode::CollisionPreview;
     let overlay = scene_instances::serialize(&scene.name, world);
     let doc = scene_instances::parse(&overlay, &scene.name, world)
         .map_err(anyhow::Error::msg)?;
-    // Cross-cell TMD/texture/MAP resource dependency import is NOT implemented.
-    // Never write an IMG missing visible foreign objects from its LCK scene.
-    if !collision_preview {
+    // Local export cannot resolve foreign dependencies. Cross-cell export
+    // must validate them separately before the edits can reach the writer.
+    if mode == PreparationMode::NativeExport {
         ensure!(doc.foreign.is_empty(),
             "This LCK scene contains cross-cell asset previews. Native IMG export is disabled until donor TMD/TIM resource relocation and collision serialization are implemented. Save the .lckscene instead.");
     }
     // Foreign asset rotations/scales are irrelevant to the native MAP wall
     // overlay; unsupported rotations/scales of a NATIVE object still block it.
-    // IMG export is unchanged: ALL non-native TMD dependencies remain forbidden.
+    // Both export modes reject every unsupported rotation or scale.
     ensure!(!has_unhandled_native_transforms(&doc, collision_preview),
         "Native rotation/scale requires a native transform/TMD export stage; reset rotation/scale or save .lckscene to preserve the edit. Stage M2 changes placement freedoms only.");
     ensure!(doc.hidden.is_empty(), "Native object hiding/deletion is not supported yet.");
@@ -480,7 +480,7 @@ fn prepare_with_mode(scene: &AssembledScene, world: &WorldModel, collision_previ
         if collision_preview {continue;}
         let draw=world.at(false,npc.key).context("NPC hierarchy draw missing")?;
         let altered=draw.offset.iter().any(|v|v.abs()>EPS)
-            || npc.model_index!=npc.original_model_index || npc.clip!=npc.anim_id;
+            || npc.model_index!=npc.original_model_index || npc.clip!=npc.anim_id || npc.frame!=0;
         if !altered {continue;}
         ensure!(!npc.conditional && npc.drawable,
             "NPC MAN #{} is conditional or not renderable; cannot rewrite its native spawn",npc.record);
@@ -545,7 +545,7 @@ fn prepare_with_mode(scene: &AssembledScene, world: &WorldModel, collision_previ
             source_rotation:[source.rot_x,source.rot_y,source.rot_z],delta:created.offset });
     }
     if !collision_preview {
-        ensure!(!result.moves.is_empty() || !result.copies.is_empty() || !result.npcs.is_empty(),
+        ensure!(mode == PreparationMode::CrossCellExport || !result.moves.is_empty() || !result.copies.is_empty() || !result.npcs.is_empty(),
             "No native objects changed. Move, duplicate or change a native environment object / NPC.");
         ensure!(result.npcs.iter().filter(|n|n.uid.is_some()).count()<=4,
             "NPC insertion is experimental: export at most 4 new actors per build");
@@ -619,6 +619,7 @@ fn move_originals(map:&mut [u8], edits:&[MoveEdit]) -> Result<Vec<usize>> {
     let mut changed=Vec::new();
     for edit in edits {
         let (id,r)=record_at(map,edit.cell,edit.source_position,edit.env_slot,edit.source_rotation)?;
+        ensure!(!anchor_has_bind(map,edit.cell,&r),"Record #{id} is script-bound; native movement requires script ownership resolution");
         ensure!(touched.insert(id),"Multiple moves share native record #{id}");
         ensure!(refs[id]==1,"Record #{id} is referenced by {} cells; cannot move it independently",refs[id]);
         let dx=quantize(edit.delta[0],"X")?;
@@ -631,6 +632,8 @@ fn move_originals(map:&mut [u8], edits:&[MoveEdit]) -> Result<Vec<usize>> {
         next[0..2].copy_from_slice(&x.to_le_bytes());
         next[2..4].copy_from_slice(&y.to_le_bytes());
         next[4..6].copy_from_slice(&z.to_le_bytes());
+        ensure!(anchor_score(x as i32,z as i32).is_some_and(|score|score<LCK_EXTENDED_ANCHOR_PENALTY),
+            "Moved record #{id} exceeds the supported native spawn-anchor reach");
         let moved=ObjectRecord::parse(&next,0).context("Moved record invalid")?;
         adjust_collider(&moved,&r,&mut next)?;
         let moved=ObjectRecord::parse(&next,0).context("Moved collision record invalid")?;
@@ -678,6 +681,7 @@ fn insert_copies(map:&mut [u8], source_map:&[u8], edits:&[InsertEdit],
         let (source_idx,src)=record_at(source_map,edit.cell,edit.source_position,
             edit.env_slot,edit.source_rotation)
             .with_context(||format!("Validate original for copy #{}",edit.uid))?;
+        ensure!(!anchor_has_bind(source_map,edit.cell,&src),"Copy UID {} has a script-bound source; cannot discard its native spawn binding",edit.uid);
         ensure!(source_idx>3,"Player/NPC source cannot be copied as static environment geometry");
         let slot=(4..512usize).rev().find(|&i| !used[i] &&
             map[i*32..i*32+32].iter().all(|&b|b==0))
@@ -1087,61 +1091,36 @@ fn collision_step(delta:f32, axis:&str)->Result<i32> {
 #[derive(Default,Clone,Debug)]
 struct WallReport {changed_bytes:usize,source_bits:usize,placed_bits:usize,cleared_bits:usize}
 
-/// Composite all object moves/copies into one wall-grid update. Rebuild from
-/// the original grid instead of edit order: destination collisions win over
-/// source removals, so overlapping moved/duplicated objects remain solid.
+/// MAP wall bits have no object owner IDs. Geometry bounds are only a
+/// diagnostic search area, never evidence that a bit belongs to an instance.
+/// Until ownership is established, reject affected edits before changing any
+/// byte. Proven record-local colliders remain independently exportable.
+fn require_no_unowned_walls(original:&[u8], bounds:Option<[i32;4]>) -> Result<()> {
+    let count=match bounds {
+        Some(_) => source_stencil(original,bounds).len(),
+        None => original[WALL_OFF..GRID_OFF].iter().map(|b|(b & 0xf0).count_ones() as usize).sum(),
+    };
+    ensure!(count==0,
+        "Unresolved collision ownership: {count} native wall bits may belong to terrain or overlapping objects. Move/copy blocked; original walls preserved");
+    Ok(())
+}
+
 fn compile_walls(map:&mut [u8], original:&[u8], edits:&ExportEdits)->Result<WallReport> {
     ensure!(map.len()==MAP_LEN && original.len()==MAP_LEN,"Invalid native field MAP length");
-    let mut remove=vec![0u8;GRID_DIM*GRID_DIM];
-    let mut add=vec![0u8;GRID_DIM*GRID_DIM];
-    let mut report=WallReport::default();
     for edit in &edits.moves {
-        let sx=collision_step(edit.delta[0],"Moved collision X")?;
-        let sz=collision_step(edit.delta[2],"Moved collision Z")?;
-        let stencil=source_stencil(original,edit.collision_bounds);
-        report.source_bits+=stencil.len();
-        for (x,z) in stencil {
-            let (src_off,src_bit)=wall_offset(x,z).context("Source wall sub-cell out of bounds")?;
-            let (dst_off,dst_bit)=wall_offset(x+sx,z+sz)
-                .context("Moved collision would cross native MAP border; move object inward")?;
-            // Ownership is NOT encoded in native MAP. Clearing this inferred
-            // footprint can affect terrain/other objects at the old position.
-            // Only the upper nibble is modified; original floor tiers remain.
-            remove[src_off-WALL_OFF]|=src_bit;
-            add[dst_off-WALL_OFF]|=dst_bit;
-            report.placed_bits+=1;
-        }
+        require_no_unowned_walls(original,edit.collision_bounds)?;
     }
     for edit in &edits.copies {
-        if let Some((_,donor_bits))=edits.foreign_wall_stencils.iter().find(|(uid,_)|*uid==edit.uid) {
-            report.source_bits+=donor_bits.len();
-            for &(x,z) in donor_bits {
-                let (dst_off,dst_bit)=wall_offset(x,z).context("Imported donor wall crosses destination MAP")?;
-                add[dst_off-WALL_OFF]|=dst_bit;
-                report.placed_bits+=1;
-            }
-            continue;
-        }
-        let sx=collision_step(edit.delta[0],"Duplicate collision X")?;
-        let sz=collision_step(edit.delta[2],"Duplicate collision Z")?;
-        let stencil=source_stencil(original,edit.collision_bounds);
-        report.source_bits+=stencil.len();
-        for (x,z) in stencil {
-            let (dst_off,dst_bit)=wall_offset(x+sx,z+sz)
-                .context("Duplicate collision would cross native MAP border; move inward")?;
-            add[dst_off-WALL_OFF]|=dst_bit;
-            report.placed_bits+=1;
+        if let Some((_,bits))=edits.foreign_wall_stencils.iter().find(|(uid,_)|*uid==edit.uid) {
+            ensure!(bits.is_empty(),"Unresolved donor wall ownership for UID {}; import blocked",edit.uid);
+        } else {
+            require_no_unowned_walls(original,edit.collision_bounds)?;
         }
     }
-    for i in 0..GRID_DIM*GRID_DIM {
-        let old=original[WALL_OFF+i];
-        let before=old&0xf0;
-        let updated=(before & !remove[i]) | add[i];
-        report.cleared_bits+=(before & !updated).count_ones() as usize;
-        if updated!=before {report.changed_bytes+=1;}
-        map[WALL_OFF+i]=(old&0x0f)|updated;
-    }
-    Ok(report)
+    // Neither deletions nor guessed additions are permitted. Preserve both
+    // wall bits and walkable floor tiers exactly, including shared walls.
+    map[WALL_OFF..GRID_OFF].copy_from_slice(&original[WALL_OFF..GRID_OFF]);
+    Ok(WallReport::default())
 }
 
 /// Return native MAP writes only after checking every other byte remains
@@ -1196,27 +1175,61 @@ fn map_patches(original: &[u8], edits: &ExportEdits) -> Result<Vec<(usize,Vec<u8
     Ok(patches)
 }
 
-/// Build a new whole-disc PS1 image, including native Mode-2 EDC/ECC fixups.
-/// The input image is only read. The output must not already exist.
-/// Rim Elm source scenes automatically update compatible story-state variants.
-pub(super) fn export(source:&Path, output:&Path, map_entry:usize, edits:&ExportEdits) -> Result<ExportResult> {
-    ensure!(!edits.moves.is_empty() || !edits.copies.is_empty() || !edits.npcs.is_empty(),"Nothing to export");
-    let source=source.canonicalize().context("Cannot find opened test image")?;
-    ensure!(source.is_file(),"Open a raw 2352-byte .img/.bin, not an extracted folder");
-    ensure!(source.extension().and_then(|s|s.to_str()).is_some_and(|s|s.eq_ignore_ascii_case("img") || s.eq_ignore_ascii_case("bin")),
-        "Native export requires a 2352-byte .img or .bin source");
-    let output_abs=if output.is_absolute(){output.to_path_buf()}else{std::env::current_dir()?.join(output)};
-    ensure!(output_abs!=source,"Refusing to overwrite the open source image");
-    ensure!(!output_abs.exists(),"Destination already exists: {}. Choose a new filename to protect earlier tests.",output_abs.display());
-    let parent=output_abs.parent().context("Output image has no parent directory")?;
-    ensure!(parent.is_dir(),"Output directory does not exist");
-    let staging=output_abs.with_extension("lckbuilding");
-    ensure!(!staging.exists(),"An unfinished staging file exists at {}. Inspect it before retrying.",staging.display());
-    let image=std::fs::read(&source).with_context(||format!("Read source image {}",source.display()))?;
-    ensure!(image.len()%2352==0,"Source is not raw Mode 2 / 2352-byte sector layout");
-    let image_length=image.len();
-    let mut disc=DiscPatcher::open(image).context("Parse disc ISO and PROT archive")?;
+/// Complete deterministic native serialization, including sector fixups.
+/// Fields are private: only the validated planner can create a writable plan.
+/// Keeping the compiled bytes makes preflight and execution use exactly the
+/// same allocations and compressed payloads, without a second interpretation.
+pub(super) struct NativeExportPlan {
+    source:PathBuf,
+    image:Vec<u8>,
+    patched:Vec<String>,
+    skipped:Vec<String>,
+}
 
+impl NativeExportPlan {
+    pub(super) fn summary(&self)->String {
+        let mut summary=self.patched.join("; ");
+        if !self.skipped.is_empty() {
+            summary.push_str(". Limitations: ");
+            summary.push_str(&self.skipped.join("; "));
+        }
+        summary
+    }
+}
+
+fn validate_source_archive(disc:&DiscPatcher,index:&ProtIndex)->Result<()> {
+    ensure!(disc.entry_count()==index.entry_count(),"Source archive changed; reload the disc");
+    for entry in 0..index.entry_count() {
+        ensure!(disc.read_entry(entry)?.as_slice()==index.entry_bytes(entry as u32)?.as_slice(),
+            "Source PROT entry {entry} changed; reload the disc before export");
+    }
+    Ok(())
+}
+
+pub(super) fn plan_export(source:&Path, scene:&AssembledScene, world:&WorldModel,
+    index:&ProtIndex) -> Result<NativeExportPlan> {
+    let source=source.canonicalize().context("Cannot find opened disc image")?;
+    ensure!(source.is_file(),"Open a raw 2352-byte .img/.bin source");
+    let image=std::fs::read(&source).context("Read source for native export preflight")?;
+    ensure!(!image.is_empty() && image.len()%2352==0,"Source is not raw Mode 2 / 2352-byte sector layout");
+    let image_length=image.len();
+    let disc=DiscPatcher::open(image).context("Parse disc ISO and PROT archive")?;
+    // Bind the editor's resource provenance to this exact source archive.
+    // Reject stale/replaced source data rather than validate one resource set
+    // and serialize another. Includes shared TIM/CLUT and MAN dependencies.
+    validate_source_archive(&disc,index)?;
+    let original=Scene::load(index,&scene.name)?;
+    let map_entry=original.field_map_index(index).context("Selected scene has no native MAP")? as usize;
+    let mut edits=prepare_cross_cell(scene,world,index)?;
+    edits.moves.sort_by_key(|e|e.cell);
+    edits.copies.sort_by_key(|e|e.uid);
+    edits.npcs.sort_by_key(|e|(e.uid,e.record));
+    compile_plan(source,disc,image_length,map_entry,&edits)
+}
+
+fn compile_plan(source:PathBuf, mut disc:DiscPatcher, image_length:usize,
+    map_entry:usize, edits:&ExportEdits) -> Result<NativeExportPlan> {
+    ensure!(!edits.moves.is_empty() || !edits.copies.is_empty() || !edits.npcs.is_empty(),"Nothing to export");
     let has_map_edits=!edits.moves.is_empty() || !edits.copies.is_empty();
     let rim_elm=RIM_ELM_MAPS.iter().any(|(_,id)|*id==map_entry);
     let targets:Vec<(&str,usize)>=if rim_elm {RIM_ELM_MAPS.to_vec()} else {vec![("selected",map_entry)]};
@@ -1307,6 +1320,20 @@ pub(super) fn export(source:&Path, output:&Path, map_entry:usize, edits:&ExportE
     }
     let written=disc.into_image();
     ensure!(written.len()==image_length,"Native patch unexpectedly changed total image size");
+    Ok(NativeExportPlan {source,image:written,patched:names,skipped})
+}
+
+/// Write only bytes already compiled and verified by native preflight.
+/// No resource resolution, allocation or compression occurs here.
+pub(super) fn export(plan:NativeExportPlan, output:&Path) -> Result<ExportResult> {
+    let output_abs=if output.is_absolute(){output.to_path_buf()}else{std::env::current_dir()?.join(output)};
+    ensure!(output_abs!=plan.source,"Refusing to overwrite the source image");
+    ensure!(!output_abs.exists(),"Destination already exists: {}",output_abs.display());
+    let parent=output_abs.parent().context("Output image has no parent directory")?;
+    ensure!(parent.is_dir(),"Output directory does not exist");
+    let staging=output_abs.with_extension("lckbuilding");
+    ensure!(!staging.exists(),"An unfinished staging file exists at {}",staging.display());
+    let NativeExportPlan {image:written,patched:names,skipped,..}=plan;
     use std::io::Write;
     let mut file=std::fs::OpenOptions::new().create_new(true).write(true).open(&staging)
         .with_context(||format!("Create staging file {}",staging.display()))?;
@@ -1326,7 +1353,97 @@ pub(super) fn export(source:&Path, output:&Path, map_entry:usize, edits:&ExportE
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
+    pub(crate) fn actor_fixture() -> (AssembledScene, WorldModel) {
+        let scene=AssembledScene {
+            name:"synthetic".into(),
+            res:legaia_engine_scene::scene_resources::SceneResources {
+                vram:legaia_tim::Vram::new(), tim_count:0, tim_parse_failures:0,
+                tmds:vec![], anm_packs:vec![], shared_tim_count:0, shared_tmd_count:0,
+                render_policy:Default::default(), world_map_slot4:None,
+            },
+            env_tmds:vec![], placements:vec![], terrain:vec![], ground:None,
+            coplanar_offsets:Default::default(),
+        };
+        let npc=world_view::NpcInfo::synthetic_export_actor();
+        let draw=world_view::DrawInfo {
+            id:0, terrain:false, index:npc.key, center:[0.0;3], radius:1.0,
+            original_center:[0.0;3], offset:[64.0,0.0,0.0], rotation:[0.0;3],
+            scale:[1.0;3], vertex_start:0, vertex_end:0, source_ref:None,
+            editor_uid:None, display_name:None, hidden:false, hidden_triangles:vec![],
+        };
+        let world=WorldModel {model:None, instances:1, unavailable:0, unique_models:0,
+            ground_triangles:0, ground_vram_covered:0, ground_textured:0,
+            draws:vec![draw], npcs:vec![npc], npc_issue:None, foreign:vec![],
+            foreign_vram:Default::default()};
+        (scene,world)
+    }
+
+    fn add_foreign_preview(world:&mut WorldModel) {
+        world.foreign.push(world_view::ForeignRef {
+            uid:7, source:"donor".into(), kind:"placement".into(), record:3,
+            raw_tmd:vec![], native_record:None, donor_wall_bits:vec![], donor_center:[0.0;3],
+        });
+        world.draws.push(world_view::DrawInfo {
+            id:1, terrain:false, index:7, center:[0.0;3], radius:1.0,
+            original_center:[0.0;3], offset:[0.0;3], rotation:[0.0;3], scale:[1.0;3],
+            vertex_start:0, vertex_end:0, source_ref:Some((false,usize::MAX)),
+            editor_uid:Some(7), display_name:None, hidden:false, hidden_triangles:vec![],
+        });
+    }
+
+    #[test]
+    fn cross_cell_preparation_keeps_existing_actor_movement_and_appearance() {
+        let (scene,mut world)=actor_fixture();
+        world.npcs[0].model_index=1;
+        world.npcs[0].clip=1;
+        assert_eq!(prepare(&scene,&world).unwrap().npcs.len(),1);
+        add_foreign_preview(&mut world);
+        let edits=prepare_with_mode(&scene,&world,PreparationMode::CrossCellExport).unwrap();
+        assert_eq!(edits.npcs.len(),1);
+        let npc=&edits.npcs[0];
+        assert_eq!(npc.uid,None);
+        assert_eq!(npc.record,1);
+        assert_eq!(npc.delta,[64.0,0.0,0.0]);
+        assert_eq!((npc.original_model,npc.model,npc.original_anim,npc.anim),(0,1,0,1));
+        assert!(prepare_collision_preview(&scene,&world).unwrap().npcs.is_empty());
+        assert!(prepare(&scene,&world).is_err(), "strict local export must reject unresolved donors");
+    }
+
+    #[test]
+    fn cross_cell_preparation_rejects_unsupported_actor_edits_instead_of_omitting_them() {
+        let (scene,mut world)=actor_fixture();
+        add_foreign_preview(&mut world);
+        world.npcs[0].conditional=true;
+        assert!(prepare_with_mode(&scene,&world,PreparationMode::CrossCellExport)
+            .unwrap_err().to_string().contains("conditional"));
+        world.npcs[0].conditional=false;
+        world.npcs[0].clip=1;
+        world.npcs[0].frame=1;
+        assert!(prepare_with_mode(&scene,&world,PreparationMode::CrossCellExport)
+            .unwrap_err().to_string().contains("preview frame"));
+        assert!(prepare_collision_preview(&scene,&world).is_ok());
+    }
+
+    #[test]
+    fn native_export_cannot_silently_drop_a_frame_only_edit() {
+        let (scene,mut world)=actor_fixture();
+        world.draws[0].offset=[0.0;3];
+        world.npcs[0].anim_id=1;
+        world.npcs[0].clip=1;
+        world.npcs[0].frame=1;
+        assert!(prepare(&scene,&world).unwrap_err().to_string().contains("preview frame"));
+    }
+
+    #[test]
+    fn foreign_only_export_can_resolve_dependencies_after_native_preparation() {
+        let (scene,mut world)=actor_fixture();
+        world.draws[0].offset=[0.0;3];
+        add_foreign_preview(&mut world);
+        assert!(prepare_with_mode(&scene,&world,PreparationMode::CrossCellExport).is_ok());
+        assert!(prepare(&scene,&world).is_err());
+    }
+
     #[test]
     fn foreign_editor_previews_do_not_disable_native_collision_wireframes() {
         use super::scene_instances::{ForeignInstance, NameTarget, SceneDocument};
@@ -1382,8 +1499,8 @@ mod tests {
         m[o+0x12..o+0x14].copy_from_slice(&flags.to_le_bytes());
         let old_grid=GRID_OFF+(r as usize*128+c as usize)*2;
         m[old_grid..old_grid+2].copy_from_slice(&(idx as u16).to_le_bytes());
-        // Source has a bind, but a new copy must use an unbound tile.
-        let bind=GRID_OFF+(33usize*128+33)*2;
+        // Unrelated binding must remain untouched; no copy may take it over.
+        let bind=GRID_OFF+(10usize*128+10)*2;
         m[bind..bind+2].copy_from_slice(&0x0400u16.to_le_bytes());
         let floor=0x4000+r as usize*128+c as usize;
         m[floor]=4;
@@ -1506,91 +1623,138 @@ mod tests {
         assert!((to.0-from.0-17).abs()<=8);
     }
     #[test]
-    fn moved_house_wall_stencil_follows_mesh_and_preserves_floor_nibbles() {
-        let (mut m,mut mov,_)=test_map(false);
-        // Physical source wall footprint centred on native (4384,4384).
-        let sx=4384/64;
-        let sz=4384/64+2; // z wall-query bias
-        let (o,b)=wall_offset(sx,sz).unwrap();
-        m[o]=b|6;
-        let old=m.clone();
-        mov.collision_bounds=Some([4384-30,4384+30,4384-30,4384+30]);
+    fn movement_rejects_unowned_walls_without_changing_grid() {
+        let (mut map,mut mov,_)=test_map(false);
+        let (off,bit)=wall_offset(68,70).unwrap();
+        map[off]=bit|6;
+        let before=map.clone();
+        mov.collision_bounds=Some([4354,4414,4354,4414]);
         mov.delta=[128.0,0.0,64.0];
-        let edits=ExportEdits{moves:vec![mov],copies:vec![],npcs:vec![],tier_heights:[None;16],foreign_wall_stencils:Vec::new()};
-        let report=compile_walls(&mut m,&old,&edits).unwrap();
-        assert_eq!(report.source_bits,1);
-        assert_eq!(m[o],6); // low nibble (floor) unchanged; old wall cleared
-        let (dest,bit)=wall_offset(sx+2,sz+1).unwrap();
-        assert_eq!(m[dest]&bit,bit);
-        assert_eq!(m[dest]&0xf,old[dest]&0xf);
+        let edits=ExportEdits{moves:vec![mov],..Default::default()};
+        assert!(compile_walls(&mut map,&before,&edits).unwrap_err().to_string().contains("ownership"));
+        assert_eq!(map,before);
+        assert!(map_patches(&before,&edits).is_err());
     }
+
     #[test]
-    fn duplicated_house_receives_same_mask_at_independent_position() {
-        let (mut m,_,mut copy)=test_map(false);
-        let sx=4384/64;
-        let sz=4384/64+2;
-        let (o,b)=wall_offset(sx,sz).unwrap();
-        m[o]=b|9;
-        let old=m.clone();
+    fn duplication_does_not_copy_unowned_or_shared_walls() {
+        let (mut map,_,mut copy)=test_map(false);
+        let (off,bit)=wall_offset(68,70).unwrap();
+        map[off]=bit|9;
         copy.collision_bounds=Some([4354,4414,4354,4414]);
-        copy.delta=[192.0,0.0,0.0];
-        let edits=ExportEdits{moves:vec![],copies:vec![copy],npcs:vec![],tier_heights:[None;16],foreign_wall_stencils:Vec::new()};
-        let report=compile_walls(&mut m,&old,&edits).unwrap();
-        assert_eq!(report.source_bits,1);
-        assert_eq!(m[o],old[o]); // original collision intact
-        let (dest,bit)=wall_offset(sx+3,sz).unwrap();
-        assert!(m[dest]&bit !=0);
+        for delta in [[0.0;3],[192.0,0.0,0.0]] {
+            copy.delta=delta;
+            let before=map.clone();
+            let edits=ExportEdits{copies:vec![copy.clone()],..Default::default()};
+            assert!(compile_walls(&mut map,&before,&edits).is_err());
+            assert_eq!(map,before);
+        }
     }
+
     #[test]
-    fn moved_source_and_overlapping_clone_collision_are_composited_not_erased() {
-        let (mut m,mut mov,mut copy)=test_map(false);
-        let sx=4384/64;
-        let sz=4384/64+2;
-        let (o,b)=wall_offset(sx,sz).unwrap();
-        m[o]=b|3;
-        let old=m.clone();
+    fn overlapping_movement_and_copy_cannot_claim_shared_wall() {
+        let (mut map,mut mov,mut copy)=test_map(false);
+        let (off,bit)=wall_offset(68,70).unwrap();
+        map[off]=bit|3;
         mov.collision_bounds=Some([4354,4414,4354,4414]);
         copy.collision_bounds=mov.collision_bounds;
-        mov.delta=[64.0,0.0,0.0];
-        copy.delta=[0.0;3]; // clone remains on original footprint
-        let edits=ExportEdits{moves:vec![mov],copies:vec![copy],npcs:vec![],tier_heights:[None;16],foreign_wall_stencils:Vec::new()};
-        compile_walls(&mut m,&old,&edits).unwrap();
-        assert!(m[o]&b != 0); // clone keeps source wall when original moved
-        let (dest,bit)=wall_offset(sx+1,sz).unwrap();
-        assert!(m[dest]&bit !=0);
+        let before=map.clone();
+        let edits=ExportEdits{moves:vec![mov],copies:vec![copy],..Default::default()};
+        assert!(compile_walls(&mut map,&before,&edits).is_err());
+        assert_eq!(map,before);
     }
+
     #[test]
-    fn grid_export_patches_wall_bytes_and_never_floor_nibbles() {
-        let (mut original,mut mov,_)=test_map(false);
-        let sx=4384/64;
-        let sz=4384/64+2;
-        let (o,b)=wall_offset(sx,sz).unwrap();
-        original[o]=b|4;
+    fn record_local_collider_edit_preserves_unrelated_walls_and_all_floor_tiers() {
+        let (mut map,mut mov,_)=test_map(false);
+        let (off,bit)=wall_offset(74,70).unwrap();
+        map[off]=bit|11;
         mov.collision_bounds=Some([4354,4414,4354,4414]);
-        mov.delta=[64.0,0.0,0.0];
-        let edits=ExportEdits{moves:vec![mov],copies:vec![],npcs:vec![],tier_heights:[None;16],foreign_wall_stencils:Vec::new()};
-        let patches=map_patches(&original,&edits).unwrap();
-        assert!(patches.iter().any(|(off,_)| (*off>=WALL_OFF)&&(*off<GRID_OFF)));
-        let mut compiled=original.clone();
-        for (off,bytes) in patches {compiled[off..off+bytes.len()].copy_from_slice(&bytes);}
-        for i in WALL_OFF..GRID_OFF {assert_eq!(compiled[i]&15,original[i]&15);}
-        let (dest,bit)=wall_offset(sx+1,sz).unwrap();
-        assert!(compiled[dest]&bit !=0);
+        let before=map.clone();
+        let edits=ExportEdits{moves:vec![mov],..Default::default()};
+        let patches=map_patches(&before,&edits).unwrap();
+        for (off,bytes) in patches {map[off..off+bytes.len()].copy_from_slice(&bytes);}
+        assert_eq!(&map[WALL_OFF..GRID_OFF],&before[WALL_OFF..GRID_OFF]);
     }
+
     #[test]
-    fn unrelated_walls_outside_original_bounds_stay_untouched() {
-        let (mut m,mut mov,_)=test_map(false);
-        let (owned,bit)=wall_offset(4384/64,4384/64+2).unwrap();
-        let (unrelated,otherbit)=wall_offset(4384/64+6,4384/64+2).unwrap();
-        m[owned]=bit|7;
-        m[unrelated]=otherbit|11;
-        let before=m.clone();
-        mov.collision_bounds=Some([4354,4414,4354,4414]);
-        mov.delta=[64.0,0.0,0.0];
-        let edits=ExportEdits{moves:vec![mov],copies:vec![],npcs:vec![],tier_heights:[None;16],foreign_wall_stencils:Vec::new()};
-        compile_walls(&mut m,&before,&edits).unwrap();
-        assert_eq!(m[unrelated],before[unrelated]);
+    fn unknown_bounds_and_foreign_wall_claims_are_not_silently_accepted() {
+        let (mut map,mov,copy)=test_map(false);
+        let (off,bit)=wall_offset(74,70).unwrap();
+        map[off]=bit;
+        let before=map.clone();
+        assert!(compile_walls(&mut map,&before,&ExportEdits{moves:vec![mov],..Default::default()}).is_err());
+        let edits=ExportEdits {foreign_wall_stencils:vec![(copy.uid,vec![(1,1)])],
+            copies:vec![copy],..Default::default()};
+        assert!(compile_walls(&mut map,&before,&edits).is_err());
+        assert_eq!(map,before);
     }
+
+    fn map_disc(map:&[u8])->Vec<u8> {
+        let mut prot=vec![0u8;2048+MAP_LEN];
+        prot[4..8].copy_from_slice(&1u32.to_le_bytes());
+        prot[8..12].copy_from_slice(&1u32.to_le_bytes());
+        prot[16..20].copy_from_slice(&1u32.to_le_bytes());
+        prot[20..24].copy_from_slice(&37u32.to_le_bytes());
+        prot[2048..].copy_from_slice(map);
+        legaia_disc_patch::disc::synth::synth_disc(&prot)
+    }
+
+    #[test]
+    fn preflight_rejects_stale_resource_bytes_and_script_bound_sources() {
+        use legaia_disc_patch::disc::synth::{synth_prot,synth_disc};
+        let prot=synth_prot(&[1,2,3]);
+        let index=ProtIndex::from_bytes(prot.clone(),None).unwrap();
+        let mut disc=DiscPatcher::open(synth_disc(&prot)).unwrap();
+        validate_source_archive(&disc,&index).unwrap();
+        disc.patch_prot_entry(1,0,&[9]).unwrap();
+        assert!(validate_source_archive(&disc,&index).is_err());
+        let (mut map,mov,copy)=test_map(false);
+        let bind=GRID_OFF+(33*128+33)*2;
+        map[bind..bind+2].copy_from_slice(&field_objects::CELL_BIND_OWNED.to_le_bytes());
+        assert!(map_patches(&map,&ExportEdits{moves:vec![mov],..Default::default()}).is_err());
+        assert!(map_patches(&map,&ExportEdits{copies:vec![copy],..Default::default()}).is_err());
+    }
+
+    #[test]
+    fn complete_plan_is_deterministic_and_contains_roundtripped_native_allocations() {
+        let (map,_,copy)=test_map(false);
+        let image=map_disc(&map);
+        let edits=ExportEdits{copies:vec![copy],..Default::default()};
+        let build=||compile_plan(PathBuf::from("synthetic.img"),DiscPatcher::open(image.clone()).unwrap(),image.len(),0,&edits).unwrap();
+        let a=build(); let b=build();
+        assert_eq!(a.image,b.image);
+        assert_eq!(a.image.len(),image.len());
+        let compiled=DiscPatcher::open(a.image).unwrap().read_entry_footprint(0).unwrap();
+        assert!(field_objects::parse_placements(&compiled).iter().any(|p|p.obj_idx==511));
+        assert_eq!(&compiled[WALL_OFF..GRID_OFF],&map[WALL_OFF..GRID_OFF]);
+    }
+
+    #[test]
+    fn complete_plan_rejects_exhausted_record_allocation_and_unowned_collision() {
+        let (mut map,_,mut copy)=test_map(false);
+        for id in 4..512 {if id!=138 {map[id*32]=1;}}
+        let image=map_disc(&map);
+        let edits=ExportEdits{copies:vec![copy.clone()],..Default::default()};
+        assert!(compile_plan(PathBuf::new(),DiscPatcher::open(image.clone()).unwrap(),image.len(),0,&edits).is_err());
+        let (mut map,_,_)=test_map(false);
+        let (off,bit)=wall_offset(68,70).unwrap(); map[off]=bit;
+        copy.collision_bounds=Some([4354,4414,4354,4414]);
+        let image=map_disc(&map);
+        assert!(compile_plan(PathBuf::new(),DiscPatcher::open(image.clone()).unwrap(),image.len(),0,
+            &ExportEdits{copies:vec![copy],..Default::default()}).is_err());
+    }
+
+    #[test]
+    fn complete_plan_does_not_accept_npc_edits_without_serializable_man() {
+        let (map,_,copy)=test_map(false);
+        let (scene,world)=actor_fixture();
+        let mut edits=prepare(&scene,&world).unwrap(); edits.copies.push(copy);
+        let image=map_disc(&map);
+        let error=compile_plan(PathBuf::new(),DiscPatcher::open(image.clone()).unwrap(),image.len(),0,&edits).err().expect("missing MAN must fail");
+        assert!(format!("{error:#}").contains("exactly one nearby scene MAN"));
+    }
+
     #[test]
     fn rim_elm_story_state_indices_are_preserved() {
         assert_eq!(RIM_ELM_MAPS.iter().map(|(_,i)|*i).collect::<Vec<_>>(),vec![1,10,19,345,739]);
