@@ -3103,6 +3103,7 @@ dependencies = [
  "legaia-art",
  "legaia-container-formats",
  "legaia-disc-audit",
+ "legaia-disc-patch",
  "legaia-engine-audio",
  "legaia-engine-scene",
  "legaia-engine-world-views",

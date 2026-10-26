@@ -12,19 +12,32 @@ pub(crate) struct Viewport {
     pub world_mirrored: bool,
     /// Editor-only pivot for MMB/Alt+LMB, or None for free-look in place.
     pub world_orbit_anchor: Option<[f32; 3]>,
-    /// Session-only preferred angle for Frame Selected, calibrated by the artist.
-    pub world_frame_angle: Option<(f32, f32)>,
+    /// ID captured at primary mouse-down on the already selected mesh.
+    /// While held, LMB moves that instance instead of panning the camera.
+    pub world_left_drag_selected: Option<u32>,
     rendered: Option<(Camera, Shading, [usize; 2], u64, Option<u32>, bool, bool)>,
     tex: Option<TextureHandle>,
+}
+
+/// The raster camera's default Euler branch renders scene-up down on screen.
+/// Keep its eye and forward vector EXACTLY the same but use the equivalent
+/// upright Euler branch (a 180-degree camera roll, not a model rotation).
+/// Never apply this to Frame Selected: frame_selected_pose already chooses
+/// its own upright Euler branch from native placement + editor transforms.
+fn upright_default_camera() -> Camera {
+    let mut cam = Camera::default();
+    cam.yaw = (cam.yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU);
+    cam.pitch = std::f32::consts::PI - cam.pitch;
+    cam
 }
 
 impl Viewport {
     pub fn new(shading: Shading) -> Self {
         Self {
-            cam: Camera::default(), shading, version: 0,
+            cam: upright_default_camera(), shading, version: 0,
             world_mirrored: true,
             world_orbit_anchor: None,
-            world_frame_angle: None,
+            world_left_drag_selected: None,
             rendered: None, tex: None,
         }
     }
@@ -35,44 +48,79 @@ impl Viewport {
 
     /// Existing per-asset preview behavior; left-drag orbits, wheel zooms.
     pub fn show_limited(&mut self, ui: &mut egui::Ui, model: &Model, vram: &Vram, max_w: usize, max_h: usize) {
-        let _ = self.show_internal(ui, model, vram, max_w, max_h, false, None, true);
+        let _ = self.show_internal(ui, model, vram, max_w, max_h, false, None, true, false);
     }
 
-    /// World editor: LMB drag pans, MMB drags orbit in all directions,
-    /// Shift+MMB also pans, Ctrl+MMB dollies, wheel zooms, RMB picks.
+    /// World editor: LMB drags a mesh ONLY when starting on the selected
+    /// instance, otherwise pans; MMB or Alt+LMB orbits. Ctrl+LMB on the
+    /// selected instance changes height. Shift+MMB pans and Ctrl+MMB dollies.
     /// Returns an instance ID when a native mesh is clicked.
     pub fn show_world_limited(&mut self, ui: &mut egui::Ui, model: &Model, vram: &Vram,
-                              max_w: usize, max_h: usize, selected: Option<u32>, show_ground: bool) -> Option<u32> {
-        self.show_internal(ui, model, vram, max_w, max_h, true, selected, show_ground)
+                              max_w: usize, max_h: usize, selected: Option<u32>,
+                              show_ground: bool, repository_drag: bool) -> Option<u32> {
+        self.show_internal(ui, model, vram, max_w, max_h, true, selected, show_ground, repository_drag)
     }
 
-    /// Save the exact camera direction the artist is currently using.
-    /// Subsequent Frame Selected commands reuse this direction for every piece.
-    pub fn remember_frame_angle(&mut self) {
-        self.world_frame_angle = Some((self.cam.yaw, self.cam.pitch));
+    /// Identical world navigation/Frame Selected; select native donor palettes by draw ID.
+    pub fn show_world_limited_with_sources(&mut self, ui: &mut egui::Ui, model: &Model,
+        vram: &Vram, max_w: usize, max_h: usize, selected: Option<u32>,
+        show_ground: bool, repository_drag: bool,
+        sources:&std::collections::HashMap<u32,std::sync::Arc<Vram>>) -> Option<u32> {
+        self.show_internal_sources(ui,model,vram,max_w,max_h,true,selected,show_ground,repository_drag,Some(sources))
     }
 
-    pub fn frame_instance(&mut self, model: &Model, point: [f32; 3], radius: f32) {
-        // Restore the editor's proven upright default (rather than the v0.4.5.3
-        // below-ground angle). The artist can override it by pressing Set F view.
-        editor_frame_front_direction(&mut self.cam);
-        if let Some((yaw, pitch)) = self.world_frame_angle {
-            self.cam.yaw = yaw;
-            self.cam.pitch = pitch;
-        }
-        self.cam.target_offset = [0, 1, 2].map(|k| point[k] - model.center[k]);
-        // UNCHANGED framing distance: retain v0.4.5.2's object-radius zoom.
-        self.cam.zoom = (radius / model.radius.max(0.01) * 1.8).clamp(0.00015, 50.0);
+    /// Center and frame the selected instance using a universal reference
+    /// composition, transformed by BOTH native PS1 placement orientation and
+    /// editor-only rotation. The eye offset is recomputed for each object's
+    /// actual center and scale; the current browsing camera angle is ignored.
+    pub fn frame_instance(&mut self, model: &Model, point: [f32; 3], radius: f32,
+                          native_quat: [f32; 4], editor_rotation: [f32; 3]) {
+        frame_selected_pose(&mut self.cam, model.center, model.radius,
+            point, radius, native_quat, editor_rotation);
     }
 
-    pub fn frame_all(&mut self) { self.cam = Camera::default(); }
+    /// Reset the whole-cell and asset preview camera to an upright pose.
+    /// Does NOT affect Frame Selected (frame_instance / F).
+    pub fn frame_all(&mut self) { self.cam = upright_default_camera(); }
 
     fn show_internal(&mut self, ui: &mut egui::Ui, model: &Model, vram: &Vram,
-                     max_w: usize, max_h: usize, world: bool, selected: Option<u32>, show_ground: bool) -> Option<u32> {
+                     max_w: usize, max_h: usize, world: bool, selected: Option<u32>,
+                     show_ground: bool, repository_drag: bool) -> Option<u32> {
+        self.show_internal_sources(ui,model,vram,max_w,max_h,world,selected,show_ground,repository_drag,None)
+    }
+
+    fn show_internal_sources(&mut self, ui: &mut egui::Ui, model: &Model, vram: &Vram,
+        max_w: usize, max_h: usize, world: bool, selected: Option<u32>, show_ground: bool,
+        repository_drag: bool,
+        donor_vram:Option<&std::collections::HashMap<u32,std::sync::Arc<Vram>>>) -> Option<u32> {
         let avail = ui.available_size();
         let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
         let mut picked = None;
         let mirror = world && self.world_mirrored;
+        // Calculate the exact same pixel resolution used by both the renderer
+        // and the hit tester (no new GPU readbacks or per-frame picks).
+        let ppp = ui.ctx().pixels_per_point();
+        let px = [
+            ((rect.width() * ppp) as usize).clamp(16, max_w.max(16)),
+            ((rect.height() * ppp) as usize).clamp(16, max_h.max(16)),
+        ];
+        if world {
+            // Capture on mouse-down, BEFORE handling any camera movement.
+            // Egui's dragged_by fires later, but the press must reserve the
+            // gesture immediately so the camera never jumps at drag start.
+            if !ui.input(|i| i.pointer.primary_down()) {
+                self.world_left_drag_selected = None;
+            } else if ui.input(|i| i.pointer.primary_pressed()) {
+                let alt = ui.input(|i| i.modifiers.alt);
+                self.world_left_drag_selected = if !repository_drag && !alt && resp.hovered() {
+                    resp.interact_pointer_pos().and_then(|pos| {
+                        let point = world_screen_pick_point(rect, pos, px, mirror);
+                        let hit = raster::pick_instance(model, self.cam, px[0], px[1], point);
+                        selected.filter(|id| Some(*id) == hit)
+                    })
+                } else { None };
+            }
+        }
         if world {
             let shift = ui.input(|i| i.modifiers.shift);
             let ctrl = ui.input(|i| i.modifiers.ctrl);
@@ -81,7 +129,10 @@ impl Viewport {
             let left = resp.dragged_by(PointerButton::Primary);
             let delta = ui.input(|i| i.pointer.delta());
             let drag_x = if mirror { -delta.x } else { delta.x };
-            if (middle && shift) || (left && !alt && !shift) {
+            if repository_drag {
+                // An asset held from All Objects owns the pointer until release;
+                // do not pan/orbit/dolly a scene while placing it.
+            } else if (middle && shift) || (left && !alt && self.world_left_drag_selected.is_none()) {
                 // Shift the camera's orbit pivot parallel to the view plane;
                 // dragging right/down moves the scenery right/down.
                 let (sy, cy) = self.cam.yaw.sin_cos();
@@ -100,7 +151,7 @@ impl Viewport {
                 }
             } else if middle && ctrl {
                 self.cam.zoom = (self.cam.zoom * (delta.y * 0.012).exp()).clamp(0.0000001, 50.0);
-            } else if middle || (left && alt) {
+            } else if middle || (left && alt && self.world_left_drag_selected.is_none()) {
                 // Orbit around the current pivot and keep the camera upright at the poles.
                 if let Some(piece) = self.world_orbit_anchor.filter(|_| !ctrl) {
                     // The first drag uses the CURRENT eye and orientation.
@@ -116,9 +167,16 @@ impl Viewport {
                 if ui.input(|i| i.key_pressed(egui::Key::Home)) { self.frame_all(); }
             }
         } else if resp.dragged() {
-            let d = resp.drag_delta();
-            self.cam.yaw += d.x * 0.01;
-            self.cam.pitch = (self.cam.pitch - d.y * 0.01).clamp(-1.5, 1.5);
+            // Asset previews formerly clamped pitch to the *other* Euler
+            // branch, instantly turning the model upside down on first drag.
+            // Also use per-frame pointer delta (drag_delta is cumulative).
+            let d = ui.input(|i| i.pointer.delta());
+            self.cam.yaw = (self.cam.yaw + d.x * 0.01)
+                .rem_euclid(std::f32::consts::TAU);
+            self.cam.pitch = (self.cam.pitch - d.y * 0.01).clamp(
+                std::f32::consts::FRAC_PI_2 + 0.02,
+                std::f32::consts::PI * 1.5 - 0.02,
+            );
         }
         if resp.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
@@ -130,16 +188,11 @@ impl Viewport {
                 }
             }
         }
-        let ppp = ui.ctx().pixels_per_point();
-        let px = [
-            ((rect.width() * ppp) as usize).clamp(16, max_w.max(16)),
-            ((rect.height() * ppp) as usize).clamp(16, max_h.max(16)),
-        ];
         let highlight = if world { selected } else { None };
         let state = (self.cam, self.shading, px, self.version, highlight, show_ground, mirror);
         if self.rendered != Some(state) || self.tex.is_none() {
             let mut rgba = if world {
-                raster::render_highlight(model, vram, self.cam, self.shading, px[0], px[1], highlight, show_ground)
+                raster::render_highlight_with_sources(model, vram, self.cam, self.shading, px[0], px[1], highlight, show_ground, donor_vram)
             } else {
                 raster::render(model, vram, self.cam, self.shading, px[0], px[1])
             };
@@ -158,13 +211,9 @@ impl Viewport {
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 Color32::WHITE);
         }
-        if world && resp.clicked_by(PointerButton::Primary) {
+        if world && !repository_drag && resp.clicked_by(PointerButton::Primary) {
             if let Some(pos) = resp.interact_pointer_pos() {
-                let screen_x = (pos.x - rect.left()) * px[0] as f32 / rect.width().max(1.0);
-                let screen_point = [
-                    if mirror { (px[0] as f32 - 1.0 - screen_x).max(0.0) } else { screen_x },
-                    (pos.y - rect.top()) * px[1] as f32 / rect.height().max(1.0),
-                ];
+                let screen_point = world_screen_pick_point(rect, pos, px, mirror);
                 picked = raster::pick_instance(model, self.cam, px[0], px[1], screen_point);
             }
         }
@@ -179,6 +228,15 @@ impl Viewport {
             .on_hover_text("Viewer light; not retail lighting");
         if ui.button("Reset view").clicked() { self.frame_all(); }
     }
+}
+
+/// Convert egui logical pointer coordinates to the rasterizer's native
+/// pixel coordinates. The editor's optional mirror is presentation-only.
+fn world_screen_pick_point(rect: egui::Rect, pos: egui::Pos2,
+                           px: [usize;2], mirror: bool) -> [f32;2] {
+    let screen_x = (pos.x - rect.left()) * px[0] as f32 / rect.width().max(1.0);
+    [if mirror { (px[0] as f32 - 1.0 - screen_x).max(0.0) } else { screen_x },
+     (pos.y - rect.top()) * px[1] as f32 / rect.height().max(1.0)]
 }
 
 /// Flip RGBA8 rows horizontally, without touching the native model or VRAM.
@@ -197,6 +255,21 @@ fn flip_rgba_rows(rgba: &mut [u8], width: usize) {
 #[cfg(test)]
 mod world_navigation_tests {
     use super::*;
+    #[test]
+    fn world_object_drag_picks_exact_selected_instance_with_mirror() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 40.0), egui::vec2(200.0, 100.0));
+        let raw = world_screen_pick_point(rect, egui::pos2(150.0, 65.0), [400, 200], false);
+        assert_eq!(raw, [100.0, 50.0]);
+        let mirrored = world_screen_pick_point(rect, egui::pos2(150.0, 65.0), [400, 200], true);
+        assert_eq!(mirrored, [299.0, 50.0]);
+        // Object ID equality is strict. Dragging a different piece never
+        // captures or moves the highlighted selection.
+        let select = Some(15u32);
+        for hit in [None, Some(0), Some(16)] {
+            assert!(select.filter(|id| Some(*id) == hit).is_none());
+        }
+        assert_eq!(select.filter(|id| Some(*id) == Some(15)), Some(15));
+    }
     #[test]
     fn viewport_mirror_reverses_rows_without_touching_pixels_within_each_rgba() {
         let original = vec![1,2,3,4, 5,6,7,8, 9,10,11,12, 13,14,15,16];
@@ -226,14 +299,75 @@ mod world_navigation_tests {
 // The renderer accepts unrestricted Euler pitch. Wrapping at TAU permits
 // repeated complete loops over both poles, rather than stopping at +/-85 deg.
 // Camera pose remains unchanged on mere selection; only dragging rotates.
-fn editor_frame_front_direction(cam: &mut Camera) {
-    // Use the original studio camera's known-upright, front three-quarter
-    // angle; it was designed against the renderer's actual yaw/pitch basis.
-    // A negative pitch places the camera ABOVE the object (positive Y-up).
-    // A custom reference angle can override this in frame_instance.
-    let default = Camera::default();
-    cam.yaw = default.yaw;
-    cam.pitch = default.pitch;
+/// Relative eye direction inferred from the screenshot's selected prop:
+/// eye ~ (4790.3,1453.1,3732.5) and native PSX placement (4800,-512,5440).
+/// Render coordinates flip PSX Y, giving ~(-9.7,+941.1,-1707.5).
+/// These are a fixed *local-space* reference, not absolute world coordinates.
+const FRAME_REFERENCE_EYE_LOCAL: [f32; 3] = [-9.7, 941.1, -1707.5];
+
+/// Apply the same editor Euler composition as world_view::editor_rotate_vertex
+/// (X then Y then Z). No scale here: scale affects distance, not viewpoint.
+fn rotate_frame_euler(v: [f32; 3], r: [f32; 3]) -> [f32; 3] {
+    let (sx, cx) = r[0].sin_cos();
+    let (sy, cy) = r[1].sin_cos();
+    let (sz, cz) = r[2].sin_cos();
+    let x = v[0];
+    let y = v[1] * cx - v[2] * sx;
+    let z = v[1] * sx + v[2] * cx;
+    let xx = x * cy + z * sy;
+    let zz = -x * sy + z * cy;
+    [xx * cz - y * sz, xx * sz + y * cz, zz]
+}
+
+/// Rotate a local direction by the original PS1 object's render-space
+/// quaternion (native orientation is baked into vertex positions).
+fn rotate_frame_quat(v: [f32; 3], q: [f32; 4]) -> [f32; 3] {
+    let u = [q[0], q[1], q[2]];
+    let t = [
+        2.0 * (u[1] * v[2] - u[2] * v[1]),
+        2.0 * (u[2] * v[0] - u[0] * v[2]),
+        2.0 * (u[0] * v[1] - u[1] * v[0]),
+    ];
+    [
+        v[0] + q[3] * t[0] + u[1] * t[2] - u[2] * t[1],
+        v[1] + q[3] * t[1] + u[2] * t[0] - u[0] * t[2],
+        v[2] + q[3] * t[2] + u[0] * t[1] - u[1] * t[0],
+    ]
+}
+
+/// Universal framing from the reference screenshot, independent of where the
+/// object is located or what camera angle the user last navigated from.
+/// Object center is the center of the EDITED mesh, not the raw PSX anchor.
+fn frame_selected_pose(
+    cam: &mut Camera, scene_center: [f32; 3], scene_radius: f32,
+    object_center: [f32; 3], object_radius: f32,
+    native_quat: [f32; 4], editor_rotation: [f32; 3],
+) {
+    let native_direction = rotate_frame_quat(FRAME_REFERENCE_EYE_LOCAL, native_quat);
+    let relative_eye = rotate_frame_euler(native_direction, editor_rotation);
+    let length = relative_eye.iter().map(|v| v*v).sum::<f32>().sqrt().max(0.00001);
+    let forward: [f32; 3] = relative_eye.map(|v| -v / length);
+    // The rasterizer supports two Euler yaw/pitch representations for the
+    // SAME camera eye and forward vector. The principal asin() solution
+    // (pitch between -90 and +90 degrees) makes +world-Y point DOWN in the
+    // frame's pixel coordinates, so Frame Selected rolls the scene upside
+    // down even though the camera POSITION is correct. Choose the equivalent
+    // opposite Euler branch to keep world-up pointing UP on screen.
+    //
+    // yaw' = yaw + PI, pitch' = PI - pitch preserves forward exactly:
+    // [-sin(yaw') cos(pitch'), sin(pitch'), cos(yaw') cos(pitch')]
+    // == [-sin(yaw) cos(pitch), sin(pitch), cos(yaw) cos(pitch)]
+    // but reverses BOTH horizontal and vertical camera image axes (180 roll).
+    // Do not flip geometry, texture UVs, global renderer or camera POSITION.
+    let base_yaw = (-forward[0]).atan2(forward[2]);
+    let base_pitch = forward[1].clamp(-1.0, 1.0).asin();
+    cam.yaw = (base_yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU);
+    cam.pitch = std::f32::consts::PI - base_pitch;
+    cam.target_offset = [0, 1, 2].map(|k| object_center[k] - scene_center[k]);
+    // Preserve the existing radius-aware frame distance; scaled objects fit
+    // without introducing selection-dependent changes to the model center.
+    cam.zoom = (object_radius.max(0.01) / scene_radius.max(0.01) * 1.8)
+        .clamp(0.00015, 50.0);
 }
 
 fn editor_camera_forward(cam: Camera) -> [f32; 3] {
@@ -413,23 +547,100 @@ mod selected_orbit_navigation_tests {
     }
 
     #[test]
-    fn framing_orients_toward_native_model_front_not_top_down() {
+    fn frame_selected_matches_reference_eye_direction_and_edited_center() {
         let mut cam = Camera::default();
-        cam.pitch = std::f32::consts::FRAC_PI_2;
-        cam.yaw = 0.65;
-        let zoom = cam.zoom;
-        editor_frame_front_direction(&mut cam);
-        let forward = editor_camera_forward(cam);
-        let expected = Camera::default();
-        assert!((cam.yaw - expected.yaw).abs() < 0.000001);
-        assert!((cam.pitch - expected.pitch).abs() < 0.000001);
-        assert!(forward[2] < -0.7, "Camera should be on the model's front-facing side");
-        assert!(forward[1] < -0.1 && forward[1] > -0.5,
-            "The view should be mildly elevated, not below-ground or top-down");
-        // Since eye = target - d * forward, negative forward.Y means the
-        // camera stands ABOVE the selected point.
-        assert!(editor_camera_eye(cam, [0.0;3], 100.0)[1] > 0.0);
-        assert_eq!(cam.zoom, zoom);
+        let world_center = [1000.0, -50.0, 2000.0];
+        let center = [4800.0, 512.0, 5440.0];
+        let world_radius = 12_000.0;
+        let object_radius = 380.0;
+        let identity = [0.0, 0.0, 0.0, 1.0];
+        frame_selected_pose(&mut cam, world_center, world_radius,
+            center, object_radius, identity, [0.0; 3]);
+        let eye = editor_camera_eye(cam, world_center, world_radius);
+        let v: [f32; 3] = [0, 1, 2].map(|k| eye[k] - center[k]);
+        let length = v.iter().map(|x| x*x).sum::<f32>().sqrt();
+        let reference_length = FRAME_REFERENCE_EYE_LOCAL.iter().map(|x|x*x).sum::<f32>().sqrt();
+        for i in 0..3 {
+            assert!((v[i]/length - FRAME_REFERENCE_EYE_LOCAL[i]/reference_length).abs() < 0.0001,
+                "camera axis {i}: expected screenshot direction, got {}", v[i]/length);
+        }
+        assert!(eye[1] > center[1], "camera must look down from ABOVE the model");
+        // The previous branch preserved position but rolled the raster view
+        // upside down. +Y-up must now project toward SMALLER image-Y.
+        let screen_up = editor_world_to_camera(cam, [0.0, 1.0, 0.0]);
+        assert!(screen_up[1] < -0.01, "up direction must project UP in the viewport, not down: {screen_up:?}");
+        assert!(cam.pitch.cos() < 0.0, "framing must choose the upright Euler branch");
+        // Camera's target is the edited object, never the scene origin.
+        assert_eq!(cam.target_offset, [3800.0, 562.0, 3440.0]);
+    }
+
+    #[test]
+    fn frame_selected_tracks_each_objects_position_size_and_baked_native_yaw() {
+        let scene_center = [1000.0, 30.0, 2000.0];
+        let mut cam = Camera::default();
+        let identity = [0.0, 0.0, 0.0, 1.0];
+        let a = [2400.0, 180.0, 3900.0];
+        frame_selected_pose(&mut cam, scene_center, 10000.0,
+            a, 130.0, identity, [0.0;3]);
+        let eye_a = editor_camera_eye(cam, scene_center, 10000.0);
+        let vec_a = [0,1,2].map(|k|eye_a[k]-a[k]);
+        let dist_a = vec_a.iter().map(|v|v*v).sum::<f32>().sqrt();
+        // A larger duplicate with a different placement should preserve the
+        // screenshot-based relative angle while doubling the camera distance.
+        let b = [-1500.0, 300.0, 1100.0];
+        frame_selected_pose(&mut cam, scene_center, 10000.0,
+            b, 260.0, identity, [0.0;3]);
+        let eye_b = editor_camera_eye(cam, scene_center, 10000.0);
+        let vec_b = [0,1,2].map(|k|eye_b[k]-b[k]);
+        for k in 0..3 { assert!((vec_b[k]/2.0 - vec_a[k]).abs() < 0.05); }
+        assert!(((vec_b.iter().map(|v|v*v).sum::<f32>().sqrt()/dist_a)-2.0).abs()<0.0001);
+        // Quarter turn of the ORIGINAL PS1 object rotates the camera's local
+        // approach, rather than using a scene-global yaw.
+        let q = [0.0, std::f32::consts::FRAC_1_SQRT_2, 0.0,
+            std::f32::consts::FRAC_1_SQRT_2];
+        frame_selected_pose(&mut cam, scene_center, 10000.0,
+            b, 130.0, q, [0.0;3]);
+        let eye_native = editor_camera_eye(cam, scene_center, 10000.0);
+        let vec_native: [f32;3] = [0,1,2].map(|k|eye_native[k]-b[k]);
+        assert!((vec_native[0]-vec_a[2]).abs()<0.05);
+        assert!((vec_native[2]+vec_a[0]).abs()<0.05);
+        assert!((vec_native[1]-vec_a[1]).abs()<0.05);
+        // Editor rotation is applied on top of baked native transform.
+        frame_selected_pose(&mut cam, scene_center, 10000.0,
+            b, 130.0, identity, [0.0, std::f32::consts::FRAC_PI_2, 0.0]);
+        let eye_editor = editor_camera_eye(cam, scene_center, 10000.0);
+        let vec_editor: [f32;3] = [0,1,2].map(|k|eye_editor[k]-b[k]);
+        for k in 0..3 {assert!((vec_editor[k]-vec_native[k]).abs() < 0.05);}
+    }
+
+    #[test]
+    fn frame_selected_stays_upright_across_native_and_editor_yaws() {
+        let scene_center = [0.0, 0.0, 0.0];
+        let selected = [4000.0, 240.0, -1000.0];
+        for angle in [0.0_f32, 0.35, std::f32::consts::FRAC_PI_2,
+                      std::f32::consts::PI, 4.7] {
+            let (sin_half, cos_half) = (angle * 0.5).sin_cos();
+            let quat = [0.0, sin_half, 0.0, cos_half];
+            for editor_y in [0.0_f32, std::f32::consts::FRAC_PI_2] {
+                let mut cam = Camera::default();
+                let editor_rotation = [0.0, editor_y, 0.0];
+                frame_selected_pose(&mut cam, scene_center, 12000.0,
+                    selected, 300.0, quat, editor_rotation);
+                let eye = editor_camera_eye(cam, scene_center, 12000.0);
+                let expected = rotate_frame_euler(
+                    rotate_frame_quat(FRAME_REFERENCE_EYE_LOCAL, quat), editor_rotation);
+                let d: [f32;3] = [0,1,2].map(|k| eye[k] - selected[k]);
+                let dl = d.iter().map(|v| v*v).sum::<f32>().sqrt();
+                let el = expected.iter().map(|v| v*v).sum::<f32>().sqrt();
+                for k in 0..3 {
+                    assert!((d[k] / dl - expected[k] / el).abs() < 0.0002,
+                        "angle {angle} editor_y {editor_y} axis {k}: camera eye moved");
+                }
+                let screen_up = editor_world_to_camera(cam, [0.0, 1.0, 0.0]);
+                assert!(screen_up[1] < 0.0,
+                    "angle {angle} editor_y {editor_y}: world-up is inverted");
+            }
+        }
     }
 
     #[test]
@@ -453,5 +664,40 @@ mod selected_orbit_navigation_tests {
             assert!((0.0..std::f32::consts::TAU).contains(&cam.pitch));
         }
         near(original_eye, editor_camera_eye(cam, [500.0, 70.0, 350.0], 900.0));
+    }
+}
+
+
+#[cfg(test)]
+mod upright_defaults_regression_tests {
+    use super::*;
+
+    fn forward(cam: Camera) -> [f32; 3] {
+        let (sy, cy) = cam.yaw.sin_cos();
+        let (sp, cp) = cam.pitch.sin_cos();
+        [-sy * cp, sp, cy * cp]
+    }
+
+    #[test]
+    fn cell_open_and_frame_all_use_upright_roll_without_moving_eye() {
+        let raw = Camera::default();
+        let mut viewport = Viewport::new(Shading::Textured);
+        let corrected = viewport.cam;
+        for (a, b) in forward(raw).into_iter().zip(forward(corrected)) {
+            assert!((a - b).abs() < 1e-5, "camera look vector must not move");
+        }
+        assert!(corrected.pitch.cos() < 0.0, "screen-up must remain upright");
+        assert_eq!(corrected.zoom, raw.zoom);
+        assert_eq!(corrected.target_offset, raw.target_offset);
+        viewport.cam.pitch = 0.2;
+        viewport.frame_all();
+        assert_eq!(viewport.cam, corrected, "Frame All must restore upright camera");
+    }
+
+    #[test]
+    fn preview_drag_pitch_limits_stay_on_upright_euler_branch() {
+        let cam = upright_default_camera();
+        assert!(cam.pitch > std::f32::consts::FRAC_PI_2 + 0.02);
+        assert!(cam.pitch < std::f32::consts::PI * 1.5 - 0.02);
     }
 }

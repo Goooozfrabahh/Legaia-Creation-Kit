@@ -43,6 +43,7 @@ legaia-mdec.workspace = true
 legaia-mes.workspace = true
 legaia-prot.workspace = true
 legaia-scene-formats.workspace = true
+legaia-disc-patch.workspace = true
 legaia-seq.workspace = true
 legaia-tim.workspace = true
 legaia-tmd.workspace = true

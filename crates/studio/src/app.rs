@@ -4,7 +4,16 @@ mod actors_ui;
 mod media_ui;
 mod viewport;
 mod world_view;
+mod scene_instances;
+mod placement_drop;
+mod cell_catalog;
+mod ps1_export;
+mod export_integration;
+mod collision_wire;
+mod object_collision;
+mod global_repository;
 
+use anyhow::Context;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,6 +29,35 @@ use crate::raster::{Model, Shading};
 use crate::scene_vram::SceneVram;
 use crate::{Source, Studio, export};
 use viewport::Viewport;
+use cell_catalog::{CellSelection, CellStore};
+
+/// One framing path for the toolbar and F key: never remember an arbitrary
+/// global camera yaw or frame around a different object. Resolve the original
+/// PS1 placement orientation (including tilt), then layer the selected editor
+/// instance's rotation, center and scale on top.
+fn frame_world_selection(
+    viewport: &mut Viewport,
+    world: &world_view::WorldModel,
+    scene: &legaia_engine_scene::scene_assembly::AssembledScene,
+    selected: Option<(bool, usize)>,
+) {
+    let (Some(model), Some((terrain, index))) = (world.model.as_ref(), selected) else { return; };
+    let Some(draw) = world.at(terrain, index).filter(|d| !d.hidden && d.radius > 0.0)
+        else { return; };
+    // A duplicate inherits its native object's baked orientation. New editor
+    // rotation is applied separately, rather than interpreting it as native.
+    let (source_terrain, source_index) = draw.source_ref.unwrap_or((terrain, index));
+    let native = if source_terrain {
+        scene.terrain.get(source_index)
+    } else {
+        scene.placements.get(source_index)
+    };
+    let original_quat = native
+        .map(legaia_engine_scene::scene_assembly::draw_rotation_quat)
+        .unwrap_or([0.0, 0.0, 0.0, 1.0]);
+    let radius = draw.radius * draw.scale.iter().copied().fold(1.0_f32, f32::max);
+    viewport.frame_instance(model, draw.center, radius, original_quat, draw.rotation);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -194,6 +232,96 @@ struct EditorTransformEdit {
     after: [f32; 3],
 }
 
+#[derive(Clone, Copy)]
+struct EditorRotateDrag {
+    key: (bool, usize),
+    pointer_start: egui::Pos2,
+    rotation_start: [f32;3],
+    /// Plain right-drag is Y (yaw), Alt+right-drag is X (pitch).
+    pitch_axis: bool,
+}
+
+#[derive(Clone, Copy)]
+struct EditorRotationEdit {
+    key: (bool,usize),
+    before: [f32;3],
+    after: [f32;3],
+}
+
+#[derive(Clone, PartialEq)]
+struct EditorSceneHistory {
+    /// Full editor-only scene state: undo can restore deleted duplicates too.
+    overlay: String,
+    /// Stable selection identity, unaffected by recreated duplicate indices.
+    selected: Option<scene_instances::NameTarget>,
+}
+
+fn editor_history_capture(world: &world_view::WorldModel, scene_name: &str,
+                          selected: Option<(bool, usize)>) -> EditorSceneHistory {
+    let selected=selected.and_then(|key|world.at(key.0,key.1).map(|draw|
+        match draw.editor_uid {
+            Some(uid) => scene_instances::NameTarget::Created(uid),
+            None => scene_instances::NameTarget::Native(key.0,key.1),
+        }));
+    EditorSceneHistory {overlay: scene_instances::serialize(scene_name,world), selected}
+}
+
+fn editor_history_selected(world: &world_view::WorldModel,
+                           target: &scene_instances::NameTarget) -> Option<(bool,usize)> {
+    match target {
+        scene_instances::NameTarget::Native(t,i)=>Some((*t,*i)),
+        scene_instances::NameTarget::Created(uid)=>world.draws.iter()
+            .find(|d|d.editor_uid==Some(*uid)).map(|d|(d.terrain,d.index)),
+    }
+}
+
+/// Rotation is in radians and normalized to avoid unbounded angular values
+/// after prolonged dragging. Prevents NaNs reaching the CPU rasterizer.
+fn editor_rotate_drag(start: [f32;3], pixels: egui::Vec2, pitch_axis: bool, mirror: bool) -> [f32;3] {
+    let mut result=start;
+    let axis=if pitch_axis {0} else {1};
+    let delta=if pitch_axis { pixels.y } else if mirror { -pixels.x } else { pixels.x };
+    let angle=start[axis] + delta*0.01;
+    if angle.is_finite() {
+        result[axis]=(angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)-std::f32::consts::PI;
+    }
+    result
+}
+
+/// GECK Phase 1: session clipboard stores RELATIVE editor offsets and local
+/// Euler rotation/scale, never original PS1/MAP records or absolute anchors.
+#[derive(Clone, Copy)]
+struct GeckTransformClipboard {
+    offset: [f32; 3],
+    rotation: [f32; 3],
+    scale: [f32; 3],
+}
+
+/// Snap only the actively dragged Euler axis; existing native placement
+/// rotations and the camera's upright/Frame Selected orientation are untouched.
+fn geck_snap_euler_axis(mut value: [f32; 3], axis: usize, degrees: f32) -> [f32; 3] {
+    if axis < 3 && degrees.is_finite() && degrees > 0.0 && value[axis].is_finite() {
+        let step = degrees.to_radians();
+        value[axis] = ((value[axis] / step).round() * step
+            + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+            - std::f32::consts::PI;
+    }
+    value
+}
+
+#[cfg(test)]
+mod geck_phase1_tests {
+    use super::geck_snap_euler_axis;
+    #[test]
+    fn angle_snap_is_axis_specific_and_off_is_identity() {
+        let input = [0.33_f32, 14.8_f32.to_radians(), -0.44];
+        assert_eq!(geck_snap_euler_axis(input, 1, 0.0), input);
+        let result = geck_snap_euler_axis(input, 1, 15.0);
+        assert!((result[1].to_degrees() - 15.0).abs() < 0.001);
+        assert_eq!(result[0], input[0]);
+        assert_eq!(result[2], input[2]);
+    }
+}
 
 /// Stable references to objects in the indexed native asset catalogue.
 /// Source-only archive rows are deliberately NOT advertised as placeable.
@@ -206,11 +334,26 @@ enum EditorCatalogItem {
     Archive(usize),
 }
 
+struct EditorRename {
+    key: (bool, usize),
+    text: String,
+}
+
 enum EditorPreview {
     Mesh(Model),
     Actor(crate::actors::Actor),
     Unavailable(String),
 }
+
+/// A single on-demand donor scene is cached for viewing its authentic TMD
+/// and source VRAM; never uses the destination scene's texture atlas.
+struct GlobalAssetPreview {
+    id: usize,
+    scene: Option<Arc<legaia_engine_scene::scene_assembly::AssembledScene>>,
+    model: Option<Model>,
+    issue: Option<String>,
+}
+
 
 /// Extract only the triangles belonging to one native draw. The main
 /// assembly, its source PS1 vertices and the active world view stay untouched.
@@ -244,13 +387,82 @@ fn editor_isolate_draw(model: &Model, id: u32) -> Option<Model> {
     Some(out)
 }
 
+/// Build a preview from an original placed TMD using precisely the same
+/// native MAP placement rotation, position, and PS1-down-Y -> viewer-up-Y
+/// conversion used by the world renderer.  This is a copy only: it cannot
+/// rotate or rewrite the donor TMD, destination cell, or the exported IMG.
+fn editor_preview_placed_tmd(
+    scene: &legaia_engine_scene::scene_assembly::AssembledScene,
+    kind: &str,
+    record: usize,
+) -> Option<Model> {
+    let (mut mesh, display_points) =
+        world_view::foreign_original_geometry(scene, kind, record).ok()?;
+    editor_preview_positions(&mut mesh, display_points)?;
+    Some(mesh)
+}
+
+/// A free-standing reusable TMD has no intrinsic "up" metadata.  Prefer a
+/// real in-game placement of that SAME resource as the reference orientation
+/// (some source models require native 180-degree placement rotations).
+/// If the source TMD is never placed in its cell, preserve native geometry
+/// except for the confirmed PS1 Y-down -> editor Y-up coordinate conversion.
+fn editor_preview_reusable_tmd(
+    scene: &legaia_engine_scene::scene_assembly::AssembledScene,
+    slot: usize,
+) -> Option<Model> {
+    let resource = *scene.env_tmds.get(slot)?;
+    if let Some((index, _)) = scene.placements.iter().enumerate()
+        .find(|(_, draw)| draw.res_tmd == resource)
+    {
+        if let Some(mesh) = editor_preview_placed_tmd(scene, "placement", index) {
+            return Some(mesh);
+        }
+    }
+    if let Some((index, _)) = scene.terrain.iter().enumerate()
+        .find(|(_, draw)| draw.res_tmd == resource)
+    {
+        if let Some(mesh) = editor_preview_placed_tmd(scene, "terrain", index) {
+            return Some(mesh);
+        }
+    }
+    let mut mesh = Model::from_tmd(&scene.res.tmds.get(resource)?.raw)?;
+    let points = mesh.positions.iter().map(|p| [p[0], -p[1], p[2]]).collect();
+    editor_preview_positions(&mut mesh, points)?;
+    Some(mesh)
+}
+
+/// Transform vertex copies and restore consistent rest pose / bounds.
+/// The common camera must remain upright; it does not compensate for
+/// individual native TMDs having PS1-down-Y or nonzero placement rotation.
+fn editor_preview_positions(mesh: &mut Model, points: Vec<[f32; 3]>) -> Option<()> {
+    if points.is_empty() || points.len() != mesh.positions.len() ||
+       points.iter().any(|p| p.iter().any(|v| !v.is_finite())) {
+        return None;
+    }
+    mesh.positions = points;
+    mesh.rest = mesh.positions.clone();
+    mesh.refit();
+    Some(())
+}
+
+/// Cross-panel repository gesture capture. Egui's ScrollArea may claim the
+/// drag before a row's Response::drag_started; capture the PRIMARY PRESS on
+/// the row rect immediately, then maintain the asset in editor state.
+fn catalog_pointer_pressed_on(ui: &egui::Ui, rect: egui::Rect) -> bool {
+    ui.input(|i| i.pointer.primary_pressed() &&
+        i.pointer.interact_pos().is_some_and(|p| rect.contains(p)))
+}
+
 /// One indexed subgroup: the search filters locally and only expanded groups
 /// draw their rows; opening a context menu never changes the camera.
 fn editor_catalog_group(ui: &mut egui::Ui, title: &str,
                         rows: &[(String, EditorCatalogItem)], filter: &str,
                         selected: Option<(bool, usize)>,
+                        catalog_active: Option<EditorCatalogItem>,
                         chosen: &mut Option<(EditorCatalogItem, bool)>,
-                        clicked: &mut Option<EditorCatalogItem>) {
+                        clicked: &mut Option<EditorCatalogItem>,
+                        drag_started: &mut Option<EditorCatalogItem>) {
     let term = filter.trim().to_lowercase();
     let matches = rows.iter().filter(|(label, _)| term.is_empty() ||
         label.to_lowercase().contains(&term)).count();
@@ -263,11 +475,42 @@ fn editor_catalog_group(ui: &mut egui::Ui, title: &str,
                 if !term.is_empty() && !label.to_lowercase().contains(&term) { continue; }
                 let active = match item {
                     EditorCatalogItem::Draw(terrain, index) =>
-                        selected == Some((*terrain, *index)),
-                    _ => false,
+                        catalog_active == Some(*item) || selected == Some((*terrain, *index)),
+                    _ => catalog_active == Some(*item),
                 };
-                let response = ui.selectable_label(active, label);
+                // Capture drag intent at MOUSE DOWN rather than waiting for
+                // response.drag_started(). A parent ScrollArea can claim the
+                // scroll gesture first, preventing cross-panel drag_started.
+                // The global primary-press state is independent of widget capture.
+                let placeable = matches!(item,
+                    EditorCatalogItem::Draw(..) | EditorCatalogItem::Mesh(..));
+                let display = if placeable {
+                    format!("↳  {label}")
+                } else { label.clone() };
+                // Non-selectable label: Windows should never highlight letters
+                // while the artist drags a complete repository record.
+                let response = ui.add_sized(
+                    egui::vec2(ui.available_width().max(40.0), 23.0),
+                    egui::Label::new(display).selectable(false)
+                        .sense(egui::Sense::click_and_drag()));
+                if active || response.hovered() {
+                    let stroke=if active { Color32::from_rgb(255,196,66) }
+                        else { Color32::from_rgb(105,146,198) };
+                    ui.painter().rect_stroke(response.rect, egui::CornerRadius::same(3),
+                        egui::Stroke::new(if active { 2.0 } else { 1.0 }, stroke),
+                        egui::StrokeKind::Inside);
+                }
+                // Use the press point, not the row's drag ownership: this
+                // remains reliable while crossing egui panels.
+                if placeable && (response.drag_started() ||
+                    catalog_pointer_pressed_on(ui, response.rect)) {
+                    *drag_started=Some(*item);
+                }
                 if response.clicked() { *clicked = Some(*item); }
+                let response=if placeable {
+                    response.on_hover_cursor(egui::CursorIcon::Grab)
+                        .on_hover_text("Drag this whole asset into the viewport. Drop anywhere at its F framing distance; hold Shift for ground snap.")
+                } else { response };
                 response.context_menu(|ui| {
                     if ui.button("Properties").clicked() {
                         *chosen = Some((*item, false)); ui.close();
@@ -280,8 +523,60 @@ fn editor_catalog_group(ui: &mut egui::Ui, title: &str,
         });
 }
 
+/// Use the same duplicate parameters for the toolbar button and Ctrl+D.
+/// Copies always point back to the original PS1 mesh, but inherit the selected
+/// instance's editor-only offset before being moved +128 units along X.
+fn editor_duplicate_request(
+    world: &world_view::WorldModel,
+    selected: Option<(bool, usize)>,
+) -> Option<((bool, usize), [f32; 3], [f32; 3], Option<(u8,u8,usize)>)> {
+    let key = selected?;
+    let draw = world.at(key.0, key.1)?;
+    if draw.hidden || draw.vertex_start==draw.vertex_end { return None; }
+    let source = draw.source_ref.unwrap_or(key);
+    let mut offset = draw.offset;
+    offset[0] += 128.0;
+    let actor=world.npc(key).map(|n|(n.model_index,n.clip,n.frame));
+    Some((source, offset, draw.rotation,actor))
+}
+
+/// The native-scene hierarchy uses its own context menu: unlike the asset
+/// browser's names, these rename individual scene instances only.
+fn editor_hierarchy_row(ui: &mut egui::Ui, label: String,
+    key: (bool,usize), selected: &mut Option<(bool,usize)>,
+    chosen: &mut Option<(EditorCatalogItem,bool)>,
+    rename: &mut Option<(bool,usize)>) {
+    let response = ui.selectable_label(*selected==Some(key), label);
+    if response.clicked() || response.secondary_clicked() { *selected=Some(key); }
+    response.context_menu(|ui| {
+        if ui.button("Properties").clicked() {
+            *chosen=Some((EditorCatalogItem::Draw(key.0,key.1),false)); ui.close();
+        }
+        if ui.button("Preview").clicked() {
+            *chosen=Some((EditorCatalogItem::Draw(key.0,key.1),true)); ui.close();
+        }
+        if ui.button("Rename").clicked() { *rename=Some(key); ui.close(); }
+    });
+}
+
+/// One editor cell is selected at a time; context menu operations are
+/// deferred so they never mutate or invalidate the catalog while iterating.
+fn editor_cell_row(ui: &mut egui::Ui, id: CellSelection, label: String,
+    selected: &mut Option<CellSelection>, focus_cell: &mut bool,
+    choose: &mut Option<CellSelection>, duplicate: &mut Option<CellSelection>,
+    rename: &mut Option<CellSelection>, properties: &mut Option<CellSelection>) {
+    let response=ui.selectable_label(selected.as_ref()==Some(&id),label);
+    if response.clicked() { *selected=Some(id.clone()); *choose=Some(id.clone()); *focus_cell=true; }
+    if response.secondary_clicked() { *selected=Some(id.clone()); *focus_cell=true; }
+    response.context_menu(|ui| {
+        if ui.button("Properties").clicked() { *properties=Some(id.clone()); ui.close(); }
+        if ui.button("Duplicate (Ctrl+D)").clicked() { *duplicate=Some(id.clone()); ui.close(); }
+        if ui.button("Rename").clicked() { *rename=Some(id); ui.close(); }
+    });
+}
+
 /// Perspective-aware screen drag, projected onto the horizontal XZ plane.
-/// Ctrl+Shift instead moves on the vertical axis. Flip the view's horizontal
+/// Ctrl+left-drag instead moves on the vertical axis. Flip the view's horizontal
 /// drag only in the editor's presentation layer, as v0.4.3.1 already does.
 fn editor_drag_offset(start: [f32; 3], pixels: egui::Vec2,
                       cam: crate::raster::Camera, radius: f32,
@@ -303,7 +598,7 @@ fn editor_drag_offset(start: [f32; 3], pixels: egui::Vec2,
 fn serialize_editor_offsets(scene_name: &str, world: &world_view::WorldModel) -> String {
     let mut data = format!("LEGAIA_OFFSETS_V1\t{scene_name}\n");
     for d in &world.draws {
-        if d.offset != [0.0; 3] {
+        if d.editor_uid.is_none() && d.offset != [0.0; 3] {
             data.push_str(&format!("{}\t{}\t{}\t{}\t{}\n",
                 if d.terrain { "terrain" } else { "placement" }, d.index,
                 d.offset[0], d.offset[1], d.offset[2]));
@@ -379,6 +674,8 @@ fn editor_item_name_key(scene: Option<&legaia_engine_scene::scene_assembly::Asse
                         item: EditorCatalogItem) -> Option<String> {
     match item {
         EditorCatalogItem::Mesh(slot) => editor_mesh_name_key(scene?, slot),
+        EditorCatalogItem::Draw(false,index) if index >= world_view::NPC_KEY_BASE =>
+            Some(format!("cell:{}|npc:man:{}",scene?.name,index-world_view::NPC_KEY_BASE)),
         EditorCatalogItem::Draw(terrain, index) => {
             let scene = scene?;
             let draw = (if terrain { &scene.terrain } else { &scene.placements }).get(index)?;
@@ -398,6 +695,9 @@ fn editor_native_item_hint(scene: Option<&legaia_engine_scene::scene_assembly::A
                            item: EditorCatalogItem) -> String {
     match item {
         EditorCatalogItem::Draw(terrain, i) => {
+            if !terrain && i >= world_view::NPC_KEY_BASE {
+                return format!("Unidentified field actor MAN #{}",i-world_view::NPC_KEY_BASE);
+            }
             let Some(draw) = scene.and_then(|s| (if terrain { &s.terrain } else { &s.placements }).get(i)) else {
                 return "Unidentified object".to_owned();
             };
@@ -426,13 +726,74 @@ pub struct App {
     native_selected: Option<(bool, usize)>, // false = placement; true = terrain
     native_view: Viewport,
     native_ground_visible: bool,
+    /// Show native field-wall collision without altering editor/game data.
+    native_collision_wire_visible: bool,
+    /// Inspect this specific object's transformed mesh as a collision draft.
+    /// Unlike the native MAP overlay, this is NOT in-game collision data.
+    object_collision_draft_visible: bool,
+    native_collision_grid: Option<collision_wire::CollisionGrid>,
+    /// Stage Q5 Fix 2: cache native donor MAP/TMD collision preflight by scene
+    /// and complete LCK placement overlay. Never re-decode a donor every frame.
+    native_collision_preview_cache: Option<(String, Result<ps1_export::ExportEdits,String>)>,
     native_move_mode: EditorMoveMode,
     native_grid_size: f32,
     native_anchor_snap: bool,
+    /// None = free X/Z dragging; Some(0) = X-only; Some(2) = Z-only.
+    geck_drag_axis: Option<usize>,
+    /// Zero disables angle snap; degrees are converted to radians in the drag code.
+    geck_angle_snap: f32,
+    geck_transform_clipboard: Option<GeckTransformClipboard>,
+    /// Session-only camera bookmarks: no changes to original scene or native IMG.
+    geck_camera_bookmarks: [Option<crate::raster::Camera>; 3],
     native_drag: Option<EditorDrag>,
+    native_rotate: Option<EditorRotateDrag>,
+    native_rotate_undo: Vec<EditorRotationEdit>,
+    native_rotate_redo: Vec<EditorRotationEdit>,
+    editor_undo: Vec<EditorSceneHistory>,
+    editor_redo: Vec<EditorSceneHistory>,
+    editor_gesture_start: Option<EditorSceneHistory>,
+    /// Animation previews change only the selected scene's raster vertices.
+    npc_playing: Option<(bool,usize)>,
+    npc_next_tick: f64,
     native_undo: Vec<EditorTransformEdit>,
     native_redo: Vec<EditorTransformEdit>,
     editor_search: String,
+    /// Entire-disc original asset inventory, independent of the active cell.
+    global_repository: Vec<global_repository::Asset>,
+    global_repository_rx: Option<Receiver<global_repository::Batch>>,
+    global_repository_started: bool,
+    global_repository_completed: usize,
+    global_repository_total: usize,
+    global_repository_failures: usize,
+    global_repository_drag: Option<usize>,
+    global_repository_selected: Option<usize>,
+    /// (global ID, preview=true / properties=false)
+    global_repository_dialog: Option<(usize,bool)>,
+    global_repository_preview: Option<GlobalAssetPreview>,
+    global_repository_preview_view: Viewport,
+    global_name_edit_key: Option<String>,
+    global_name_draft: Record,
+    global_name_status: Option<String>,
+    global_repository_target: Option<String>,
+    global_repository_tmd_hashes: Vec<(u64,usize)>,
+    /// Explicit single-open accordion. Nothing expanded when LCK starts.
+    global_open_category: Option<usize>,
+    global_open_branch: Option<bool>, // world objects: towns or other scenes
+    global_open_scene: Option<String>,
+    /// Independent left-pane cell browser (separate scroll and drag-to-resize splitter).
+    editor_cell_search: String,
+    editor_cells: CellStore,
+    editor_cell_selected: Option<CellSelection>,
+    editor_cell_active: Option<CellSelection>,
+    editor_cell_rename: Option<(CellSelection, String)>,
+    editor_cell_properties: Option<CellSelection>,
+    editor_cell_last_autosave: f64,
+    /// Background native test-image export; no edits to the currently open image.
+    ps1_export_job: Option<Receiver<anyhow::Result<ps1_export::ExportResult>>>,
+    /// Source being dragged across the panels (no mouse-driven text selection).
+    editor_asset_drag: Option<EditorCatalogItem>,
+    /// Highlight a single catalog entry while dragging or after clicking.
+    editor_catalog_active: Option<EditorCatalogItem>,
     editor_modal: Option<(EditorCatalogItem, bool)>, // false: properties; true: preview
     editor_preview: Option<(EditorCatalogItem, EditorPreview)>,
     editor_preview_view: Viewport,
@@ -441,7 +802,11 @@ pub struct App {
     editor_names: Catalog,
     editor_catalog_error: Option<String>,
     editor_hierarchy_filter: String,
-    editor_inspector_open: bool,
+    editor_rename: Option<EditorRename>,
+    /// Detached inspector never reserves height in the scene viewport.
+    editor_properties_target: Option<(bool, usize)>,
+    /// Right-click context menu appears only for an un-dragged selected mesh.
+    editor_context_menu: Option<(egui::Pos2, (bool, usize))>,
     editor_name_edit_key: Option<String>,
     editor_name_draft: Record,
     editor_name_apply_mesh: bool,
@@ -549,30 +914,81 @@ impl App {
             Ok(catalog) => (catalog, None),
             Err(error) => (Catalog::default(), Some(error)),
         };
+        let (editor_cells, cell_catalog_error)=match CellStore::open(studio.settings.last_source.as_deref()) {
+            Ok(cells)=>(cells,None),
+            Err(error)=>(CellStore::default(),Some(error)),
+        };
         let mut app = Self {
             studio,
             mode,
             tab,
             native_scene: None,
             native_selected: None,
-            native_view: Viewport::new(Shading::Lit),
+            native_view: Viewport::new(Shading::Textured),
             native_ground_visible: true,
+            native_collision_wire_visible: false,
+            object_collision_draft_visible: false,
+            native_collision_grid: None,
+            native_collision_preview_cache: None,
             native_move_mode: EditorMoveMode::Grid,
             native_grid_size: 32.0,
             native_anchor_snap: false,
+            geck_drag_axis: None,
+            geck_angle_snap: 0.0,
+            geck_transform_clipboard: None,
+            geck_camera_bookmarks: [None; 3],
             native_drag: None,
+            native_rotate: None,
+            native_rotate_undo: Vec::new(),
+            native_rotate_redo: Vec::new(),
+            editor_undo: Vec::new(),
+            editor_redo: Vec::new(),
+            editor_gesture_start: None,
+            npc_playing: None,
+            npc_next_tick: 0.0,
             native_undo: Vec::new(),
             native_redo: Vec::new(),
             editor_search: String::new(),
+            global_repository: Vec::new(),
+            global_repository_rx: None,
+            global_repository_started: false,
+            global_repository_completed: 0,
+            global_repository_total: 0,
+            global_repository_failures: 0,
+            global_repository_drag: None,
+            global_repository_selected: None,
+            global_repository_dialog: None,
+            global_repository_preview: None,
+            global_repository_preview_view: Viewport::new(Shading::Textured),
+            global_name_edit_key: None,
+            global_name_draft: Record::default(),
+            global_name_status: None,
+            global_repository_target: None,
+            global_repository_tmd_hashes: Vec::new(),
+            global_open_category: None,
+            global_open_branch: None,
+            global_open_scene: None,
+            editor_cell_search: String::new(),
+            editor_cells,
+            editor_cell_selected: None,
+            editor_cell_active: None,
+            editor_cell_rename: None,
+            editor_cell_properties: None,
+            editor_cell_last_autosave: 0.0,
+            ps1_export_job: None,
+            editor_asset_drag: None,
+            editor_catalog_active: None,
             editor_modal: None,
             editor_preview: None,
             editor_preview_view: Viewport::new(Shading::Textured),
             editor_monsters: None,
             editor_archives: None,
             editor_names,
-            editor_catalog_error,
+            editor_catalog_error: editor_catalog_error.or(cell_catalog_error),
             editor_hierarchy_filter: String::new(),
-            editor_inspector_open: true,
+            editor_rename: None,
+            editor_properties_target: None,
+            editor_context_menu: None,
             editor_name_edit_key: None,
             editor_name_draft: Record::default(),
             editor_name_apply_mesh: false,
@@ -640,13 +1056,52 @@ impl App {
     }
 
     fn open_path(&mut self, p: &Path) {
+        self.save_active_editor_cell();
+        match CellStore::open(Some(p)) {
+            Ok(cells)=>{self.editor_cells=cells;self.editor_cell_selected=None;self.editor_cell_active=None;
+                self.editor_cell_rename=None;self.editor_cell_properties=None;},
+            Err(err)=>{self.editor_cells=CellStore::default();
+                self.editor_cell_selected=None;self.editor_cell_active=None;self.studio.error=Some(format!("Cell catalog: {err}"));},
+        }
+        // A newly opened disc has a different asset identity / index.
+        // Dropping the receiver cancels the old scan on its next send.
+        self.global_repository.clear();
+        self.global_repository_rx = None;
+        self.global_repository_started = false;
+        self.global_repository_completed = 0;
+        self.global_repository_total = 0;
+        self.global_repository_failures = 0;
+        self.global_repository_drag = None;
+        self.global_repository_selected = None;
+        self.global_repository_dialog = None;
+        self.global_repository_preview = None;
+        self.global_name_edit_key = None;
+        self.global_name_status = None;
+        self.global_repository_target = None;
+        self.global_repository_tmd_hashes.clear();
+        self.global_open_category = None;
+        self.global_open_branch = None;
+        self.global_open_scene = None;
         self.native_scene = None;
+        self.native_collision_preview_cache = None;
         self.native_selected = None;
         self.native_drag = None;
+        self.editor_asset_drag = None;
+        self.editor_catalog_active = None;
+        self.native_rotate = None;
+        self.native_rotate_undo.clear();
+        self.native_rotate_redo.clear();
+        self.editor_undo.clear();
+        self.editor_redo.clear();
+        self.editor_gesture_start=None;
+        self.npc_playing=None;
         self.native_undo.clear();
         self.native_redo.clear();
         self.editor_modal = None;
         self.editor_preview = None;
+        self.editor_rename = None;
+        self.editor_properties_target = None;
+        self.editor_context_menu = None;
         self.editor_monsters = None;
         self.editor_archives = None;
         self.native_view.version = self.native_view.version.wrapping_add(1);
@@ -883,19 +1338,32 @@ impl App {
             let result = legaia_engine_world_views::scene_staging::assemble_field_scene(
                 index.as_ref(), &requested_name,
             ).map(|scene| {
-                let world = world_view::build_world(&scene);
+                let world = world_view::build_world(&scene, index.as_ref());
                 (scene, world)
             });
             let _ = tx.send(result);
         });
         self.native_scene = Some((scene_name, NativeSceneSlot::Loading(rx)));
+        self.native_collision_preview_cache = None;
         self.native_selected = None;
         self.native_drag = None;
+        self.native_rotate = None;
+        self.native_rotate_undo.clear();
+        self.native_rotate_redo.clear();
+        self.editor_undo.clear();
+        self.editor_redo.clear();
+        self.editor_gesture_start=None;
+        self.npc_playing=None;
         self.native_undo.clear();
         self.native_redo.clear();
         self.editor_modal = None;
         self.editor_preview = None;
-        self.native_view.cam = crate::raster::Camera::default();
+        self.editor_rename = None;
+        self.editor_properties_target = None;
+        self.editor_context_menu = None;
+        // The normal Frame All reset now uses the upright Euler branch.
+        // Frame Selected / F uses frame_instance and is deliberately unchanged.
+        self.native_view.frame_all();
         self.native_view.version = self.native_view.version.wrapping_add(1);
     }
 
@@ -904,6 +1372,19 @@ impl App {
     fn editor_name_for(&self,
             scene: Option<&legaia_engine_scene::scene_assembly::AssembledScene>,
             item: EditorCatalogItem) -> String {
+        if let EditorCatalogItem::Draw(false,index) = item {
+            if index >= world_view::NPC_KEY_BASE {
+                if let Some(name) = editor_item_name_key(scene,item)
+                    .and_then(|key|self.editor_names.get(&key)) {
+                    return name.clone();
+                }
+                if let Some((_,NativeSceneSlot::Ready(_,world))) = self.native_scene.as_ref()
+                    && let Some(npc) = world.npc((false,index)) {
+                    return npc.evidence_label();
+                }
+                return format!("Field actor MAN #{}",index-world_view::NPC_KEY_BASE);
+            }
+        }
         if let Some(key) = editor_item_name_key(scene, item) {
             if let Some(name) = self.editor_names.get(&key) { return name.clone(); }
         }
@@ -937,6 +1418,13 @@ impl App {
         if term.is_empty() { return true; }
         let key = editor_item_name_key(scene, item).unwrap_or_default();
         let mut text = format!("{} {}", self.editor_name_for(scene, item), self.editor_names.search_text(&key));
+        if let EditorCatalogItem::Draw(false,index)=item {
+            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_ref()
+                && let Some(npc)=world.npc((false,index)) {
+                    text.push_str(&format!(" {} ANM {} TMD {} MAN {} {}",
+                        npc.dialog.as_deref().unwrap_or(""),npc.anim_id,npc.model_index,npc.record,npc.kind));
+                }
+        }
         if let (Some(s), EditorCatalogItem::Draw(terrain, i)) = (scene, item) {
             if let Some(d) = (if terrain { &s.terrain } else { &s.placements }).get(i) {
                 if let Some(mesh_key) = editor_mesh_name_key(s, d.env_slot) {
@@ -1033,6 +1521,10 @@ impl App {
             items.extend((0..scene.placements.len()).map(|i| EditorCatalogItem::Draw(false, i)));
             items.extend((0..scene.terrain.len()).map(|i| EditorCatalogItem::Draw(true, i)));
             items.extend((0..scene.env_tmds.len()).map(EditorCatalogItem::Mesh));
+            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_ref() {
+                items.extend(world.npcs.iter().filter(|n|!n.is_copy)
+                .map(|n|EditorCatalogItem::Draw(false,n.key)));
+            }
         }
         items.extend((0..4).map(EditorCatalogItem::Character));
         if let Some(monsters) = &self.editor_monsters {
@@ -1072,138 +1564,563 @@ impl App {
         text
     }
 
-    /// Object Window, redesigned as a scrollable indexed asset list.
-    /// Only the scene's native mesh slots and placed instances are actual
-    /// environment renderables; actor/archive entries are source references.
-    fn editor_catalog(&mut self, ui: &mut egui::Ui,
-                      scene: Option<&legaia_engine_scene::scene_assembly::AssembledScene>) {
-        ui.heading("All Objects");
-        ui.add(egui::TextEdit::singleline(&mut self.editor_search)
-            .hint_text("Search objects, characters, monsters..."));
-        ui.small("Right-click for identification or preview. Esc closes preview.");
-        if let Some(error) = &self.editor_catalog_error {
-            ui.colored_label(Color32::LIGHT_RED, format!("Catalog: {error}"));
+    /// Persist a copied cell's overlay without writing to the PS1 disc.
+    /// Invoked when changing cells, closing the application and periodically
+    /// while editing a project copy (avoids losing unsaved scene changes).
+    fn save_active_editor_cell(&mut self) {
+        let Some(CellSelection::Copy(id))=self.editor_cell_active.as_ref() else {return};
+        let Some((source,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_ref() else {return};
+        let overlay=scene_instances::serialize(source,world);
+        if let Err(error)=self.editor_cells.write_overlay(*id,&overlay) {
+            self.studio.error=Some(format!("Cell copy autosave failed: {error}"));
         }
-        ui.small(format!("{} saved name records", self.editor_names.records.len()));
+    }
+
+    fn select_editor_cell(&mut self, cell: CellSelection) {
+        if self.editor_cell_active.as_ref()==Some(&cell) &&
+            self.native_scene.as_ref().is_some_and(|(_,slot)|matches!(slot,NativeSceneSlot::Ready(..)|NativeSceneSlot::Loading(..))) {
+            return;
+        }
+        let Some(source)=self.editor_cells.source(&cell).map(str::to_owned) else {
+            self.studio.error=Some("Selected project cell is missing".into());
+            return;
+        };
+        self.save_active_editor_cell();
+        self.editor_cell_selected=Some(cell.clone());
+        self.editor_cell_active=Some(cell);
+        self.load_native_scene(source);
+    }
+
+    fn duplicate_editor_cell(&mut self, selected: CellSelection) {
+        let Some(source)=self.editor_cells.source(&selected).map(str::to_owned) else {
+            self.studio.error=Some("No source cell for selected copy".into());
+            return;
+        };
+        let current=self.editor_cell_active.as_ref()==Some(&selected);
+        let overlay=if current {
+            self.native_scene.as_ref().and_then(|(name,slot)| {
+                if name==&source {
+                    if let NativeSceneSlot::Ready(_,world)=slot {
+                        return Some(scene_instances::serialize(name,world));
+                    }
+                }
+                None
+            })
+        } else {None};
+        let overlay=match (overlay, &selected) {
+            (Some(text),_) => text,
+            (None,CellSelection::Copy(id))=> match self.editor_cells.read_overlay(*id) {
+                Ok(text)=>text,
+                Err(error)=>{self.studio.error=Some(format!("Cannot duplicate cell: {error}"));return;}
+            },
+            (None,CellSelection::Original(_))=>format!("LCK_SCENE_V1\t{source}\n"),
+        };
+        let base=self.editor_cells.label(&selected).unwrap_or_else(|| source.clone());
+        let name=format!("{} Copy",base);
+        match self.editor_cells.duplicate(source,name,&overlay) {
+            Ok(id)=>{
+                self.select_editor_cell(CellSelection::Copy(id));
+                self.studio.status=Some(format!("Created independent editor cell copy #{id}. Native PS1 data unchanged; scene edits autosave."));
+            }
+            Err(error)=>self.studio.error=Some(format!("Cell duplication: {error}")),
+        }
+    }
+
+    /// Separate, independently scrollable cell tree below All Objects.
+    fn editor_cells_panel(&mut self,ui:&mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Cells / Scenes");
+            ui.weak("↕ drag divider");
+        });
+        ui.add(egui::TextEdit::singleline(&mut self.editor_cell_search)
+            .hint_text("Search cell names, native IDs..."));
+        ui.small("Select to load · RMB: Properties / Duplicate / Rename · Ctrl+D");
         ui.separator();
-        if self.editor_monsters.is_none() {
-            if let Some(lib) = self.studio.library.as_ref() {
-                self.editor_monsters = Some(crate::actors::monster_rows(lib).unwrap_or_default());
-            }
-        }
-        if self.editor_archives.is_none() {
-            if let Some(lib) = self.studio.library.as_ref() {
-                let mut by_type = std::collections::BTreeMap::<String, Vec<(String,EditorCatalogItem)>>::new();
-                for pos in 0..lib.entries.len() {
-                    let e = &lib.entries[pos];
-                    let kind = self.studio.class_of(pos)
-                        .map(|c| c.name().to_string())
-                        .unwrap_or_else(|| "Unknown archive data".into());
-                    let place = lib.retail_block(e.index).unwrap_or("unidentified block");
-                    let display_place = crate::place_name(place).unwrap_or(place);
-                    by_type.entry(format!("Source / {kind}"))
-                        .or_default().push((format!("PROT {:04}  {display_place} ({place})  {kind}",e.index),
-                            EditorCatalogItem::Archive(pos)));
-                }
-                self.editor_archives = Some(by_type.into_iter().collect());
-            }
-        }
-        let mut groups: Vec<(String, Vec<(String,EditorCatalogItem)>)> = Vec::new();
-        if let Some(s) = scene {
-            groups.push(("Placed objects".into(), s.placements.iter().enumerate().map(|(i,d)| {
-                let item = EditorCatalogItem::Draw(false,i);
-                (format!("{}  [#{i:03}]  ({} / {})",
-                    self.editor_name_for(Some(s), item), d.cell.0, d.cell.1), item)
-            }).collect()));
-            groups.push(("Terrain / panels".into(), s.terrain.iter().enumerate().map(|(i,_)| {
-                let item = EditorCatalogItem::Draw(true,i);
-                (format!("{}  [#{i:03}]", self.editor_name_for(Some(s), item)), item)
-            }).collect()));
-            groups.push(("Reusable cell meshes".into(), s.env_tmds.iter().enumerate().map(|(slot,_)| {
-                let item = EditorCatalogItem::Mesh(slot);
-                (format!("{}  [#{slot:03}]", self.editor_name_for(Some(s), item)), item)
-            }).collect()));
-        }
-        groups.push(("Characters".into(), ["Vahn","Noa","Gala","Terra"]
-            .into_iter().enumerate().map(|(i,_)| {
-                let item = EditorCatalogItem::Character(i);
-                (self.editor_name_for(scene, item), item)
-            }).collect()));
-        if let Some(monsters) = &self.editor_monsters {
-            groups.push(("Monsters".into(), monsters.iter().map(|m| {
-                let item = EditorCatalogItem::Monster(m.id);
-                (format!("{}  [#{:03}]",self.editor_name_for(scene,item),m.id), item)
-            }).collect()));
-        }
-        let term = self.editor_search.trim().to_lowercase();
-        for (title, rows) in &mut groups {
-            if !title.to_lowercase().contains(&term) {
-                rows.retain(|(label, item)| label.to_lowercase().contains(&term)
-                    || self.editor_item_matches(scene, *item, &term));
-            }
-        }
-        if ui.button("Export identification inventory...")
-            .on_hover_text("Export this cell, loaded actors and archive references. Includes unidentified entries and evidence; does not modify the disc.").clicked() {
-            if let Some(path) = rfd::FileDialog::new().set_file_name("LCK_IdentificationInventory.tsv")
-                .add_filter("Tab-separated inventory", &["tsv"]).save_file() {
-                match std::fs::write(&path, self.editor_inventory(scene)) {
-                    Ok(()) => self.studio.status = Some(format!("Identification inventory saved: {}", path.display())),
-                    Err(e) => self.studio.error = Some(format!("Cannot export identification inventory: {e}")),
-                }
-            }
-        }
-        let mut chosen = None;
-        let mut clicked = None;
-        egui::ScrollArea::vertical().id_salt("editor_catalog_scroll")
+        let mut choose=None;
+        let mut duplicate=None;
+        let mut rename=None;
+        let mut properties=None;
+        let mut focus_cell=false;
+        let term=self.editor_cell_search.trim().to_lowercase();
+        let copies=self.editor_cells.copies.values().cloned().collect::<Vec<_>>();
+        egui::ScrollArea::vertical().id_salt("lck_cell_scroll")
             .auto_shrink([false,false]).show(ui, |ui| {
-                for (title, rows) in &groups {
-                    editor_catalog_group(ui, title, rows, "",
-                        self.native_selected, &mut chosen, &mut clicked);
-                }
-                if let Some(archives) = &self.editor_archives {
-                    egui::CollapsingHeader::new("Original archive resources (not directly placeable)")
-                        .id_salt("editor_source_resources").show(ui, |ui| {
-                            for (title, rows) in archives {
-                                let display_rows: Vec<(String, EditorCatalogItem)> = rows.iter()
-                                    .map(|(technical, item)| {
-                                        let nickname = editor_item_name_key(scene, *item)
-                                            .and_then(|key| self.editor_names.get(&key));
-                                        (nickname.map(|name| format!("{}  ({technical})",name))
-                                            .unwrap_or_else(|| technical.clone()), *item)
-                                    }).filter(|(label, item)| title.to_lowercase().contains(&term)
-                                        || label.to_lowercase().contains(&term)
-                                        || self.editor_item_matches(scene, *item, &term)).collect();
-                                editor_catalog_group(ui, title, &display_rows, "",
-                                    self.native_selected, &mut chosen, &mut clicked);
-                            }
-                        });
-                }
-                ui.separator();
-                egui::CollapsingHeader::new(format!("Cells / scenes ({})",self.studio.blocks.len()))
-                    .id_salt("editor_scene_picker").show(ui, |ui| {
-                        let mut choose_cell = None;
-                        for b in &self.studio.blocks {
-                            let label = format!("{} ({})",
-                                crate::place_name(&b.name).unwrap_or(&b.name), b.name);
-                            if !self.editor_search.is_empty() &&
-                                !label.to_lowercase().contains(&self.editor_search.to_lowercase()) {
-                                continue;
-                            }
-                            if ui.selectable_label(self.native_scene.as_ref()
-                                .is_some_and(|(s,_)| s == &b.name), label).clicked() {
-                                choose_cell = Some(b.name.clone());
+                egui::CollapsingHeader::new(format!("Original PS1 cells ({})", self.studio.blocks.len()))
+                    .id_salt("lck_cell_original_tree").default_open(true).show(ui,|ui| {
+                        // Group all source variants under their original location. Native
+                        // CDNAME scene IDs remain independent; this is a browser-only tree.
+                        // The grouping key is derived from the ORIGINAL ID, never a
+                        // user-editable label. The first occurrence retains disc order.
+                        let mut seen=std::collections::HashSet::new();
+                        let mut families:Vec<(String,Vec<(CellSelection,String)>)>=Vec::new();
+                        for cell in &self.studio.blocks {
+                            if !seen.insert(cell.name.as_str()) {continue;}
+                            let id=CellSelection::Original(cell.name.clone());
+                            let label=self.editor_cells.label(&id).unwrap_or_else(||cell.name.clone());
+                            let row=format!("{label}  ({})",cell.name);
+                            let family=match cell.name.as_str() {
+                                "town01"|"town0b"|"town0c"|"town0d"|"town0e"|"jou" => "Rim Elm".to_owned(),
+                                "conc"|"conc2"|"conc3"|"concnow"|"concend" => "Conkram".to_owned(),
+                                "rayman"|"rayman2"|"ropeway"|"ropeway2"|"station" => "Octam".to_owned(),
+                                "bubu1"|"bubu2"|"edbubu" => "Buma".to_owned(),
+                                "balden"|"balden2"|"edbalden" => "Vidna".to_owned(),
+                                "retock"|"retockin"|"edretoin" => "Ratayu".to_owned(),
+                                "bylon"|"edbylon" => "Biron Monastery".to_owned(),
+                                "dolk"|"dolk2" => "Drake Castle".to_owned(),
+                                "kor"|"kor3"|"kor4"|"kor5"|"korb2"|"korb3"|"korout"|
+                                "koin1"|"koin1b"|"koin2"|"koin3"|"koin4"|"koin6"|"edkorout" => "Sol Tower".to_owned(),
+                                "jouina"|"jouinb"|"jouinc"|"jouind"|"jouine"|"juui1"|"juui2" => "Bio Castle".to_owned(),
+                                "deroa"|"chitei2" => "Jette's Fortress".to_owned(),
+                                "taiku"|"taiku2" => "Zora's Floating Castle".to_owned(),
+                                "nilboa"|"nilboa2" => "Nivora Ravine".to_owned(),
+                                "uru"|"uru2" => "Uru Mais".to_owned(),
+                                "tunnelb"|"tunnelc" => "Fire Path".to_owned(),
+                                "teien"|"edteien" => "Sky Gardens".to_owned(),
+                                "doman"|"eddoman" => "Usha Research Center".to_owned(),
+                                "son"|"edson" => "Soren Camp".to_owned(),
+                                _ => label.split(" (").next().unwrap_or(&label).trim().to_owned(),
+                            };
+                            if let Some((_,entries))=families.iter_mut().find(|(key,_)|*key==family) {
+                                entries.push((id,row));
+                            } else {
+                                families.push((family,vec![(id,row)]));
                             }
                         }
-                        if let Some(name) = choose_cell { self.load_native_scene(name); }
+                        let mut singles=Vec::new();
+                        for (family,entries) in families {
+                            if entries.len()==1 {singles.extend(entries);continue;}
+                            let family_match=family.to_lowercase().contains(&term);
+                            let entries=entries.into_iter().filter(|(_,row)|
+                                family_match || row.to_lowercase().contains(&term)).collect::<Vec<_>>();
+                            if entries.is_empty(){continue;}
+                            egui::CollapsingHeader::new(format!("{} ({})",family,entries.len()))
+                                .id_salt(("lck_original_location",family.as_str()))
+                                .default_open(false)
+                                .open(if term.is_empty(){None}else{Some(true)})
+                                .show(ui,|ui| {
+                                    for (id,row) in entries {
+                                        editor_cell_row(ui,id,row,&mut self.editor_cell_selected,&mut focus_cell,
+                                            &mut choose,&mut duplicate,&mut rename,&mut properties);
+                                    }
+                                });
+                        }
+                        let singles=singles.into_iter().filter(|(_,row)|
+                            row.to_lowercase().contains(&term)).collect::<Vec<_>>();
+                        if !singles.is_empty() {
+                            egui::CollapsingHeader::new(format!("Other / standalone cells ({})",singles.len()))
+                                .id_salt("lck_original_standalone")
+                                .default_open(false)
+                                .open(if term.is_empty(){None}else{Some(true)})
+                                .show(ui,|ui| {
+                                    for (id,row) in singles {
+                                        editor_cell_row(ui,id,row,&mut self.editor_cell_selected,&mut focus_cell,
+                                            &mut choose,&mut duplicate,&mut rename,&mut properties);
+                                    }
+                                });
+                        }
+                    });
+                egui::CollapsingHeader::new(format!("Project cell copies ({})",copies.len()))
+                    .id_salt("lck_cell_copy_tree").default_open(true).show(ui,|ui| {
+                        for cell in &copies {
+                            let id=CellSelection::Copy(cell.id);
+                            let label=format!("{}  [copy #{} of {}]",cell.name,cell.id,cell.source);
+                            if !label.to_lowercase().contains(&term) {continue;}
+                            editor_cell_row(ui,id,label,&mut self.editor_cell_selected,&mut focus_cell,
+                                &mut choose,&mut duplicate,&mut rename,&mut properties);
+                        }
                     });
             });
-        if let Some(item) = clicked {
-            match item {
-                EditorCatalogItem::Draw(terrain,idx) => self.native_selected = Some((terrain,idx)),
-                _ => self.editor_modal = Some((item, false)),
+        if focus_cell || duplicate.is_some() || rename.is_some() || properties.is_some() {
+            self.native_selected=None;
+        }
+        if let Some(cell)=choose {self.select_editor_cell(cell);}
+        if let Some(cell)=duplicate {self.duplicate_editor_cell(cell);}
+        if let Some(cell)=rename {
+            let name=self.editor_cells.label(&cell).unwrap_or_default();
+            self.editor_cell_rename=Some((cell,name));
+        }
+        if let Some(cell)=properties {self.editor_cell_properties=Some(cell);}
+    }
+
+    fn editor_cell_dialogs(&mut self,ctx:&egui::Context) {
+        if let Some(cell)=self.editor_cell_properties.clone() {
+            let mut open=true;
+            egui::Window::new("Cell Properties")
+                .id(egui::Id::new("lck_cell_properties"))
+                .collapsible(false).resizable(true).open(&mut open).show(ctx,|ui| {
+                    ui.heading(self.editor_cells.label(&cell).unwrap_or_default());
+                    if let Some(source)=self.editor_cells.source(&cell) {
+                        ui.label(format!("Original CDNAME / scene ID: {source}"));
+                        if let Some(block)=self.studio.blocks.iter().find(|b|b.name==source) {
+                            ui.label(format!("Source archive entries in this block: {}",block.entries.len()));
+                        }
+                    }
+                    match cell {
+                        CellSelection::Original(_) => {ui.label("Kind: original PS1 cell (source is read-only)");}
+                        CellSelection::Copy(id) => {
+                            ui.label(format!("Kind: independent LCK project cell, ID {id}"));
+                            ui.label("Contents: original scene + its own .lckscene instance overlay");
+                            if let Some(dir)=&self.editor_cells.dir {
+                                ui.small(format!("Stored under: {}",dir.display()));
+                            }
+                        }
+                    }
+                    ui.small("Names, copies and scene edits are editor-only. This does not modify the original disc or add a PS1 CDNAME entry.");
+                    if ui.button("Close").clicked(){self.editor_cell_properties=None;}
+                });
+            if !open {self.editor_cell_properties=None;}
+        }
+        if let Some((cell,mut value))=self.editor_cell_rename.take() {
+            let mut open=true;
+            let mut save=false;
+            let mut cancel=false;
+            egui::Window::new("Rename Cell")
+                .id(egui::Id::new("lck_cell_rename"))
+                .collapsible(false).resizable(false).open(&mut open).show(ctx,|ui| {
+                    ui.label("Editor display name (original native ID is preserved):");
+                    let response=ui.add(egui::TextEdit::singleline(&mut value).desired_width(335.0));
+                    save=ui.button("Save").clicked() ||
+                        (response.lost_focus() && ui.input(|i|i.key_pressed(egui::Key::Enter)));
+                    cancel=ui.button("Cancel").clicked();
+                });
+            if save {
+                match self.editor_cells.rename(&cell,&value) {
+                    Ok(())=>self.studio.status=Some("Cell display name saved to LCK catalog".into()),
+                    Err(error)=>{
+                        self.studio.error=Some(error);
+                        self.editor_cell_rename=Some((cell,value));
+                    }
+                }
+            } else if open && !cancel {self.editor_cell_rename=Some((cell,value));}
+        }
+    }
+
+
+    /// Load one original donor scene only on Preview. Cached content always uses
+    /// the SOURCE scene's authentic VRAM rather than the active target's VRAM.
+    fn editor_load_global_asset_preview(&mut self, id: usize) {
+        if self.global_repository_preview.as_ref().is_some_and(|p|p.id==id) { return; }
+        self.global_repository_preview_view=Viewport::new(Shading::Textured);
+        let mut preview=GlobalAssetPreview{id,scene:None,model:None,issue:None};
+        let Some(asset)=self.global_repository.get(id) else { return; };
+        let Some(lib)=self.studio.library.as_ref() else {
+            preview.issue=Some("Open an original PS1 disc image first".into());
+            self.global_repository_preview=Some(preview);
+            return;
+        };
+        match legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,&asset.source) {
+            Err(e)=>preview.issue=Some(format!("Cannot assemble source scene: {e}")),
+            Ok(scene)=>{
+                preview.model=match asset.kind {
+                    // World geometry is authored with PS1-down Y and can
+                    // carry a native 180-degree MAP rotation.  Apply the
+                    // source's REAL placement instead of spinning the camera.
+                    global_repository::Kind::Placement(i) =>
+                        editor_preview_placed_tmd(&scene, "placement", i),
+                    global_repository::Kind::Terrain(i) =>
+                        editor_preview_placed_tmd(&scene, "terrain", i),
+                    global_repository::Kind::Mesh(slot) =>
+                        editor_preview_reusable_tmd(&scene, slot),
+                    global_repository::Kind::Npc(record) =>{
+                        // A field actor's posed instance comes from its MAN record.
+                        // Do not pass NPC assets through environment TMD indices.
+                        let world=world_view::build_world(&scene,&lib.index);
+                        let key=world.npcs.iter().find(|n|n.record==record).map(|n|n.key);
+                        key.and_then(|key|world.at(false,key))
+                            .and_then(|d|world.model.as_ref()
+                                .and_then(|m|editor_isolate_draw(m,d.id)))
+                    }
+                };
+                if preview.model.is_none() {
+                    preview.issue=Some("This source has no decodable visible TMD in its original scene; original record metadata is still accessible.".into());
+                }
+                preview.scene=Some(Arc::new(scene));
             }
         }
-        if let Some(next) = chosen { self.editor_modal = Some(next); }
+        self.global_repository_preview=Some(preview);
+    }
+
+    /// The *only* left-hand repository. The current cell's independent
+    /// hierarchy remains on the right; the cell tree stays below this pane.
+    fn editor_global_repository(&mut self, ui: &mut egui::Ui,
+        scene: Option<&legaia_engine_scene::scene_assembly::AssembledScene>) {
+        ui.heading("Game-wide Asset Repository");
+        let total=self.global_repository_total;
+        ui.small(if self.global_repository_started {
+            format!("{} original assets | {} / {} cells scanned ({} unavailable)",
+                self.global_repository.len(),self.global_repository_completed,total,
+                self.global_repository_failures)
+        } else {"Open a disc to scan original game content.".into()});
+        ui.add(egui::TextEdit::singleline(&mut self.editor_search)
+            .hint_text("Search any source cell, object ID or identified name..."));
+        ui.small("Select for details · RMB for Preview / Properties · drag ↳ to place");
+        ui.small("↳ native match  |  ⇢ foreign geometry preview  |  ◇ foreign MAN actor (not imported)");
+        if let Some(error)=&self.editor_catalog_error {
+            ui.colored_label(Color32::LIGHT_RED,format!("Identification catalog: {error}"));
+        }
+        let wanted=scene.map(|s|s.name.as_str());
+        if self.global_repository_target.as_deref()!=wanted {
+            self.global_repository_tmd_hashes=scene.map(global_repository::destination_fingerprints).unwrap_or_default();
+            self.global_repository_target=wanted.map(str::to_owned);
+        }
+        if let Some(id)=self.global_repository_selected {
+            if let Some(asset)=self.global_repository.get(id) {
+                let display=self.editor_names.get(&asset.key).unwrap_or(&asset.label);
+                let label=display.to_string();
+                let source=asset.source.clone();
+                let kind=asset.kind_label();
+                let selected_key=asset.key.clone();
+                ui.group(|ui| {
+                    ui.small("Selected original asset");
+                    ui.label(egui::RichText::new(label).strong());
+                    ui.small(format!("{kind} · {source}"));
+                    if let Some(record)=self.editor_names.records.get(&selected_key) {
+                        if !record.category.trim().is_empty() {
+                            ui.small(format!("Identification category: {}",record.category));
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Preview 3D").clicked() {
+                            self.global_repository_dialog=Some((id,true));
+                        }
+                        if ui.button("Properties / Name").clicked() {
+                            self.global_repository_dialog=Some((id,false));
+                        }
+                    });
+                });
+            }
+        }
+        if self.global_repository.is_empty() {return;}
+        let term=self.editor_search.trim().to_lowercase();
+        let mut counts=[0usize;4];
+        // Count the entire 40K+ catalog without materializing GUI rows.
+        for asset in &self.global_repository {
+            if asset.matches(&term,&self.editor_names) { counts[asset.group()]+=1; }
+        }
+        let titles=["World objects / MAP", "Terrain / decoration", "Reusable geometry / TMD", "Field NPCs / MAN"];
+        let mut dragging=None;
+        let mut selection=None;
+        let mut open_dialog=None;
+        let mut category=self.global_open_category;
+        let mut branch=self.global_open_branch;
+        let mut open_scene=self.global_open_scene.clone();
+        ui.small("Verified town groupings from the original scene table; names require evidence.");
+        for group in 0..4 {
+            let label=format!("{} {} ({})", if category==Some(group) {"▾"} else {"▸"},titles[group],counts[group]);
+            if ui.add_sized([ui.available_width().max(40.0),24.0],egui::Button::new(label)).clicked() {
+                if category==Some(group) { category=None; } else { category=Some(group); }
+                branch=None;
+                open_scene=None;
+            }
+            if category!=Some(group) || counts[group]==0 { continue; }
+            // One tier per original source cell; none depends on the loaded destination.
+            // Grouping source provenance keeps similarly numbered TMDs distinct.
+            let mut indexed:std::collections::BTreeMap<(String,String),Vec<usize>>=std::collections::BTreeMap::new();
+            for (id,asset) in self.global_repository.iter().enumerate() {
+                if asset.group()==group && asset.matches(&term,&self.editor_names) {
+                    indexed.entry((asset.source_label.clone(),asset.source.clone())).or_default().push(id);
+                }
+            }
+            for section in 0..(if group==0 {2} else {1}) {
+                if group==0 {
+                    let is_town=section==0;
+                    let n=indexed.iter().filter(|((_,source),_)|
+                        global_repository::is_verified_town(source)==is_town).count();
+                    if n==0 { continue; }
+                    let title=if is_town {"Towns & settlements"} else {"Other original locations"};
+                    let active=branch==Some(is_town);
+                    if ui.button(format!("  {} {} ({} scenes)",if active {"▾"} else {"▸"},title,n)).clicked() {
+                        branch=if active {None} else {Some(is_town)};
+                        open_scene=None;
+                    }
+                    if branch!=Some(is_town) { continue; }
+                }
+                for ((place,source),items) in &indexed {
+                    if group==0 && global_repository::is_verified_town(source)!=(section==0) { continue; }
+                    let active=open_scene.as_deref()==Some(source.as_str());
+                    let header=format!("    {} {} ({}) [{}]",if active {"▾"} else {"▸"},place,items.len(),source);
+                    if ui.add_sized([ui.available_width().max(40.0),24.0],egui::Button::new(header)).clicked() {
+                        open_scene=if active {None} else {Some(source.clone())};
+                    }
+                    if !active { continue; }
+                    if items.len()>125 {
+                        ui.small(format!("Showing first 125 of {}. Search above to narrow.",items.len()));
+                    }
+                    for &id in items.iter().take(125) {
+                        let asset=&self.global_repository[id];
+                        let usable=scene.is_some_and(|s|global_repository::compatible_source_with_index(
+                            s,asset,&self.global_repository_tmd_hashes).is_some());
+                        let symbol=if usable {"↳"}else if matches!(asset.kind,global_repository::Kind::Npc(_)) {"◇"} else {"⇢"};
+                        let name=self.editor_names.get(&asset.key).unwrap_or(&asset.label);
+                        let text=format!("{symbol} [{}] {name}",asset.source_label);
+                        let active=self.global_repository_selected==Some(id);
+                        let response=ui.add_sized(egui::vec2(ui.available_width().max(40.0),24.0),
+                            egui::Label::new(text).selectable(false).sense(egui::Sense::click_and_drag()));
+                        if active || response.hovered() {
+                            let color=if active {Color32::from_rgb(255,196,66)}
+                                else if usable {Color32::from_rgb(96,210,180)}
+                                else {Color32::from_rgb(160,164,180)};
+                            ui.painter().rect_stroke(response.rect,egui::CornerRadius::same(3),
+                                egui::Stroke::new(if active {2.0}else{1.0},color),egui::StrokeKind::Inside);
+                        }
+                        if response.drag_started() || catalog_pointer_pressed_on(ui,response.rect) {
+                            dragging=Some(id);
+                        }
+                        if response.clicked() {selection=Some(id);}
+                        response.context_menu(|ui| {
+                            if ui.button("Preview original 3D model...").clicked() {
+                                selection=Some(id);open_dialog=Some((id,true));ui.close();
+                            }
+                            if ui.button("Properties / identify asset...").clicked() {
+                                selection=Some(id);open_dialog=Some((id,false));ui.close();
+                            }
+                            ui.separator();
+                            ui.small(format!("Original source: {}",asset.source));
+                            ui.small(if usable {"Exact original mesh in destination"}
+                                else {"Needs native donor resource import"});
+                        });
+                        response.on_hover_text(if usable {
+                            "Exact native match in target cell. Drag to create an independent native instance."
+                        } else if matches!(asset.kind,global_repository::Kind::Npc(_)) {
+                            "Original MAN actor is previewable, but cross-cell dialogue/animation/script import is not yet supported."
+                        } else {
+                            "Drag original PS1 geometry and donor textures for editor preview. Save .lckscene; native collision and IMG import still need resource relocation."
+                        });
+                    }
+                }
+            }
+        }
+        self.global_open_category=category;
+        self.global_open_branch=branch;
+        self.global_open_scene=open_scene;
+        if let Some(id)=selection {self.global_repository_selected=Some(id);}
+        if let Some(dialog)=open_dialog {self.global_repository_dialog=Some(dialog);}
+        if let Some(id)=dragging {
+            self.global_repository_selected=Some(id);
+            self.global_repository_drag=Some(id);
+            self.editor_asset_drag=None;
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// Separate source-asset window. Names/categories are user-maintained
+    /// evidence records, never false verified identifications.
+    fn editor_global_repository_dialog(&mut self,ctx:&egui::Context) {
+        let Some((id,preview_mode))=self.global_repository_dialog else{return;};
+        let Some(asset)=self.global_repository.get(id).cloned() else {
+            self.global_repository_dialog=None;return;
+        };
+        if preview_mode {self.editor_load_global_asset_preview(id);}
+        if !preview_mode && self.global_name_edit_key.as_deref()!=Some(&asset.key) {
+            self.global_name_edit_key=Some(asset.key.clone());
+            self.global_name_draft=self.editor_names.record(&asset.key);
+            self.global_name_status=None;
+        }
+        let title=self.editor_names.get(&asset.key).cloned().unwrap_or(asset.label.clone());
+        let mut open=true;
+        egui::Window::new(format!("{} — {title}",if preview_mode {"Preview"}else{"Asset Properties"}))
+            .id(egui::Id::new("lck_global_asset_details"))
+            .resizable(true).default_size([610.0,540.0]).min_size([390.0,240.0])
+            .open(&mut open).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(preview_mode,"3D Preview").clicked() {
+                        self.global_repository_dialog=Some((id,true));
+                    }
+                    if ui.selectable_label(!preview_mode,"Properties / Name").clicked() {
+                        self.global_repository_dialog=Some((id,false));
+                    }
+                });
+                ui.separator();
+                ui.label(format!("Source: {} ({})",asset.source_label,asset.source));
+                ui.label(format!("Record type: {}",asset.kind_label()));
+                if asset.source!=self.native_scene.as_ref().map(|(name,_)|name.as_str()).unwrap_or("") {
+                    ui.label("Foreign preview uses original donor textures. Native collision, scripts and IMG export still require resource import.");
+                }
+                ui.small(format!("Native record: {}",asset.label));
+                ui.collapsing("Immutable original identifiers", |ui| {
+                    ui.monospace(&asset.key);
+                    if let Some(hash)=asset.mesh_fingerprint {ui.monospace(format!("TMD fingerprint: {hash:016x}"));}
+                    if ui.button("Copy source identifier").clicked() {ui.ctx().copy_text(asset.key.clone());}
+                });
+                ui.separator();
+                if preview_mode {
+                    if let Some(model_preview)=self.global_repository_preview.as_ref() {
+                        if let (Some(scene),Some(model))=(&model_preview.scene,&model_preview.model) {
+                            ui.small(format!("Native source TMD • {} triangles • original scene VRAM",model.triangles()));
+                            let available=ui.available_width().max(360.0);
+                            ui.allocate_ui(egui::vec2(available,420.0),|ui| {
+                                self.global_repository_preview_view.show_limited(
+                                    ui,model,&scene.res.vram,800,600);
+                            });
+                        }
+                        if let Some(issue)=&model_preview.issue {ui.label(issue);}
+                    }
+                    ui.small("Preview geometry and TIM palettes are from the donor scene; this does not add dependencies to the destination.");
+                } else {
+                    ui.heading("Asset identification");
+                    ui.label("User-supplied label (not a verified original game name unless supported by evidence):");
+                    ui.add(egui::TextEdit::singleline(&mut self.global_name_draft.name)
+                        .hint_text("Name / label"));
+                    egui::ComboBox::from_id_salt("lck_global_confidence")
+                        .selected_text(self.global_name_draft.confidence.label())
+                        .show_ui(ui,|ui| {
+                            for confidence in Confidence::ALL {
+                                ui.selectable_value(&mut self.global_name_draft.confidence,
+                                    confidence,confidence.label());
+                            }
+                        });
+                    ui.add(egui::TextEdit::singleline(&mut self.global_name_draft.category)
+                        .hint_text("Category (e.g. architecture, foliage, props)"));
+                    ui.add(egui::TextEdit::singleline(&mut self.global_name_draft.aliases)
+                        .hint_text("Alternate names / search terms"));
+                    ui.add(egui::TextEdit::multiline(&mut self.global_name_draft.evidence)
+                        .desired_rows(3).hint_text("Evidence supporting identification"));
+                    ui.add_enabled_ui(self.editor_catalog_error.is_none(),|ui| {
+                        ui.horizontal(|ui| {
+                            let save=ui.button("Save identification").clicked();
+                            let remove=ui.button("Remove identification").clicked();
+                            if save||remove {
+                                let mut next=self.editor_names.clone();
+                                if remove {next.records.remove(&asset.key);}
+                                else {
+                                    let mut record=self.global_name_draft.clone();
+                                    record.name=record.name.trim().to_owned();
+                                    next.records.insert(asset.key.clone(),record);
+                                }
+                                self.global_name_status=Some(match next.save(&editor_catalog_path()) {
+                                    Ok(())=>{
+                                        self.editor_names=next;
+                                        if remove {self.global_name_draft=Record::default();}
+                                        "Identification saved; original game assets unchanged.".into()
+                                    }
+                                    Err(e)=>format!("Could not save identification: {e}"),
+                                });
+                            }
+                        });
+                    });
+                    if let Some(status)=&self.global_name_status {ui.label(status);}
+                    ui.small("The same native TMD can have multiple placed copies. Names are attached to original record IDs, not guessed from scene context.");
+                }
+            });
+        if !open {self.global_repository_dialog=None;}
+    }
+
+    /// This panel intentionally contains no current-cell instance inventory;
+    /// that already lives in the Scene hierarchy to the right.
+    fn editor_catalog(&mut self,ui:&mut egui::Ui,
+        scene: Option<&legaia_engine_scene::scene_assembly::AssembledScene>) {
+        if ui.button("Export identification inventory...").clicked() {
+            if let Some(path)=rfd::FileDialog::new().set_file_name("LCK_IdentificationInventory.tsv")
+                .add_filter("Tab-separated inventory",&["tsv"]).save_file() {
+                match std::fs::write(&path,self.editor_inventory(scene)) {
+                    Ok(())=>self.studio.status=Some(format!("Inventory saved: {}",path.display())),
+                    Err(e)=>self.studio.error=Some(format!("Cannot save inventory: {e}")),
+                }
+            }
+        }
+        egui::ScrollArea::vertical().id_salt("lck_global_assets_scroll")
+            .drag_to_scroll(false).auto_shrink([false,false])
+            .show(ui,|ui|self.editor_global_repository(ui,scene));
     }
 
     fn editor_catalog_popup(&mut self, ctx: &egui::Context,
@@ -1222,9 +2139,7 @@ impl App {
                         .unwrap_or_else(|| EditorPreview::Unavailable("No drawable mesh in this cell".into()))
                 }
                 EditorCatalogItem::Mesh(slot) => {
-                    scene.and_then(|s| s.env_tmds.get(slot).and_then(|&index|
-                        s.res.tmds.get(index).and_then(|tmd|
-                            Model::from_tmd(&tmd.raw))))
+                    scene.and_then(|s| editor_preview_reusable_tmd(s, slot))
                         .map(EditorPreview::Mesh)
                         .unwrap_or_else(|| EditorPreview::Unavailable("No decoded native mesh for this slot".into()))
                 }
@@ -1242,7 +2157,12 @@ impl App {
             self.editor_preview = Some((item,content));
         }
         let mut open = true;
-        let object_title = self.editor_name_for(scene, item);
+        let object_title = match item {
+            EditorCatalogItem::Draw(terrain,i) => world.and_then(|w|w.at(terrain,i))
+                .and_then(|d|d.display_name.clone())
+                .unwrap_or_else(||self.editor_name_for(scene,item)),
+            _=>self.editor_name_for(scene,item),
+        };
         egui::Window::new(if preview {
             format!("Preview - {object_title}")
         } else {
@@ -1274,9 +2194,28 @@ impl App {
                         None => { ui.label("Preparing preview..."); }
                     }
                 } else {
-                    self.editor_name_properties(ui, scene, item);
+                    if !matches!(item, EditorCatalogItem::Draw(terrain,i)
+                        if world.and_then(|w|w.at(terrain,i)).is_some_and(|d|d.editor_uid.is_some())) {
+                        self.editor_name_properties(ui, scene, item);
+                    }
                     match item {
                         EditorCatalogItem::Draw(terrain,i) => {
+                            if let Some(npc)=world.and_then(|w|w.npc((terrain,i))) {
+                                ui.heading(format!("{} field actor MAN #{}",
+                                    if npc.is_copy {"Editor copy of"} else {"Original"},npc.record));
+                                ui.label(format!("Model TMD index: {} | Animation ID: {} | class: {}",
+                                    npc.model_index,npc.anim_id,npc.kind));
+                                ui.label(format!("PSX starting position: X {:.0}, Y {:.0}, Z {:.0}",
+                                    npc.psx_position[0],npc.psx_position[1],npc.psx_position[2]));
+                                if let Some(dialog)=&npc.dialog {ui.label(format!("First dialog line (evidence, not identity): {dialog}"));}
+                                ui.label(format!("Scene ANM clips with compatible bone count: {}",npc.clips.len()));
+                                ui.label(format!("Current preview: ANM {} / frame {}",npc.clip,npc.frame));
+                                if npc.conditional {ui.colored_label(Color32::YELLOW,
+                                    "Script-conditional: not visible at initial scene load");}
+                                if !npc.drawable {ui.label("No displayable initial mesh for this record.");}
+                                else if npc.posed {ui.label("ANM first-frame pose applied.");}
+                                ui.small("Field actor metadata is authentic; display names are not inferred from dialog.");
+                            }
                             if let Some(s) = scene {
                                 let rows = if terrain { &s.terrain } else { &s.placements };
                                 if let Some(d) = rows.get(i) {
@@ -1301,7 +2240,7 @@ impl App {
                                     ui.label(format!("Scene resource TMD index: {idx}"));
                                 }
                             }
-                            ui.small("This native resource may be reused once new-instance placement is implemented.");
+                            ui.small("Drag this mesh into the viewport if the active scene has an original placed instance referencing it. Otherwise it needs a future direct-TMD instancer.");
                         }
                         EditorCatalogItem::Character(slot) => {
                             ui.heading(["Vahn","Noa","Gala","Terra"].get(slot).copied().unwrap_or("Character"));
@@ -1338,17 +2277,40 @@ impl App {
         // changing the camera or the native scene data. Leave the key visible
         // to a focused search field, which also uses Escape to clear its text.
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.editor_modal.is_some() {
+            if self.global_repository_dialog.take().is_some() {
+                // Do not invalidate cached model: toggling Preview reuses it.
+            } else if self.editor_modal.is_some() {
                 self.editor_modal = None;
                 self.editor_preview = None;
+            } else if self.editor_context_menu.take().is_some() {
+                // Escape dismisses the viewport context menu first.
+            } else if self.editor_properties_target.take().is_some() {
+                self.npc_playing = None;
             } else {
                 self.native_selected = None;
                 self.native_drag = None;
+                self.native_rotate = None;
             }
         }
         let mut pending_transform: Option<((bool, usize), [f32; 3], bool)> = None;
+        let mut pending_rotation: Option<((bool, usize), [f32; 3], bool)> = None;
+        let mut pending_scale: Option<((bool, usize), [f32; 3])> = None;
+        let mut pending_npc_animation: Option<((bool,usize),u8,usize,bool)> = None;
+        let mut pending_npc_model: Option<((bool,usize),u8)> = None;
+        let mut pending_history_undo=false;
+        let mut pending_history_redo=false;
         let mut finish_drag: Option<EditorDrag> = None;
+        let mut finish_rotate: Option<EditorRotateDrag> = None;
         let mut pending_import: Option<Vec<((bool,usize),[f32;3])>> = None;
+        let mut pending_project: Option<scene_instances::SceneDocument> = None;
+        let mut pending_duplicate: Option<((bool, usize), [f32; 3], [f32; 3], Option<(u8,u8,usize)>)> = None;
+        let mut pending_repository_drop = false;
+        let mut pending_foreign: Option<(usize,[f32;2],[usize;2],bool)> = None;
+        let mut pending_delete: Option<(bool,usize)> = None;
+        let mut pending_restore: Option<(bool,usize)> = None;
+        let mut pending_name: Option<((bool,usize),Option<String>)> = None;
+        let mut hierarchy_popup: Option<(EditorCatalogItem,bool)> = None;
+        let mut hierarchy_rename: Option<(bool,usize)> = None;
         let ready = self.native_scene.as_ref().and_then(|(_, state)| match state {
             NativeSceneSlot::Ready(scene, _) => Some(Arc::clone(scene)),
             _ => None,
@@ -1362,6 +2324,11 @@ impl App {
             .default_width(305.0)
             .min_width(240.0)
             .show(ctx, |ui| {
+                // A nested resizable bottom panel creates a persistent divider.
+                // Its ScrollArea is independent of the top All Objects list.
+                egui::TopBottomPanel::bottom("lck_editor_cell_split")
+                    .resizable(true).default_height(205.0).min_height(105.0)
+                    .show_inside(ui, |ui| self.editor_cells_panel(ui));
                 self.editor_catalog(ui, ready.as_deref());
             });
         egui::SidePanel::right("native_instance_tree")
@@ -1382,8 +2349,12 @@ impl App {
                     (Some((name, NativeSceneSlot::Failed(err))), _) => {
                         ui.colored_label(egui::Color32::LIGHT_RED, format!("{name}: {err}"));
                     }
-                    (Some(_), Some(scene)) => {
-                        ui.strong(&scene.name);
+                    (Some((source,_)), Some(scene)) => {
+                        let display=self.editor_cell_active.as_ref()
+                            .and_then(|id| self.editor_cells.label(id))
+                            .unwrap_or_else(||crate::place_name(source).unwrap_or(source).to_owned());
+                        ui.strong(display);
+                        ui.small(format!("Original scene ID: {source}"));
                         ui.label(format!("Mesh slots: {}", scene.env_tmds.len()));
                         ui.label(format!("Placed objects: {}", scene.placements.len()));
                         ui.label(format!("Terrain tiles: {}", scene.terrain.len()));
@@ -1393,25 +2364,101 @@ impl App {
                             egui::CollapsingHeader::new(format!("Placements ({})", scene.placements.len()))
                                 .default_open(true).show(ui, |ui| {
                                     for (i, d) in scene.placements.iter().enumerate() {
-                                        if !self.editor_item_matches(Some(scene), EditorCatalogItem::Draw(false, i), &hierarchy_filter) { continue; }
-                                        if ui.selectable_label(self.native_selected == Some((false, i)),
-                                            format!("{}  [#{i:03}]  ({}, {}, {})",
-                                                self.editor_name_for(Some(scene), EditorCatalogItem::Draw(false,i)),
-                                                d.world_x, d.world_y, d.world_z)
-                                        ).clicked() { self.native_selected = Some((false, i)); }
+                                        let key=(false,i);
+                                        if world.as_ref().and_then(|w|w.at(false,i)).is_some_and(|d|d.hidden) {continue;}
+                                        let default=self.editor_name_for(Some(scene),EditorCatalogItem::Draw(false,i));
+                                        let custom=world.as_ref().and_then(|w|w.at(false,i)).and_then(|d|d.display_name.as_deref());
+                                        let label=format!("{}  [#{i:03}]  ({}, {}, {})",
+                                            custom.unwrap_or(&default),d.world_x,d.world_y,d.world_z);
+                                        if !hierarchy_filter.is_empty() &&
+                                            !label.to_lowercase().contains(&hierarchy_filter) &&
+                                            !self.editor_item_matches(Some(scene),EditorCatalogItem::Draw(false,i),&hierarchy_filter) {continue;}
+                                        editor_hierarchy_row(ui,label,key,&mut self.native_selected,
+                                            &mut hierarchy_popup,&mut hierarchy_rename);
                                     }
                                 });
                             egui::CollapsingHeader::new(format!("Terrain ({})", scene.terrain.len()))
                                 .show(ui, |ui| {
                                     for (i, d) in scene.terrain.iter().enumerate() {
-                                        if !self.editor_item_matches(Some(scene), EditorCatalogItem::Draw(true, i), &hierarchy_filter) { continue; }
-                                        if ui.selectable_label(self.native_selected == Some((true, i)),
-                                            format!("{}  [#{i:03}]  cell ({}, {})",
-                                                self.editor_name_for(Some(scene), EditorCatalogItem::Draw(true,i)),
-                                                d.cell.0, d.cell.1)
-                                        ).clicked() { self.native_selected = Some((true, i)); }
+                                        let key=(true,i);
+                                        if world.as_ref().and_then(|w|w.at(true,i)).is_some_and(|d|d.hidden) {continue;}
+                                        let default=self.editor_name_for(Some(scene),EditorCatalogItem::Draw(true,i));
+                                        let custom=world.as_ref().and_then(|w|w.at(true,i)).and_then(|d|d.display_name.as_deref());
+                                        let label=format!("{}  [#{i:03}]  cell ({}, {})",
+                                            custom.unwrap_or(&default),d.cell.0,d.cell.1);
+                                        if !hierarchy_filter.is_empty() &&
+                                            !label.to_lowercase().contains(&hierarchy_filter) &&
+                                            !self.editor_item_matches(Some(scene),EditorCatalogItem::Draw(true,i),&hierarchy_filter) {continue;}
+                                        editor_hierarchy_row(ui,label,key,&mut self.native_selected,
+                                            &mut hierarchy_popup,&mut hierarchy_rename);
                                     }
                                 });
+                            if let Some(world) = &world {
+                                egui::CollapsingHeader::new(format!("NPCs / field actors ({})",world.npcs.iter().filter(|n|!n.is_copy).count()))
+                                    .default_open(true).show(ui, |ui| {
+                                        for npc in world.npcs.iter().filter(|n|!n.is_copy) {
+                                            let key=(false,npc.key);
+                                            let Some(draw)=world.at(false,npc.key) else {continue};
+                                            if draw.hidden {continue;}
+                                            let status=if npc.conditional {" [conditional]"}
+                                                else if !npc.drawable {" [no mesh]"} else {""};
+                                            let label=format!("{}  [MAN #{:03} / TMD {}]{}",
+                                                draw.display_name.clone().unwrap_or_else(||
+                                                    self.editor_name_for(Some(scene),EditorCatalogItem::Draw(false,npc.key))),
+                                                npc.record,npc.model_index,status);
+                                            if !hierarchy_filter.is_empty() &&
+                                                !label.to_lowercase().contains(&hierarchy_filter) &&
+                                                !self.editor_item_matches(Some(scene),
+                                                    EditorCatalogItem::Draw(false,npc.key),&hierarchy_filter) {continue;}
+                                            editor_hierarchy_row(ui,label,key,&mut self.native_selected,
+                                                &mut hierarchy_popup,&mut hierarchy_rename);
+                                        }
+                                    });
+                                if let Some(issue)=&world.npc_issue {
+                                    ui.small(format!("NPC notes: {issue}"));
+                                }
+                                let created: Vec<_> = world.draws.iter()
+                                    .filter(|d| d.editor_uid.is_some()).collect();
+                                egui::CollapsingHeader::new(format!("New editor instances ({})", created.len()))
+                                    .default_open(true).show(ui, |ui| {
+                                        for d in created {
+                                            let origin=d.source_ref.unwrap_or((false,0));
+                                            let default=if let Some(foreign)=world.foreign.iter()
+                                                .find(|f|Some(f.uid)==d.editor_uid) {
+                                                format!("Foreign {} #{} from {} (UID {})",
+                                                    foreign.kind,foreign.record,foreign.source,foreign.uid)
+                                            } else if let Some(npc)=world.npc((false,d.index)) {
+                                                format!("NPC copy #{} of MAN #{} (TMD {})",
+                                                    d.editor_uid.unwrap_or(0),npc.record,npc.model_index)
+                                            } else {
+                                                format!("New copy #{} of {} #{}",
+                                                    d.editor_uid.unwrap_or(0),
+                                                    if origin.0 {"terrain"} else {"placement"}, origin.1)
+                                            };
+                                            let label=format!("{}  [copy #{}]",d.display_name.as_deref()
+                                                .unwrap_or(&default),d.editor_uid.unwrap_or(0));
+                                            if !hierarchy_filter.is_empty() &&
+                                                !label.to_lowercase().contains(&hierarchy_filter) {continue;}
+                                            editor_hierarchy_row(ui,label,(false,d.index),&mut self.native_selected,
+                                                &mut hierarchy_popup,&mut hierarchy_rename);
+                                        }
+                                    });
+                                let hidden: Vec<_>=world.draws.iter().filter(|d|d.hidden && d.editor_uid.is_none()).collect();
+                                if !hidden.is_empty() {
+                                    egui::CollapsingHeader::new(format!("Hidden native objects ({})",hidden.len()))
+                                        .show(ui,|ui| {
+                                            for d in hidden {
+                                                ui.horizontal(|ui| {
+                                                    if ui.small_button("Restore").clicked() {
+                                                        pending_restore=Some((d.terrain,d.index));
+                                                    }
+                                                    ui.label(format!("{} #{}: {}",if d.terrain {"Terrain"} else {"Placement"},
+                                                        d.index,d.display_name.as_deref().unwrap_or("Hidden original")));
+                                                });
+                                            }
+                                        });
+                                }
+                            }
                             egui::CollapsingHeader::new(format!("Mesh references ({})", scene.env_tmds.len()))
                                 .show(ui, |ui| {
                                     for (slot, idx) in scene.env_tmds.iter().enumerate() {
@@ -1425,28 +2472,234 @@ impl App {
                     _ => { ui.label("Waiting for native scene data..."); }
                 }
             });
+        self.editor_cell_dialogs(ctx);
+        if let Some(modal)=hierarchy_popup {
+            self.editor_modal=Some(modal);
+            self.editor_preview=None;
+        }
+        // Hierarchy and repository Properties now share the same editable,
+        // detached inspector instead of the old read-only asset popup.
+        if let Some((EditorCatalogItem::Draw(terrain,index),false))=self.editor_modal {
+            if world.as_ref().and_then(|w|w.at(terrain,index)).is_some() {
+                self.native_selected=Some((terrain,index));
+                self.editor_properties_target=Some((terrain,index));
+                self.editor_context_menu=None;
+            }
+            self.editor_modal=None;
+        }
+        if let Some(key)=hierarchy_rename {
+            if let Some(draw)=world.as_ref().and_then(|w|w.at(key.0,key.1)) {
+                let default=if let Some(name)=&draw.display_name {name.clone()}
+                    else if draw.editor_uid.is_some() {
+                        format!("New copy #{}",draw.editor_uid.unwrap_or(0))
+                    } else {
+                        self.editor_name_for(ready.as_deref(),EditorCatalogItem::Draw(key.0,key.1))
+                    };
+                self.editor_rename=Some(EditorRename {key,text:default});
+            } else {
+                self.studio.error=Some("This source record has no drawable instance to rename.".into());
+            }
+        }
+        if let Some(edit)=&mut self.editor_rename {
+            let mut open=true;
+            let mut save=false;
+            let mut cancel=false;
+            egui::Window::new("Rename scene instance")
+                .id(egui::Id::new("lck_scene_instance_rename"))
+                .collapsible(false).resizable(false).open(&mut open).show(ctx,|ui| {
+                    ui.label("Instance display name (editor-only; doesn't rename the PS1 asset):");
+                    let response=ui.add(egui::TextEdit::singleline(&mut edit.text).desired_width(320.0));
+                    save=ui.button("Save name").clicked() ||
+                        (response.lost_focus() && ui.input(|i|i.key_pressed(egui::Key::Enter)));
+                    cancel=ui.button("Cancel").clicked();
+                    ui.small("An empty name clears the custom label. Save LCK scene to persist it.");
+                });
+            if save {
+                match scene_instances::valid_name(&edit.text) {
+                    Ok(name) => { pending_name=Some((edit.key,name)); self.editor_rename=None; }
+                    Err(error) => self.studio.error=Some(error),
+                }
+            } else if cancel || !open { self.editor_rename=None; }
+        }
         // Selection must never move, zoom, or retarget the camera.
         // Press F to deliberately frame a selected piece instead.
-        egui::TopBottomPanel::bottom("editor_readonly_inspector")
-            .resizable(self.editor_inspector_open)
-            .default_height(235.0)
-            .min_height(if self.editor_inspector_open { 150.0 } else { 28.0 })
-            .max_height(if self.editor_inspector_open { f32::INFINITY } else { 28.0 })
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.editor_inspector_open, "Placement inspector");
-                    ui.small("Editor-only transforms");
-                });
-                if !self.editor_inspector_open { return; }
-                if let (Some(scene), Some((terrain, i))) = (&ready, self.native_selected) {
+        // Stage O: a floating, scrollable Properties window leaves every pixel
+        // of the central viewport available for PS1 scene editing. The target
+        // is fixed when the window opens; clicking elsewhere won't hijack it.
+        if let Some(properties_key)=self.editor_properties_target {
+            if world.as_ref().and_then(|w|w.at(properties_key.0,properties_key.1)).is_none() {
+                self.editor_properties_target=None;
+                self.npc_playing=None;
+            } else {
+                let title=world.as_ref().and_then(|w|w.at(properties_key.0,properties_key.1))
+                    .and_then(|d|d.display_name.clone())
+                    .unwrap_or_else(||self.editor_name_for(ready.as_deref(),
+                        EditorCatalogItem::Draw(properties_key.0,properties_key.1)));
+                let mut window_open=true;
+                egui::Window::new(format!("Properties - {title}"))
+                    .id(egui::Id::new("lck_scene_object_properties"))
+                    .default_pos([380.0, 170.0])
+                    .default_size([650.0, 525.0])
+                    .min_size([375.0, 240.0])
+                    .resizable(true)
+                    .open(&mut window_open)
+                    .show(ctx, |ui| {
+                        ui.small("Original source details, editable placement, scale, rotation and supported NPC animation.");
+                        if let Some(foreign)=world.as_ref().and_then(|w|w.at(properties_key.0,properties_key.1)
+                            .and_then(|d|d.editor_uid)
+                            .and_then(|uid|w.foreign.iter().find(|f|f.uid==uid))) {
+                            ui.label(format!("Foreign original: {} / {} #{} — geometry-only preview. No native IMG export or imported collision/textures.",
+                                foreign.source,foreign.kind,foreign.record));
+                        }
+                        ui.separator();
+                        egui::ScrollArea::vertical().id_salt("lck_properties_scroll").show(ui, |ui| {
+                if let Some(key)=Some(properties_key) {
+                    if let Some(draw)=world.as_ref().and_then(|w|w.at(key.0,key.1)) {
+                        if draw.vertex_start < draw.vertex_end && !draw.hidden {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Rotation (degrees)");
+                                for (axis,label) in [(0,"X tilt"),(1,"Y spin"),(2,"Z roll")] {
+                                    let mut value=draw.rotation[axis].to_degrees();
+                                    ui.label(label);
+                                    if ui.add(egui::DragValue::new(&mut value).speed(0.5).max_decimals(1)).changed() {
+                                        let mut next=draw.rotation;
+                                        next[axis]=value.to_radians();
+                                        pending_rotation=Some((key,next,true));
+                                    }
+                                }
+                                if ui.small_button("Reset rotation").clicked() {
+                                    pending_rotation=Some((key,[0.0;3],true));
+                                }
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Scale (1.00 = original)");
+                                let mut uniform=draw.scale[0];
+                                ui.label("Uniform");
+                                if ui.add(egui::DragValue::new(&mut uniform).speed(0.01)
+                                    .range(0.05..=20.0).max_decimals(3)).changed() {
+                                    pending_scale=Some((key,[uniform;3]));
+                                }
+                                for (axis,label) in [(0,"X"),(1,"Y"),(2,"Z")] {
+                                    let mut value=draw.scale[axis];
+                                    ui.label(label);
+                                    if ui.add(egui::DragValue::new(&mut value).speed(0.01)
+                                        .range(0.05..=20.0).max_decimals(3)).changed() {
+                                        let mut next=draw.scale;
+                                        next[axis]=value;
+                                        pending_scale=Some((key,next));
+                                    }
+                                }
+                                if ui.small_button("Reset scale").clicked() {
+                                    pending_scale=Some((key,[1.0;3]));
+                                }
+                            });
+                            ui.small("RMB: rotate Y | Alt+RMB: rotate X | Scale 0.05-20x. Save .lckscene to persist.");
+                        }
+                    }
+                }
+                if let (Some(world),Some(key))=(&world,Some(properties_key)) {
+                    if let Some(npc)=world.npc(key) {
+                        ui.separator();
+                        ui.strong(format!("Native NPC / field actor #{}",npc.record));
+                        ui.label(format!("MAN {} | TMD {} | ANM {} | {}",
+                            npc.record,npc.model_index,npc.anim_id,npc.kind));
+                        ui.label(format!("PSX spawn X {:.0} Y {:.0} Z {:.0}",
+                            npc.psx_position[0],npc.psx_position[1],npc.psx_position[2]));
+                        if let Some(dialog)=&npc.dialog {
+                            ui.label(format!("Dialog evidence (speaker unverified): {dialog}"));
+                        }
+                        if npc.is_copy { ui.small("Editor NPC copy: editable and saved in LCK scene overlay."); }
+                        if npc.conditional {ui.small("Conditional script spawn; initial visibility off.");}
+                        if !npc.drawable { ui.small("Static actor mesh unavailable; animation editing disabled."); }
+                        if npc.drawable {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Appearance (cell TMD)");
+                                let mut model=npc.model_index;
+                                egui::ComboBox::from_id_salt(("npc_model",npc.key))
+                                    .selected_text(format!("TMD {}",npc.model_index))
+                                    .show_ui(ui,|ui| {
+                                        for (index,entry) in npc.model_pool.iter().enumerate() {
+                                            if let Some((_,parts))=entry {
+                                                ui.selectable_value(&mut model,index as u8,
+                                                    format!("TMD {index:03} ({parts} parts)"));
+                                            }
+                                        }
+                                    });
+                                if model!=npc.model_index {
+                                    self.npc_playing=None;
+                                    pending_npc_model=Some((key,model));
+                                }
+                                if ui.small_button("Original model").clicked() {
+                                    self.npc_playing=None;
+                                    pending_npc_model=Some((key,npc.original_model_index));
+                                }
+                            });
+                            ui.small("Model changes reuse original cell TMDs and textures. Incompatible multipart models are refused.");
+                        }
+                        if npc.drawable && !npc.clips.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Animation (native PS1 ANM)");
+                                let mut clip=npc.clip;
+                                egui::ComboBox::from_id_salt(("npc_clip",npc.key))
+                                    .selected_text(format!("ANM {}",npc.clip)).show_ui(ui,|ui| {
+                                        if npc.nobj==1 {
+                                            ui.selectable_value(&mut clip,0,"Rest pose");
+                                        }
+                                        for &(id,frames) in &npc.clips {
+                                            ui.selectable_value(&mut clip,id,
+                                                format!("ANM {id} ({frames} frames)"));
+                                        }
+                                    });
+                                if clip!=npc.clip {
+                                    self.npc_playing=None;
+                                    pending_npc_animation=Some((key,clip,0,true));
+                                }
+                                let count=npc.frames_for(clip).unwrap_or(1);
+                                let mut frame=if clip==npc.clip {npc.frame.min(count-1)} else {0};
+                                ui.label("Frame");
+                                if ui.add(egui::Slider::new(&mut frame,0..=count-1)
+                                    .show_value(true)).changed() {
+                                    self.npc_playing=None;
+                                    pending_npc_animation=Some((key,clip,frame,true));
+                                }
+                                if self.npc_playing==Some(key) {
+                                    if ui.button("Pause").clicked() {self.npc_playing=None;}
+                                } else if ui.button("Play").clicked() {
+                                    self.npc_playing=Some(key);
+                                    self.npc_next_tick=ctx.input(|i|i.time)+1.0/15.0;
+                                }
+                                if ui.small_button("Original pose").clicked() {
+                                    self.npc_playing=None;
+                                    pending_npc_animation=Some((key,npc.anim_id,0,true));
+                                }
+                            });
+                            if self.npc_playing==Some(key) {
+                                let now=ctx.input(|i|i.time);
+                                if now>=self.npc_next_tick {
+                                    let frames=npc.frames_for(npc.clip).unwrap_or(1);
+                                    if frames>1 {
+                                        pending_npc_animation=Some((key,npc.clip,(npc.frame+1)%frames,false));
+                                    }
+                                    self.npc_next_tick=now+1.0/15.0;
+                                }
+                                ctx.request_repaint_after(std::time::Duration::from_millis(67));
+                            }
+                        }
+                        ui.small("Animation is a static/looping editor preview. Clips are indexed by verified bone-count compatibility, NOT named idle/walk/talk without supporting evidence.");
+                        ui.small("Preview is editable. Save .lckscene to persist; Export PS1 test IMG to test supported native edits.");
+                    }
+                }
+                if let (Some(scene), Some((terrain, i))) = (&ready, Some(properties_key)) {
                     let records = if terrain { &scene.terrain } else { &scene.placements };
                     if let Some(d) = records.get(i) {
                         ui.label(format!("{}  [#{i:03}] | {} | model slot {} | res TMD {} | anchor {:?} | source cell {:?}",
-                            self.editor_name_for(Some(scene), EditorCatalogItem::Draw(terrain,i)),
+                            world.as_ref().and_then(|w|w.at(terrain,i))
+                                .and_then(|d|d.display_name.clone())
+                                .unwrap_or_else(||self.editor_name_for(Some(scene), EditorCatalogItem::Draw(terrain,i))),
                             if terrain { "Terrain" } else { "Placement" }, d.env_slot, d.res_tmd, d.anchor, d.cell));
                         ui.label(format!("Original PSX coordinates: X={} Y={} Z={}", d.world_x, d.world_y, d.world_z));
                         ui.label(format!("Original PSX rotations: X={} Y={} Z={} | anim ID={}", d.rot_x, d.rot_y, d.rot_z, d.anim_id));
-                        ui.small("Original PSX placement stays unchanged. Editor offsets below are preview-only, with +Y upward.");
+                        ui.small("Native coordinates are shown for reference. Edited offsets use +Y upward; PS1 export support depends on object type.");
                         if let Some(world) = &world {
                             if let Some(draw) = world.at(terrain, i) {
                                 ui.horizontal_wrapped(|ui| {
@@ -1463,6 +2716,28 @@ impl App {
                                     }
                                     ui.checkbox(&mut self.native_anchor_snap, "Magnet: object centers")
                                         .on_hover_text("Optionally lock near another piece's center, within half the selected grid size. Disabled by default.");
+                                    egui::ComboBox::from_id_salt("geck_drag_axis")
+                                        .selected_text(match self.geck_drag_axis {
+                                            Some(0) => "Drag X only",
+                                            Some(2) => "Drag Z only",
+                                            _ => "Drag free X/Z",
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut self.geck_drag_axis, None, "Free X/Z");
+                                            ui.selectable_value(&mut self.geck_drag_axis, Some(0), "X only");
+                                            ui.selectable_value(&mut self.geck_drag_axis, Some(2), "Z only");
+                                        });
+                                    egui::ComboBox::from_id_salt("geck_angle_snap")
+                                        .selected_text(if self.geck_angle_snap <= 0.0 {
+                                            "Angle: off".to_owned()
+                                        } else {
+                                            format!("Angle: {}°", self.geck_angle_snap)
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            for (value, label) in [(0.0,"Off"),(5.0,"5°"),(15.0,"15°"),(45.0,"45°"),(90.0,"90°")] {
+                                                ui.selectable_value(&mut self.geck_angle_snap, value, label);
+                                            }
+                                        });
                                 });
                                 ui.small("Snap grid starts at THIS piece's original position, so zero offset restores the original placement.");
                                 ui.horizontal_wrapped(|ui| {
@@ -1492,8 +2767,28 @@ impl App {
                                         }
                                     }
                                 });
-                                ui.small("Shift + left-drag in scene: move on X/Z | Ctrl+Shift + left-drag: height (Y) | Normal left-drag: pan");
+                                ui.small("Left-drag starting ON selected object: move X/Z | Ctrl+left-drag on object: height (Y) | Left-drag elsewhere: pan");
                             } else { ui.small("This native record has no drawable mesh to move."); }
+                        }
+                    } else if let Some(d) = world.as_ref().and_then(|w| w.at(terrain,i)) {
+                        if d.editor_uid.is_some() {
+                            let origin = d.source_ref.unwrap_or((false,0));
+                            ui.strong(format!("Editor-created instance #{}", d.editor_uid.unwrap_or(0)));
+                            ui.label(format!("Source: {} #{} | editor index {}",
+                                if origin.0 { "Terrain" } else { "Placement" }, origin.1, i));
+                            ui.small("Editor copy. Save as .lckscene or use Export PS1 test IMG for supported native instances.");
+                            ui.horizontal_wrapped(|ui| {
+                                for (axis,label) in [(0,"X"),(1,"Y"),(2,"Z")] {
+                                    let mut value=d.offset[axis];
+                                    ui.label(label);
+                                    if ui.add(egui::DragValue::new(&mut value).speed(1.0).max_decimals(2)).changed() {
+                                        let mut next=d.offset;
+                                        next[axis]=value;
+                                        pending_transform=Some(((terrain,i),next,true));
+                                    }
+                                }
+                            });
+                            ui.small("Drag selected object directly to move it. Drag empty space to pan. Ctrl+Z undoes changes including duplicate/delete, rotation and scale.");
                         }
                     }
                 } else if let (Some(lib), Some(pos)) = (&self.studio.library, self.studio.selected) {
@@ -1504,19 +2799,73 @@ impl App {
                 } else {
                     ui.label("Select a cell, then choose a placed object or terrain tile in the hierarchy.");
                 }
-            });
+                        });
+                    });
+                if !window_open {
+                    self.editor_properties_target=None;
+                    self.npc_playing=None;
+                }
+            }
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("World Viewport");
             if let (Some(scene), Some(world)) = (&ready, &world) {
-                ui.small(format!("Native '{}' | {} drawn instances | {} unique TMDs | {} unavailable",
+                ui.small(format!("Native '{}' | {} environmental instances | {} unique TMDs | {} unavailable",
                     scene.name, world.instances, world.unique_models, world.unavailable));
+                ui.small(format!("MAN field actors: {} catalogued | {} initially rendered | {} conditional",
+                    world.npcs.iter().filter(|n|!n.is_copy).count(),
+                    world.npcs.iter().filter(|n|!n.is_copy && n.drawable).count(),
+                    world.npcs.iter().filter(|n|!n.is_copy && n.conditional).count()));
+                // Stage Q7: collision sources are different for visible terrain,
+                // walls, NPCs and walkable floor. A yellow/tan TMD preview must
+                // never be represented as having native PS1 collision merely
+                // because another cell's wall bits overlap its silhouette.
+                if let Some(foreign) = self.native_selected
+                    .and_then(|(terrain, index)| world.at(terrain,index))
+                    .and_then(|draw|draw.editor_uid)
+                    .and_then(|uid|world.foreign.iter().find(|f|f.uid==uid)) {
+                    let wall_count=foreign.donor_wall_bits.len();
+                    let message=match foreign.kind.as_str() {
+                        "terrain" => format!("Selected foreign terrain UID {}: {} source MAP wall samples inside its footprint (NOT object-owned). Imported mesh is NOT native walk-ground; floor heightfield still belongs to destination. IMG export unsupported.",foreign.uid,wall_count),
+                        "placement" => format!("Selected foreign MAP object UID {}: original 32-byte placement {}. {} inferred source wall samples (NOT proven object-owned). Native IMG export requires target resource compatibility.",foreign.uid,if foreign.native_record.is_some() {"captured"} else {"unverified"},wall_count),
+                        "mesh" => format!("Selected foreign raw TMD UID {}: no native placement/wall ownership. Original texture data is editor-only until scene-resource transplantation is implemented.",foreign.uid),
+                        _ => format!("Selected foreign {} UID {}: actor or other collision is not represented by static MAP walls; native IMG import requires dedicated support.",foreign.kind,foreign.uid),
+                    };
+                    ui.colored_label(Color32::from_rgb(225,175,70),message)
+                        .on_hover_text("This is a source-provenance diagnostic, NOT a claim that the destination PS1 engine will collide with or walk on this object. The retail IMG is unchanged.");
+                }
                 ui.horizontal_wrapped(|ui| {
                     self.native_view.controls(ui, "Sample original PS1 TIM/CLUT atlas from assembled scene VRAM");
                     ui.checkbox(&mut self.native_ground_visible, "Show walk-ground")
                         .on_hover_text("Original per-cell PS1 walkable terrain: UV, CLUT and texture page are read from the disc's native heightfield and scene VRAM.");
+                    ui.checkbox(&mut self.native_collision_wire_visible, "Collision wireframe")
+                        .on_hover_text("View native MAP wall collision at its actual 64-unit resolution. Orange: original walls; cyan: newly positioned wall cells for supported object moves/copies. Does not modify the disc. NPC collider shapes and script-painted walls are not shown.");
+                    ui.checkbox(&mut self.object_collision_draft_visible, "Selected mesh collider DRAFT")
+                        .on_hover_text("Shows geometric collision candidates attached to ONLY the selected object, following its move, rotation and scale. Purple = steep faces; green = near-horizontal faces. This is not native PS1 MAP collision or walkable-ground data and is not exported to IMG yet.");
                     ui.checkbox(&mut self.native_view.world_mirrored, "Mirror view (X)")
                         .on_hover_text("Checked by default to restore your previous left/right view. Display only: native PS1 world coordinates, geometry and textured materials are not modified. Uncheck to compare orientations.");
                     if ui.button("Frame all").clicked() { self.native_view.frame_all(); }
+                    ui.menu_button("Camera marks", |ui| {
+                        ui.small("Session-only; no PS1 or .lckscene changes.");
+                        for index in 0..3 {
+                            ui.horizontal(|ui| {
+                                if ui.small_button(format!("Save {}", index + 1)).clicked() {
+                                    self.geck_camera_bookmarks[index] = Some(self.native_view.cam);
+                                    self.studio.status = Some(format!("Camera bookmark {} saved for this session.", index + 1));
+                                    ui.close();
+                                }
+                                if ui.add_enabled(self.geck_camera_bookmarks[index].is_some(),
+                                    egui::Button::new(format!("Go {}", index + 1))).clicked() {
+                                    if let Some(cam) = self.geck_camera_bookmarks[index] {
+                                        self.native_view.cam = cam;
+                                        self.native_view.version = self.native_view.version.wrapping_add(1);
+                                        ui.ctx().request_repaint();
+                                    }
+                                    ui.close();
+                                }
+                            });
+                        }
+                    });
                     if ui.button("Save layout...").on_hover_text("Save editor move offsets as a separate .lgmove file; doesn't write to game disc.").clicked() {
                         if let Some((name, _)) = &self.native_scene {
                             if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{name}.lgmove"))
@@ -1542,35 +2891,178 @@ impl App {
                             }
                         }
                     }
-                    if ui.add_enabled(!self.native_undo.is_empty(), egui::Button::new("Undo move")).clicked() {
-                        if let Some(edit) = self.native_undo.pop() {
-                            pending_transform = Some((edit.key, edit.before, false));
-                            self.native_redo.push(edit);
-                        }
+                    if ui.add_enabled(!self.editor_undo.is_empty() || self.editor_gesture_start.is_some(),
+                        egui::Button::new("Undo (Ctrl+Z)")).clicked() {
+                        pending_history_undo=true;
                     }
-                    if ui.add_enabled(!self.native_redo.is_empty(), egui::Button::new("Redo move")).clicked() {
-                        if let Some(edit) = self.native_redo.pop() {
-                            pending_transform = Some((edit.key, edit.after, false));
-                            self.native_undo.push(edit);
-                        }
+                    if ui.add_enabled(!self.editor_redo.is_empty(),
+                        egui::Button::new("Redo (Ctrl+Y)")).clicked() {
+                        pending_history_redo=true;
                     }
-                    if ui.add_enabled(self.native_selected.is_some(), egui::Button::new("Frame selected (F)")).clicked() {
-                        if let (Some(model), Some((terrain, index))) = (world.model.as_ref(), self.native_selected) {
-                            if let Some(draw) = world.at(terrain, index) {
-                                self.native_view.frame_instance(model, draw.center, draw.radius);
+                    if ui.button("Save LCK scene...").on_hover_text("Save original move offsets AND new editor-created instances to an .lckscene file. Does NOT modify the PS1 disc.").clicked() {
+                        if let Some((name, _)) = &self.native_scene {
+                            if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{name}.lckscene"))
+                                .add_filter("LCK scene overlay", &["lckscene"]).save_file() {
+                                let path = path.with_extension("lckscene");
+                                match std::fs::write(&path, scene_instances::serialize(name, world)) {
+                                    Ok(()) => self.studio.status = Some(format!("Saved LCK editor project: {}", path.display())),
+                                    Err(err) => self.studio.error = Some(format!("Could not save LCK project: {err}")),
+                                }
                             }
                         }
                     }
-                    // Capture the artist's chosen front/three-quarter framing angle.
-                    // F reuses that yaw/pitch without changing the zoom rule.
-                    if ui.add_enabled(self.native_selected.is_some(), egui::Button::new("Set F view"))
-                        .on_hover_text("Orbit until the selected piece looks right, then click to save this as the angle used by Frame Selected (F). This lasts until the editor is closed.")
+                    if let Some((terrain, index)) = self.native_selected {
+                        if let Some(draw) = world.at(terrain, index) {
+                            if ui.button("Copy transform")
+                                .on_hover_text("Copy editor RELATIVE offset, local rotation and scale; original MAP anchor is not copied.")
+                                .clicked() {
+                                self.geck_transform_clipboard = Some(GeckTransformClipboard {
+                                    offset: draw.offset, rotation: draw.rotation, scale: draw.scale,
+                                });
+                                self.studio.status = Some("Editor transform copied (relative offset + rotation + scale).".into());
+                            }
+                            if ui.add_enabled(self.geck_transform_clipboard.is_some(),
+                                egui::Button::new("Paste transform"))
+                                .on_hover_text("Apply copied local editor transforms. Native PS1 export may reject rotation/scale; use Check IMG before exporting.")
+                                .clicked() {
+                                if let Some(copy) = self.geck_transform_clipboard {
+                                    let key = (terrain, index);
+                                    pending_transform = Some((key, copy.offset, true));
+                                    pending_rotation = Some((key, copy.rotation, true));
+                                    pending_scale = Some((key, copy.scale));
+                                    self.studio.status = Some("Pasted editor transform. Use Check IMG to verify native support.".into());
+                                }
+                            }
+                        }
+                    }
+                    if ui.button("Check IMG")
+                        .on_hover_text("Run the SAME strict PS1-native export preparation, but do not open a save dialog or write any file. Passing preflight is not proof of PS1 runtime behavior.")
                         .clicked() {
-                        self.native_view.remember_frame_angle();
-                        self.studio.status = Some("Frame Selected will now reuse your current camera angle (this session).".into());
+                        let result = (|| -> anyhow::Result<()> {
+                            let lib = self.studio.library.as_ref()
+                                .ok_or_else(||anyhow::anyhow!("No disc image loaded"))?;
+                            if !matches!(&lib.source, Source::Disc(_)) {
+                                anyhow::bail!("Open the native PS1 .img disc source first");
+                            }
+                            let original = legaia_engine_scene::scene::Scene::load(lib.index.as_ref(), &scene.name)
+                                .context("Resolve original game cell")?;
+                            if original.field_map_index(lib.index.as_ref()).is_none() {
+                                anyhow::bail!("Selected cell has no native field MAP");
+                            }
+                            let _validated = ps1_export::prepare_cross_cell(scene, world, lib.index.as_ref())?;
+                            Ok(())
+                        })();
+                        match result {
+                            Ok(()) => self.studio.status = Some(format!(
+                                "PS1 export preflight PASSED for {}. No IMG was written. Confirm actual changes in DuckStation after exporting.", scene.name)),
+                            Err(e) => self.studio.error = Some(format!(
+                                "PS1 export preflight BLOCKED for {}: {e:#}", scene.name)),
+                        }
+                    }
+                    if ui.add_enabled(self.ps1_export_job.is_none(), egui::Button::new("Export PS1 test IMG..."))
+                        .on_hover_text("Stage M3 experimental: move/copy native static collider and authored 64-unit wall-grid footprint, up to 16 copies. Floor height, terrain records and scripts are preserved.")
+                        .clicked() {
+                        let prepared = (|| -> anyhow::Result<(PathBuf,usize,ps1_export::ExportEdits,String)> {
+                            let lib=self.studio.library.as_ref().ok_or_else(||anyhow::anyhow!("No disc image loaded"))?;
+                            let source=match &lib.source {
+                                Source::Disc(path) => path.clone(),
+                                Source::Extracted(_) => anyhow::bail!("Open the actual 2352-byte test .img, not extracted assets"),
+                            };
+                            let name=&scene.name;
+                            let catalog=legaia_engine_scene::scene::Scene::load(lib.index.as_ref(),name)
+                                .context("Resolve original game cell")?;
+                            let map=catalog.field_map_index(lib.index.as_ref())
+                                .ok_or_else(||anyhow::anyhow!("Cell {name} has no native field .MAP"))? as usize;
+                            // Integration V1: capture the COMPLETE editor change manifest
+                            // before native preflight. Names remain editor-side metadata.
+                            let overlay=scene_instances::serialize(name,world);
+                            if export_integration::only_editor_labels(&overlay) {
+                                let report=export_integration::render_report(name,&overlay,Some(&source));
+                                let note="Only hierarchy labels changed: no native PS1 data needs writing. Save the .lckscene to preserve the labels; IMG unchanged.";
+                                let log_path=export_integration::write_log(name,&report,note)
+                                    .map(|p|p.display().to_string()).unwrap_or_else(|e|e);
+                                anyhow::bail!("{note} Integration V1 log: {log_path}");
+                            }
+                            let edits=ps1_export::prepare_cross_cell(scene,world,lib.index.as_ref())
+                                .map_err(|error| {
+                                    let report=export_integration::render_report(name,&overlay,Some(&source));
+                                    let cause=format!("NATIVE PREFLIGHT FAILED: {error:#}");
+                                    let log_path=export_integration::write_log(name,&report,&cause)
+                                        .map(|p|p.display().to_string()).unwrap_or_else(|e|e);
+                                    anyhow::anyhow!("{cause}. Integration V1 log: {log_path}")
+                                })?;
+                            Ok((source,map,edits,name.to_string()))
+                        })();
+                        match prepared {
+                            Ok((source,map,edits,cell_name)) => {
+                                let suggestion=format!("{}_LCK_{}.img",
+                                    source.file_stem().and_then(|s|s.to_str()).unwrap_or("LegaiaTest"),cell_name);
+                                let mut dialog=rfd::FileDialog::new().set_file_name(&suggestion)
+                                    .add_filter("Raw PS1 test image", &["img"]);
+                                if let Some(parent)=source.parent() {dialog=dialog.set_directory(parent);}
+                                if let Some(destination)=dialog.save_file() {
+                                    let overlay=scene_instances::serialize(&cell_name,world);
+                                    let report=export_integration::render_report(&cell_name,&overlay,Some(&source));
+                                    let (tx,rx)=std::sync::mpsc::channel();
+                                    let repaint=ctx.clone();
+                                    std::thread::spawn(move|| {
+                                        let result=ps1_export::export(&source,&destination,map,&edits);
+                                        let outcome=match &result {
+                                            Ok(done)=>format!("NATIVE EXPORT SUCCESS: {}\nPatched: {}\nSkipped: {}",
+                                                done.path.display(),done.patched.join(" | "),done.skipped.join(" | ")),
+                                            Err(error)=>format!("NATIVE EXPORT FAILED: {error:#}"),
+                                        };
+                                        if let Err(error)=export_integration::write_log(&cell_name,&report,&outcome) {
+                                            log::warn!("Export Integration V1 diagnostic log unavailable: {error}");
+                                        }
+                                        let _=tx.send(result);
+                                        repaint.request_repaint();
+                                    });
+                                    self.ps1_export_job=Some(rx);
+                                    self.studio.status=Some("Building Stage N experimental test IMG: static wall collisions + native MAN NPC spawn/model/clip edits and script-bearing NPC copies. Actor scripts may still override placements; verify in DuckStation...".into());
+                                }
+                            }
+                            Err(error) => {
+                                if error.to_string().starts_with("Only hierarchy labels changed:") {
+                                    self.studio.error=None;
+                                    // An editor-only rename is not an invalid IMG. No native
+                                    // changes exist to compile; the LCK scene keeps the name.
+                                    self.studio.status=Some(format!("Editor-only rename: IMG export skipped (no native bytes changed). Save .lckscene. {error:#}"));
+                                } else {
+                                    self.studio.error=Some(format!("Cannot export native PS1 placement: {error:#}"));
+                                }
+                            },
+                        }
+                    }
+                    if ui.button("Open LCK scene...").on_hover_text("Rebuild the preview from an editor-only .lckscene file. Does NOT write the game disc.").clicked() {
+                        if let Some((name, _)) = &self.native_scene {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("LCK scene overlay", &["lckscene"]).pick_file() {
+                                let parsed = std::fs::read_to_string(&path).map_err(|e| e.to_string())
+                                    .and_then(|text| scene_instances::parse(&text, name, world));
+                                match parsed {
+                                    Ok(doc) => pending_project = Some(doc),
+                                    Err(err) => self.studio.error = Some(format!("LCK project not loaded: {err}")),
+                                }
+                            }
+                        }
+                    }
+                    if ui.add_enabled(self.native_selected.and_then(|key| world.at(key.0,key.1)).is_some(),
+                        egui::Button::new("Duplicate selected (Ctrl+D)"))
+                        .on_hover_text("Ctrl+D: create an editable copy of the selected PS1 mesh, shifted 128 units along X. Save LCK scene to persist it.")
+                        .clicked() {
+                        pending_duplicate=editor_duplicate_request(world, self.native_selected);
+                    }
+                    if ui.add_enabled(self.native_selected.is_some(), egui::Button::new("Delete selected (Del)"))
+                        .on_hover_text("Remove a new editor copy, or hide a native object until restored. .lckscene saves this without altering the PS1 disc.")
+                        .clicked() { pending_delete=self.native_selected; }
+                    if ui.add_enabled(self.native_selected.is_some(), egui::Button::new("Frame selected (F)"))
+                        .on_hover_text("Automatically center and frame this object from the reference elevated front view, relative to its original PS1 placement rotation and editor transform. No calibration step required.")
+                        .clicked() {
+                        frame_world_selection(&mut self.native_view, world, scene, self.native_selected);
                     }
                 });
-                ui.small("Click: select | Shift+LMB: move X/Z | Ctrl+Shift+LMB: move Y | LMB: pan | MMB/Alt+LMB: orbit or free-look | Esc: deselect | F: frame | Set F view: remember current angle | Home: frame all");
+                ui.small("Click: select | RMB click selected: Properties | RMB drag: spin Y | Alt+RMB drag: tilt X | Ctrl+D: duplicate | Ctrl+Z: undo | Del: delete | LMB drag ON selected: move X/Z | Ctrl+LMB drag ON selected: move Y | LMB elsewhere: pan | MMB/Alt+LMB: orbit | Esc: deselect | F: frame | Home: frame all");
                 // World-space camera eye: live scene coordinates, NOT selection/pivot.
                 // Keep the current v0.4.5.4 camera framing and movement unchanged.
                 if let Some(model) = world.model.as_ref() {
@@ -1587,8 +3079,8 @@ impl App {
                 if let Some(model) = &world.model {
                     if ui.rect_contains_pointer(ui.max_rect()) && ui.input(|i| i.key_pressed(egui::Key::F)) {
                         if let Some((terrain, index)) = self.native_selected {
-                            if let Some(draw) = world.at(terrain, index) {
-                                self.native_view.frame_instance(model, draw.center, draw.radius);
+                            if world.at(terrain, index).is_some() {
+                                frame_world_selection(&mut self.native_view, world, scene, self.native_selected);
                             }
                         }
                     }
@@ -1604,22 +3096,153 @@ impl App {
                         world.at(terrain, index).map(|d| d.center));
                     let selected_id = self.native_selected.and_then(|(terrain, index)|
                         world.at(terrain, index).map(|d| d.id));
-                    // A Shift-drag is an edit gesture; the viewport's standard
-                    // LMB pan skips Shift so selection and navigation stay intact.
+                    // Gesture is determined at mouse-down from the actual rasterized
+                    // mesh hit: dragging the selected mesh edits it, elsewhere pans.
+                    // The viewport suppresses camera navigation for captured edits.
                     let view_rect = ui.available_rect_before_wrap();
-                    let picked = self.native_view.show_world_limited(ui, model, &scene.res.vram, 900, 680, selected_id, self.native_ground_visible);
-                    let (pointer, down, pressed, shift, ctrl, alt) = ui.input(|inp| (
+                    let picked = self.native_view.show_world_limited_with_sources(ui, model, &scene.res.vram,
+                        900, 680, selected_id, self.native_ground_visible,
+                        self.editor_asset_drag.is_some(), &world.foreign_vram);
+                    if self.native_collision_wire_visible {
+                        let source_key = self.studio.library.as_ref()
+                            .map(|lib| match &lib.source {
+                                Source::Disc(path) | Source::Extracted(path) => path.display().to_string(),
+                            }).unwrap_or_default();
+                        if self.native_collision_grid.as_ref().is_none_or(|grid|
+                            grid.scene != scene.name || grid.source_key != source_key) {
+                            let loaded = self.studio.library.as_ref()
+                                .ok_or_else(|| anyhow::anyhow!("Open an original PS1 disc image or extracted field data"))
+                                .and_then(|lib| collision_wire::CollisionGrid::load(lib.index.as_ref(), &scene.name, &source_key));
+                            match loaded {
+                                Ok(grid) => self.native_collision_grid = Some(grid),
+                                Err(err) => {
+                                    self.native_collision_grid = None;
+                                    self.native_collision_wire_visible = false;
+                                    self.studio.error = Some(format!("Collision wireframe unavailable: {err:#}"));
+                                }
+                            }
+                        }
+                        if let Some(grid) = &self.native_collision_grid {
+                            // The overlay is drawn AFTER the raster image using the
+                            // identical camera projection. It never changes
+                            // camera gestures, hit testing, or IMG export.
+                            // The Q5 preview originally assembled donor scenes and decoded
+                            // their meshes/MAP on EVERY repaint. That triggers severe stutter
+                            // in the CPU raster editor, especially while moving an object.
+                            // A complete serialized LCK scene overlay is a deterministic
+                            // change key; moving or deleting objects invalidates this cache.
+                            // The disc and cell are included to prevent cross-disc reuse.
+                            let overlay = scene_instances::serialize(&scene.name, world);
+                            let key = format!("{}\n{}\n{}", source_key, scene.name, overlay);
+                            let dragging = self.native_drag.is_some() || self.native_rotate.is_some()
+                                || self.editor_asset_drag.is_some();
+                            let changed = self.native_collision_preview_cache.as_ref()
+                                .is_none_or(|(cached,_)| cached != &key);
+                            // Do not reload/decompress whole donor scenes on every mouse
+                            // move. While dragging show base native collision only, then
+                            // compute once when the gesture has finished.
+                            if changed && !dragging {
+                                let outcome = self.studio.library.as_ref()
+                                    .map(|lib| ps1_export::prepare_cross_cell_collision_preview(
+                                        scene, world, lib.index.as_ref()))
+                                    .unwrap_or_else(|| Err(anyhow::anyhow!("Missing open disc index")))
+                                    .map_err(|err| format!("{err:#}"));
+                                self.native_collision_preview_cache=Some((key.clone(),outcome));
+                            }
+                            let edits = match self.native_collision_preview_cache.as_ref() {
+                                Some((cached,result)) if cached==&key =>
+                                    result.clone().map_err(anyhow::Error::msg),
+                                _ => ps1_export::prepare_collision_preview(scene,world),
+                            };
+                            collision_wire::paint(ui, view_rect, &self.native_view, model,
+                                grid, edits);
+                        }
+                    }
+                    if self.object_collision_draft_visible {
+                        if let Some((terrain,index))=self.native_selected {
+                            if let Some(draw)=world.at(terrain,index) {
+                                // Use live transformed mesh vertices: native originals,
+                                // duplicates, and imported game-wide draws all follow
+                                // the same non-destructive editor transforms.
+                                object_collision::paint(ui,view_rect,&self.native_view,model,draw);
+                            }
+                        }
+                    }
+                    let (pointer, down, pressed, ctrl, alt) = ui.input(|inp| (
                         inp.pointer.interact_pos(), inp.pointer.primary_down(),
-                        inp.pointer.primary_pressed(), inp.modifiers.shift,
-                        inp.modifiers.ctrl, inp.modifiers.alt));
-                    if self.native_drag.is_some() && (!down || !shift || alt) {
+                        inp.pointer.primary_pressed(), inp.modifiers.ctrl, inp.modifiers.alt));
+                    if self.native_drag.is_some() && (!down || alt) {
                         finish_drag = self.native_drag.take();
                     }
-                    if down && shift && !alt {
+                    // Start an object rotation ONLY when RMB is pressed directly on
+                    // the highlighted mesh (not on empty space or another object).
+                    // MMB/Alt+LMB camera orbit and hierarchy RMB remain untouched.
+                    let (right_down,right_pressed)=ui.input(|inp|
+                        (inp.pointer.secondary_down(),inp.pointer.secondary_pressed()));
+                    if self.native_rotate.is_some() && !right_down {
+                        if let Some(gesture)=self.native_rotate.take() {
+                            let released_at=pointer.unwrap_or(gesture.pointer_start);
+                            if (released_at-gesture.pointer_start).length_sq() <= 36.0 &&
+                                !gesture.pitch_axis {
+                                self.editor_context_menu=Some((released_at,gesture.key));
+                            } else {
+                                finish_rotate=Some(gesture);
+                            }
+                        }
+                    }
+                    if right_pressed && self.editor_modal.is_none() && self.editor_rename.is_none() {
+                        if let (Some(key),Some(pos))=(self.native_selected,pointer) {
+                            if view_rect.contains(pos) {
+                                if let Some(draw)=world.at(key.0,key.1) {
+                                    if !draw.hidden && draw.vertex_start < draw.vertex_end {
+                                        // Match the raster viewport's pixel scale and
+                                        // optional horizontal display-only mirroring.
+                                        let scale=ui.ctx().pixels_per_point();
+                                        let px=[((view_rect.width()*scale) as usize).clamp(16,900),
+                                                ((view_rect.height()*scale) as usize).clamp(16,680)];
+                                        let x=(pos.x-view_rect.left())*px[0] as f32/view_rect.width().max(1.0);
+                                        let y=(pos.y-view_rect.top())*px[1] as f32/view_rect.height().max(1.0);
+                                        let hit_x=if self.native_view.world_mirrored {
+                                            (px[0] as f32 - 1.0 - x).max(0.0)
+                                        } else { x };
+                                        let id=crate::raster::pick_instance(model,self.native_view.cam,
+                                            px[0],px[1],[hit_x,y]);
+                                        if id==Some(draw.id) {
+                                            self.native_rotate=Some(EditorRotateDrag {
+                                                key,pointer_start:pos,rotation_start:draw.rotation,
+                                                pitch_axis:alt,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if right_down {
+                        if let (Some(drag),Some(pos))=(self.native_rotate,pointer) {
+                            if self.native_selected==Some(drag.key) &&
+                                (pos-drag.pointer_start).length_sq()>36.0 {
+                                let rotation=editor_rotate_drag(drag.rotation_start,
+                                    pos-drag.pointer_start,drag.pitch_axis,self.native_view.world_mirrored);
+                                let rotation=geck_snap_euler_axis(rotation,
+                                    if drag.pitch_axis {0} else {1}, self.geck_angle_snap);
+                                pending_rotation=Some((drag.key,rotation,false));
+                            }
+                        }
+                    }
+                    if down && !alt && self.editor_asset_drag.is_none() && self.global_repository_drag.is_none() {
                         if let (Some(key), Some(pos)) = (self.native_selected, pointer) {
+                            // A previously selected *visible* mesh must be hit at mouse-down.
+                            // Never start moving an object when a drag begins over ground,
+                            // empty space or another object (those gestures pan normally).
                             if pressed && view_rect.contains(pos) {
                                 if let Some(draw) = world.at(key.0, key.1) {
-                                    self.native_drag = Some(EditorDrag { key, pointer_start: pos, offset_start: draw.offset });
+                                    if !draw.hidden && draw.vertex_start < draw.vertex_end &&
+                                        self.native_view.world_left_drag_selected == Some(draw.id) {
+                                        self.native_drag = Some(EditorDrag {
+                                            key, pointer_start: pos, offset_start: draw.offset,
+                                        });
+                                    }
                                 }
                             }
                             if let Some(drag) = self.native_drag.filter(|d| d.key == key) {
@@ -1632,7 +3255,96 @@ impl App {
                                 if self.native_anchor_snap {
                                     desired = world.snap_nearby_anchor(key, desired, self.native_grid_size * 0.5);
                                 }
+                                // Lock after magnet so snapping cannot move the locked axis.
+                                // Ctrl+drag remains the established vertical/Y movement.
+                                if !ctrl {
+                                    match self.geck_drag_axis {
+                                        Some(0) => desired[2] = drag.offset_start[2],
+                                        Some(2) => desired[0] = drag.offset_start[0],
+                                        _ => {}
+                                    }
+                                }
                                 pending_transform = Some((key, desired, false));
+                            }
+                        }
+                    }
+                    // Repository drag starts in the LEFT panel; release is handled in
+                    // the scene panel only. The viewport cannot mistake this for
+                    // camera pan or movement of an already-selected instance.
+                    if let Some(global_id)=self.global_repository_drag {
+                        let released=ui.input(|i|i.pointer.primary_released());
+                        let hovering=ui.input(|i|i.pointer.latest_pos())
+                            .filter(|p|view_rect.contains(*p));
+                        if let Some(asset)=self.global_repository.get(global_id) {
+                            let compatible=global_repository::compatible_source_with_index(scene,asset,
+                                &self.global_repository_tmd_hashes)
+                                .and_then(|local| placement_drop::native_source_key(scene,world,local).map(|_|local));
+                            if let Some(pointer)=hovering {
+                                ui.painter().text(pointer+egui::vec2(12.0,15.0),
+                                    egui::Align2::LEFT_TOP,
+                                    if compatible.is_some() {"Release: create destination-native instance"}
+                                    else if !matches!(asset.kind,global_repository::Kind::Npc(_)) {
+                                        "Release: stage foreign TMD mesh (untextured editor preview only)"
+                                    } else {"Foreign MAN actors need script/animation importing"},
+                                    egui::FontId::proportional(14.0),Color32::YELLOW);
+                            }
+                            if released {
+                                if let Some(pointer)=hovering {
+                                    if let Some(local)=compatible {
+                                        let px=placement_drop::viewport_pixels(view_rect,
+                                            ui.ctx().pixels_per_point(),[900,680]);
+                                        let pixel=placement_drop::viewport_pixel(view_rect,pointer,
+                                            px,self.native_view.world_mirrored);
+                                        let snap=ui.input(|i|i.modifiers.shift);
+                                        match placement_drop::prepare_drop(scene,world,local,
+                                            self.native_view.cam,pixel,px,snap) {
+                                            Ok(request)=>{
+                                                pending_duplicate=Some(request);
+                                                pending_repository_drop=true;
+                                            },
+                                            Err(error)=>self.studio.error=Some(format!(
+                                                "Global asset placement: {error}")),
+                                        }
+                                    } else if !matches!(asset.kind,global_repository::Kind::Npc(_)) {
+                                        let px=placement_drop::viewport_pixels(view_rect,
+                                            ui.ctx().pixels_per_point(),[900,680]);
+                                        let pixel=placement_drop::viewport_pixel(view_rect,pointer,
+                                            px,self.native_view.world_mirrored);
+                                        pending_foreign=Some((global_id,pixel,px,ui.input(|i|i.modifiers.shift)));
+                                    } else {
+                                        self.studio.error=Some("Cross-cell MAN actors need resource, animation and script relocation before staging as functioning NPCs. Original actor preview remains available.".into());
+                                    }
+                                }
+                                self.global_repository_drag=None;
+                            }
+                        }
+                    }
+                    if let Some(asset)=self.editor_asset_drag {
+                        let released=ui.input(|i|i.pointer.primary_released());
+                        let hovering=ui.input(|i|i.pointer.latest_pos())
+                            .filter(|p|view_rect.contains(*p));
+                        if let Some(pointer)=hovering {
+                            let label=if placement_drop::native_source_key(scene,world,asset).is_some() {
+                                "Release: place at F distance | Shift: snap to walk-ground"
+                            } else {"No drawable native source in this cell"};
+                            ui.painter().text(pointer+egui::vec2(12.0,15.0),
+                                egui::Align2::LEFT_TOP,label,
+                                egui::FontId::proportional(14.0),Color32::YELLOW);
+                        }
+                        if released {
+                            self.editor_asset_drag=None;
+                            if let Some(pointer)=hovering {
+                                let px=placement_drop::viewport_pixels(view_rect,ui.ctx().pixels_per_point(),[900,680]);
+                                let pixel=placement_drop::viewport_pixel(view_rect,pointer,px,self.native_view.world_mirrored);
+                                let ground_snap=ui.input(|i| i.modifiers.shift);
+                                match placement_drop::prepare_drop(scene,world,asset,
+                                    self.native_view.cam,pixel,px,ground_snap) {
+                                    Ok(request)=>{
+                                        pending_duplicate=Some(request);
+                                        pending_repository_drop=true;
+                                    },
+                                    Err(message)=>self.studio.error=Some(format!("Cannot place asset: {message}")),
+                                }
                             }
                         }
                     }
@@ -1651,11 +3363,265 @@ impl App {
                 self.preview(ui);
             }
         });
+        if let Some(global_id)=self.global_repository_drag {
+            if ctx.input(|i|i.key_pressed(egui::Key::Escape)) {
+                self.global_repository_drag=None;
+                self.studio.status=Some("Cross-cell placement cancelled".into());
+            } else if let (Some(pointer),Some(asset))=(ctx.input(|i|i.pointer.latest_pos()),
+                self.global_repository.get(global_id)) {
+                let painter=ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip,
+                    egui::Id::new("lck_global_asset_drag_cursor")));
+                let text=format!("{} / {}\nDrag into target viewport · Shift: ground snap",asset.source,asset.label);
+                painter.rect_filled(egui::Rect::from_min_size(pointer+egui::vec2(12.0,18.0),
+                    egui::vec2(390.0,44.0)),egui::CornerRadius::same(5),
+                    Color32::from_rgba_unmultiplied(26,38,50,225));
+                painter.text(pointer+egui::vec2(20.0,23.0),egui::Align2::LEFT_TOP,text,
+                    egui::FontId::proportional(13.0),Color32::YELLOW);
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                ctx.request_repaint();
+            }
+        }
+        if let Some(asset)=self.editor_asset_drag {
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.editor_asset_drag=None;
+                self.studio.status=Some("Repository placement cancelled".into());
+            } else if let Some(pointer)=ctx.input(|i| i.pointer.latest_pos()) {
+                let kind=match asset {
+                    EditorCatalogItem::Draw(true,_)=>"Terrain",
+                    EditorCatalogItem::Draw(false,_)=>"Native object / NPC",
+                    EditorCatalogItem::Mesh(_)=>"Native mesh",
+                    _=>"Resource",
+                };
+                let painter=ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Tooltip, egui::Id::new("lck_asset_drag_cursor")));
+                let name=self.editor_name_for(ready.as_deref(),asset);
+                painter.rect_filled(egui::Rect::from_min_size(pointer+egui::vec2(12.0,18.0),
+                    egui::vec2(350.0,42.0)),egui::CornerRadius::same(5),
+                    Color32::from_rgba_unmultiplied(26,38,50,225));
+                painter.text(pointer+egui::vec2(20.0,23.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("{kind}: {name}\nDrop: F distance · Shift: ground"),
+                    egui::FontId::proportional(13.0),Color32::YELLOW);
+                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                // Keep hover/drop guidance alive while crossing panel borders.
+                ctx.request_repaint();
+            }
+        }
+        if ctx.input(|i|i.pointer.primary_released()) {
+            self.editor_asset_drag=None;
+            self.global_repository_drag=None;
+        }
+        // RMB click (without moving) opens a context dropdown on the selected
+        // mesh. RMB drag continues to rotate Y; Alt+RMB drag tilts X.
+        // Keeping the menu outside the viewport allocation prevents resizing
+        // and does not affect existing pan/orbit or rendering code.
+        if let Some((position,key))=self.editor_context_menu {
+            let panel=egui::Area::new(egui::Id::new("lck_viewport_properties_context"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(position)
+                .interactable(true)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.set_min_width(175.0);
+                        if ui.button("Properties...").clicked() {
+                            self.native_selected=Some(key);
+                            self.editor_properties_target=Some(key);
+                            self.editor_context_menu=None;
+                        }
+                    });
+                });
+            if self.editor_context_menu.is_some() && ctx.input(|i|i.pointer.any_pressed()) &&
+                !panel.response.rect.contains(ctx.input(|i|i.pointer.interact_pos())
+                    .unwrap_or(egui::Pos2::ZERO)) {
+                self.editor_context_menu=None;
+            }
+        }
         self.editor_catalog_popup(ctx, ready.as_deref(), world.as_deref());
+        self.editor_global_repository_dialog(ctx);
+        // Ctrl+D and the Duplicate button share one path. Keep this shortcut
+        // local to the World Editor and disable it while typing, renaming or
+        // using an object properties/preview dialog.
+        if self.editor_modal.is_none() && self.global_repository_dialog.is_none() &&
+            self.editor_properties_target.is_none() && self.editor_rename.is_none() &&
+            self.editor_cell_rename.is_none() && self.editor_cell_properties.is_none() &&
+            !ctx.wants_keyboard_input() &&
+            ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND, egui::Key::D))) {
+            if let Some(key)=self.native_selected {
+                pending_duplicate=world.as_deref().and_then(|w|
+                    editor_duplicate_request(w, Some(key)));
+            } else if let Some(cell)=self.editor_cell_selected.clone() {
+                self.duplicate_editor_cell(cell);
+            }
+        }
+        // Guard Delete so text entry (hierarchy filter, rename, coordinates)
+        // and preview dialogs never delete scene objects by accident.
+        if self.editor_modal.is_none() && self.global_repository_dialog.is_none() &&
+            self.editor_properties_target.is_none() && self.editor_rename.is_none() &&
+            self.editor_cell_rename.is_none() && self.editor_cell_properties.is_none() &&
+            !ctx.wants_keyboard_input() && ctx.input(|i|i.key_pressed(egui::Key::Delete)) {
+            pending_delete=self.native_selected;
+        }
+        // Capture lightweight scene metadata before edits, never clone raster
+        // vertices per frame. One mouse gesture becomes one undo operation.
+        let editor_changed_this_frame = pending_name.is_some() || pending_restore.is_some() ||
+            pending_delete.is_some() || pending_duplicate.is_some() || pending_foreign.is_some() ||
+            pending_transform.is_some() || pending_rotation.is_some() ||
+            pending_scale.is_some() || pending_import.is_some() ||
+            pending_npc_animation.as_ref().is_some_and(|item|item.3) ||
+            pending_npc_model.is_some() ||
+            pending_project.is_some() || self.editor_gesture_start.is_some();
+        let before_frame=if editor_changed_this_frame {
+            match (self.native_scene.as_ref(),world.as_deref()) {
+                (Some((name,NativeSceneSlot::Ready(_, _))),Some(w))=>
+                    Some(editor_history_capture(w,name,self.native_selected)),
+                _=>None,
+            }
+        } else {None};
+        // Keyboard shortcuts are disabled while entering text or using dialogs.
+        if self.editor_modal.is_none() && self.editor_rename.is_none() &&
+            !ctx.wants_keyboard_input() {
+            pending_history_undo |= ctx.input_mut(|i| i.consume_shortcut(
+                &egui::KeyboardShortcut::new(egui::Modifiers::COMMAND,egui::Key::Z)));
+            pending_history_redo |= ctx.input_mut(|i| i.consume_shortcut(
+                &egui::KeyboardShortcut::new(egui::Modifiers::COMMAND,egui::Key::Y)));
+        }
         // All panels have released their Arc clones before the mutation.
         // Arc::get_mut keeps one writable world, without cloning thousands
         // of vertices on every mouse frame. The original scene remains intact.
         drop(world);
+        if let Some((key,name))=pending_name {
+            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut() {
+                if let Some(world)=Arc::get_mut(world) {
+                    if world.set_display_name(key,name) {
+                        self.studio.status=Some("Scene instance renamed. Save LCK scene to preserve the name.".into());
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
+        if let Some(key)=pending_restore {
+            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut() {
+                if let Some(world)=Arc::get_mut(world) {
+                    if world.set_hidden(key,false) {
+                        self.native_view.version=self.native_view.version.wrapping_add(1);
+                        self.studio.status=Some("Native scene object restored (editor only).".into());
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
+        if let Some(key)=pending_delete {
+            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut() {
+                if let Some(world)=Arc::get_mut(world) {
+                    let created=world.at(key.0,key.1).map(|d|d.editor_uid.is_some());
+                    let result=match created {
+                        Some(true)=>world.delete_created(key),
+                        Some(false)=>if world.set_hidden(key,true) {Ok(())} else {Err("Could not hide native object".into())},
+                        None=>Err("Selected instance was not found".into()),
+                    };
+                    match result {
+                        Ok(())=>{
+                            self.native_selected=None;
+                            self.native_drag=None;
+                            self.native_rotate=None;
+                            self.native_undo.clear(); self.native_redo.clear();
+                            self.native_rotate_undo.clear(); self.native_rotate_redo.clear();
+                            self.editor_preview=None; self.editor_modal=None;
+                            self.editor_properties_target=None; self.editor_context_menu=None;
+                            self.npc_playing=None;
+                            self.native_view.version=self.native_view.version.wrapping_add(1);
+                            self.studio.status=Some("Deleted from editor scene. Native PS1 files unchanged. Save LCK scene to persist.".into());
+                            ctx.request_repaint();
+                        },
+                        Err(error)=>self.studio.error=Some(format!("Cannot delete selected object: {error}")),
+                    }
+                }
+            }
+        }
+        if let Some((global_id,pixel,px,snap))=pending_foreign {
+            let asset=self.global_repository.get(global_id).cloned();
+            let index=self.studio.library.as_ref().map(|lib|Arc::clone(&lib.index));
+            if let (Some(asset),Some(index))=(asset,index) {
+                let donor=legaia_engine_world_views::scene_staging::assemble_field_scene(&index,&asset.source);
+                match donor {
+                    Ok(donor)=>{
+                        let (kind,record)=match asset.kind {
+                            global_repository::Kind::Placement(i)=>("placement",i),
+                            global_repository::Kind::Terrain(i)=>("terrain",i),
+                            global_repository::Kind::Mesh(i)=>("mesh",i),
+                            global_repository::Kind::Npc(_)=>("unsupported",0),
+                        };
+                        let result=world_view::foreign_size(&donor,kind,record).and_then(|(radius,bottom)|{
+                            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut(){
+                                let world=Arc::get_mut(world).ok_or("Destination world is borrowed")?;
+                                let center=placement_drop::foreign_drop_center(world,
+                                    self.native_view.cam,pixel,px,radius,bottom,snap)?;
+                                let uid=world.draws.iter().filter_map(|d|d.editor_uid)
+                                    .max().unwrap_or(0).saturating_add(1);
+                                world.insert_foreign(&donor,kind,record,uid,center,&index)
+                            } else {Err("Destination scene is not ready".into())}
+                        });
+                        match result {
+                            Ok(key)=>{
+                                self.native_selected=Some(key);
+                                if let Some((_,NativeSceneSlot::Ready(scene,world)))=self.native_scene.as_ref() {
+                                    frame_world_selection(&mut self.native_view,world,scene,Some(key));
+                                }
+                                self.native_view.version=self.native_view.version.wrapping_add(1);
+                                self.studio.status=Some(format!("Foreign original {} staged as independent editor mesh. Save .lckscene to persist. Geometry and source VRAM materials are displayed; native collision and IMG export are not imported.",asset.label));
+                                ctx.request_repaint();
+                            }
+                            Err(error)=>self.studio.error=Some(format!("Cross-cell placement: {error}")),
+                        }
+                    }
+                    Err(error)=>self.studio.error=Some(format!("Could not open original donor {}: {error}",asset.source)),
+                }
+            }
+        }
+        if let Some((source,offset,rotation,actor)) = pending_duplicate {
+            if let Some((_,NativeSceneSlot::Ready(scene,world)))=self.native_scene.as_mut() {
+                if let Some(world)=Arc::get_mut(world) {
+                    let uid=world.draws.iter().filter_map(|d|d.editor_uid).max().unwrap_or(0).saturating_add(1);
+                    // Repository drops are fresh instances: never inherit a
+                    // different selected object's scale by accident.
+                    let selected_scale=if pending_repository_drop { [1.0;3] } else {
+                        self.native_selected.and_then(|old|
+                            world.at(old.0,old.1).map(|d|d.scale)).unwrap_or([1.0;3])
+                    };
+                    match world.duplicate_native(source,scene.placements.len(),uid,offset) {
+                        Ok(key) => {
+                            // Copy the *selected instance* appearance and frame, not just the
+                            // source's original MAN record. Each copy stays independent.
+                            if let Some((model,clip,frame))=actor {
+                                if let Err(error)=world.set_npc_model(key,model)
+                                    .and_then(|_|world.set_npc_animation(key,clip,frame)) {
+                                    self.studio.error=Some(format!("NPC copy appearance: {error}"));
+                                }
+                            }
+                            if selected_scale != [1.0;3] && !world.set_scale(key.0,key.1,selected_scale) {
+                                self.studio.error=Some("Copy created, but its scale could not be inherited".into());
+                            }
+                            if rotation != [0.0;3] && !world.set_rotation(key.0,key.1,rotation) {
+                                self.studio.error=Some("Copy created, but its rotation could not be inherited".into());
+                            }
+                            self.native_selected=Some(key);
+                            if pending_repository_drop {
+                                // The selected item appears at the exact F
+                                // reference viewing distance and original
+                                // native orientation, with no extra key press.
+                                frame_world_selection(&mut self.native_view,world,scene,Some(key));
+                            }
+                            self.native_view.version=self.native_view.version.wrapping_add(1);
+                            self.studio.status=Some(format!("New editor instance #{uid} created and selected{}; save LCK scene to persist.",
+                                if pending_repository_drop { " (auto-framed as F)" } else { "" }));
+                            ctx.request_repaint();
+                        },
+                        Err(error)=>self.studio.error=Some(format!("Could not duplicate object: {error}")),
+                    }
+                }
+            }
+        }
         if let Some((key, desired, record)) = pending_transform {
             if let Some((_, NativeSceneSlot::Ready(_, world))) = self.native_scene.as_mut() {
                 if let Some(world) = Arc::get_mut(world) {
@@ -1668,6 +3634,64 @@ impl App {
                                 self.native_undo.push(EditorTransformEdit { key, before, after: desired });
                                 self.native_redo.clear();
                             }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((key,desired,record))=pending_rotation {
+            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut() {
+                if let Some(world)=Arc::get_mut(world) {
+                    if let Some(draw)=world.at(key.0,key.1) {
+                        let before=draw.rotation;
+                        if before != desired && world.set_rotation(key.0,key.1,desired) {
+                            self.native_view.version=self.native_view.version.wrapping_add(1);
+                            ctx.request_repaint();
+                            if record {
+                                self.native_rotate_undo.push(EditorRotationEdit{key,before,after:desired});
+                                self.native_rotate_redo.clear();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((key,desired))=pending_scale {
+            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut() {
+                if let Some(world)=Arc::get_mut(world) {
+                    if world.at(key.0,key.1).is_some_and(|d|d.scale!=desired) &&
+                        world.set_scale(key.0,key.1,desired) {
+                        self.native_view.version=self.native_view.version.wrapping_add(1);
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
+        if let Some((key,index))=pending_npc_model {
+            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut() {
+                if let Some(world)=Arc::get_mut(world) {
+                    match world.set_npc_model(key,index) {
+                        Ok(())=>{
+                            self.native_view.version=self.native_view.version.wrapping_add(1);
+                            self.studio.status=Some(format!("NPC uses scene TMD {index}; save LCK scene to persist appearance."));
+                            ctx.request_repaint();
+                        }
+                        Err(reason)=>self.studio.error=Some(format!("NPC appearance: {reason}")),
+                    }
+                }
+            }
+        }
+        if let Some((key,clip,frame,_))=pending_npc_animation {
+            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut() {
+                if let Some(world)=Arc::get_mut(world) {
+                    match world.set_npc_animation(key,clip,frame) {
+                        Ok(())=>{
+                            self.native_view.version=self.native_view.version.wrapping_add(1);
+                            ctx.request_repaint();
+                        }
+                        Err(reason)=>{
+                            self.npc_playing=None;
+                            self.studio.error=Some(format!("NPC animation preview: {reason}"));
                         }
                     }
                 }
@@ -1686,9 +3710,49 @@ impl App {
                     self.native_undo.clear();
                     self.native_redo.clear();
                     self.native_drag = None;
+                    self.native_rotate = None;
+                    self.native_rotate_undo.clear(); self.native_rotate_redo.clear();
                     self.native_view.version = self.native_view.version.wrapping_add(1);
                     ctx.request_repaint();
                     self.studio.status = Some("Preview layout offsets loaded; the PS1 disc remains untouched.".into());
+                }
+            }
+        }
+        if let Some(doc) = pending_project {
+            let index=self.studio.library.as_ref().map(|lib|Arc::clone(&lib.index));
+            if let Some((_,NativeSceneSlot::Ready(scene,world)))=self.native_scene.as_mut() {
+                if let Some(world)=Arc::get_mut(world) {
+                    let result=index.as_ref().ok_or("No disc index for project restoration".to_string())
+                        .and_then(|index|scene_instances::apply(&doc,world,scene.placements.len(),index));
+                    match result {
+                        Ok(())=>{
+                            self.native_selected=None;
+                            self.editor_properties_target=None;
+                            self.editor_context_menu=None;
+                            self.npc_playing=None;
+                            self.native_undo.clear();
+                            self.native_redo.clear();
+                            self.native_drag=None;
+                            self.native_rotate=None;
+                            self.native_rotate_undo.clear(); self.native_rotate_redo.clear();
+                            self.native_view.version=self.native_view.version.wrapping_add(1);
+                            self.studio.status=Some(format!("Loaded LCK scene with {} additional native copies and {} foreign geometry previews; PS1 disc unchanged.",doc.created.len(),doc.foreign.len()));
+                            ctx.request_repaint();
+                        },
+                        Err(err)=>self.studio.error=Some(format!("Could not restore LCK scene: {err}")),
+                    }
+                }
+            }
+        }
+        if let Some(drag)=finish_rotate {
+            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_ref() {
+                if let Some(draw)=world.at(drag.key.0,drag.key.1) {
+                    if draw.rotation!=drag.rotation_start {
+                        self.native_rotate_undo.push(EditorRotationEdit {
+                            key:drag.key,before:drag.rotation_start,after:draw.rotation,
+                        });
+                        self.native_rotate_redo.clear();
+                    }
                 }
             }
         }
@@ -1700,6 +3764,73 @@ impl App {
                             key: drag.key, before: drag.offset_start, after: draw.offset,
                         });
                         self.native_redo.clear();
+                    }
+                }
+            }
+        }
+        // Coalesce live mouse drags (translation, rotation, numeric scale) to
+        // one history entry on mouse release. Snapshot captures only metadata.
+        let after_frame=if editor_changed_this_frame || pending_history_undo || pending_history_redo {
+            self.native_scene.as_ref().and_then(|(name,state)|match state {
+                NativeSceneSlot::Ready(_,w)=>Some(editor_history_capture(w,name,self.native_selected)),
+                _=>None,
+            })
+        } else {None};
+        if let (Some(before),Some(after))=(&before_frame,&after_frame) {
+            if before.overlay!=after.overlay && self.editor_gesture_start.is_none() {
+                self.editor_gesture_start=Some(before.clone());
+            }
+        }
+        let any_button_down=ctx.input(|i|i.pointer.primary_down() || i.pointer.secondary_down());
+        if !any_button_down {
+            if let Some(start)=self.editor_gesture_start.take() {
+                if after_frame.as_ref().is_some_and(|after|after.overlay!=start.overlay) {
+                    self.editor_undo.push(start);
+                    if self.editor_undo.len()>100 {self.editor_undo.remove(0);}
+                    self.editor_redo.clear();
+                }
+            }
+        }
+        if pending_history_undo || pending_history_redo {
+            // Undo/redo intentionally does not create a new undo record.
+            // A still-held mouse gesture must not be rolled back mid-gesture.
+            if !any_button_down {
+                let history=if pending_history_undo {
+                    &mut self.editor_undo
+                } else { &mut self.editor_redo };
+                if let Some(target)=history.last().cloned() {
+                    let current=after_frame;
+                    let index=self.studio.library.as_ref().map(|lib|Arc::clone(&lib.index));
+                    let restore=self.native_scene.as_mut().ok_or("No scene selected".to_owned())
+                        .and_then(|(name,slot)| {
+                            let NativeSceneSlot::Ready(scene,world)=slot else {
+                                return Err("Scene is not ready".into());
+                            };
+                            let Some(world)=Arc::get_mut(world) else {
+                                return Err("Scene is still borrowed".into());
+                            };
+                            let doc=scene_instances::parse(&target.overlay,name,world)?;
+                            let index=index.as_ref().ok_or("Original disc index unavailable")?;
+                            scene_instances::apply(&doc,world,scene.placements.len(),index)?;
+                            self.native_selected=target.selected.as_ref()
+                                .and_then(|id|editor_history_selected(world,id));
+                            Ok(())
+                        });
+                    match restore {
+                        Ok(())=>{
+                            if pending_history_undo {self.editor_undo.pop();
+                                if let Some(current)=current {self.editor_redo.push(current);}}
+                            else {self.editor_redo.pop();
+                                if let Some(current)=current {self.editor_undo.push(current);}}
+                            self.native_drag=None;
+                            self.native_rotate=None;
+                            self.native_view.version=self.native_view.version.wrapping_add(1);
+                            self.studio.status=Some(if pending_history_undo {
+                                "Undo applied (editor scene only).".into()
+                            } else {"Redo applied (editor scene only).".into()});
+                            ctx.request_repaint();
+                        }
+                        Err(error)=>self.studio.error=Some(format!("Cannot restore edit: {error}")),
                     }
                 }
             }
@@ -3290,17 +5421,90 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.sync_appearance(ctx);
+        // Process native .img export completion on the UI thread.
+        if let Some(rx)=&self.ps1_export_job {
+            use std::sync::mpsc::TryRecvError;
+            match rx.try_recv() {
+                Ok(Ok(result))=>{
+                    self.last_written=result.path.parent().map(Path::to_path_buf);
+                    let details=if result.skipped.is_empty(){String::new()}else{format!(" Not updated: {}",result.skipped.join(" | "))};
+                    self.studio.status=Some(format!("Native PS1 image saved: {}. Patched: {}.{} In DuckStation: boot THIS IMG (not an old CUE or save state), then reload Rim Elm. Experimental native wall-grid collision updated where source walls could be inferred; door triggers/script-driven walls remain unchanged.",result.path.display(),result.patched.join(", "),details));
+                    self.ps1_export_job=None;
+                }
+                Ok(Err(error))=>{
+                    self.studio.error=Some(format!("Native IMG export failed: {error:#}"));
+                    self.ps1_export_job=None;
+                }
+                Err(TryRecvError::Disconnected)=>{
+                    self.studio.error=Some("Native IMG export worker disconnected without a result".into());
+                    self.ps1_export_job=None;
+                }
+                Err(TryRecvError::Empty)=>{}
+            }
+        }
+
         if self.studio.poll() {
             ctx.request_repaint();
+        }
+        // Index the disc exactly once, asynchronously. The currently opened
+        // cell and its placement state do not affect the global asset catalog.
+        if self.mode==Mode::Editor && !self.global_repository_started {
+            if let Some(lib)=self.studio.library.as_ref() {
+                let names=self.studio.blocks.iter().map(|b|b.name.clone())
+                    .collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+                if !names.is_empty() {
+                    let index=Arc::clone(&lib.index);
+                    let (tx,rx)=std::sync::mpsc::channel();
+                    self.global_repository_rx=Some(rx);
+                    self.global_repository_started=true;
+                    self.global_repository_total=names.len();
+                    std::thread::spawn(move ||global_repository::scan_disc(index,names,tx));
+                    ctx.request_repaint();
+                }
+            }
+        }
+        if let Some(rx)=self.global_repository_rx.as_ref() {
+            let mut done=false;
+            for _ in 0..10 {
+                match rx.try_recv() {
+                    Ok(batch)=>{
+                        self.global_repository_completed+=1;
+                        if batch.failed {self.global_repository_failures+=1;}
+                        self.global_repository.extend(batch.assets);
+                        ctx.request_repaint();
+                    },
+                    Err(std::sync::mpsc::TryRecvError::Empty)=>break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected)=>{
+                        done=true;
+                        break;
+                    },
+                }
+            }
+            if done {self.global_repository_rx=None;}
+            else {ctx.request_repaint_after(std::time::Duration::from_millis(180));}
         }
         let completed = self.native_scene.as_ref().and_then(|(_, s)| match s {
             NativeSceneSlot::Loading(rx) => rx.try_recv().ok(),
             _ => None,
         });
         if let Some(result) = completed {
-            if let Some((_, slot)) = &mut self.native_scene {
+            let index=self.studio.library.as_ref().map(|lib|Arc::clone(&lib.index));
+            if let Some((source, slot)) = &mut self.native_scene {
                 *slot = match result {
-                    Ok((scene, world)) => NativeSceneSlot::Ready(Arc::new(scene), Arc::new(world)),
+                    Ok((scene, mut world)) => {
+                        let restored=if let Some(CellSelection::Copy(id))=&self.editor_cell_active {
+                            self.editor_cells.read_overlay(*id)
+                                .and_then(|text|scene_instances::parse(&text,source,&world))
+                                .and_then(|doc|index.as_ref()
+                                    .ok_or("Original disc index unavailable".to_string())
+                                    .and_then(|index|scene_instances::apply(&doc,&mut world,scene.placements.len(),index)))
+                        } else { Ok(()) };
+                        match restored {
+                            Ok(()) => NativeSceneSlot::Ready(Arc::new(scene),Arc::new(world)),
+                            Err(error) => NativeSceneSlot::Failed(format!(
+                                "Copy overlay failed to restore: {error}. Saved copy data was preserved.")),
+                        }
+                    },
                     Err(e) => NativeSceneSlot::Failed(e),
                 };
             }
@@ -3381,9 +5585,17 @@ impl eframe::App for App {
                 egui::CentralPanel::default().show(ctx, |ui| self.extract_panel(ui));
             }
         }
+        if self.mode == Mode::Editor && self.native_scene.is_some() {
+            let seconds=ctx.input(|i|i.time);
+            if seconds-self.editor_cell_last_autosave > 1.5 {
+                self.editor_cell_last_autosave=seconds;
+                self.save_active_editor_cell();
+            }
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_active_editor_cell();
         self.player.stop();
         let s = &mut self.studio.settings;
         s.mode = Some(self.mode.key().to_string());
@@ -3721,6 +5933,57 @@ mod catalog_ui_tests {
         assert!(!result.shapes.is_empty());
     }
     #[test]
+    fn history_selection_uses_stable_created_uid_not_transient_index() {
+        let source = scene_instances::NameTarget::Created(7);
+        let native = scene_instances::NameTarget::Native(false,9);
+        assert_ne!(source,native);
+        let restored = EditorSceneHistory {overlay:"LCK_SCENE_V1\ttown\n".into(),
+            selected:Some(source.clone())};
+        assert_eq!(restored.selected,Some(source));
+    }
+    #[test]
+    fn right_drag_rotates_y_and_alt_right_drag_rotates_x() {
+        let normal=editor_rotate_drag([0.0;3],egui::vec2(100.0,20.0),false,false);
+        assert!((normal[1]-1.0).abs()<0.00001);
+        assert_eq!(normal[0],0.0);
+        let alt=editor_rotate_drag([0.0;3],egui::vec2(100.0,20.0),true,false);
+        assert!((alt[0]-0.2).abs()<0.00001);
+        assert_eq!(alt[1],0.0);
+        assert!((editor_rotate_drag([0.0;3],egui::vec2(100.0,0.0),false,true)[1]+1.0).abs()<0.00001);
+    }
+    #[test]
+    fn duplicate_button_and_ctrl_d_share_native_source_and_copy_relative_offset() {
+        use super::world_view::{DrawInfo, WorldModel};
+        let original = DrawInfo {
+            id: 0, terrain: false, index: 2, center: [0.0; 3], radius: 1.0,
+            original_center: [0.0; 3], offset: [12.0, 3.0, -8.0], rotation:[0.0;3], scale:[1.0;3],
+            vertex_start: 0, vertex_end: 3, source_ref: None, editor_uid: None,
+            display_name: None, hidden: false, hidden_triangles: Vec::new(),
+        };
+        let copy = DrawInfo {
+            id: 1, terrain: false, index: 3, center: [0.0; 3], radius: 1.0,
+            original_center: [0.0; 3], offset: [140.0, 3.0, -8.0], rotation:[0.0;3], scale:[1.0;3],
+            vertex_start: 3, vertex_end: 6, source_ref: Some((false, 2)), editor_uid: Some(1),
+            display_name: None, hidden: false, hidden_triangles: Vec::new(),
+        };
+        let mut world = WorldModel {
+            model: None, instances: 2, unavailable: 0, unique_models: 1,
+            ground_triangles: 0, ground_vram_covered: 0, ground_textured: 0,
+            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),foreign_vram:std::collections::HashMap::new(),
+            draws: vec![original, copy],
+        };
+        assert_eq!(editor_duplicate_request(&world, Some((false, 2))),
+            Some(((false, 2), [140.0, 3.0, -8.0], [0.0;3], None)));
+        assert_eq!(editor_duplicate_request(&world, Some((false, 3))),
+            Some(((false, 2), [268.0, 3.0, -8.0], [0.0;3], None)));
+        assert_eq!(editor_duplicate_request(&world, None), None);
+        assert_eq!(editor_duplicate_request(&world, Some((false, 9))), None);
+        // Unrendered native actor records have no source geometry and must
+        // remain unavailable for duplication until a drawable TMD is loaded.
+        world.draws[0].vertex_end = world.draws[0].vertex_start;
+        assert_eq!(editor_duplicate_request(&world, Some((false, 2))), None);
+    }
+    #[test]
     fn metadata_search_and_inventory_do_not_promote_user_names() {
         let mut app = app();
         app.editor_names.records.insert("actor:character:0".into(), Record {
@@ -3742,9 +6005,9 @@ mod catalog_ui_tests {
         let mut app = app();
         let ctx = egui::Context::default();
         frame(&mut app, &ctx, vec![]);
-        app.editor_inspector_open = false;
+        assert!(app.editor_properties_target.is_none());
+        assert!(app.editor_context_menu.is_none());
         frame(&mut app, &ctx, vec![]);
-        app.editor_inspector_open = true;
         app.editor_modal = Some((EditorCatalogItem::Character(0), false));
         frame(&mut app, &ctx, vec![]);
         assert!(app.editor_modal.is_some());
@@ -3768,5 +6031,46 @@ mod catalog_ui_tests {
         frame(&mut app, &ctx, vec![escape()]);
         assert_eq!(app.native_selected, None);
         assert_eq!(app.native_view.cam, camera);
+    }
+}
+
+
+#[cfg(test)]
+mod source_asset_upright_preview_tests {
+    use super::*;
+
+    #[test]
+    fn ps1_coordinate_conversion_keeps_geometry_and_rest_consistent() {
+        let mut mesh = Model {
+            positions: vec![[1.0, -25.0, 3.0], [5.0, -55.0, 7.0], [5.0, -25.0, 7.0]],
+            rest: vec![], object_ids: vec![0; 3],
+            uvs: vec![[0, 0]; 3], cba_tsb: vec![[0, 0]; 3],
+            modulation: vec![[128; 3]; 3], fill: vec![[180; 3]; 3],
+            textured: vec![0; 3], indices: vec![0, 1, 2],
+            center: [0.0; 3], radius: 1.0,
+        };
+        let original = mesh.positions.clone();
+        let points = original.iter().map(|p| [p[0], -p[1], p[2]]).collect();
+        assert!(editor_preview_positions(&mut mesh, points).is_some());
+        assert_eq!(mesh.positions, vec![[1.0,25.0,3.0], [5.0,55.0,7.0], [5.0,25.0,7.0]]);
+        assert_eq!(mesh.rest, mesh.positions);
+        assert_eq!(mesh.indices, vec![0, 1, 2]);
+        assert!(mesh.center.iter().all(|v| v.is_finite()));
+        assert!(mesh.radius > 0.0);
+        assert_eq!(original[0][1], -25.0, "native original must not be mutated");
+    }
+
+    #[test]
+    fn preview_rejects_incomplete_or_invalid_geometry() {
+        let mut mesh = Model {
+            positions: vec![[1.0, 2.0, 3.0]], rest: vec![[1.0, 2.0, 3.0]],
+            object_ids: vec![0], uvs: vec![[0,0]], cba_tsb: vec![[0,0]],
+            modulation: vec![[128;3]], fill: vec![[128;3]], textured: vec![0],
+            indices: vec![0,0,0], center: [0.0;3], radius: 1.0,
+        };
+        let before = mesh.positions.clone();
+        assert!(editor_preview_positions(&mut mesh, vec![[0.0,0.0,0.0];2]).is_none());
+        assert!(editor_preview_positions(&mut mesh, vec![[0.0,f32::NAN,0.0]]).is_none());
+        assert_eq!(mesh.positions, before);
     }
 }
