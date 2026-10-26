@@ -4,6 +4,72 @@ use super::*;
 use std::io::Write;
 
 #[test]
+#[ignore = "explicit read-only unbound candidate dependency validation"]
+fn unbound_candidate_reports_scene_wall_dependencies() -> Result<()> {
+    let source=PathBuf::from(std::env::var_os("LCK_P0_SOURCE").context("LCK_P0_SOURCE required")?);
+    let lib=crate::library::Library::open(&source)?;
+    let scene=legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,"town01").map_err(anyhow::Error::msg)?;
+    let world=world_view::build_world(&scene,&lib.index);
+    let before=scene_instances::serialize(&scene.name,&world);
+    // Previously established compact unbound placement. Other uses of record
+    // 230 are bound, so identify the source by cell as well as descriptor.
+    let key=world.collision.sources.iter().find(|(_,s)|s.object.descriptor_id==230 && s.object.cell==[94,78])
+        .map(|(key,_)|*key).context("Candidate native identity absent")?;
+    let report=super::super::native_dependency_report::report(&scene,&world,key,&lib.index).map_err(anyhow::Error::msg)?;
+    ensure!(report.contains("No kind-1 binding"),"Candidate unexpectedly bound");
+    ensure!(report.contains("Incomplete record scans:"),"Unbound report skipped scene scripts");
+    ensure!(report.contains("Wall ownership: UNKNOWN"),"Unproven collision ownership");
+    ensure!(before==scene_instances::serialize(&scene.name,&world),"Read-only report mutated document");
+    println!("{report}");
+    let mut copy=world.clone();
+    copy.duplicate_native(key,scene.placements.len(),910001,[64.0,0.0,0.0]).map_err(anyhow::Error::msg)?;
+    let recipe=copy.collision.recipes.iter().find(|a|a.owner==super::super::collision_recipes::ObjectId::Created(910001))
+        .context("Automatic collision recipe missing")?;
+    ensure!(recipe.recipe.generated.is_some(),"Copy lacks mesh geometry definition");
+    let generated=recipe.recipe.generated.as_ref().unwrap();
+    println!("Automatic #230 collision: {} faces, {:?} floor/steep/filtered; {} transformed wall sub-cells",
+        generated.triangles.len(),generated.surface_counts(),generated.wall_cells([64.0,0.0,0.0],[0.0;3],[1.0;3]).map_err(anyhow::Error::msg)?.len());
+    let saved=scene_instances::serialize(&scene.name,&copy);
+    let parsed=scene_instances::parse(&saved,&scene.name,&copy).map_err(anyhow::Error::msg)?;
+    scene_instances::apply(&parsed,&mut copy,scene.placements.len(),&lib.index).map_err(anyhow::Error::msg)?;
+    ensure!(scene_instances::serialize(&scene.name,&copy)==saved,"Generated collision did not roundtrip");
+    let selected=copy.draws.iter().find(|d|d.editor_uid==Some(910001)).map(|d|(d.terrain,d.index)).context("Copy draw absent")?;
+    let ctx=eframe::egui::Context::default();
+    let _=ctx.run(Default::default(),|ctx|{
+        eframe::egui::CentralPanel::default().show(ctx,|ui|{
+            assert!(super::super::collision_recipes::show_editor(ui,&copy,selected,&lib.index).is_none());
+        });
+    });
+    ensure!(scene_instances::serialize(&scene.name,&copy)==saved,"Opening visual review changed document");
+    match plan_export(&source,&scene,&copy,&lib.index) {
+        Ok(_)=>bail!("Unresolved candidate collision unexpectedly accepted"),
+        Err(error)=>{
+            ensure!(format!("{error:#}").contains("Unresolved collision ownership"),"Unexpected candidate rejection: {error:#}");
+            ensure!(format!("{error:#}").contains("9 native wall bits"),"Missing exact native conflict count");
+            println!("Candidate copy correctly blocked: {error:#}");
+        }
+    }
+    // Exercise both a native-placement repository drop and a mesh-only donor
+    // without writing a project or disc image.
+    let mut imports=world.clone();
+    let center=world.at(key.0,key.1).context("Candidate draw")?.original_center;
+    imports.insert_foreign(&scene,"placement",key.1,910002,center,&lib.index).map_err(anyhow::Error::msg)?;
+    let mesh=scene.placements[key.1].env_slot as usize;
+    imports.insert_foreign(&scene,"mesh",mesh,910003,center,&lib.index).map_err(anyhow::Error::msg)?;
+    ensure!(imports.collision.recipes.iter().any(|a|a.owner==super::super::collision_recipes::ObjectId::Created(910002)),"Donor placement collision missing");
+    ensure!(imports.collision.mesh_recipes.contains_key(&910003),"Mesh-only donor collision missing");
+    let saved=scene_instances::serialize(&scene.name,&imports);
+    let parsed=scene_instances::parse(&saved,&scene.name,&imports).map_err(anyhow::Error::msg)?;
+    scene_instances::apply(&parsed,&mut imports,scene.placements.len(),&lib.index).map_err(anyhow::Error::msg)?;
+    ensure!(scene_instances::serialize(&scene.name,&imports)==saved,"Foreign collision did not roundtrip");
+    let mut stale=parsed.clone();stale.mesh_collision[0].tmd_sha256="0".repeat(64);
+    ensure!(scene_instances::apply(&stale,&mut imports,scene.placements.len(),&lib.index).is_err(),"Stale TMD collision accepted");
+    ensure!(scene_instances::serialize(&scene.name,&imports)==saved,"Failed donor restore changed document");
+    println!("Placement and mesh-only repository defaults and transactional restoration passed");
+    Ok(())
+}
+
+#[test]
 #[ignore = "explicit read-only retail selection report validation"]
 fn selected_world_object_report_preserves_native_provenance() -> Result<()> {
     let source=PathBuf::from(std::env::var_os("LCK_P0_SOURCE").context("LCK_P0_SOURCE required")?);
@@ -19,6 +85,7 @@ fn selected_world_object_report_preserves_native_provenance() -> Result<()> {
     ensure!(report.contains("Wall ownership: UNKNOWN"),"Report claims unproven ownership");
     ensure!(scene_instances::serialize(&scene.name,&world)==before,"Report changed document");
     println!("Read-only selection report passed; {} bytes; source identities={}",report.len(),world.collision.sources.len());
+    println!("{report}");
     Ok(())
 }
 

@@ -87,7 +87,7 @@ pub(super) struct DrawInfo {
 
 /// Apply editor-only rotation around the object's own world-space center.
 /// Native orientation is already baked into `rest`, so zero angles restore it.
-fn editor_rotate_vertex(rest: [f32; 3], pivot: [f32; 3], offset: [f32; 3],
+pub(super) fn editor_rotate_vertex(rest: [f32; 3], pivot: [f32; 3], offset: [f32; 3],
                         rotation: [f32; 3], scale: [f32; 3]) -> [f32; 3] {
     let (sx,cx)=rotation[0].sin_cos();
     let (sy,cy)=rotation[1].sin_cos();
@@ -254,6 +254,12 @@ impl WorldModel {
         });
         self.instances += 1;
         if let Some(owner)=collision_owner {self.collision.duplicate(&owner,uid);}
+        if npc_source.is_none() {
+            if let Err(error)=self.ensure_automatic_collision((false,new_index)) {
+                self.delete_created((false,new_index))?;
+                return Err(error);
+            }
+        }
         if let Some(mut actor)=npc_source {
             actor.key=new_index;
             actor.is_copy=true;
@@ -303,6 +309,10 @@ impl WorldModel {
             .ok_or("Original source TMD is missing")?.raw.clone();
         let (native_record, donor_wall_bits) = super::ps1_export::capture_donor_native(
             source_index,donor,kind,record,&raw_points);
+        let collision_source=if kind=="placement" {
+            super::collision_recipes::source_inventory(donor,source_index).ok()
+                .and_then(|mut state|state.sources.remove(&(false,record)))
+        } else {None};
         let index=self.next_copy_key(false,donor.placements.len())?;
         let id=u32::try_from(self.draws.len()).map_err(|_|"Too many world draw IDs")?;
         let model=self.model.as_mut().ok_or("Scene is missing world model")?;
@@ -345,6 +355,15 @@ impl WorldModel {
             raw_tmd,native_record,donor_wall_bits,donor_center:original_center
         });
         self.instances+=1;
+        if let Some(source)=collision_source {
+            self.collision.foreign_sources.insert(uid,source);
+            if let Err(error)=self.ensure_automatic_collision((false,index)) {
+                self.delete_created((false,index))?;return Err(error);
+            }
+        }
+        if let Err(error)=self.ensure_foreign_mesh_collision((false,index)) {
+            self.delete_created((false,index))?;return Err(error);
+        }
         Ok((false,index))
     }
 
@@ -422,6 +441,8 @@ impl WorldModel {
         if let Some(uid)=self.draws[pos].editor_uid {
             self.foreign.retain(|f|f.uid!=uid);
             self.collision.recipes.retain(|a|a.owner!=super::collision_recipes::ObjectId::Created(uid));
+            self.collision.foreign_sources.remove(&uid);
+            self.collision.mesh_recipes.remove(&uid);
         }
         self.draws.remove(pos);
         self.foreign_vram.remove(&id);
@@ -442,6 +463,8 @@ impl WorldModel {
     /// Remove every editor-created copy; only appended vertices are removed.
     /// Used when reloading a saved editor project, never for native writeback.
     pub fn clear_created(&mut self) {
+        self.collision.foreign_sources.clear();
+        self.collision.mesh_recipes.clear();
         self.collision.recipes.retain(|a|matches!(a.owner,super::collision_recipes::ObjectId::Native(_)));
         self.foreign.clear();
         self.foreign_vram.clear();

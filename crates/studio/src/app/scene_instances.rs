@@ -24,6 +24,7 @@ pub(super) enum NameTarget { Native(bool, usize), Created(u64) }
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct SceneDocument {
+    pub mesh_collision: Vec<super::collision_generation::MeshOnlyRecipe>,
     pub collision_recipes: Vec<super::collision_recipes::Assignment>,
     pub moves: Vec<((bool, usize), [f32; 3])>,
     pub created: Vec<NewInstance>,
@@ -143,6 +144,10 @@ pub(super) fn serialize(scene_name: &str, world: &WorldModel) -> String {
             if d.hidden { out.push_str(&format!("HIDE\t{}\t{}\n", kind(d.terrain), d.index)); }
         }
     }
+    for recipe in world.collision.mesh_recipes.values() {
+        out.push_str("MESH_COLLISION\t");
+        out.push_str(&serde_json::to_string(recipe).expect("Serializable mesh collision"));out.push('\n');
+    }
     for assignment in &world.collision.recipes {
         // JSON is one line; evidence control characters are forbidden. Exact
         // source IDs are persisted, never current draw indices.
@@ -174,6 +179,13 @@ pub(super) fn parse(text: &str, scene_name: &str, world: &WorldModel) -> Result<
         let items: Vec<_> = line.split('\t').collect();
         let at = line_index + 2;
         match items.first().copied() {
+            Some("MESH_COLLISION")=>{
+                if items.len()!=2 {return Err(format!("Incorrect MESH_COLLISION fields at line {at}"));}
+                let recipe:super::collision_generation::MeshOnlyRecipe=serde_json::from_str(items[1]).map_err(|e|e.to_string())?;
+                recipe.validate()?;
+                if doc.mesh_collision.iter().any(|r|r.uid==recipe.uid) {return Err("Duplicate mesh collision owner".into());}
+                doc.mesh_collision.push(recipe);
+            }
             Some("COLLISION")=>{
                 if items.len()!=2 {return Err(format!("Incorrect COLLISION fields at line {at}"));}
                 let assignment:super::collision_recipes::Assignment=serde_json::from_str(items[1])
@@ -330,9 +342,16 @@ pub(super) fn parse(text: &str, scene_name: &str, world: &WorldModel) -> Result<
             }
             _ => return Err(format!("Unrecognized record at line {at}")),
         }
-        if doc.moves.len()+doc.created.len()+doc.foreign.len()+doc.names.len()+doc.rotations.len()+doc.scales.len()+doc.animations.len()+doc.models.len()+doc.hidden.len()+doc.collision_recipes.len()>10_000 {
+        if doc.moves.len()+doc.created.len()+doc.foreign.len()+doc.names.len()+doc.rotations.len()+doc.scales.len()+doc.animations.len()+doc.models.len()+doc.hidden.len()+doc.collision_recipes.len()+doc.mesh_collision.len()>10_000 {
             return Err("Project overlay has too many records".into());
         }
+    }
+    for recipe in &doc.mesh_collision {
+        let foreign=doc.foreign.iter().find(|f|f.uid==recipe.uid).ok_or("Mesh collision references missing foreign owner")?;
+        if (foreign.source.as_str(),foreign.kind.as_str(),foreign.record)!=(recipe.scene.as_str(),recipe.kind.as_str(),recipe.record) {
+            return Err("Mesh collision donor identity mismatch".into());
+        }
+        if doc.collision_recipes.iter().any(|a|a.owner==super::collision_recipes::ObjectId::Created(recipe.uid)) {return Err("Conflicting collision recipe representations".into());}
     }
     for target in doc.names.iter().map(|(t,_)|t)
         .chain(doc.rotations.iter().map(|(t,_)|t))
@@ -407,11 +426,11 @@ pub(super) fn apply(doc: &SceneDocument, world: &mut WorldModel, native_placemen
 
 fn apply_staged(doc:&SceneDocument, world:&mut WorldModel, native_placements:usize,
     index:&legaia_engine_scene::scene::ProtIndex) -> Result<(),String> {
+    world.collision.restoring=true;
     for assignment in &doc.collision_recipes {
         assignment.recipe.validate()?;
-        if !world.collision.sources.values().any(|s|s==&assignment.recipe.source) {
-            return Err("Collision recipe source is stale or unavailable".into());
-        }
+        // Source equality is checked against each restored owner below, after
+        // foreign donor provenance has been resolved in the staged document.
     }
     // Resolve and validate every donor BEFORE discarding the current overlay.
     // An absent source cell must not silently wipe the user's edited world.
@@ -521,6 +540,19 @@ fn apply_staged(doc:&SceneDocument, world:&mut WorldModel, native_placements:usi
         if !world.set_hidden(key,true) { return Err("Cannot hide native scene object".into()); }
     }
     let mut collision_owners=std::collections::BTreeSet::new();
+    // Creation defaults apply to new editor actions, never overwrite the
+    // exact recipe set (including deliberate absence) in a saved document.
+    world.collision.recipes.clear();
+    world.collision.mesh_recipes.clear();
+    for recipe in &doc.mesh_collision {
+        recipe.validate()?;
+        let foreign=world.foreign.iter().find(|f|f.uid==recipe.uid).ok_or("Mesh collision owner missing after restore")?;
+        if foreign.source!=recipe.scene || foreign.kind!=recipe.kind || foreign.record!=recipe.record ||
+            super::collision_recipes::digest(&foreign.raw_tmd)!=recipe.tmd_sha256 {
+            return Err("Mesh collision source TMD changed".into());
+        }
+        if world.collision.mesh_recipes.insert(recipe.uid,recipe.clone()).is_some() {return Err("Duplicate mesh collision owner".into());}
+    }
     for assignment in &doc.collision_recipes {
         if !collision_owners.insert(assignment.owner.clone()) {return Err("Duplicate collision owner".into());}
         let key=world.draws.iter().find_map(|draw| {
@@ -529,6 +561,7 @@ fn apply_staged(doc:&SceneDocument, world:&mut WorldModel, native_placements:usi
         }).ok_or("Collision recipe owner is missing")?;
         world.set_collision_recipe(key,assignment.recipe.clone())?;
     }
+    world.collision.restoring=false;
     Ok(())
 }
 
@@ -551,6 +584,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn automatic_collision_is_independent_saved_and_not_regenerated_over_edits() {
+        use super::super::collision_recipes::{self,ObjectId,Evidence};
+        let mut world=test_world();
+        let positions=vec![[256.0,0.0,256.0],[256.0,128.0,256.0],[256.0,0.0,384.0]];
+        world.model=Some(crate::raster::Model{rest:positions.clone(),positions,indices:vec![0,1,2],
+            object_ids:vec![0;3],uvs:vec![[0,0];3],cba_tsb:vec![[0,0];3],modulation:vec![[128;3];3],
+            fill:vec![[0;3];3],textured:vec![0;3],center:[0.0;3],radius:512.0});
+        let (map,assignment)=collision_recipes::fixture();
+        world.collision.sources.insert((false,0),assignment.recipe.source);
+        let first=world.duplicate_native((false,0),1,90,[64.0,0.0,0.0]).unwrap();
+        let original_source=world.collision.sources[&(false,0)].object.clone();
+        assert!(!world.collision.recipes.iter().any(|r|r.owner==ObjectId::Native(original_source.clone())));
+        let automatic=world.collision.recipes[0].recipe.clone();
+        assert!(matches!(automatic.evidence,Evidence::MeshDerived{..}));assert!(automatic.generated.is_some());
+        assert_eq!(world.collision.generated_bases.len(),1);
+        let second=world.duplicate_native((false,0),1,91,[128.0,0.0,0.0]).unwrap();
+        assert_eq!(world.collision.generated_bases.len(),1);
+        let mut edited=automatic.clone();edited.evidence=Evidence::UserAuthored{note:"Corrected doorway".into()};
+        edited.nonblocking=vec![[4,6]];
+        world.set_collision_recipe(first,edited.clone()).unwrap();
+        world.ensure_automatic_collision(first).unwrap();
+        world.inherit_collision_recipe(first,second).unwrap();
+        assert_eq!(world.collision.recipes.iter().find(|a|a.owner==ObjectId::Created(91)).unwrap().recipe,edited);
+        let index=legaia_engine_scene::scene::ProtIndex::from_bytes(legaia_disc_patch::disc::synth::synth_prot(&[]),None).unwrap();
+        let saved=serialize("test",&world);let doc=parse(&saved,"test",&world).unwrap();
+        world.delete_created(first).unwrap();
+        apply(&doc,&mut world,1,&index).unwrap();assert_eq!(serialize("test",&world),saved);
+        let mut bad=doc.clone();bad.collision_recipes[0].recipe.generated.as_mut().unwrap().mesh_sha256="0".repeat(64);
+        assert!(apply(&bad,&mut world,1,&index).is_err());assert_eq!(serialize("test",&world),saved);
+        // Remove all corrections, then validate generated native additions.
+        for a in &mut world.collision.recipes {a.recipe.nonblocking.clear();}
+        let output=world.compile_authored_collision("test",0,&map).unwrap();
+        for i in 0x4000..0x8000 {assert_eq!(output[i]&map[i],map[i]);assert_eq!(output[i]&15,map[i]&15);}
+        assert!(world.set_rotation(second.0,second.1,[0.0,0.4,0.0]));
+        assert!(world.set_scale(second.0,second.1,[1.2,1.0,1.0]));
+        assert!(world.compile_authored_collision("test",0,&map).is_ok());
+    }
     #[test]
     fn oversized_collision_copy_is_rejected_without_losing_document() {
         use super::super::collision_recipes;

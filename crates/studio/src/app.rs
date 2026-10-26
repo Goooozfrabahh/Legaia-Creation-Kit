@@ -6,6 +6,8 @@ mod viewport;
 mod world_view;
 mod scene_instances;
 mod collision_recipes;
+mod collision_authoring;
+mod collision_generation;
 mod native_dependency_report;
 mod placement_drop;
 mod cell_catalog;

@@ -1137,6 +1137,14 @@ fn require_no_unowned_walls(original:&[u8], bounds:Option<[i32;4]>) -> Result<()
     Ok(())
 }
 
+pub(super) fn collision_ownership_diagnostic(world:&WorldModel,key:(bool,usize),map:&[u8])->String {
+    let source=world.at(key.0,key.1).and_then(|d|d.source_ref).unwrap_or(key);
+    match require_no_unowned_walls(map,original_collision_bounds(world,source.1)) {
+        Ok(())=>"No spatial wall conflicts observed; this does not establish ownership or complete collision".into(),
+        Err(error)=>error.to_string(),
+    }
+}
+
 fn compile_walls(map:&mut [u8], original:&[u8], edits:&ExportEdits)->Result<WallReport> {
     ensure!(map.len()==MAP_LEN && original.len()==MAP_LEN,"Invalid native field MAP length");
     for edit in &edits.moves {
@@ -1264,7 +1272,8 @@ fn validate_source_archive(disc:&DiscPatcher,index:&ProtIndex)->Result<()> {
 
 pub(super) fn plan_export(source:&Path, scene:&AssembledScene, world:&WorldModel,
     index:&ProtIndex) -> Result<NativeExportPlan> {
-    ensure!(world.collision.recipes.is_empty(),"Authored collision recipes are in-memory only; native IMG export is not enabled for these edits. No collision intent was discarded");
+    ensure!(world.collision.recipes.is_empty() && world.collision.mesh_recipes.is_empty(),"Authored collision recipes are in-memory only; native IMG export is not enabled for these edits. No collision intent was discarded.\n{}",
+        super::collision_recipes::export_diagnostics(scene,world,index));
     let source=source.canonicalize().context("Cannot find opened disc image")?;
     ensure!(source.is_file(),"Open a raw 2352-byte .img/.bin source");
     let image=std::fs::read(&source).context("Read source for native export preflight")?;
