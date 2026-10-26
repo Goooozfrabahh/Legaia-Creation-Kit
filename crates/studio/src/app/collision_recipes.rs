@@ -383,7 +383,70 @@ pub(super) fn compile(scene:&str,map_entry:u32,native:&[u8],contributions:&[Cont
 }
 
 #[derive(Clone,Default)]
-struct RecipeDraft {walls:String,nonblocking:String,note:String,error:Option<String>}
+struct RecipeDraft {walls:String,nonblocking:String,note:String,error:Option<String>,replace_corrections:bool}
+
+pub(super) fn generated_for(world:&super::world_view::WorldModel,key:(bool,usize))
+    ->Option<&super::collision_generation::GeneratedCollision> {
+    let owner=world.collision.owner(world,key);
+    world.collision.recipes.iter().find(|a|Some(&a.owner)==owner.as_ref()).and_then(|a|a.recipe.generated.as_ref())
+        .or_else(||world.at(key.0,key.1).and_then(|d|d.editor_uid).and_then(|uid|world.collision.mesh_recipes.get(&uid)).map(|r|&r.generated))
+}
+
+pub(super) fn generation_status(world:&super::world_view::WorldModel,key:(bool,usize))->String {
+    if let Some(g)=generated_for(world,key) {
+        let (floors,walls,filtered)=g.surface_counts();
+        format!("Saved generated collision: {walls} steep faces, {floors} floor candidates, {filtered} filtered faces")
+    } else if world.collision.owner(world,key).is_some_and(|owner|world.collision.recipes.iter().any(|a|a.owner==owner)) {
+        "Saved explicit collision recipe; no generated geometry".into()
+    } else {"No saved collision recipe (original object, intentional removal, or unavailable provenance)".into()}
+}
+
+/// Explicit regeneration action. Ordinary rendering, opening Properties and
+/// duplication never regenerate over existing authored data.
+pub(super) fn regeneration(world:&super::world_view::WorldModel,key:(bool,usize),replace_corrections:bool)->Result<Recipe,String> {
+    let generated=world.automatic_collision_recipe(key)?;
+    if !replace_corrections {
+        if let Some(owner)=world.collision.owner(world,key) {
+            if let Some(saved)=world.collision.recipes.iter().find(|a|a.owner==owner) {
+                let mut next=saved.recipe.clone();next.generated=generated.generated;next.validate()?;return Ok(next);
+            }
+        }
+    }
+    Ok(generated)
+}
+
+/// Always-visible status and preview control in the right-click Properties
+/// window. Resource availability affects editing, never panel visibility.
+pub(super) fn show_properties(ui:&mut eframe::egui::Ui,world:&super::world_view::WorldModel,key:(bool,usize),
+    index:Option<&legaia_engine_scene::scene::ProtIndex>,wireframe:&mut bool)->Option<Option<Recipe>> {
+    ui.strong("Collision Properties (P1)");
+    ui.label(generation_status(world,key));
+    let generated=generated_for(world,key);
+    ui.add_enabled(generated.is_some(),eframe::egui::Checkbox::new(wireframe,"Show this object's generated collision wireframe"))
+        .on_hover_text("Saved generated geometry only; separate from the original MAP wall overlay. Visibility does not edit collision or move the camera.");
+    if let Some(source)=world.collision.source(world,key) {
+        ui.label(format!("Source: {} / MAP {} / descriptor {} / cell {:?}",source.object.scene,source.object.map_entry,source.object.descriptor_id,source.object.cell));
+        ui.small(format!("MAP SHA-256 {}",source.map_sha256));
+        let warning=world.collision.owner(world,key).and_then(|owner|{
+            let draft_id=eframe::egui::Id::new(("lck_collision_recipe",format!("{owner:?}"),&source.map_sha256));
+            ui.ctx().data_mut(|data|data.get_temp::<RecipeDraft>(draft_id)).and_then(|d|d.error)
+        });
+        if let Some(warning)=warning {
+            ui.colored_label(eframe::egui::Color32::YELLOW,warning);
+        }
+    } else if let Some(recipe)=world.at(key.0,key.1).and_then(|d|d.editor_uid).and_then(|uid|world.collision.mesh_recipes.get(&uid)) {
+        ui.label(format!("Source: {} / {} #{} / TMD {}",recipe.scene,recipe.kind,recipe.record,recipe.tmd_sha256));
+    }
+    if let Some(g)=generated {ui.small(&g.native_inspection);}
+    ui.small("Generated collision is a review proposal. Native wall ownership, actor behavior and walkability remain unresolved; native export safeguards still apply.");
+    let mut action=None;
+    if let Some(index)=index {
+        eframe::egui::CollapsingHeader::new("Collision authoring, regeneration and validation")
+            .id_salt(("properties_collision_controls",format!("{:?}",world.collision.owner(world,key))))
+            .show(ui,|ui|{action=show_editor(ui,world,key,index);});
+    } else {ui.colored_label(eframe::egui::Color32::YELLOW,"Open the source library to enable manual collision editing and validation. Saved collision status is shown above.");}
+    action
+}
 
 pub(super) fn parse_cells(text:&str)->Result<Vec<[i32;2]>,String> {
     if text.len()>1_000_000 {return Err("Wall input exceeds limit".into());}
@@ -415,7 +478,7 @@ pub(super) fn show_editor(ui:&mut eframe::egui::Ui,world:&super::world_view::Wor
         walls:saved.map(|a|a.recipe.walls.iter().map(|c|format!("{},{}",c[0],c[1])).collect::<Vec<_>>().join("\n")).unwrap_or_default(),
         nonblocking:saved.map(|a|a.recipe.nonblocking.iter().map(|c|format!("{},{}",c[0],c[1])).collect::<Vec<_>>().join("\n")).unwrap_or_default(),
         note:saved.map(|a|match &a.recipe.evidence {Evidence::UserAuthored{note}|Evidence::MeshDerived{note}=>note.clone(),Evidence::NativeObserved{evidence}=>evidence.clone()})
-            .unwrap_or_else(||"Authored in LCK; no native ownership claimed".into()),error:None,
+            .unwrap_or_else(||"Authored in LCK; no native ownership claimed".into()),error:None,replace_corrections:false,
     };
     let mut draft=ui.ctx().data_mut(|data|data.get_temp::<RecipeDraft>(id)).unwrap_or_else(from_saved);
     ui.label(format!("Stable owner: {owner:?}"));
@@ -438,6 +501,20 @@ pub(super) fn show_editor(ui:&mut eframe::egui::Ui,world:&super::world_view::Wor
             Ok(recipe)=>{action=Some(Some(recipe));draft.error=None;},
             Err(error)=>draft.error=Some(error),
         }
+    }
+    if saved.is_some() {
+        ui.checkbox(&mut draft.replace_corrections,"Replace saved manual corrections when regenerating");
+        let label=if draft.replace_corrections {"Regenerate geometry and replace corrections"}else{"Regenerate geometry (keep saved corrections)"};
+        if ui.button(label).clicked() {
+            match regeneration(world,key,draft.replace_corrections) {
+                Ok(recipe)=>{
+                    if draft.replace_corrections {draft.walls.clear();draft.nonblocking.clear();draft.note=match &recipe.evidence {
+                        Evidence::UserAuthored{note}|Evidence::MeshDerived{note}=>note.clone(),Evidence::NativeObserved{evidence}=>evidence.clone()};}
+                    action=Some(Some(recipe));draft.error=None;
+                },Err(error)=>draft.error=Some(error),
+            }
+        }
+        ui.small("Regeneration changes saved geometry only. Unsaved grid/text drafts are applied separately with Save authored recipe.");
     }
     ui.horizontal_wrapped(|ui| {
         if ui.button("Save authored recipe").clicked() {
@@ -466,6 +543,18 @@ pub(super) fn show_editor(ui:&mut eframe::egui::Ui,world:&super::world_view::Wor
 }
 
 #[cfg(test)]
+pub(super) fn properties_fixture()->super::world_view::WorldModel {
+    let (_,mut world)=super::ps1_export::tests::actor_fixture();world.npcs.clear();
+    world.draws[0].index=0;world.draws[0].offset=[0.0;3];world.draws[0].vertex_end=3;
+    let positions=vec![[256.0,0.0,256.0],[256.0,128.0,256.0],[256.0,0.0,384.0]];
+    world.model=Some(crate::raster::Model{rest:positions.clone(),positions,indices:vec![0,1,2],
+        object_ids:vec![0;3],uvs:vec![[0,0];3],cba_tsb:vec![[0,0];3],modulation:vec![[128;3];3],
+        fill:vec![[0;3];3],textured:vec![0;3],center:[256.0,64.0,320.0],radius:512.0});
+    let (_,assignment)=fixture();world.collision.sources.insert((false,0),assignment.recipe.source);
+    world.duplicate_native((false,0),1,90,[64.0,0.0,0.0]).unwrap();world
+}
+
+#[cfg(test)]
 pub(super) fn fixture()->(Vec<u8>,Assignment) {
     let mut map=vec![0;0x12000];map[0x4000]=0x15;
     let source=SourceProvenance{object:NativeObjectId{scene:"test".into(),map_entry:0,cell:[0,0],descriptor_id:0},
@@ -479,6 +568,21 @@ pub(super) fn fixture()->(Vec<u8>,Assignment) {
 mod tests {
     use super::*;
     fn contribution(a:&Assignment,offset:[f32;3])->Contribution<'_>{Contribution{assignment:a,offset,rotation:[0.0;3],scale:[1.0;3]}}
+    #[test]
+    fn regeneration_preserves_manual_data_unless_replacement_is_explicit() {
+        let mut world=properties_fixture();let key=(false,1);
+        let mut recipe=world.collision.recipes[0].recipe.clone();
+        recipe.walls=vec![[12,12]];recipe.nonblocking=vec![[13,12]];
+        recipe.evidence=Evidence::UserAuthored{note:"Reviewed doorway".into()};
+        world.set_collision_recipe(key,recipe.clone()).unwrap();
+        let before=super::super::scene_instances::serialize("test",&world);
+        let regenerated=regeneration(&world,key,false).unwrap();
+        assert_eq!(regenerated.walls,recipe.walls);assert_eq!(regenerated.nonblocking,recipe.nonblocking);
+        assert_eq!(regenerated.evidence,recipe.evidence);
+        let replaced=regeneration(&world,key,true).unwrap();
+        assert!(replaced.walls.is_empty()&&replaced.nonblocking.is_empty());
+        assert_eq!(super::super::scene_instances::serialize("test",&world),before,"Rendering/proposing regeneration must not mutate the document");
+    }
     #[test]
     fn nonblocking_requirements_never_clear_native_or_another_owner() {
         let (map,mut a)=fixture();a.recipe.walls.clear();a.recipe.nonblocking=vec![[0,0]];

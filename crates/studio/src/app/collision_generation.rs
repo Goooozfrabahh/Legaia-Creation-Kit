@@ -101,6 +101,21 @@ impl GeneratedCollision {
         }}
         (floor,wall,decorative)
     }
+
+    /// Properties wireframe uses the same saved faces, classification and
+    /// review band as generation. Floor candidates stay visibly distinct.
+    pub fn preview_faces(&self,offset:[f32;3],rotation:[f32;3],scale:[f32;3])->Result<Vec<([[f32;3];3],bool)>,String> {
+        let triangles=self.transformed(offset,rotation,scale)?;
+        let bottom=triangles.iter().flatten().map(|p|p[1]).fold(f32::INFINITY,f32::min);
+        let top=bottom+self.band_height*scale[1];let mut faces=Vec::new();
+        for tri in triangles {
+            let Some((area,steep))=face_measure(tri) else {continue;};
+            if area<self.min_face_area {continue;}
+            let polygon=if steep {clip_height(&clip_height(&tri,bottom,true),top,false)}else{tri.to_vec()};
+            for i in 1..polygon.len().saturating_sub(1) {faces.push(([polygon[0],polygon[i],polygon[i+1]],steep));}
+        }
+        Ok(faces)
+    }
 }
 
 fn face_measure(tri:[[f32;3];3])->Option<(f32,bool)> {
@@ -226,6 +241,9 @@ mod tests {
         assert!(!cells.contains(&[4,5]),"door opening must not become an AABB wall");
         assert!(!cells.contains(&[0,2]),"floor must not become a wall");
         assert_eq!(g.surface_counts(),(1,3,0));
+        let preview=g.preview_faces([0.0;3],[0.0;3],[1.0;3]).unwrap();
+        assert!(preview.iter().any(|(_,steep)|!*steep));
+        for (triangle,steep) in preview {if steep {assert!(triangle.iter().all(|p|p[1]<=128.0));}}
     }
     #[test]
     fn transformed_faces_use_the_same_renderer_transform_without_drift() {

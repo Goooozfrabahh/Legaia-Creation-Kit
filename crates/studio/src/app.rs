@@ -735,6 +735,8 @@ pub struct App {
     /// Inspect this specific object's transformed mesh as a collision draft.
     /// Unlike the native MAP overlay, this is NOT in-game collision data.
     object_collision_draft_visible: bool,
+    /// Properties preview uses a stable UID and never changes selection.
+    generated_collision_target: Option<(String,scene_instances::NameTarget)>,
     native_collision_grid: Option<collision_wire::CollisionGrid>,
     /// Stage Q5 Fix 2: cache native donor MAP/TMD collision preflight by scene
     /// and complete LCK placement overlay. Never re-decode a donor every frame.
@@ -931,6 +933,7 @@ impl App {
             native_ground_visible: true,
             native_collision_wire_visible: false,
             object_collision_draft_visible: false,
+            generated_collision_target: None,
             native_collision_grid: None,
             native_collision_preview_cache: None,
             native_move_mode: EditorMoveMode::Grid,
@@ -2585,23 +2588,39 @@ impl App {
                     .resizable(true)
                     .open(&mut window_open)
                     .show(ctx, |ui| {
-                        ui.small("Original source details, editable placement, scale, rotation and supported NPC animation.");
+                        ui.small("Original source details, collision, editable placement, scale, rotation and supported NPC animation.");
                         if let Some(foreign)=world.as_ref().and_then(|w|w.at(properties_key.0,properties_key.1)
                             .and_then(|d|d.editor_uid)
                             .and_then(|uid|w.foreign.iter().find(|f|f.uid==uid))) {
-                            ui.label(format!("Foreign original: {} / {} #{} — geometry-only preview. No native IMG export or imported collision/textures.",
+                            ui.label(format!("Foreign original: {} / {} #{} — editor preview; native resource/collision import remains unresolved.",
                                 foreign.source,foreign.kind,foreign.record));
                         }
                         ui.separator();
-                        egui::ScrollArea::vertical().id_salt("lck_properties_scroll").show(ui, |ui| {
+                        egui::ScrollArea::vertical().id_salt(("lck_properties_scroll_p1",properties_key))
+                            .auto_shrink([false,false]).max_height(ui.available_height().max(140.0)).show(ui, |ui| {
+                if let Some(world)=world.as_deref() {
+                    let scene_name=ready.as_ref().map(|s|s.name.clone()).unwrap_or_default();
+                    let target=world.at(properties_key.0,properties_key.1).map(|d|match d.editor_uid {
+                        Some(uid)=>scene_instances::NameTarget::Created(uid),None=>scene_instances::NameTarget::Native(properties_key.0,properties_key.1)});
+                    let mut visible=self.object_collision_draft_visible && match &self.generated_collision_target {
+                        Some((name,id))=>name==&scene_name && Some(id)==target.as_ref(),
+                        None=>self.native_selected==Some(properties_key) && collision_recipes::generated_for(world,properties_key).is_some(),
+                    };
+                    let before=visible;
+                    if let Some(edit)=collision_recipes::show_properties(ui,world,properties_key,
+                        self.studio.library.as_ref().map(|lib|lib.index.as_ref()),&mut visible) {
+                        pending_collision_edit=Some((properties_key,edit));
+                    }
+                    if visible!=before {
+                        self.object_collision_draft_visible=visible;
+                        self.generated_collision_target=if visible {target.map(|target|(scene_name,target))}else{None};
+                        ctx.request_repaint();
+                    }
+                    ui.separator();
+                }
                 if let (Some(scene),Some(world),Some(lib))=(&ready,&world,&self.studio.library) {
                     ui.collapsing("Native dependencies (read only)",|ui| {
                         native_dependency_report::show(ui,scene,world,properties_key,&lib.index);
-                    });
-                    ui.collapsing("Authored collision recipe (in memory)",|ui| {
-                        if let Some(edit)=collision_recipes::show_editor(ui,world,properties_key,&lib.index) {
-                            pending_collision_edit=Some((properties_key,edit));
-                        }
                     });
                 }
                 if let Some(key)=Some(properties_key) {
@@ -2891,8 +2910,10 @@ impl App {
                         .on_hover_text("Original per-cell PS1 walkable terrain: UV, CLUT and texture page are read from the disc's native heightfield and scene VRAM.");
                     ui.checkbox(&mut self.native_collision_wire_visible, "Collision wireframe")
                         .on_hover_text("View native MAP wall collision at its actual 64-unit resolution. Orange: original walls; cyan: newly positioned wall cells for supported object moves/copies. Does not modify the disc. NPC collider shapes and script-painted walls are not shown.");
-                    ui.checkbox(&mut self.object_collision_draft_visible, "Selected mesh collider DRAFT")
-                        .on_hover_text("Shows geometric collision candidates attached to ONLY the selected object, following its move, rotation and scale. Purple = steep faces; green = near-horizontal faces. This is not native PS1 MAP collision or walkable-ground data and is not exported to IMG yet.");
+                    if ui.checkbox(&mut self.object_collision_draft_visible, "Selected mesh collider DRAFT")
+                        .on_hover_text("Shows saved generated collision when available, otherwise the selected mesh draft. Purple = steep faces; green = unverified floor candidates. Separate from native MAP walls.").changed() {
+                        self.generated_collision_target=None;
+                    }
                     ui.checkbox(&mut self.native_view.world_mirrored, "Mirror view (X)")
                         .on_hover_text("Checked by default to restore your previous left/right view. Display only: native PS1 world coordinates, geometry and textured materials are not modified. Uncheck to compare orientations.");
                     if ui.button("Frame all").clicked() { self.native_view.frame_all(); }
@@ -3201,12 +3222,20 @@ impl App {
                         }
                     }
                     if self.object_collision_draft_visible {
-                        if let Some((terrain,index))=self.native_selected {
+                        let preview=match &self.generated_collision_target {
+                            Some((name,target)) if name==&scene.name=>editor_history_selected(world,target),
+                            Some(_)=>None,None=>self.native_selected,
+                        };
+                        if let Some((terrain,index))=preview {
                             if let Some(draw)=world.at(terrain,index) {
                                 // Use live transformed mesh vertices: native originals,
                                 // duplicates, and imported game-wide draws all follow
                                 // the same non-destructive editor transforms.
-                                object_collision::paint(ui,view_rect,&self.native_view,model,draw);
+                                if let Some(generated)=collision_recipes::generated_for(world,(terrain,index)) {
+                                    object_collision::paint_generated(ui,view_rect,&self.native_view,model,draw,generated);
+                                } else if self.generated_collision_target.is_none() {
+                                    object_collision::paint(ui,view_rect,&self.native_view,model,draw);
+                                }
                             }
                         }
                     }
@@ -5965,6 +5994,39 @@ mod catalog_ui_tests {
         };
         let result = ctx.run(input, |ctx| app.editor_workspace(ctx));
         assert!(!result.shapes.is_empty());
+    }
+    #[test]
+    fn right_click_properties_shows_collision_without_library_and_preview_does_not_edit() {
+        fn text_shapes(shape:&egui::Shape,out:&mut Vec<(String,egui::Pos2)>) {
+            match shape {
+                egui::Shape::Text(t)=>out.push((t.galley.job.text.clone(),t.pos)),
+                egui::Shape::Vec(shapes)=>for shape in shapes {text_shapes(shape,out)},_=>{}
+            }
+        }
+        let mut app=app();let (scene,_)=ps1_export::tests::actor_fixture();
+        let world=collision_recipes::properties_fixture();let key=(false,1);
+        let overlay=scene_instances::serialize("test",&world);
+        app.native_scene=Some(("test".into(),NativeSceneSlot::Ready(Arc::new(scene),Arc::new(world))));
+        app.native_selected=Some(key);app.editor_properties_target=Some(key);
+        let camera=app.native_view.cam;let ctx=egui::Context::default();
+        let render=|app:&mut App|ctx.run(egui::RawInput {
+            screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(1280.0,820.0))),..Default::default()
+        },|ctx|app.editor_workspace(ctx));
+        let _=render(&mut app);let output=render(&mut app);
+        let mut texts=Vec::new();for shape in &output.shapes {text_shapes(&shape.shape,&mut texts);}
+        assert!(texts.iter().any(|(text,_)|text.contains("Collision Properties (P1)")));
+        assert!(texts.iter().any(|(text,_)|text.contains("Saved generated collision:")));
+        assert!(texts.iter().any(|(text,_)|text.contains("Open the source library")));
+        let pos=texts.iter().find(|(text,_)|text.contains("Show this object's generated collision wireframe")).unwrap().1+egui::vec2(4.0,4.0);
+        frame(&mut app,&ctx,vec![egui::Event::PointerMoved(pos),egui::Event::PointerButton {pos,button:egui::PointerButton::Primary,pressed:true,modifiers:Default::default()}]);
+        frame(&mut app,&ctx,vec![egui::Event::PointerButton {pos,button:egui::PointerButton::Primary,pressed:false,modifiers:Default::default()}]);
+        assert!(app.object_collision_draft_visible);
+        assert!(matches!(&app.generated_collision_target,Some((_,scene_instances::NameTarget::Created(90)))));
+        assert!(!app.native_collision_wire_visible);
+        assert_eq!(app.native_selected,Some(key));assert_eq!(app.native_view.cam,camera);
+        assert!(app.editor_undo.is_empty()&&app.editor_redo.is_empty());
+        let Some((_,NativeSceneSlot::Ready(_,world)))=&app.native_scene else {panic!("Scene disappeared")};
+        assert_eq!(scene_instances::serialize("test",world),overlay);
     }
     #[test]
     fn failed_scene_switch_preserves_document_selection_camera_and_history() {

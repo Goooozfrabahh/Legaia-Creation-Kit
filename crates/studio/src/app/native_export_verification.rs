@@ -4,6 +4,46 @@ use super::*;
 use std::io::Write;
 
 #[test]
+#[ignore = "explicit read-only retail Ctrl+D and Properties integration"]
+fn rim_elm_ctrl_d_opens_generated_collision_properties() -> Result<()> {
+    use super::super::{App,Automation,NativeSceneSlot};
+    use eframe::egui;
+    let source=PathBuf::from(std::env::var_os("LCK_P0_SOURCE").context("LCK_P0_SOURCE required")?);
+    let lib=std::sync::Arc::new(crate::library::Library::open(&source)?);
+    let scene=legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,"town01").map_err(anyhow::Error::msg)?;
+    let world=world_view::build_world(&scene,&lib.index);
+    let key=world.collision.sources.iter().find(|(_,s)|s.object.descriptor_id==230 && s.object.cell==[94,78])
+        .map(|(key,_)|*key).context("Candidate absent")?;
+    let mut app=App::new(crate::Studio::new(None),None,Automation::default());
+    app.studio.library=Some(lib);app.native_selected=Some(key);
+    app.native_scene=Some(("town01".into(),NativeSceneSlot::Ready(std::sync::Arc::new(scene),std::sync::Arc::new(world))));
+    let ctx=egui::Context::default();
+    let frame=|app:&mut App,events:Vec<egui::Event>,modifiers|ctx.run(egui::RawInput {
+        screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(1280.0,820.0))),events,modifiers,..Default::default()
+    },|ctx|app.editor_workspace(ctx));
+    let _=frame(&mut app,vec![],Default::default());let camera=app.native_view.cam;
+    // Native egui integration sets both ctrl and the platform command alias.
+    let command=egui::Modifiers{ctrl:true,command:true,..Default::default()};
+    let _=frame(&mut app,vec![egui::Event::Key{key:egui::Key::D,physical_key:None,pressed:true,repeat:false,modifiers:command}],command);
+    let copied=app.native_selected.context("Ctrl+D did not select a copy")?;
+    ensure!(copied!=key,"Ctrl+D failed to create an independent draw; keyboard input {}, error {:?}",ctx.wants_keyboard_input(),app.studio.error);
+    let Some((_,NativeSceneSlot::Ready(_,world)))=&app.native_scene else {bail!("Scene absent")};
+    ensure!(super::super::collision_recipes::generated_for(world,copied).is_some(),"Ctrl+D copy has no generated recipe");
+    let before=scene_instances::serialize("town01",world);
+    app.editor_properties_target=Some(copied);
+    let _=frame(&mut app,vec![],Default::default());let output=frame(&mut app,vec![],Default::default());
+    fn contains(shape:&egui::Shape,needle:&str)->bool {match shape {
+        egui::Shape::Text(t)=>t.galley.job.text.contains(needle),egui::Shape::Vec(shapes)=>shapes.iter().any(|s|contains(s,needle)),_=>false
+    }}
+    ensure!(output.shapes.iter().any(|s|contains(&s.shape,"Collision Properties (P1)")),"Actual Properties window omitted collision controls");
+    ensure!(output.shapes.iter().any(|s|contains(&s.shape,"Saved generated collision:")),"Properties failed to identify the saved recipe");
+    ensure!(app.native_view.cam==camera,"Properties/Ctrl+D changed camera");
+    let Some((_,NativeSceneSlot::Ready(_,world)))=&app.native_scene else {bail!("Scene absent")};
+    ensure!(scene_instances::serialize("town01",world)==before,"Properties mutated document");
+    Ok(())
+}
+
+#[test]
 #[ignore = "explicit read-only unbound candidate dependency validation"]
 fn unbound_candidate_reports_scene_wall_dependencies() -> Result<()> {
     let source=PathBuf::from(std::env::var_os("LCK_P0_SOURCE").context("LCK_P0_SOURCE required")?);

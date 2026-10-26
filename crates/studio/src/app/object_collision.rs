@@ -17,6 +17,41 @@ use super::{collision_wire::Projector, viewport::Viewport, world_view::DrawInfo}
 
 const MAX_DRAWN_FACES: usize = 1200;
 
+/// Saved generated definition, independent of the original MAP wall overlay
+/// and of any later selection change while Properties is pinned to a UID.
+pub(super) fn paint_generated(ui:&Ui,rect:Rect,view:&Viewport,model:&Model,draw:&DrawInfo,
+    generated:&super::collision_generation::GeneratedCollision) {
+    if draw.hidden {return;}
+    type Faces=std::sync::Arc<Vec<([[f32;3];3],bool)>>;
+    let cache=eframe::egui::Id::new(("generated_collision_wireframe",&generated.mesh_sha256,generated.pivot.map(f32::to_bits),
+        generated.band_height.to_bits(),generated.min_face_area.to_bits(),draw.offset.map(f32::to_bits),
+        draw.rotation.map(f32::to_bits),draw.scale.map(f32::to_bits)));
+    let faces=ui.ctx().data_mut(|d|d.get_temp::<Result<Faces,String>>(cache)).unwrap_or_else(||{
+        let result=generated.preview_faces(draw.offset,draw.rotation,draw.scale).map(std::sync::Arc::new);
+        ui.ctx().data_mut(|d|d.insert_temp(cache,result.clone()));result
+    });
+    let painter=ui.painter_at(rect);
+    let faces=match faces {Ok(faces)=>faces,Err(error)=>{
+        painter.text(rect.min+Vec2::splat(12.0),Align2::LEFT_TOP,format!("Generated collision preview unavailable: {error}"),FontId::monospace(11.0),Color32::LIGHT_RED);return;
+    }};
+    let projector=Projector::new(ui,rect,view,model);let mut drawn=0;
+    for (tri,steep) in faces.iter() {
+        if drawn>=MAX_DRAWN_FACES {break;}
+        let [Some(a),Some(b),Some(c)]=tri.map(|p|projector.project(p)) else {continue;};
+        let bounds=Rect::from_min_max(Pos2::new(a.x.min(b.x).min(c.x),a.y.min(b.y).min(c.y)),
+            Pos2::new(a.x.max(b.x).max(c.x),a.y.max(b.y).max(c.y)));
+        if !bounds.intersects(rect) {continue;}
+        let color=if *steep {Color32::from_rgb(228,96,255)}else{Color32::from_rgb(52,255,152)};
+        let stroke=Stroke::new(1.0_f32,color);
+        for line in [[a,b],[b,c],[c,a]] {painter.line_segment(line,stroke);}
+        drawn+=1;
+    }
+    let label=format!("Saved generated collision DRAFT • {} faces shown / {} • purple walls, green floor candidates\nGeometry review only; manual grid corrections are in Properties. Native export remains guarded.",drawn,faces.len());
+    let label_rect=Rect::from_min_size(rect.min+Vec2::splat(8.0),Vec2::new(rect.width().min(720.0)-16.0,44.0));
+    painter.rect_filled(label_rect,3.0,Color32::from_black_alpha(205));
+    painter.text(label_rect.min+Vec2::splat(5.0),Align2::LEFT_TOP,label,FontId::monospace(10.0),Color32::WHITE);
+}
+
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub(super) enum Surface { Horizontal, Steep }
 
