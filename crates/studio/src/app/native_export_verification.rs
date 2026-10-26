@@ -1,0 +1,301 @@
+//! Opt-in real-disc acceptance test. Never runs in the normal unit suite.
+//! Source is read-only; the caller supplies a new output directory explicitly.
+use super::*;
+use std::io::Write;
+
+#[test]
+#[ignore = "explicit read-only retail selection report validation"]
+fn selected_world_object_report_preserves_native_provenance() -> Result<()> {
+    let source=PathBuf::from(std::env::var_os("LCK_P0_SOURCE").context("LCK_P0_SOURCE required")?);
+    let lib=crate::library::Library::open(&source)?;
+    let scene=legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,"town01").map_err(anyhow::Error::msg)?;
+    let world=world_view::build_world(&scene,&lib.index);
+    let key=world.collision.sources.iter().find(|(_,source)|source.object.descriptor_id==137)
+        .map(|(key,_)|*key).context("Native source identity absent")?;
+    let before=scene_instances::serialize(&scene.name,&world);
+    let report=super::super::native_dependency_report::report(&scene,&world,key,&lib.index).map_err(anyhow::Error::msg)?;
+    ensure!(report.contains("flat MAN record 0"),"Binding report missing native context");
+    ensure!(report.contains("Animation ID 1"),"Native ANM evidence absent");
+    ensure!(report.contains("Wall ownership: UNKNOWN"),"Report claims unproven ownership");
+    ensure!(scene_instances::serialize(&scene.name,&world)==before,"Report changed document");
+    println!("Read-only selection report passed; {} bytes; source identities={}",report.len(),world.collision.sources.len());
+    Ok(())
+}
+
+#[test]
+#[ignore = "explicit read-only retail binding investigation"]
+fn inspect_rim_elm_binding_dependencies() -> Result<()> {
+    let source=PathBuf::from(std::env::var_os("LCK_P0_SOURCE").context("LCK_P0_SOURCE required")?);
+    let dir=PathBuf::from(std::env::var_os("LCK_P0_OUTPUT_DIR").context("LCK_P0_OUTPUT_DIR required")?);
+    let mut log=std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join("binding-dependencies.txt"))?;
+    let disc=DiscPatcher::open(std::fs::read(source)?)?;
+    for entry in [1,10,19] {
+        let load=disc.read_disc_sectors(disc.entry_disc_lba(entry).context("MAP address")?,0x28)?;
+        let bindings=NativeBindings::parse(&load[0x10000..0x12000],&load[0x12000..])?;
+        let (man_entry,_,_,_,man)=find_native_man(&disc,entry)?;
+        let mf=man_section::parse(&man)?;
+        writeln!(log,"MAP={entry} MAN={man_entry} partitions={:?}",mf.header.partition_counts)?;
+        for p in field_objects::parse_placements(&load) {
+            let Some(bind)=bindings.at((p.anchor_col,p.anchor_row)) else {continue};
+            writeln!(log,"record={} cell=({},{}) anchor=({},{}) binding={bind:?}",p.obj_idx,p.col,p.row,p.anchor_col,p.anchor_row)?;
+            let flat=bind.record as usize;
+            if flat>=mf.partitions[0].len() {writeln!(log,"  non-P0 flat record: unresolved header semantics")?;continue;}
+            let start=mf.data_region_offset+mf.partitions[0][flat] as usize;
+            let end=man_actor_record_end(&mf,man.len(),start);
+            let bytes=man.get(start..end).context("MAN record range")?;
+            let pc0=2+2*(*bytes.first().context("MAN header")? as usize);
+            ensure!(pc0<bytes.len(),"Invalid P0 header");
+            writeln!(log,"  animation={} MAN_range={start:#x}..{end:#x} pc0={pc0}",bytes[pc0-1])?;
+            // Detailed case study uses the native record, never changes an
+            // export policy. Stop decoding on first error: no byte resync can
+            // establish dependency completeness.
+            if p.obj_idx==137 {
+                for instruction in legaia_scene_formats::field_disasm::LinearWalker::new(bytes,pc0) {
+                    writeln!(log,"    {instruction:?}")?;
+                    if instruction.is_err() {break;}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires explicit retail source and fresh controlled output directory"]
+fn classify_rim_elm_native_constraints() -> Result<()> {
+    let source=PathBuf::from(std::env::var_os("LCK_P0_SOURCE").context("LCK_P0_SOURCE required")?);
+    let dir=PathBuf::from(std::env::var_os("LCK_P0_OUTPUT_DIR").context("LCK_P0_OUTPUT_DIR required")?);
+    let mut log=std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join("placement-constraints.txt"))?;
+    let lib=crate::library::Library::open(&source)?;
+    let scene=legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,"town01").map_err(anyhow::Error::msg)?;
+    let world=world_view::build_world(&scene,&lib.index);
+    let disc=DiscPatcher::open(std::fs::read(&source)?)?;
+    for entry in [1,10,19] {
+        let map=disc.read_entry_footprint(entry)?;
+        let mut refs=[0usize;512];
+        for word in map[GRID_OFF..GRID_OFF+32768].chunks_exact(2) { refs[(u16::from_le_bytes([word[0],word[1]])&511) as usize]+=1; }
+        let free=(4..512).filter(|&id|refs[id]==0 && map[id*32..id*32+32].iter().all(|b|*b==0)).count();
+        writeln!(log,"MAP {entry}: blank unused records={free}")?;
+        for (i,p) in scene.placements.iter().enumerate() {
+            let (id,r)=record_at(&map,p.cell,(p.world_x,p.world_z),p.env_slot,[p.rot_x,p.rot_y,p.rot_z])?;
+            let bounds=original_collision_bounds(&world,i);
+            let walls=require_no_unowned_walls(&map,bounds).err().map(|e|e.to_string());
+            writeln!(log,"placement={i} record={id} cell={:?} xyz=({},{},{}) mesh={} flags={:#x} bind={} refs={} bounds={bounds:?} wall_constraint={walls:?} offset=({},{}) collider=({},{})",p.cell,p.world_x,p.world_y,p.world_z,p.env_slot,r.flags,anchor_has_bind(&map,p.cell,&r),refs[id],r.x_off,r.z_off,source_collision(&r,p.cell.0,p.cell.1).0,source_collision(&r,p.cell.0,p.cell.1).1)?;
+            let mov=MoveEdit{collision_bounds:bounds,cell:p.cell,source_position:(p.world_x,p.world_z),env_slot:p.env_slot,source_rotation:[p.rot_x,p.rot_y,p.rot_z],delta:[64.0,0.0,0.0]};
+            let copy=InsertEdit{collision_bounds:bounds,uid:900000+i as u64,cell:p.cell,source_position:mov.source_position,env_slot:p.env_slot,source_rotation:mov.source_rotation,delta:mov.delta};
+            // Diagnose allocation separately in memory. This never authorizes
+            // export and never bypasses full collision validation on disk.
+            let mut moved=map.clone();
+            let allocation=move_originals(&mut moved,&[mov.clone()]);
+            if allocation.is_ok() {
+                let parsed=field_objects::parse_placements(&moved);
+                ensure!(parsed.iter().any(|v|(v.col,v.row)==p.cell && v.world_x==p.world_x+64 && v.world_z==p.world_z),"Moved reference readback mismatch");
+                ensure!(moved[WALL_OFF..GRID_OFF]==map[WALL_OFF..GRID_OFF],"Allocation changed collision");
+                for other in field_objects::parse_placements(&map) {
+                    if (other.col,other.row)==p.cell {continue;}
+                    ensure!(parsed.contains(&other),"Allocation altered unrelated placement");
+                }
+            }
+            let mut copied=map.clone();
+            let copies=insert_copies(&mut copied,&map,&[copy],&[None;16]);
+            if copies.is_ok() {
+                ensure!(copied[id*32..id*32+32]==map[id*32..id*32+32],"Copy changed original descriptor");
+                let parsed=field_objects::parse_placements(&copied);
+                for original in field_objects::parse_placements(&map) {ensure!(parsed.contains(&original),"Copy altered original placement");}
+            }
+            writeln!(log,"  move_allocation={allocation:?}; copy_allocation={copies:?}; full_move={:?}",map_patches(&map,&ExportEdits{moves:vec![mov],..Default::default()}).map(|p|p.len()))?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires explicit retail source and fresh controlled output directory"]
+fn controlled_rim_elm_export() -> Result<()> {
+    let source=PathBuf::from(std::env::var_os("LCK_P0_SOURCE").context("LCK_P0_SOURCE required")?);
+    let dir=PathBuf::from(std::env::var_os("LCK_P0_OUTPUT_DIR").context("LCK_P0_OUTPUT_DIR required")?);
+    let output=dir.join("RimElm_P0_translation.img");
+    let rejected_output=dir.join("unsupported_edit_must_not_exist.img");
+    ensure!(!output.exists() && !rejected_output.exists(),"Fresh output paths required");
+    let mut log=std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join("native-verification.txt"))?;
+    let outcome=(||->Result<()> {
+        let lib=crate::library::Library::open(&source)?;
+        let scene=legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,"town01")
+            .map_err(anyhow::Error::msg)?;
+        let mut world=world_view::build_world(&scene,&lib.index);
+        let original=DiscPatcher::open(std::fs::read(&source)?)?;
+        writeln!(log,"Scene={} placements={} PROT entries={}",scene.name,scene.placements.len(),original.entry_count())?;
+        let mut selected=None;
+        let mut failures=std::collections::BTreeMap::<String,usize>::new();
+        for (i,p) in scene.placements.iter().enumerate() {
+            if world.at(false,i).is_none() {continue;}
+            let mov=MoveEdit {collision_bounds:original_collision_bounds(&world,i),cell:p.cell,
+                source_position:(p.world_x,p.world_z),env_slot:p.env_slot,
+                source_rotation:[p.rot_x,p.rot_y,p.rot_z],delta:[64.0,0.0,0.0]};
+            let edits=ExportEdits{moves:vec![mov],..Default::default()};
+            let supported=[1,10,19].into_iter().try_for_each(|entry| {
+                map_patches(&original.read_entry_footprint(entry)?,&edits).map(|_|())
+            });
+            match supported {
+                Ok(())=>{selected=Some(i);break;},
+                Err(error)=>{*failures.entry(format!("{error:#}")).or_default()+=1;},
+            }
+        }
+        writeln!(log,"Candidate rejection reasons: {failures:#?}")?;
+        let i=selected.context("No currently supported +64 X translation across the principal Rim Elm maps")?;
+        let p=&scene.placements[i];
+        ensure!(world.set_offset(false,i,[64.0,0.0,0.0]),"Could not set independent object offset");
+        writeln!(log,"Selected placement={i} cell={:?} env_slot={} resource={} native_xyz=({},{},{}) delta_view=(64,0,0)",p.cell,p.env_slot,p.res_tmd,p.world_x,p.world_y,p.world_z)?;
+        std::fs::write(dir.join("supported_translation.lckscene"),scene_instances::serialize(&scene.name,&world))?;
+        let plan=plan_export(&source,&scene,&world,&lib.index)?;
+        writeln!(log,"Full preflight: {}",plan.summary())?;
+        let predicted=plan.image.clone();
+        let done=export(plan,&output)?;
+        let written=std::fs::read(&done.path)?;
+        ensure!(written==predicted,"Written image differs from the exact preflight plan");
+        drop(predicted);
+        ensure!(written.len()==original.image().len(),"Image size changed");
+        let mut changed_sectors=Vec::new();
+        for (lba,(before,after)) in original.image().chunks_exact(2352).zip(written.chunks_exact(2352)).enumerate() {
+            if before==after {continue;}
+            ensure!(legaia_iso::write::mode2_form1_sector_is_valid(after),"Invalid EDC/ECC in changed sector {lba}");
+            ensure!(before[..24]==after[..24],"Sector header/subheader changed at {lba}");
+            changed_sectors.push(lba);
+        }
+        ensure!(!changed_sectors.is_empty(),"No actual image changes");
+        let edited=DiscPatcher::open(written)?;
+        let edits=prepare_cross_cell(&scene,&world,&lib.index)?;
+        let mut changed_entries=Vec::new();
+        let mut allowed_sectors=HashSet::new();
+        for entry in 0..original.entry_count() {
+            let before=original.read_entry_footprint(entry)?;
+            let after=edited.read_entry_footprint(entry)?;
+            if before==after {continue;}
+            ensure!(RIM_ELM_MAPS.iter().any(|(_,e)|*e==entry),"Unrelated PROT resource {entry} changed");
+            let patches=map_patches(&before,&edits)?;
+            let mut expected=before.clone();
+            let lba=original.entry_disc_lba(entry).context("Missing native entry LBA")? as usize;
+            for (offset,bytes) in patches {
+                expected[offset..offset+bytes.len()].copy_from_slice(&bytes);
+                for sector in offset/2048..=(offset+bytes.len()-1)/2048 {allowed_sectors.insert(lba+sector);}
+            }
+            ensure!(expected==after,"MAP {entry} includes unplanned bytes");
+            ensure!(before[WALL_OFF..]==after[WALL_OFF..],"Wall/floor/grid/tail changed in MAP {entry}");
+            let (id,old_record)=record_at(&before,p.cell,(p.world_x,p.world_z),p.env_slot,[p.rot_x,p.rot_y,p.rot_z])?;
+            let new_record=ObjectRecord::parse(&after,id).context("Native record readback")?;
+            ensure!(new_record.x_off as i32==old_record.x_off as i32+64,"Native X did not translate");
+            let parsed=field_objects::parse_placements(&after);
+            let moved=parsed.iter().find(|v|v.obj_idx as usize==id && (v.col,v.row)==p.cell).context("Moved spawn reference missing")?;
+            ensure!(moved.world_x==p.world_x+64 && moved.world_z==p.world_z,"Native parser position mismatch");
+            writeln!(log,"MAP {entry}: record={id} world=({},{},{}) -> ({},{},{}) collider=({},{})",p.world_x,p.world_y,p.world_z,moved.world_x,p.world_y,moved.world_z,moved.collider_x,moved.collider_z)?;
+            changed_entries.push(entry);
+        }
+        ensure!([1,10,19].iter().all(|e|changed_entries.contains(e)),"Principal Rim Elm states missing");
+        ensure!(changed_sectors.iter().all(|lba|allowed_sectors.contains(lba)),"Non-MAP sectors changed");
+        writeln!(log,"Readback PASS: changed_entries={changed_entries:?}; changed_sectors={changed_sectors:?}; all other raw sectors and native resources identical; changed EDC/ECC valid")?;
+        ensure!(world.set_offset(false,i,[0.0;3]),"Reset test translation");
+        // A real original object with nearby wall bits supplies the negative case.
+        let blocked=scene.placements.iter().enumerate().find(|(n,_)|
+            !source_stencil(&original.read_entry_footprint(1).unwrap(),original_collision_bounds(&world,*n)).is_empty())
+            .map(|(n,_)|n).context("No native collision conflict candidate")?;
+        world.duplicate_native((false,blocked),scene.placements.len(),900001,[64.0,0.0,0.0])
+            .map_err(anyhow::Error::msg)?;
+        std::fs::write(dir.join("unsupported_duplicate.lckscene"),scene_instances::serialize(&scene.name,&world))?;
+        match plan_export(&source,&scene,&world,&lib.index) {
+            Ok(_)=>bail!("Unsupported collision duplicate unexpectedly passed preflight"),
+            Err(error)=>writeln!(log,"Negative preflight PASS: placement={blocked}, UID=900001, {error:#}")?,
+        }
+        ensure!(!rejected_output.exists(),"Rejected edit produced an image");
+        writeln!(log,"Supported output={}\nRejected output absent={}\nRuntime not verified by this automated test.",output.display(),rejected_output.display())?;
+        Ok(())
+    })();
+    writeln!(log,"RESULT: {}",match &outcome {Ok(())=>"PASS".into(),Err(e)=>format!("FAIL: {e:#}")})?;
+    log.sync_all()?;
+    outcome
+}
+
+
+#[test]
+#[ignore = "explicit controlled retail NPC translation verification"]
+fn controlled_rim_elm_npc_export() -> Result<()> {
+    let source=PathBuf::from(std::env::var_os("LCK_P0_SOURCE").context("source required")?);
+    let dir=PathBuf::from(std::env::var_os("LCK_P0_OUTPUT_DIR").context("output directory required")?);
+    let output=dir.join("RimElm_P0_NPC_translation.img");
+    ensure!(!output.exists(),"Output exists");
+    let mut log=std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join("npc-verification.txt"))?;
+    let result=(||->Result<()> {
+        let lib=crate::library::Library::open(&source)?;
+        let scene=legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,"town01").map_err(anyhow::Error::msg)?;
+        let mut world=world_view::build_world(&scene,&lib.index);
+        let original=DiscPatcher::open(std::fs::read(&source)?)?;
+        let candidates=world.npcs.iter().filter(|n|!n.is_copy && n.drawable && !n.conditional)
+            .map(|n|(n.key,n.record,n.psx_position,n.kind)).collect::<Vec<_>>();
+        writeln!(log,"Original unconditional drawable MAN actors: {candidates:?}")?;
+        let mut selected=None;
+        for (key,record,pos,kind) in candidates {
+            if !world.set_offset(false,key,[64.0,0.0,0.0]) {continue;}
+            match plan_export(&source,&scene,&world,&lib.index) {
+                Ok(plan)=>{selected=Some((key,record,pos,kind,plan));break;},
+                Err(error)=>writeln!(log,"Actor {record} rejected: {error:#}")?,
+            }
+            ensure!(world.set_offset(false,key,[0.0;3]),"Reset candidate failed");
+        }
+        let (key,record,pos,kind,plan)=selected.context("No supported original actor translation")?;
+        writeln!(log,"Selected NPC key={key} MAN={record} kind={kind} PSX={pos:?}; delta_view=[64,0,0]\nFull preflight: {}",plan.summary())?;
+        std::fs::write(dir.join("supported_npc_translation.lckscene"),scene_instances::serialize(&scene.name,&world))?;
+        let predicted=plan.image.clone();
+        export(plan,&output)?;
+        let bytes=std::fs::read(&output)?;
+        ensure!(bytes==predicted,"Image differs from preflight bytes"); drop(predicted);
+        let mut changed_sectors=Vec::new();
+        for (lba,(before,after)) in original.image().chunks_exact(2352).zip(bytes.chunks_exact(2352)).enumerate() {
+            if before!=after {
+                ensure!(legaia_iso::write::mode2_form1_sector_is_valid(after),"EDC/ECC invalid at {lba}");
+                ensure!(before[..24]==after[..24],"Sector header changed");
+                changed_sectors.push(lba);
+            }
+        }
+        ensure!(bytes.len()==original.image().len() && !changed_sectors.is_empty(),"Image size/difference failure");
+        let edited=DiscPatcher::open(bytes)?;
+        let (entry,offset,budget,_,man)=find_native_man(&original,1)?;
+        let edits=prepare(&scene,&world)?;
+        let expected=compile_man_npcs(&man,&edits.npcs)?;
+        let (_,_,_,_,readback)=find_native_man(&edited,1)?;
+        ensure!(readback==expected,"Native MAN readback mismatch");
+        let (header,_)=man_actor_header(&man,record)?;
+        let (next_header,_)=man_actor_header(&readback,record)?;
+        ensure!(header==next_header,"Actor record moved unexpectedly");
+        let mut changed_entries=Vec::new();
+        for i in 0..original.entry_count() {
+            let before=original.read_entry_footprint(i)?;
+            let after=edited.read_entry_footprint(i)?;
+            if before!=after {
+                ensure!(i==entry,"Unrelated resource {i} changed");
+                ensure!(before[..offset]==after[..offset] && before[offset+budget..]==after[offset+budget..],"Bytes outside MAN compression budget changed");
+                changed_entries.push(i);
+            }
+        }
+        ensure!(changed_entries==vec![entry],"Expected one MAN resource change");
+        let start=original.entry_disc_lba(entry).unwrap() as usize;
+        ensure!(changed_sectors.iter().all(|&s|s>=start+offset/2048 && s<=start+(offset+budget-1)/2048),"Unexpected raw sectors changed");
+        let logical_changes=man.iter().zip(&readback).enumerate().filter_map(|(o,(a,b))|(a!=b).then_some((o,*a,*b))).collect::<Vec<_>>();
+        writeln!(log,"Native readback PASS: MAN PROT={entry}, compressed_offset={offset}, budget={budget}, logical_byte_changes={logical_changes:?}")?;
+        writeln!(log,"Integrity PASS: {changed_sectors:?} changed sectors; EDC/ECC valid. All other raw sectors and all other {} PROT entries byte-identical. All MAP/TMD/TIM/CLUT resources unchanged.",original.entry_count()-1)?;
+        ensure!(world.set_offset(false,key,[0.0;3]),"Reset NPC failed");
+        let blocked=scene.placements.iter().enumerate().find(|(n,_)|
+            !source_stencil(&original.read_entry_footprint(1).unwrap(),original_collision_bounds(&world,*n)).is_empty())
+            .map(|(n,_)|n).context("No collision-bearing original")?;
+        world.duplicate_native((false,blocked),scene.placements.len(),900001,[64.0,0.0,0.0]).map_err(anyhow::Error::msg)?;
+        std::fs::write(dir.join("unsupported_duplicate.lckscene"),scene_instances::serialize(&scene.name,&world))?;
+        match plan_export(&source,&scene,&world,&lib.index) {
+            Ok(_)=>bail!("Unsupported duplicate unexpectedly passed"),
+            Err(e)=>writeln!(log,"Negative preflight PASS: original placement={blocked}, UID=900001: {e:#}")?,
+        }
+        ensure!(!dir.join("unsupported_edit_must_not_exist.img").exists(),"Rejected edit generated an image");
+        writeln!(log,"Output={}\nRuntime behavior remains unverified.",output.display())?;
+        Ok(())
+    })();
+    writeln!(log,"RESULT: {}",match &result {Ok(())=>"PASS".into(),Err(e)=>format!("FAIL: {e:#}")})?;
+    log.sync_all()?;
+    result
+}

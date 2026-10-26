@@ -20,6 +20,10 @@ use legaia_disc_patch::compress_within;
 
 use super::{scene_instances, world_view::WorldModel};
 
+#[path = "native_dependencies.rs"]
+pub(super) mod native_dependencies;
+use native_dependencies::NativeBindings;
+
 const MAP_LEN: usize = 0x12000;
 const GRID_OFF: usize = 0x8000;
 const WALL_OFF: usize = 0x4000;
@@ -608,7 +612,25 @@ fn adjust_collider(r:&ObjectRecord, original:&ObjectRecord,
     Ok(())
 }
 
-fn move_originals(map:&mut [u8], edits:&[MoveEdit]) -> Result<Vec<usize>> {
+#[derive(Debug, PartialEq, Eq)]
+struct MovedRecord {
+    id: usize,
+    /// A shared descriptor is detached by changing only this reference.
+    detached_cell: Option<(u8,u8)>,
+}
+
+/// Allocate only zeroed descriptors that no native grid reference uses.
+/// The search order is fixed so preflight and serialization stay deterministic.
+fn blank_object_record(map:&[u8]) -> Result<usize> {
+    let mut used=[false;512];
+    for word in map[GRID_OFF..GRID_OFF+GRID_DIM*GRID_DIM*2].chunks_exact(2) {
+        used[(u16::from_le_bytes([word[0],word[1]])&field_objects::OBJECT_INDEX_MASK) as usize]=true;
+    }
+    (4..512).rev().find(|&id|!used[id] && map[id*32..id*32+32].iter().all(|&b|b==0))
+        .context("No completely blank and unreferenced 32-byte native object slot remains")
+}
+
+fn move_originals(map:&mut [u8], edits:&[MoveEdit]) -> Result<Vec<MovedRecord>> {
     let mut touched=HashSet::new();
     let mut refs=[0u16;512];
     for i in 0..GRID_DIM*GRID_DIM {
@@ -620,8 +642,12 @@ fn move_originals(map:&mut [u8], edits:&[MoveEdit]) -> Result<Vec<usize>> {
     for edit in edits {
         let (id,r)=record_at(map,edit.cell,edit.source_position,edit.env_slot,edit.source_rotation)?;
         ensure!(!anchor_has_bind(map,edit.cell,&r),"Record #{id} is script-bound; native movement requires script ownership resolution");
-        ensure!(touched.insert(id),"Multiple moves share native record #{id}");
-        ensure!(refs[id]==1,"Record #{id} is referenced by {} cells; cannot move it independently",refs[id]);
+        ensure!(touched.insert(edit.cell),"Multiple moves target the same native reference {:?}",edit.cell);
+        // Native mesh selection is record +0x10, not the record index. Keep
+        // every other reference on the original descriptor; detach only this
+        // selected unbound spawn. Bound objects still require MAN resolution.
+        let detached=refs[id]>1;
+        let target=if detached {blank_object_record(map)?} else {id};
         let dx=quantize(edit.delta[0],"X")?;
         let dy=quantize(edit.delta[1],"Y")?;
         let dz=quantize(edit.delta[2],"Z")?;
@@ -641,8 +667,14 @@ fn move_originals(map:&mut [u8], edits:&[MoveEdit]) -> Result<Vec<usize>> {
         let new_c=source_collision(&moved,edit.cell.0,edit.cell.1);
         ensure!((new_c.0-old_c.0-dx).abs()<=8 && (new_c.1-old_c.1-dz).abs()<=8,
             "Native static collider moved outside the engine's 16-unit precision");
-        map[id*32..id*32+32].copy_from_slice(&next);
-        changed.push(id);
+        map[target*32..target*32+32].copy_from_slice(&next);
+        if detached {
+            let grid=GRID_OFF+(edit.cell.1 as usize*GRID_DIM+edit.cell.0 as usize)*2;
+            let word=u16::from_le_bytes(map[grid..grid+2].try_into()?);
+            let next_word=(word & !field_objects::OBJECT_INDEX_MASK)|target as u16;
+            map[grid..grid+2].copy_from_slice(&next_word.to_le_bytes());
+        }
+        changed.push(MovedRecord{id:target,detached_cell:detached.then_some(edit.cell)});
     }
     Ok(changed)
 }
@@ -668,14 +700,15 @@ fn anchor_score(xoff:i32,zoff:i32)->Option<i32> {
 #[derive(Clone,Debug)]
 struct Inserted { id:usize, col:u8, row:u8, uid:u64, collider:(i32,i32) }
 
+#[cfg(test)]
 fn insert_copies(map:&mut [u8], source_map:&[u8], edits:&[InsertEdit],
                  tiers:&[Option<i32>;16]) -> Result<Vec<Inserted>> {
-    let mut used=[false;512];
-    for i in 0..GRID_DIM*GRID_DIM {
-        let o=GRID_OFF+i*2;
-        let id=(u16::from_le_bytes(map[o..o+2].try_into()?)&0x1FF) as usize;
-        used[id]=true;
-    }
+    let bindings=NativeBindings::parse(&source_map[0x10000..],&[])?;
+    insert_copies_with_bindings(map,source_map,edits,tiers,&bindings)
+}
+
+fn insert_copies_with_bindings(map:&mut [u8], source_map:&[u8], edits:&[InsertEdit],
+                 tiers:&[Option<i32>;16],bindings:&NativeBindings) -> Result<Vec<Inserted>> {
     let mut done=Vec::new();
     for edit in edits {
         let (source_idx,src)=record_at(source_map,edit.cell,edit.source_position,
@@ -683,9 +716,7 @@ fn insert_copies(map:&mut [u8], source_map:&[u8], edits:&[InsertEdit],
             .with_context(||format!("Validate original for copy #{}",edit.uid))?;
         ensure!(!anchor_has_bind(source_map,edit.cell,&src),"Copy UID {} has a script-bound source; cannot discard its native spawn binding",edit.uid);
         ensure!(source_idx>3,"Player/NPC source cannot be copied as static environment geometry");
-        let slot=(4..512usize).rev().find(|&i| !used[i] &&
-            map[i*32..i*32+32].iter().all(|&b|b==0))
-            .context("No completely blank and unreferenced 32-byte native object slot remains")?;
+        let slot=blank_object_record(map)?;
         let dx=quantize(edit.delta[0],"Copy X")?;
         let dy=quantize(edit.delta[1],"Copy Y")?;
         let dz=quantize(edit.delta[2],"Copy Z")?;
@@ -706,10 +737,12 @@ fn insert_copies(map:&mut [u8], source_map:&[u8], edits:&[InsertEdit],
                 // Never displace terrain, decals, scripts, walkable ground,
                 // an existing static object, or a saved field trigger.
                 if map[go]!=0 || map[go+1]!=0 {continue;}
+                if bindings.has_trigger((col as u8,row as u8)) {continue;}
                 blank+=1;
                 let anchor_col=col as i32+src.col_delta as i32;
                 let anchor_row=row as i32+src.row_delta as i32;
                 if !(0..128).contains(&anchor_col) || !(0..128).contains(&anchor_row) {continue;}
+                if bindings.at((anchor_col as u8,anchor_row as u8)).is_some() {continue;}
                 let anchor=GRID_OFF+(anchor_row as usize*GRID_DIM+anchor_col as usize)*2;
                 let word=u16::from_le_bytes(map[anchor..anchor+2].try_into()?);
                 if word&field_objects::CELL_BIND_OWNED!=0 {continue;}
@@ -765,7 +798,6 @@ fn insert_copies(map:&mut [u8], source_map:&[u8], edits:&[InsertEdit],
         map[slot*32..slot*32+32].copy_from_slice(&bytes);
         let grid=GRID_OFF+(row*GRID_DIM+col)*2;
         map[grid..grid+2].copy_from_slice(&(slot as u16).to_le_bytes());
-        used[slot]=true;
         let rec=ObjectRecord::parse(&bytes,0).context("Inserted copy invalid")?;
         done.push(Inserted{id:slot,col:col as u8,row:row as u8,uid:edit.uid,
             collider:source_collision(&rec,col as u8,row as u8)});
@@ -1125,11 +1157,29 @@ fn compile_walls(map:&mut [u8], original:&[u8], edits:&ExportEdits)->Result<Wall
 
 /// Return native MAP writes only after checking every other byte remains
 /// untouched. Object slots and grid links are validated independently.
+#[cfg(test)]
 fn map_patches(original: &[u8], edits: &ExportEdits) -> Result<Vec<(usize,Vec<u8>)>> {
     ensure!(original.len()==MAP_LEN,"MAP must be exactly 0x12000 bytes");
+    let bindings=NativeBindings::parse(&original[0x10000..],&[])?;
+    map_patches_with_bindings(original,edits,&bindings)
+}
+
+fn map_patches_with_bindings(original:&[u8],edits:&ExportEdits,bindings:&NativeBindings) -> Result<Vec<(usize,Vec<u8>)>> {
+    ensure!(original.len()==MAP_LEN,"MAP must be exactly 0x12000 bytes");
+    for cell in edits.moves.iter().map(|e|e.cell).chain(edits.copies.iter().map(|e|e.cell)) {
+        let go=GRID_OFF+(cell.1 as usize*GRID_DIM+cell.0 as usize)*2;
+        ensure!(cell.0<128 && cell.1<128,"Source reference outside native grid");
+        let id=(u16::from_le_bytes(original[go..go+2].try_into()?)&511) as usize;
+        let rec=ObjectRecord::parse(original,id).context("Missing source descriptor")?;
+        let x=cell.0 as i32+rec.col_delta as i32;let z=cell.1 as i32+rec.row_delta as i32;
+        ensure!((0..128).contains(&x)&&(0..128).contains(&z),"Invalid source bind anchor");
+        if let Some(binding)=bindings.at((x as u8,z as u8)) {
+            bail!("Native binding unresolved for record #{id}: {} trigger byte {:#x}, MAN flat record {}, gate {}. Independent script/animation/collision dependencies must be resolved before export",binding.block,binding.offset,binding.record,binding.gate);
+        }
+    }
     let mut updated=original.to_vec();
     let moved=move_originals(&mut updated,&edits.moves)?;
-    let inserted=insert_copies(&mut updated,original,&edits.copies,&edits.tier_heights)?;
+    let inserted=insert_copies_with_bindings(&mut updated,original,&edits.copies,&edits.tier_heights,bindings)?;
     let wall_report=compile_walls(&mut updated,original,edits)?;
     for i in WALL_OFF..GRID_OFF {
         ensure!(original[i]&0x0f==updated[i]&0x0f,
@@ -1141,10 +1191,16 @@ fn map_patches(original: &[u8], edits: &ExportEdits) -> Result<Vec<(usize,Vec<u8
     ensure!(original[0x10000..]==updated[0x10000..],"MAP tail unexpectedly changed");
     let mut allowed=vec![false;MAP_LEN];
     for i in WALL_OFF..GRID_OFF {if original[i]!=updated[i] {allowed[i]=true;}}
-    for idx in moved {
-        let off=idx*32;
-        for p in off..off+6 {allowed[p]=true;}
-        for p in off+14..off+16 {allowed[p]=true;}
+    for moved in moved {
+        let off=moved.id*32;
+        if let Some((col,row))=moved.detached_cell {
+            for p in off..off+32 {allowed[p]=true;}
+            let grid=GRID_OFF+(row as usize*GRID_DIM+col as usize)*2;
+            allowed[grid]=true;allowed[grid+1]=true;
+        } else {
+            for p in off..off+6 {allowed[p]=true;}
+            for p in off+14..off+16 {allowed[p]=true;}
+        }
     }
     for copy in &inserted {
         for p in copy.id*32..copy.id*32+32 {allowed[p]=true;}
@@ -1208,6 +1264,7 @@ fn validate_source_archive(disc:&DiscPatcher,index:&ProtIndex)->Result<()> {
 
 pub(super) fn plan_export(source:&Path, scene:&AssembledScene, world:&WorldModel,
     index:&ProtIndex) -> Result<NativeExportPlan> {
+    ensure!(world.collision.recipes.is_empty(),"Authored collision recipes are in-memory only; native IMG export is not enabled for these edits. No collision intent was discarded");
     let source=source.canonicalize().context("Cannot find opened disc image")?;
     ensure!(source.is_file(),"Open a raw 2352-byte .img/.bin source");
     let image=std::fs::read(&source).context("Read source for native export preflight")?;
@@ -1243,7 +1300,13 @@ fn compile_plan(source:PathBuf, mut disc:DiscPatcher, image_length:usize,
         let planned=(|| -> Result<Vec<(usize,Vec<u8>)>> {
             let original=disc.read_entry_footprint(idx)
                 .with_context(||format!("Read native MAP for {name} / PROT {idx}"))?;
-            map_patches(&original,edits)
+            // Retail streams 0x28 sectors: MAP plus the next 0x2000-byte
+            // fallback window. Read physical adjacency, not guessed entry IDs.
+            let lba=disc.entry_disc_lba(idx).context("Missing MAP disc address")?;
+            let loaded=disc.read_disc_sectors(lba,0x28).context("Read native MAP trigger fallback")?;
+            ensure!(loaded.len()==0x14000,"Incomplete native MAP load window");
+            let bindings=NativeBindings::parse(&loaded[0x10000..0x12000],&loaded[0x12000..])?;
+            map_patches_with_bindings(&original,edits,&bindings)
         })();
         match planned {
             Ok(records)=>plans.push((name.to_string(),idx,records)),
@@ -1375,7 +1438,7 @@ pub(super) mod tests {
         let world=WorldModel {model:None, instances:1, unavailable:0, unique_models:0,
             ground_triangles:0, ground_vram_covered:0, ground_textured:0,
             draws:vec![draw], npcs:vec![npc], npc_issue:None, foreign:vec![],
-            foreign_vram:Default::default()};
+            collision:Default::default(),foreign_vram:Default::default()};
         (scene,world)
     }
 
@@ -1513,11 +1576,129 @@ pub(super) mod tests {
         (m,mov,copy)
     }
     #[test]
+    fn authored_collision_intent_cannot_be_silently_omitted_from_export() {
+        let (scene,mut world)=actor_fixture();
+        let (_,recipe)=super::super::collision_recipes::fixture();
+        world.collision.recipes.push(recipe);
+        let index=ProtIndex::from_bytes(legaia_disc_patch::disc::synth::synth_prot(&[]),None).unwrap();
+        let error=plan_export(Path::new("not-read.img"),&scene,&world,&index).err().unwrap();
+        assert!(error.to_string().contains("Authored collision recipes are in-memory only"));
+    }
+
+    #[test]
+    fn complete_plan_reads_physical_fallback_before_allocating() {
+        let (map,mov,_)=test_map(false);
+        let image=map_disc(&map);
+        let length=image.len();
+        let mut disc=DiscPatcher::open(image).unwrap();
+        let rec=ObjectRecord::parse(&map,138).unwrap();
+        let mut fallback=vec![0;22];
+        fallback[6..8].copy_from_slice(&18i16.to_le_bytes());
+        fallback[8..10].copy_from_slice(&1i16.to_le_bytes());
+        fallback[18..22].copy_from_slice(&[(mov.cell.0 as i32+rec.col_delta as i32) as u8,
+            (mov.cell.1 as i32+rec.row_delta as i32) as u8,17,0]);
+        disc.patch_prot_entry(1,0,&fallback).unwrap();
+        let error=compile_plan(PathBuf::new(),disc,length,0,&ExportEdits{moves:vec![mov],..Default::default()}).err().unwrap();
+        assert!(format!("{error:#}").contains("fallback trigger"));
+        assert!(format!("{error:#}").contains("MAN flat record 17"));
+    }
+
+    #[test]
+    fn fallback_binding_blocks_source_without_grid_bind_bit() {
+        let (map,mov,_)=test_map(false);
+        let rec=ObjectRecord::parse(&map,138).unwrap();
+        let anchor=((mov.cell.0 as i32+rec.col_delta as i32) as u8,(mov.cell.1 as i32+rec.row_delta as i32) as u8);
+        let mut fallback=vec![0;22];fallback[6..8].copy_from_slice(&18i16.to_le_bytes());
+        fallback[8..10].copy_from_slice(&1i16.to_le_bytes());
+        fallback[18..22].copy_from_slice(&[anchor.0,anchor.1,255,7]);
+        let bindings=NativeBindings::parse(&map[0x10000..],&fallback).unwrap();
+        let error=map_patches_with_bindings(&map,&ExportEdits{moves:vec![mov],..Default::default()},&bindings).unwrap_err();
+        assert!(error.to_string().contains("fallback trigger"));
+        assert!(error.to_string().contains("MAN flat record 255"));
+    }
+
+    #[test]
+    fn copy_allocation_avoids_unmarked_fallback_script_anchor() {
+        let (mut map,_,copy)=test_map(false);
+        map[WALL_OFF..GRID_OFF].fill(4);
+        let first=insert_copies(&mut map.clone(),&map,&[copy.clone()],&[None;16]).unwrap().remove(0);
+        let rec=ObjectRecord::parse(&map,138).unwrap();
+        let anchor=((first.col as i32+rec.col_delta as i32) as u8,(first.row as i32+rec.row_delta as i32) as u8);
+        let mut fallback=vec![0;22];fallback[6..8].copy_from_slice(&18i16.to_le_bytes());
+        fallback[8..10].copy_from_slice(&1i16.to_le_bytes());
+        fallback[18..22].copy_from_slice(&[anchor.0,anchor.1,6,0]);
+        let bindings=NativeBindings::parse(&map[0x10000..],&fallback).unwrap();
+        let mut after=map.clone();
+        let added=insert_copies_with_bindings(&mut after,&map,&[copy],&[None;16],&bindings).unwrap().remove(0);
+        assert_ne!((first.col,first.row),(added.col,added.row));
+        let grid=GRID_OFF+(first.row as usize*GRID_DIM+first.col as usize)*2;
+        assert_eq!(&after[grid..grid+2],&map[grid..grid+2]);
+        assert_eq!(&after[0x10000..],&map[0x10000..]);
+    }
+
+    #[test]
+    fn shared_reference_move_allocates_without_moving_other_instances() {
+        let (mut map,mov,mut copy)=test_map(true);
+        let other=GRID_OFF+(35*GRID_DIM+34)*2;
+        map[other..other+2].copy_from_slice(&138u16.to_le_bytes());
+        let selected=GRID_OFF+(mov.cell.1 as usize*GRID_DIM+mov.cell.0 as usize)*2;
+        map[selected..selected+2].copy_from_slice(&(138u16|0x2000).to_le_bytes());
+        // Copy and move the same base in one plan: the copy must use the
+        // original source, not the newly moved independent descriptor.
+        copy.delta=[0.0;3];
+        let edits=ExportEdits{moves:vec![mov.clone()],copies:vec![copy],..Default::default()};
+        let image=map_disc(&map);
+        let compile=||compile_plan(PathBuf::new(),DiscPatcher::open(image.clone()).unwrap(),image.len(),0,&edits).unwrap();
+        let a=compile();let b=compile();assert_eq!(a.image,b.image);
+        let after=DiscPatcher::open(a.image).unwrap().read_entry_footprint(0).unwrap();
+        assert_eq!(&after[138*32..139*32],&map[138*32..139*32]);
+        assert_eq!(&after[other..other+2],&map[other..other+2]);
+        assert_eq!(u16::from_le_bytes(after[selected..selected+2].try_into().unwrap()),511|0x2000);
+        let placed=field_objects::parse_placements(&after);
+        let moved=placed.iter().find(|p|p.obj_idx==511).unwrap();
+        assert_eq!((moved.col,moved.row),mov.cell);
+        assert_eq!((moved.world_x,moved.world_z),(mov.source_position.0-16,mov.source_position.1+32));
+        let duplicated=placed.iter().find(|p|p.obj_idx==510).unwrap();
+        assert_eq!((duplicated.world_x,duplicated.world_z),mov.source_position);
+        assert_eq!(&after[WALL_OFF..GRID_OFF],&map[WALL_OFF..GRID_OFF]);
+        assert_eq!(&after[0x10000..],&map[0x10000..]);
+    }
+
+    #[test]
+    fn shared_reference_moves_are_independent_in_one_plan() {
+        let (mut map,first,_)=test_map(false);
+        let other=GRID_OFF+(35*GRID_DIM+34)*2;
+        map[other..other+2].copy_from_slice(&138u16.to_le_bytes());
+        let mut second=first.clone();second.cell=(34,35);
+        second.source_position.1+=128;second.delta=[32.0,0.0,0.0];
+        let mut after=map.clone();
+        let changed=move_originals(&mut after,&[first.clone(),second.clone()]).unwrap();
+        assert_eq!(changed.iter().map(|r|r.id).collect::<Vec<_>>(),vec![511,510]);
+        assert_eq!(&after[138*32..139*32],&map[138*32..139*32]);
+        let placed=field_objects::parse_placements(&after);
+        assert_eq!(placed.iter().find(|p|p.obj_idx==510).unwrap().world_x,second.source_position.0+32);
+        assert_eq!(placed.iter().find(|p|p.obj_idx==511).unwrap().world_x,first.source_position.0-16);
+    }
+
+    #[test]
+    fn shared_reference_allocation_still_rejects_walls_and_exhaustion() {
+        let (mut map,mov,_)=test_map(false);
+        let other=GRID_OFF+(35*GRID_DIM+34)*2;
+        map[other..other+2].copy_from_slice(&138u16.to_le_bytes());
+        let edits=ExportEdits{moves:vec![mov],..Default::default()};
+        map[WALL_OFF]=0x10;
+        assert!(map_patches(&map,&edits).unwrap_err().to_string().contains("Unresolved collision ownership"));
+        map[WALL_OFF]=0;
+        for id in 4..512 {if id!=138 {map[id*32]=1;}}
+        assert!(map_patches(&map,&edits).unwrap_err().to_string().contains("No completely blank"));
+    }
+
+    #[test]
     fn moving_corrected_original_moves_static_collider_same_distance() {
         let (mut m,mov,_)=test_map(true);
         let before=ObjectRecord::parse(&m,138).unwrap();
         let collider=source_collision(&before,34,34);
-        assert_eq!(move_originals(&mut m,&[mov]).unwrap(),vec![138]);
+        assert_eq!(move_originals(&mut m,&[mov]).unwrap(),vec![MovedRecord{id:138,detached_cell:None}]);
         let after=ObjectRecord::parse(&m,138).unwrap();
         assert_eq!(source_collision(&after,34,34),(collider.0-16,collider.1+32));
         assert_eq!(after.sub_anchor_x,-1);
@@ -1691,12 +1872,14 @@ pub(super) mod tests {
     }
 
     fn map_disc(map:&[u8])->Vec<u8> {
-        let mut prot=vec![0u8;2048+MAP_LEN];
-        prot[4..8].copy_from_slice(&1u32.to_le_bytes());
+        // The engine's 0x28-sector read includes a fallback trigger window.
+        let mut prot=vec![0u8;2048+MAP_LEN+0x2000];
+        prot[4..8].copy_from_slice(&2u32.to_le_bytes());
         prot[8..12].copy_from_slice(&1u32.to_le_bytes());
         prot[16..20].copy_from_slice(&1u32.to_le_bytes());
         prot[20..24].copy_from_slice(&37u32.to_le_bytes());
-        prot[2048..].copy_from_slice(map);
+        prot[24..28].copy_from_slice(&41u32.to_le_bytes());
+        prot[2048..2048+MAP_LEN].copy_from_slice(map);
         legaia_disc_patch::disc::synth::synth_disc(&prot)
     }
 
@@ -1760,3 +1943,7 @@ pub(super) mod tests {
         assert_eq!(RIM_ELM_MAPS.iter().map(|(_,i)|*i).collect::<Vec<_>>(),vec![1,10,19,345,739]);
     }
 }
+
+#[cfg(test)]
+#[path = "native_export_verification.rs"]
+mod controlled_verification;

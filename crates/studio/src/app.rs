@@ -5,6 +5,8 @@ mod media_ui;
 mod viewport;
 mod world_view;
 mod scene_instances;
+mod collision_recipes;
+mod native_dependency_report;
 mod placement_drop;
 mod cell_catalog;
 mod ps1_export;
@@ -2335,6 +2337,7 @@ impl App {
         let mut pending_npc_model: Option<((bool,usize),u8)> = None;
         let mut pending_history_undo=false;
         let mut pending_history_redo=false;
+        let mut pending_collision_edit:Option<((bool,usize),Option<collision_recipes::Recipe>)>=None;
         let mut finish_drag: Option<EditorDrag> = None;
         let mut finish_rotate: Option<EditorRotateDrag> = None;
         let mut pending_import: Option<Vec<((bool,usize),[f32;3])>> = None;
@@ -2589,6 +2592,16 @@ impl App {
                         }
                         ui.separator();
                         egui::ScrollArea::vertical().id_salt("lck_properties_scroll").show(ui, |ui| {
+                if let (Some(scene),Some(world),Some(lib))=(&ready,&world,&self.studio.library) {
+                    ui.collapsing("Native dependencies (read only)",|ui| {
+                        native_dependency_report::show(ui,scene,world,properties_key,&lib.index);
+                    });
+                    ui.collapsing("Authored collision recipe (in memory)",|ui| {
+                        if let Some(edit)=collision_recipes::show_editor(ui,world,properties_key,&lib.index) {
+                            pending_collision_edit=Some((properties_key,edit));
+                        }
+                    });
+                }
                 if let Some(key)=Some(properties_key) {
                     if let Some(draw)=world.as_ref().and_then(|w|w.at(key.0,key.1)) {
                         if draw.vertex_start < draw.vertex_end && !draw.hidden {
@@ -3496,7 +3509,7 @@ impl App {
             pending_scale.is_some() || pending_import.is_some() ||
             pending_npc_animation.as_ref().is_some_and(|item|item.3) ||
             pending_npc_model.is_some() ||
-            pending_project.is_some() || self.editor_gesture_start.is_some();
+            pending_project.is_some() || pending_collision_edit.is_some() || self.editor_gesture_start.is_some();
         let before_frame=if editor_changed_this_frame {
             match (self.native_scene.as_ref(),world.as_deref()) {
                 (Some((name,NativeSceneSlot::Ready(_, _))),Some(w))=>
@@ -3516,6 +3529,17 @@ impl App {
         // Arc::get_mut keeps one writable world, without cloning thousands
         // of vertices on every mouse frame. The original scene remains intact.
         drop(world);
+        if let Some((key,recipe))=pending_collision_edit {
+            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut() {
+                if let Some(world)=Arc::get_mut(world) {
+                    let result=match recipe {Some(recipe)=>world.set_collision_recipe(key,recipe),None=>world.remove_collision_recipe(key)};
+                    match result {
+                        Ok(())=>{self.studio.status=Some("Collision recipe updated (editor/in-memory only). Save LCK scene to preserve it.".into());ctx.request_repaint();},
+                        Err(error)=>self.studio.error=Some(error),
+                    }
+                }
+            }
+        }
         if let Some((key,name))=pending_name {
             if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut() {
                 if let Some(world)=Arc::get_mut(world) {
@@ -3615,7 +3639,21 @@ impl App {
                         self.native_selected.and_then(|old|
                             world.at(old.0,old.1).map(|d|d.scale)).unwrap_or([1.0;3])
                     };
-                    match world.duplicate_native(source,scene.placements.len(),uid,offset) {
+                    let duplicated=world.duplicate_native(source,scene.placements.len(),uid,offset).and_then(|key| {
+                        if !pending_repository_drop {
+                            if let Some(old)=self.native_selected {
+                                if world.collision.source(world,old).is_some() &&
+                                    world.collision.source(world,old)==world.collision.source(world,source) {
+                                    if let Err(error)=world.inherit_collision_recipe(old,key) {
+                                        world.delete_created(key)?;
+                                        return Err(error);
+                                    }
+                                }
+                            }
+                        }
+                        Ok(key)
+                    });
+                    match duplicated {
                         Ok(key) => {
                             // Copy the *selected instance* appearance and frame, not just the
                             // source's original MAN record. Each copy stays independent.
@@ -5997,7 +6035,7 @@ mod catalog_ui_tests {
         let mut world = WorldModel {
             model: None, instances: 2, unavailable: 0, unique_models: 1,
             ground_triangles: 0, ground_vram_covered: 0, ground_textured: 0,
-            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),foreign_vram:std::collections::HashMap::new(),
+            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),collision:Default::default(),foreign_vram:std::collections::HashMap::new(),
             draws: vec![original, copy],
         };
         assert_eq!(editor_duplicate_request(&world, Some((false, 2))),

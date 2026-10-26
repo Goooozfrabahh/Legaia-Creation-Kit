@@ -1,0 +1,131 @@
+//! Read-only evidence reporting; never authorizes MAN relocation or export.
+use super::{collision_recipes, ps1_export::native_dependencies::NativeBindings, world_view::WorldModel};
+use legaia_engine_scene::{scene::{ProtIndex, Scene},scene_assembly::AssembledScene};
+use legaia_scene_formats::{field_disasm::{LinearWalker,InsnInfo,MenuCtrlKind},field_objects::ObjectRecord,man_section};
+use std::fmt::Write;
+
+#[derive(Default,Debug)]
+struct Scan {
+    instructions: Vec<String>,
+    targets: Vec<(usize,u8)>,
+    wall_writes: Vec<usize>,
+    error: Option<String>,
+}
+
+fn scan_script(bytes:&[u8],pc0:usize)->Scan {
+    let mut scan=Scan::default();
+    if pc0>=bytes.len() {scan.error=Some("Invalid/empty script range".into());return scan;}
+    for decoded in LinearWalker::new(bytes,pc0) {
+        match decoded {
+            Ok(insn)=>{
+                if scan.instructions.len()>=10000 {scan.error=Some("Instruction report limit reached".into());break;}
+                if let Some(target)=insn.extended {scan.targets.push((insn.pc,target));}
+                if matches!(insn.info,InsnInfo::MenuCtrl{kind:MenuCtrlKind::Nibble7Tile{..},..}) {scan.wall_writes.push(insn.pc);}
+                scan.instructions.push(format!("+{:#x}: {:?}",insn.pc,insn));
+            }
+            Err((pc,error))=>{scan.error=Some(format!("Decode stopped at +{pc:#x}: {error:?}"));break;}
+        }
+    }
+    scan
+}
+
+pub(super) fn report(scene:&AssembledScene,world:&WorldModel,key:(bool,usize),index:&ProtIndex)->Result<String,String> {
+    let source=world.collision.source(world,key).ok_or("Verified native MAP source unavailable for this selection")?;
+    let id=&source.object;
+    if id.scene!=scene.name {return Err("Source scene differs; donor dependency reporting is not available here".into());}
+    let native=Scene::load(index,&id.scene).map_err(|e|e.to_string())?;
+    let map=index.entry_bytes(id.map_entry).map_err(|e|e.to_string())?;
+    if collision_recipes::digest(&map)!=source.map_sha256 {return Err("Source MAP changed".into());}
+    let lba=index.entry_start_lba_retail(id.map_entry.try_into().map_err(|_|"MAP index outside native range")?)
+        .ok_or("Native MAP load address unavailable")?;
+    let load=index.prot_dat_raw_bytes(lba as u64*2048,0x14000).map_err(|e|e.to_string())?;
+    if load.get(..0x12000)!=Some(map.as_slice()) {return Err("Physical MAP load differs from indexed MAP".into());}
+    let binds=NativeBindings::parse(&load[0x10000..0x12000],&load[0x12000..]).map_err(|e|e.to_string())?;
+    let rec=ObjectRecord::parse(&source.descriptor,0).ok_or("Descriptor unavailable")?;
+    let anchor=(id.cell[0] as i32+rec.col_delta as i32,id.cell[1] as i32+rec.row_delta as i32);
+    if !(0..128).contains(&anchor.0)||!(0..128).contains(&anchor.1) {return Err("Native anchor outside grid".into());}
+    let grid=0x8000+(id.cell[1] as usize*128+id.cell[0] as usize)*2;
+    let word=u16::from_le_bytes(map[grid..grid+2].try_into().unwrap());
+    let mut out=String::new();
+    writeln!(out,"Native source: {} / MAP PROT {} / descriptor {}\nPlacement cell {:?}; binding anchor {:?}",id.scene,id.map_entry,id.descriptor_id,id.cell,anchor).unwrap();
+    writeln!(out,"MAP SHA-256 {}\nDescriptor flags {:#06x}; mesh selector {}; grid word {word:#06x}",source.map_sha256,rec.flags,rec.pack_index_field).unwrap();
+    let offset=legaia_scene_formats::field_objects::collision_footprint_offset(&rec);
+    writeln!(out,"Verified record-local collider offset: X {} Z {}. Script runtime flags may change collision.\nWall ownership: UNKNOWN. Walkable surfaces: scene grid/LUT/kind-2 dependencies; mesh does not establish ownership.",offset.0,offset.1).unwrap();
+    for (name,block) in [("MAP",&load[0x10000..0x12000]),("fallback",&load[0x12000..])] {
+        for kind in 0..3 {
+            let h=kind*4;let start=i16::from_le_bytes([block[h+2],block[h+3]]);let count=i16::from_le_bytes([block[h+4],block[h+5]]);
+            if count<=0 {continue;}
+            // NativeBindings already checked these complete row ranges.
+            for (i,row) in block[start as usize..start as usize+count as usize*4].chunks_exact(4).enumerate() {
+                if (row[0],row[1])==(id.cell[0],id.cell[1]) || (row[0] as i32,row[1] as i32)==anchor {
+                    writeln!(out,"{name} kind-{kind} row at +{:#x}: {row:02x?}",start as usize+i*4).unwrap();
+                }
+            }
+        }
+    }
+    let Some(binding)=binds.at((anchor.0 as u8,anchor.1 as u8)) else {
+        writeln!(out,"No kind-1 binding at native anchor. Stored bind marker and window spawn rules still require validation. No script-closure claim.").unwrap();
+        return Ok(out);
+    };
+    writeln!(out,"Resolved binding: {} block +{:#x}; flat MAN record {}; gate {} (gate is not a bind filter)",binding.block,binding.offset,binding.record,binding.gate).unwrap();
+    let man=native.field_man_payload(index).map_err(|e|e.to_string())?.ok_or("Bound object MAN unavailable")?;
+    if source.man_sha256.as_deref()!=Some(&collision_recipes::digest(&man)) {return Err("Source MAN changed".into());}
+    let file=man_section::parse(&man).map_err(|e|e.to_string())?;
+    let target=binding.record as usize;
+    writeln!(out,"MAN SHA-256 {}; partition counts {:?}",collision_recipes::digest(&man),file.header.partition_counts).unwrap();
+    let mut base=0usize;let mut incomplete=0;let mut incoming=Vec::new();let mut found=false;
+    for (partition,records) in file.partitions.iter().enumerate() {
+        for record in 0..records.len() {
+            let flat=base+record;
+            let Some((start,pc0,len))=legaia_engine_field::man_field_scripts::partition_record_span(&file,&man,partition,record) else {
+                incomplete+=1;continue;
+            };
+            let body=&man[start..start+len];let scan=scan_script(body,pc0);
+            if scan.error.is_some() {incomplete+=1;}
+            for (pc,destination) in &scan.targets {
+                if *destination as usize==target {incoming.push(format!("P{partition}[{record}] flat {flat} +{pc:#x}"));}
+            }
+            if flat==target {
+                found=true;
+                writeln!(out,"Bound P{partition}[{record}] bytes {start:#x}..{:#x}; script +{pc0:#x}",start+len).unwrap();
+                if partition==0 {writeln!(out,"Animation ID {} (native header); clip compatibility/lifetime not proven by this report",body[pc0-1]).unwrap();}
+                writeln!(out,"Decoded outgoing context targets: {:?}\nDecoded wall-write instruction offsets: {:?}",scan.targets,scan.wall_writes).unwrap();
+                if let Some(error)=&scan.error {writeln!(out,"INCOMPLETE: {error}").unwrap();}
+                for instruction in &scan.instructions {writeln!(out,"{instruction}").unwrap();}
+            }
+        }
+        base+=records.len();
+    }
+    if !found {writeln!(out,"UNRESOLVED: bound MAN record is absent or its header/span cannot be decoded.").unwrap();}
+    writeln!(out,"Observed incoming context references: {incoming:?}\nIncomplete record scans: {incomplete}. Scans stop at first decode error without resynchronizing.\nThis is a linear instruction inventory, not a complete control-flow/dependency proof. Dynamic targets, helper calls, global state and resource closure remain unresolved. No MAN relocation is performed.").unwrap();
+    Ok(out)
+}
+
+pub(super) fn show(ui:&mut eframe::egui::Ui,scene:&AssembledScene,world:&WorldModel,key:(bool,usize),index:&ProtIndex) {
+    use eframe::egui;
+    let source=world.collision.source(world,key);
+    let id=egui::Id::new(("lck_native_dependency_report",&scene.name,key,source.map(|s|(&s.map_sha256,&s.man_sha256))));
+    if ui.button("Read native dependencies").clicked() {
+        let text=report(scene,world,key,index).unwrap_or_else(|error|format!("Dependency report unavailable: {error}"));
+        ui.ctx().data_mut(|data|data.insert_temp(id,text));
+    }
+    if let Some(text)=ui.ctx().data_mut(|data|data.get_temp::<String>(id)) {
+        egui::ScrollArea::vertical().id_salt(id).max_height(240.0).show(ui,|ui|{ui.monospace(text);});
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn stops_on_unknown_instruction_without_claiming_later_dependencies() {
+        let scan=scan_script(&[0x21,0x4c,0xb0,0xcc,7,0x21],0);
+        assert!(scan.error.is_some());assert!(scan.targets.is_empty());
+        assert_eq!(scan.instructions.len(),1);
+    }
+    #[test]
+    fn reports_context_reference_on_instruction_boundary() {
+        let scan=scan_script(&[0xa1,7,0x21],0);
+        assert!(scan.error.is_none());assert_eq!(scan.targets,vec![(0,7)]);
+    }
+}
