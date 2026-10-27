@@ -12,10 +12,21 @@ pub(in crate::app) struct Binding {
     pub offset: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::app) struct Trigger {
+    pub kind: usize,
+    pub cell: (u8,u8),
+    /// Raw bytes: their meaning depends on the trigger kind.
+    pub payload: [u8;2],
+    pub block: &'static str,
+    pub offset: usize,
+}
+
 #[derive(Default, Debug)]
 pub(in crate::app) struct NativeBindings {
     bindings:BTreeMap<(u8,u8), Binding>,
     trigger_cells:BTreeSet<(u8,u8)>,
+    triggers:Vec<Trigger>,
 }
 
 impl NativeBindings {
@@ -36,6 +47,7 @@ impl NativeBindings {
                 let rows=bytes.get(start..end).with_context(||format!("Truncated {name} kind-{kind} trigger table"))?;
                 for (i,row) in rows.chunks_exact(4).enumerate() {
                     result.trigger_cells.insert((row[0],row[1]));
+                    result.triggers.push(Trigger{kind,cell:(row[0],row[1]),payload:[row[2],row[3]],block:name,offset:start+i*4});
                     if kind!=1 {continue;}
                     // First match wins, including duplicate primary rows and
                     // primary records that cannot be decoded as partition 0.
@@ -49,6 +61,7 @@ impl NativeBindings {
     }
     pub fn at(&self, cell:(u8,u8))->Option<&Binding> {self.bindings.get(&cell)}
     pub fn has_trigger(&self, cell:(u8,u8))->bool {self.trigger_cells.contains(&cell)}
+    pub fn triggers_at(&self, cell:(u8,u8))->impl Iterator<Item=&Trigger> {self.triggers.iter().filter(move |t|t.cell==cell)}
 }
 
 #[cfg(test)]
@@ -68,6 +81,9 @@ mod tests {
         let bindings=NativeBindings::parse(&[],&b).unwrap();
         assert!(bindings.has_trigger((4,5))&&bindings.has_trigger((6,7)));
         assert!(bindings.at((4,5)).is_none()&&bindings.at((6,7)).is_none());
+        let height=bindings.triggers_at((6,7)).collect::<Vec<_>>();
+        assert_eq!(height.len(),1);assert_eq!(height[0].kind,2);
+        assert_eq!((height[0].block,height[0].offset,height[0].payload),("fallback",22,[0,0]));
     }
     #[test]
     fn primary_first_match_keeps_unknown_man_record_and_nonzero_gate() {

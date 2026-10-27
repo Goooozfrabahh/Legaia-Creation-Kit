@@ -69,7 +69,8 @@ pub(super) fn render_report(cell: &str, overlay: &str, opened_image: Option<&Pat
     report.push_str(
         "V1 compiler status:\n\
          - MAP moves and same-cell copies: routed to the existing native writer.\n\
-         - Foreign assets requiring a NEW TMD/TIM, terrain, resizing, and transformed\n\
+           - Native terrain decorations: descriptor translations with collision, binding and cull-reach validation. Ground geometry is separate.\n\
+           - Foreign assets requiring a NEW TMD/TIM, terrain copies/deletion, resizing, and transformed\n\
            collision: writers NOT implemented by this version.\n\
          - NPCs: existing MAN writer capabilities and restrictions remain.\n\
          - Editor labels: not game engine object names; they do not block\n\

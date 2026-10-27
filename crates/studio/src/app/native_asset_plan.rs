@@ -44,7 +44,7 @@ pub(super) enum Requirement {
     ScenePackingAndMemory, Transform,
 }
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub(super) enum Adapter { NativeMap, ResidentStaticBridge, NativeMan, Unsupported }
+pub(super) enum Adapter { NativeMap, NativeTerrain, ResidentStaticBridge, NativeMan, Unsupported }
 #[derive(Clone,Debug,PartialEq,Eq)]
 pub(super) struct Request {
     pub id:InstanceId, pub source:String, pub category:Category,
@@ -106,6 +106,7 @@ fn route(category:Category,foreign:bool)->Adapter {
     match (category,foreign) {
         (Category::MapPlacement,false)=>Adapter::NativeMap,
         (Category::MapPlacement,true)=>Adapter::ResidentStaticBridge,
+        (Category::TerrainTile,false)=>Adapter::NativeTerrain,
         (Category::Actor,false)=>Adapter::NativeMan,
         _=>Adapter::Unsupported,
     }
@@ -218,7 +219,7 @@ mod tests {
     #[test]
     fn category_adapters_fail_closed_without_a_native_writer() {
         for (category,local,foreign) in [(Category::MapPlacement,Adapter::NativeMap,Adapter::ResidentStaticBridge),
-            (Category::TerrainTile,Adapter::Unsupported,Adapter::Unsupported),(Category::RawMesh,Adapter::Unsupported,Adapter::Unsupported),
+            (Category::TerrainTile,Adapter::NativeTerrain,Adapter::Unsupported),(Category::RawMesh,Adapter::Unsupported,Adapter::Unsupported),
             (Category::Actor,Adapter::NativeMan,Adapter::Unsupported)] {
             assert_eq!(route(category,false),local);assert_eq!(route(category,true),foreign);
             let request=Request{id:InstanceId::Created(9),source:"donor".into(),category,source_record:0,adapter:foreign,resources:BTreeSet::new(),requirements:requirements(category)};
