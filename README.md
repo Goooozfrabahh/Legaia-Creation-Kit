@@ -10,6 +10,16 @@ This repository is code and documentation only. **You bring the disc**: nothing 
 
 ## What you can do with it
 
+**Legaia Studio / LCK** is the Windows desktop scene editor developed in this
+repository. It provides GECK-inspired cell browsing, scene editing, persistent
+names and World Objects discovery. Genuine objects imported from Biron and
+Hunter's Spring have now rendered in Rim Elm through an experimental native IMG
+in the original retail engine, as manually verified by the project owner.
+Collision and general runtime safety remain unresolved for these imports;
+unrestricted cross-cell production export is not enabled. See the
+[milestone and evidence record](docs/tooling/lck-native-cross-cell-milestone.md)
+and [Studio capabilities](crates/studio/README.md#legaia-creation-kit-lck).
+
 | You want to | What ships | Where |
 |---|---|---|
 | **Play the game** | The port: title screen, New Game, towns, dungeons, world map, battles, menus, saves | [Browser play page](https://andrewaltimit.github.io/legend-of-legaia-re/play.html), or `legaia-engine` natively |

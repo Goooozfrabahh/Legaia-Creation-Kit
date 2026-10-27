@@ -5,6 +5,15 @@ use anyhow::{Result,Context,ensure};
 use legaia_engine_scene::{scene::{ProtIndex,Scene},scene_assembly::AssembledScene};
 use super::{world_view::WorldModel,collision_recipes::digest};
 
+#[path = "texture_relocation.rs"]
+pub(super) mod texture_relocation;
+
+#[path = "scene_registration.rs"]
+pub(super) mod scene_registration;
+
+#[path = "runtime_evidence.rs"]
+pub(super) mod runtime_evidence;
+
 #[derive(Clone,Copy,Debug,PartialEq,Eq,PartialOrd,Ord)]
 pub(super) enum Category { MapPlacement, TerrainTile, RawMesh, Actor }
 #[derive(Clone,Debug,PartialEq,Eq,PartialOrd,Ord)]
@@ -49,7 +58,7 @@ pub(super) struct NativeAssetPlan {
     pub resources:BTreeMap<ResourceId,Resource>,
 }
 impl NativeAssetPlan {
-    fn register(&mut self,kind:ResourceKind,bytes:&[u8],origin:Origin,resident:bool)->Result<ResourceId> {
+    pub(super) fn register(&mut self,kind:ResourceKind,bytes:&[u8],origin:Origin,resident:bool)->Result<ResourceId> {
         ensure!(!bytes.is_empty(),"Empty native resource {:?} from {}",kind,origin.scene);
         let id=ResourceId{kind,sha256:digest(bytes)};
         if let Some(resource)=self.resources.get_mut(&id) {

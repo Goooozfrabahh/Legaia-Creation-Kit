@@ -9,7 +9,35 @@ lines do for a single asset is a button here.
 No game data ships with it. The app reads the disc image the user picks, at
 runtime, and writes only into folders the user chooses.
 
-## What it does
+## Legaia Creation Kit (LCK)
+
+The Windows scene-editing workspace extends the asset browser with a
+GECK-inspired workflow. These editor capabilities are distinct from what the
+retail engine can safely serialize:
+
+| Area | Current support |
+|---|---|
+| Scene view | Native cells, original ground and textures, hierarchy, selection and asset preview |
+| Navigation | Orbit, pan, zoom and Frame Selected |
+| Editing | Move, duplicate, rotate, scale and delete in the editor; undo/redo and scene saving |
+| Naming | Persistent asset/cell aliases and independent instance-name overrides |
+| Actors | Native NPC and field-actor visualization; constrained native edits |
+| World Objects | Game-wide discovery and donor-aware cross-cell previews/import development |
+| Collision | Automatic mesh proposals, optional authoring, provenance and persisted corrections |
+| Native output | Supported native MAP edits; independently allocated foreign resource/placement candidates |
+| Experimental IMG | Explicit opt-in visual tests; two genuine foreign donors manually observed rendering in Rim Elm |
+
+Editor rotation, scale, deletion, terrain, actor and collision controls do not
+imply universal native export support. Mesh-derived collision does not prove
+ownership of original MAP walls or native walkability. Normal preflight rejects
+unsupported edits; visual-only experiments do not grant production approval.
+Camera and rendering behavior are preserved by the milestone checkpoint.
+
+Build the desktop editor with `cargo build -p legaia-studio --locked`.
+For the evidence boundary, test commands and remaining limitations, see
+[the native cross-cell milestone](../../docs/tooling/lck-native-cross-cell-milestone.md).
+
+## Asset browser
 
 | Area | What the user gets |
 |---|---|

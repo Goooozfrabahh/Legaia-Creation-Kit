@@ -153,3 +153,9 @@ legaia-options.toml
 # but an `--out` pointed at the repo would otherwise be committable.
 *.jsonl
 !ghidra/scripts/**/*.jsonl
+
+# LCK machine-local aliases, historical source copies and experiment logs.
+# Keep these on disk; active implementation lives under crates/ and scripts/.
+/LegaiaStudio_AssetCatalog.tsv
+/lck_*backup*/
+/export integrationV1_logs/

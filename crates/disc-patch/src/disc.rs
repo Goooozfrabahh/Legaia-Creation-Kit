@@ -207,7 +207,7 @@ impl DiscPatcher {
             if !payload.len().is_multiple_of(sector) {
                 bail!("grown PROT entry {idx} payload is not a whole number of sectors");
             }
-            let new_sectors = (payload.len() / sector) as u32;
+            let new_sectors = u32::try_from(payload.len() / sector).context("Grown entry sector count overflow")?;
             let old_sectors = self
                 .entry_true_footprint_sectors(idx)
                 .with_context(|| format!("PROT entry {idx} footprint"))?;
@@ -220,16 +220,36 @@ impl DiscPatcher {
         }
 
         // Cumulative shift applied to entry j = sum of growth of entries < j.
-        let start0 = self.entries[0].start_lba as usize * sector;
+        let first=self.entries.first().context("Cannot grow an empty PROT archive")?;
+        let start0 = (first.start_lba as usize).checked_mul(sector).context("PROT prefix size overflow")?;
+        let header_sectors=u32::from_le_bytes(old_prot.get(8..12).context("Missing PROT header length")?.try_into()?);
+        let header_end=(header_sectors as usize).checked_mul(sector).context("PROT header size overflow")?;
+        let bound_off=8usize.checked_add(n.checked_add(2).and_then(|v|v.checked_mul(4)).context("TOC bound offset overflow")?).context("TOC bound offset overflow")?;
+        if header_end>start0 || bound_off.checked_add(4).is_none_or(|v|v>header_end) {
+            bail!("PROT live TOC exceeds declared header sectors");
+        }
+        // entries must be a dense projection of the actual TOC, not the
+        // Archive reader's filtered holes. Never silently patch a shifted ID.
+        for (j,span) in self.entries.iter().enumerate() {
+            let off=8+(j+2)*4;
+            if u32::from_le_bytes(old_prot[off..off+4].try_into()?)!=span.start_lba {bail!("Non-dense PROT TOC at entry {j}");}
+        }
+        let old_bound=u32::from_le_bytes(old_prot[bound_off..bound_off+4].try_into()?);
+        let last=self.entries.last().unwrap();
+        let expected_bound=last.start_lba.checked_add(u32::try_from(last.size_bytes/sector as u64)?).context("PROT final bound overflow")?;
+        if old_bound!=expected_bound || old_bound>self.prot_sectors {bail!("Unverified PROT final entry bound");}
+        if growth[n-1]>0 && old_bound!=self.prot_sectors {
+            bail!("Cannot grow final entry across an opaque archive trailer");
+        }
         let mut new_prot = Vec::with_capacity(old_prot.len());
         new_prot.extend_from_slice(&old_prot[..start0]);
         for e in 0..n {
             let start = self.entries[e].start_lba as usize * sector;
             let foot_sectors = self.entry_true_footprint_sectors(e).unwrap() as usize;
-            let end = start + foot_sectors * sector;
+            let end = start.checked_add(foot_sectors.checked_mul(sector).context("PROT entry length overflow")?).context("PROT entry end overflow")?;
             match new_payloads.get(&e) {
                 Some(p) => new_prot.extend_from_slice(p),
-                None => new_prot.extend_from_slice(&old_prot[start..end]),
+                None => new_prot.extend_from_slice(old_prot.get(start..end).context("PROT entry outside archive")?),
             }
         }
         debug_assert_eq!(new_prot.len() % sector, 0);
@@ -239,28 +259,19 @@ impl DiscPatcher {
         // cumulative growth of every earlier entry.
         let mut cum = 0u32;
         for (j, span) in self.entries.iter().enumerate() {
-            let new_start = span.start_lba + cum;
+            let new_start = span.start_lba.checked_add(cum).context("PROT relocated start overflow")?;
             let off = 8 + (j + 2) * 4;
             if off + 4 <= start0 {
                 new_prot[off..off + 4].copy_from_slice(&new_start.to_le_bytes());
             }
-            cum += growth[j];
+            cum = cum.checked_add(growth[j]).context("PROT cumulative sector growth overflow")?;
         }
-        // The words past the last entry's start are its end bound and the
-        // TOC's monotone tail - every non-zero one names a sector past every
-        // grown entry, so all move by the total growth. The reader sizes an
-        // entry by the gap to the next word (`toc[p+3] - toc[p+2]`, retail's
-        // own arithmetic); leaving the bound behind shrank the last entry by
-        // the total growth and, once that wrapped, dropped it from the index.
-        // Zero words are TOC padding (LBA 0 is the header) and stay zero.
-        let mut off = 8 + (n + 2) * 4;
-        while off + 4 <= start0 {
-            let word = u32::from_le_bytes(new_prot[off..off + 4].try_into().unwrap());
-            if word != 0 {
-                new_prot[off..off + 4].copy_from_slice(&(word + cum).to_le_bytes());
-            }
-            off += 4;
-        }
+        // Shift only the validated final end bound. start0 is the first
+        // *extraction* entry; the prefix also contains raw entries 0/1 (TIMs
+        // etc.), not just a TOC. The old tail scan rewrote their data and
+        // overflowed on 0xffffffff. Header padding/unused words stay opaque.
+        let new_bound=old_bound.checked_add(cum).context("PROT relocated end bound overflow")?;
+        new_prot[bound_off..bound_off+4].copy_from_slice(&new_bound.to_le_bytes());
 
         // Disc-level relayout: grow PROT.DAT + cascade every LBA reference.
         let new_image = legaia_iso::relayout::grow_prot_dat(
@@ -272,7 +283,13 @@ impl DiscPatcher {
 
         // Re-open against the grown image so entry LBAs / prot_sectors are current
         // and later index-keyed same-size edits resolve.
-        *self = Self::open(new_image)?;
+        let rebuilt=Self::open(new_image)?;
+        if rebuilt.entries.len()!=n {bail!("PROT entry count changed after growth");}
+        for j in 0..n {
+            let expected=if let Some(payload)=new_payloads.get(&j){payload.clone()}else{self.read_entry_footprint(j)?};
+            if rebuilt.read_entry_footprint(j)?!=expected {bail!("PROT entry {j} changed unexpectedly after growth");}
+        }
+        *self = rebuilt;
         Ok(())
     }
 
@@ -1053,6 +1070,23 @@ pub fn boot_exe_name(patcher: &DiscPatcher) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn growth_preserves_raw_prefix_and_opaque_header_tail_transactionally() {
+        use super::*;
+        let original=synth::synth_prot(b"native-payload");
+        let mut prot=original[..2048].to_vec();prot.extend_from_slice(&vec![0xff;4096]);prot.extend_from_slice(&original[2048..]);
+        for off in [16usize,20,24,28] {let value=u32::from_le_bytes(prot[off..off+4].try_into().unwrap())+2;prot[off..off+4].copy_from_slice(&value.to_le_bytes());}
+        prot[100..104].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut disc=DiscPatcher::open(synth::synth_disc(&prot)).unwrap();let before=disc.image().to_vec();
+        let prefix=disc.read_prot_bytes(2048,4096).unwrap();let others=[disc.read_entry_footprint(0).unwrap(),disc.read_entry_footprint(2).unwrap()];
+        assert!(disc.grow_prot_entries(&BTreeMap::from([(1,vec![0;1])])).is_err());assert_eq!(disc.image(),before);
+        let mut ambiguous=disc.read_entry_footprint(2).unwrap();ambiguous.extend_from_slice(&vec![0;2048]);
+        assert!(disc.grow_prot_entries(&BTreeMap::from([(2,ambiguous)])).is_err());assert_eq!(disc.image(),before);
+        let mut payload=disc.read_entry_footprint(1).unwrap();payload.extend_from_slice(&vec![0x42;2048]);
+        disc.grow_prot_entries(&BTreeMap::from([(1,payload.clone())])).unwrap();
+        assert_eq!(disc.read_entry_footprint(1).unwrap(),payload);assert_eq!(disc.read_entry_footprint(0).unwrap(),others[0]);assert_eq!(disc.read_entry_footprint(2).unwrap(),others[1]);
+        assert_eq!(disc.read_prot_bytes(2048,4096).unwrap(),prefix);assert_eq!(disc.read_prot_bytes(100,4).unwrap(),u32::MAX.to_le_bytes());
+    }
     use super::synth::{synth_disc, synth_prot};
     use super::*;
 

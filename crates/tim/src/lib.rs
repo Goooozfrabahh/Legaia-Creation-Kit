@@ -199,12 +199,25 @@ pub fn parse_strict(buf: &[u8]) -> Result<Tim> {
     parse_with(buf, true)
 }
 
+/// Validate a TIM already identified by a native resource descriptor, for
+/// Legaia's FUN_800198E0 upload path, not heuristic scanning. Retail reads
+/// has-CLUT at 0x80019950 (andi 8) and pixel mode at 0x80019A28 (andi 3).
+/// Upper flag metadata is retained verbatim, not interpreted or erased.
+/// Exact block lengths, dimensions and image bounds remain strict; mode bit
+/// 2 remains unsupported because it disagrees with ordinary TIM decoding.
+pub fn parse_native_upload(buf: &[u8]) -> Result<Tim> {
+    parse_policy(buf, true, true)
+}
+
 /// VRAM is 1024 16-bit pixels wide by 512 rows; every TIM rectangle (image
 /// and CLUT) loads somewhere inside it.
 pub const VRAM_FB_WIDTH: u16 = 1024;
 pub const VRAM_FB_HEIGHT: u16 = 512;
 
 fn parse_with(buf: &[u8], strict: bool) -> Result<Tim> {
+    parse_policy(buf, strict, false)
+}
+fn parse_policy(buf: &[u8], strict: bool, native_metadata: bool) -> Result<Tim> {
     if buf.len() < 8 {
         bail!("buffer too small for TIM header");
     }
@@ -217,7 +230,7 @@ fn parse_with(buf: &[u8], strict: bool) -> Result<Tim> {
         );
     }
     let flags = u32_le(buf, 4);
-    if strict && flags & !0xF != 0 {
+    if strict && !native_metadata && flags & !0xF != 0 {
         bail!("reserved TIM flag bits set: 0x{:08x}", flags);
     }
     let pmode = flags & 0x7;
@@ -412,6 +425,10 @@ pub fn decode_rgba8_with_palette(tim: &Tim, palette: &[u16]) -> Result<Vec<u8>> 
     // particular packs 1.5 words per pixel, so its row stride is NOT
     // `w * 3` when `fb_w * 2` isn't a multiple of 3.
     let row_bytes = tim.image.fb_w as usize * 2;
+    let input_len=row_bytes.checked_mul(h).context("TIM input dimensions overflow")?;
+    if tim.image.data.len()<input_len {
+        bail!("TIM image data shorter than declared dimensions");
+    }
     let mut out = Vec::with_capacity(out_len);
     match tim.mode {
         PixelMode::Bpp4 => {
@@ -629,6 +646,17 @@ mod tests {
         assert!(parse_strict(&buf).is_ok());
         let tim = parse_strict(&buf).unwrap();
         assert_eq!(tim.byte_extent(), buf.len());
+    }
+
+    #[test]
+    fn native_upload_preserves_metadata_without_relaxing_layout_or_scanning() {
+        for flags in [0x0001_0008u32,0x8000_0008] {
+            let mut raw=build_tim_4bpp();raw[4..8].copy_from_slice(&flags.to_le_bytes());let saved=raw.clone();
+            assert!(parse_strict(&raw).is_err());
+            let parsed=parse_native_upload(&raw).unwrap();assert_eq!(parsed.flags,flags);assert_eq!(raw,saved);
+            let mut short=raw.clone();short.pop();assert!(parse_native_upload(&short).is_err());
+            raw[4]|=4;assert!(parse_native_upload(&raw).is_err());
+        }
     }
 
     #[test]
