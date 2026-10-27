@@ -1,46 +1,9 @@
 //! Read-only evidence reporting; never authorizes MAN relocation or export.
 use super::{collision_recipes, ps1_export::native_dependencies::NativeBindings, world_view::WorldModel};
 use legaia_engine_scene::{scene::{ProtIndex, Scene},scene_assembly::AssembledScene};
-use legaia_scene_formats::{field_disasm::{LinearWalker,InsnInfo,MenuCtrlKind},field_objects::ObjectRecord,man_section};
+use legaia_scene_formats::field_objects::ObjectRecord;
+use super::native_script_dependencies::{scan_script, SceneInventory};
 use std::fmt::Write;
-
-#[derive(Default,Debug)]
-struct Scan {
-    instructions: Vec<String>,
-    targets: Vec<(usize,u8)>,
-    wall_writes: Vec<usize>,
-    wall_operations: Vec<String>,
-    error: Option<String>,
-}
-
-fn wall_operation(kind:&MenuCtrlKind)->String {
-    let MenuCtrlKind::Nibble7Tile{sub,x0,z0,x1,z1,mask}=kind else {return format!("{kind:?}");};
-    let effect=match sub {0=>"clear all",1=>"set all",2=>"clear mask",3=>"set mask",_=>"unsupported sub-op (halts)"};
-    // Same byte wrapping and asymmetric Z bias as the verified VM consumer
-    // engine-vm/field/step/menu_ctrl/dialog_vram_wall_paint.rs::op_4c_n7.
-    format!("{kind:?}; native tile range X [{x0},{}) Z [{},{}) (half-open, u8 wrapping); {effect}, mask {:#x}",
-        x1.wrapping_add(1),z0.wrapping_add(1),z1.wrapping_add(2),mask&15)
-}
-
-fn scan_script(bytes:&[u8],pc0:usize)->Scan {
-    let mut scan=Scan::default();
-    if pc0>=bytes.len() {scan.error=Some("Invalid/empty script range".into());return scan;}
-    for decoded in LinearWalker::new(bytes,pc0) {
-        match decoded {
-            Ok(insn)=>{
-                if scan.instructions.len()>=10000 {scan.error=Some("Instruction report limit reached".into());break;}
-                if let Some(target)=insn.extended {scan.targets.push((insn.pc,target));}
-                if let InsnInfo::MenuCtrl{kind:kind @ MenuCtrlKind::Nibble7Tile{..},..}=&insn.info {
-                    scan.wall_writes.push(insn.pc);
-                    scan.wall_operations.push(wall_operation(kind));
-                }
-                scan.instructions.push(format!("+{:#x}: {:?}",insn.pc,insn));
-            }
-            Err((pc,error))=>{scan.error=Some(format!("Decode stopped at +{pc:#x}: {error:?}"));break;}
-        }
-    }
-    scan
-}
 
 pub(super) fn report(scene:&AssembledScene,world:&WorldModel,key:(bool,usize),index:&ProtIndex)->Result<String,String> {
     let source=world.collision.source(world,key).ok_or("Verified native MAP source unavailable for this selection")?;
@@ -87,26 +50,19 @@ pub(super) fn report(scene:&AssembledScene,world:&WorldModel,key:(bool,usize),in
     // script. Always inventory the MAN; a missing bind is not a wall proof.
     let man=native.field_man_payload(index).map_err(|e|e.to_string())?.ok_or("Scene MAN unavailable; wall-writer coverage unresolved")?;
     if source.man_sha256.as_deref()!=Some(&collision_recipes::digest(&man)) {return Err("Source MAN changed".into());}
-    let file=man_section::parse(&man).map_err(|e|e.to_string())?;
+    let inventory=SceneInventory::read(&man)?;
     let target=binding.map(|b|b.record as usize);
-    writeln!(out,"MAN SHA-256 {}; partition counts {:?}",collision_recipes::digest(&man),file.header.partition_counts).unwrap();
-    let mut base=0usize;let mut incomplete=0;let mut incoming=Vec::new();let mut found=false;
-    for (partition,records) in file.partitions.iter().enumerate() {
-        for record in 0..records.len() {
-            let flat=base+record;
-            let Some((start,pc0,len))=legaia_engine_field::man_field_scripts::partition_record_span(&file,&man,partition,record) else {
-                incomplete+=1;continue;
-            };
-            let body=&man[start..start+len];let scan=scan_script(body,pc0);
-            if scan.error.is_some() {incomplete+=1;}
+    writeln!(out,"MAN SHA-256 {}; partition counts {:?}",inventory.man_sha256,inventory.partition_counts).unwrap();
+    let mut incoming=Vec::new();let mut found=false;
+    for item in &inventory.records {
+            let (partition,record,flat,start,pc0,len)=(item.partition,item.record,item.flat,item.start,item.pc0,item.len);
+            let body=&man[start..start+len];let scan=&item.scan;
             for (pc,destination) in &scan.targets {
                 if Some(*destination as usize)==target {incoming.push(format!("P{partition}[{record}] flat {flat} +{pc:#x}"));}
             }
-            for (pc,operation) in scan.wall_writes.iter().zip(&scan.wall_operations) {
+            for writer in &scan.wall_writes {
+                let pc=writer.pc;let operation=writer.description();
                 writeln!(out,"Observed scene wall writer: P{partition}[{record}] flat {flat}, MAN byte {:#x}, record +{pc:#x}: {operation}. Execution conditions unresolved. Writer is not exclusive ownership.",start+pc).unwrap();
-            }
-            if let Some(error)=&scan.error {
-                writeln!(out,"Scene coverage gap: P{partition}[{record}] flat {flat}: {error}").unwrap();
             }
             if Some(flat)==target {
                 found=true;
@@ -116,9 +72,9 @@ pub(super) fn report(scene:&AssembledScene,world:&WorldModel,key:(bool,usize),in
                 if let Some(error)=&scan.error {writeln!(out,"INCOMPLETE: {error}").unwrap();}
                 for instruction in &scan.instructions {writeln!(out,"{instruction}").unwrap();}
             }
-        }
-        base+=records.len();
     }
+    for gap in &inventory.gaps {writeln!(out,"Scene coverage gap: {gap}").unwrap();}
+    let incomplete=inventory.gaps.len();
     if target.is_some() && !found {writeln!(out,"UNRESOLVED: bound MAN record is absent or its header/span cannot be decoded.").unwrap();}
     writeln!(out,"Observed incoming context references: {incoming:?}\nIncomplete record scans: {incomplete}. Scans stop at first decode error without resynchronizing.\nThis is a linear instruction inventory, not a complete control-flow/dependency proof. Dynamic targets, helper calls, global state and resource closure remain unresolved. No MAN relocation is performed.").unwrap();
     Ok(out)
@@ -155,11 +111,11 @@ mod tests {
     fn wall_writer_inventory_keeps_clear_and_set_instruction_boundaries() {
         let scan=scan_script(&[0x4c,0x70,1,2,3,4,0x4c,0x73,1,2,3,4,5,0x21],0);
         assert!(scan.error.is_none());
-        assert_eq!(scan.wall_writes,vec![0,6]);
-        assert!(scan.wall_operations[0].contains("sub: 0"));
-        assert!(scan.wall_operations[1].contains("mask: 5"));
-        assert!(scan.wall_operations[1].contains("X [1,4) Z [3,6)"));
-        let edge=wall_operation(&MenuCtrlKind::Nibble7Tile{sub:3,x0:255,z0:255,x1:255,z1:255,mask:255});
+        assert_eq!(scan.wall_writes.iter().map(|w|w.pc).collect::<Vec<_>>(),vec![0,6]);
+        assert!(scan.wall_writes[0].description().contains("sub: 0"));
+        assert!(scan.wall_writes[1].description().contains("mask: 5"));
+        assert!(scan.wall_writes[1].description().contains("X [1,4) Z [3,6)"));
+        let edge=super::super::native_script_dependencies::WallWrite{pc:0,sub:3,x0:255,z0:255,x1:255,z1:255,mask:255}.description();
         assert!(edge.contains("X [255,0) Z [0,1)"));
         let truncated=scan_script(&[0x4c,0x73,1,2,3,4],0);
         assert!(truncated.error.is_some());assert!(truncated.wall_writes.is_empty());

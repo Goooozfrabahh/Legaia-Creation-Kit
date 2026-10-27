@@ -11,6 +11,8 @@ mod collision_authoring;
 mod collision_generation;
 mod naming;
 mod native_dependency_report;
+mod native_script_dependencies;
+mod native_wall_ownership;
 mod native_asset_plan;
 mod placement_drop;
 mod cell_catalog;
