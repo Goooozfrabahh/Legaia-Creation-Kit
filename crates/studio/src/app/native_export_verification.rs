@@ -4,6 +4,119 @@ use super::*;
 use std::io::Write;
 
 #[test]
+#[ignore = "explicit read-only multi-town native asset dependency inventory"]
+fn multiple_towns_and_categories_share_one_native_dependency_inventory() -> Result<()> {
+    use super::super::native_asset_plan::{self,Category,InstanceId,ResourceKind};
+    let source=PathBuf::from(std::env::var_os("LCK_P0_SOURCE").context("LCK_P0_SOURCE required")?);
+    let lib=crate::library::Library::open(&source)?;
+    let target=legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,"town01").map_err(anyhow::Error::msg)?;
+    let mut world=world_view::build_world(&target,&lib.index);
+    let local=world.draws.iter().find(|d|!d.terrain && world.npc((false,d.index)).is_none()).map(|d|(false,d.index)).context("No local environmental draw")?;
+    world.duplicate_native(local,target.placements.len(),940001,[0.0;3]).map_err(anyhow::Error::msg)?;
+    let npc=world.npcs.iter().find(|n|n.drawable && world.at(false,n.key).is_some()).map(|n|n.key).context("No local actor draw")?;
+    ensure!(world.set_offset(false,npc,[64.0,0.0,0.0]),"Cannot request actor movement");
+    let mut uid=940002;
+    for name in ["izumi","bylon"] {
+        let donor=legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,name).map_err(anyhow::Error::msg)?;
+        for kind in ["placement","terrain","mesh"] {
+            let count=match kind {"placement"=>donor.placements.len(),"terrain"=>donor.terrain.len(),_=>donor.env_tmds.len()};
+            ensure!(count>0,"Representative {name} lacks {kind} category");
+            world.insert_foreign(&donor,kind,0,uid,[4096.0,0.0,4096.0],&lib.index).map_err(anyhow::Error::msg)?;
+            uid+=1;
+        }
+    }
+    let saved=scene_instances::serialize(&target.name,&world);
+    let first=native_asset_plan::collect(&target,&world,&lib.index)?;
+    let second=native_asset_plan::collect(&target,&world,&lib.index)?;
+    ensure!(first==second,"Native dependency inventory is nondeterministic");
+    let categories=first.requests.values().map(|r|r.category).collect::<std::collections::BTreeSet<_>>();
+    ensure!(categories.len()==4 && categories.contains(&Category::Actor),"Category coverage incomplete");
+    for id in 940001..uid {ensure!(first.requests.contains_key(&InstanceId::Created(id)),"Requested instance omitted");}
+    ensure!(first.resources.keys().any(|r|r.kind==ResourceKind::Tim),"Native TIM payload provenance absent");
+    for foreign in &world.foreign {
+        let request=&first.requests[&InstanceId::Created(foreign.uid)];
+        ensure!(request.resources.iter().any(|id|id.kind==ResourceKind::Tmd && first.resources[id].payload.as_deref()==Some(foreign.raw_tmd.as_slice())),"Donor bytes lost");
+    }
+    ensure!(first.validate_routes().is_err(),"Unsupported terrain/raw mesh routes accepted");
+    let mut unsupported=world.clone();unsupported.collision.recipes.clear();unsupported.collision.mesh_recipes.clear();
+    let error=plan_export(&source,&target,&unsupported,&lib.index).err().context("Unsupported categories generated a writable plan")?;
+    let text=format!("{error:#}");ensure!(text.contains("TerrainTile") && text.contains("RawMesh") && text.contains("No requested instance was omitted"),"Incomplete category rejection: {text}");
+    let mut stale=world.clone();stale.foreign[0].raw_tmd[0]^=1;
+    ensure!(native_asset_plan::collect(&target,&stale,&lib.index).is_err(),"Stale native donor bytes accepted");
+    ensure!(scene_instances::serialize(&target.name,&world)==saved,"Inventory changed document");
+    println!("{} requests across town01, izumi, bylon; {} immutable resources; categories {categories:?}; unsupported categories blocked, donor bytes retained, stale provenance rejected",first.requests.len(),first.resources.len());
+    Ok(())
+}
+
+#[test]
+#[ignore = "explicit read-only retail allocation and additive collision contract validation"]
+fn rim_elm_static_copy_additive_contract_stays_blocked() -> Result<()> {
+    let source=PathBuf::from(std::env::var_os("LCK_P0_SOURCE").context("LCK_P0_SOURCE required")?);
+    let lib=crate::library::Library::open(&source)?;
+    let scene=legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,"town01").map_err(anyhow::Error::msg)?;
+    let mut world=world_view::build_world(&scene,&lib.index);
+    let key=world.collision.sources.iter().find(|(_,s)|s.object.descriptor_id==230 && s.object.cell==[94,78])
+        .map(|(k,_)|*k).context("Candidate absent")?;
+    let provenance=world.collision.sources[&key].clone();
+    let map=lib.index.entry_bytes(provenance.object.map_entry)?.as_ref().clone();
+    let lba=lib.index.entry_start_lba_retail(provenance.object.map_entry.try_into()?).context("MAP LBA absent")?;
+    let load=lib.index.prot_dat_raw_bytes(lba as u64*2048,0x14000)?;
+    ensure!(load[..MAP_LEN]==map,"Physical and indexed MAP differ");
+    let bindings=NativeBindings::parse(&load[0x10000..0x12000],&load[0x12000..])?;
+    let p=&scene.placements[key.1];
+    ensure!(p.env_slot==15 && (p.world_x,p.world_y,p.world_z)==(12096,0,10048),"Candidate native geometry/position changed");
+    let report=super::super::native_dependency_report::report(&scene,&world,key,&lib.index).map_err(anyhow::Error::msg)?;
+    ensure!(report.contains("No kind-1 binding"),"Candidate unexpectedly bound");
+    let before=scene_instances::serialize(&scene.name,&world);
+    let copied=world.duplicate_native(key,scene.placements.len(),930001,[64.0,0.0,0.0]).map_err(anyhow::Error::msg)?;
+    let saved=scene_instances::serialize(&scene.name,&world);
+    let draw=world.at(copied.0,copied.1).context("Copy absent")?;
+    ensure!(draw.rotation==[0.0;3] && draw.scale==[1.0;3],"Unexpected transform");
+    // These are isolated in-memory stages, not an alternate export path.
+    // Keep the automatic recipe's MeshDerived provenance; do not fabricate review.
+    let collision=world.compile_authored_collision(&scene.name,provenance.object.map_entry,&map).map_err(anyhow::Error::msg)?;
+    let added_bits: u32=map.iter().zip(&collision).map(|(&a,&b)|(b&!a).count_ones()).sum();
+    let changed_bytes=map.iter().zip(&collision).filter(|(a,b)|a!=b).count();
+    let mut allocated=map.clone();
+    let edits=[InsertEdit{uid:930001,cell:p.cell,source_position:(p.world_x,p.world_z),env_slot:p.env_slot,
+        source_rotation:[p.rot_x,p.rot_y,p.rot_z],delta:[64.0,0.0,0.0],collision_bounds:original_collision_bounds(&world,key.1)}];
+    let inserted=insert_copies_with_bindings(&mut allocated,&map,&edits,&[None;16],&bindings)?;
+    ensure!(inserted.len()==1 && inserted[0].id!=230,"Copy did not allocate independent identity");
+    let copy=&inserted[0];
+    let parsed=field_objects::parse_placements(&allocated);
+    for original in field_objects::parse_placements(&map) {ensure!(parsed.contains(&original),"Original placement changed");}
+    let placed=parsed.iter().find(|p|p.obj_idx as usize==copy.id).context("Allocated copy failed readback")?;
+    ensure!((placed.world_x,placed.world_z)==(12160,10048),"Copy position mismatch");
+    ensure!(placed.pack_index==Some(15) && [placed.rot_x,placed.rot_y,placed.rot_z]==[p.rot_x,p.rot_y,p.rot_z],"Native model/orientation changed");
+    ensure!((placed.world_x-(copy.col as i32*128+64)).abs()<=LCK_SAFE_ANCHOR_REACH &&
+        (placed.world_z-(copy.row as i32*128+64)).abs()<=LCK_SAFE_ANCHOR_REACH,"Distant spawn anchor accepted");
+    ensure!(!bindings.has_trigger((copy.col,copy.row)) && bindings.at((placed.anchor_col,placed.anchor_row)).is_none(),"Copy collides with native binding/trigger");
+    let slot=copy.id*32;let grid=GRID_OFF+(copy.row as usize*128+copy.col as usize)*2;
+    for i in 0..MAP_LEN {
+        if !(slot..slot+32).contains(&i) && !(grid..grid+2).contains(&i) {ensure!(allocated[i]==map[i],"Allocation changed unrelated MAP byte {i:#x}");}
+    }
+    // Compose the isolated stages only in this fixture, then read the native
+    // grid independently. This checks bytes, not playability or actor behavior.
+    allocated[WALL_OFF..GRID_OFF].copy_from_slice(&collision[WALL_OFF..GRID_OFF]);
+    let original=legaia_engine_field::minigame_floor::FloorGrid::new(&map);
+    let output=legaia_engine_field::minigame_floor::FloorGrid::new(&allocated);
+    for z in 0..128 {for x in 0..128 {
+        ensure!(original.height_index(x,z)==output.height_index(x,z),"Floor tier changed");
+        ensure!(output.wall_nibble(x,z)&original.wall_nibble(x,z)==original.wall_nibble(x,z),"Native wall removed");
+    }}
+    ensure!(allocated[0x10000..]==map[0x10000..],"Native scene bindings changed");
+    ensure!(allocated[230*32..231*32]==map[230*32..231*32],"Original descriptor changed");
+    let generated=super::super::collision_recipes::generated_for(&world,copied).context("Generated recipe absent")?;
+    println!("Candidate: original (12096,0,10048), copy (12160,0,10048), mesh 15; descriptor {}, spawn cell ({},{}), collider {:?}; {} changed wall bytes / {} added bits; {:?} floor/steep/filtered faces, heuristic band {}. No runtime contract or IMG.",copy.id,copy.col,copy.row,copy.collider,changed_bytes,added_bits,generated.surface_counts(),generated.band_height);
+    let error=plan_export(&source,&scene,&world,&lib.index).err().context("Unreviewed collision unexpectedly authorized")?;
+    let diagnostic=format!("{error:#}");
+    ensure!(diagnostic.contains("Copy collision intent: additive") && diagnostic.contains("Floor candidates are not compiled as walkable surfaces") && diagnostic.contains("native IMG export is not enabled"),"Missing precise contract rejection: {diagnostic}");
+    ensure!(scene_instances::serialize(&scene.name,&world)==saved,"Read-only validation changed document");
+    world.clear_created();ensure!(scene_instances::serialize(&scene.name,&world)==before,"Original state changed");
+    Ok(())
+}
+
+#[test]
 #[ignore = "explicit read-only retail naming identity and persistence validation"]
 fn rim_elm_names_use_native_identity_and_verified_visual_aliases() -> Result<()> {
     let source=PathBuf::from(std::env::var_os("LCK_P0_SOURCE").context("LCK_P0_SOURCE required")?);

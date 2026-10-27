@@ -1244,6 +1244,7 @@ fn map_patches_with_bindings(original:&[u8],edits:&ExportEdits,bindings:&NativeB
 /// Keeping the compiled bytes makes preflight and execution use exactly the
 /// same allocations and compressed payloads, without a second interpretation.
 pub(super) struct NativeExportPlan {
+    dependencies:super::native_asset_plan::NativeAssetPlan,
     source:PathBuf,
     image:Vec<u8>,
     patched:Vec<String>,
@@ -1253,6 +1254,7 @@ pub(super) struct NativeExportPlan {
 impl NativeExportPlan {
     pub(super) fn summary(&self)->String {
         let mut summary=self.patched.join("; ");
+        if !self.dependencies.requests.is_empty() {summary.push_str("\n");summary.push_str(&self.dependencies.summary());}
         if !self.skipped.is_empty() {
             summary.push_str(". Limitations: ");
             summary.push_str(&self.skipped.join("; "));
@@ -1272,8 +1274,12 @@ fn validate_source_archive(disc:&DiscPatcher,index:&ProtIndex)->Result<()> {
 
 pub(super) fn plan_export(source:&Path, scene:&AssembledScene, world:&WorldModel,
     index:&ProtIndex) -> Result<NativeExportPlan> {
+    let dependencies=super::native_asset_plan::collect(scene,world,index);
+    let inventory=match &dependencies {Ok(plan)=>plan.summary(),Err(error)=>format!("Native asset inventory unresolved: {error:#}")};
     ensure!(world.collision.recipes.is_empty() && world.collision.mesh_recipes.is_empty(),"Authored collision recipes are in-memory only; native IMG export is not enabled for these edits. No collision intent was discarded.\n{}",
-        super::collision_recipes::export_diagnostics(scene,world,index));
+        format!("{}\n{}",inventory,super::collision_recipes::export_diagnostics(scene,world,index)));
+    let dependencies=dependencies.context("Build native asset dependency inventory")?;
+    dependencies.validate_routes().with_context(||inventory.clone())?;
     let source=source.canonicalize().context("Cannot find opened disc image")?;
     ensure!(source.is_file(),"Open a raw 2352-byte .img/.bin source");
     let image=std::fs::read(&source).context("Read source for native export preflight")?;
@@ -1286,11 +1292,13 @@ pub(super) fn plan_export(source:&Path, scene:&AssembledScene, world:&WorldModel
     validate_source_archive(&disc,index)?;
     let original=Scene::load(index,&scene.name)?;
     let map_entry=original.field_map_index(index).context("Selected scene has no native MAP")? as usize;
-    let mut edits=prepare_cross_cell(scene,world,index)?;
+    let mut edits=prepare_cross_cell(scene,world,index).with_context(||inventory.clone())?;
     edits.moves.sort_by_key(|e|e.cell);
     edits.copies.sort_by_key(|e|e.uid);
     edits.npcs.sort_by_key(|e|(e.uid,e.record));
-    compile_plan(source,disc,image_length,map_entry,&edits)
+    let mut plan=compile_plan(source,disc,image_length,map_entry,&edits).with_context(||inventory)?;
+    plan.dependencies=dependencies;
+    Ok(plan)
 }
 
 fn compile_plan(source:PathBuf, mut disc:DiscPatcher, image_length:usize,
@@ -1392,7 +1400,7 @@ fn compile_plan(source:PathBuf, mut disc:DiscPatcher, image_length:usize,
     }
     let written=disc.into_image();
     ensure!(written.len()==image_length,"Native patch unexpectedly changed total image size");
-    Ok(NativeExportPlan {source,image:written,patched:names,skipped})
+    Ok(NativeExportPlan {dependencies:Default::default(),source,image:written,patched:names,skipped})
 }
 
 /// Write only bytes already compiled and verified by native preflight.

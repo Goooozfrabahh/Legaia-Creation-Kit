@@ -287,10 +287,21 @@ pub(super) fn export_diagnostics(scene:&legaia_engine_scene::scene_assembly::Ass
         let id=&assignment.recipe.source.object;
         writeln!(text,"Owner {:?}: {} / MAP {} / descriptor {} cell {:?}; {} explicit blocks, {} open requirements, generated mesh {}",
             assignment.owner,id.scene,id.map_entry,id.descriptor_id,id.cell,assignment.recipe.walls.len(),assignment.recipe.nonblocking.len(),assignment.recipe.generated.is_some()).unwrap();
+        if let Some(draw)=world.draws.iter().find(|d|world.collision.owner(world,(d.terrain,d.index)).as_ref()==Some(&assignment.owner)) {
+            if draw.editor_uid.is_some() {
+                writeln!(text,"Copy collision intent: additive contribution only; original native walls remain protected. Unknown original wall ownership does not authorize copying those bits. Runtime actor collider, walkable surfaces and script-writer coverage still require independent acceptance.").unwrap();
+            } else if draw.offset!=[0.0;3] || draw.rotation!=[0.0;3] || draw.scale!=[1.0;3] || draw.hidden {
+                writeln!(text,"Original collision removal UNRESOLVED: an additive recipe cannot remove the retail footprint when an original moves, changes transform or is hidden. Exclusive/shared native wall ownership is required; leaving ghost collision is not preservation.").unwrap();
+            }
+        }
+        if let Some(generated)=&assignment.recipe.generated {
+            let (floors,steep,filtered)=generated.surface_counts();
+            writeln!(text,"Mesh review candidates: {floors} floor, {steep} steep, {filtered} filtered faces; vertical review band {} PS1 units is heuristic, not verified actor height. Floor candidates are not compiled as walkable surfaces.",generated.band_height).unwrap();
+        }
         if sources.insert(id.clone()) {
             let compiled=index.entry_bytes(id.map_entry).map_err(|e|e.to_string()).and_then(|map|world.compile_authored_collision(&id.scene,id.map_entry,&map)
-                .map(|out|map.iter().zip(&out).filter(|(a,b)|a!=b).count()));
-            match compiled {Ok(bytes)=>{writeln!(text,"Additive wall planner/readback passed: {bytes} changed bytes; baseline walls and floor data retained.").unwrap();},
+                .map(|out|(map.iter().zip(&out).filter(|(a,b)|a!=b).count(),map.iter().zip(&out).map(|(&a,&b)|(b&!a).count_ones()).sum::<u32>())));
+            match compiled {Ok((bytes,bits))=>{writeln!(text,"Additive wall planner/readback passed: {bytes} changed bytes, {bits} added wall bits; baseline walls and floor data retained. This is byte serialization evidence, not collision/surface acceptance.").unwrap();},
                 Err(error)=>{writeln!(text,"Collision compilation BLOCKED: {error}").unwrap();}}
             if let Some(draw)=world.draws.iter().find(|d|world.collision.owner(world,(d.terrain,d.index)).as_ref()==Some(&assignment.owner)) {
                 match super::native_dependency_report::report(scene,world,(draw.terrain,draw.index),index) {
@@ -568,6 +579,24 @@ pub(super) fn fixture()->(Vec<u8>,Assignment) {
 mod tests {
     use super::*;
     fn contribution(a:&Assignment,offset:[f32;3])->Contribution<'_>{Contribution{assignment:a,offset,rotation:[0.0;3],scale:[1.0;3]}}
+    #[test]
+    fn preflight_distinguishes_copy_additions_from_original_removal() {
+        let mut world=properties_fixture();
+        let (scene,_)=super::super::ps1_export::tests::actor_fixture();
+        let index=legaia_engine_scene::scene::ProtIndex::from_bytes(legaia_disc_patch::disc::synth::synth_prot(&[]),None).unwrap();
+        let copied=export_diagnostics(&scene,&world,&index);
+        assert!(copied.contains("Copy collision intent: additive"));
+        assert!(copied.contains("Floor candidates are not compiled as walkable surfaces"));
+        assert!(!copied.contains("Original collision removal UNRESOLVED"));
+        let recipe=world.collision.recipes[0].recipe.clone();
+        world.set_collision_recipe((false,0),recipe).unwrap();
+        assert!(world.set_offset(false,0,[64.0,0.0,0.0]));
+        let before=super::super::scene_instances::serialize("test",&world);
+        let moved=export_diagnostics(&scene,&world,&index);
+        assert!(moved.contains("Original collision removal UNRESOLVED"));
+        assert!(moved.contains("Copy collision intent: additive"));
+        assert_eq!(super::super::scene_instances::serialize("test",&world),before);
+    }
     #[test]
     fn regeneration_preserves_manual_data_unless_replacement_is_explicit() {
         let mut world=properties_fixture();let key=(false,1);
