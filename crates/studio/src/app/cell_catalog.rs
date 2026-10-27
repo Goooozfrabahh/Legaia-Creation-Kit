@@ -17,12 +17,13 @@ pub(super) struct CellCopy {
     pub name: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(super) struct CellStore {
     pub dir: Option<PathBuf>,
     pub names: BTreeMap<String, String>,
     pub copies: BTreeMap<u64, CellCopy>,
     pub next_id: u64,
+    snapshot:Option<String>,
 }
 
 fn hex(s: &str) -> String {
@@ -44,6 +45,10 @@ fn valid_label(s: &str) -> Result<String, String> {
     }
     Ok(trimmed.to_owned())
 }
+pub(super) fn duplicate_label(base:&str)->String {
+    let mut base=base.to_owned();
+    loop {let label=format!("{base} Copy");if valid_label(&label).is_ok(){return label;}if base.pop().is_none(){return "Cell Copy".into();}}
+}
 fn hash_source(path: &Path) -> String {
     // Stable FNV-1a rather than Rust's version-dependent DefaultHasher.
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -61,34 +66,21 @@ fn project_dir(source: &Path) -> Result<PathBuf, String> {
     Ok(root.join("LegaiaStudio").join("CellProjects").join(hash_source(source)))
 }
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let parent = path.parent().ok_or("Invalid cell storage directory")?;
-    std::fs::create_dir_all(parent).map_err(|e| format!("Create {}: {e}", parent.display()))?;
-    let tmp = path.with_extension("saving");
-    std::fs::write(&tmp, bytes).map_err(|e| format!("Write {}: {e}", tmp.display()))?;
-    // On Windows rename-over-existing can fail. Keep the old file safe on a
-    // failed replacement, and never touch the original PlayStation resources.
-    if path.exists() {
-        let backup = path.with_extension("previous");
-        if backup.exists() { std::fs::remove_file(&backup).map_err(|e|e.to_string())?; }
-        std::fs::rename(path, &backup).map_err(|e| format!("Backup {}: {e}", path.display()))?;
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            let _ = std::fs::rename(&backup, path);
-            return Err(format!("Save {}: {e}", path.display()));
-        }
-        let _ = std::fs::remove_file(&backup);
-    } else {
-        std::fs::rename(&tmp, path).map_err(|e| format!("Save {}: {e}", path.display()))?;
-    }
-    Ok(())
+    let old=match std::fs::read(path) {Ok(bytes)=>Some(bytes),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>None,Err(e)=>return Err(e.to_string())};
+    crate::asset_catalog::atomic_write(path,bytes,old.as_deref())
 }
 impl CellStore {
     pub fn open(source: Option<&Path>) -> Result<Self, String> {
         let Some(source) = source else { return Ok(Self::default()); };
         let dir = project_dir(source)?;
+        Self::open_dir(dir)
+    }
+    fn open_dir(dir:PathBuf)->Result<Self,String> {
         let file = dir.join("cells.lckcatalog");
         let mut store = Self { dir: Some(dir), next_id: 1, ..Default::default() };
         if !file.exists() { return Ok(store); }
         let input = std::fs::read_to_string(&file).map_err(|e| format!("Read {}: {e}",file.display()))?;
+        store.snapshot=Some(input.clone());
         if input.len() > 1_000_000 { return Err("Cell catalog is too large".into()); }
         if input.lines().next() != Some("LCK_CELLS_V1") {
             return Err("Unsupported LCK cell catalog version (not overwritten)".into());
@@ -137,18 +129,20 @@ impl CellStore {
         }
         text
     }
-    fn save(&self) -> Result<(),String> {
+    fn save(&mut self) -> Result<(),String> {
         let Some(dir)=self.dir.as_ref() else {return Err("Open a disc image before creating project cells".into());};
-        atomic_write(&dir.join("cells.lckcatalog"),self.manifest().as_bytes())
+        let manifest=self.manifest();
+        crate::asset_catalog::atomic_write(&dir.join("cells.lckcatalog"),manifest.as_bytes(),self.snapshot.as_deref().map(str::as_bytes))?;
+        self.snapshot=Some(manifest);Ok(())
     }
     pub fn rename(&mut self, selected:&CellSelection, value:&str) -> Result<(),String> {
-        let value=valid_label(value)?;
-        let mut draft=Self { dir:self.dir.clone(), names:self.names.clone(), copies:self.copies.clone(), next_id:self.next_id };
+        let value=crate::asset_catalog::display_name(value)?;
+        let mut draft=self.clone();
         match selected {
-            CellSelection::Original(source)=>{draft.names.insert(source.clone(),value);}
+            CellSelection::Original(source)=>{if let Some(value)=value {draft.names.insert(source.clone(),value);}else{draft.names.remove(source);}}
             CellSelection::Copy(id)=>{
                 let entry=draft.copies.get_mut(id).ok_or("Missing cell copy")?;
-                entry.name=value;
+                entry.name=value.unwrap_or_else(||format!("{} Copy #{}",crate::place_name(&entry.source).unwrap_or(&entry.source),entry.id));
             }
         }
         draft.save()?;
@@ -184,9 +178,14 @@ impl CellStore {
         let id=self.next_id.max(1);
         let next=id.checked_add(1).ok_or("Maximum number of cell copies reached")?;
         if self.copies.contains_key(&id) {return Err("Cell ID collision".into());}
-        let mut draft=Self { dir:self.dir.clone(), names:self.names.clone(), copies:self.copies.clone(), next_id:next };
+        let mut draft=self.clone();draft.next_id=next;
         draft.copies.insert(id,CellCopy{id,source,name});
-        draft.write_overlay(id,overlay)?;
+        if overlay.len()>2_000_000 || !overlay.starts_with(&format!("LCK_SCENE_V1\t{}\n",draft.copies[&id].source)) {
+            return Err("Overlay is oversized or does not match the source cell".into());
+        }
+        // A stale session must never replace another session's copy at the
+        // same ID before the manifest conflict is detected.
+        crate::asset_catalog::atomic_write(&draft.overlay_path(id)?,overlay.as_bytes(),None)?;
         if let Err(error)=draft.save() {
             let _=std::fs::remove_file(draft.overlay_path(id)?);
             return Err(error);
@@ -200,11 +199,43 @@ impl CellStore {
 mod tests {
     use super::*;
     #[test]
+    fn cell_names_restart_defaults_and_stale_sessions_preserve_source() {
+        let dir=tempfile::tempdir().unwrap();let mut store=CellStore::open_dir(dir.path().to_owned()).unwrap();
+        let original=CellSelection::Original("town01".into());
+        store.rename(&original,"Rim Elm - Workshop").unwrap();
+        let id=store.duplicate("town01".into(),"Independent cell".into(),"LCK_SCENE_V1\ttown01\n").unwrap();
+        store.rename(&CellSelection::Copy(id),"Rim Elm - Interior 🏡").unwrap();
+        let mut restarted=CellStore::open_dir(dir.path().to_owned()).unwrap();
+        assert_eq!(restarted.label(&original).as_deref(),Some("Rim Elm - Workshop"));
+        assert_eq!(restarted.source(&CellSelection::Copy(id)),Some("town01"));
+        assert_eq!(restarted.label(&CellSelection::Copy(id)).as_deref(),Some("Rim Elm - Interior 🏡"));
+        let mut stale=CellStore::open_dir(dir.path().to_owned()).unwrap();
+        restarted.rename(&original,"Latest name").unwrap();
+        assert!(stale.rename(&original,"Stale name").is_err());
+        assert_eq!(stale.label(&original).as_deref(),Some("Rim Elm - Workshop"));
+        restarted.rename(&original,"").unwrap();restarted.rename(&CellSelection::Copy(id),"").unwrap();
+        let fresh=CellStore::open_dir(dir.path().to_owned()).unwrap();
+        assert_eq!(fresh.label(&original),CellStore::default().label(&original));
+        assert!(fresh.label(&CellSelection::Copy(id)).unwrap().contains(&format!("#{id}")));
+        assert_eq!(fresh.read_overlay(id).unwrap(),"LCK_SCENE_V1\ttown01\n");
+    }
+    #[test]
+    fn stale_copy_allocation_never_overwrites_an_existing_overlay() {
+        let dir=tempfile::tempdir().unwrap();let mut first=CellStore::open_dir(dir.path().to_owned()).unwrap();
+        let mut stale=CellStore::open_dir(dir.path().to_owned()).unwrap();
+        let overlay="LCK_SCENE_V1\ttown01\n# preserved\n";
+        let id=first.duplicate("town01".into(),"First".into(),overlay).unwrap();
+        assert!(stale.duplicate("town01".into(),"Second".into(),"LCK_SCENE_V1\ttown01\n").is_err());
+        assert_eq!(first.read_overlay(id).unwrap(),overlay);
+    }
+    #[test]
     fn names_preserve_unicode() {
         let n="Rim Elm — House";
         assert_eq!(unhex(&hex(n)).unwrap(),n);
         assert!(valid_label("  ").is_err());
         assert!(valid_label("New\nCell").is_err());
+        assert!(valid_label(&duplicate_label(&"A".repeat(80))).is_ok());
+        assert!(valid_label(&duplicate_label(&"🏡".repeat(64))).is_ok());
     }
     #[test]
     fn stable_disc_fingerprint() {

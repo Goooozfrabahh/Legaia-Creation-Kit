@@ -1447,7 +1447,7 @@ pub(super) mod tests {
         let world=WorldModel {model:None, instances:1, unavailable:0, unique_models:0,
             ground_triangles:0, ground_vram_covered:0, ground_textured:0,
             draws:vec![draw], npcs:vec![npc], npc_issue:None, foreign:vec![],
-            collision:Default::default(),foreign_vram:Default::default()};
+            naming:Default::default(),collision:Default::default(),foreign_vram:Default::default()};
         (scene,world)
     }
 

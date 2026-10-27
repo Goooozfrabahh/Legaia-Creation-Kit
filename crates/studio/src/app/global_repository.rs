@@ -15,13 +15,20 @@ pub(super) struct Asset {
     pub source_label:String,
     pub label:String,
     pub key:String,
+    pub alias_key:Option<String>,
     pub kind:Kind,
     /// Hash of original exact PS1 TMD bytes, not a guessed semantic name.
     /// Any missing or malformed geometry is never offered as placeable.
     pub mesh_fingerprint:Option<u64>,
 }
 impl Asset {
-    pub fn name_key(&self)->String {self.key.clone()}
+    pub fn name_key(&self)->String {self.alias_key.clone().unwrap_or_else(||self.key.clone())}
+    pub fn display_name(&self,names:&Catalog)->String {
+        names.get(&self.name_key()).or_else(||names.get(&self.key)).cloned().unwrap_or_else(||self.label.clone())
+    }
+    pub fn name_record(&self,names:&Catalog)->crate::asset_catalog::Record {
+        names.records.get(&self.name_key()).or_else(||names.records.get(&self.key)).cloned().unwrap_or_default()
+    }
     /// Structural categories reflect PS1 source formats, NOT invented identities.
     pub fn group(&self)->usize {
         match self.kind {Kind::Placement(_)=>0,Kind::Terrain(_)=>1,
@@ -37,7 +44,7 @@ impl Asset {
         self.source_label.to_lowercase().contains(term) ||
         self.key.to_lowercase().contains(term) ||
         names.get(&self.key).is_some_and(|s|s.to_lowercase().contains(term)) ||
-        names.search_text(&self.key).to_lowercase().contains(term)
+        names.search_text(&self.key).to_lowercase().contains(term) || names.search_text(&self.name_key()).to_lowercase().contains(term)
     }
 }
 #[derive(Debug)]
@@ -55,6 +62,7 @@ fn mesh_hash(scene:&AssembledScene,index:usize)->Option<u64> {
 fn catalog_one(index:&ProtIndex,name:&str)->Result<Vec<Asset>,String> {
     let scene=legaia_engine_world_views::scene_staging::assemble_field_scene(index,name)?;
     let display_source=crate::place_name(name).unwrap_or(name).to_owned();
+    let visual_keys=super::naming::visual_keys(&scene);
     let mut found=Vec::with_capacity(scene.placements.len()+scene.terrain.len()+scene.env_tmds.len());
     for (i,d) in scene.placements.iter().enumerate() {
         found.push(Asset {
@@ -62,7 +70,7 @@ fn catalog_one(index:&ProtIndex,name:&str)->Result<Vec<Asset>,String> {
                 d.env_slot,d.world_x,d.world_y,d.world_z),
             key:format!("cell:{name}|placed:{i}|mesh:{}|anchor:{},{}|pos:{},{},{}",
                 d.env_slot,d.anchor.0,d.anchor.1,d.world_x,d.world_y,d.world_z),
-            kind:Kind::Placement(i),mesh_fingerprint:mesh_hash(&scene,d.res_tmd),
+            alias_key:visual_keys.get(d.res_tmd).cloned().flatten(),kind:Kind::Placement(i),mesh_fingerprint:mesh_hash(&scene,d.res_tmd),
         });
     }
     for (i,d) in scene.terrain.iter().enumerate() {
@@ -70,14 +78,14 @@ fn catalog_one(index:&ProtIndex,name:&str)->Result<Vec<Asset>,String> {
             source:name.to_string(),source_label:display_source.clone(),label:format!("Terrain / decoration #{i:03} [TMD {}]",d.env_slot),
             key:format!("cell:{name}|terrain:{i}|mesh:{}|anchor:{},{}|pos:{},{},{}",
                 d.env_slot,d.anchor.0,d.anchor.1,d.world_x,d.world_y,d.world_z),
-            kind:Kind::Terrain(i),mesh_fingerprint:mesh_hash(&scene,d.res_tmd),
+            alias_key:visual_keys.get(d.res_tmd).cloned().flatten(),kind:Kind::Terrain(i),mesh_fingerprint:mesh_hash(&scene,d.res_tmd),
         });
     }
     for (slot,&res_tmd) in scene.env_tmds.iter().enumerate() {
         found.push(Asset {
             source:name.to_string(),source_label:display_source.clone(),label:format!("Reusable original TMD #{slot:03} / resource {res_tmd}"),
             key:format!("cell:{name}|mesh:{slot}|resource:{res_tmd}"),
-            kind:Kind::Mesh(slot),mesh_fingerprint:mesh_hash(&scene,res_tmd),
+            alias_key:visual_keys.get(res_tmd).cloned().flatten(),kind:Kind::Mesh(slot),mesh_fingerprint:mesh_hash(&scene,res_tmd),
         });
     }
     // Index original scene actors (including conditionally hidden ones) but
@@ -90,7 +98,7 @@ fn catalog_one(index:&ProtIndex,name:&str)->Result<Vec<Asset>,String> {
                 npc.record,npc.model_index,npc.anim_id,
                 if npc.conditional {" [conditional]"} else {""}),
             key:format!("cell:{name}|npc:man:{}",npc.record),
-            kind:Kind::Npc(npc.record),mesh_fingerprint:None,
+            alias_key:world.naming.assets.get(&(false,npc.key)).cloned(),kind:Kind::Npc(npc.record),mesh_fingerprint:None,
         });
     }
     Ok(found)
@@ -139,7 +147,7 @@ mod tests {
     fn foreign_geometry_fingerprint_never_substitutes_a_local_source() {
         let mut asset=Asset { source:"donor".into(), source_label:"donor".into(),
             label:"object".into(), key:"cell:donor|placed:0".into(),
-            kind:Kind::Placement(0), mesh_fingerprint:fingerprint(&[1,2,3]) };
+            alias_key:None,kind:Kind::Placement(0), mesh_fingerprint:fingerprint(&[1,2,3]) };
         // Geometry equality cannot prove equality of the external TIM/CLUT,
         // native placement record or collision resource. Every foreign kind
         // must use the donor-aware path even with a valid matching fingerprint.
@@ -161,7 +169,7 @@ mod tests {
     #[test]
     fn labels_distinguish_provenance(){
         let a=Asset{source:"town01".into(),source_label:"Rim Elm".into(),label:"Unidentified world object #004".into(),
-            key:"cell:town01|placed:4".into(),kind:Kind::Placement(4),mesh_fingerprint:Some(5)};
+            key:"cell:town01|placed:4".into(),alias_key:None,kind:Kind::Placement(4),mesh_fingerprint:Some(5)};
         assert_eq!(a.kind_label(),"MAP object");
         assert_ne!(a.source,"road01");
         assert_eq!(a.group(),0);

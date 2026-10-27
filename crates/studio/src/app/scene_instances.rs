@@ -42,13 +42,7 @@ pub(super) struct SceneDocument {
 }
 
 pub(super) fn valid_name(name: &str) -> Result<Option<String>, String> {
-    let value = name.trim();
-    if value.is_empty() { return Ok(None); }
-    if value.chars().count() > 80 || value.len() > 256 ||
-        value.chars().any(char::is_control) {
-        return Err("Name must contain 1-80 printable characters (at most 256 UTF-8 bytes)".into());
-    }
-    Ok(Some(value.into()))
+    crate::asset_catalog::display_name(name)
 }
 
 fn hex_name(name: &str) -> String {
@@ -75,6 +69,13 @@ fn native_key(kind: &str, index: &str, world: &WorldModel) -> Result<(bool,usize
 }
 
 fn kind(terrain: bool) -> &'static str { if terrain { "terrain" } else { "placement" } }
+
+pub(super) fn save(path:&std::path::Path,scene:&str,world:&WorldModel)->Result<(),String> {
+    if !path.extension().is_some_and(|e|e.to_string_lossy().eq_ignore_ascii_case("lckscene")) {return Err("Scene metadata must use the .lckscene extension".into());}
+    let text=serialize(scene,world);if text.len()>2_000_000 {return Err("Scene file exceeds safety limit".into());}
+    let old=match std::fs::read(path) {Ok(bytes)=>Some(bytes),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>None,Err(e)=>return Err(e.to_string())};
+    crate::asset_catalog::atomic_write(path,text.as_bytes(),old.as_deref())
+}
 
 /// Version 1 remains backward compatible with old MOVE/INSTANCE overlays.
 /// Names and hidden originals are editor-only metadata, never PS1 writes.
@@ -121,7 +122,9 @@ pub(super) fn serialize(scene_name: &str, world: &WorldModel) -> String {
                     kind(d.terrain), d.index, d.offset[0], d.offset[1], d.offset[2]));
             }
             if let Some(name) = &d.display_name {
-                out.push_str(&format!("NAME\t{}\t{}\t{}\n", kind(d.terrain),d.index,hex_name(name)));
+                if let Some(identity)=world.naming.native.get(&(d.terrain,d.index)) {
+                    out.push_str(&format!("NATIVE_NAME\t{identity}\t{}\n",hex_name(name)));
+                } else {out.push_str(&format!("NAME\t{}\t{}\t{}\n", kind(d.terrain),d.index,hex_name(name)));}
             }
             if d.rotation != [0.0;3] {
                 out.push_str(&format!("ROTATE\t{}\t{}\t{}\t{}\t{}\n",
@@ -174,11 +177,21 @@ pub(super) fn parse(text: &str, scene_name: &str, world: &WorldModel) -> Result<
     let mut seen_anims = HashSet::new();
     let mut seen_models = HashSet::new();
     let mut seen_collision=std::collections::BTreeSet::new();
+    let mut stable_names=std::collections::HashMap::new();
+    for (key,id) in &world.naming.native {stable_names.entry(id.as_str()).and_modify(|value|*value=None).or_insert(Some(*key));}
     for (line_index, line) in lines.enumerate() {
         if line.trim().is_empty() { continue; }
         let items: Vec<_> = line.split('\t').collect();
         let at = line_index + 2;
         match items.first().copied() {
+            Some("NATIVE_NAME")=>{
+                if items.len()!=3 {return Err(format!("Incorrect NATIVE_NAME fields at line {at}"));}
+                let (terrain,index)=stable_names.get(items[1]).copied().flatten().ok_or_else(||format!("Native name identity missing or ambiguous at line {at}"))?;
+                if world.at(terrain,index).is_none_or(|d|d.editor_uid.is_some()) {return Err("Native name target is not original".into());}
+                let target=NameTarget::Native(terrain,index);
+                if !seen_names.insert(target.clone()) {return Err("Duplicate native name".into());}
+                doc.names.push((target,decode_name(items[2])?));
+            }
             Some("MESH_COLLISION")=>{
                 if items.len()!=2 {return Err(format!("Incorrect MESH_COLLISION fields at line {at}"));}
                 let recipe:super::collision_generation::MeshOnlyRecipe=serde_json::from_str(items[1]).map_err(|e|e.to_string())?;
@@ -569,12 +582,62 @@ fn apply_staged(doc:&SceneDocument, world:&mut WorldModel, native_placements:usi
 mod tests {
     use super::*;
     use super::super::world_view::{DrawInfo, WorldModel};
+    #[test]
+    fn failed_atomic_scene_save_preserves_previous_names() {
+        let dir=tempfile::tempdir().unwrap();let path=dir.path().join("names.lckscene");let mut world=test_world();
+        world.set_display_name((false,0),Some("Saved name".into()));save(&path,"test",&world).unwrap();
+        let before=std::fs::read(&path).unwrap();world.set_display_name((false,0),Some("New name".into()));
+        std::fs::create_dir(dir.path().join("names.lckscene.pending")).unwrap();
+        assert!(save(&path,"test",&world).is_err());assert_eq!(std::fs::read(&path).unwrap(),before);
+        assert!(save(&dir.path().join("original.img"),"test",&world).is_err());
+    }
+    #[test]
+    fn native_names_resolve_stable_identity_after_adapter_reordering() {
+        let mut world=test_world();world.naming.native.insert((false,0),"map-instance-v1:test:verified-map:placement:4:8:230".into());
+        world.set_display_name((false,0),Some("Workshop lantern".into()));
+        let saved=serialize("test",&world);assert!(saved.contains("NATIVE_NAME\tmap-instance-v1:"));
+        let id=world.naming.native.remove(&(false,0)).unwrap();world.naming.native.insert((false,42),id);world.draws[0].index=42;
+        let doc=parse(&saved,"test",&world).unwrap();assert_eq!(doc.names[0].0,NameTarget::Native(false,42));
+        let index=legaia_engine_scene::scene::ProtIndex::from_bytes(legaia_disc_patch::disc::synth::synth_prot(&[]),None).unwrap();
+        apply(&doc,&mut world,43,&index).unwrap();assert_eq!(serialize("test",&world),saved);
+        world.naming.native.insert((false,42),"different-native-source".into());assert!(parse(&saved,"test",&world).is_err());
+    }
+    #[test]
+    fn originals_terrain_and_npcs_keep_independent_native_names() {
+        let mut world=test_world();
+        for (terrain,key,id,name) in [(false,0,"placement","Lantern"),(true,4,"terrain","Path"),(false,super::super::world_view::NPC_KEY_BASE+1,"man-record","Villager")] {
+            if key!=0 {let mut draw=world.draws[0].clone();draw.terrain=terrain;draw.index=key;world.draws.push(draw);}
+            world.naming.native.insert((terrain,key),format!("native-test:{id}"));world.set_display_name((terrain,key),Some(name.into()));
+        }
+        let saved=serialize("test",&world);let doc=parse(&saved,"test",&world).unwrap();assert_eq!(doc.names.len(),3);
+        assert!(doc.names.iter().any(|(t,n)|*t==NameTarget::Native(true,4)&&n=="Path"));
+        assert!(doc.names.iter().any(|(t,n)|*t==NameTarget::Native(false,super::super::world_view::NPC_KEY_BASE+1)&&n=="Villager"));
+    }
+    #[test]
+    fn duplicate_names_stay_independent_through_scene_history_and_reload() {
+        let mut world=super::super::collision_recipes::properties_fixture();
+        world.naming.native.insert((false,0),"native-test:original".into());
+        world.set_display_name((false,0),Some("Original lantern".into()));
+        let copied=world.duplicate_native((false,0),1,91,[128.0,0.0,0.0]).unwrap();
+        assert_eq!(world.at(copied.0,copied.1).unwrap().display_name.as_deref(),Some("Original lantern"));
+        world.set_display_name(copied,Some("Independent lantern".into()));
+        let before=super::super::editor_history_capture(&world,"test",Some(copied));
+        world.set_display_name(copied,Some("Renamed lantern".into()));let after=serialize("test",&world);
+        let index=legaia_engine_scene::scene::ProtIndex::from_bytes(legaia_disc_patch::disc::synth::synth_prot(&[]),None).unwrap();
+        let undo=parse(&before.overlay,"test",&world).unwrap();apply(&undo,&mut world,1,&index).unwrap();
+        assert_eq!(world.draws.iter().find(|d|d.editor_uid==Some(91)).unwrap().display_name.as_deref(),Some("Independent lantern"));
+        assert_eq!(world.at(false,0).unwrap().display_name.as_deref(),Some("Original lantern"));
+        let redo=parse(&after,"test",&world).unwrap();apply(&redo,&mut world,1,&index).unwrap();assert_eq!(serialize("test",&world),after);
+        // Existing legacy native NAME rows remain accepted.
+        let legacy="LCK_SCENE_V1\ttest\nNAME\tplacement\t0\t4c6567616379\n";
+        let doc=parse(legacy,"test",&world).unwrap();apply(&doc,&mut world,1,&index).unwrap();assert_eq!(world.at(false,0).unwrap().display_name.as_deref(),Some("Legacy"));
+    }
 
     fn test_world() -> WorldModel {
         WorldModel {
             model: None, instances: 1, unavailable: 0, unique_models: 1,
             ground_triangles: 0, ground_vram_covered: 0, ground_textured: 0,
-            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),collision:Default::default(),foreign_vram:std::collections::HashMap::new(),
+            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),naming:Default::default(),collision:Default::default(),foreign_vram:std::collections::HashMap::new(),
             draws: vec![DrawInfo {
                 id: 0, terrain: false, index: 0, center:[0.0;3], radius: 1.0,
                 original_center:[0.0;3], offset:[0.0;3], rotation:[0.0;3],scale:[1.0;3], vertex_start:0,vertex_end:3,

@@ -18,6 +18,7 @@ pub(super) const NPC_KEY_BASE: usize = 1_000_000_000;
 
 #[derive(Clone)]
 pub(super) struct WorldModel {
+    pub naming:super::naming::Inventory,
     pub collision: super::collision_recipes::CollisionState,
     pub model: Option<Model>,
     pub instances: usize,
@@ -206,6 +207,7 @@ impl WorldModel {
         let source_end = source.vertex_end;
         let source_center = source.original_center;
         let source_radius = source.radius;
+        let source_name=source.display_name.clone();
         // MAN actors and MAP environmental objects MUST NOT share editor-key
         // namespaces. The old allocator always returned an environment index;
         // clones retained NPC pixels but WorldModel::npc() could not see their
@@ -250,7 +252,7 @@ impl WorldModel {
             radius: source_radius, original_center: source_center,
             offset, rotation: [0.0;3], scale: [1.0;3], vertex_start: original_count, vertex_end: new_end,
             source_ref: Some(source_key), editor_uid: Some(uid),
-            display_name: None, hidden: false, hidden_triangles: Vec::new(),
+            display_name: source_name, hidden: false, hidden_triangles: Vec::new(),
         });
         self.instances += 1;
         if let Some(owner)=collision_owner {self.collision.duplicate(&owner,uid);}
@@ -355,6 +357,11 @@ impl WorldModel {
             raw_tmd,native_record,donor_wall_bits,donor_center:original_center
         });
         self.instances+=1;
+        let legacy_item=match kind {"placement"=>Some(super::EditorCatalogItem::Draw(false,record)),"terrain"=>Some(super::EditorCatalogItem::Draw(true,record)),"mesh"=>Some(super::EditorCatalogItem::Mesh(record)),_=>None};
+        if let Some(key)=legacy_item.and_then(|item|super::editor_item_name_key(Some(donor),item)) {self.naming.foreign_legacy.insert(uid,key);}
+        if let Some(key)=super::naming::visual_key(&self.foreign.last().unwrap().raw_tmd,&super::naming::material_key(&donor.res.vram)) {
+            self.naming.foreign.insert(uid,key);
+        }
         if let Some(source)=collision_source {
             self.collision.foreign_sources.insert(uid,source);
             if let Err(error)=self.ensure_automatic_collision((false,index)) {
@@ -443,6 +450,8 @@ impl WorldModel {
             self.collision.recipes.retain(|a|a.owner!=super::collision_recipes::ObjectId::Created(uid));
             self.collision.foreign_sources.remove(&uid);
             self.collision.mesh_recipes.remove(&uid);
+            self.naming.foreign.remove(&uid);
+            self.naming.foreign_legacy.remove(&uid);
         }
         self.draws.remove(pos);
         self.foreign_vram.remove(&id);
@@ -464,6 +473,8 @@ impl WorldModel {
     /// Used when reloading a saved editor project, never for native writeback.
     pub fn clear_created(&mut self) {
         self.collision.foreign_sources.clear();
+        self.naming.foreign.clear();
+        self.naming.foreign_legacy.clear();
         self.collision.mesh_recipes.clear();
         self.collision.recipes.retain(|a|matches!(a.owner,super::collision_recipes::ObjectId::Native(_)));
         self.foreign.clear();
@@ -524,7 +535,7 @@ mod transform_tests {
         let mut world = WorldModel {
             model: None, instances: 0, unavailable: 0, unique_models: 0,
             ground_triangles: 0, ground_vram_covered: 0, ground_textured: 0,
-            npcs: Vec::new(), npc_issue: None,foreign:Vec::new(),collision:Default::default(),foreign_vram:HashMap::new(),
+            npcs: Vec::new(), npc_issue: None,foreign:Vec::new(),naming:Default::default(),collision:Default::default(),foreign_vram:HashMap::new(),
             draws: vec![
                 DrawInfo { id: 0, terrain: false, index: 18,
                     center:[0.0;3], radius:1.0, original_center:[0.0;3],
@@ -565,7 +576,7 @@ mod transform_tests {
         let mut w = WorldModel {
             model: Some(mesh), instances: 1, unavailable: 0, unique_models: 1,
             ground_triangles: 0, ground_vram_covered: 0, ground_textured: 0,
-            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),collision:Default::default(),foreign_vram:HashMap::new(),
+            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),naming:Default::default(),collision:Default::default(),foreign_vram:HashMap::new(),
             draws: vec![DrawInfo { id:0, terrain:false, index:0,
                 center:[0.5,0.0,0.5], radius:1.0,
                 original_center:[0.5,0.0,0.5], offset:[0.0;3],rotation:[0.0;3],scale:[1.0;3],
@@ -597,7 +608,7 @@ mod transform_tests {
         let mut world=WorldModel {
             model:Some(mesh),instances:1,unavailable:0,unique_models:1,
             ground_triangles:0,ground_vram_covered:0,ground_textured:0,
-            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),collision:Default::default(),foreign_vram:HashMap::new(),
+            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),naming:Default::default(),collision:Default::default(),foreign_vram:HashMap::new(),
             draws:vec![DrawInfo {id:0,terrain:false,index:0,
                 center:[0.0;3],original_center:[0.0;3],radius:1.0,
                 offset:[0.0;3],rotation:[0.0;3],scale:[1.0;3],vertex_start:0,vertex_end:3,
@@ -631,7 +642,7 @@ mod transform_tests {
         let mut w=WorldModel {
             model: Some(mesh), instances:1, unavailable:0, unique_models:1,
             ground_triangles:0, ground_vram_covered:0, ground_textured:0,
-            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),collision:Default::default(),foreign_vram:HashMap::new(),
+            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),naming:Default::default(),collision:Default::default(),foreign_vram:HashMap::new(),
             draws:vec![DrawInfo {id:0,terrain:false,index:0,
                 center:[0.0;3],original_center:[0.0;3],radius:1.0,
                 offset:[0.0;3],rotation:[0.0;3],scale:[1.0;3],vertex_start:0,vertex_end:2,
@@ -659,7 +670,7 @@ mod transform_tests {
         mesh.rest=mesh.positions.clone();
         let mut w=WorldModel { model:Some(mesh),instances:1,unavailable:0,unique_models:1,
             ground_triangles:0,ground_vram_covered:0,ground_textured:0,
-            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),collision:Default::default(),foreign_vram:HashMap::new(),
+            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),naming:Default::default(),collision:Default::default(),foreign_vram:HashMap::new(),
             draws:vec![DrawInfo{id:0,terrain:false,index:0,center:[0.0;3],
                 original_center:[0.0;3],radius:3.0,offset:[0.0;3],rotation:[0.0;3],scale:[1.0;3],
                 vertex_start:0,vertex_end:2,source_ref:None,editor_uid:None,
@@ -683,7 +694,7 @@ mod transform_tests {
         let mut mesh=empty_model(); mesh.positions=vec![[0.0;3]]; mesh.rest=mesh.positions.clone();
         let mut w=WorldModel {model:Some(mesh),instances:1,unavailable:0,unique_models:1,
             ground_triangles:0,ground_vram_covered:0,ground_textured:0,
-            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),collision:Default::default(),foreign_vram:HashMap::new(),
+            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),naming:Default::default(),collision:Default::default(),foreign_vram:HashMap::new(),
             draws:vec![DrawInfo{id:0,terrain:false,index:0,center:[0.0;3],
                 original_center:[0.0;3],radius:1.0,offset:[0.0;3],rotation:[0.0;3],scale:[1.0;3],
                 vertex_start:0,vertex_end:1,source_ref:None,editor_uid:None,
@@ -701,7 +712,7 @@ mod transform_tests {
         let mut w = WorldModel {
             model: Some(m), instances: 1, unavailable: 0, unique_models: 1,
             ground_triangles: 0, ground_vram_covered: 0, ground_textured: 0,
-            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),collision:Default::default(),foreign_vram:HashMap::new(),
+            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),naming:Default::default(),collision:Default::default(),foreign_vram:HashMap::new(),
             draws: vec![DrawInfo {id:0, terrain:false, index:0,
                 center:[1.0,2.0,3.0],radius:1.0,
                 original_center:[1.0,2.0,3.0],offset:[0.0;3],rotation:[0.0;3],scale:[1.0;3],
@@ -921,6 +932,7 @@ pub(super) fn build_world(
         Some(out)
     };
     WorldModel {
+        naming:super::naming::inventory(scene,index,&npcs),
         model, instances, unavailable,
         unique_models: cache.values().filter(|v| v.is_some()).count(),
         ground_triangles, ground_vram_covered, ground_textured, draws,

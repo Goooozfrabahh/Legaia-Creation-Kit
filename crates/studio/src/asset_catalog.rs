@@ -7,6 +7,14 @@ use std::path::{Path, PathBuf};
 
 const HEADER: &str = "LEGAIA_ASSET_CATALOG_V2";
 
+pub(crate) fn display_name(value:&str)->Result<Option<String>,String> {
+    let value=value.trim();if value.is_empty(){return Ok(None);}
+    if value.chars().count()>80 || value.len()>256 || value.chars().any(char::is_control) {
+        return Err("Name must contain 1-80 printable characters (at most 256 UTF-8 bytes)".into());
+    }
+    Ok(Some(value.into()))
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Confidence {
     #[default]
@@ -152,6 +160,7 @@ impl Catalog {
             record
                 .validate()
                 .map_err(|e| format!("Row {}: {e}", i + 2))?;
+            if fields[0].starts_with("visual-v1:") || fields[0].starts_with("npc-asset-v1:") {display_name(&record.name)?.ok_or("A display name is required")?;}
             if result.records.insert(fields[0].clone(), record).is_some() {
                 return Err(format!("Duplicate key at row {}", i + 2));
             }
@@ -165,6 +174,7 @@ impl Catalog {
                 return Err("An asset key is required".into());
             }
             r.validate()?;
+            if key.starts_with("visual-v1:") || key.starts_with("npc-asset-v1:") {display_name(&r.name)?.ok_or("A display name is required")?;}
             text.push_str(
                 &[
                     key.as_str(),
@@ -187,6 +197,16 @@ impl Catalog {
     /// A sibling lock serializes cooperating LCK writers. Stale snapshots fail.
     pub fn save(&mut self, path: &Path) -> Result<(), String> {
         let text = self.serialize()?;
+        atomic_write(path,text.as_bytes(),self.snapshot.as_deref().map(str::as_bytes))?;
+        self.snapshot = Some(text);
+        Ok(())
+    }
+}
+
+/// Shared metadata writer: sibling lock, expected bytes, durable temporary
+/// file and one replace operation. Never remove the destination first.
+pub(crate) fn atomic_write(path:&Path,bytes:&[u8],expected:Option<&[u8]>)->Result<(),String> {
+        if let Some(parent)=path.parent() {fs::create_dir_all(parent).map_err(|e|e.to_string())?;}
         let lock_path = sidecar(path, ".lock");
         let lock = OpenOptions::new().write(true).create_new(true).open(&lock_path)
             .map_err(|e| format!("Cannot lock catalog {}: {e}. If no editor is running, remove the stale .lock file.", path.display()))?;
@@ -194,7 +214,8 @@ impl Catalog {
             file: Some(lock),
             path: lock_path,
         };
-        if read_optional(path)? != self.snapshot {
+        let current=match fs::read(path) {Ok(bytes)=>Some(bytes),Err(e) if e.kind()==ErrorKind::NotFound=>None,Err(e)=>return Err(e.to_string())};
+        if current.as_deref() != expected {
             return Err("Catalog changed on disk. Restart LCK before editing names to avoid overwriting another session.".into());
         }
         let temp = sidecar(path, ".pending");
@@ -205,7 +226,7 @@ impl Catalog {
                 .open(&temp)
                 .map_err(|e| format!("Cannot create {}: {e}", temp.display()))?;
             let write_result = (|| -> std::io::Result<()> {
-                file.write_all(text.as_bytes())?;
+                file.write_all(bytes)?;
                 file.sync_all()
             })();
             drop(file);
@@ -214,7 +235,7 @@ impl Catalog {
                 return Err(e.to_string());
             }
             let replace_result = (|| -> std::io::Result<()> {
-                if self.snapshot.is_some() {
+                if current.is_some() {
                     fs::copy(path, sidecar(path, ".bak"))?;
                 }
                 fs::rename(&temp, path)
@@ -226,9 +247,7 @@ impl Catalog {
             Ok(())
         })();
         result?;
-        self.snapshot = Some(text);
         Ok(())
-    }
 }
 fn read_optional(path: &Path) -> Result<Option<String>, String> {
     match fs::read_to_string(path) {

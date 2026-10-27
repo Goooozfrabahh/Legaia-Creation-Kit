@@ -8,6 +8,7 @@ mod scene_instances;
 mod collision_recipes;
 mod collision_authoring;
 mod collision_generation;
+mod naming;
 mod native_dependency_report;
 mod placement_drop;
 mod cell_catalog;
@@ -1418,9 +1419,37 @@ impl App {
 
 
 
+    fn shared_name_key(&self,scene:Option<&legaia_engine_scene::scene_assembly::AssembledScene>,item:EditorCatalogItem)->Option<String> {
+        let (Some(scene),Some((_,NativeSceneSlot::Ready(loaded,world))))=(scene,self.native_scene.as_ref()) else {return None;};
+        if scene.name!=loaded.name {return None;}
+        match item {
+            EditorCatalogItem::Draw(t,i)=>world.base_name_key((t,i)).map(str::to_owned),
+            EditorCatalogItem::Mesh(i)=>world.naming.meshes.get(i).cloned().flatten(),_=>None,
+        }
+    }
+
     fn editor_name_for(&self,
             scene: Option<&legaia_engine_scene::scene_assembly::AssembledScene>,
             item: EditorCatalogItem) -> String {
+        if let EditorCatalogItem::Draw(t,i)=item {
+            if let Some((_,NativeSceneSlot::Ready(loaded,world)))=&self.native_scene {
+                if scene.is_some_and(|s|s.name==loaded.name) {
+                    if let Some(draw)=world.at(t,i) {
+                        if let Some(name)=&draw.display_name {return name.clone();}
+                        if let Some(name)=world.base_name_key((t,i)).and_then(|key|self.editor_names.get(key)) {return name.clone();}
+                        if let Some(uid)=draw.editor_uid {
+                            if let Some(name)=world.naming.foreign_legacy.get(&uid).and_then(|key|self.editor_names.get(key)) {return name.clone();}
+                            if let Some(foreign)=world.foreign.iter().find(|f|f.uid==uid) {return format!("Foreign {} #{} from {}",foreign.kind,foreign.record,foreign.source);}
+                            if let Some(origin)=draw.source_ref {
+                                if let Some(name)=editor_item_name_key(scene,EditorCatalogItem::Draw(origin.0,origin.1)).and_then(|key|self.editor_names.get(&key)) {return name.clone();}
+                                return editor_native_item_hint(scene,EditorCatalogItem::Draw(origin.0,origin.1));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(name)=self.shared_name_key(scene,item).and_then(|key|self.editor_names.get(&key)) {return name.clone();}
         if let EditorCatalogItem::Draw(false,index) = item {
             if index >= world_view::NPC_KEY_BASE {
                 if let Some(name) = editor_item_name_key(scene,item)
@@ -1461,12 +1490,18 @@ impl App {
         }
     }
 
+    fn repository_matches(&self,asset:&global_repository::Asset,term:&str)->bool {
+        asset.matches(term,&self.editor_names) || self.editor_cells.label(&CellSelection::Original(asset.source.clone()))
+            .is_some_and(|name|name.to_lowercase().contains(term))
+    }
+
     fn editor_item_matches(&self,
         scene: Option<&legaia_engine_scene::scene_assembly::AssembledScene>,
         item: EditorCatalogItem, term: &str) -> bool {
         if term.is_empty() { return true; }
         let key = editor_item_name_key(scene, item).unwrap_or_default();
         let mut text = format!("{} {}", self.editor_name_for(scene, item), self.editor_names.search_text(&key));
+        if let Some(key)=self.shared_name_key(scene,item) {text.push_str(&self.editor_names.search_text(&key));}
         if let EditorCatalogItem::Draw(false,index)=item {
             if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_ref()
                 && let Some(npc)=world.npc((false,index)) {
@@ -1487,10 +1522,11 @@ impl App {
     fn editor_name_properties(&mut self, ui: &mut egui::Ui,
             scene: Option<&legaia_engine_scene::scene_assembly::AssembledScene>,
             item: EditorCatalogItem) {
-        let Some(key) = editor_item_name_key(scene, item) else { return; };
+        let Some(key) = self.shared_name_key(scene,item).or_else(||editor_item_name_key(scene, item)) else { return; };
         if self.editor_name_edit_key.as_deref() != Some(&key) {
             self.editor_name_edit_key = Some(key.clone());
-            self.editor_name_draft = self.editor_names.record(&key);
+            self.editor_name_draft = self.editor_names.records.get(&key).cloned().or_else(||
+                editor_item_name_key(scene,item).and_then(|old|self.editor_names.records.get(&old).cloned())).unwrap_or_default();
             self.editor_name_apply_mesh = false;
             self.editor_name_status = None;
         }
@@ -1513,13 +1549,13 @@ impl App {
         ui.add(egui::TextEdit::singleline(&mut self.editor_name_draft.aliases).hint_text("Alternate names / search terms"));
         ui.add(egui::TextEdit::multiline(&mut self.editor_name_draft.evidence)
             .desired_rows(2).hint_text("Evidence: native reference or visual inspection details"));
-        let mesh_key = match (scene, item) {
+        let mesh_key = if key.starts_with("visual-v1:") || key.starts_with("npc-asset-v1:") {None} else {match (scene, item) {
             (Some(s), EditorCatalogItem::Draw(terrain, index)) => {
                 let draws = if terrain { &s.terrain } else { &s.placements };
                 draws.get(index).and_then(|draw| editor_mesh_name_key(s, draw.env_slot))
             }
             _ => None,
-        };
+        }};
         if mesh_key.is_some() {
             ui.checkbox(&mut self.editor_name_apply_mesh,
                 "Also apply to the source mesh in this cell");
@@ -1532,6 +1568,7 @@ impl App {
                     let mut next = self.editor_names.clone();
                     if remove {
                         next.records.remove(&key);
+                        if let Some(old)=editor_item_name_key(scene,item) {next.records.remove(&old);}
                     } else {
                         let mut record = self.editor_name_draft.clone();
                         record.name = record.name.trim().to_owned();
@@ -1592,7 +1629,7 @@ impl App {
                 }
                 _ => None,
             };
-            let direct = self.editor_names.records.get(&key);
+            let direct = self.shared_name_key(scene,item).and_then(|shared|self.editor_names.records.get(&shared)).or_else(||self.editor_names.records.get(&key));
             let record = direct.or_else(|| inherited_key.as_ref().and_then(|k| self.editor_names.records.get(k)));
             let name = self.editor_name_for(scene, item);
             let status = record.map(|r| r.confidence.label()).unwrap_or("Not catalog-identified");
@@ -1665,7 +1702,7 @@ impl App {
             (None,CellSelection::Original(_))=>format!("LCK_SCENE_V1\t{source}\n"),
         };
         let base=self.editor_cells.label(&selected).unwrap_or_else(|| source.clone());
-        let name=format!("{} Copy",base);
+        let name=cell_catalog::duplicate_label(&base);
         match self.editor_cells.duplicate(source,name,&overlay) {
             Ok(id)=>{
                 self.select_editor_cell(CellSelection::Copy(id));
@@ -1727,7 +1764,7 @@ impl App {
                                 "teien"|"edteien" => "Sky Gardens".to_owned(),
                                 "doman"|"eddoman" => "Usha Research Center".to_owned(),
                                 "son"|"edson" => "Soren Camp".to_owned(),
-                                _ => label.split(" (").next().unwrap_or(&label).trim().to_owned(),
+                                _ => {let native=crate::place_name(&cell.name).unwrap_or(&cell.name);native.split(" (").next().unwrap_or(native).trim().to_owned()},
                             };
                             if let Some((_,entries))=families.iter_mut().find(|(key,_)|*key==family) {
                                 entries.push((id,row));
@@ -1815,6 +1852,7 @@ impl App {
                         }
                     }
                     ui.small("Names, copies and scene edits are editor-only. This does not modify the original disc or add a PS1 CDNAME entry.");
+                    if ui.button("Rename...").clicked() {self.editor_cell_rename=Some((cell.clone(),self.editor_cells.label(&cell).unwrap_or_default()));}
                     if ui.button("Close").clicked(){self.editor_cell_properties=None;}
                 });
             if !open {self.editor_cell_properties=None;}
@@ -1830,6 +1868,7 @@ impl App {
                     let response=ui.add(egui::TextEdit::singleline(&mut value).desired_width(335.0));
                     save=ui.button("Save").clicked() ||
                         (response.lost_focus() && ui.input(|i|i.key_pressed(egui::Key::Enter)));
+                    if ui.button("Restore default name").clicked() {value.clear();save=true;}
                     cancel=ui.button("Cancel").clicked();
                 });
             if save {
@@ -1909,11 +1948,11 @@ impl App {
         }
         if let Some(id)=self.global_repository_selected {
             if let Some(asset)=self.global_repository.get(id) {
-                let display=self.editor_names.get(&asset.key).unwrap_or(&asset.label);
+                let display=asset.display_name(&self.editor_names);
                 let label=display.to_string();
                 let source=asset.source.clone();
                 let kind=asset.kind_label();
-                let selected_key=asset.key.clone();
+                let selected_key=asset.name_key();
                 ui.group(|ui| {
                     ui.small("Selected original asset");
                     ui.label(egui::RichText::new(label).strong());
@@ -1939,7 +1978,7 @@ impl App {
         let mut counts=[0usize;4];
         // Count the entire 40K+ catalog without materializing GUI rows.
         for asset in &self.global_repository {
-            if asset.matches(&term,&self.editor_names) { counts[asset.group()]+=1; }
+            if self.repository_matches(asset,&term) { counts[asset.group()]+=1; }
         }
         let titles=["World objects / MAP", "Terrain / decoration", "Reusable geometry / TMD", "Field NPCs / MAN"];
         let mut dragging=None;
@@ -1961,8 +2000,9 @@ impl App {
             // Grouping source provenance keeps similarly numbered TMDs distinct.
             let mut indexed:std::collections::BTreeMap<(String,String),Vec<usize>>=std::collections::BTreeMap::new();
             for (id,asset) in self.global_repository.iter().enumerate() {
-                if asset.group()==group && asset.matches(&term,&self.editor_names) {
-                    indexed.entry((asset.source_label.clone(),asset.source.clone())).or_default().push(id);
+                if asset.group()==group && self.repository_matches(asset,&term) {
+                    let place=self.editor_cells.label(&CellSelection::Original(asset.source.clone())).unwrap_or(asset.source_label.clone());
+                    indexed.entry((place,asset.source.clone())).or_default().push(id);
                 }
             }
             for section in 0..(if group==0 {2} else {1}) {
@@ -1994,8 +2034,8 @@ impl App {
                         let asset=&self.global_repository[id];
                         let usable=scene.is_some_and(|s|global_repository::local_source(s,asset).is_some());
                         let symbol=if usable {"↳"}else if matches!(asset.kind,global_repository::Kind::Npc(_)) {"◇"} else {"⇢"};
-                        let name=self.editor_names.get(&asset.key).unwrap_or(&asset.label);
-                        let text=format!("{symbol} [{}] {name}",asset.source_label);
+                        let name=asset.display_name(&self.editor_names);
+                        let text=format!("{symbol} [{place}] {name}");
                         let active=self.global_repository_selected==Some(id);
                         let response=ui.add_sized(egui::vec2(ui.available_width().max(40.0),24.0),
                             egui::Label::new(text).selectable(false).sense(egui::Sense::click_and_drag()));
@@ -2017,6 +2057,7 @@ impl App {
                             if ui.button("Properties / identify asset...").clicked() {
                                 selection=Some(id);open_dialog=Some((id,false));ui.close();
                             }
+                            if ui.button("Rename...").clicked() {selection=Some(id);open_dialog=Some((id,false));ui.close();}
                             ui.separator();
                             ui.small(format!("Original source: {}",asset.source));
                             ui.small(if usable {"Exact original mesh in destination"}
@@ -2054,12 +2095,13 @@ impl App {
             self.global_repository_dialog=None;return;
         };
         if preview_mode {self.editor_load_global_asset_preview(id);}
-        if !preview_mode && self.global_name_edit_key.as_deref()!=Some(&asset.key) {
-            self.global_name_edit_key=Some(asset.key.clone());
-            self.global_name_draft=self.editor_names.record(&asset.key);
+        let name_key=asset.name_key();
+        if !preview_mode && self.global_name_edit_key.as_deref()!=Some(&name_key) {
+            self.global_name_edit_key=Some(name_key.clone());
+            self.global_name_draft=asset.name_record(&self.editor_names);
             self.global_name_status=None;
         }
-        let title=self.editor_names.get(&asset.key).cloned().unwrap_or(asset.label.clone());
+        let title=asset.display_name(&self.editor_names);
         let mut open=true;
         egui::Window::new(format!("{} — {title}",if preview_mode {"Preview"}else{"Asset Properties"}))
             .id(egui::Id::new("lck_global_asset_details"))
@@ -2074,7 +2116,7 @@ impl App {
                     }
                 });
                 ui.separator();
-                ui.label(format!("Source: {} ({})",asset.source_label,asset.source));
+                ui.label(format!("Source: {} ({})",self.editor_cells.label(&CellSelection::Original(asset.source.clone())).unwrap_or(asset.source_label.clone()),asset.source));
                 ui.label(format!("Record type: {}",asset.kind_label()));
                 if asset.source!=self.native_scene.as_ref().map(|(name,_)|name.as_str()).unwrap_or("") {
                     ui.label("Foreign preview uses original donor textures. Native collision, scripts and IMG export still require resource import.");
@@ -2082,6 +2124,7 @@ impl App {
                 ui.small(format!("Native record: {}",asset.label));
                 ui.collapsing("Immutable original identifiers", |ui| {
                     ui.monospace(&asset.key);
+                    ui.monospace(format!("Shared naming identity: {name_key}"));
                     if let Some(hash)=asset.mesh_fingerprint {ui.monospace(format!("TMD fingerprint: {hash:016x}"));}
                     if ui.button("Copy source identifier").clicked() {ui.ctx().copy_text(asset.key.clone());}
                 });
@@ -2118,17 +2161,18 @@ impl App {
                         .hint_text("Alternate names / search terms"));
                     ui.add(egui::TextEdit::multiline(&mut self.global_name_draft.evidence)
                         .desired_rows(3).hint_text("Evidence supporting identification"));
-                    ui.add_enabled_ui(self.editor_catalog_error.is_none(),|ui| {
+                    if asset.alias_key.is_none() {ui.colored_label(Color32::YELLOW,"Verified asset identity unavailable; existing legacy labels are read-only.");}
+                    ui.add_enabled_ui(self.editor_catalog_error.is_none() && asset.alias_key.is_some(),|ui| {
                         ui.horizontal(|ui| {
                             let save=ui.button("Save identification").clicked();
-                            let remove=ui.button("Remove identification").clicked();
+                            let remove=ui.button("Restore default name").clicked();
                             if save||remove {
                                 let mut next=self.editor_names.clone();
-                                if remove {next.records.remove(&asset.key);}
+                                if remove {next.records.remove(&name_key);next.records.remove(&asset.key);}
                                 else {
                                     let mut record=self.global_name_draft.clone();
                                     record.name=record.name.trim().to_owned();
-                                    next.records.insert(asset.key.clone(),record);
+                                    next.records.insert(name_key.clone(),record);
                                 }
                                 self.global_name_status=Some(match next.save(&editor_catalog_path()) {
                                     Ok(())=>{
@@ -2142,7 +2186,7 @@ impl App {
                         });
                     });
                     if let Some(status)=&self.global_name_status {ui.label(status);}
-                    ui.small("The same native TMD can have multiple placed copies. Names are attached to original record IDs, not guessed from scene context.");
+                    ui.small("Shared aliases use verified original TMD + texture data, or a native MAN identity. Instance overrides stay in the LCK scene. No source identifiers are renamed.");
                 }
             });
         if !open {self.global_repository_dialog=None;}
@@ -2466,21 +2510,7 @@ impl App {
                                 egui::CollapsingHeader::new(format!("New editor instances ({})", created.len()))
                                     .default_open(true).show(ui, |ui| {
                                         for d in created {
-                                            let origin=d.source_ref.unwrap_or((false,0));
-                                            let default=if let Some(foreign)=world.foreign.iter()
-                                                .find(|f|Some(f.uid)==d.editor_uid) {
-                                                format!("Foreign {} #{} from {} (UID {})",
-                                                    foreign.kind,foreign.record,foreign.source,foreign.uid)
-                                            } else if let Some(npc)=world.npc((false,d.index)) {
-                                                format!("NPC copy #{} of MAN #{} (TMD {})",
-                                                    d.editor_uid.unwrap_or(0),npc.record,npc.model_index)
-                                            } else {
-                                                format!("New copy #{} of {} #{}",
-                                                    d.editor_uid.unwrap_or(0),
-                                                    if origin.0 {"terrain"} else {"placement"}, origin.1)
-                                            };
-                                            let label=format!("{}  [copy #{}]",d.display_name.as_deref()
-                                                .unwrap_or(&default),d.editor_uid.unwrap_or(0));
+                                            let label=format!("{}  [copy #{}]",self.editor_name_for(Some(scene),EditorCatalogItem::Draw(d.terrain,d.index)),d.editor_uid.unwrap_or(0));
                                             if !hierarchy_filter.is_empty() &&
                                                 !label.to_lowercase().contains(&hierarchy_filter) {continue;}
                                             editor_hierarchy_row(ui,label,(false,d.index),&mut self.native_selected,
@@ -2497,7 +2527,8 @@ impl App {
                                                         pending_restore=Some((d.terrain,d.index));
                                                     }
                                                     ui.label(format!("{} #{}: {}",if d.terrain {"Terrain"} else {"Placement"},
-                                                        d.index,d.display_name.as_deref().unwrap_or("Hidden original")));
+                                                        d.index,self.editor_name_for(Some(scene),EditorCatalogItem::Draw(d.terrain,d.index))))
+                                                        .context_menu(|ui|{if ui.button("Rename").clicked(){hierarchy_rename=Some((d.terrain,d.index));ui.close();}});
                                                 });
                                             }
                                         });
@@ -2532,13 +2563,8 @@ impl App {
             self.editor_modal=None;
         }
         if let Some(key)=hierarchy_rename {
-            if let Some(draw)=world.as_ref().and_then(|w|w.at(key.0,key.1)) {
-                let default=if let Some(name)=&draw.display_name {name.clone()}
-                    else if draw.editor_uid.is_some() {
-                        format!("New copy #{}",draw.editor_uid.unwrap_or(0))
-                    } else {
-                        self.editor_name_for(ready.as_deref(),EditorCatalogItem::Draw(key.0,key.1))
-                    };
+            if world.as_ref().and_then(|w|w.at(key.0,key.1)).is_some() {
+                let default=self.editor_name_for(ready.as_deref(),EditorCatalogItem::Draw(key.0,key.1));
                 self.editor_rename=Some(EditorRename {key,text:default});
             } else {
                 self.studio.error=Some("This source record has no drawable instance to rename.".into());
@@ -2555,6 +2581,7 @@ impl App {
                     let response=ui.add(egui::TextEdit::singleline(&mut edit.text).desired_width(320.0));
                     save=ui.button("Save name").clicked() ||
                         (response.lost_focus() && ui.input(|i|i.key_pressed(egui::Key::Enter)));
+                    if ui.button("Restore default name").clicked() {edit.text.clear();save=true;}
                     cancel=ui.button("Cancel").clicked();
                     ui.small("An empty name clears the custom label. Save LCK scene to persist it.");
                 });
@@ -2599,6 +2626,15 @@ impl App {
                         egui::ScrollArea::vertical().id_salt(("lck_properties_scroll_p1",properties_key))
                             .auto_shrink([false,false]).max_height(ui.available_height().max(140.0)).show(ui, |ui| {
                 if let Some(world)=world.as_deref() {
+                    if ui.button("Rename this instance...").clicked() {self.editor_rename=Some(EditorRename{key:properties_key,text:self.editor_name_for(ready.as_deref(),EditorCatalogItem::Draw(properties_key.0,properties_key.1))});}
+                    ui.collapsing("Naming scope and original identifiers",|ui| {
+                        let draw=world.at(properties_key.0,properties_key.1).unwrap();
+                        ui.label(if draw.display_name.is_some(){"Scope: instance override in this LCK scene"}else{"Scope: shared asset alias or default label"});
+                        if let Some(uid)=draw.editor_uid {ui.monospace(format!("Persistent instance UID {uid}"));}
+                        else if let Some(id)=world.naming.native.get(&properties_key) {ui.monospace(id);}
+                        else {ui.colored_label(Color32::YELLOW,"Stable native identity unavailable; new original-instance naming is disabled.");}
+                        if let Some(id)=world.base_name_key(properties_key) {ui.monospace(format!("Shared alias identity: {id}"));}
+                    });
                     let scene_name=ready.as_ref().map(|s|s.name.clone()).unwrap_or_default();
                     let target=world.at(properties_key.0,properties_key.1).map(|d|match d.editor_uid {
                         Some(uid)=>scene_instances::NameTarget::Created(uid),None=>scene_instances::NameTarget::Native(properties_key.0,properties_key.1)});
@@ -2976,7 +3012,7 @@ impl App {
                             if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{name}.lckscene"))
                                 .add_filter("LCK scene overlay", &["lckscene"]).save_file() {
                                 let path = path.with_extension("lckscene");
-                                match std::fs::write(&path, scene_instances::serialize(name, world)) {
+                                match scene_instances::save(&path,name,world) {
                                     Ok(()) => self.studio.status = Some(format!("Saved LCK editor project: {}", path.display())),
                                     Err(err) => self.studio.error = Some(format!("Could not save LCK project: {err}")),
                                 }
@@ -3498,6 +3534,10 @@ impl App {
                             self.editor_properties_target=Some(key);
                             self.editor_context_menu=None;
                         }
+                        if ui.button("Rename...").clicked() {
+                            self.editor_rename=Some(EditorRename{key,text:self.editor_name_for(ready.as_deref(),EditorCatalogItem::Draw(key.0,key.1))});
+                            self.editor_context_menu=None;
+                        }
                     });
                 });
             if self.editor_context_menu.is_some() && ctx.input(|i|i.pointer.any_pressed()) &&
@@ -3574,7 +3614,9 @@ impl App {
         if let Some((key,name))=pending_name {
             if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut() {
                 if let Some(world)=Arc::get_mut(world) {
-                    if world.set_display_name(key,name) {
+                    if name.is_some() && world.at(key.0,key.1).is_some_and(|d|d.editor_uid.is_none()) && !world.naming.native.contains_key(&key) {
+                        self.studio.error=Some("Cannot rename this original instance without a verified stable MAP/MAN identity. Existing names are retained.".into());
+                    } else if world.set_display_name(key,name) {
                         self.studio.status=Some("Scene instance renamed. Save LCK scene to preserve the name.".into());
                         ctx.request_repaint();
                     }
@@ -3670,6 +3712,7 @@ impl App {
                         self.native_selected.and_then(|old|
                             world.at(old.0,old.1).map(|d|d.scale)).unwrap_or([1.0;3])
                     };
+                    let selected_name=if pending_repository_drop {None}else{self.native_selected.and_then(|old|world.at(old.0,old.1)).and_then(|d|d.display_name.clone())};
                     let duplicated=world.duplicate_native(source,scene.placements.len(),uid,offset).and_then(|key| {
                         if !pending_repository_drop {
                             if let Some(old)=self.native_selected {
@@ -3686,6 +3729,7 @@ impl App {
                     });
                     match duplicated {
                         Ok(key) => {
+                            world.set_display_name(key,selected_name);
                             // Copy the *selected instance* appearance and frame, not just the
                             // source's original MAN record. Each copy stays independent.
                             if let Some((model,clip,frame))=actor {
@@ -5996,6 +6040,33 @@ mod catalog_ui_tests {
         assert!(!result.shapes.is_empty());
     }
     #[test]
+    fn universal_name_precedence_search_and_ctrl_d_keep_instance_overrides() {
+        let mut app=app();let (scene,_)=ps1_export::tests::actor_fixture();
+        let mut world=collision_recipes::properties_fixture();
+        let alias=naming::visual_key(&[1,2,3],&collision_recipes::digest(&[4,5])).unwrap();
+        world.naming.assets.insert((false,0),alias.clone());world.naming.native.insert((false,0),"stable-original".into());
+        app.editor_names.records.insert(alias.clone(),Record{name:"Lantern".into(),aliases:"lamp".into(),..Default::default()});
+        app.native_scene=Some(("synthetic".into(),NativeSceneSlot::Ready(Arc::new(scene),Arc::new(world))));
+        let scene=match &app.native_scene {Some((_,NativeSceneSlot::Ready(s,_)))=>s.clone(),_=>unreachable!()};
+        assert_eq!(app.editor_name_for(Some(&scene),EditorCatalogItem::Draw(false,0)),"Lantern");
+        assert_eq!(app.editor_name_for(Some(&scene),EditorCatalogItem::Draw(false,1)),"Lantern");
+        assert!(app.editor_item_matches(Some(&scene),EditorCatalogItem::Draw(false,1),"lamp"));
+        if let Some((_,NativeSceneSlot::Ready(_,world)))=&mut app.native_scene {
+            let world=Arc::get_mut(world).unwrap();world.set_display_name((false,0),Some("Original lamp".into()));world.set_display_name((false,1),Some("Side entrance lamp".into()));
+        }
+        app.native_selected=Some((false,1));let ctx=egui::Context::default();frame(&mut app,&ctx,vec![]);
+        let camera=app.native_view.cam;
+        frame(&mut app,&ctx,vec![egui::Event::Key{key:egui::Key::D,physical_key:None,pressed:true,repeat:false,modifiers:egui::Modifiers{ctrl:true,command:true,..Default::default()}}]);
+        let copied=app.native_selected.unwrap();assert_ne!(copied,(false,1));
+        assert_eq!(app.editor_name_for(Some(&scene),EditorCatalogItem::Draw(copied.0,copied.1)),"Side entrance lamp");
+        assert_eq!(app.editor_name_for(Some(&scene),EditorCatalogItem::Draw(false,0)),"Original lamp");
+        assert_eq!(app.native_view.cam,camera);
+        app.editor_names.records.get_mut(&alias).unwrap().name="New global alias".into();
+        assert_eq!(app.editor_name_for(Some(&scene),EditorCatalogItem::Draw(false,1)),"Side entrance lamp");
+        if let Some((_,NativeSceneSlot::Ready(_,world)))=&mut app.native_scene {Arc::get_mut(world).unwrap().set_display_name((false,1),None);}
+        assert_eq!(app.editor_name_for(Some(&scene),EditorCatalogItem::Draw(false,1)),"New global alias");
+    }
+    #[test]
     fn right_click_properties_shows_collision_without_library_and_preview_does_not_edit() {
         fn text_shapes(shape:&egui::Shape,out:&mut Vec<(String,egui::Pos2)>) {
             match shape {
@@ -6099,7 +6170,7 @@ mod catalog_ui_tests {
         let mut world = WorldModel {
             model: None, instances: 2, unavailable: 0, unique_models: 1,
             ground_triangles: 0, ground_vram_covered: 0, ground_textured: 0,
-            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),collision:Default::default(),foreign_vram:std::collections::HashMap::new(),
+            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),naming:Default::default(),collision:Default::default(),foreign_vram:std::collections::HashMap::new(),
             draws: vec![original, copy],
         };
         assert_eq!(editor_duplicate_request(&world, Some((false, 2))),

@@ -4,6 +4,43 @@ use super::*;
 use std::io::Write;
 
 #[test]
+#[ignore = "explicit read-only retail naming identity and persistence validation"]
+fn rim_elm_names_use_native_identity_and_verified_visual_aliases() -> Result<()> {
+    let source=PathBuf::from(std::env::var_os("LCK_P0_SOURCE").context("LCK_P0_SOURCE required")?);
+    let lib=crate::library::Library::open(&source)?;
+    let scene=legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,"town01").map_err(anyhow::Error::msg)?;
+    let mut world=world_view::build_world(&scene,&lib.index);
+    let unique=world.naming.native.values().collect::<std::collections::BTreeSet<_>>();
+    ensure!(unique.len()==world.naming.native.len(),"Native naming identities are ambiguous");
+    let missing=world.draws.iter().filter(|d|d.editor_uid.is_none()&&!world.naming.native.contains_key(&(d.terrain,d.index)))
+        .map(|d|(d.terrain,d.index)).collect::<Vec<_>>();
+    ensure!(missing.is_empty(),"Original Rim Elm instances lack stable naming identities: {missing:?}");
+    let key=world.collision.sources.iter().find(|(_,s)|s.object.descriptor_id==230&&s.object.cell==[94,78]).map(|(k,_)|*k).context("Candidate absent")?;
+    let canonical=world.base_name_key(key).context("Verified visual alias unavailable")?.to_owned();
+    ensure!(canonical.starts_with("visual-v1:"),"Naming identity lacks visual provenance");
+    ensure!(world.naming.native.contains_key(&key),"Stable native instance identity absent");
+    world.set_display_name(key,Some("Rim Elm test lantern".into()));
+    let copied=world.duplicate_native(key,scene.placements.len(),920001,[64.0,0.0,0.0]).map_err(anyhow::Error::msg)?;
+    ensure!(world.at(copied.0,copied.1).and_then(|d|d.display_name.as_deref())==Some("Rim Elm test lantern"),"Duplicate did not retain its independent initial name");
+    world.set_display_name(copied,Some("Independent test lantern".into()));
+    let saved=scene_instances::serialize(&scene.name,&world);
+    ensure!(saved.contains("NATIVE_NAME\tmap-instance-v1:town01:"),"Original name uses a transient list index");
+    let doc=scene_instances::parse(&saved,&scene.name,&world).map_err(anyhow::Error::msg)?;
+    scene_instances::apply(&doc,&mut world,scene.placements.len(),&lib.index).map_err(anyhow::Error::msg)?;
+    ensure!(scene_instances::serialize(&scene.name,&world)==saved,"Native names failed to restore");
+    ensure!(world.base_name_key(copied)==Some(canonical.as_str()),"Copy's verified base alias changed");
+    let center=world.at(key.0,key.1).context("Source draw absent")?.original_center;
+    let foreign=world.insert_foreign(&scene,"placement",key.1,920002,center,&lib.index).map_err(anyhow::Error::msg)?;
+    ensure!(world.base_name_key(foreign)==Some(canonical.as_str()),"Imported donor did not retain the verified shared naming identity");
+    world.set_display_name(foreign,Some("Imported test lantern".into()));
+    let saved=scene_instances::serialize(&scene.name,&world);let doc=scene_instances::parse(&saved,&scene.name,&world).map_err(anyhow::Error::msg)?;
+    scene_instances::apply(&doc,&mut world,scene.placements.len(),&lib.index).map_err(anyhow::Error::msg)?;
+    ensure!(scene_instances::serialize(&scene.name,&world)==saved,"Imported instance name failed to restore");
+    println!("Verified {} unique native naming identities; original, copy and imported naming roundtrip passed",world.naming.native.len());
+    Ok(())
+}
+
+#[test]
 #[ignore = "explicit read-only retail Ctrl+D and Properties integration"]
 fn rim_elm_ctrl_d_opens_generated_collision_properties() -> Result<()> {
     use super::super::{App,Automation,NativeSceneSlot};
