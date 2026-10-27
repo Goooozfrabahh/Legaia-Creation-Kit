@@ -5593,7 +5593,7 @@ impl eframe::App for App {
                 Ok(Ok(result))=>{
                     self.last_written=result.path.parent().map(Path::to_path_buf);
                     let details=if result.skipped.is_empty(){String::new()}else{format!(" Not updated: {}",result.skipped.join(" | "))};
-                    self.studio.status=Some(format!("Native PS1 image saved: {}. Patched: {}.{} In DuckStation: boot THIS IMG (not an old CUE or save state), then reload Rim Elm. Experimental native wall-grid collision updated where source walls could be inferred; door triggers/script-driven walls remain unchanged.",result.path.display(),result.patched.join(", "),details));
+                    self.studio.status=Some(format!("Native PS1 image saved: {}. Patched: {}.{} In DuckStation: boot THIS IMG (not an old CUE or save state), then reload Rim Elm. Native writes were read back. Original walls/floors and scripts are preserved unless an explicit supported plan changes them; gameplay verification remains required.",result.path.display(),result.patched.join(", "),details));
                     self.ps1_export_job=None;
                 }
                 Ok(Err(error))=>{

@@ -25,6 +25,10 @@ pub(super) mod native_dependencies;
 #[path = "experimental_native_export.rs"]
 pub(super) mod experimental;
 use native_dependencies::NativeBindings;
+#[path = "native_deletion.rs"]
+mod native_deletion;
+#[path = "insertion_provenance.rs"]
+mod insertion_provenance;
 
 const MAP_LEN: usize = 0x12000;
 const GRID_OFF: usize = 0x8000;
@@ -83,6 +87,7 @@ pub(super) struct NpcEdit {
 pub(super) struct ExportEdits {
     pub moves: Vec<MoveEdit>,
     pub deletes: Vec<MoveEdit>,
+    insertion_provenance:Option<insertion_provenance::VerifiedInsertions>,
     pub copies: Vec<InsertEdit>,
     pub npcs: Vec<NpcEdit>,
     /// Native placed-object floor height in the original PSX Y-down frame,
@@ -484,7 +489,7 @@ fn prepare_with_mode(scene: &AssembledScene, world: &WorldModel, mode: Preparati
         ensure!(!terrain,"Native deletion of terrain/ground is unsupported; no output written");
         ensure!(world.npc((terrain,index)).is_none(),"Native NPC/actor deletion requires MAN script/dependency removal; no output written");
         let native=scene.placements.get(index).with_context(||format!("No native placement for deletion #{index}"))?;
-        result.deletes.push(MoveEdit{collision_bounds:None,cell:native.cell,
+        result.deletes.push(MoveEdit{collision_bounds:original_collision_bounds(world,index),cell:native.cell,
             source_position:(native.world_x,native.world_z),env_slot:native.env_slot,
             source_rotation:[native.rot_x,native.rot_y,native.rot_z],delta:[0.0;3]});
     }
@@ -1168,7 +1173,9 @@ pub(super) fn collision_ownership_diagnostic(world:&WorldModel,key:(bool,usize),
 fn compile_walls(map:&mut [u8], original:&[u8], edits:&ExportEdits)->Result<WallReport> {
     ensure!(map.len()==MAP_LEN && original.len()==MAP_LEN,"Invalid native field MAP length");
     for edit in &edits.moves {
-        require_no_unowned_walls(original,edit.collision_bounds)?;
+        if !edits.insertion_provenance.as_ref().is_some_and(|p|p.covers(original,edit)) {
+            require_no_unowned_walls(original,edit.collision_bounds)?;
+        }
     }
     for edit in &edits.copies {
         if let Some((_,bits))=edits.foreign_wall_stencils.iter().find(|(uid,_)|*uid==edit.uid) {
@@ -1209,17 +1216,13 @@ fn map_patches_with_bindings(original:&[u8],edits:&ExportEdits,bindings:&NativeB
     let mut deleted=HashSet::new();
     for edit in &edits.deletes {
         ensure!(deleted.insert(edit.cell)&&!edits.moves.iter().any(|e|e.cell==edit.cell),"Conflicting repeated move/delete request");
-        let (id,record)=record_at(original,edit.cell,edit.source_position,edit.env_slot,edit.source_rotation)?;
-        ensure!(id>3&&!anchor_has_bind(original,edit.cell,&record)&&!bindings.has_trigger(edit.cell),
-            "Native deletion has unresolved binding/trigger dependencies for record #{id}");
-        // No ownership metadata exists. Do not infer absence or ownership from
-        // mesh bounds: this first deletion writer requires a wall-free MAP.
-        ensure!(original[WALL_OFF..GRID_OFF].iter().all(|b|b&0xf0==0),
-            "Native deletion blocked: original MAP contains walls with unresolved ownership. Removing an object cannot leave guessed collision behind; original walls preserved");
+        let dependency=native_deletion::analyze(original,edit,bindings,edits.insertion_provenance.as_ref())?;
+        dependency.validate()?;
+        // Only the independently validated spawn reference is removed. Its
+        // actor (and record-local collider) is no longer created by that sweep.
+        // Native descriptor/resources, MAP walls, floors and scripts remain.
         let off=GRID_OFF+(edit.cell.1 as usize*GRID_DIM+edit.cell.0 as usize)*2;
-        ensure!(u16::from_le_bytes(original[off..off+2].try_into()?)==id as u16,
-            "Native deletion shares its grid reference with terrain/visibility flags; a separate native writer is required");
-        updated[off..off+2].fill(0);
+        updated[off..off+2].copy_from_slice(&dependency.replacement_word.to_le_bytes());
     }
     let moved=move_originals(&mut updated,&edits.moves)?;
     let inserted=insert_copies_with_bindings(&mut updated,original,&edits.copies,&edits.tier_heights,bindings)?;
@@ -1289,6 +1292,7 @@ pub(super) struct NativeExportPlan {
     image:Vec<u8>,
     patched:Vec<String>,
     skipped:Vec<String>,
+    continuation_receipt:Option<serde_json::Value>,
 }
 
 /// Serialized resource+placement candidate, deliberately NOT an exportable
@@ -1580,6 +1584,12 @@ pub(super) fn plan_export(source:&Path, scene:&AssembledScene, world:&WorldModel
     let original=Scene::load(index,&scene.name)?;
     let map_entry=original.field_map_index(index).context("Selected scene has no native MAP")? as usize;
     let mut edits=prepare_cross_cell(scene,world,index).with_context(||inventory.clone())?;
+    if let Some((origin_name,origin_map))=insertion_provenance::context(&source)? {
+        let origin=Scene::load(index,&origin_name)?;
+        ensure!(origin.field_map_index(index).map(|i|i as usize)==Some(origin_map),"Receipt scene/MAP identity mismatch");
+        edits.insertion_provenance=insertion_provenance::load(&source,&disc,origin_map,&origin_name,
+            origin.field_floor_height_lut(index)?.context("Native floor ladder needed for insertion provenance")?)?;
+    }
     edits.moves.sort_by_key(|e|e.cell);
     edits.deletes.sort_by_key(|e|e.cell);
     edits.copies.sort_by_key(|e|e.uid);
@@ -1594,7 +1604,9 @@ fn compile_plan(source:PathBuf, mut disc:DiscPatcher, image_length:usize,
     ensure!(!edits.moves.is_empty() || !edits.deletes.is_empty() || !edits.copies.is_empty() || !edits.npcs.is_empty(),"Nothing to export");
     let has_map_edits=!edits.moves.is_empty() || !edits.deletes.is_empty() || !edits.copies.is_empty();
     let rim_elm=RIM_ELM_MAPS.iter().any(|(_,id)|*id==map_entry);
-    let targets:Vec<(&str,usize)>=if rim_elm {RIM_ELM_MAPS.to_vec()} else {vec![("selected",map_entry)]};
+    let has_unscoped=!edits.copies.is_empty() || edits.moves.iter().chain(&edits.deletes)
+        .any(|e|!edits.insertion_provenance.as_ref().is_some_and(|p|p.applies_to(map_entry,e.cell)));
+    let targets:Vec<(&str,usize)>=if rim_elm&&has_unscoped {RIM_ELM_MAPS.to_vec()} else {vec![("selected",map_entry)]};
     // IMPORTANT: validate every candidate against *its own* original MAP before
     // touching any sector. A variant with a different building cannot be forced
     // to use the coordinates/model of a similar-looking source placement.
@@ -1611,7 +1623,18 @@ fn compile_plan(source:PathBuf, mut disc:DiscPatcher, image_length:usize,
             let loaded=disc.read_disc_sectors(lba,0x28).context("Read native MAP trigger fallback")?;
             ensure!(loaded.len()==0x14000,"Incomplete native MAP load window");
             let bindings=NativeBindings::parse(&loaded[0x10000..0x12000],&loaded[0x12000..])?;
-            map_patches_with_bindings(&original,edits,&bindings)
+            let mut local=edits.clone();
+            if let Some(proof)=&edits.insertion_provenance {
+                if map_entry==proof.map_entry&&idx!=proof.map_entry {
+                    // Proven additions exist only in their recorded source MAP.
+                    // Never remove a different story state's unrelated object.
+                    local.moves.retain(|e|!proof.contains(e.cell));
+                    local.deletes.retain(|e|!proof.contains(e.cell));
+                    local.insertion_provenance=None;
+                }
+                if map_entry!=proof.map_entry {local.insertion_provenance=None;}
+            }
+            map_patches_with_bindings(&original,&local,&bindings)
         })();
         match planned {
             Ok(records)=>plans.push((name.to_string(),idx,records)),
@@ -1626,7 +1649,7 @@ fn compile_plan(source:PathBuf, mut disc:DiscPatcher, image_length:usize,
     }
     // Never silently export only the wrong Rim Elm story state. A normal
     // story save most often loads town0b or town0c rather than town01.
-    if rim_elm && has_map_edits {
+    if rim_elm && has_map_edits && has_unscoped {
         let core=[1usize,10,19];
         for idx in core {
             ensure!(plans.iter().any(|(_,found,_)|*found==idx),
@@ -1688,7 +1711,15 @@ fn compile_plan(source:PathBuf, mut disc:DiscPatcher, image_length:usize,
     }
     let written=disc.into_image();
     ensure!(written.len()==image_length,"Native patch unexpectedly changed total image size");
-    Ok(NativeExportPlan {dependencies:Default::default(),source,image:written,patched:names,skipped})
+    let continuation_receipt=edits.insertion_provenance.as_ref().map(|p|p.output_receipt(&written)).transpose()?;
+    if continuation_receipt.is_some() {
+        skipped.push(if has_unscoped {
+            "EXPERIMENTAL SOURCE: original edits retain existing story-variant validation; insertion collision evidence is never transferred between scenes. Existing resource/physics/runtime limitations remain; no production approval."
+        }else{
+            "EXPERIMENTAL SOURCE: verified inserted references are scoped to their recorded MAP; other story-state originals are unchanged. Existing resource/physics/runtime limitations remain; no production approval."
+        }.into());
+    }
+    Ok(NativeExportPlan {dependencies:Default::default(),source,image:written,patched:names,skipped,continuation_receipt})
 }
 
 /// Write only bytes already compiled and verified by native preflight.
@@ -1701,7 +1732,12 @@ pub(super) fn export(plan:NativeExportPlan, output:&Path) -> Result<ExportResult
     ensure!(parent.is_dir(),"Output directory does not exist");
     let staging=output_abs.with_extension("lckbuilding");
     ensure!(!staging.exists(),"An unfinished staging file exists at {}",staging.display());
-    let NativeExportPlan {image:written,patched:names,skipped,..}=plan;
+    let NativeExportPlan {image:written,patched:names,skipped,continuation_receipt,..}=plan;
+    if continuation_receipt.is_some() {
+        ensure!(output_abs.file_name().and_then(|n|n.to_str()).is_some_and(|n|n.contains("EXPERIMENTAL")),
+            "Input IMG retains experimental native behavior; output filename must contain EXPERIMENTAL");
+        ensure!(!output_abs.with_extension("json").exists(),"Experimental continuation receipt already exists");
+    }
     use std::io::Write;
     let mut file=std::fs::OpenOptions::new().create_new(true).write(true).open(&staging)
         .with_context(||format!("Create staging file {}",staging.display()))?;
@@ -1714,7 +1750,17 @@ pub(super) fn export(plan:NativeExportPlan, output:&Path) -> Result<ExportResult
         let _=std::fs::remove_file(&staging);
         bail!("Destination appeared during export; not replacing it");
     }
-    std::fs::rename(&staging,&output_abs).context("Finalize new test disc image")?;
+    let receipt_path=output_abs.with_extension("json");
+    if let Some(mut receipt)=continuation_receipt {
+        receipt["output_image"]=serde_json::json!(output_abs);
+        let bytes=serde_json::to_vec_pretty(&receipt)?;
+        let mut file=std::fs::OpenOptions::new().create_new(true).write(true).open(&receipt_path)?;
+        file.write_all(&bytes)?;file.sync_all()?;
+    }
+    // Create-only publication also protects against a destination appearing
+    // between preflight and finalization. Never overwrite an existing IMG.
+    std::fs::hard_link(&staging,&output_abs).context("Publish new native IMG without replacement")?;
+    std::fs::remove_file(&staging).context("Remove own staging link")?;
     log::info!("LCK native PS1 Rim Elm export: {}",names.join(", "));
     for entry in &skipped {log::warn!("{entry}");}
     Ok(ExportResult{path:output_abs,patched:names,skipped})
@@ -2023,7 +2069,7 @@ pub(super) mod tests {
     #[test]
     fn copies_use_empty_slot_and_empty_grid_keep_collision_and_floor() {
         let (original,mov,copy)=test_map(true);
-        let edits=ExportEdits{moves:vec![mov],deletes:vec![],copies:vec![copy],npcs:vec![],tier_heights:[None;16],foreign_wall_stencils:Vec::new()};
+        let edits=ExportEdits{moves:vec![mov],deletes:vec![],insertion_provenance:None,copies:vec![copy],npcs:vec![],tier_heights:[None;16],foreign_wall_stencils:Vec::new()};
         let plan=map_patches(&original,&edits).unwrap();
         let mut changed=original.clone();
         for (o,v) in plan {changed[o..o+v.len()].copy_from_slice(&v);}
@@ -2241,7 +2287,11 @@ pub(super) mod tests {
             let mut edit=first.clone();edit.cell=cell;
             edit.source_position=(field_objects::world_x(cell.0,rec.x_off),field_objects::world_z(cell.1,rec.z_off));edits.push(edit);
         }
-        for edit in &mut edits {edit.delta=[64.0,32.0,-64.0];}
+        for edit in &mut edits {
+            edit.delta=[64.0,32.0,-64.0];
+            // Explicit synthetic geometry diagnostic extent, not native ownership.
+            let (x,z)=edit.source_position;edit.collision_bounds=Some([x-64,x+64,z-64,z+64]);
+        }
         (map,edits)
     }
     #[test]
@@ -2277,13 +2327,121 @@ pub(super) mod tests {
     #[test]
     fn native_batch_deletion_rejects_unknown_walls_bindings_shared_grid_and_conflicts() {
         let (map,edits)=three_native_placements();let batch=ExportEdits{deletes:edits.clone(),..Default::default()};
-        let mut walls=map.clone();walls[WALL_OFF+1]|=0x10;
-        assert!(format!("{:#}",map_patches(&walls,&batch).unwrap_err()).contains("unresolved ownership"));assert_eq!(map[WALL_OFF+1],0);
-        let mut shared=map.clone();let off=GRID_OFF+(edits[0].cell.1 as usize*128+edits[0].cell.0 as usize)*2;shared[off+1]|=0x20;
-        assert!(map_patches(&shared,&batch).is_err());
+        let mut distant=map.clone();distant[WALL_OFF+1]|=0x10;
+        let patches=map_patches(&distant,&batch).unwrap();
+        assert!(patches.iter().all(|(off,_)|*off>=GRID_OFF));
+        let mut walls=distant.clone();let (x,z)=edits[0].source_position;
+        let (off,bit)=wall_offset(x.div_euclid(64),z.div_euclid(64)+2).unwrap();walls[off]|=bit;
+        let error=format!("{:#}",map_patches(&walls,&batch).unwrap_err());
+        assert!(error.contains("spatially relevant")&&error.contains("unresolved ownership")&&error.contains("sub-cell examples"));
+        assert_eq!(walls[WALL_OFF+1],0x10);
+        let mut shared=map.clone();let off=GRID_OFF+(edits[0].cell.1 as usize*128+edits[0].cell.0 as usize)*2;
+        shared[off+1]|=0xb8; // draw gates + slope and ground-order bits
+        let mut result=shared.clone();for (at,bytes) in map_patches(&shared,&batch).unwrap(){result[at..at+bytes.len()].copy_from_slice(&bytes);}
+        assert_eq!(u16::from_le_bytes(result[off..off+2].try_into().unwrap()),0x8800);
+        assert_eq!(&result[WALL_OFF..GRID_OFF],&shared[WALL_OFF..GRID_OFF]);
         let mut conflict=batch.clone();conflict.moves.push(edits[0].clone());assert!(map_patches(&map,&conflict).is_err());
         conflict=batch.clone();conflict.deletes.push(edits[0].clone());assert!(map_patches(&map,&conflict).is_err());
-        let mut bound=map.clone();bound[off+1]|=(field_objects::CELL_BIND_OWNED>>8) as u8;assert!(map_patches(&bound,&batch).is_err());
+        let mut bound=map.clone();let rec=ObjectRecord::parse(&bound,138).unwrap();
+        let (c,r)=edits[0].cell;let anchor=GRID_OFF+((r as i32+rec.row_delta as i32) as usize*128+(c as i32+rec.col_delta as i32) as usize)*2;
+        bound[anchor+1]|=(field_objects::CELL_BIND_OWNED>>8) as u8;assert!(map_patches(&bound,&batch).is_err());
+    }
+
+    #[test]
+    #[ignore="explicit read-only real Rim Elm deletion dependency inventory"]
+    fn real_rim_elm_deletion_dependency_inventory()->Result<()> {
+        let path=PathBuf::from(std::env::var_os("LCK_P0_SOURCE").context("LCK_P0_SOURCE required")?);
+        let library=crate::library::Library::open(&path)?;
+        let native=Scene::load(&library.index,"town01")?;
+        let assembled=legaia_engine_world_views::scene_staging::assemble_field_scene(&library.index,"town01").map_err(anyhow::Error::msg)?;
+        let world=world_view::build_world(&assembled,&library.index);
+        let disc=DiscPatcher::open(std::fs::read(&path)?)?;
+        let map_entry=native.field_map_index(&library.index).context("No MAP")? as usize;
+        let map=disc.read_entry_footprint(map_entry)?;
+        let loaded=disc.read_disc_sectors(disc.entry_disc_lba(map_entry).context("No MAP LBA")?,0x28)?;
+        let bindings=NativeBindings::parse(&loaded[0x10000..0x12000],&loaded[0x12000..])?;
+        let mut rows=Vec::new();let mut accepted=0;
+        for (index,p) in assembled.placements.iter().enumerate() {
+            let edit=MoveEdit{cell:p.cell,source_position:(p.world_x,p.world_z),env_slot:p.env_slot,
+                source_rotation:[p.rot_x,p.rot_y,p.rot_z],delta:[0.0;3],collision_bounds:original_collision_bounds(&world,index)};
+            let id=(u16::from_le_bytes(map[GRID_OFF+(p.cell.1 as usize*128+p.cell.0 as usize)*2..][..2].try_into()?)&511) as usize;
+            let status=(||->Result<()>{native_deletion::analyze(&map,&edit,&bindings,None)?.validate()?;
+                let edits=ExportEdits{deletes:vec![edit.clone()],..Default::default()};
+                let mut output=map.clone();for (off,bytes) in map_patches_with_bindings(&map,&edits,&bindings)? {output[off..off+bytes.len()].copy_from_slice(&bytes);}
+                ensure!(output[..GRID_OFF]==map[..GRID_OFF]&&output[0x10000..]==map[0x10000..],"Deletion altered native records/walls/floors/bindings");Ok(())})();
+            let outcome=match status {Ok(())=>{accepted+=1;"Native deletion bytes/readback accepted; runtime not verified".to_string()},Err(error)=>format!("{error:#}")};
+            println!("Rim Elm record #{id}, cell {:?}, model {}: {outcome}",p.cell,p.env_slot);
+            rows.push(serde_json::json!({"descriptor":id,"cell":p.cell,"model":p.env_slot,"bounds":edit.collision_bounds,"result":outcome}));
+        }
+        println!("Rim Elm: {accepted}/{} per-instance deletion candidates; no IMG generated",rows.len());
+        if let Some(out)=std::env::var_os("LCK_M11_REPORT") {
+            use std::io::Write;
+            let mut file=std::fs::OpenOptions::new().write(true).create_new(true).open(out)?;
+            file.write_all(&serde_json::to_vec_pretty(&serde_json::json!({"source":path,"scene":"town01","accepted":accepted,"rows":rows}))?)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore="explicit genuine native insertion continuation; optional new experimental IMG outputs"]
+    fn real_native_insertions_group_move_delete_and_mixed_export()->Result<()> {
+        let path=PathBuf::from(std::env::var_os("LCK_P0_SOURCE").context("LCK_P0_SOURCE required")?);
+        let library=crate::library::Library::open(&path)?;
+        let name=std::env::var("LCK_M11_SCENE").context("LCK_M11_SCENE required")?;
+        let native=Scene::load(&library.index,&name)?;
+        let assembled=legaia_engine_world_views::scene_staging::assemble_field_scene(&library.index,&name).map_err(anyhow::Error::msg)?;
+        let world=world_view::build_world(&assembled,&library.index);
+        let original=DiscPatcher::open(std::fs::read(&path)?)?;
+        let map_entry=native.field_map_index(&library.index).context("No MAP")? as usize;
+        let lut=native.field_floor_height_lut(&library.index)?.context("No native floor ladder")?;
+        let proof=insertion_provenance::load(&path,&original,map_entry,&name,lut)?.context("Verified native addition receipt required")?;
+        let selected=assembled.placements.iter().enumerate().filter(|(_,p)|proof.contains(p.cell)).map(|(i,_)|(false,i)).collect::<Vec<_>>();
+        ensure!(selected.len()==2,"Fixture expects two real independent added instances, not object-specific donor IDs");
+        let source_hash=super::super::collision_recipes::digest(original.image());
+        let out=if let Some(dir)=std::env::var_os("LCK_M11_EXPORT_DIR") {
+            let dir=PathBuf::from(dir);ensure!(dir.is_absolute()&&!dir.exists()&&dir.parent().is_some_and(|p|p.is_dir()),"Use a NEW output directory");std::fs::create_dir(&dir)?;Some(dir)
+        }else{None};
+        for case in ["move_two","delete_two","move_one_delete_one"] {
+            let mut edited=world.clone();
+            for (i,&key) in selected.iter().enumerate() {
+                if case=="delete_two"||(case=="move_one_delete_one"&&i==1) {ensure!(edited.set_hidden(key,true),"Cannot stage native deletion");}
+                else {ensure!(edited.set_offset(key.0,key.1,[64.0,0.0,0.0]),"Cannot stage native move");}
+            }
+            // Save/reopen uses the same source and existing transactional restore.
+            let text=scene_instances::serialize(&name,&edited);let doc=scene_instances::parse(&text,&name,&world).map_err(anyhow::Error::msg)?;
+            let mut reopened=world.clone();scene_instances::apply(&doc,&mut reopened,assembled.placements.len(),&library.index).map_err(anyhow::Error::msg)?;
+            ensure!(scene_instances::serialize(&name,&reopened)==text,"Saved group intent changed on restore");
+            let plan=plan_export(&path,&assembled,&reopened,&library.index)?;
+            ensure!(plan.continuation_receipt.is_some(),"Experimental input status was lost");
+            let read=DiscPatcher::open(plan.image.clone())?;let map=read.read_entry_footprint(map_entry)?;
+            let before=original.read_entry_footprint(map_entry)?;
+            ensure!(map[WALL_OFF..GRID_OFF]==before[WALL_OFF..GRID_OFF]&&map[0x10000..]==before[0x10000..],"Native wall/floor/binding data changed");
+            let start=original.entry_disc_lba(map_entry).context("No native MAP LBA")? as usize*2352;
+            let end=start+MAP_LEN/2048*2352;
+            ensure!(plan.image[..start]==original.image()[..start]&&plan.image[end..]==original.image()[end..],"Unrelated raw IMG/resource/other-story-state bytes changed");
+            for (i,&key) in selected.iter().enumerate() {
+                let p=&assembled.placements[key.1];let off=GRID_OFF+(p.cell.1 as usize*128+p.cell.0 as usize)*2;
+                let word=u16::from_le_bytes(map[off..off+2].try_into()?);
+                if case=="delete_two"||(case=="move_one_delete_one"&&i==1) {
+                    ensure!(word&511==0,"Deleted native reference survived");
+                    ensure!(!legaia_engine_field::field_regions::window_rebuild_spawns(&map,(0,0,128,128),lut.map(|v|-v)).iter().any(|s|s.tile==p.cell),"Deleted actor still appears in native window-sweep readback");
+                }else{
+                    let record=ObjectRecord::parse(&map,(word&511) as usize).context("Moved native record missing")?;
+                    ensure!(field_objects::world_x(p.cell.0,record.x_off)==p.world_x+64&&field_objects::world_z(p.cell.1,record.z_off)==p.world_z,"Shared native movement delta lost");
+                }
+            }
+            for sector in start/2352..end/2352 {ensure!(legaia_iso::write::mode2_form1_sector_is_valid(&plan.image[sector*2352..(sector+1)*2352]),"Native sector EDC/ECC failed");}
+            if let Some(dir)=&out {
+                let output=dir.join(format!("LCK_EXPERIMENTAL_M11_{name}_{case}.img"));
+                export(plan,&output)?;
+                let disk=DiscPatcher::open(std::fs::read(&output)?)?;
+                ensure!(disk.read_entry_footprint(map_entry)?==map,"Final on-disk MAP readback changed");
+                ensure!(insertion_provenance::load(&output,&disk,map_entry,&name,lut)?.is_some(),"Continuation receipt failed actual-byte verification");
+                println!("{case}: {} ; actual native bytes verified, gameplay NOT verified",output.display());
+            }
+        }
+        ensure!(super::super::collision_recipes::digest(&std::fs::read(&path)?)==source_hash,"Source IMG changed");
+        Ok(())
     }
 
     #[test]
