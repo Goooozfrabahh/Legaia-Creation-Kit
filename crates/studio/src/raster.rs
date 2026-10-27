@@ -297,6 +297,13 @@ pub fn render_highlight_with_sources(
     show_ground: bool,
     donor_vram: Option<&std::collections::HashMap<u32,std::sync::Arc<Vram>>>,
 ) -> Vec<u8> {
+    render_highlights_with_sources(model,vram,cam,shading,w,h,selected.as_slice(),show_ground,donor_vram)
+}
+
+/// Same texture/depth path with independent highlighted object IDs.
+pub fn render_highlights_with_sources(model:&Model,vram:&Vram,cam:Camera,shading:Shading,
+    w:usize,h:usize,selected:&[u32],show_ground:bool,
+    donor_vram:Option<&std::collections::HashMap<u32,std::sync::Arc<Vram>>>) -> Vec<u8> {
     let mut rgba = vec![0u8; w * h * 4];
     for px in rgba.as_chunks_mut::<4>().0 {
         px.copy_from_slice(&[30, 32, 36, 255]);
@@ -392,7 +399,7 @@ pub fn render_highlight_with_sources(
         let material_vram = donor_vram.and_then(|sources|
             model.object_ids.get(i[0]).and_then(|id|sources.get(id)))
             .map(|v|v.as_ref()).unwrap_or(vram);
-        let highlighted = selected.is_some() && model.object_ids.get(i[0]).copied() == selected;
+        let highlighted = model.object_ids.get(i[0]).is_some_and(|id|selected.contains(id));
         let lit = if shading == Shading::Lit {
             // Face normal of the drawn (posed) triangle, in view space.
             let p = [

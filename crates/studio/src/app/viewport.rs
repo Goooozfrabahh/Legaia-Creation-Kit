@@ -15,6 +15,8 @@ pub(crate) struct Viewport {
     /// ID captured at primary mouse-down on the already selected mesh.
     /// While held, LMB moves that instance instead of panning the camera.
     pub world_left_drag_selected: Option<u32>,
+    pub world_selected: Vec<u32>,
+    rendered_selection: Vec<u32>,
     rendered: Option<(Camera, Shading, [usize; 2], u64, Option<u32>, bool, bool)>,
     tex: Option<TextureHandle>,
 }
@@ -38,6 +40,7 @@ impl Viewport {
             world_mirrored: true,
             world_orbit_anchor: None,
             world_left_drag_selected: None,
+            world_selected: Vec::new(), rendered_selection: Vec::new(),
             rendered: None, tex: None,
         }
     }
@@ -116,7 +119,7 @@ impl Viewport {
                     resp.interact_pointer_pos().and_then(|pos| {
                         let point = world_screen_pick_point(rect, pos, px, mirror);
                         let hit = raster::pick_instance(model, self.cam, px[0], px[1], point);
-                        selected.filter(|id| Some(*id) == hit)
+                        hit.filter(|id|selected==Some(*id)||self.world_selected.contains(id)||ui.input(|i|i.modifiers.shift))
                     })
                 } else { None };
             }
@@ -190,9 +193,10 @@ impl Viewport {
         }
         let highlight = if world { selected } else { None };
         let state = (self.cam, self.shading, px, self.version, highlight, show_ground, mirror);
-        if self.rendered != Some(state) || self.tex.is_none() {
+        if self.rendered != Some(state) || self.rendered_selection!=self.world_selected || self.tex.is_none() {
             let mut rgba = if world {
-                raster::render_highlight_with_sources(model, vram, self.cam, self.shading, px[0], px[1], highlight, show_ground, donor_vram)
+                raster::render_highlights_with_sources(model, vram, self.cam, self.shading, px[0], px[1],
+                    if self.world_selected.is_empty() {highlight.as_slice()} else {&self.world_selected}, show_ground, donor_vram)
             } else {
                 raster::render(model, vram, self.cam, self.shading, px[0], px[1])
             };
@@ -205,13 +209,14 @@ impl Viewport {
                 None => self.tex = Some(ui.ctx().load_texture("model", img, TextureOptions::LINEAR)),
             }
             self.rendered = Some(state);
+            self.rendered_selection=self.world_selected.clone();
         }
         if let Some(tex) = &self.tex {
             ui.painter().image(tex.id(), rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 Color32::WHITE);
         }
-        if world && !repository_drag && resp.clicked_by(PointerButton::Primary) {
+        if world && !repository_drag && resp.hovered() && ui.input(|i|i.pointer.primary_pressed() && !i.modifiers.alt) {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let screen_point = world_screen_pick_point(rect, pos, px, mirror);
                 picked = raster::pick_instance(model, self.cam, px[0], px[1], screen_point);
@@ -255,6 +260,37 @@ fn flip_rgba_rows(rgba: &mut [u8], width: usize) {
 #[cfg(test)]
 mod world_navigation_tests {
     use super::*;
+    #[test]
+    fn group_member_press_captures_drag_without_camera_pan_or_release_reselection() {
+        let world=super::super::collision_recipes::properties_fixture();let model=world.model.as_ref().unwrap();
+        let ctx=egui::Context::default();let mut view=Viewport::new(Shading::Textured);
+        view.world_mirrored=false;view.world_selected=vec![0,1];
+        let mut rect=egui::Rect::NOTHING;
+        let frame=|view:&mut Viewport,rect:&mut egui::Rect,events:Vec<egui::Event>| {
+            let mut picked=None;
+            let _=ctx.run(egui::RawInput{screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(320.0,240.0))),events,..Default::default()},|ctx|{
+                egui::CentralPanel::default().show(ctx,|ui|{*rect=ui.available_rect_before_wrap();
+                    picked=view.show_world_limited_with_sources(ui,model,&Vram::new(),400,300,Some(0),true,false,&world.foreign_vram);
+                });
+            });picked
+        };
+        frame(&mut view,&mut rect,vec![]);let camera=view.cam;
+        let px=[rect.width() as usize,rect.height() as usize];
+        let point=(0..px[1]).step_by(3).find_map(|y|(0..px[0]).step_by(3).find_map(|x|
+            (raster::pick_instance(model,camera,px[0],px[1],[x as f32,y as f32])==Some(1)).then_some([x,y]))).expect("Fixture's second object must be visible");
+        let pos=rect.min+egui::vec2(point[0] as f32,point[1] as f32);
+        let press=egui::Event::PointerButton{pos,button:PointerButton::Primary,pressed:true,modifiers:Default::default()};
+        assert_eq!(frame(&mut view,&mut rect,vec![egui::Event::PointerMoved(pos),press]),Some(1));
+        assert_eq!(view.world_left_drag_selected,Some(1)); // not just primary 0
+        frame(&mut view,&mut rect,vec![egui::Event::PointerMoved(pos+egui::vec2(16.0,8.0))]);
+        assert_eq!(view.cam,camera);
+        let release=egui::Event::PointerButton{pos,button:PointerButton::Primary,pressed:false,modifiers:Default::default()};
+        assert_eq!(frame(&mut view,&mut rect,vec![release]),None);
+        assert_eq!(view.world_left_drag_selected,None);
+        let single=raster::render_highlight_with_sources(model,&Vram::new(),camera,Shading::Textured,px[0],px[1],Some(0),true,None);
+        let group=raster::render_highlights_with_sources(model,&Vram::new(),camera,Shading::Textured,px[0],px[1],&[0,1],true,None);
+        assert_ne!(single,group,"Both independent meshes must receive highlights");
+    }
     #[test]
     fn world_object_drag_picks_exact_selected_instance_with_mirror() {
         let rect = egui::Rect::from_min_size(egui::pos2(100.0, 40.0), egui::vec2(200.0, 100.0));

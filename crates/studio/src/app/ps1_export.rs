@@ -82,6 +82,7 @@ pub(super) struct NpcEdit {
 #[derive(Clone, Debug, Default)]
 pub(super) struct ExportEdits {
     pub moves: Vec<MoveEdit>,
+    pub deletes: Vec<MoveEdit>,
     pub copies: Vec<InsertEdit>,
     pub npcs: Vec<NpcEdit>,
     /// Native placed-object floor height in the original PSX Y-down frame,
@@ -351,7 +352,7 @@ pub(super) fn prepare_cross_cell(scene: &AssembledScene, world: &WorldModel,
     }
     ensure!(imported.len()==doc.foreign.len(),"Some foreign assets did not resolve to native copies");
     ensure!(edits.copies.len()<=16,"Native IMG export permits no more than 16 total original/cross-cell object copies");
-    ensure!(!edits.moves.is_empty() || !edits.copies.is_empty() || !edits.npcs.is_empty(),
+    ensure!(!edits.moves.is_empty() || !edits.deletes.is_empty() || !edits.copies.is_empty() || !edits.npcs.is_empty(),
         "No native changes to export");
     Ok(edits)
 }
@@ -460,8 +461,12 @@ enum PreparationMode { NativeExport, CrossCellExport, CollisionPreview }
 fn prepare_with_mode(scene: &AssembledScene, world: &WorldModel, mode: PreparationMode) -> Result<ExportEdits> {
     let collision_preview = mode == PreparationMode::CollisionPreview;
     let overlay = scene_instances::serialize(&scene.name, world);
-    let doc = scene_instances::parse(&overlay, &scene.name, world)
+    let mut doc = scene_instances::parse(&overlay, &scene.name, world)
         .map_err(anyhow::Error::msg)?;
+    // Final deletion supersedes earlier preview transforms of that original.
+    doc.moves.retain(|(key,_)|!doc.hidden.contains(key));
+    doc.rotations.retain(|(key,_)|!matches!(key,scene_instances::NameTarget::Native(t,i) if doc.hidden.contains(&(*t,*i))));
+    doc.scales.retain(|(key,_)|!matches!(key,scene_instances::NameTarget::Native(t,i) if doc.hidden.contains(&(*t,*i))));
     // Local export cannot resolve foreign dependencies. Cross-cell export
     // must validate them separately before the edits can reach the writer.
     if mode == PreparationMode::NativeExport {
@@ -473,8 +478,16 @@ fn prepare_with_mode(scene: &AssembledScene, world: &WorldModel, mode: Preparati
     // Both export modes reject every unsupported rotation or scale.
     ensure!(!has_unhandled_native_transforms(&doc, collision_preview),
         "Native rotation/scale requires a native transform/TMD export stage; reset rotation/scale or save .lckscene to preserve the edit. Stage M2 changes placement freedoms only.");
-    ensure!(doc.hidden.is_empty(), "Native object hiding/deletion is not supported yet.");
+
     let mut result=ExportEdits::default();
+    for &(terrain,index) in &doc.hidden {
+        ensure!(!terrain,"Native deletion of terrain/ground is unsupported; no output written");
+        ensure!(world.npc((terrain,index)).is_none(),"Native NPC/actor deletion requires MAN script/dependency removal; no output written");
+        let native=scene.placements.get(index).with_context(||format!("No native placement for deletion #{index}"))?;
+        result.deletes.push(MoveEdit{collision_bounds:None,cell:native.cell,
+            source_position:(native.world_x,native.world_z),env_slot:native.env_slot,
+            source_rotation:[native.rot_x,native.rot_y,native.rot_z],delta:[0.0;3]});
+    }
     // NPC clip and model selections are represented in WorldModel; the parsed
     // overlay has already checked model/animation compatibility.
     // Scene actor edit controls are already wired to the MAN catalog.
@@ -551,7 +564,7 @@ fn prepare_with_mode(scene: &AssembledScene, world: &WorldModel, mode: Preparati
             source_rotation:[source.rot_x,source.rot_y,source.rot_z],delta:created.offset });
     }
     if !collision_preview {
-        ensure!(mode == PreparationMode::CrossCellExport || !result.moves.is_empty() || !result.copies.is_empty() || !result.npcs.is_empty(),
+        ensure!(mode == PreparationMode::CrossCellExport || !result.moves.is_empty() || !result.deletes.is_empty() || !result.copies.is_empty() || !result.npcs.is_empty(),
             "No native objects changed. Move, duplicate or change a native environment object / NPC.");
         ensure!(result.npcs.iter().filter(|n|n.uid.is_some()).count()<=4,
             "NPC insertion is experimental: export at most 4 new actors per build");
@@ -1181,7 +1194,7 @@ fn map_patches(original: &[u8], edits: &ExportEdits) -> Result<Vec<(usize,Vec<u8
 
 fn map_patches_with_bindings(original:&[u8],edits:&ExportEdits,bindings:&NativeBindings) -> Result<Vec<(usize,Vec<u8>)>> {
     ensure!(original.len()==MAP_LEN,"MAP must be exactly 0x12000 bytes");
-    for cell in edits.moves.iter().map(|e|e.cell).chain(edits.copies.iter().map(|e|e.cell)) {
+    for cell in edits.moves.iter().chain(&edits.deletes).map(|e|e.cell).chain(edits.copies.iter().map(|e|e.cell)) {
         let go=GRID_OFF+(cell.1 as usize*GRID_DIM+cell.0 as usize)*2;
         ensure!(cell.0<128 && cell.1<128,"Source reference outside native grid");
         let id=(u16::from_le_bytes(original[go..go+2].try_into()?)&511) as usize;
@@ -1193,6 +1206,21 @@ fn map_patches_with_bindings(original:&[u8],edits:&ExportEdits,bindings:&NativeB
         }
     }
     let mut updated=original.to_vec();
+    let mut deleted=HashSet::new();
+    for edit in &edits.deletes {
+        ensure!(deleted.insert(edit.cell)&&!edits.moves.iter().any(|e|e.cell==edit.cell),"Conflicting repeated move/delete request");
+        let (id,record)=record_at(original,edit.cell,edit.source_position,edit.env_slot,edit.source_rotation)?;
+        ensure!(id>3&&!anchor_has_bind(original,edit.cell,&record)&&!bindings.has_trigger(edit.cell),
+            "Native deletion has unresolved binding/trigger dependencies for record #{id}");
+        // No ownership metadata exists. Do not infer absence or ownership from
+        // mesh bounds: this first deletion writer requires a wall-free MAP.
+        ensure!(original[WALL_OFF..GRID_OFF].iter().all(|b|b&0xf0==0),
+            "Native deletion blocked: original MAP contains walls with unresolved ownership. Removing an object cannot leave guessed collision behind; original walls preserved");
+        let off=GRID_OFF+(edit.cell.1 as usize*GRID_DIM+edit.cell.0 as usize)*2;
+        ensure!(u16::from_le_bytes(original[off..off+2].try_into()?)==id as u16,
+            "Native deletion shares its grid reference with terrain/visibility flags; a separate native writer is required");
+        updated[off..off+2].fill(0);
+    }
     let moved=move_originals(&mut updated,&edits.moves)?;
     let inserted=insert_copies_with_bindings(&mut updated,original,&edits.copies,&edits.tier_heights,bindings)?;
     let wall_report=compile_walls(&mut updated,original,edits)?;
@@ -1216,6 +1244,11 @@ fn map_patches_with_bindings(original:&[u8],edits:&ExportEdits,bindings:&NativeB
             for p in off..off+6 {allowed[p]=true;}
             for p in off+14..off+16 {allowed[p]=true;}
         }
+    }
+    for &(col,row) in &deleted {
+        let off=GRID_OFF+(row as usize*GRID_DIM+col as usize)*2;
+        allowed[off]=true;allowed[off+1]=true;
+        ensure!(!field_objects::parse_placements(&updated).iter().any(|p|(p.col,p.row)==(col,row)),"Deleted placement survived native readback");
     }
     for copy in &inserted {
         for p in copy.id*32..copy.id*32+32 {allowed[p]=true;}
@@ -1548,6 +1581,7 @@ pub(super) fn plan_export(source:&Path, scene:&AssembledScene, world:&WorldModel
     let map_entry=original.field_map_index(index).context("Selected scene has no native MAP")? as usize;
     let mut edits=prepare_cross_cell(scene,world,index).with_context(||inventory.clone())?;
     edits.moves.sort_by_key(|e|e.cell);
+    edits.deletes.sort_by_key(|e|e.cell);
     edits.copies.sort_by_key(|e|e.uid);
     edits.npcs.sort_by_key(|e|(e.uid,e.record));
     let mut plan=compile_plan(source,disc,image_length,map_entry,&edits).with_context(||inventory)?;
@@ -1557,8 +1591,8 @@ pub(super) fn plan_export(source:&Path, scene:&AssembledScene, world:&WorldModel
 
 fn compile_plan(source:PathBuf, mut disc:DiscPatcher, image_length:usize,
     map_entry:usize, edits:&ExportEdits) -> Result<NativeExportPlan> {
-    ensure!(!edits.moves.is_empty() || !edits.copies.is_empty() || !edits.npcs.is_empty(),"Nothing to export");
-    let has_map_edits=!edits.moves.is_empty() || !edits.copies.is_empty();
+    ensure!(!edits.moves.is_empty() || !edits.deletes.is_empty() || !edits.copies.is_empty() || !edits.npcs.is_empty(),"Nothing to export");
+    let has_map_edits=!edits.moves.is_empty() || !edits.deletes.is_empty() || !edits.copies.is_empty();
     let rim_elm=RIM_ELM_MAPS.iter().any(|(_,id)|*id==map_entry);
     let targets:Vec<(&str,usize)>=if rim_elm {RIM_ELM_MAPS.to_vec()} else {vec![("selected",map_entry)]};
     // IMPORTANT: validate every candidate against *its own* original MAP before
@@ -1989,7 +2023,7 @@ pub(super) mod tests {
     #[test]
     fn copies_use_empty_slot_and_empty_grid_keep_collision_and_floor() {
         let (original,mov,copy)=test_map(true);
-        let edits=ExportEdits{moves:vec![mov],copies:vec![copy],npcs:vec![],tier_heights:[None;16],foreign_wall_stencils:Vec::new()};
+        let edits=ExportEdits{moves:vec![mov],deletes:vec![],copies:vec![copy],npcs:vec![],tier_heights:[None;16],foreign_wall_stencils:Vec::new()};
         let plan=map_patches(&original,&edits).unwrap();
         let mut changed=original.clone();
         for (o,v) in plan {changed[o..o+v.len()].copy_from_slice(&v);}
@@ -2193,6 +2227,63 @@ pub(super) mod tests {
         let compiled=DiscPatcher::open(a.image).unwrap().read_entry_footprint(0).unwrap();
         assert!(field_objects::parse_placements(&compiled).iter().any(|p|p.obj_idx==511));
         assert_eq!(&compiled[WALL_OFF..GRID_OFF],&map[WALL_OFF..GRID_OFF]);
+    }
+
+    fn three_native_placements()->(Vec<u8>,Vec<MoveEdit>) {
+        let (mut map,first,_)=test_map(false);let mut edits=vec![first.clone()];
+        let record=map[138*32..139*32].to_vec();
+        for (id,cell) in [(139usize,(37u8,33u8)),(140,(41,33))] {
+            map[id*32..id*32+32].copy_from_slice(&record);
+            let off=GRID_OFF+(cell.1 as usize*128+cell.0 as usize)*2;
+            map[off..off+2].copy_from_slice(&(id as u16).to_le_bytes());
+            map[WALL_OFF+cell.1 as usize*128+cell.0 as usize]=4;
+            let rec=ObjectRecord::parse(&map,id).unwrap();
+            let mut edit=first.clone();edit.cell=cell;
+            edit.source_position=(field_objects::world_x(cell.0,rec.x_off),field_objects::world_z(cell.1,rec.z_off));edits.push(edit);
+        }
+        for edit in &mut edits {edit.delta=[64.0,32.0,-64.0];}
+        (map,edits)
+    }
+    #[test]
+    fn three_moved_and_three_deleted_placements_export_and_reopen_synthetic_imgs() {
+        let (map,edits)=three_native_placements();let image=map_disc(&map);
+        let folder=std::env::current_dir().unwrap().join("target").join(format!("m1-native-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let source=folder.join("synthetic-source.img");std::fs::write(&source,&image).unwrap();
+        for deleting in [false,true] {
+            let batch=if deleting {ExportEdits{deletes:edits.clone(),..Default::default()}}
+                else {ExportEdits{moves:edits.clone(),..Default::default()}};
+            let make=||compile_plan(source.clone(),DiscPatcher::open(image.clone()).unwrap(),image.len(),0,&batch).unwrap();
+            let a=make();let b=make();assert_eq!(a.image,b.image);
+            let output=folder.join(if deleting {"three-deleted.img"}else{"three-moved.img"});
+            export(a,&output).unwrap();
+            let bytes=std::fs::read(&output).unwrap();assert!(export(make(),&output).is_err());
+            assert_eq!(std::fs::read(&output).unwrap(),bytes);assert_eq!(std::fs::read(&source).unwrap(),image);
+            let read=DiscPatcher::open(bytes).unwrap();let result=read.read_entry_footprint(0).unwrap();
+            let placed=field_objects::parse_placements(&result);
+            for edit in &edits {
+                let found=placed.iter().find(|p|(p.col,p.row)==edit.cell);
+                if deleting {assert!(found.is_none());}
+                else {let p=found.unwrap();assert_eq!((p.world_x,p.world_z),(edit.source_position.0+64,edit.source_position.1-64));
+                    let r=ObjectRecord::parse(&result,p.obj_idx as usize).unwrap();let old=ObjectRecord::parse(&map,p.obj_idx as usize).unwrap();assert_eq!(r.y_off,old.y_off-32);}
+            }
+            if deleting {assert_eq!(&result[..WALL_OFF],&map[..WALL_OFF]);}
+            assert_eq!(&result[WALL_OFF..GRID_OFF],&map[WALL_OFF..GRID_OFF]);assert_eq!(&result[0x10000..],&map[0x10000..]);
+            let original=DiscPatcher::open(image.clone()).unwrap();assert_eq!(read.read_entry_footprint(1).unwrap(),original.read_entry_footprint(1).unwrap());
+            let start=read.entry_disc_lba(0).unwrap() as usize;
+            for sector in 0..MAP_LEN/2048 {let offset=(start+sector)*2352;assert!(legaia_iso::write::mode2_form1_sector_is_valid(&read.image()[offset..offset+2352]));}
+        }
+    }
+    #[test]
+    fn native_batch_deletion_rejects_unknown_walls_bindings_shared_grid_and_conflicts() {
+        let (map,edits)=three_native_placements();let batch=ExportEdits{deletes:edits.clone(),..Default::default()};
+        let mut walls=map.clone();walls[WALL_OFF+1]|=0x10;
+        assert!(format!("{:#}",map_patches(&walls,&batch).unwrap_err()).contains("unresolved ownership"));assert_eq!(map[WALL_OFF+1],0);
+        let mut shared=map.clone();let off=GRID_OFF+(edits[0].cell.1 as usize*128+edits[0].cell.0 as usize)*2;shared[off+1]|=0x20;
+        assert!(map_patches(&shared,&batch).is_err());
+        let mut conflict=batch.clone();conflict.moves.push(edits[0].clone());assert!(map_patches(&map,&conflict).is_err());
+        conflict=batch.clone();conflict.deletes.push(edits[0].clone());assert!(map_patches(&map,&conflict).is_err());
+        let mut bound=map.clone();bound[off+1]|=(field_objects::CELL_BIND_OWNED>>8) as u8;assert!(map_patches(&bound,&batch).is_err());
     }
 
     #[test]

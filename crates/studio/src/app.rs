@@ -1,6 +1,7 @@
 //! The egui front end over [`Studio`].
 
 mod actors_ui;
+mod multi_selection;
 mod media_ui;
 mod viewport;
 mod world_view;
@@ -259,6 +260,7 @@ struct EditorSceneHistory {
     overlay: String,
     /// Stable selection identity, unaffected by recreated duplicate indices.
     selected: Option<scene_instances::NameTarget>,
+    selection: Vec<scene_instances::NameTarget>,
 }
 
 fn editor_history_capture(world: &world_view::WorldModel, scene_name: &str,
@@ -268,7 +270,18 @@ fn editor_history_capture(world: &world_view::WorldModel, scene_name: &str,
             Some(uid) => scene_instances::NameTarget::Created(uid),
             None => scene_instances::NameTarget::Native(key.0,key.1),
         }));
-    EditorSceneHistory {overlay: scene_instances::serialize(scene_name,world), selected}
+    EditorSceneHistory {overlay: scene_instances::serialize(scene_name,world), selection: selected.iter().cloned().collect(), selected}
+}
+
+fn editor_history_capture_group(world: &world_view::WorldModel, name: &str,
+    primary: Option<(bool,usize)>, selection: &std::collections::BTreeSet<(bool,usize)>) -> EditorSceneHistory {
+    let mut history=editor_history_capture(world,name,primary);
+    history.selection=multi_selection::keys(primary,selection).into_iter().filter_map(|key|
+        world.at(key.0,key.1).map(|draw|match draw.editor_uid {
+            Some(uid)=>scene_instances::NameTarget::Created(uid),
+            None=>scene_instances::NameTarget::Native(key.0,key.1),
+        })).collect();
+    history
 }
 
 fn editor_history_selected(world: &world_view::WorldModel,
@@ -549,10 +562,12 @@ fn editor_duplicate_request(
 /// browser's names, these rename individual scene instances only.
 fn editor_hierarchy_row(ui: &mut egui::Ui, label: String,
     key: (bool,usize), selected: &mut Option<(bool,usize)>,
+    selection: &mut std::collections::BTreeSet<(bool,usize)>,
     chosen: &mut Option<(EditorCatalogItem,bool)>,
-    rename: &mut Option<(bool,usize)>) {
-    let response = ui.selectable_label(*selected==Some(key), label);
-    if response.clicked() || response.secondary_clicked() { *selected=Some(key); }
+    rename: &mut Option<(bool,usize)>) -> egui::Rect {
+    let response = ui.selectable_label(multi_selection::keys(*selected,selection).contains(&key), label);
+    if response.clicked() {multi_selection::click(selected,selection,key,ui.input(|i|i.modifiers.shift));}
+    if response.secondary_clicked() {multi_selection::click(selected,selection,key,false);}
     response.context_menu(|ui| {
         if ui.button("Properties").clicked() {
             *chosen=Some((EditorCatalogItem::Draw(key.0,key.1),false)); ui.close();
@@ -562,6 +577,7 @@ fn editor_hierarchy_row(ui: &mut egui::Ui, label: String,
         }
         if ui.button("Rename").clicked() { *rename=Some(key); ui.close(); }
     });
+    response.rect
 }
 
 /// One editor cell is selected at a time; context menu operations are
@@ -729,6 +745,7 @@ pub struct App {
     tab: Tab,
     native_scene: Option<(String, NativeSceneSlot)>,
     pending_native_scene: Option<(String, CellSelection, NativeSceneSlot)>,
+    native_selection: std::collections::BTreeSet<(bool,usize)>,
     native_selected: Option<(bool, usize)>, // false = placement; true = terrain
     native_view: Viewport,
     native_ground_visible: bool,
@@ -753,6 +770,7 @@ pub struct App {
     geck_transform_clipboard: Option<GeckTransformClipboard>,
     /// Session-only camera bookmarks: no changes to original scene or native IMG.
     geck_camera_bookmarks: [Option<crate::raster::Camera>; 3],
+    native_drag_group: Vec<((bool,usize),[f32;3])>,
     native_drag: Option<EditorDrag>,
     native_rotate: Option<EditorRotateDrag>,
     native_rotate_undo: Vec<EditorRotationEdit>,
@@ -930,6 +948,7 @@ impl App {
             tab,
             native_scene: None,
             pending_native_scene: None,
+            native_selection: Default::default(),
             native_selected: None,
             native_view: Viewport::new(Shading::Textured),
             native_ground_visible: true,
@@ -945,6 +964,7 @@ impl App {
             geck_angle_snap: 0.0,
             geck_transform_clipboard: None,
             geck_camera_bookmarks: [None; 3],
+            native_drag_group: Vec::new(),
             native_drag: None,
             native_rotate: None,
             native_rotate_undo: Vec::new(),
@@ -1089,7 +1109,7 @@ impl App {
         self.native_scene = None;
         self.pending_native_scene = None;
         self.native_collision_preview_cache = None;
-        self.native_selected = None;
+        self.native_selected = None; self.native_selection.clear();
         self.native_drag = None;
         self.editor_asset_drag = None;
         self.editor_catalog_active = None;
@@ -1396,7 +1416,7 @@ impl App {
     /// Reset document-local UI only after a replacement scene is ready.
     fn finish_native_scene_load(&mut self) {
         self.native_collision_preview_cache = None;
-        self.native_selected = None;
+        self.native_selected = None; self.native_selection.clear();
         self.native_drag = None;
         self.native_rotate = None;
         self.native_rotate_undo.clear();
@@ -1818,7 +1838,7 @@ impl App {
                     });
             });
         if focus_cell || duplicate.is_some() || rename.is_some() || properties.is_some() {
-            self.native_selected=None;
+            self.native_selected=None; self.native_selection.clear();
         }
         if let Some(cell)=choose {self.select_editor_cell(cell);}
         if let Some(cell)=duplicate {self.duplicate_editor_cell(cell);}
@@ -2375,10 +2395,12 @@ impl App {
             } else if self.editor_properties_target.take().is_some() {
                 self.npc_playing = None;
             } else {
-                self.native_selected = None;
+                self.native_selected = None; self.native_selection.clear();
                 self.native_drag = None;
                 self.native_rotate = None;
             }
+            self.native_selected=None;self.native_selection.clear();
+            self.native_drag=None;self.native_rotate=None;
         }
         let mut pending_transform: Option<((bool, usize), [f32; 3], bool)> = None;
         let mut pending_rotation: Option<((bool, usize), [f32; 3], bool)> = None;
@@ -2462,7 +2484,7 @@ impl App {
                                         if !hierarchy_filter.is_empty() &&
                                             !label.to_lowercase().contains(&hierarchy_filter) &&
                                             !self.editor_item_matches(Some(scene),EditorCatalogItem::Draw(false,i),&hierarchy_filter) {continue;}
-                                        editor_hierarchy_row(ui,label,key,&mut self.native_selected,
+                                        editor_hierarchy_row(ui,label,key,&mut self.native_selected,&mut self.native_selection,
                                             &mut hierarchy_popup,&mut hierarchy_rename);
                                     }
                                 });
@@ -2478,7 +2500,7 @@ impl App {
                                         if !hierarchy_filter.is_empty() &&
                                             !label.to_lowercase().contains(&hierarchy_filter) &&
                                             !self.editor_item_matches(Some(scene),EditorCatalogItem::Draw(true,i),&hierarchy_filter) {continue;}
-                                        editor_hierarchy_row(ui,label,key,&mut self.native_selected,
+                                        editor_hierarchy_row(ui,label,key,&mut self.native_selected,&mut self.native_selection,
                                             &mut hierarchy_popup,&mut hierarchy_rename);
                                     }
                                 });
@@ -2499,7 +2521,7 @@ impl App {
                                                 !label.to_lowercase().contains(&hierarchy_filter) &&
                                                 !self.editor_item_matches(Some(scene),
                                                     EditorCatalogItem::Draw(false,npc.key),&hierarchy_filter) {continue;}
-                                            editor_hierarchy_row(ui,label,key,&mut self.native_selected,
+                                            editor_hierarchy_row(ui,label,key,&mut self.native_selected,&mut self.native_selection,
                                                 &mut hierarchy_popup,&mut hierarchy_rename);
                                         }
                                     });
@@ -2514,7 +2536,7 @@ impl App {
                                             let label=format!("{}  [copy #{}]",self.editor_name_for(Some(scene),EditorCatalogItem::Draw(d.terrain,d.index)),d.editor_uid.unwrap_or(0));
                                             if !hierarchy_filter.is_empty() &&
                                                 !label.to_lowercase().contains(&hierarchy_filter) {continue;}
-                                            editor_hierarchy_row(ui,label,(false,d.index),&mut self.native_selected,
+                                            editor_hierarchy_row(ui,label,(false,d.index),&mut self.native_selected,&mut self.native_selection,
                                                 &mut hierarchy_popup,&mut hierarchy_rename);
                                         }
                                     });
@@ -3194,6 +3216,8 @@ impl App {
                     // the camera eye stays fixed when MMB/Alt+LMB rotates.
                     self.native_view.world_orbit_anchor = self.native_selected.and_then(|(terrain, index)|
                         world.at(terrain, index).map(|d| d.center));
+                    self.native_view.world_selected=multi_selection::keys(self.native_selected,&self.native_selection).iter()
+                        .filter_map(|key|world.at(key.0,key.1).filter(|d|!d.hidden).map(|d|d.id)).collect();
                     let selected_id = self.native_selected.and_then(|(terrain, index)|
                         world.at(terrain, index).map(|d| d.id));
                     // Gesture is determined at mouse-down from the actual rasterized
@@ -3203,6 +3227,11 @@ impl App {
                     let picked = self.native_view.show_world_limited_with_sources(ui, model, &scene.res.vram,
                         900, 680, selected_id, self.native_ground_visible,
                         self.editor_asset_drag.is_some(), &world.foreign_vram);
+                    if let Some(draw)=picked.and_then(|id|world.by_id(id)) {
+                        multi_selection::click(&mut self.native_selected,&mut self.native_selection,
+                            (draw.terrain,draw.index),ui.input(|i|i.modifiers.shift));
+                        ui.ctx().request_repaint();
+                    }
                     if self.native_collision_wire_visible {
                         let source_key = self.studio.library.as_ref()
                             .map(|lib| match &lib.source {
@@ -3343,10 +3372,12 @@ impl App {
                             // A previously selected *visible* mesh must be hit at mouse-down.
                             // Never start moving an object when a drag begins over ground,
                             // empty space or another object (those gestures pan normally).
-                            if pressed && view_rect.contains(pos) {
+                            if pressed && !ui.input(|i|i.modifiers.shift) && view_rect.contains(pos) {
                                 if let Some(draw) = world.at(key.0, key.1) {
                                     if !draw.hidden && draw.vertex_start < draw.vertex_end &&
                                         self.native_view.world_left_drag_selected == Some(draw.id) {
+                                        self.native_drag_group=multi_selection::keys(self.native_selected,&self.native_selection).into_iter()
+                                            .filter_map(|k|world.at(k.0,k.1).filter(|d|!d.hidden).map(|d|(k,d.offset))).collect();
                                         self.native_drag = Some(EditorDrag {
                                             key, pointer_start: pos, offset_start: draw.offset,
                                         });
@@ -3453,12 +3484,6 @@ impl App {
                                     Err(message)=>self.studio.error=Some(format!("Cannot place asset: {message}")),
                                 }
                             }
-                        }
-                    }
-                    if let Some(id) = picked {
-                        if let Some(draw) = world.by_id(id) {
-                            self.native_selected = Some((draw.terrain, draw.index));
-                            ui.ctx().request_repaint();
                         }
                     }
                 } else {
@@ -3585,7 +3610,7 @@ impl App {
         let before_frame=if editor_changed_this_frame {
             match (self.native_scene.as_ref(),world.as_deref()) {
                 (Some((name,NativeSceneSlot::Ready(_, _))),Some(w))=>
-                    Some(editor_history_capture(w,name,self.native_selected)),
+                    Some(editor_history_capture_group(w,name,self.native_selected,&self.native_selection)),
                 _=>None,
             }
         } else {None};
@@ -3638,15 +3663,11 @@ impl App {
         if let Some(key)=pending_delete {
             if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut() {
                 if let Some(world)=Arc::get_mut(world) {
-                    let created=world.at(key.0,key.1).map(|d|d.editor_uid.is_some());
-                    let result=match created {
-                        Some(true)=>world.delete_created(key),
-                        Some(false)=>if world.set_hidden(key,true) {Ok(())} else {Err("Could not hide native object".into())},
-                        None=>Err("Selected instance was not found".into()),
-                    };
+                    let keys=multi_selection::keys(Some(key),&self.native_selection);
+                    let result=multi_selection::delete(world,&keys);
                     match result {
                         Ok(())=>{
-                            self.native_selected=None;
+                            self.native_selected=None; self.native_selection.clear();
                             self.native_drag=None;
                             self.native_rotate=None;
                             self.native_undo.clear(); self.native_redo.clear();
@@ -3767,7 +3788,13 @@ impl App {
                 if let Some(world) = Arc::get_mut(world) {
                     if let Some(draw) = world.at(key.0, key.1) {
                         let before = draw.offset;
-                        if before != desired && world.set_offset(key.0, key.1, desired) {
+                        let group=if !record && self.native_drag.is_some_and(|d|d.key==key) {
+                            let delta=[0,1,2].map(|a|desired[a]-self.native_drag.unwrap().offset_start[a]);
+                            self.native_drag_group.iter().map(|(k,start)|(*k,[0,1,2].map(|a|start[a]+delta[a]))).collect()
+                        }else{vec![(key,desired)]};
+                        let moved=if before!=desired {multi_selection::move_offsets(world,&group)}else{Ok(())};
+                        if let Err(error)=moved {self.studio.error=Some(error);}
+                        else if before != desired {
                             self.native_view.version = self.native_view.version.wrapping_add(1);
                             ctx.request_repaint();
                             if record {
@@ -3863,7 +3890,7 @@ impl App {
                         .and_then(|index|scene_instances::apply(&doc,world,scene.placements.len(),index));
                     match result {
                         Ok(())=>{
-                            self.native_selected=None;
+                            self.native_selected=None; self.native_selection.clear();
                             self.editor_properties_target=None;
                             self.editor_context_menu=None;
                             self.npc_playing=None;
@@ -3909,7 +3936,7 @@ impl App {
         // one history entry on mouse release. Snapshot captures only metadata.
         let after_frame=if editor_changed_this_frame || pending_history_undo || pending_history_redo {
             self.native_scene.as_ref().and_then(|(name,state)|match state {
-                NativeSceneSlot::Ready(_,w)=>Some(editor_history_capture(w,name,self.native_selected)),
+                NativeSceneSlot::Ready(_,w)=>Some(editor_history_capture_group(w,name,self.native_selected,&self.native_selection)),
                 _=>None,
             })
         } else {None};
@@ -3951,6 +3978,7 @@ impl App {
                             scene_instances::apply(&doc,world,scene.placements.len(),index)?;
                             self.native_selected=target.selected.as_ref()
                                 .and_then(|id|editor_history_selected(world,id));
+                            self.native_selection=target.selection.iter().filter_map(|id|editor_history_selected(world,id)).collect();
                             Ok(())
                         });
                     match restore {
@@ -6107,8 +6135,8 @@ mod catalog_ui_tests {
         let world=Arc::new(world);
         app.native_scene=Some(("synthetic".into(),NativeSceneSlot::Ready(Arc::new(scene),world.clone())));
         app.native_selected=Some((false,world_view::NPC_KEY_BASE+1));
-        app.editor_undo.push(EditorSceneHistory{overlay:"undo".into(),selected:None});
-        app.editor_redo.push(EditorSceneHistory{overlay:"redo".into(),selected:None});
+        app.editor_undo.push(EditorSceneHistory{overlay:"undo".into(),selected:None,selection:vec![]});
+        app.editor_redo.push(EditorSceneHistory{overlay:"redo".into(),selected:None,selection:vec![]});
         let version=app.native_view.version;
         let camera=app.native_view.cam;
         let (tx,rx)=std::sync::mpsc::channel();
@@ -6140,7 +6168,7 @@ mod catalog_ui_tests {
         let native = scene_instances::NameTarget::Native(false,9);
         assert_ne!(source,native);
         let restored = EditorSceneHistory {overlay:"LCK_SCENE_V1\ttown\n".into(),
-            selected:Some(source.clone())};
+            selected:Some(source.clone()),selection:vec![source.clone()]};
         assert_eq!(restored.selected,Some(source));
     }
     #[test]
@@ -6216,7 +6244,73 @@ mod catalog_ui_tests {
         assert_eq!(app.editor_name_edit_key.as_deref(), Some("actor:character:0"));
     }
     #[test]
-    fn escape_closes_modal_before_clearing_selection_without_moving_camera() {
+    fn viewport_drag_moves_three_members_as_one_workspace_undo_redo() {
+        let mut app=app();let ctx=egui::Context::default();let (scene,_)=ps1_export::tests::actor_fixture();
+        let mut world=collision_recipes::properties_fixture();world.duplicate_native((false,0),1,91,[256.0,0.0,0.0]).unwrap();
+        let before=scene_instances::serialize("synthetic",&world);
+        let offsets=world.draws.iter().map(|d|d.offset).collect::<Vec<_>>();
+        let index=legaia_engine_scene::scene::ProtIndex::from_bytes(legaia_disc_patch::disc::synth::synth_prot(&[]),None).unwrap();
+        app.studio.library=Some(Arc::new(crate::Library{source:Source::Disc("unused-synthetic.img".into()),entries:vec![],cdname:None,iso_files:vec![],region:None,exe:None,index:Arc::new(index)}));
+        app.native_scene=Some(("synthetic".into(),NativeSceneSlot::Ready(Arc::new(scene),Arc::new(world))));
+        app.native_selected=Some((false,0));app.native_selection.extend([(false,0),(false,1),(false,2)]);
+        let run=|app:&mut App,events|ctx.run(egui::RawInput{screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(1280.0,820.0))),events,..Default::default()},|ctx|app.editor_workspace(ctx));
+        let output=run(&mut app,vec![]);
+        let rect=output.shapes.iter().filter_map(|s|match &s.shape {
+            egui::Shape::Mesh(m) if m.texture_id!=egui::TextureId::Managed(0)=>Some(m.calc_bounds()),_=>None,
+        }).max_by(|a,b|a.area().total_cmp(&b.area())).expect("World viewport image missing");
+        let camera=app.native_view.cam;let px=[(rect.width() as usize).clamp(16,900),(rect.height() as usize).clamp(16,680)];
+        let point=match &app.native_scene {Some((_,NativeSceneSlot::Ready(_,world)))=>{
+            let model=world.model.as_ref().unwrap();
+            (0..px[1]).step_by(3).find_map(|y|(0..px[0]).step_by(3).find_map(|x|
+                (crate::raster::pick_instance(model,camera,px[0],px[1],[x as f32,y as f32])==Some(2)).then_some([x,y]))).expect("Third fixture member missing")
+        },_=>unreachable!()};
+        let x=if app.native_view.world_mirrored {px[0]-1-point[0]}else{point[0]};
+        let pos=rect.min+egui::vec2(x as f32/px[0] as f32*rect.width(),point[1] as f32/px[1] as f32*rect.height());
+        run(&mut app,vec![egui::Event::PointerMoved(pos),egui::Event::PointerButton{pos,button:egui::PointerButton::Primary,pressed:true,modifiers:Default::default()}]);
+        assert_eq!(app.native_selected,Some((false,2)));assert_eq!(app.native_selection.len(),3);
+        let end=pos+egui::vec2(34.0,19.0);
+        run(&mut app,vec![egui::Event::PointerMoved(end)]);
+        run(&mut app,vec![egui::Event::PointerButton{pos:end,button:egui::PointerButton::Primary,pressed:false,modifiers:Default::default()}]);
+        assert_eq!(app.editor_undo.len(),1);assert_eq!(app.native_view.cam,camera);
+        let after=match &app.native_scene {Some((_,NativeSceneSlot::Ready(_,world)))=>{
+            let delta=[0,1,2].map(|a|world.draws[0].offset[a]-offsets[0][a]);assert_ne!(delta,[0.0;3]);
+            for (d,start) in world.draws.iter().zip(&offsets) {assert_eq!([0,1,2].map(|a|d.offset[a]-start[a]),delta);}
+            scene_instances::serialize("synthetic",world)
+        },_=>unreachable!()};
+        for (key,expected) in [(egui::Key::Z,&before),(egui::Key::Y,&after)] {
+            run(&mut app,vec![egui::Event::Key{key,physical_key:None,pressed:true,repeat:false,modifiers:egui::Modifiers{ctrl:true,command:true,..Default::default()}}]);
+            match &app.native_scene {Some((_,NativeSceneSlot::Ready(_,world)))=>assert_eq!(&scene_instances::serialize("synthetic",world),expected),_=>unreachable!()};
+        }
+        assert_eq!(app.editor_undo.len(),1);assert_eq!(app.native_view.cam,camera);
+    }
+    #[test]
+    fn batch_delete_keyboard_is_one_complete_undo_redo_in_the_workspace() {
+        let mut app=app();let ctx=egui::Context::default();
+        let (scene,_)=ps1_export::tests::actor_fixture();let world=collision_recipes::properties_fixture();
+        let before=scene_instances::serialize("synthetic",&world);
+        let index=legaia_engine_scene::scene::ProtIndex::from_bytes(legaia_disc_patch::disc::synth::synth_prot(&[]),None).unwrap();
+        app.studio.library=Some(Arc::new(crate::Library{source:Source::Disc("unused-synthetic.img".into()),entries:vec![],cdname:None,iso_files:vec![],region:None,exe:None,index:Arc::new(index)}));
+        app.native_scene=Some(("synthetic".into(),NativeSceneSlot::Ready(Arc::new(scene),Arc::new(world))));
+        app.native_selected=Some((false,1));app.native_selection.extend([(false,0),(false,1)]);
+        let camera=app.native_view.cam;
+        let key=|key,command|egui::Event::Key{key,physical_key:None,pressed:true,repeat:false,modifiers:egui::Modifiers{ctrl:command,command,..Default::default()}};
+        frame(&mut app,&ctx,vec![]);
+        frame(&mut app,&ctx,vec![key(egui::Key::Delete,false)]);
+        assert_eq!(app.editor_undo.len(),1);assert_eq!(app.native_selected,None);
+        let saved=match &app.native_scene {Some((_,NativeSceneSlot::Ready(_,w)))=>scene_instances::serialize("synthetic",w),_=>unreachable!()};
+        assert_ne!(saved,before);
+        frame(&mut app,&ctx,vec![key(egui::Key::Z,true)]);
+        assert!(app.studio.error.is_none(),"{:?}",app.studio.error);
+        assert!(app.editor_undo.is_empty());assert_eq!(app.editor_redo.len(),1);
+        assert_eq!(app.native_selection.len(),2);
+        match &app.native_scene {Some((_,NativeSceneSlot::Ready(_,w)))=>assert_eq!(scene_instances::serialize("synthetic",w),before),_=>unreachable!()};
+        frame(&mut app,&ctx,vec![key(egui::Key::Y,true)]);
+        assert_eq!(app.editor_undo.len(),1);assert!(app.editor_redo.is_empty());
+        match &app.native_scene {Some((_,NativeSceneSlot::Ready(_,w)))=>assert_eq!(scene_instances::serialize("synthetic",w),saved),_=>unreachable!()};
+        assert_eq!(app.native_view.cam,camera);
+    }
+    #[test]
+    fn escape_closes_modal_and_clears_entire_selection_without_moving_camera() {
         let mut app = app();
         let ctx = egui::Context::default();
         app.native_selected = Some((false, 7));
@@ -6226,7 +6320,7 @@ mod catalog_ui_tests {
             pressed: true, repeat: false, modifiers: egui::Modifiers::default() };
         frame(&mut app, &ctx, vec![escape()]);
         assert!(app.editor_modal.is_none());
-        assert_eq!(app.native_selected, Some((false, 7)));
+        assert_eq!(app.native_selected, None);
         assert_eq!(app.native_view.cam, camera);
         frame(&mut app, &ctx, vec![egui::Event::Key { key: egui::Key::Escape, physical_key: None,
             pressed: false, repeat: false, modifiers: egui::Modifiers::default() }]);
