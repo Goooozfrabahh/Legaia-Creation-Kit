@@ -1,5 +1,11 @@
 # M1.1 manual acceptance and development continuation
 
+For the corrected Latest Build, use [the exact selection-fix procedure](lck-m11-selection-fix.md).
+The original M1.1 binary is preserved separately at
+`D:\AstraRimElmProject\ManualTests\M11_20261027_01\bin\legaia-studio-M11-2667653.exe`.
+The desktop launcher was found rebuilding an older checkout; the installed-path
+hash below is historical and must not be used to identify later corrected builds.
+
 The user operates LCK and DuckStation. The assistant must not launch either
 application or control the host desktop. VM provisioning is paused indefinitely;
 development continues without waiting for a sandbox. Current AGENTS.md is binding.

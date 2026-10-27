@@ -2,6 +2,8 @@
 
 mod actors_ui;
 mod multi_selection;
+#[cfg(test)]
+mod multi_selection_workspace_tests;
 mod media_ui;
 mod viewport;
 mod world_view;
@@ -566,10 +568,11 @@ fn editor_hierarchy_row(ui: &mut egui::Ui, label: String,
     key: (bool,usize), selected: &mut Option<(bool,usize)>,
     selection: &mut std::collections::BTreeSet<(bool,usize)>,
     chosen: &mut Option<(EditorCatalogItem,bool)>,
-    rename: &mut Option<(bool,usize)>) -> egui::Rect {
+    rename: &mut Option<(bool,usize)>, input:&mut multi_selection::HierarchyInput) -> egui::Rect {
+    input.rows.push(key);
     let response = ui.selectable_label(multi_selection::keys(*selected,selection).contains(&key), label);
-    if response.clicked() {multi_selection::click(selected,selection,key,ui.input(|i|i.modifiers.shift));}
-    if response.secondary_clicked() {multi_selection::click(selected,selection,key,false);}
+    if response.clicked() {input.click=Some((key,ui.input(|i|i.modifiers),false));}
+    if response.secondary_clicked() {input.click=Some((key,ui.input(|i|i.modifiers),true));}
     response.context_menu(|ui| {
         if ui.button("Properties").clicked() {
             *chosen=Some((EditorCatalogItem::Draw(key.0,key.1),false)); ui.close();
@@ -749,6 +752,8 @@ pub struct App {
     pending_native_scene: Option<(String, CellSelection, NativeSceneSlot)>,
     native_selection: std::collections::BTreeSet<(bool,usize)>,
     native_selected: Option<(bool, usize)>, // false = placement; true = terrain
+    native_hierarchy_anchor: Option<(bool,usize)>,
+    native_selection_click: Option<((bool,usize),egui::Pos2,bool)>,
     native_view: Viewport,
     native_ground_visible: bool,
     /// Show native field-wall collision without altering editor/game data.
@@ -952,6 +957,8 @@ impl App {
             pending_native_scene: None,
             native_selection: Default::default(),
             native_selected: None,
+            native_hierarchy_anchor: None,
+            native_selection_click: None,
             native_view: Viewport::new(Shading::Textured),
             native_ground_visible: true,
             native_collision_wire_visible: false,
@@ -1111,7 +1118,7 @@ impl App {
         self.native_scene = None;
         self.pending_native_scene = None;
         self.native_collision_preview_cache = None;
-        self.native_selected = None; self.native_selection.clear();
+        self.native_selected = None; self.native_selection.clear(); self.native_hierarchy_anchor=None; self.native_selection_click=None;
         self.native_drag = None;
         self.editor_asset_drag = None;
         self.editor_catalog_active = None;
@@ -1418,7 +1425,7 @@ impl App {
     /// Reset document-local UI only after a replacement scene is ready.
     fn finish_native_scene_load(&mut self) {
         self.native_collision_preview_cache = None;
-        self.native_selected = None; self.native_selection.clear();
+        self.native_selected = None; self.native_selection.clear(); self.native_hierarchy_anchor=None; self.native_selection_click=None;
         self.native_drag = None;
         self.native_rotate = None;
         self.native_rotate_undo.clear();
@@ -2397,11 +2404,11 @@ impl App {
             } else if self.editor_properties_target.take().is_some() {
                 self.npc_playing = None;
             } else {
-                self.native_selected = None; self.native_selection.clear();
+                self.native_selected = None; self.native_selection.clear(); self.native_hierarchy_anchor=None; self.native_selection_click=None;
                 self.native_drag = None;
                 self.native_rotate = None;
             }
-            self.native_selected=None;self.native_selection.clear();
+            self.native_selected=None;self.native_selection.clear();self.native_hierarchy_anchor=None;self.native_selection_click=None;
             self.native_drag=None;self.native_rotate=None;
         }
         let mut pending_transform: Option<((bool, usize), [f32; 3], bool)> = None;
@@ -2424,6 +2431,7 @@ impl App {
         let mut pending_name: Option<((bool,usize),Option<String>)> = None;
         let mut hierarchy_popup: Option<(EditorCatalogItem,bool)> = None;
         let mut hierarchy_rename: Option<(bool,usize)> = None;
+        let mut hierarchy_input=multi_selection::HierarchyInput::default();
         let ready = self.native_scene.as_ref().and_then(|(_, state)| match state {
             NativeSceneSlot::Ready(scene, _) => Some(Arc::clone(scene)),
             _ => None,
@@ -2450,6 +2458,8 @@ impl App {
             .min_width(230.0)
             .show(ctx, |ui| {
                 ui.heading("Scene hierarchy");
+                ui.small("Click: single • Ctrl: toggle • Shift: range • Ctrl+Shift: add range");
+                ui.label(format!("{} selected",multi_selection::keys(self.native_selected,&self.native_selection).len()));
                 ui.add(egui::TextEdit::singleline(&mut self.editor_hierarchy_filter).hint_text("Filter names or identifiers"));
                 let hierarchy_filter = self.editor_hierarchy_filter.trim().to_lowercase();
                 ui.separator();
@@ -2487,7 +2497,7 @@ impl App {
                                             !label.to_lowercase().contains(&hierarchy_filter) &&
                                             !self.editor_item_matches(Some(scene),EditorCatalogItem::Draw(false,i),&hierarchy_filter) {continue;}
                                         editor_hierarchy_row(ui,label,key,&mut self.native_selected,&mut self.native_selection,
-                                            &mut hierarchy_popup,&mut hierarchy_rename);
+                                            &mut hierarchy_popup,&mut hierarchy_rename,&mut hierarchy_input);
                                     }
                                 });
                             egui::CollapsingHeader::new(format!("Terrain ({})", scene.terrain.len()))
@@ -2503,7 +2513,7 @@ impl App {
                                             !label.to_lowercase().contains(&hierarchy_filter) &&
                                             !self.editor_item_matches(Some(scene),EditorCatalogItem::Draw(true,i),&hierarchy_filter) {continue;}
                                         editor_hierarchy_row(ui,label,key,&mut self.native_selected,&mut self.native_selection,
-                                            &mut hierarchy_popup,&mut hierarchy_rename);
+                                            &mut hierarchy_popup,&mut hierarchy_rename,&mut hierarchy_input);
                                     }
                                 });
                             if let Some(world) = &world {
@@ -2524,7 +2534,7 @@ impl App {
                                                 !self.editor_item_matches(Some(scene),
                                                     EditorCatalogItem::Draw(false,npc.key),&hierarchy_filter) {continue;}
                                             editor_hierarchy_row(ui,label,key,&mut self.native_selected,&mut self.native_selection,
-                                                &mut hierarchy_popup,&mut hierarchy_rename);
+                                                &mut hierarchy_popup,&mut hierarchy_rename,&mut hierarchy_input);
                                         }
                                     });
                                 if let Some(issue)=&world.npc_issue {
@@ -2539,7 +2549,7 @@ impl App {
                                             if !hierarchy_filter.is_empty() &&
                                                 !label.to_lowercase().contains(&hierarchy_filter) {continue;}
                                             editor_hierarchy_row(ui,label,(false,d.index),&mut self.native_selected,&mut self.native_selection,
-                                                &mut hierarchy_popup,&mut hierarchy_rename);
+                                                &mut hierarchy_popup,&mut hierarchy_rename,&mut hierarchy_input);
                                         }
                                     });
                                 let hidden: Vec<_>=world.draws.iter().filter(|d|d.hidden && d.editor_uid.is_none()).collect();
@@ -2572,6 +2582,10 @@ impl App {
                     _ => { ui.label("Waiting for native scene data..."); }
                 }
             });
+        if hierarchy_input.apply(&mut self.native_selected,&mut self.native_selection,&mut self.native_hierarchy_anchor) {
+            if self.editor_properties_target.is_some() {self.editor_properties_target=self.native_selected;}
+            ctx.request_repaint();
+        }
         self.editor_cell_dialogs(ctx);
         if let Some(modal)=hierarchy_popup {
             self.editor_modal=Some(modal);
@@ -2640,7 +2654,9 @@ impl App {
                     .resizable(true)
                     .open(&mut window_open)
                     .show(ctx, |ui| {
-                        ui.small("Original source details, collision, editable placement, scale, rotation and supported NPC animation.");
+                        let count=multi_selection::keys(self.native_selected,&self.native_selection).len();
+                        ui.strong(format!("{count} selected • primary object shown"));
+                        ui.small("Placement changes apply to the selection. Rotation uses each object's pivot; scale uses a shared ratio. Native export validates every edited object.");
                         if let Some(foreign)=world.as_ref().and_then(|w|w.at(properties_key.0,properties_key.1)
                             .and_then(|d|d.editor_uid)
                             .and_then(|uid|w.foreign.iter().find(|f|f.uid==uid))) {
@@ -3186,7 +3202,7 @@ impl App {
                         frame_world_selection(&mut self.native_view, world, scene, self.native_selected);
                     }
                 });
-                ui.small("Click: select | RMB click selected: Properties | RMB drag: spin Y | Alt+RMB drag: tilt X | Ctrl+D: duplicate | Ctrl+Z: undo | Del: delete | LMB drag ON selected: move X/Z | Ctrl+LMB drag ON selected: move Y | LMB elsewhere: pan | MMB/Alt+LMB: orbit | Esc: deselect | F: frame | Home: frame all");
+                ui.small("Click: single | Shift+click: add | Ctrl+click: toggle | Drag selected: move group | Ctrl+drag selected: move Y | RMB drag: rotate group at individual pivots | Ctrl+D: duplicate group | Del: delete group | Ctrl+Z/Y: undo/redo | LMB elsewhere: pan | MMB/Alt+LMB: orbit | Esc: deselect | F: frame | Home: frame all");
                 // World-space camera eye: live scene coordinates, NOT selection/pivot.
                 // Keep the current v0.4.5.4 camera framing and movement unchanged.
                 if let Some(model) = world.model.as_ref() {
@@ -3230,8 +3246,17 @@ impl App {
                         900, 680, selected_id, self.native_ground_visible,
                         self.editor_asset_drag.is_some(), &world.foreign_vram);
                     if let Some(draw)=picked.and_then(|id|world.by_id(id)) {
-                        multi_selection::click(&mut self.native_selected,&mut self.native_selection,
-                            (draw.terrain,draw.index),ui.input(|i|i.modifiers.shift));
+                        let key=(draw.terrain,draw.index);
+                        let modifiers=ui.input(|i|i.modifiers);
+                        let was_selected=multi_selection::keys(self.native_selected,&self.native_selection).contains(&key);
+                        self.native_selection_click=ui.input(|i|i.pointer.interact_pos()).filter(|_|!modifiers.shift)
+                            .map(|pos|(key,pos,modifiers.ctrl && was_selected));
+                        // Ctrl on a new member adds it immediately. On an existing
+                        // member, defer removal until release to preserve Y dragging.
+                        multi_selection::viewport_press(&mut self.native_selected,&mut self.native_selection,key,modifiers.shift,modifiers.ctrl);
+                        if modifiers.ctrl && !was_selected {self.native_selection_click=None;}
+                        self.native_hierarchy_anchor=Some(key);
+                        if self.editor_properties_target.is_some() {self.editor_properties_target=self.native_selected;}
                         ui.ctx().request_repaint();
                     }
                     if self.native_collision_wire_visible {
@@ -3312,6 +3337,16 @@ impl App {
                         inp.pointer.primary_pressed(), inp.modifiers.ctrl, inp.modifiers.alt));
                     if self.native_drag.is_some() && (!down || alt) {
                         finish_drag = self.native_drag.take();
+                    }
+                    if ui.input(|i|i.pointer.primary_released()) {
+                        if let Some((key,start,toggle))=self.native_selection_click.take() {
+                            if pointer.is_some_and(|pos|(pos-start).length_sq()<=36.0) {
+                                if toggle {multi_selection::toggle(&mut self.native_selected,&mut self.native_selection,key);}
+                                else {multi_selection::single(&mut self.native_selected,&mut self.native_selection,key);}
+                                if self.editor_properties_target.is_some() {self.editor_properties_target=self.native_selected;}
+                                ctx.request_repaint();
+                            }
+                        }
                     }
                     // Start an object rotation ONLY when RMB is pressed directly on
                     // the highlighted mesh (not on empty space or another object).
@@ -3580,7 +3615,7 @@ impl App {
         // local to the World Editor and disable it while typing, renaming or
         // using an object properties/preview dialog.
         if self.editor_modal.is_none() && self.global_repository_dialog.is_none() &&
-            self.editor_properties_target.is_none() && self.editor_rename.is_none() &&
+            self.editor_rename.is_none() &&
             self.editor_cell_rename.is_none() && self.editor_cell_properties.is_none() &&
             !ctx.wants_keyboard_input() &&
             ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(
@@ -3595,7 +3630,7 @@ impl App {
         // Guard Delete so text entry (hierarchy filter, rename, coordinates)
         // and preview dialogs never delete scene objects by accident.
         if self.editor_modal.is_none() && self.global_repository_dialog.is_none() &&
-            self.editor_properties_target.is_none() && self.editor_rename.is_none() &&
+            self.editor_rename.is_none() &&
             self.editor_cell_rename.is_none() && self.editor_cell_properties.is_none() &&
             !ctx.wants_keyboard_input() && ctx.input(|i|i.key_pressed(egui::Key::Delete)) {
             pending_delete=self.native_selected;
@@ -3726,6 +3761,26 @@ impl App {
                 }
             }
         }
+        if pending_duplicate.is_some() && !pending_repository_drop {
+            let old_primary=self.native_selected;
+            let keys=multi_selection::keys(self.native_selected,&self.native_selection);
+            if let Some((_,NativeSceneSlot::Ready(scene,world)))=self.native_scene.as_mut() {
+                if let Some(world)=Arc::get_mut(world) {
+                    match multi_selection::duplicate(world,&keys,scene.placements.len()) {
+                        Ok(created)=>{
+                            self.native_selected=keys.iter().zip(&created).find_map(|(old,new)|(Some(*old)==old_primary).then_some(*new));
+                            self.native_selection=created.into_iter().collect();
+                            if self.editor_properties_target.is_some() {self.editor_properties_target=self.native_selected;}
+                            self.native_view.version=self.native_view.version.wrapping_add(1);
+                            self.studio.status=Some(format!("{} independent editor copies created and selected; save LCK scene to persist.",self.native_selection.len()));
+                            ctx.request_repaint();
+                        }
+                        Err(error)=>self.studio.error=Some(format!("Could not duplicate selection: {error}")),
+                    }
+                }
+            }
+            pending_duplicate=None;
+        }
         if let Some((source,offset,rotation,actor)) = pending_duplicate {
             if let Some((_,NativeSceneSlot::Ready(scene,world)))=self.native_scene.as_mut() {
                 if let Some(world)=Arc::get_mut(world) {
@@ -3790,10 +3845,16 @@ impl App {
                 if let Some(world) = Arc::get_mut(world) {
                     if let Some(draw) = world.at(key.0, key.1) {
                         let before = draw.offset;
-                        let group=if !record && self.native_drag.is_some_and(|d|d.key==key) {
+                        let group:Vec<_>=if !record && self.native_drag.is_some_and(|d|d.key==key) {
                             let delta=[0,1,2].map(|a|desired[a]-self.native_drag.unwrap().offset_start[a]);
                             self.native_drag_group.iter().map(|(k,start)|(*k,[0,1,2].map(|a|start[a]+delta[a]))).collect()
-                        }else{vec![(key,desired)]};
+                        }else{
+                            let delta=[0,1,2].map(|a|desired[a]-before[a]);
+                            multi_selection::keys(Some(key),&self.native_selection).into_iter().map(|k|{
+                                let start=world.at(k.0,k.1).map(|d|d.offset).unwrap_or([f32::NAN;3]);
+                                (k,[0,1,2].map(|a|start[a]+delta[a]))
+                            }).collect()
+                        };
                         let moved=if before!=desired {multi_selection::move_offsets(world,&group)}else{Ok(())};
                         if let Err(error)=moved {self.studio.error=Some(error);}
                         else if before != desired {
@@ -3813,7 +3874,9 @@ impl App {
                 if let Some(world)=Arc::get_mut(world) {
                     if let Some(draw)=world.at(key.0,key.1) {
                         let before=draw.rotation;
-                        if before != desired && world.set_rotation(key.0,key.1,desired) {
+                        let result=if before!=desired {multi_selection::rotate(world,key,&self.native_selection,desired)}else{Ok(())};
+                        if let Err(error)=result {self.studio.error=Some(error);}
+                        else if before != desired {
                             self.native_view.version=self.native_view.version.wrapping_add(1);
                             ctx.request_repaint();
                             if record {
@@ -3828,10 +3891,11 @@ impl App {
         if let Some((key,desired))=pending_scale {
             if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut() {
                 if let Some(world)=Arc::get_mut(world) {
-                    if world.at(key.0,key.1).is_some_and(|d|d.scale!=desired) &&
-                        world.set_scale(key.0,key.1,desired) {
-                        self.native_view.version=self.native_view.version.wrapping_add(1);
-                        ctx.request_repaint();
+                    if world.at(key.0,key.1).is_some_and(|d|d.scale!=desired) {
+                        match multi_selection::scale(world,key,&self.native_selection,desired) {
+                            Ok(())=>{self.native_view.version=self.native_view.version.wrapping_add(1);ctx.request_repaint();}
+                            Err(error)=>self.studio.error=Some(error),
+                        }
                     }
                 }
             }
@@ -3981,6 +4045,8 @@ impl App {
                             self.native_selected=target.selected.as_ref()
                                 .and_then(|id|editor_history_selected(world,id));
                             self.native_selection=target.selection.iter().filter_map(|id|editor_history_selected(world,id)).collect();
+                            self.native_hierarchy_anchor=self.native_selected;
+                            if self.editor_properties_target.is_some() {self.editor_properties_target=self.native_selected;}
                             Ok(())
                         });
                     match restore {

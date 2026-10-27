@@ -2403,9 +2403,18 @@ pub(super) mod tests {
         }else{None};
         for case in ["move_two","delete_two","move_one_delete_one"] {
             let mut edited=world.clone();
-            for (i,&key) in selected.iter().enumerate() {
-                if case=="delete_two"||(case=="move_one_delete_one"&&i==1) {ensure!(edited.set_hidden(key,true),"Cannot stage native deletion");}
-                else {ensure!(edited.set_offset(key.0,key.1,[64.0,0.0,0.0]),"Cannot stage native move");}
+            // Route the actual selected set through the same batch editing
+            // helpers as the workspace, before persistence and native planning.
+            let mut primary=None;let mut selection=std::collections::BTreeSet::new();
+            for &key in &selected {super::super::multi_selection::viewport_press(&mut primary,&mut selection,key,true,false);}
+            ensure!(selection.len()==2,"Shared selection state lost a native instance");
+            if case=="delete_two" {
+                super::super::multi_selection::delete(&mut edited,&selection).map_err(anyhow::Error::msg)?;
+            } else {
+                let moving=if case=="move_two" {selection.clone()}else{std::collections::BTreeSet::from([selected[0]])};
+                let moves=moving.iter().map(|&key|(key,[64.0,0.0,0.0])).collect::<Vec<_>>();
+                super::super::multi_selection::move_offsets(&mut edited,&moves).map_err(anyhow::Error::msg)?;
+                if case=="move_one_delete_one" {super::super::multi_selection::delete(&mut edited,&std::collections::BTreeSet::from([selected[1]])).map_err(anyhow::Error::msg)?;}
             }
             // Save/reopen uses the same source and existing transactional restore.
             let text=scene_instances::serialize(&name,&edited);let doc=scene_instances::parse(&text,&name,&world).map_err(anyhow::Error::msg)?;

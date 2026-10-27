@@ -9,13 +9,48 @@ pub(super) fn keys(primary:Option<Key>, selected:&BTreeSet<Key>)->BTreeSet<Key> 
     match primary {Some(key) if selected.contains(&key)=>selected.clone(),
         Some(key)=>BTreeSet::from([key]),None=>BTreeSet::new()}
 }
-pub(super) fn click(primary:&mut Option<Key>, selected:&mut BTreeSet<Key>, key:Key, shift:bool) {
+/// Keep an already-selected member at mouse-down so a drag can move the group.
+/// A plain click collapses on release; Ctrl toggling a selected member is also
+/// deferred so the existing Ctrl+drag vertical gesture remains available.
+pub(super) fn viewport_press(primary:&mut Option<Key>, selected:&mut BTreeSet<Key>, key:Key, shift:bool, ctrl:bool) {
     *selected=keys(*primary,selected);
-    if shift && selected.remove(&key) {
+    if !shift && !ctrl && !selected.contains(&key) {selected.clear();}
+    selected.insert(key);*primary=Some(key);
+}
+pub(super) fn toggle(primary:&mut Option<Key>, selected:&mut BTreeSet<Key>, key:Key) {
+    *selected=keys(*primary,selected);
+    if selected.remove(&key) {
         if *primary==Some(key) {*primary=selected.iter().next_back().copied();}
-    } else {
-        if !shift && !selected.contains(&key) {selected.clear();}
-        selected.insert(key);*primary=Some(key);
+    } else {selected.insert(key);*primary=Some(key);}
+}
+pub(super) fn single(primary:&mut Option<Key>, selected:&mut BTreeSet<Key>, key:Key) {
+    *primary=Some(key);*selected=BTreeSet::from([key]);
+}
+
+#[derive(Default)]
+pub(super) struct HierarchyInput {
+    pub rows: Vec<Key>,
+    pub click: Option<(Key, eframe::egui::Modifiers, bool)>,
+}
+impl HierarchyInput {
+    /// Apply after collecting all expanded, filtered rows, so reverse ranges
+    /// and ranges across visible hierarchy groups use exactly the display order.
+    pub fn apply(&self, primary:&mut Option<Key>, selected:&mut BTreeSet<Key>, anchor:&mut Option<Key>) -> bool {
+        let Some((key,modifiers,secondary))=self.click else {return false;};
+        *selected=keys(*primary,selected);
+        if secondary {
+            viewport_press(primary,selected,key,false,false);
+        } else if modifiers.shift {
+            let start=anchor.or(*primary).and_then(|k|self.rows.iter().position(|r|*r==k));
+            let end=self.rows.iter().position(|r|*r==key);
+            if !modifiers.ctrl {selected.clear();}
+            if let (Some(a),Some(b))=(start,end) {selected.extend(&self.rows[a.min(b)..=a.max(b)]);}
+            else {selected.insert(key);*anchor=Some(key);}
+            *primary=Some(key);
+        } else if modifiers.ctrl {
+            toggle(primary,selected,key);*anchor=Some(key);
+        } else {single(primary,selected,key);*anchor=Some(key);}
+        true
     }
 }
 
@@ -34,6 +69,61 @@ pub(super) fn move_offsets(world:&mut WorldModel, edits:&[(Key,[f32;3])])->Resul
     }
     for &(key,offset) in edits {assert!(world.set_offset(key.0,key.1,offset));}
     Ok(())
+}
+
+fn validate_draws(world:&WorldModel, edits:&[(Key,[f32;3])], scale:bool)->Result<(),String> {
+    let model=world.model.as_ref().ok_or("World geometry unavailable")?;let mut seen=BTreeSet::new();
+    for &(key,value) in edits {
+        let d=world.at(key.0,key.1).ok_or("Selected member no longer exists")?;
+        if !seen.insert(key)||d.hidden||d.vertex_start>=d.vertex_end||d.vertex_end>model.positions.len()||d.vertex_end>model.rest.len()
+            ||value.iter().any(|v|!v.is_finite()||if scale {!(0.05..=20.0).contains(v)}else{v.abs()>=1000.0}) {
+            return Err("Invalid group transform; no objects changed".into());
+        }
+    }
+    Ok(())
+}
+/// Inspector values apply a common angular delta about each object's own pivot.
+pub(super) fn rotate(world:&mut WorldModel, primary:Key, selected:&BTreeSet<Key>, desired:[f32;3])->Result<(),String> {
+    let before=world.at(primary.0,primary.1).ok_or("Primary object unavailable")?.rotation;
+    let edits=keys(Some(primary),selected).into_iter().map(|key| {
+        let d=world.at(key.0,key.1).ok_or("Selected object unavailable")?;
+        Ok((key,[0,1,2].map(|a|d.rotation[a]+desired[a]-before[a])))
+    }).collect::<Result<Vec<_>,String>>()?;
+    validate_draws(world,&edits,false)?;
+    for (key,value) in edits {assert!(world.set_rotation(key.0,key.1,value));} Ok(())
+}
+/// Preserve each member's individual scale using the primary's per-axis ratio.
+pub(super) fn scale(world:&mut WorldModel, primary:Key, selected:&BTreeSet<Key>, desired:[f32;3])->Result<(),String> {
+    let before=world.at(primary.0,primary.1).ok_or("Primary object unavailable")?.scale;
+    let edits=keys(Some(primary),selected).into_iter().map(|key| {
+        let d=world.at(key.0,key.1).ok_or("Selected object unavailable")?;
+        Ok((key,[0,1,2].map(|a|d.scale[a]*desired[a]/before[a])))
+    }).collect::<Result<Vec<_>,String>>()?;
+    validate_draws(world,&edits,true)?;
+    for (key,value) in edits {assert!(world.set_scale(key.0,key.1,value));} Ok(())
+}
+
+/// Stage infrequent duplication as one transaction, preserving every selected
+/// instance's name, recipe, transform and NPC appearance. One bad member cannot
+/// leave a partially duplicated group or alter an unrelated source.
+pub(super) fn duplicate(world:&mut WorldModel, selected:&BTreeSet<Key>, first_created:usize)->Result<Vec<Key>,String> {
+    if selected.is_empty() {return Err("No objects selected".into());}
+    let mut staged=world.clone();let mut result=Vec::new();
+    let mut uid=world.draws.iter().filter_map(|d|d.editor_uid).max().unwrap_or(0);
+    for &key in selected {
+        let d=world.at(key.0,key.1).ok_or("Selected object unavailable")?;
+        if d.hidden||d.vertex_start>=d.vertex_end {return Err("Selected object has no visible geometry to duplicate".into());}
+        uid=uid.checked_add(1).ok_or("No remaining instance UIDs")?;
+        let source=d.source_ref.unwrap_or(key);
+        let mut offset=d.offset;offset[0]+=128.0;
+        let next=staged.duplicate_native(source,first_created,uid,offset)?;
+        if world.collision.source(world,key).is_some() {staged.inherit_collision_recipe(key,next)?;}
+        staged.set_display_name(next,d.display_name.clone());
+        if !staged.set_rotation(next.0,next.1,d.rotation)||!staged.set_scale(next.0,next.1,d.scale) {return Err("Cannot inherit duplicate transform".into());}
+        if let Some(npc)=world.npc(key) {staged.set_npc_model(next,npc.model_index)?;staged.set_npc_animation(next,npc.clip,npc.frame)?;}
+        result.push(next);
+    }
+    *world=staged;Ok(result)
 }
 
 /// Deletion is infrequent; stage it on a clone so malformed/missing members do
@@ -126,24 +216,25 @@ mod tests {
     fn hierarchy_shift_clicks_share_the_viewport_selection() {
         use eframe::egui;
         let ctx=egui::Context::default();let mut primary=None;let mut selected=BTreeSet::new();
-        let mut rects=Vec::new();
-        let mut frame=|events:Vec<egui::Event>,shift:bool,primary:&mut Option<Key>,selected:&mut BTreeSet<Key>| {
+        let mut rects=Vec::new();let mut anchor=None;
+        let mut frame=|events:Vec<egui::Event>,modifiers:egui::Modifiers,primary:&mut Option<Key>,selected:&mut BTreeSet<Key>| {
+            let mut input=HierarchyInput::default();
             rects.clear();
-            let input=egui::RawInput{screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(320.0,240.0))),
-                events,modifiers:egui::Modifiers{shift,..Default::default()},..Default::default()};
-            let _=ctx.run(input,|ctx|{egui::CentralPanel::default().show(ctx,|ui|{
-                for i in 0..3 {rects.push(super::super::editor_hierarchy_row(ui,format!("Object {i}"),(false,i),primary,selected,&mut None,&mut None));}
-            });});rects.clone()
+            let raw=egui::RawInput{screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(320.0,240.0))),
+                events,modifiers,..Default::default()};
+            let _=ctx.run(raw,|ctx|{egui::CentralPanel::default().show(ctx,|ui|{
+                for i in 0..3 {rects.push(super::super::editor_hierarchy_row(ui,format!("Object {i}"),(false,i),primary,selected,&mut None,&mut None,&mut input));}
+            });});input.apply(primary,selected,&mut anchor);rects.clone()
         };
-        let rows=frame(vec![],false,&mut primary,&mut selected);
-        for (i,shift) in [(0,false),(1,true),(2,true),(0,false),(1,true)] {
-            let pos=rows[i].center();let modifiers=egui::Modifiers{shift,..Default::default()};
-            frame(vec![egui::Event::PointerMoved(pos),egui::Event::PointerButton{pos,button:egui::PointerButton::Primary,pressed:true,modifiers}],shift,&mut primary,&mut selected);
-            frame(vec![egui::Event::PointerButton{pos,button:egui::PointerButton::Primary,pressed:false,modifiers}],shift,&mut primary,&mut selected);
+        let rows=frame(vec![],Default::default(),&mut primary,&mut selected);
+        for (i,shift,ctrl) in [(0,false,false),(1,false,true),(2,true,false),(0,false,true),(1,false,true)] {
+            let pos=rows[i].center();let modifiers=egui::Modifiers{shift,ctrl,..Default::default()};
+            frame(vec![egui::Event::PointerMoved(pos),egui::Event::PointerButton{pos,button:egui::PointerButton::Primary,pressed:true,modifiers}],modifiers,&mut primary,&mut selected);
+            frame(vec![egui::Event::PointerButton{pos,button:egui::PointerButton::Primary,pressed:false,modifiers}],modifiers,&mut primary,&mut selected);
         }
         assert_eq!(selected,BTreeSet::from([(false,0),(false,2)]));
         // A viewport toggle operates on exactly the same set and primary.
-        click(&mut primary,&mut selected,(false,2),true);
+        toggle(&mut primary,&mut selected,(false,2));
         assert_eq!(selected,BTreeSet::from([(false,0)]));
     }
     #[test]
@@ -164,23 +255,58 @@ mod tests {
         }
     }
     #[test]
-    fn both_surfaces_share_toggle_preserve_and_primary_rules() {
+    fn viewport_shift_adds_idempotently_and_ctrl_toggles_members() {
         let mut primary=None;let mut selected=BTreeSet::new();
-        click(&mut primary,&mut selected,(false,1),false); // hierarchy
-        click(&mut primary,&mut selected,(true,2),true); // viewport
-        click(&mut primary,&mut selected,(false,3),true);
-        click(&mut primary,&mut selected,(false,1),false);
-        assert_eq!(selected.len(),3);assert_eq!(primary,Some((false,1)));
-        click(&mut primary,&mut selected,(true,2),true);
-        assert_eq!(selected.len(),2);
-        click(&mut primary,&mut selected,(false,1),true);
-        assert_eq!(primary,Some((false,3)));
-        click(&mut primary,&mut selected,(false,3),true);
-        assert!(selected.is_empty());assert_eq!(primary,None);
-        click(&mut primary,&mut selected,(false,4),false);
-        click(&mut primary,&mut selected,(false,5),true);
-        click(&mut primary,&mut selected,(false,6),false);
-        assert_eq!(selected,BTreeSet::from([(false,6)]));
-        assert!(keys(None,&selected).is_empty());
+        viewport_press(&mut primary,&mut selected,(false,1),false,false);
+        viewport_press(&mut primary,&mut selected,(true,2),true,false);
+        viewport_press(&mut primary,&mut selected,(true,2),true,false);
+        assert_eq!(selected.len(),2);assert_eq!(primary,Some((true,2)));
+        toggle(&mut primary,&mut selected,(true,2));
+        assert_eq!(selected,BTreeSet::from([(false,1)]));
+        toggle(&mut primary,&mut selected,(false,1));assert!(selected.is_empty());assert_eq!(primary,None);
+        single(&mut primary,&mut selected,(false,4));
+        viewport_press(&mut primary,&mut selected,(false,5),true,false);
+        single(&mut primary,&mut selected,(false,6));
+        assert_eq!(selected,BTreeSet::from([(false,6)]));assert!(keys(None,&selected).is_empty());
+    }
+
+    #[test]
+    fn hierarchy_ranges_follow_visible_order_in_both_directions_and_ctrl_shift_unions() {
+        let rows=vec![(false,4),(false,1),(true,8),(false,20)];
+        let mut primary=Some(rows[2]);let mut selected=BTreeSet::from([rows[2]]);let mut anchor=primary;
+        let apply=|key,shift,ctrl,primary:&mut Option<Key>,selected:&mut BTreeSet<Key>,anchor:&mut Option<Key>| {
+            HierarchyInput{rows:rows.clone(),click:Some((key,eframe::egui::Modifiers{shift,ctrl,..Default::default()},false))}.apply(primary,selected,anchor)
+        };
+        apply(rows[0],true,false,&mut primary,&mut selected,&mut anchor);
+        assert_eq!(selected,BTreeSet::from([rows[0],rows[1],rows[2]]));assert_eq!(anchor,Some(rows[2]));
+        apply(rows[3],false,true,&mut primary,&mut selected,&mut anchor);
+        apply(rows[2],true,true,&mut primary,&mut selected,&mut anchor);
+        assert_eq!(selected.len(),4);
+        apply(rows[1],false,false,&mut primary,&mut selected,&mut anchor);assert_eq!(selected,BTreeSet::from([rows[1]]));
+    }
+
+    #[test]
+    fn group_rotation_scale_and_duplication_preserve_other_instances_and_metadata() {
+        let mut world=three();let keys=BTreeSet::from([(false,0),(false,1)]);
+        world.set_rotation(false,1,[0.1,0.2,0.3]);world.set_scale(false,1,[2.0,1.0,0.5]);
+        let unrelated=world.at(false,2).unwrap().clone();
+        rotate(&mut world,(false,0),&keys,[0.0,0.5,0.0]).unwrap();
+        assert_eq!(world.at(false,0).unwrap().rotation,[0.0,0.5,0.0]);
+        assert!((world.at(false,1).unwrap().rotation[1]-0.7).abs()<1e-6);
+        scale(&mut world,(false,0),&keys,[2.0,2.0,2.0]).unwrap();
+        assert_eq!(world.at(false,1).unwrap().scale,[4.0,2.0,1.0]);
+        let before=scene_instances::serialize("test",&world);
+        assert!(scale(&mut world,(false,0),&keys,[20.0;3]).is_err());assert_eq!(before,scene_instances::serialize("test",&world));
+        let created=duplicate(&mut world,&keys,1).unwrap();assert_eq!(created.len(),2);
+        for (old,new) in keys.iter().zip(&created) {
+            let a=world.at(old.0,old.1).unwrap();let b=world.at(new.0,new.1).unwrap();
+            assert_eq!(b.offset,[a.offset[0]+128.0,a.offset[1],a.offset[2]]);
+            assert_eq!(b.rotation,a.rotation);assert_eq!(b.scale,a.scale);assert_ne!(b.editor_uid,a.editor_uid);
+        }
+        assert_eq!(world.at(false,2).unwrap().offset,unrelated.offset);
+        assert_eq!(world.at(false,2).unwrap().rotation,unrelated.rotation);
+        let before=scene_instances::serialize("test",&world);
+        assert!(duplicate(&mut world,&BTreeSet::from([(false,0),(false,999)]),1).is_err());
+        assert_eq!(before,scene_instances::serialize("test",&world));
     }
 }
