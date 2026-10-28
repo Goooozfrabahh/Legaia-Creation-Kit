@@ -28,6 +28,7 @@ mod cell_catalog;
 mod ps1_export;
 mod export_integration;
 mod collision_wire;
+mod floor_debug;
 mod object_collision;
 mod global_repository;
 
@@ -765,6 +766,9 @@ pub struct App {
     native_ground_visible: bool,
     /// Show native field-wall collision without altering editor/game data.
     native_collision_wire_visible: bool,
+    native_floor_debug_visible: bool,
+    native_floor_debug: Option<Result<floor_debug::DebugFloor,String>>,
+    native_floor_debug_key: String,
     /// Inspect this specific object's transformed mesh as a collision draft.
     /// Unlike the native MAP overlay, this is NOT in-game collision data.
     object_collision_draft_visible: bool,
@@ -969,6 +973,9 @@ impl App {
             native_view: Viewport::new(Shading::Textured),
             native_ground_visible: true,
             native_collision_wire_visible: false,
+            native_floor_debug_visible: false,
+            native_floor_debug: None,
+            native_floor_debug_key: String::new(),
             object_collision_draft_visible: false,
             generated_collision_target: None,
             native_collision_grid: None,
@@ -2992,6 +2999,7 @@ impl App {
                     self.native_view.controls(ui, "Sample original PS1 TIM/CLUT atlas from assembled scene VRAM");
                     ui.checkbox(&mut self.native_ground_visible, "Show walk-ground")
                         .on_hover_text("Original per-cell PS1 walkable terrain: UV, CLUT and texture page are read from the disc's native heightfield and scene VRAM.");
+                    ui.checkbox(&mut self.native_floor_debug_visible, "Native floor comparison");
                     ui.checkbox(&mut self.native_collision_wire_visible, "Collision wireframe")
                         .on_hover_text("View native MAP wall collision at its actual 64-unit resolution. Orange: original walls; cyan: newly positioned wall cells for supported object moves/copies. Does not modify the disc. NPC collider shapes and script-painted walls are not shown.");
                     if ui.checkbox(&mut self.object_collision_draft_visible, "Selected mesh collider DRAFT")
@@ -3265,6 +3273,20 @@ impl App {
                         self.native_hierarchy_anchor=Some(key);
                         if self.editor_properties_target.is_some() {self.editor_properties_target=self.native_selected;}
                         ui.ctx().request_repaint();
+                    }
+                    if self.native_floor_debug_visible {
+                        if let Some(lib)=self.studio.library.as_ref() {
+                            let key=format!("{}:{}:{:p}",lib.source.path().display(),scene.name,lib.index.as_ref());
+                            if self.native_floor_debug_key!=key {
+                                self.native_floor_debug=Some(floor_debug::DebugFloor::load(lib.index.as_ref(),&scene.name,key.clone()).map_err(|e|format!("{e:#}")));
+                                self.native_floor_debug_key=key;
+                            }
+                            match &self.native_floor_debug {
+                                Some(Ok(debug))=>{debug.paint(ui,view_rect,&self.native_view,model);debug.window(ui.ctx());},
+                                Some(Err(error))=>{egui::Window::new("Native floor comparison unavailable").show(ui.ctx(),|ui|{ui.label(error);});},
+                                None=>{}
+                            }
+                        }
                     }
                     if self.native_collision_wire_visible {
                         let source_key = self.studio.library.as_ref()
