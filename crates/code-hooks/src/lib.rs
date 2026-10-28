@@ -20,6 +20,7 @@ pub mod arenas;
 pub mod bonus_drop;
 pub mod conkram_freeze_fix;
 pub mod enemy_hp_bar;
+pub mod extended_floor;
 pub mod flee_exp;
 pub mod jewel_fix;
 pub mod mips;

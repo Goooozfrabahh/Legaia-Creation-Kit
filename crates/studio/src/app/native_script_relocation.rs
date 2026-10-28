@@ -14,6 +14,56 @@ impl Relocation {
     }
 }
 fn shared(id:u8)->bool {matches!(id,0xf8|0xfb)}
+
+pub(super) struct WallTranslation {pub instruction_offset:usize,pub delta_tiles:[i16;2]}
+pub(super) struct WallRelocation {source_sha256:String,output:Vec<u8>,pub changed:Vec<usize>}
+impl WallRelocation {
+    pub fn apply(&self,source:&[u8])->Result<Vec<u8>> {ensure!(digest(source)==self.source_sha256,"Wall script source changed");Ok(self.output.clone())}
+}
+/// Relocate explicitly selected native wall-paint instructions without changing
+/// script widths, branches, context references or execution conditions. This is
+/// NOT proof those instructions exclusively own any stored MAP wall bit.
+pub(super) fn compile_wall_translations(man:&[u8],edits:&[WallTranslation])->Result<WallRelocation> {
+    let inventory=SceneInventory::read(man).map_err(anyhow::Error::msg)?;
+    ensure!(inventory.gaps.is_empty() && !edits.is_empty(),"Incomplete/empty native wall-script request");
+    let mut output=man.to_vec();let mut allowed=BTreeSet::new();let mut changed=Vec::new();
+    for edit in edits {
+        ensure!(edit.delta_tiles!=[0;2] && !changed.contains(&edit.instruction_offset),"Repeated/empty wall-script translation");
+        let record=inventory.records.iter().find(|r|edit.instruction_offset>=r.start+r.pc0 && edit.instruction_offset<r.start+r.len).context("Wall instruction is outside a native script")?;
+        let local=edit.instruction_offset-record.start;
+        let wall=record.scan.wall_writes.iter().find(|w|w.pc==local).context("Selected byte is not a decoded native wall-paint boundary")?;
+        ensure!(wall.sub<=3,"Unknown native wall-paint suboperation");
+        let instruction=LinearWalker::new(&man[record.start..record.start+record.len],record.pc0).find_map(|r|r.ok().filter(|i|i.pc==local)).context("Missing wall instruction")?;
+        let operand=edit.instruction_offset+instruction.size-if wall.sub>=2 {5}else{4};
+        let old=[wall.x0,wall.z0,wall.x1,wall.z1];
+        ensure!(man[operand..operand+4]==old,"Native wall operand layout differs");
+        for axis in 0..4 {
+            let v=i32::from(old[axis])+i32::from(edit.delta_tiles[axis%2]);
+            ensure!((0..128).contains(&v),"Wall-paint translation exceeds native MAP bounds");
+            output[operand+axis]=v as u8;allowed.insert(operand+axis);
+        }
+        changed.push(edit.instruction_offset);
+    }
+    let read=SceneInventory::read(&output).map_err(anyhow::Error::msg)?;
+    ensure!(read.gaps.is_empty() && read.partition_counts==inventory.partition_counts,"Wall translation changed script structure");
+    for edit in edits {
+        let old_record=inventory.records.iter().find(|r|r.scan.wall_writes.iter().any(|w|r.start+w.pc==edit.instruction_offset)).unwrap();
+        let new_record=read.records.iter().find(|r|r.flat==old_record.flat).unwrap();
+        let old=old_record.scan.wall_writes.iter().find(|w|old_record.start+w.pc==edit.instruction_offset).unwrap();
+        let new=new_record.scan.wall_writes.iter().find(|w|new_record.start+w.pc==edit.instruction_offset).context("Wall instruction disappeared")?;
+        // Verify exact native sub-cell contributions, including row bias,
+        // masks and wrapping bounds. No bounding-box ownership inference.
+        let mut before=BTreeSet::new();let mut after=BTreeSet::new();
+        for z in 0..256 {for x in 0..256 {
+            if old.touches([x as u8,z as u8]) {let tx=x+edit.delta_tiles[0] as i32*2;let tz=z+edit.delta_tiles[1] as i32*2;
+                ensure!((0..256).contains(&tx)&&(0..256).contains(&tz),"Native wall contribution would leave the grid");before.insert([tx,tz]);}
+            if new.touches([x as u8,z as u8]) {after.insert([x,z]);}
+        }}
+        ensure!(!before.is_empty() && before==after && old.sub==new.sub && old.mask==new.mask,"Native wall effect translation/readback differs");
+    }
+    for (i,(&old,&new)) in man.iter().zip(&output).enumerate(){ensure!(old==new||allowed.contains(&i),"Unrelated MAN byte changed");}
+    Ok(WallRelocation{source_sha256:digest(man),output,changed})
+}
 /// Resolve the static context reference domain only. Dynamic helpers, actor
 /// bindings, movement streams and scene transitions remain separate contracts.
 pub(super) fn references(man:&[u8])->Result<Vec<Reference>> {
@@ -81,6 +131,38 @@ pub(super) fn compile(man:&[u8],remap:&BTreeMap<u8,u8>)->Result<Relocation> {
 mod tests {
     use super::*;
     use super::super::native_script_dependencies::fixture_man;
+    #[test]
+    fn wall_paint_dependencies_translate_exact_native_effects_without_rewriting_control_flow()->Result<()> {
+        let man=fixture_man(&[&[0x4c,0x70,3,4,4,5,0x4c,0x73,3,4,4,5,5,0x21]]);
+        let inventory=SceneInventory::read(&man).unwrap();let record=&inventory.records[0];
+        let edits=record.scan.wall_writes.iter().map(|w|WallTranslation{instruction_offset:record.start+w.pc,delta_tiles:[2,-1]}).collect::<Vec<_>>();
+        let plan=compile_wall_translations(&man,&edits)?;assert_eq!(plan.changed.len(),2);
+        let output=plan.apply(&man)?;assert_eq!(output.len(),man.len());
+        assert!(compile_wall_translations(&man,&[WallTranslation{instruction_offset:edits[0].instruction_offset+1,delta_tiles:[1,0]}]).is_err());
+        assert!(compile_wall_translations(&man,&[WallTranslation{instruction_offset:edits[0].instruction_offset,delta_tiles:[-10,0]}]).is_err());
+        assert!(compile_wall_translations(&man,&[WallTranslation{instruction_offset:edits[0].instruction_offset,delta_tiles:[i16::MAX,0]}]).is_err());
+        let mut stale=man;stale[1]=1;assert!(plan.apply(&stale).is_err());Ok(())
+    }
+    #[test]
+    #[ignore="explicit read-only retail MAN dependency serializer regression; no IMG/GUI"]
+    fn retail_native_wall_script_translation_readback()->Result<()> {
+        let path=std::path::PathBuf::from(std::env::var_os("LCK_RETAIL_SOURCE").context("LCK_RETAIL_SOURCE required")?);
+        let library=crate::library::Library::open(&path)?;
+        let scene=legaia_engine_scene::scene::Scene::load(&library.index,"town01")?;
+        let man=scene.field_man_payload(&library.index)?.context("No native MAN")?;
+        let inventory=SceneInventory::read(&man).map_err(anyhow::Error::msg)?;
+        ensure!(inventory.gaps.is_empty(),"Retail wall writer coverage incomplete");
+        let mut accepted=0;let mut rejected=0;
+        for record in &inventory.records {for wall in &record.scan.wall_writes {
+            let offset=record.start+wall.pc;
+            let candidate=[[1,0],[-1,0],[0,1],[0,-1]].into_iter().find_map(|delta_tiles|compile_wall_translations(&man,&[WallTranslation{instruction_offset:offset,delta_tiles}]).ok());
+            if let Some(plan)=candidate {let rewritten=plan.apply(&man)?;ensure!(rewritten.len()==man.len(),"Native MAN allocation changed");accepted+=1;
+                println!("Native wall instruction MAN {offset:#x}, flat {}: same-width coordinate/effect readback passed; object ownership NOT established",record.flat);
+            }else{rejected+=1;}
+        }}
+        ensure!(accepted>0,"No real native wall instruction was safely relocated");
+        println!("Retail MAN: {accepted} wall instructions passed relocation readback; {rejected} rejected. No MAP wall bit or exported IMG changed.");Ok(())
+    }
     #[test]
     fn context_references_relocate_without_changing_branches_positions_or_other_records()->Result<()> {
         let man=fixture_man(&[&[0xa3,0,12,24,0xa1,0,0x21],&[0x23,12,24,0x21]]);

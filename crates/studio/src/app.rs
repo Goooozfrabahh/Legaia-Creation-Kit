@@ -18,6 +18,7 @@ mod native_wall_ownership;
 mod native_cell_inventory;
 mod native_elevation_codec;
 mod native_floor_patch;
+pub mod native_extended_floor;
 mod native_script_relocation;
 #[cfg(test)]
 mod native_retail_floor_tests;

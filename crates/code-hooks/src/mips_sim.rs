@@ -13,6 +13,11 @@ pub struct Cpu {
     pub lo: u32,
     pub mem: HashMap<u32, u8>,
     pub steps: usize,
+    /// Optional R3000 one-instruction integer load delay. Off by default for
+    /// historical functional tests; native-engine regressions enable it.
+    pub load_delays: bool,
+    pub strict_alignment: bool,
+    pending_load: Option<(usize,u32)>,
 }
 
 impl Default for Cpu {
@@ -30,6 +35,9 @@ impl Cpu {
             lo: 0,
             mem: HashMap::new(),
             steps: 0,
+            load_delays: false,
+            strict_alignment: false,
+            pending_load: None,
         }
     }
     pub fn load(&mut self, va: u32, bytes: &[u8]) {
@@ -47,9 +55,11 @@ impl Cpu {
         *self.mem.get(&a).unwrap_or(&0)
     }
     pub fn rd16(&self, a: u32) -> u16 {
+        assert!(!self.strict_alignment || a&1==0,"unaligned halfword read {a:#x}");
         u16::from_le_bytes([self.rd8(a), self.rd8(a + 1)])
     }
     pub fn rd32(&self, a: u32) -> u32 {
+        assert!(!self.strict_alignment || a&3==0,"unaligned word read {a:#x}");
         u32::from_le_bytes([
             self.rd8(a),
             self.rd8(a + 1),
@@ -61,9 +71,11 @@ impl Cpu {
         self.mem.insert(a, v);
     }
     pub fn wr16(&mut self, a: u32, v: u16) {
+        assert!(!self.strict_alignment || a&1==0,"unaligned halfword write {a:#x}");
         self.load(a, &v.to_le_bytes());
     }
     pub fn wr32(&mut self, a: u32, v: u32) {
+        assert!(!self.strict_alignment || a&3==0,"unaligned word write {a:#x}");
         self.load(a, &v.to_le_bytes());
     }
     /// Execute one instruction (with its delay slot for control flow).
@@ -77,6 +89,8 @@ impl Cpu {
         let simm = imm as i16 as i32 as u32;
         let mut next = self.pc + 4;
         let mut branch: Option<u32> = None;
+        let prior_load=self.pending_load.take();
+        let old_rt=self.r[rt];
         match op {
             0 => match w & 0x3f {
                 0x00 => self.r[rd] = self.r[rt] << sa,
@@ -172,10 +186,18 @@ impl Cpu {
             0x2b => self.wr32(self.r[rs].wrapping_add(simm), self.r[rt]),
             o => panic!("unsupported opcode {o:#x} at {:#x}", self.pc),
         }
+        if self.load_delays {
+            let loading=matches!(op,0x20|0x21|0x23|0x24|0x25);
+            let written=if loading {None}else{match op {
+                0=>match w&63 {0x08|0x18|0x19|0x1a|0x1b|0x11|0x13=>None,_=>Some(rd)},
+                3=>Some(31),0x09|0x0a|0x0b|0x0c|0x0d|0x0f=>Some(rt),_=>None}};
+            if loading && rt!=0 {let value=self.r[rt];self.r[rt]=old_rt;self.pending_load=Some((rt,value));}
+            if let Some((reg,value))=prior_load {if written!=Some(reg){self.r[reg]=value;}}
+        }
         self.r[0] = 0;
         if let Some(target) = branch {
-            // Delay slot, then the jump. Load delays are not modelled - the
-            // routines are asserted delay-safe by the static tests above.
+            // Delay slot, then the jump. Pending integer loads commit before
+            // executing this slot, after the branch has consumed its operands.
             let slot = self.rd32(self.pc + 4);
             self.pc += 4;
             self.exec_plain(slot);
@@ -204,6 +226,16 @@ impl Cpu {
 #[cfg(test)]
 mod shift_tests {
     use super::Cpu;
+    #[test]
+    fn r3000_integer_load_delay_including_branch_slot_and_overwrite() {
+        use crate::mips::*;
+        let mut c=Cpu::new();c.load_delays=true;c.r[T0 as usize]=0x1000;c.r[T1 as usize]=7;c.wr32(0x1000,42);
+        c.exec(lw(T1,T0,0));c.exec(addu(T2,T1,ZERO));
+        assert_eq!(c.r[T2 as usize],7);assert_eq!(c.r[T1 as usize],42);
+        c.exec(lw(T1,T0,0));c.exec(addiu(T1,ZERO,3));assert_eq!(c.r[T1 as usize],3);
+        c.exec(lw(T1,T0,0));c.load_words(c.pc+4,&[addu(T2,T1,ZERO)]);
+        c.exec(bne(T1,ZERO,2));assert_eq!(c.r[T2 as usize],42);
+    }
     #[test]
     fn srav_preserves_sign_and_masks_the_shift_register() {
         let mut cpu=Cpu::new();let instruction=(1<<21)|(2<<16)|(3<<11)|7;
