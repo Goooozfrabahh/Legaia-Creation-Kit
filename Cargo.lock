@@ -3101,6 +3101,7 @@ dependencies = [
  "legaia-actor-formats",
  "legaia-app-theme",
  "legaia-art",
+ "legaia-code-hooks",
  "legaia-container-formats",
  "legaia-disc-audit",
  "legaia-disc-patch",

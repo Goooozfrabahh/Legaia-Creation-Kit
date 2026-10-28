@@ -45,6 +45,17 @@ pub(super) fn serialize(record:&ElevationOverride)->Result<[u8;4]> {
     ensure!(record.tile_x<128 && record.tile_z<128,"Elevation row outside native grid");
     Ok([record.tile_x,record.tile_z,record.coarse as u8,record.quads])
 }
+/// A native bilinear sampler restricted to one integer X (or Z) is affine,
+/// rounded toward zero at 14 fractional bits. If samples at 0 and d round to
+/// the same height, this bound proves an observed height at d+1 impossible
+/// for ANY corner tiers, not merely the current sixteen ladder entries.
+pub(super) fn excludes_bilinear_step(heights:[i32;3],distance:u32)->bool {
+    if heights[0]!=heights[1] || distance==0 {return false;}
+    let difference=(i128::from(heights[2])-i128::from(heights[0])).abs();
+    if difference<=1 {return false;}
+    let d=i128::from(distance);let scale=16384i128;
+    d*((difference-1)*scale+1)>(d+2)*(scale-1)
+}
 pub(super) fn repartition(samples:&[Sample],delta_subcells:[i32;2],background:&BTreeMap<[u8;2],Destination>)->Result<Vec<ElevationOverride>> {
     let mut tiles=BTreeMap::<[u8;2],[i32;4]>::new();let mut used=BTreeSet::new();
     for sample in samples {
@@ -103,5 +114,19 @@ mod tests {
         assert!(encode([0,0],[0,-16,-32,-64]).is_err());
         assert!(encode([0,0],[1;4]).is_err());
         assert!(encode([0,0],[i32::MIN;4]).is_err());
+    }
+    #[test]
+    fn quadrant_discontinuity_cannot_be_hidden_by_different_native_floor_tiers() {
+        assert!(excludes_bilinear_step([0,0,-64],63));
+        assert!(excludes_bilinear_step([-192,-192,-304],63));
+        // Integer rounding near zero must not be mistaken for a discontinuity.
+        assert!(!excludes_bilinear_step([0,0,-1],63));
+        for a in [-32768i64,-192,-1,0,1,192,32767] {for b in [-32768i64,-112,-1,0,1,112,32767] {
+            for x in [0i64,32,64,96,127] {
+                let left=b*x+a*(128-x);let right=a*x+b*(128-x);
+                let values=[0i64,63,64].map(|z|((left*(128-z)+right*z)/16384) as i32);
+                assert!(!excludes_bilinear_step(values,63));
+            }
+        }}
     }
 }

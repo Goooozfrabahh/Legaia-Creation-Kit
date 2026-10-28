@@ -54,4 +54,5 @@ legaia-vab.workspace = true
 legaia-xa.workspace = true
 
 [dev-dependencies]
+legaia-code-hooks.workspace = true
 tempfile.workspace = true

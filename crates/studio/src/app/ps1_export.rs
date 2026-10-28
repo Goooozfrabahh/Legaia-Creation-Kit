@@ -2288,7 +2288,7 @@ pub(super) mod tests {
         assert_eq!(map,before);
     }
 
-    pub(super) fn map_disc(map:&[u8])->Vec<u8> {
+    pub(in crate::app) fn map_disc(map:&[u8])->Vec<u8> {
         // The engine's 0x28-sector read includes a fallback trigger window.
         let mut prot=vec![0u8;2048+MAP_LEN+0x2000];
         prot[4..8].copy_from_slice(&2u32.to_le_bytes());

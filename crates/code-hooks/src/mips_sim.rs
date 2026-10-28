@@ -84,6 +84,7 @@ impl Cpu {
                 0x03 => self.r[rd] = ((self.r[rt] as i32) >> sa) as u32,
                 0x04 => self.r[rd] = self.r[rt] << (self.r[rs] & 31),
                 0x06 => self.r[rd] = self.r[rt] >> (self.r[rs] & 31),
+                0x07 => self.r[rd] = ((self.r[rt] as i32) >> (self.r[rs] & 31)) as u32,
                 0x08 => branch = Some(self.r[rs]),
                 0x10 => self.r[rd] = self.hi,
                 0x12 => self.r[rd] = self.lo,
@@ -197,5 +198,17 @@ impl Cpu {
             self.exec(w);
         }
         self.pc
+    }
+}
+
+#[cfg(test)]
+mod shift_tests {
+    use super::Cpu;
+    #[test]
+    fn srav_preserves_sign_and_masks_the_shift_register() {
+        let mut cpu=Cpu::new();let instruction=(1<<21)|(2<<16)|(3<<11)|7;
+        for (value,count,expected) in [(0xffff_ff80,2,0xffff_ffe0),(0x8000_0000,63,0xffff_ffff),(0x7fff_ffff,36,0x07ff_ffff),(0xffff_ff80,32,0xffff_ff80)] {
+            cpu.r[1]=count;cpu.r[2]=value;cpu.exec(instruction);assert_eq!(cpu.r[3],expected);
+        }
     }
 }
