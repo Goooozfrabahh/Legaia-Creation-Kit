@@ -1,6 +1,15 @@
 //! Structured observations, not a proof of script control-flow closure.
 use legaia_scene_formats::{field_disasm::{InsnInfo, LinearWalker, MenuCtrlKind}, man_section};
 
+#[derive(Clone,Debug,serde::Serialize)]
+pub(super) struct ScriptEffect {
+    pub pc:usize,
+    pub size:usize,
+    pub kind:&'static str,
+    pub context:Option<u8>,
+    pub raw:Vec<u8>,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct WallWrite {
     pub pc: usize,
@@ -29,6 +38,7 @@ pub(super) struct ScriptScan {
     pub targets: Vec<(usize, u8)>,
     pub wall_writes: Vec<WallWrite>,
     pub error: Option<String>,
+    pub effects:Vec<ScriptEffect>,
 }
 pub(super) fn scan_script(bytes: &[u8], pc0: usize) -> ScriptScan {
     let mut scan = ScriptScan::default();
@@ -41,6 +51,13 @@ pub(super) fn scan_script(bytes: &[u8], pc0: usize) -> ScriptScan {
                 if let InsnInfo::MenuCtrl { kind: MenuCtrlKind::Nibble7Tile {sub, x0, z0, x1, z1, mask}, .. } = &insn.info {
                     scan.wall_writes.push(WallWrite {pc: insn.pc, sub: *sub, x0: *x0, z0: *z0, x1: *x1, z1: *z1, mask: *mask});
                 }
+                let effect=match &insn.info {
+                    InsnInfo::MenuCtrl{kind:MenuCtrlKind::HighNibble{outer:9,..},..}=>Some("FloorLadderOperation"),
+                    InsnInfo::MenuCtrl{kind:MenuCtrlKind::Nibble6ClutFx{..},..}=>Some("ClutEffect"),
+                    InsnInfo::MenuCtrl{kind:MenuCtrlKind::Nibble5NpcRun{..},..}|InsnInfo::MoveTo{..}|InsnInfo::ExecMove{..}=>Some("ActorSpatialOperation"),
+                    _=>None,
+                };
+                if let Some(kind)=effect {scan.effects.push(ScriptEffect{pc:insn.pc,size:insn.size,kind,context:insn.extended,raw:bytes[insn.pc..insn.pc+insn.size].to_vec()});}
                 scan.instructions.push(format!("+{:#x}: {:?}", insn.pc, insn));
             }
             Err((pc, error)) => {scan.error = Some(format!("Decode stopped at +{pc:#x}: {error:?}")); break;}

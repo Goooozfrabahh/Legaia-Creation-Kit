@@ -15,6 +15,8 @@ mod naming;
 mod native_dependency_report;
 mod native_script_dependencies;
 mod native_wall_ownership;
+mod native_cell_inventory;
+mod native_elevation_codec;
 mod native_asset_plan;
 mod placement_drop;
 mod cell_catalog;
