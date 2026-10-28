@@ -359,6 +359,9 @@ pub(super) fn parse(text: &str, scene_name: &str, world: &WorldModel) -> Result<
             return Err("Project overlay has too many records".into());
         }
     }
+    // Export has its own per-operation failure ledger. Do not let a semantic
+    // compatibility preflight discard the entire otherwise parseable manifest.
+    if super::ps1_export::unrestricted::active() {return Ok(doc);}
     for recipe in &doc.mesh_collision {
         let foreign=doc.foreign.iter().find(|f|f.uid==recipe.uid).ok_or("Mesh collision references missing foreign owner")?;
         if (foreign.source.as_str(),foreign.kind.as_str(),foreign.record)!=(recipe.scene.as_str(),recipe.kind.as_str(),recipe.record) {

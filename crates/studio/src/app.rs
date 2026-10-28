@@ -832,6 +832,7 @@ pub struct App {
     editor_cell_last_autosave: f64,
     /// Background native test-image export; no edits to the currently open image.
     ps1_export_job: Option<Receiver<anyhow::Result<ps1_export::ExportResult>>>,
+    unrestricted_img_export: bool,
     /// Source being dragged across the panels (no mouse-driven text selection).
     editor_asset_drag: Option<EditorCatalogItem>,
     /// Highlight a single catalog entry while dragging or after clicking.
@@ -1025,6 +1026,7 @@ impl App {
             editor_cell_properties: None,
             editor_cell_last_autosave: 0.0,
             ps1_export_job: None,
+            unrestricted_img_export: true,
             editor_asset_drag: None,
             editor_catalog_active: None,
             editor_modal: None,
@@ -2995,6 +2997,8 @@ impl App {
                     ui.colored_label(Color32::from_rgb(225,175,70),message)
                         .on_hover_text("This is a source-provenance diagnostic, NOT a claim that the destination PS1 engine will collide with or walk on this object. The retail IMG is unchanged.");
                 }
+                ui.checkbox(&mut self.unrestricted_img_export,"Unrestricted IMG Export Mode (experimental)")
+                    .on_hover_text("Attempt available native writers without compatibility preflight. Each export creates debug.txt with warnings and exact failures; an IMG may be incomplete.");
                 ui.horizontal_wrapped(|ui| {
                     self.native_view.controls(ui, "Sample original PS1 TIM/CLUT atlas from assembled scene VRAM");
                     ui.checkbox(&mut self.native_ground_visible, "Show walk-ground")
@@ -3100,7 +3104,7 @@ impl App {
                         }
                     }
                     if ui.button("Check IMG")
-                        .on_hover_text("Run the SAME strict PS1-native export preparation, but do not open a save dialog or write any file. Passing preflight is not proof of PS1 runtime behavior.")
+                        .on_hover_text("Unrestricted mode bypasses compatibility preflight. With the checkbox off, run strict preparation without writing a file. Neither mode verifies gameplay.")
                         .clicked() {
                         let result = (|| -> anyhow::Result<String> {
                             let lib = self.studio.library.as_ref()
@@ -3108,10 +3112,12 @@ impl App {
                             let Source::Disc(source)=&lib.source else {
                                 anyhow::bail!("Open the native PS1 disc source first");
                             };
+                            if self.unrestricted_img_export {return Ok("Compatibility preflight disabled. Export attempts all manifest operations; debug.txt records written fields and exact failures.".into());}
                             let plan=ps1_export::plan_export(source,scene,world,lib.index.as_ref())?;
                             Ok(plan.summary())
                         })();
                         match result {
+                            Ok(summary) if self.unrestricted_img_export => self.studio.status=Some(summary),
                             Ok(summary) => self.studio.status = Some(format!(
                                 "PS1 serialization preflight PASSED for {}: {summary}. No IMG written; PS1 runtime behavior remains unverified.", scene.name)),
                             Err(e) => self.studio.error = Some(format!(
@@ -3119,7 +3125,7 @@ impl App {
                         }
                     }
                     if ui.add_enabled(self.ps1_export_job.is_none(), egui::Button::new("Export PS1 test IMG..."))
-                        .on_hover_text("Compile and validate native record allocation, resources and MAN changes. Unresolved wall ownership blocks export; original walls and floors are preserved.")
+                        .on_hover_text("Unrestricted mode attempts native writes without compatibility gates and creates per-export debug.txt. Failed operations produce an explicitly partial IMG; protected source files are never overwritten.")
                         .clicked() {
                         let prepared = (|| -> anyhow::Result<(PathBuf,ps1_export::NativeExportPlan,String)> {
                             let lib=self.studio.library.as_ref().ok_or_else(||anyhow::anyhow!("No disc image loaded"))?;
@@ -3131,17 +3137,17 @@ impl App {
                             // Integration V1: capture the COMPLETE editor change manifest
                             // before native preflight. Names remain editor-side metadata.
                             let overlay=scene_instances::serialize(name,world);
-                            if export_integration::only_editor_labels(&overlay) {
+                            if !self.unrestricted_img_export && export_integration::only_editor_labels(&overlay) {
                                 let report=export_integration::render_report(name,&overlay,Some(&source));
                                 let note="Only hierarchy labels changed: no native PS1 data needs writing. Save the .lckscene to preserve the labels; IMG unchanged.";
                                 let log_path=export_integration::write_log(name,&report,note)
                                     .map(|p|p.display().to_string()).unwrap_or_else(|e|e);
                                 anyhow::bail!("{note} Integration V1 log: {log_path}");
                             }
-                            let plan=ps1_export::plan_export(&source,scene,world,lib.index.as_ref())
+                            let plan=if self.unrestricted_img_export {ps1_export::unrestricted::prepare(&source,scene,world,lib.index.as_ref())}else{ps1_export::plan_export(&source,scene,world,lib.index.as_ref())}
                                 .map_err(|error| {
                                     let report=export_integration::render_report(name,&overlay,Some(&source));
-                                    let cause=format!("NATIVE PREFLIGHT FAILED: {error:#}");
+                                    let cause=format!("Native export preparation failed: {error:#}");
                                     let log_path=export_integration::write_log(name,&report,&cause)
                                         .map(|p|p.display().to_string()).unwrap_or_else(|e|e);
                                     anyhow::anyhow!("{cause}. Integration V1 log: {log_path}")
@@ -3163,7 +3169,7 @@ impl App {
                                     std::thread::spawn(move|| {
                                         let result=ps1_export::export(plan,&destination);
                                         let outcome=match &result {
-                                            Ok(done)=>format!("NATIVE EXPORT SUCCESS: {}\nPatched: {}\nSkipped: {}",
+                                            Ok(done)=>format!("{}: {}\nPatched: {}\nSkipped: {}",if done.skipped.iter().any(|s|s.starts_with("UNRESTRICTED EXPERIMENT")){"EXPERIMENTAL IMG ATTEMPT WRITTEN — NOT PROVEN COMPLETE"}else{"NATIVE EXPORT SUCCESS"},
                                                 done.path.display(),done.patched.join(" | "),done.skipped.join(" | ")),
                                             Err(error)=>format!("NATIVE EXPORT FAILED: {error:#}"),
                                         };
@@ -3174,7 +3180,7 @@ impl App {
                                         repaint.request_repaint();
                                     });
                                     self.ps1_export_job=Some(rx);
-                                    self.studio.status=Some("Writing validated native export plan. PS1 runtime behavior remains unverified.".into());
+                                    self.studio.status=Some(if self.unrestricted_img_export {"Writing experimental native attempt. Partial failures remain failures; debug.txt will be created.".into()}else{"Writing validated native export plan. PS1 runtime behavior remains unverified.".into()});
                                 }
                             }
                             Err(error) => {
@@ -5691,6 +5697,9 @@ impl eframe::App for App {
                     self.last_written=result.path.parent().map(Path::to_path_buf);
                     let details=if result.skipped.is_empty(){String::new()}else{format!(" Not updated: {}",result.skipped.join(" | "))};
                     self.studio.status=Some(format!("Native PS1 image saved: {}. Patched: {}.{} In DuckStation: boot THIS IMG (not an old CUE or save state), then reload Rim Elm. Native writes were read back. Original walls/floors and scripts are preserved unless an explicit supported plan changes them; gameplay verification remains required.",result.path.display(),result.patched.join(", "),details));
+                    if result.skipped.iter().any(|s|s.starts_with("UNRESTRICTED EXPERIMENT")) {
+                        self.studio.status=Some(format!("EXPERIMENTAL IMG saved: {}. {} native write reports; {} failed requests. NOT PROVEN COMPLETE. {}",result.path.display(),result.patched.len(),result.skipped.len().saturating_sub(1),result.skipped.last().cloned().unwrap_or_default()));
+                    }
                     self.ps1_export_job=None;
                 }
                 Ok(Err(error))=>{

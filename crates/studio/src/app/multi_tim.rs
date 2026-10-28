@@ -16,9 +16,9 @@ pub(in crate::app) struct UploadTrace {
     tim_flags:BTreeMap<ResourceId,u32>,
 }
 fn payload<'a>(inventory:&'a NativeAssetPlan,id:&ResourceId,kind:ResourceKind)->Result<&'a [u8]> {
-    ensure!(id.kind==kind,"Wrong resource kind in dependency closure");
+    export_check!(id.kind==kind,"Wrong resource kind in dependency closure");
     let raw=inventory.resources.get(id).and_then(|r|r.payload.as_deref()).context("Upload resource missing")?;
-    ensure!(super::super::digest(raw)==id.sha256,"Stale upload resource");Ok(raw)
+    export_check!(super::super::digest(raw)==id.sha256,"Stale upload resource");Ok(raw)
 }
 impl UploadTrace {
     /// A scanner's resource order is not evidence. Supply explicit sequence
@@ -32,20 +32,20 @@ impl UploadTrace {
         Self::verify(inventory,events,expected,evidence,true)
     }
     fn verify(inventory:&NativeAssetPlan,events:&[Upload],expected:&Vram,evidence:&str,native:bool)->Result<Self> {
-        ensure!(!events.is_empty() && !evidence.trim().is_empty(),"Upload-order evidence missing");
+        export_check!(!events.is_empty() && !evidence.trim().is_empty(),"Upload-order evidence missing");
         let mut trace=Self{events:events.to_vec(),blocks:BTreeMap::new(),owners:vec![None;1024*512],vram:Vram::new(),replay_evidence:evidence.into(),fingerprints:BTreeMap::new(),tim_flags:BTreeMap::new()};
         for (i,event) in events.iter().enumerate() {
-            ensure!(event.sequence==Some(i as u32),"Ambiguous or incomplete upload ordering");
-            ensure!(event.image||event.clut,"Empty upload operation");
+            export_check!(event.sequence==Some(i as u32),"Ambiguous or incomplete upload ordering");
+            export_check!(event.image||event.clut,"Empty upload operation");
             let raw=payload(inventory,&event.resource,ResourceKind::Tim)?;let tim=if native{legaia_tim::parse_native_upload(raw)?}else{legaia_tim::parse_strict(raw)?};
             trace.tim_flags.insert(event.resource.clone(),tim.flags);
-            ensure!(tim.byte_extent()==raw.len(),"Trailing TIM data in upload trace");
+            export_check!(tim.byte_extent()==raw.len(),"Trailing TIM data in upload trace");
             let depth=match tim.mode {PixelMode::Bpp4=>0,PixelMode::Bpp8=>1,PixelMode::Bpp16=>2,_=>bail!("Unsupported ordered TIM mode")};
             trace.fingerprints.insert(event.resource.clone(),super::super::digest(raw));
             if event.clut {
                 let c=tim.clut.as_ref().context("CLUT upload has no palette block")?;
                 let rect=Rect{x:c.fb_x,y:c.fb_y,w:c.w.checked_mul(c.h).context("Linear CLUT overflow")?,h:1}.valid()?;
-                ensure!(rect.x%16==0,"Unaligned native palette");
+                export_check!(rect.x%16==0,"Unaligned native palette");
                 trace.write(Owner{event:i,clut:true},SourceBlock{rect,bytes:c.entries.iter().flat_map(|v|v.to_le_bytes()).collect(),depth:3},event.merge_clut_zeros);
             }
             if event.image {
@@ -53,7 +53,7 @@ impl UploadTrace {
                 trace.write(Owner{event:i,clut:false},SourceBlock{rect,bytes:tim.image.data,depth},false);
             }
         }
-        ensure!(super::super::super::naming::material_key(&trace.vram)==super::super::super::naming::material_key(expected),"Ordered upload replay differs from reference pixels/coverage");
+        export_check!(super::super::super::naming::material_key(&trace.vram)==super::super::super::naming::material_key(expected),"Ordered upload replay differs from reference pixels/coverage");
         Ok(trace)
     }
     fn write(&mut self,owner:Owner,block:SourceBlock,merge:bool) {
@@ -68,9 +68,9 @@ impl UploadTrace {
         rect.valid()?;let owner=self.owners[rect.y as usize*1024+rect.x as usize].context("Unresolved external image/palette data")?;
         // CBA addresses raw VRAM words: an image upload may intentionally
         // supply a palette. No guessed CLUT ownership is needed in that case.
-        if !clut {ensure!(!owner.clut,"Texture image overwritten by a palette upload");}
+        if !clut {export_check!(!owner.clut,"Texture image overwritten by a palette upload");}
         for y in rect.y..rect.y+rect.h {for x in rect.x..rect.x+rect.w {
-            ensure!(self.owners[y as usize*1024+x as usize]==Some(owner),"Fragmented image/composite palette requires a native composite-block writer");
+            export_check!(self.owners[y as usize*1024+x as usize]==Some(owner),"Fragmented image/composite palette requires a native composite-block writer");
         }}Ok(owner)
     }
 }
@@ -85,7 +85,7 @@ impl MultiPlan {
         self.uploads.iter().map(|u|u.source.clone()).chain(self.tmds.keys().cloned()).collect()
     }
     pub fn apply(&self,destination:&Vram)->Result<Vram> {
-        ensure!(super::super::super::naming::material_key(destination)==self.source_vram,"Multi-TIM destination changed");Ok(self.output.clone())
+        export_check!(super::super::super::naming::material_key(destination)==self.source_vram,"Multi-TIM destination changed");Ok(self.output.clone())
     }
 }
 struct Binding {reference:Reference,image:Owner,palette:Option<Owner>}
@@ -94,23 +94,23 @@ impl Planner {
         let mut staged=self.clone();let result=staged.compile_multi(inventory,trace,tmd_ids)?;*self=staged;Ok(result)
     }
     fn compile_multi(&mut self,inventory:&NativeAssetPlan,trace:&UploadTrace,tmd_ids:&[ResourceId])->Result<MultiPlan> {
-        for (id,hash) in &trace.fingerprints {ensure!(super::super::digest(payload(inventory,id,ResourceKind::Tim)?)==*hash,"Upload trace source changed");}
-        ensure!(!tmd_ids.is_empty(),"No model dependencies");
+        for (id,hash) in &trace.fingerprints {export_check!(super::super::digest(payload(inventory,id,ResourceKind::Tim)?)==*hash,"Upload trace source changed");}
+        export_check!(!tmd_ids.is_empty(),"No model dependencies");
         let mut bindings=BTreeMap::new();let mut required=BTreeSet::new();
         for id in tmd_ids {
-            ensure!(!bindings.contains_key(id),"Duplicate TMD dependency");
+            export_check!(!bindings.contains_key(id),"Duplicate TMD dependency");
             let mut model=Vec::new();
             for r in references(payload(inventory,id,ResourceKind::Tmd)?)? {
                 let depth=((r.tsb>>7)&3) as u8;let divisor=match depth {0=>4,1=>2,_=>1};
                 let u0=r.uvs.iter().map(|p|p.0).min().unwrap() as u16;let u1=r.uvs.iter().map(|p|p.0).max().unwrap() as u16;
                 let v0=r.uvs.iter().map(|p|p.1).min().unwrap() as u16;let v1=r.uvs.iter().map(|p|p.1).max().unwrap() as u16;
                 let rect=Rect{x:(r.tsb&15)*64+u0/divisor,y:((r.tsb>>4)&1)*256+v0,w:u1/divisor-u0/divisor+1,h:v1-v0+1};
-                let image=trace.owner(rect,false)?;ensure!(trace.blocks[&image].depth==depth,"Native image depth mismatch");required.insert(image);
+                let image=trace.owner(rect,false)?;export_check!(trace.blocks[&image].depth==depth,"Native image depth mismatch");required.insert(image);
                 let palette=if depth<2 {let owner=trace.owner(Rect{x:(r.cba&63)*16,y:(r.cba>>6)&511,w:if depth==0{16}else{256},h:1},true)?;required.insert(owner);Some(owner)}else{None};
                 model.push(Binding{reference:r,image,palette});
             }bindings.insert(id.clone(),model);
         }
-        ensure!(!required.is_empty(),"No textured dependencies");
+        export_check!(!required.is_empty(),"No textured dependencies");
         let source_vram=super::super::super::naming::material_key(&self.vram);
         let mut targets=BTreeMap::new();let mut uploads=Vec::new();
         for owner in required {
@@ -120,7 +120,7 @@ impl Planner {
             // Merge-zero palettes are not promoted to complete original blocks:
             // any skipped source words remain unresolved outside used windows.
             if owner.clut && trace.events[owner.event].merge_clut_zeros {
-                ensure!((block.rect.y..block.rect.y+block.rect.h).all(|y|(block.rect.x..block.rect.x+block.rect.w).all(|x|trace.owners[y as usize*1024+x as usize]==Some(owner))),"Partial merge-zero CLUT cannot be emitted as an authentic complete block");
+                export_check!((block.rect.y..block.rect.y+block.rect.h).all(|y|(block.rect.x..block.rect.x+block.rect.w).all(|x|trace.owners[y as usize*1024+x as usize]==Some(owner))),"Partial merge-zero CLUT cannot be emitted as an authentic complete block");
             }
             let source=trace.events[owner.event].resource.clone();
             uploads.push(UploadBlock{rect:target,bytes:block.bytes.clone(),depth:block.depth,source:source.clone(),origins:inventory.resources[&source].origins.clone(),flags:trace.tim_flags[&source]});
@@ -137,13 +137,13 @@ impl Planner {
                 }else{r.cba};
                 for (at,value) in [(r.at+2,cba),(r.at+6,tsb)] {out[at..at+2].copy_from_slice(&value.to_le_bytes());allowed.extend([at,at+1]);}
             }
-            ensure!(raw.iter().zip(&out).enumerate().all(|(i,(a,b))|a==b||allowed.contains(&i)),"Unrelated TMD bytes changed");
-            let readback=references(&out)?;ensure!(readback.len()==model.len(),"Primitive readback count changed");
+            export_check!(raw.iter().zip(&out).enumerate().all(|(i,(a,b))|a==b||allowed.contains(&i)),"Unrelated TMD bytes changed");
+            let readback=references(&out)?;export_check!(readback.len()==model.len(),"Primitive readback count changed");
             for (b,r) in model.iter().zip(readback) {
-                let a=&b.reference;ensure!(r.uvs==a.uvs && r.tsb&!31==a.tsb&!31,"UV/depth/blend changed");
+                let a=&b.reference;export_check!(r.uvs==a.uvs && r.tsb&!31==a.tsb&!31,"UV/depth/blend changed");
                 for u in a.uvs.iter().map(|p|p.0).min().unwrap()..=a.uvs.iter().map(|p|p.0).max().unwrap() {for v in a.uvs.iter().map(|p|p.1).min().unwrap()..=a.uvs.iter().map(|p|p.1).max().unwrap() {
-                    samples+=1;ensure!(samples<=8_000_000,"Multi-TIM readback sample budget exceeded");
-                    ensure!(super::super::super::ps1_export::vram_texel(&trace.vram,a.cba,a.tsb,u as usize,v as usize)==super::super::super::ps1_export::vram_texel(&self.vram,r.cba,r.tsb,u as usize,v as usize),"Multi-TIM sample mismatch");
+                    samples+=1;export_check!(samples<=8_000_000,"Multi-TIM readback sample budget exceeded");
+                    export_check!(super::super::super::ps1_export::vram_texel(&trace.vram,a.cba,a.tsb,u as usize,v as usize)==super::super::super::ps1_export::vram_texel(&self.vram,r.cba,r.tsb,u as usize,v as usize),"Multi-TIM sample mismatch");
                 }}
             }tmds.insert(id,out);
         }
@@ -155,11 +155,11 @@ impl Planner {
 /// selector table. Slots here are local pack indexes, not runtime mesh IDs.
 pub(in crate::app) struct SceneResourcePackage {pub tim_pack:Vec<u8>,pub tmd_pack:Vec<u8>,pub model_slots:BTreeMap<ResourceId,u32>}
 fn pack(items:&[Vec<u8>])->Result<Vec<u8>> {
-    ensure!(!items.is_empty() && items.len()<=65536,"Native pack count out of range");
+    export_check!(!items.is_empty() && items.len()<=65536,"Native pack count out of range");
     let mut out=vec![0;4+items.len()*4];out[..4].copy_from_slice(&(items.len() as u32).to_le_bytes());
-    for (i,item) in items.iter().enumerate() {ensure!(out.len()/4<=u32::MAX as usize,"Native pack offset overflow");let word=(out.len()/4) as u32;out[4+i*4..8+i*4].copy_from_slice(&word.to_le_bytes());out.extend_from_slice(item);while out.len()%4!=0{out.push(0);}}
-    let ranges=legaia_container_formats::pack::parse_pack(&out)?;ensure!(ranges.len()==items.len(),"Native pack count readback");
-    for (entry,item) in ranges.iter().zip(items) {ensure!(&out[entry.byte_offset..entry.byte_offset+item.len()]==item,"Native pack bytes changed");}
+    for (i,item) in items.iter().enumerate() {export_check!(out.len()/4<=u32::MAX as usize,"Native pack offset overflow");let word=(out.len()/4) as u32;out[4+i*4..8+i*4].copy_from_slice(&word.to_le_bytes());out.extend_from_slice(item);while out.len()%4!=0{out.push(0);}}
+    let ranges=legaia_container_formats::pack::parse_pack(&out)?;export_check!(ranges.len()==items.len(),"Native pack count readback");
+    for (entry,item) in ranges.iter().zip(items) {export_check!(&out[entry.byte_offset..entry.byte_offset+item.len()]==item,"Native pack bytes changed");}
     Ok(out)
 }
 impl MultiPlan {
@@ -175,7 +175,7 @@ impl MultiPlan {
             let tim=legaia_tim::parse_native_upload(&raw)?;
             if emitted.insert(raw.clone()) {replay.upload_tim(&tim);tims.push(raw);}
         }
-        ensure!(super::super::super::naming::material_key(&replay)==super::super::super::naming::material_key(&self.output),"Native TIM package replay differs");
+        export_check!(super::super::super::naming::material_key(&replay)==super::super::super::naming::material_key(&self.output),"Native TIM package replay differs");
         let tmds=self.tmds.values().cloned().collect::<Vec<_>>();for raw in &tmds {references(raw)?;}
         Ok(SceneResourcePackage{tim_pack:pack(&tims)?,tmd_pack:pack(&tmds)?,model_slots:self.tmds.keys().enumerate().map(|(i,id)|(id.clone(),i as u32)).collect()})
     }
