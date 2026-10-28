@@ -29,6 +29,8 @@ use native_dependencies::NativeBindings;
 mod native_deletion;
 #[path = "insertion_provenance.rs"]
 mod insertion_provenance;
+#[path = "native_map_rotation.rs"]
+mod native_map_rotation;
 
 const MAP_LEN: usize = 0x12000;
 const GRID_OFF: usize = 0x8000;
@@ -86,6 +88,7 @@ pub(super) struct NpcEdit {
 #[derive(Clone, Debug, Default)]
 pub(super) struct ExportEdits {
     pub moves: Vec<MoveEdit>,
+    pub yaws: Vec<native_map_rotation::YawEdit>,
     /// Non-placed decoration references, not the walkable heightfield.
     pub terrain_moves: Vec<MoveEdit>,
     pub deletes: Vec<MoveEdit>,
@@ -363,7 +366,7 @@ pub(super) fn prepare_cross_cell(scene: &AssembledScene, world: &WorldModel,
     }
     ensure!(imported.len()==doc.foreign.len(),"Some foreign assets did not resolve to native copies");
     ensure!(edits.copies.len()<=16,"Native IMG export permits no more than 16 total original/cross-cell object copies");
-    ensure!(!edits.terrain_moves.is_empty() || !edits.moves.is_empty() || !edits.deletes.is_empty() || !edits.copies.is_empty() || !edits.npcs.is_empty(),
+    ensure!(!edits.yaws.is_empty() || !edits.terrain_moves.is_empty() || !edits.moves.is_empty() || !edits.deletes.is_empty() || !edits.copies.is_empty() || !edits.npcs.is_empty(),
         "No native changes to export");
     Ok(edits)
 }
@@ -484,13 +487,32 @@ fn prepare_with_mode(scene: &AssembledScene, world: &WorldModel, mode: Preparati
         ensure!(doc.foreign.is_empty(),
             "This LCK scene contains cross-cell asset previews. Native IMG export is disabled until donor TMD/TIM resource relocation and collision serialization are implemented. Save the .lckscene instead.");
     }
-    // Foreign asset rotations/scales are irrelevant to the native MAP wall
-    // overlay; unsupported rotations/scales of a NATIVE object still block it.
-    // Both export modes reject every unsupported rotation or scale.
-    ensure!(!has_unhandled_native_transforms(&doc, collision_preview),
-        "Native rotation/scale requires a native transform/TMD export stage; reset rotation/scale or save .lckscene to preserve the edit. Stage M2 changes placement freedoms only.");
-
     let mut result=ExportEdits::default();
+    let mut remaining=doc.clone();
+    remaining.rotations.clear();
+    for (target,rotation) in &doc.rotations {
+        if let scene_instances::NameTarget::Native(false,index)=target {
+            if world.npc((false,*index)).is_none() {
+                let native=scene.placements.get(*index).context("Missing native yaw placement")?;
+                let draw=world.at(false,*index).context("Missing native yaw hierarchy entry")?;
+                ensure!(native.anim_id==0 && draw.editor_uid.is_none() && !draw.hidden,
+                    "Animated/created MAP yaw requires additional native dependency closure");
+                let quarters=native_map_rotation::quarters(*rotation)?;
+                let delta=doc.moves.iter().find(|(key,_)|*key==(false,*index)).map(|(_,d)|*d).unwrap_or([0.0;3]);
+                result.yaws.push(native_map_rotation::YawEdit{source:MoveEdit{
+                    collision_bounds:original_collision_bounds(world,*index),cell:native.cell,
+                    source_position:(native.world_x,native.world_z),env_slot:native.env_slot,
+                    source_rotation:[native.rot_x,native.rot_y,native.rot_z],delta},
+                    center:[draw.original_center[0],draw.original_center[2]],quarters});
+                continue;
+            }
+        }
+        remaining.rotations.push((target.clone(),*rotation));
+    }
+    ensure!(!has_unhandled_native_transforms(&remaining,collision_preview),
+        "Requested native rotation/scale requires an additional native transform adapter; no edits omitted");
+    ensure!(!collision_preview || result.yaws.is_empty(),
+        "Native yaw collider overlay is not implemented; rotation preview collision is not verified");
     for &(terrain,index) in &doc.hidden {
         ensure!(!terrain,"Native deletion of terrain/ground is unsupported; no output written");
         ensure!(world.npc((terrain,index)).is_none(),"Native NPC/actor deletion requires MAN script/dependency removal; no output written");
@@ -543,6 +565,7 @@ fn prepare_with_mode(scene: &AssembledScene, world: &WorldModel, mode: Preparati
         let draw=world.at(terrain,index).context("Original source is absent from hierarchy")?;
         ensure!(draw.editor_uid.is_none() && !draw.hidden,"Moved source is a created or hidden object");
         ensure!(delta.iter().all(|v|v.is_finite()) && delta.iter().any(|v|v.abs()>EPS),"Bad native movement delta");
+        if !terrain && result.yaws.iter().any(|e|e.source.cell==native.cell) {continue;}
         let edits=if terrain {&mut result.terrain_moves} else {&mut result.moves};
         edits.push(MoveEdit { collision_bounds:original_draw_bounds(world,(terrain,index)), cell:native.cell,
             source_position:(native.world_x,native.world_z), env_slot:native.env_slot,
@@ -576,7 +599,7 @@ fn prepare_with_mode(scene: &AssembledScene, world: &WorldModel, mode: Preparati
             source_rotation:[source.rot_x,source.rot_y,source.rot_z],delta:created.offset });
     }
     if !collision_preview {
-        ensure!(mode == PreparationMode::CrossCellExport || !result.terrain_moves.is_empty() || !result.moves.is_empty() || !result.deletes.is_empty() || !result.copies.is_empty() || !result.npcs.is_empty(),
+        ensure!(mode == PreparationMode::CrossCellExport || !result.yaws.is_empty() || !result.terrain_moves.is_empty() || !result.moves.is_empty() || !result.deletes.is_empty() || !result.copies.is_empty() || !result.npcs.is_empty(),
             "No native objects changed. Move, duplicate or change a native environment object / NPC.");
         ensure!(result.npcs.iter().filter(|n|n.uid.is_some()).count()<=4,
             "NPC insertion is experimental: export at most 4 new actors per build");
@@ -1211,6 +1234,7 @@ fn compile_walls(map:&mut [u8], original:&[u8], edits:&ExportEdits)->Result<Wall
             require_no_unowned_walls(original,edit.collision_bounds)?;
         }
     }
+    for edit in &edits.yaws {require_no_unowned_walls(original,edit.source.collision_bounds)?;}
     for edit in &edits.copies {
         if let Some((_,bits))=edits.foreign_wall_stencils.iter().find(|(uid,_)|*uid==edit.uid) {
             ensure!(bits.is_empty(),"Unresolved donor wall ownership for UID {}; import blocked",edit.uid);
@@ -1242,7 +1266,7 @@ fn map_patches_with_bindings(original:&[u8],edits:&ExportEdits,bindings:&NativeB
             unresolved.push(format!("Terrain reference {:?} has native trigger/height dependencies ({triggers}); ownership resolution is required",edit.cell));
         }
     }
-    for cell in edits.moves.iter().chain(&edits.terrain_moves).chain(&edits.deletes).map(|e|e.cell).chain(edits.copies.iter().map(|e|e.cell)) {
+    for cell in edits.moves.iter().chain(&edits.terrain_moves).chain(&edits.deletes).chain(edits.yaws.iter().map(|e|&e.source)).map(|e|e.cell).chain(edits.copies.iter().map(|e|e.cell)) {
         let go=GRID_OFF+(cell.1 as usize*GRID_DIM+cell.0 as usize)*2;
         ensure!(cell.0<128 && cell.1<128,"Source reference outside native grid");
         let id=(u16::from_le_bytes(original[go..go+2].try_into()?)&511) as usize;
@@ -1252,6 +1276,13 @@ fn map_patches_with_bindings(original:&[u8],edits:&ExportEdits,bindings:&NativeB
         if let Some(binding)=bindings.at((x as u8,z as u8)) {
             unresolved.push(format!("Native binding unresolved for record #{id}: {} trigger byte {:#x}, MAN flat record {}, gate {}. Independent script/animation/collision dependencies must be resolved before export",binding.block,binding.offset,binding.record,binding.gate));
         }
+    }
+    for edit in &edits.yaws {
+        ensure!(!edits.moves.iter().any(|m|m.cell==edit.source.cell),
+            "Native move/yaw must be compiled as one transform, not repeated requests");
+        ensure!(!edits.insertion_provenance.as_ref().is_some_and(|p|p.contains(edit.source.cell)),
+            "Receipt-tracked imported yaw requires angle-aware provenance; no output written");
+        ensure!(!bindings.has_trigger(edit.source.cell),"Native yaw anchor has unresolved trigger/height dependencies");
     }
     // Report every moving object's unresolved dependency in one attempt. A
     // category route is not a waiver of wall ownership or native behavior.
@@ -1265,7 +1296,7 @@ fn map_patches_with_bindings(original:&[u8],edits:&ExportEdits,bindings:&NativeB
     let mut updated=original.to_vec();
     let mut deleted=HashSet::new();
     for edit in &edits.deletes {
-        ensure!(deleted.insert(edit.cell)&&!edits.moves.iter().any(|e|e.cell==edit.cell),"Conflicting repeated move/delete request");
+        ensure!(deleted.insert(edit.cell)&&!edits.moves.iter().any(|e|e.cell==edit.cell) && !edits.yaws.iter().any(|e|e.source.cell==edit.cell),"Conflicting repeated move/delete request");
         let dependency=native_deletion::analyze(original,edit,bindings,edits.insertion_provenance.as_ref())?;
         dependency.validate()?;
         // Only the independently validated spawn reference is removed. Its
@@ -1276,6 +1307,7 @@ fn map_patches_with_bindings(original:&[u8],edits:&ExportEdits,bindings:&NativeB
     }
     let mut moved=move_originals(&mut updated,&edits.moves)?;
     moved.extend(move_records(&mut updated,&edits.terrain_moves,true)?);
+    let rotated=native_map_rotation::apply(&mut updated,original,&edits.yaws)?;
     let inserted=insert_copies_with_bindings(&mut updated,original,&edits.copies,&edits.tier_heights,bindings)?;
     let wall_report=compile_walls(&mut updated,original,edits)?;
     for i in WALL_OFF..GRID_OFF {
@@ -1297,6 +1329,18 @@ fn map_patches_with_bindings(original:&[u8],edits:&ExportEdits,bindings:&NativeB
         } else {
             for p in off..off+6 {allowed[p]=true;}
             for p in off+14..off+16 {allowed[p]=true;}
+        }
+    }
+    for rotation in rotated {
+        let off=rotation.id*32;
+        if let Some((col,row))=rotation.detached_cell {
+            allowed[off..off+32].fill(true);
+            let grid=GRID_OFF+(row as usize*128+col as usize)*2;
+            allowed[grid..grid+2].fill(true);
+        } else {
+            allowed[off..off+6].fill(true);
+            allowed[off+10..off+12].fill(true);
+            allowed[off+14..off+16].fill(true);
         }
     }
     for &(col,row) in &deleted {
@@ -1641,6 +1685,7 @@ pub(super) fn plan_export(source:&Path, scene:&AssembledScene, world:&WorldModel
         edits.insertion_provenance=insertion_provenance::load(&source,&disc,origin_map,&origin_name,
             origin.field_floor_height_lut(index)?.context("Native floor ladder needed for insertion provenance")?)?;
     }
+    edits.yaws.sort_by_key(|e|e.source.cell);
     edits.moves.sort_by_key(|e|e.cell);
     edits.terrain_moves.sort_by_key(|e|e.cell);
     edits.deletes.sort_by_key(|e|e.cell);
@@ -1653,8 +1698,8 @@ pub(super) fn plan_export(source:&Path, scene:&AssembledScene, world:&WorldModel
 
 fn compile_plan(source:PathBuf, mut disc:DiscPatcher, image_length:usize,
     map_entry:usize, edits:&ExportEdits) -> Result<NativeExportPlan> {
-    ensure!(!edits.terrain_moves.is_empty() || !edits.moves.is_empty() || !edits.deletes.is_empty() || !edits.copies.is_empty() || !edits.npcs.is_empty(),"Nothing to export");
-    let has_map_edits=!edits.terrain_moves.is_empty() || !edits.moves.is_empty() || !edits.deletes.is_empty() || !edits.copies.is_empty();
+    ensure!(!edits.yaws.is_empty() || !edits.terrain_moves.is_empty() || !edits.moves.is_empty() || !edits.deletes.is_empty() || !edits.copies.is_empty() || !edits.npcs.is_empty(),"Nothing to export");
+    let has_map_edits=!edits.yaws.is_empty() || !edits.terrain_moves.is_empty() || !edits.moves.is_empty() || !edits.deletes.is_empty() || !edits.copies.is_empty();
     let rim_elm=RIM_ELM_MAPS.iter().any(|(_,id)|*id==map_entry);
     // Terrain draw identity is scene-local. A matching grid coordinate in
     // another story state is not proof that it is the same decoration.
@@ -1678,7 +1723,7 @@ fn compile_plan(source:PathBuf, mut disc:DiscPatcher, image_length:usize,
             ensure!(loaded.len()==0x14000,"Incomplete native MAP load window");
             let bindings=NativeBindings::parse(&loaded[0x10000..0x12000],&loaded[0x12000..])?;
             let mut local=edits.clone();
-            if idx!=map_entry {local.terrain_moves.clear();}
+            if idx!=map_entry {local.terrain_moves.clear();local.yaws.clear();}
             if let Some(proof)=&edits.insertion_provenance {
                 if map_entry==proof.map_entry&&idx!=proof.map_entry {
                     // Proven additions exist only in their recorded source MAP.

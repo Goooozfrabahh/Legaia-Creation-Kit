@@ -69,6 +69,7 @@ pub(super) fn render_report(cell: &str, overlay: &str, opened_image: Option<&Pat
     report.push_str(
         "V1 compiler status:\n\
          - MAP moves and same-cell copies: routed to the existing native writer.\n\
+           - Static unbound MAP quarter-yaw: native angles, pivot compensation and exact record-local collider; unresolved dependencies block export.\n\
            - Native terrain decorations: descriptor translations with collision, binding and cull-reach validation. Ground geometry is separate.\n\
            - Foreign assets requiring a NEW TMD/TIM, terrain copies/deletion, resizing, and transformed\n\
            collision: writers NOT implemented by this version.\n\
