@@ -118,64 +118,62 @@ impl Planner {
         }
         export_check!(!required.is_empty(),"No textured dependencies");
         let source_vram=super::super::super::naming::material_key(&self.vram);
-        let mut targets=BTreeMap::new();let mut uploads=Vec::new();
-        // Pack image regions before small palettes so a tiny CLUT cannot
-        // fragment the only remaining texture-page-sized space.
-        let mut required=required.into_iter().collect::<Vec<_>>();
-        required.sort_by_key(|owner|(usize::from(!bindings.values().flatten().any(|b|b.image==*owner)),std::cmp::Reverse(trace.blocks[owner].bytes.len())));
+        let mut images=BTreeMap::new();let mut palettes=BTreeMap::new();let mut uploads=Vec::new();
+        let union=|a:Rect,b:Rect|{let x=a.x.min(b.x);let y=a.y.min(b.y);Rect{x,y,w:(a.x+a.w).max(b.x+b.w)-x,h:(a.y+a.h).max(b.y+b.h)-y}};
+        let mut regions=Vec::<(Owner,Rect,Vec<Reference>,bool)>::new();
         for owner in required {
-            let block=&trace.blocks[&owner];let refs=bindings.values().flatten().filter(|b|b.image==owner).map(|b|b.reference.clone()).collect::<Vec<_>>();
-            // Allocate only native words referenced by these primitives or
-            // their complete CLUT windows, rather than transplant an entire
-            // unrelated atlas. Keep UVs unchanged by preserving page congruence.
-            let mut needed=Vec::new();
-            for r in &refs {
+            // Split only DISJOINT sampled word regions of the same native upload.
+            // Overlapping primitive footprints stay together; no primitive is
+            // subdivided, resampled or stretched. This avoids allocating unused
+            // atlas gaps while retaining exact donor image/palette provenance.
+            let mut groups=Vec::<(Rect,Vec<Reference>)>::new();
+            for r in bindings.values().flatten().filter(|b|b.image==owner).map(|b|b.reference.clone()) {
                 let divisor=match(r.tsb>>7)&3{0=>4,1=>2,_=>1};
                 let x=(r.tsb&15)*64+r.uvs.iter().map(|p|p.0 as u16/divisor).min().unwrap();
                 let end=(r.tsb&15)*64+r.uvs.iter().map(|p|p.0 as u16/divisor).max().unwrap()+1;
                 let y=((r.tsb>>4)&1)*256+r.uvs.iter().map(|p|p.1 as u16).min().unwrap();
                 let bottom=((r.tsb>>4)&1)*256+r.uvs.iter().map(|p|p.1 as u16).max().unwrap()+1;
-                needed.push(Rect{x,y,w:end-x,h:bottom-y});
+                let mut region=Rect{x,y,w:end-x,h:bottom-y};let mut refs=vec![r];
+                loop{let Some(i)=groups.iter().position(|(old,_)|old.overlaps(region))else{break};let(old,mut joined)=groups.remove(i);region=union(region,old);refs.append(&mut joined);}
+                groups.push((region,refs));
             }
-            for b in bindings.values().flatten().filter(|b|b.palette==Some(owner)) {
-                needed.push(Rect{x:(b.reference.cba&63)*16,y:(b.reference.cba>>6)&511,w:if(b.reference.tsb>>7)&3==0{16}else{256},h:1});
-            }
-            let x=needed.iter().map(|r|r.x).min().context("No required native words")?;let y=needed.iter().map(|r|r.y).min().unwrap();
-            let used=Rect{x,y,w:needed.iter().map(|r|r.x+r.w).max().unwrap()-x,h:needed.iter().map(|r|r.y+r.h).max().unwrap()-y};
-            anyhow::ensure!(block.rect.contains(x as usize,y as usize)&&block.rect.contains((x+used.w-1) as usize,(y+used.h-1) as usize),"Required native texture region leaves its upload owner");
+            for(region,refs)in groups{regions.push((owner,region,refs,false));}
+            let needed=bindings.values().flatten().filter(|b|b.palette==Some(owner)).map(|b|Rect{x:(b.reference.cba&63)*16,y:(b.reference.cba>>6)&511,w:if(b.reference.tsb>>7)&3==0{16}else{256},h:1}).reduce(union);
+            if let Some(region)=needed{regions.push((owner,region,vec![],true));}
+        }
+        regions.sort_by_key(|(_,r,_,palette)|(*palette,std::cmp::Reverse(r.w as usize*r.h as usize)));
+        for(owner,used,refs,palette)in regions {
+            let block=&trace.blocks[&owner];let x=used.x;let y=used.y;
+            anyhow::ensure!(block.rect.contains(x as usize,y as usize)&&block.rect.contains((x+used.w-1)as usize,(y+used.h-1)as usize),"Required native region leaves its upload owner");
             let mut bytes=Vec::with_capacity(used.w as usize*used.h as usize*2);
-            for row in y..y+used.h {let at=((row-block.rect.y) as usize*block.rect.w as usize+(x-block.rect.x) as usize)*2;bytes.extend_from_slice(&block.bytes[at..at+used.w as usize*2]);}
-            let role=if refs.is_empty(){3}else{block.depth};
-            let target=self.allocate(used,&bytes,role,None,&refs)?;
-            targets.insert(owner,(used,target));
-            // Merge-zero palettes are not promoted to complete original blocks:
-            // any skipped source words remain unresolved outside used windows.
-            if owner.clut && trace.events[owner.event].merge_clut_zeros {
-                export_check!((block.rect.y..block.rect.y+block.rect.h).all(|y|(block.rect.x..block.rect.x+block.rect.w).all(|x|trace.owners[y as usize*1024+x as usize]==Some(owner))),"Partial merge-zero CLUT cannot be emitted as an authentic complete block");
-            }
-            let source=trace.events[owner.event].resource.clone();
-            uploads.push(UploadBlock{rect:target,bytes,depth:role,source:source.clone(),origins:inventory.resources[&source].origins.clone(),flags:trace.tim_flags[&source]});
+            for row in y..y+used.h{let at=((row-block.rect.y)as usize*block.rect.w as usize+(x-block.rect.x)as usize)*2;bytes.extend_from_slice(&block.bytes[at..at+used.w as usize*2]);}
+            let role=if palette{3}else{block.depth};
+            let target=match self.allocate(used,&bytes,role,None,&refs){Ok(rect)=>rect,Err(error)if !palette=>self.allocate_rebased(used,&bytes,role,&refs).with_context(||format!("UV-preserving allocation failed ({error}); native UV rebasing also failed"))?,Err(error)=>return Err(error)};
+            if palette{palettes.insert(owner,(used,target));}else{for r in refs{images.insert((owner,r.tsb,r.uvs),(used,target));}}
+            if owner.clut&&trace.events[owner.event].merge_clut_zeros{export_check!((block.rect.y..block.rect.y+block.rect.h).all(|y|(block.rect.x..block.rect.x+block.rect.w).all(|x|trace.owners[y as usize*1024+x as usize]==Some(owner))),"Partial merge-zero CLUT cannot be emitted as a complete block");}
+            let source=trace.events[owner.event].resource.clone();uploads.push(UploadBlock{rect:target,bytes,depth:role,source:source.clone(),origins:inventory.resources[&source].origins.clone(),flags:trace.tim_flags[&source]});
         }
         let mut tmds=BTreeMap::new();let mut samples=0usize;let mut reference_diagnostics=Vec::new();
         for (id,model) in bindings {
             let raw=payload(inventory,&id,ResourceKind::Tmd)?;let mut out=raw.to_vec();let mut allowed=BTreeSet::new();
             for b in &model {
-                let r=&b.reference;let (src,dst)=targets[&b.image];
-                let x=(r.tsb as i32&15)*64+dst.x as i32-src.x as i32;let y=((r.tsb as i32>>4)&1)*256+dst.y as i32-src.y as i32;
-                let tsb=(r.tsb&!31)|(x as u16/64)|((y as u16/256)<<4);
-                let cba=if let Some(owner)=b.palette {let (src,dst)=targets[&owner];
+                let r=&b.reference;let (src,dst)=images[&(b.image,r.tsb,r.uvs.clone())];
+                let(tsb,uvs)=super::rebase_uv(r,src,dst)?;
+                let cba=if let Some(owner)=b.palette {let (src,dst)=palettes[&owner];
                     let x=(r.cba&63)*16-src.x+dst.x;let y=((r.cba>>6)&511)-src.y+dst.y;(r.cba&0x8000)|(x/16)|(y<<6)
                 }else{r.cba};
-                reference_diagnostics.push(format!("TMD {} texture block {:#x}: TSB {:#06x} -> {tsb:#06x} (page {},{}), CBA {:#06x} -> {cba:#06x} (CLUT {},{}); UVs {:?} unchanged",id.sha256,r.at,r.tsb,(tsb&15)*64,((tsb>>4)&1)*256,r.cba,(cba&63)*16,(cba>>6)&511,r.uvs));
+                reference_diagnostics.push(format!("TMD {} texture block {:#x}: TSB {:#06x} -> {tsb:#06x} (page {},{}), CBA {:#06x} -> {cba:#06x} (CLUT {},{}); requested native UVs {:?}, encoded {:?}; sampled texels preserved",id.sha256,r.at,r.tsb,(tsb&15)*64,((tsb>>4)&1)*256,r.cba,(cba&63)*16,(cba>>6)&511,r.uvs,uvs));
                 for (at,value) in [(r.at+2,cba),(r.at+6,tsb)] {out[at..at+2].copy_from_slice(&value.to_le_bytes());allowed.extend([at,at+1]);}
+                for (i,&(u,v))in uvs.iter().enumerate(){let at=r.at+match i{0=>0,1=>4,2=>8,3=>10,_=>bail!("Unknown native UV vertex")};out[at]=u;out[at+1]=v;allowed.extend([at,at+1]);}
             }
             export_check!(raw.iter().zip(&out).enumerate().all(|(i,(a,b))|a==b||allowed.contains(&i)),"Unrelated TMD bytes changed");
             let readback=references(&out)?;export_check!(readback.len()==model.len(),"Primitive readback count changed");
             for (b,r) in model.iter().zip(readback) {
-                let a=&b.reference;export_check!(r.uvs==a.uvs && r.tsb&!31==a.tsb&!31,"UV/depth/blend changed");
+                let a=&b.reference;let du=r.uvs[0].0 as i32-a.uvs[0].0 as i32;let dv=r.uvs[0].1 as i32-a.uvs[0].1 as i32;
+                export_check!(r.tsb&!31==a.tsb&!31&&a.uvs.iter().zip(&r.uvs).all(|(a,b)|b.0 as i32-a.0 as i32==du&&b.1 as i32-a.1 as i32==dv),"UV shape/depth/blend changed");
                 for u in a.uvs.iter().map(|p|p.0).min().unwrap()..=a.uvs.iter().map(|p|p.0).max().unwrap() {for v in a.uvs.iter().map(|p|p.1).min().unwrap()..=a.uvs.iter().map(|p|p.1).max().unwrap() {
                     samples+=1;export_check!(samples<=8_000_000,"Multi-TIM readback sample budget exceeded");
-                    export_check!(super::super::super::ps1_export::vram_texel(&trace.vram,a.cba,a.tsb,u as usize,v as usize)==super::super::super::ps1_export::vram_texel(&self.vram,r.cba,r.tsb,u as usize,v as usize),"Multi-TIM sample mismatch");
+                    export_check!(super::super::super::ps1_export::vram_texel(&trace.vram,a.cba,a.tsb,u as usize,v as usize)==super::super::super::ps1_export::vram_texel(&self.vram,r.cba,r.tsb,(u as i32+du)as usize,(v as i32+dv)as usize),"Multi-TIM sample mismatch");
                 }}
             }tmds.insert(id,out);
         }

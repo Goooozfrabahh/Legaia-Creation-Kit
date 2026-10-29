@@ -70,7 +70,7 @@ fn translate_record(map:&mut [u8],cell:(u8,u8),delta:[f32;3])->Result<usize>{
 }
 /// Allocate a native descriptor/reference anywhere representable. Occupied
 /// world-space positions and distant anchors do not block this allocator.
-pub(super) fn copy_record(map:&mut [u8],original:&[u8],source_cell:(u8,u8),delta:[f32;3],tiers:&[Option<i32>;16],source_tiers:Option<&[Option<i32>;16]>)->Result<(usize,(u8,u8))>{
+pub(in crate::app) fn copy_record(map:&mut [u8],original:&[u8],source_cell:(u8,u8),delta:[f32;3],tiers:&[Option<i32>;16],source_tiers:Option<&[Option<i32>;16]>)->Result<(usize,(u8,u8))>{
     let old_id=id_at(original,source_cell)?;let raw=record(original,old_id)?;let old=ObjectRecord::parse(&raw,0).unwrap();
     let id=blank_object_record(map)?;let dx=integer(delta[0])?;let dy=integer(delta[1])?;let dz=integer(delta[2])?;
     let wx=field_objects::world_x(source_cell.0,old.x_off)+dx;let wz=field_objects::world_z(source_cell.1,old.z_off)+dz;
@@ -94,7 +94,7 @@ pub(super) fn copy_record(map:&mut [u8],original:&[u8],source_cell:(u8,u8),delta
     map[at..at+2].copy_from_slice(&((oldword&!511)|id as u16|if old.is_placed(){0}else{field_objects::CELL_VISIBLE}).to_le_bytes());
     note(format!("Independent descriptor {id}, reference {cell:?}, native offsets ({x},{z}); occupied visual locations allowed; spawn-window/physics/runtime behavior unverified"));Ok((id,cell))
 }
-fn yaw(map:&mut [u8],cell:(u8,u8),rotation:[f32;3],center:[f32;3])->Result<()> {
+pub(in crate::app) fn yaw(map:&mut [u8],cell:(u8,u8),rotation:[f32;3],center:[f32;3])->Result<()> {
     anyhow::ensure!(rotation.iter().all(|v|v.is_finite()),"Non-finite rotation");
     let id=detach(map,cell)?;let mut raw=record(map,id)?;let old=ObjectRecord::parse(&raw,0).unwrap();
     anyhow::ensure!(rotation[0].abs()<0.00001&&rotation[2].abs()<0.00001&&old.rot_x&4095==0&&old.rot_z&4095==0,"Available native transform writer cannot compose pitch/roll/tilted matrices; writer missing, not a claimed PS1 engine limit");
@@ -114,12 +114,13 @@ pub(in crate::app) fn prepare(source_path:&Path,scene:&AssembledScene,world:&Wor
     let mut log=vec!["UNRESTRICTED IMG EXPORT — EXPERIMENTAL ATTEMPT, NOT A COMPLETE/VERIFIED EXPORT".into(),format!("Source: {}\nScene: {}\nFull requested manifest:\n{overlay}",source_path.display(),scene.name),"WARNING All compatibility/ownership/binding/collision/overlap/spawn-window preflight is disabled. Encoder failures are retained per operation. Original scripts, collision and resources may become inconsistent; no gameplay verification.".into()];
     let mut disc=DiscPatcher::open(image)?;
     let mut imports=ImportCoverage{requested:world.foreign.len(),written:0};
+    let mut object_verification=Vec::new();
     let doc=attempt("parse exact editor manifest",&mut log,||scene_instances::parse(&overlay,&scene.name,world).map_err(anyhow::Error::msg));
     if let Some(doc)=doc {
         let native=attempt("resolve selected native cell",&mut log,||Scene::load(index,&scene.name));
         if let Some(native)=native {
             if let Some(entry)=native.field_map_index(index).map(|i|i as usize) {
-                compile(&mut disc,entry,scene,world,index,&doc,&mut log,&mut imports);
+                compile(&mut disc,entry,scene,world,index,&doc,&mut log,&mut imports,&mut object_verification);
             }else{log.push("FAILED No native MAP writer for selected cell; all requested edits remain unwritten".into());}
         }
     }
@@ -128,14 +129,15 @@ pub(in crate::app) fn prepare(source_path:&Path,scene:&AssembledScene,world:&Wor
     let written=log.iter().filter(|l|l.starts_with("WRITTEN ")).cloned().collect::<Vec<_>>();
     log.push(format!("IMPORT COVERAGE: {} requested; {} native objects written; {} FAILED IMPORTS. {}",imports.requested,imports.written,imports.failed(),imports.failure_message().unwrap_or_default()));
     log.push(format!("FINAL STATUS: {}. {} successful writer attempts; {} failures. Read all warnings. No claim of complete native behavior or gameplay compatibility.",if failed.is_empty(){"ATTEMPT WRITTEN / DEPENDENCIES UNVERIFIED"}else{"PARTIAL / REQUESTED CHANGES NOT FULLY WRITTEN"},written.len(),failed.len()));
-    Ok(NativeExportPlan{dependencies:Default::default(),source:source_path,image:disc.into_image(),patched:written,skipped:failed,continuation_receipt:None,unrestricted_log:Some(log.join("\n")),imports:Some(imports)})
+    Ok(NativeExportPlan{dependencies:Default::default(),source:source_path,image:disc.into_image(),patched:written,skipped:failed,continuation_receipt:None,unrestricted_log:Some(log.join("\n")),imports:Some(imports),object_verification})
 }
 
-fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldModel,index:&ProtIndex,doc:&scene_instances::SceneDocument,log:&mut Vec<String>,coverage:&mut ImportCoverage){
+fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldModel,index:&ProtIndex,doc:&scene_instances::SceneDocument,log:&mut Vec<String>,coverage:&mut ImportCoverage,reports:&mut Vec<serde_json::Value>){
     // Import each requested instance independently using the existing native
     // resource registration writer. No collision/runtime acceptance gate.
     let mut imported_targets=HashMap::new();
     let mut resource_session=None;
+    let mut intended_models=HashMap::<u64,String>::new();
     // Identical donor instances share the registered native resource closure,
     // while each receives its own descriptor and MAP reference. Cache only the
     // exact donor identity, never a nearby or merely similar object.
@@ -155,6 +157,7 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
             }){
                 *disc=candidate;imported_targets.insert(scene_instances::NameTarget::Created(foreign.uid),allocated);
                 coverage.written+=1;
+                if let Ok(hash)=independent_hash(disc,entry,allocated){intended_models.insert(foreign.uid,hash);}
                 log.push(format!("WRITTEN {label}: independent MAP descriptor {descriptor} at {:#x}, reference {allocated:?}; REUSED exact donor TMD/TIM resource closure from reference {cell:?}; no additional texture uploads or bundle growth",descriptor*32));
             }
             continue;
@@ -170,6 +173,7 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
                 super::super::native_asset_plan::scene_registration::Limits{max_models:u16::MAX as usize-field_objects::FIELD_ACTOR_PACK_BIAS as usize,max_decoded:usize::MAX,max_encoded:usize::MAX},&mut resource_session)
         }){for &(uid,descriptor,cell,selector) in &candidate.placements{imported_targets.insert(scene_instances::NameTarget::Created(uid),cell);
                 coverage.written+=1;
+                if let Ok(hash)=independent_hash(&candidate.disc,entry,cell){intended_models.insert(uid,hash);}
                 if let Some(donor)=world.foreign.iter().find(|f|f.uid==uid){prototypes.insert(identity.clone(),(cell,[0,1,2].map(|a|(foreign.center[a]-donor.donor_center[a]).round() as i32)));}
                 log.push(format!("WRITTEN {label}: MAP PROT {entry}, descriptor {descriptor} at {:#x}, grid {cell:?} at {:#x}, TMD selector {selector}",descriptor*32,grid(cell)));}
             for idx in [entry+3,entry+4] {
@@ -180,7 +184,7 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
             *disc=candidate.disc;log.push(format!("WRITTEN {label}: resource registration and native reference committed to IMG buffer"));}
     }
     let Some(original)=attempt("read native MAP",log,||disc.read_entry_footprint(entry)) else{return};let mut map=original.clone();
-    let mut targets:HashMap<scene_instances::NameTarget,(u8,u8)>=imported_targets;
+    let mut targets:HashMap<scene_instances::NameTarget,(u8,u8)>=imported_targets.clone();
     let tiers=Scene::load(index,&scene.name).ok().and_then(|n|n.field_floor_height_lut(index).ok().flatten()).map(|h|h.map(|v|Some(-(v as i32)))).unwrap_or([None;16]);
     for created in &doc.created {
         if let Some(npc)=world.npc(created.source){npc_attempt(disc,entry,npc,Some(created.uid),created.offset,log);continue;}
@@ -262,6 +266,45 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
             log.push("WRITTEN MAP: all successful MAP operation attempts above committed together to IMG buffer; failed operations were rolled back individually".into());
         }else{log.push("FAILED MAP COMMIT: successful MAP encodings above did not reach IMG; imports/MAN writes are independent".into());}
     }
+    for foreign in &doc.foreign{
+        let result=(||->Result<serde_json::Value>{
+            let cell=*imported_targets.get(&scene_instances::NameTarget::Created(foreign.uid)).context("No committed native MAP reference")?;
+            let map=disc.read_entry_footprint(entry)?;let id=id_at(&map,cell)?;let r=ObjectRecord::parse(&map,id).context("Native descriptor missing")?;
+            let loaded_model=independent_model(disc,entry,cell)?;
+            let actual=loaded_model.sha256;let expected=intended_models.get(&foreign.uid).context("No independent identity witness recorded at commit")?;
+            anyhow::ensure!(&actual==expected,"Cumulative registration identity changed after later imports/transforms");
+            let anchor=[cell.0 as i32+r.col_delta as i32,cell.1 as i32+r.row_delta as i32];
+            let anchor_word=if (0..128).contains(&anchor[0])&&(0..128).contains(&anchor[1]){Some(u16::from_le_bytes(map[grid((anchor[0]as u8,anchor[1]as u8))..][..2].try_into()?))}else{None};
+            let donor=legaia_engine_world_views::scene_staging::assemble_field_scene(index,&foreign.source).map_err(anyhow::Error::msg)?;
+            let original=if foreign.kind=="terrain"{donor.terrain.get(foreign.record)}else{donor.placements.get(foreign.record)}.context("Donor draw missing")?;
+            let donor_native=Scene::load(index,&foreign.source)?;
+            let binding=donor_native.field_object_binds(index)?.and_then(|b|b.get(&original.anchor).copied());
+            let binding_evidence=if let Some(binding)=binding{
+                let man=donor_native.field_man_payload(index)?.context("Donor bound object has no MAN")?;
+                let inventory=super::super::native_script_dependencies::SceneInventory::read(&man).map_err(anyhow::Error::msg)?;
+                let record=inventory.records.iter().find(|r|r.flat==binding.record as usize).context("Donor binding record missing")?;
+                serde_json::json!({"record":binding.record,"animation":binding.anim_id,"man_sha256":inventory.man_sha256,
+                    "record_sha256":super::super::collision_recipes::digest(&man[record.start..record.start+record.len]),"record_range":[record.start,record.len],"pc0":record.pc0,
+                    "record_bytes":&man[record.start..record.start+record.len],"decoded_instructions":record.scan.instructions,"incoming_extended_context_sites":inventory.incoming(record.flat),
+                    "scan_error":record.scan.error,"transplanted":false,"control_flow_closure_verified":false})
+            }else{serde_json::Value::Null};
+            let mut gaps=vec!["native rendering, heap availability and subsequent runtime writes not observed".to_owned(),"collision encoding does not verify walkability or interaction".into()];
+            if let Some(binding)=binding{gaps.push(format!("MISSING: donor MAN object context {} / ANM clip {} was not relocated; static geometry encoding does not preserve donor behavior",binding.record,binding.anim_id));}
+            if anchor_word.is_none(){gaps.push("Native footprint anchor is outside MAP".into());}
+            if anchor_word.is_some_and(|w|w&field_objects::CELL_BIND_OWNED!=0){gaps.push("Native window sweep skips a bind-owned anchor; matching init-sweep MAN binding must be verified".into());}
+            let raw=world.foreign.iter().find(|f|f.uid==foreign.uid).context("Donor provenance missing")?;
+            let failures=log.iter().filter(|l|l.starts_with("FAILED ")&&(l.contains(&format!("Created({})",foreign.uid))||l.contains(&format!("UID {} ",foreign.uid)))).cloned().collect::<Vec<_>>();
+            Ok(serde_json::json!({"uid":foreign.uid,"source_scene":foreign.source,"category":foreign.kind,"source_catalog_ordinal":foreign.record,
+                "source_tmd_sha256":super::super::collision_recipes::digest(&raw.raw_tmd),"encoded_successfully":failures.is_empty(),"native_import_reference_written":true,"operation_failures":failures,"img_write_readback_verified":false,
+                "requested_editor_center":foreign.center,
+                "donor_binding_evidence":binding_evidence,
+                "native_loader_identity":{"status":"independent_static_contract_matched_cumulatively","runtime_verified":false,"relocated_tmd_sha256":actual,"relocated_tmd_bytes":loaded_model.bytes.len(),"scene_selector":r.pack_index_field,"global_slot":r.pack_index_field as usize+5,"pointer_table_address":format!("{:#x}",0x8007c018+(r.pack_index_field as u32+5)*4)},
+                "native_reference":{"map_entry":entry,"descriptor":id,"cell":cell,"anchor":anchor,"anchor_word":anchor_word,"rotation_ticks":[r.rot_x,r.rot_y,r.rot_z],"offsets":[r.x_off,r.y_off,r.z_off],"cull_radius":original.cull_radius},
+                "render_visibility_verified":false,"collision_interaction_verified":false,"missing_or_unverified_dependencies":gaps}))
+        })();
+        let value=match result{Ok(value)=>value,Err(e)=>{log.push(format!("FAILED FINAL IDENTITY UID {}: {e:#}",foreign.uid));serde_json::json!({"uid":foreign.uid,"source_scene":foreign.source,"category":foreign.kind,"encoded_successfully":false,"img_write_readback_verified":false,"native_loader_identity":{"status":"failed_or_unavailable","runtime_verified":false},"render_visibility_verified":false,"collision_interaction_verified":false,"missing_or_unverified_dependencies":[format!("{e:#}")]})}};
+        log.push(format!("PER-OBJECT VERIFICATION: {value}"));reports.push(value);
+    }
     // Attempt the existing data-only native floor writer for a terrain source
     // with a real keyed primary row. This is explicit key association, not a
     // claim of mesh ownership. No experimental engine patch is installed here.
@@ -290,6 +333,15 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
         match result {Some(Some(candidate))=>{*disc=candidate;log.push(format!("WRITTEN {label}: native floor row and grid flag committed"));},Some(None)=>log.push(format!("WARNING {label}: no primary keyed floor row. Shared tier/bilinear floor data remains unchanged; no ownership-based replacement inferred")),None=>{}}
     }
 }
+fn independent_hash(disc:&DiscPatcher,entry:usize,cell:(u8,u8))->Result<String>{
+    Ok(independent_model(disc,entry,cell)?.sha256)
+}
+fn independent_model(disc:&DiscPatcher,entry:usize,cell:(u8,u8))->Result<super::super::native_loader_trace::Model>{
+    let map=disc.read_entry_footprint(entry)?;let r=ObjectRecord::parse(&map,id_at(&map,cell)?).context("Native MAP record missing")?;
+    let bundle=disc.read_entry_footprint(entry+3)?;let(base,_)=super::super::native_asset_plan::scene_registration::native_descriptor_table(&bundle)?;
+    let pac=disc.read_entry_footprint(entry+4)?;let trace=super::super::native_loader_trace::trace(&bundle,base,Some(&pac))?;
+    Ok(trace.models.get(r.pack_index_field as usize).context("Native loader contract did not register selected TMD")?.clone())
+}
 fn npc_attempt(disc:&mut DiscPatcher,entry:usize,npc:&world_view::NpcInfo,uid:Option<u64>,delta:[f32;3],log:&mut Vec<String>){
     let label=format!("MAN actor {} copy {uid:?} delta {delta:?}",npc.record);
     if delta[1].abs()>EPS {log.push(format!("FAILED {label} Y component: existing MAN spawn writer has no elevation field; Y request {0} is not serialized",delta[1]));}
@@ -310,6 +362,8 @@ pub(super) fn publish(plan:NativeExportPlan,output:&Path)->Result<ExportResult>{
     std::fs::create_dir(&logs)?;let debug=logs.join("debug.txt");
     let mut report=plan.unrestricted_log.clone().unwrap_or_default();report.push_str(&format!("\nOutput requested: {}\n",output.display()));
     std::fs::write(&debug,&report)?;
+    let verification=logs.join("object-verification.json");
+    std::fs::write(&verification,serde_json::to_vec_pretty(&serde_json::json!({"schema":1,"output":output,"objects":plan.object_verification,"native_runtime_verified":false,"render_verified":false,"interaction_verified":false}))?)?;
     let expected_hash=super::super::collision_recipes::digest(&plan.image);
     let result=(||->Result<()>{
         let staging=logs.join("output.lckbuilding");let mut file=std::fs::OpenOptions::new().write(true).create_new(true).open(&staging)?;
@@ -321,14 +375,26 @@ pub(super) fn publish(plan:NativeExportPlan,output:&Path)->Result<ExportResult>{
         loop {let n=input.read(&mut buffer)?;if n==0{break;}hash.update(&buffer[..n]);}
         anyhow::ensure!(format!("{:x}",hash.finalize())==expected_hash,"Output IMG readback hash mismatch: {}",output.display());Ok(())})();
     match result {Ok(())=>report.push_str("OUTPUT WRITTEN. Experimental native writes only; partial/dependency failures above remain unresolved.\n"),Err(e)=>{report.push_str(&format!("OUTPUT FAILED: {e:#}\n"));std::fs::write(&debug,report)?;return Err(e);}}
-    report.push_str(&format!("OUTPUT FILE VERIFIED: {} ({} bytes; disk readback matches intended IMG)\nOutput SHA256: {expected_hash}\n",output.display(),plan.image.len()));std::fs::write(&debug,report)?;
-    let mut skipped=plan.skipped;skipped.push(format!("UNRESTRICTED EXPERIMENT — NOT PROVEN COMPLETE. Full debug.txt: {}",debug.display()));
+    report.push_str(&format!("OUTPUT FILE VERIFIED: {} ({} bytes; disk readback matches intended IMG)\nOutput SHA256: {expected_hash}\n",output.display(),plan.image.len()));
+    let mut objects=plan.object_verification;
+    for object in &mut objects{object["img_write_readback_verified"]=serde_json::json!(object["native_import_reference_written"].as_bool()==Some(true));report.push_str(&format!("FINAL PER-OBJECT VERIFICATION: {object}\n"));}
+    std::fs::write(&debug,&report)?;
+    std::fs::write(&verification,serde_json::to_vec_pretty(&serde_json::json!({"schema":1,"output":output,"img_sha256":expected_hash,"objects":objects,"native_runtime_verified":false,"render_verified":false,"interaction_verified":false}))?)?;
+    let mut skipped=plan.skipped;
+    for object in &objects{if let Some(gaps)=object["missing_or_unverified_dependencies"].as_array(){for gap in gaps{if gap.as_str().is_some_and(|g|g.starts_with("MISSING:")){skipped.push(format!("MISSING NATIVE DEPENDENCY UID {}: {}",object["uid"],gap.as_str().unwrap()));}}}}
+    skipped.push(format!("UNRESTRICTED EXPERIMENT — NOT PROVEN COMPLETE. Full debug.txt: {}; per-object report: {}",debug.display(),verification.display()));
     Ok(ExportResult{path:output,patched:plan.patched,skipped,imports:plan.imports})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn written_import_with_missing_behavior_is_prominently_incomplete(){
+        let result=ExportResult{path:"partial.img".into(),patched:vec![],skipped:vec!["MISSING NATIVE DEPENDENCY UID 2: MAN object context and animation".into()],imports:Some(ImportCoverage{requested:3,written:3})};
+        assert!(result.experimental_summary().contains("INCOMPLETE NATIVE BEHAVIOR"));
+        assert!(result.verification_warning().unwrap().contains("NOT verified working objects"));
+    }
     #[test]
     fn zero_successful_imports_are_not_confused_with_successful_collision_writes(){
         let result=ExportResult{path:"partial.img".into(),patched:vec!["WRITTEN collision".into()],skipped:vec!["FAILED IMPORT UID 1".into()],imports:Some(ImportCoverage{requested:3,written:0})};

@@ -2,6 +2,18 @@ use super::*;
 use legaia_tmd::{encode::{ModelObject,ModelGroup,ModelPrim,LEGAIA_OBJECT_SCALE},descriptor::PacketShape};
 
 #[test]
+fn native_uv_rebasing_uses_a_noncongruent_free_region_without_wrapping_or_resampling(){
+    let reservations=[Rect{x:0,y:0,w:1024,h:20},Rect{x:0,y:28,w:1024,h:484},Rect{x:0,y:20,w:12,h:8},Rect{x:14,y:20,w:1010,h:8}];
+    let mut planner=Planner::new(&Vram::new(),&reservations).unwrap();let source=Rect{x:128,y:0,w:2,h:8};
+    let reference=Reference{at:0,cba:0,tsb:0x62,uvs:vec![(0,0),(7,0),(0,7)]};let bytes=vec![0x31;32];
+    assert!(planner.allocate(source,&bytes,0,None,&[reference.clone()]).is_err());
+    let target=planner.allocate_rebased(source,&bytes,0,&[reference.clone()]).unwrap();assert_eq!(target,Rect{x:12,y:20,w:2,h:8});
+    let(tsb,uv)=rebase_uv(&reference,source,target).unwrap();assert_eq!(tsb&!31,reference.tsb&!31);
+    assert_eq!(uv,vec![(48,20),(55,20),(48,27)]);
+    for(&(u,v),&(ru,rv))in reference.uvs.iter().zip(&uv){assert_eq!((tsb&15)*64+ru as u16/4,12+u as u16/4);assert_eq!(((tsb>>4)&1)*256+rv as u16,20+v as u16);}
+}
+
+#[test]
 fn unrestricted_export_respects_framebuffers_existing_textures_and_boot_words(){
     crate::app::ps1_export::unrestricted::with_test_scope(||{
         field_runtime_buffers_remain_reserved_even_without_tim_upload_coverage();

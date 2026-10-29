@@ -930,9 +930,16 @@ impl ImportCoverage{
     pub fn failure_message(self)->Option<String>{(self.failed()>0).then(||format!("{} FAILED IMPORTS of {} requested; {} native objects imported. {}",self.failed(),self.requested,self.written,if self.written==0{"NO REQUESTED OBJECTS IMPORTED — scene export is incomplete."}else{"PARTIAL SCENE — inspect debug.txt."}))}
 }
 impl ExportResult{
+    pub fn verification_warning(&self)->Option<String>{
+        self.imports.and_then(|coverage|coverage.failure_message()).or_else(||{
+            let gaps=self.skipped.iter().filter(|s|s.starts_with("MISSING NATIVE DEPENDENCY")).collect::<Vec<_>>();
+            (!gaps.is_empty()).then(||format!("INCOMPLETE NATIVE BEHAVIOR: {} missing dependency reports. Encoded imports are NOT verified working objects. {}",gaps.len(),gaps.into_iter().cloned().collect::<Vec<_>>().join("; ")))
+        })
+    }
     pub fn experimental_summary(&self)->String{
         let coverage=self.imports.unwrap_or_default();let failures=self.skipped.iter().filter(|s|s.starts_with("FAILED ")).count();
-        let state=if coverage.requested>0&&coverage.written==0{"PARTIAL IMG FILE ONLY — NO REQUESTED OBJECTS IMPORTED"}else if coverage.failed()>0||failures>0{"PARTIAL IMG FILE — INCOMPLETE SCENE"}else{"EXPERIMENTAL IMG FILE VERIFIED — GAMEPLAY UNVERIFIED"};
+        let dependencies=self.skipped.iter().filter(|s|s.starts_with("MISSING NATIVE DEPENDENCY")).count();
+        let state=if coverage.requested>0&&coverage.written==0{"PARTIAL IMG FILE ONLY — NO REQUESTED OBJECTS IMPORTED"}else if coverage.failed()>0||failures>0{"PARTIAL IMG FILE — INCOMPLETE SCENE"}else if dependencies>0{"IMG WRITTEN — INCOMPLETE NATIVE BEHAVIOR / DEPENDENCIES MISSING"}else{"EXPERIMENTAL IMG FILE VERIFIED — GAMEPLAY UNVERIFIED"};
         format!("{state}: {}. Native imports {}/{} written; {} FAILED IMPORTS; {failures} failed operations. {}",self.path.display(),coverage.written,coverage.requested,coverage.failed(),self.skipped.last().cloned().unwrap_or_default())
     }
 }
@@ -1422,6 +1429,7 @@ pub(super) struct NativeExportPlan {
     continuation_receipt:Option<serde_json::Value>,
     unrestricted_log:Option<String>,
     imports:Option<ImportCoverage>,
+    object_verification:Vec<serde_json::Value>,
 }
 
 pub(super) fn verify_output_file(path:&Path,expected:Option<u64>)->Result<u64>{
@@ -1534,8 +1542,14 @@ impl NativeExportPlan {
         let doc=scene_instances::parse(&scene_instances::serialize(&scene.name,world),&scene.name,world).map_err(anyhow::Error::msg)?;
         export_check!(!doc.foreign.is_empty(),"No persisted foreign instances to compile");
         export_check!(doc.moves.is_empty()&&doc.created.is_empty()&&doc.rotations.is_empty()&&doc.scales.is_empty()&&doc.animations.is_empty()&&doc.models.is_empty()&&doc.hidden.is_empty(),"Import candidate cannot omit other transform, actor, visibility or copy edits; compile them in a complete export plan");
-        validate_source_archive(&disc,index)?;
         let target=Scene::load(index,&scene.name)?;let map_entry=target.field_map_index(index).context("No destination MAP")? as usize;
+        if session.as_ref().is_some_and(|s|s.is_some()){
+            // A cumulative export deliberately changes these three entries.
+            // Donor/unrelated bytes must still match the opened source exactly.
+            anyhow::ensure!(disc.entry_count()==index.entry_count(),"Staged native archive identity count changed");
+            for entry in 0..index.entry_count(){if [map_entry,map_entry+3,map_entry+4].contains(&entry){continue;}
+                anyhow::ensure!(disc.read_entry(entry)?.as_slice()==index.entry_bytes(entry as u32)?.as_slice(),"Unexpected source PROT change during cumulative export: {entry}");}
+        }else{validate_source_archive(&disc,index)?;}
         let bundle=disc.read_entry_footprint(map_entry+3)?;
         let pac=if scene_registration::native_stream_mode(&bundle).is_some(){Some(disc.read_entry_footprint(map_entry+4)?)}else{None};
         let (_,mut before)=scene_registration::native_texture_sequence(&bundle,pac.as_deref(),limits)?;
@@ -1550,6 +1564,14 @@ impl NativeExportPlan {
             anyhow::ensure!(super::naming::material_key(previous)==super::naming::material_key(&before),"Native resource session upload state differs from staged IMG");planner.clone()
         }else{Planner::new(&before,&reservations)?};
         let mut boot=legaia_tim::Vram::new();index.system_ui_bundle()?.upload_boot_resident_to_vram(&mut boot);planner.reserve_written(&boot);
+        // Field assembly is mesh-targeted and may omit the party atlas. The
+        // actual FUN_8001E890 loader uploads ALL PROT 0874 section-2 images and
+        // flattened CLUTs, including alternate faces later read by MoveImage.
+        // Reserve complete authored footprints, including uploaded zero words.
+        let player=index.entry_bytes(legaia_actor_formats::field_char_textures::PROT_ENTRY_INDEX)?;
+        let character_textures=legaia_actor_formats::field_char_textures::parse(&player).context("Resolve complete native field-character residency")?;
+        let mut party_vram=legaia_tim::Vram::new();character_textures.upload_to_vram(&mut party_vram,false);planner.reserve_written(&party_vram);
+        if unrestricted::active(){unrestricted::diagnostic(format!("NATIVE RESIDENT PROTECTION: all {} field-character TIMs from PROT {} section {} reserved (complete images, flattened CLUTs, alternate face-frame source words). Scene-targeted mesh uploads alone are not a residency map",character_textures.textures.len(),legaia_actor_formats::field_char_textures::PROT_ENTRY_INDEX,legaia_actor_formats::field_char_textures::CONTAINER_SECTION));}
         planner.reserve_written(&scene.res.vram);
         if unrestricted::active(){unrestricted::diagnostic(format!("VRAM allocation protects {} runtime/CLUT-walk rectangles, existing ordered uploads, assembled destination resources and boot-resident uploads; unrestricted object export remains enabled",reservations.len()));}
         if let Some(observed)=observations {planner.reserve_observations(observed)?;}
@@ -1572,7 +1594,7 @@ impl NativeExportPlan {
             let models=bank.materialise(&native);let model=models.get(placed.env_slot).and_then(|m|m.as_ref()).context("Native model registration source failed to decode")?;
             anyhow::ensure!(model.starts_with(&cached.raw_tmd)||cached.raw_tmd.starts_with(model),"Native model bank selector does not match selected donor TMD; no different mesh substituted");
             let model_entry=match source {
-                legaia_engine_scene::model_bank::ModelSource::BundlePack{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::BundleSingle{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::StreamPack{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::StreamSingle{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::WalkedPack{entry_idx,..}=>entry_idx,
+                legaia_engine_scene::model_bank::ModelSource::BundlePack{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::BundleSingle{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::StreamPack{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::StreamSingle{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::WalkedPack{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::WalkedSingle{entry_idx,..}=>entry_idx,
             };
             let mut inventory=NativeAssetPlan::default();let id=inventory.register(ResourceKind::Tmd,model,Origin{scene:foreign.source.clone(),entry:Some(model_entry),offset:None},false)?;
             if unrestricted::active(){let (base,table)=scene_registration::native_descriptor_table(&source_bundle)?;unrestricted::diagnostic(format!("NATIVE DONOR RESOLVED UID {}: model selector {} -> {source:?}; TMD {} bytes SHA256 {}; table base {base:#x}, {} descriptors, stream mode {:?}",foreign.uid,placed.env_slot,model.len(),id.sha256,table.count,scene_registration::native_stream_mode(&source_bundle)));}
@@ -1705,6 +1727,9 @@ impl NativeExportPlan {
         let expected_pool=super::native_asset_plan::scene_registration::native_model_pool(registered.bytes(),registered.pac_bytes());
         let actual_pac=if registered.pac_bytes().is_some(){Some(compiled.read_entry_footprint(pac_entry)?)}else{None};
         let actual_pool=super::native_asset_plan::scene_registration::native_model_pool(&check,actual_pac.as_deref());
+        let(base,_)=super::native_asset_plan::scene_registration::native_descriptor_table(&check)?;
+        let independent=super::native_loader_trace::trace(&check,base,actual_pac.as_deref())?;
+        anyhow::ensure!(independent.models.len()==expected_pool.len()&&independent.models.iter().zip(&expected_pool).all(|(a,b)|a.bytes==b.bytes),"Independent original-loader contract disagrees with registration planner; no identity verified");
         let (_,uploaded)=super::native_asset_plan::scene_registration::native_texture_sequence(&check,actual_pac.as_deref(),limits)?;
         anyhow::ensure!(super::naming::material_key(&uploaded)==super::naming::material_key(&relocation.apply(before)?),"Final native descriptor/PAC upload order does not reproduce intended texture words");
         export_check!(actual_pool.len()==expected_pool.len()&&actual_pool.iter().zip(&expected_pool).all(|(a,b)|a.bytes==b.bytes),"Registered model lookup failed after native PROT packaging");
@@ -1901,7 +1926,7 @@ fn compile_plan(source:PathBuf, mut disc:DiscPatcher, image_length:usize,
             "EXPERIMENTAL SOURCE: verified inserted references are scoped to their recorded MAP; other story-state originals are unchanged. Existing resource/physics/runtime limitations remain; no production approval."
         }.into());
     }
-    Ok(NativeExportPlan {dependencies:Default::default(),source,image:written,patched:names,skipped,continuation_receipt,unrestricted_log:None,imports:None})
+    Ok(NativeExportPlan {dependencies:Default::default(),source,image:written,patched:names,skipped,continuation_receipt,unrestricted_log:None,imports:None,object_verification:vec![]})
 }
 
 /// Write only bytes already compiled and verified by native preflight.

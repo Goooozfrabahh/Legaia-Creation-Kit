@@ -235,6 +235,8 @@ pub enum ModelSource {
         descriptor: usize,
         member: usize,
     },
+    /// Bare type-9 model in a count-driven table outside the strict bundle family.
+    WalkedSingle { entry_idx:u32, descriptor:usize },
 }
 
 /// One scene's model bank: the pool ids `SCENE_BANK_BASE..` in registration
@@ -310,6 +312,9 @@ impl SceneModelBank {
                 };
                 let before = sources.len();
                 for (i, d) in descs.iter().enumerate() {
+                    if AssetType::from_byte(d.type_byte)==AssetType::Tmd2 {
+                        sources.push(ModelSource::WalkedSingle{entry_idx:entry.idx,descriptor:i});continue;
+                    }
                     if AssetType::from_byte(d.type_byte) != AssetType::Tmd {
                         continue;
                     }
@@ -464,8 +469,16 @@ impl SceneModelBank {
                 descriptor,
                 member,
             } => walked_member(scene, entry_idx, descriptor, member),
+            ModelSource::WalkedSingle{entry_idx,descriptor}=>walked_single(scene,entry_idx,descriptor),
         }
     }
+}
+
+fn walked_single(scene:&Scene,entry_idx:u32,descriptor:usize)->Option<Vec<u8>>{
+    let entry=scene.entries.iter().find(|e|e.idx==entry_idx)?;
+    let descriptors=legaia_scene_formats::scene_asset_table::descriptor_bundle_walk(&entry.bytes)?;
+    let d=descriptors.get(descriptor)?;
+    legaia_lzs::decompress(entry.bytes.get(d.data_offset as usize..)?,d.size as usize).ok()
 }
 
 /// Decode one walked table's type-`0x02` descriptor and split its pack:
@@ -566,7 +579,7 @@ impl SceneModelBank {
                     }
                     member(packs.get(&key)?, m)
                 }
-                ModelSource::BundleSingle { .. } | ModelSource::StreamSingle { .. } => {
+                ModelSource::BundleSingle { .. } | ModelSource::StreamSingle { .. } | ModelSource::WalkedSingle { .. } => {
                     let index = self.sources.iter().position(|s| s == src)?;
                     self.tmd_bytes(scene, index as i16)
                 }
@@ -592,6 +605,16 @@ fn stream_chunk_body(bytes: &[u8], header_offset: usize) -> Option<(usize, usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn count_driven_single_tmd_has_a_real_registration_identity(){
+        let model=[0x80000002u32,0,0].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+        let mut bytes=vec![0;16];bytes[..4].copy_from_slice(&1u32.to_le_bytes());bytes[4..8].copy_from_slice(&(model.len()as u32).to_le_bytes());
+        bytes[8..12].copy_from_slice(&(0x09000000|model.len()as u32).to_le_bytes());bytes[12..16].copy_from_slice(&16u32.to_le_bytes());bytes.extend(legaia_lzs::compress(&model));
+        let scene=Scene{name:"format-fixture".into(),start:0,end:1,entries:vec![crate::scene::SceneEntry{idx:0,class:legaia_disc_audit::categorize::Class::LzsContainer,bytes:std::sync::Arc::new(bytes)}]};
+        let bank=SceneModelBank::build(&scene);assert_eq!(bank.sources(),&[ModelSource::WalkedSingle{entry_idx:0,descriptor:0}]);
+        assert_eq!(bank.materialise(&scene),vec![Some(model.clone())]);assert_eq!(bank.tmd_bytes(&scene,0),Some(model));
+    }
 
     #[test]
     fn the_f0_split_matches_both_consumers() {

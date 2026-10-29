@@ -59,7 +59,7 @@ fn mesh_hash(scene:&AssembledScene,index:usize)->Option<u64> {
     let bytes=&scene.res.tmds.get(index)?.raw;
     fingerprint(bytes)
 }
-fn catalog_one(index:&ProtIndex,name:&str)->Result<Vec<Asset>,String> {
+pub(super) fn catalog_one(index:&ProtIndex,name:&str)->Result<Vec<Asset>,String> {
     let scene=legaia_engine_world_views::scene_staging::assemble_field_scene(index,name)?;
     let display_source=crate::place_name(name).unwrap_or(name).to_owned();
     let visual_keys=super::naming::visual_keys(&scene);

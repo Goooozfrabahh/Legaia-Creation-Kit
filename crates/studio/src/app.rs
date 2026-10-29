@@ -16,6 +16,7 @@ mod native_dependency_report;
 mod native_script_dependencies;
 mod native_wall_ownership;
 mod native_cell_inventory;
+mod native_loader_trace;
 mod native_elevation_codec;
 mod native_floor_patch;
 pub mod native_extended_floor;
@@ -5719,7 +5720,7 @@ impl eframe::App for App {
                     self.studio.status=Some(format!("Native PS1 image saved: {}. Patched: {}.{} In DuckStation: boot THIS IMG (not an old CUE or save state), then reload Rim Elm. Native writes were read back. Original walls/floors and scripts are preserved unless an explicit supported plan changes them; gameplay verification remains required.",result.path.display(),result.patched.join(", "),details));
                     if result.skipped.iter().any(|s|s.starts_with("UNRESTRICTED EXPERIMENT")) {
                         self.studio.status=Some(result.experimental_summary());
-                        self.studio.error=result.imports.and_then(|coverage|coverage.failure_message());
+                        self.studio.error=result.verification_warning();
                     }
                     self.ps1_export_job=None;
                 }

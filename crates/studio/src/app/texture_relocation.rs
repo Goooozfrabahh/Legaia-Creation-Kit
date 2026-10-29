@@ -58,10 +58,11 @@ pub(in crate::app) fn texture_sample_changes(a:&[u8],av:&Vram,b:&[u8],bv:&Vram)-
     let ar=references(a)?;let br=references(b)?;anyhow::ensure!(ar.len()==br.len(),"Primitive counts differ");
     let(mut samples,mut changed)=(0,0);
     for (a,b) in ar.iter().zip(br.iter()){
-        anyhow::ensure!(a.uvs==b.uvs,"Texture UVs changed");
+        let du=b.uvs[0].0 as i32-a.uvs[0].0 as i32;let dv=b.uvs[0].1 as i32-a.uvs[0].1 as i32;
+        anyhow::ensure!(a.uvs.len()==b.uvs.len()&&a.uvs.iter().zip(&b.uvs).all(|(a,b)|b.0 as i32-a.0 as i32==du&&b.1 as i32-a.1 as i32==dv),"Texture UV shape changed");
         let min=a.uvs.iter().map(|p|p.0).min().context("No UVs")?;let max=a.uvs.iter().map(|p|p.0).max().unwrap();
         let vmin=a.uvs.iter().map(|p|p.1).min().unwrap();let vmax=a.uvs.iter().map(|p|p.1).max().unwrap();
-        for u in min..=max {for v in vmin..=vmax {samples+=1;if super::super::ps1_export::vram_texel(av,a.cba,a.tsb,u as usize,v as usize)!=super::super::ps1_export::vram_texel(bv,b.cba,b.tsb,u as usize,v as usize){changed+=1;}}}
+        for u in min..=max {for v in vmin..=vmax {samples+=1;if super::super::ps1_export::vram_texel(av,a.cba,a.tsb,u as usize,v as usize)!=super::super::ps1_export::vram_texel(bv,b.cba,b.tsb,(u as i32+du)as usize,(v as i32+dv)as usize){changed+=1;}}}
     }Ok((samples,changed))
 }
 
@@ -91,7 +92,7 @@ fn references(raw:&[u8])->Result<Vec<Reference>> {
         }
     }
     // Aliased primitive storage must not cause a second patch interpretation.
-    let mut ranges=BTreeSet::new();for r in &out {for at in [r.at+2,r.at+3,r.at+6,r.at+7] {
+    let mut ranges=BTreeSet::new();for r in &out {for at in r.at..r.at+4+r.uvs.len()*2 {
         export_check!(at>=table_end && !geometry.iter().any(|range|range.contains(&at)),"Texture fields alias native geometry/header data");
         export_check!(ranges.insert(at),"Aliased native texture reference fields");
     }}
@@ -114,6 +115,24 @@ fn page_fits(refs:&[Reference],dx:i32,dy:i32)->bool {
         let x=(r.tsb as i32&15)*64+dx;let y=((r.tsb as i32>>4)&1)*256+dy;
         (0..=960).contains(&x) && x%64==0 && (y==0||y==256)
     })
+}
+/// Preserve sampled native words while rebasing a primitive's UVs onto an
+/// encodable page. Every vertex receives the SAME translation: no resampling,
+/// stretching, wrapping, colour changes or geometry changes.
+fn rebase_uv(r:&Reference,source:Rect,target:Rect)->Result<(u16,Vec<(u8,u8)>)>{
+    let divisor=match (r.tsb>>7)&3{0=>4,1=>2,2=>1,_=>bail!("Reserved texture depth")};
+    let dx=target.x as i32-source.x as i32;let dy=target.y as i32-source.y as i32;
+    let old_x=(r.tsb as i32&15)*64;let old_y=((r.tsb as i32>>4)&1)*256;
+    if (0..=960).contains(&(old_x+dx))&&(old_x+dx)%64==0&&matches!(old_y+dy,0|256){
+        return Ok(((r.tsb&!31)|((old_x+dx)as u16/64)|(((old_y+dy)as u16/256)<<4),r.uvs.clone()));
+    }
+    let minimum_x=old_x+r.uvs.iter().map(|p|p.0 as i32).min().context("Missing UV")?/divisor+dx;
+    let minimum_y=old_y+r.uvs.iter().map(|p|p.1 as i32).min().context("Missing UV")?+dy;
+    let x=minimum_x.div_euclid(64)*64;let y=minimum_y.div_euclid(256)*256;
+    ensure!((0..=960).contains(&x)&&matches!(y,0|256),"Rebased native texture page outside VRAM");
+    let du=(old_x+dx-x)*divisor;let dv=old_y+dy-y;
+    let uv=r.uvs.iter().map(|&(u,v)|Ok((u8::try_from(u as i32+du).context("Rebased U exceeds native byte")?,u8::try_from(v as i32+dv).context("Rebased V exceeds native byte")?))).collect::<Result<Vec<_>>>()?;
+    Ok(((r.tsb&!31)|(x as u16/64)|((y as u16/256)<<4),uv))
 }
 fn verify_source(refs:&[Reference],image:Rect,clut:Option<Rect>,depth:u8)->Result<()> {
     for r in refs {
@@ -172,6 +191,20 @@ impl Planner {
             self.vram.write_block(chosen.x,chosen.y,chosen.w,chosen.h,bytes);
             self.blocks.push(Block{rect:chosen,bytes:bytes.to_vec(),role,align});
         }Ok(chosen)
+    }
+    fn allocate_rebased(&mut self,source:Rect,bytes:&[u8],role:u8,refs:&[Reference])->Result<Rect>{
+        ensure!(role!=3&&!refs.is_empty(),"UV rebasing requires image consumers");
+        // Distinct policy tag prevents confusing UV-preserving block reuse.
+        let align=[u16::MAX,u16::MAX];
+        let fits=|r:Rect|self.available(r,bytes,role,align)&&refs.iter().all(|p|rebase_uv(p,source,r).is_ok());
+        let mut chosen=self.blocks.iter().find(|b|b.bytes==bytes&&b.role==role&&b.align==align&&fits(b.rect)).map(|b|b.rect);
+        if chosen.is_none(){'rows:for y in 0..=512-source.h{for x in 0..=1024-source.w{
+            let r=Rect{x,y,w:source.w,h:source.h};if fits(r){chosen=Some(r);break 'rows;}
+        }}}
+        let r=chosen.context("No native image allocation remains even with UV rebasing")?;
+        if !self.blocks.iter().any(|b|b.rect==r&&b.bytes==bytes&&b.role==role&&b.align==align){
+            self.vram.write_block(r.x,r.y,r.w,r.h,bytes);self.blocks.push(Block{rect:r,bytes:bytes.to_vec(),role,align});
+        }Ok(r)
     }
     /// Atomic in-memory allocation; failures preserve all prior reservations.
     pub fn plan(&mut self,inventory:&NativeAssetPlan,tim_id:&ResourceId,tmd_ids:&[ResourceId],placement:Option<Placement>)->Result<RelocationPlan> {
