@@ -2,6 +2,21 @@ use super::*;
 use legaia_tmd::{encode::{ModelObject,ModelGroup,ModelPrim,LEGAIA_OBJECT_SCALE},descriptor::PacketShape};
 
 #[test]
+fn unrestricted_export_respects_framebuffers_existing_textures_and_boot_words(){
+    crate::app::ps1_export::unrestricted::with_test_scope(||{
+        field_runtime_buffers_remain_reserved_even_without_tim_upload_coverage();
+        let mut destination=Vram::new();destination.write_block(640,0,256,256,&vec![0;131072]);
+        let mut planner=Planner::new(&destination,&field_runtime_reservations()).unwrap();
+        let mut boot=Vram::new();boot.write_block(896,0,64,256,&vec![0;32768]);planner.reserve_written(&boot);
+        let source=Rect{x:0,y:0,w:64,h:256};let target=planner.allocate(source,&vec![1;32768],0,None,&[]).unwrap();
+        assert_eq!(target,Rect{x:960,y:0,w:64,h:256});
+        assert!(!field_runtime_reservations().iter().any(|r|r.overlaps(target)));
+        assert!(Rect{x:1000,y:511,w:256,h:1}.valid().is_err());
+        assert!(planner.allocate(source,&vec![2;32768],0,Some([0,0]),&[]).is_err());
+    });
+}
+
+#[test]
 fn field_runtime_buffers_remain_reserved_even_without_tim_upload_coverage() {
     let mut planner=Planner::new(&Vram::new(),&field_runtime_reservations()).unwrap();
     for [x,y] in [[0,0],[319,479],[320,0],[639,511],[640,256],[655,511]] {assert!(planner.protected[y*1024+x]);}

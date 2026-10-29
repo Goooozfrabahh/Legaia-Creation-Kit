@@ -79,11 +79,13 @@ pub(super) struct UploadBlock {pub rect:Rect,pub bytes:Vec<u8>,pub depth:u8,pub 
 pub(in crate::app) struct MultiPlan {
     uploads:Vec<UploadBlock>,tmds:BTreeMap<ResourceId,Vec<u8>>,
     source_vram:String,output:Vram,pub evidence:String,
+    reference_diagnostics:Vec<String>,
 }
 impl MultiPlan {
     pub(in crate::app) fn resource_diagnostics(&self)->Vec<String>{
-        self.uploads.iter().map(|u|format!("TIM {:?} -> native VRAM {:?}, {} bytes",u.source,u.rect,u.bytes.len()))
-            .chain(self.tmds.iter().map(|(id,bytes)|format!("TMD {id:?} relocated SHA256 {} ({} bytes)",super::super::digest(bytes),bytes.len()))).collect()
+        self.uploads.iter().map(|u|format!("TIM {:?} {} -> native VRAM {:?}, {} bytes",u.source,if u.depth==3{"CLUT words"}else{"IMAGE"},u.rect,u.bytes.len()))
+            .chain(self.tmds.iter().map(|(id,bytes)|format!("TMD {id:?} relocated SHA256 {} ({} bytes)",super::super::digest(bytes),bytes.len())))
+            .chain(self.reference_diagnostics.iter().cloned()).collect()
     }
     pub(in crate::app::native_asset_plan) fn source_resources(&self)->BTreeSet<ResourceId> {
         self.uploads.iter().map(|u|u.source.clone()).chain(self.tmds.keys().cloned()).collect()
@@ -129,7 +131,7 @@ impl Planner {
             let source=trace.events[owner.event].resource.clone();
             uploads.push(UploadBlock{rect:target,bytes:block.bytes.clone(),depth:block.depth,source:source.clone(),origins:inventory.resources[&source].origins.clone(),flags:trace.tim_flags[&source]});
         }
-        let mut tmds=BTreeMap::new();let mut samples=0usize;
+        let mut tmds=BTreeMap::new();let mut samples=0usize;let mut reference_diagnostics=Vec::new();
         for (id,model) in bindings {
             let raw=payload(inventory,&id,ResourceKind::Tmd)?;let mut out=raw.to_vec();let mut allowed=BTreeSet::new();
             for b in &model {
@@ -139,6 +141,7 @@ impl Planner {
                 let cba=if let Some(owner)=b.palette {let src=trace.blocks[&owner].rect;let dst=targets[&owner];
                     let x=(r.cba&63)*16-src.x+dst.x;let y=((r.cba>>6)&511)-src.y+dst.y;(r.cba&0x8000)|(x/16)|(y<<6)
                 }else{r.cba};
+                reference_diagnostics.push(format!("TMD {} texture block {:#x}: TSB {:#06x} -> {tsb:#06x} (page {},{}), CBA {:#06x} -> {cba:#06x} (CLUT {},{}); UVs {:?} unchanged",id.sha256,r.at,r.tsb,(tsb&15)*64,((tsb>>4)&1)*256,r.cba,(cba&63)*16,(cba>>6)&511,r.uvs));
                 for (at,value) in [(r.at+2,cba),(r.at+6,tsb)] {out[at..at+2].copy_from_slice(&value.to_le_bytes());allowed.extend([at,at+1]);}
             }
             export_check!(raw.iter().zip(&out).enumerate().all(|(i,(a,b))|a==b||allowed.contains(&i)),"Unrelated TMD bytes changed");
@@ -151,7 +154,8 @@ impl Planner {
                 }}
             }tmds.insert(id,out);
         }
-        Ok(MultiPlan{uploads,tmds,source_vram,output:self.vram.clone(),evidence:trace.replay_evidence.clone()})
+        reference_diagnostics.push(format!("Native TMD texture readback compared {samples} UV-bounding-box samples against final ordered donor upload pixels"));
+        Ok(MultiPlan{uploads,tmds,source_vram,output:self.vram.clone(),evidence:trace.replay_evidence.clone(),reference_diagnostics})
     }
 }
 

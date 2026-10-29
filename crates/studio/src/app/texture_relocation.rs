@@ -25,7 +25,7 @@ pub(in crate::app) fn field_runtime_reservations()->[Rect;5] {
      Rect{x:320,y:0,w:320,h:240},Rect{x:320,y:256,w:320,h:256},Rect{x:640,y:256,w:16,h:256}]
 }
 impl Rect {
-    fn valid(self)->Result<Self> {export_check!(self.w>0 && self.h>0 && self.x as u32+self.w as u32<=1024 && self.y as u32+self.h as u32<=512,"VRAM rectangle out of bounds");Ok(self)}
+    fn valid(self)->Result<Self> {anyhow::ensure!(self.w>0 && self.h>0 && self.x as u32+self.w as u32<=1024 && self.y as u32+self.h as u32<=512,"VRAM rectangle out of bounds");Ok(self)}
     fn contains(self,x:usize,y:usize)->bool {x>=self.x as usize && y>=self.y as usize && x<(self.x+self.w) as usize && y<(self.y+self.h) as usize}
     fn overlaps(self,b:Self)->bool {self.x<b.x+b.w && b.x<self.x+self.w && self.y<b.y+b.h && b.y<self.y+self.h}
 }
@@ -52,6 +52,18 @@ impl RelocationPlan {
 }
 #[derive(Clone)]
 struct Reference {at:usize,cba:u16,tsb:u16,uvs:Vec<(u8,u8)>}
+
+#[cfg(test)]
+pub(in crate::app) fn texture_sample_changes(a:&[u8],av:&Vram,b:&[u8],bv:&Vram)->Result<(usize,usize)>{
+    let ar=references(a)?;let br=references(b)?;anyhow::ensure!(ar.len()==br.len(),"Primitive counts differ");
+    let(mut samples,mut changed)=(0,0);
+    for (a,b) in ar.iter().zip(br.iter()){
+        anyhow::ensure!(a.uvs==b.uvs,"Texture UVs changed");
+        let min=a.uvs.iter().map(|p|p.0).min().context("No UVs")?;let max=a.uvs.iter().map(|p|p.0).max().unwrap();
+        let vmin=a.uvs.iter().map(|p|p.1).min().unwrap();let vmax=a.uvs.iter().map(|p|p.1).max().unwrap();
+        for u in min..=max {for v in vmin..=vmax {samples+=1;if super::super::ps1_export::vram_texel(av,a.cba,a.tsb,u as usize,v as usize)!=super::super::ps1_export::vram_texel(bv,b.cba,b.tsb,u as usize,v as usize){changed+=1;}}}
+    }Ok((samples,changed))
+}
 
 fn references(raw:&[u8])->Result<Vec<Reference>> {
     let tmd=legaia_tmd::parse(raw)?;
@@ -127,13 +139,12 @@ impl Planner {
     /// Reserve a verified immutable/shared upload footprint, including zero
     /// words, without inventing missing pixels in the destination replay.
     pub(in crate::app) fn reserve_written(&mut self,known:&Vram) {
-        if crate::app::ps1_export::unrestricted::active(){return;}
         for i in 0..1024*512 {if known.is_written(i%1024,i/1024){self.protected[i]=true;}}
     }
     /// All destination uploads are protected, including uploaded zero words.
     /// Caller must additionally reserve framebuffer/shared/runtime-use regions.
     pub fn new(destination:&Vram,reservations:&[Rect])->Result<Self> {
-        let mut protected=(0..1024*512).map(|i|!crate::app::ps1_export::unrestricted::active() && destination.is_written(i%1024,i/1024)).collect::<Vec<_>>();
+        let mut protected=(0..1024*512).map(|i|destination.is_written(i%1024,i/1024)).collect::<Vec<_>>();
         for &rect in reservations {let r=rect.valid()?;for y in r.y..r.y+r.h {for x in r.x..r.x+r.w {protected[y as usize*1024+x as usize]=true;}}}
         Ok(Self{vram:destination.clone(),protected,blocks:Vec::new()})
     }
@@ -148,7 +159,7 @@ impl Planner {
         let candidate=|x,y|Rect{x,y,w:source.w,h:source.h};
         let fits=|r:Rect|r.w==source.w && r.h==source.h && self.available(r,bytes,role,align) && if role==3 {r.x%16==align[0]}else{
             r.x%64==align[0] && r.y%256==align[1] && page_fits(refs,r.x as i32-source.x as i32,r.y as i32-source.y as i32)};
-        let chosen=if let Some([x,y])=explicit {let r=candidate(x,y);export_check!(fits(r),"Conflicting, out-of-bounds or unencodable VRAM destination");r}
+        let chosen=if let Some([x,y])=explicit {let r=candidate(x,y);anyhow::ensure!(fits(r),"Conflicting, out-of-bounds or unencodable VRAM destination");r}
         else if let Some(b)=self.blocks.iter().find(|b|b.bytes==bytes && b.role==role && b.align==align && fits(b.rect)) {b.rect}
         else {
             let mut found=None;

@@ -1512,9 +1512,15 @@ impl NativeExportPlan {
         let (_,mut before)=scene_registration::native_texture_sequence(&bundle,pac.as_deref(),limits)?;
         let tiers=target.field_floor_height_lut(index)?.context("Destination native floor ladder unresolved")?.map(|y|Some(-(y as i32)));
         let mut staged=disc;let mut last=None;let mut placements=Vec::new();let mut foreign=doc.foreign.clone();foreign.sort_by_key(|f|f.uid);
-        let mut reservations=if unrestricted::active(){Vec::new()}else{super::native_asset_plan::texture_relocation::field_runtime_reservations().to_vec()};reservations.extend_from_slice(protected);
+        let mut reservations=super::native_asset_plan::texture_relocation::field_runtime_reservations().to_vec();reservations.extend_from_slice(protected);
+        if let Ok(walkers)=legaia_scene_formats::clut_walk::from_scene_bundle(&bundle){for walker in walkers.entries {
+            reservations.push(super::native_asset_plan::texture_relocation::Rect{x:walker.dest_x,y:walker.dest_y,w:16,h:1});
+            for frame in walker.frames {reservations.push(super::native_asset_plan::texture_relocation::Rect{x:frame.src_x,y:frame.src_y,w:16,h:1});}
+        }}
         let mut planner=Planner::new(&before,&reservations)?;
         let mut boot=legaia_tim::Vram::new();index.system_ui_bundle()?.upload_boot_resident_to_vram(&mut boot);planner.reserve_written(&boot);
+        planner.reserve_written(&scene.res.vram);
+        if unrestricted::active(){unrestricted::diagnostic(format!("VRAM allocation protects {} runtime/CLUT-walk rectangles, existing ordered uploads, assembled destination resources and boot-resident uploads; unrestricted object export remains enabled",reservations.len()));}
         if let Some(observed)=observations {planner.reserve_observations(observed)?;}
         for foreign in foreign {
             export_check!(foreign.kind=="placement" || (unrestricted::active()&&foreign.kind=="terrain"),"Foreign UID {} category {} requires a native actor/terrain/behavior writer",foreign.uid,foreign.kind);

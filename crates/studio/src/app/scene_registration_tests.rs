@@ -52,6 +52,19 @@ fn streamed_flag_size_is_not_a_payload_extent_and_survives_repacking(){
     let read=table::detect(registered.bytes()).unwrap();assert_eq!(read.used()[i].size,declared);assert_eq!(registered.selector(&id).unwrap(),1);
     let (_,after)=slots_for_scene(registered.bytes(),budgets(),true).unwrap();assert_eq!(after[i].stored,slots[i].stored);
 }
+
+#[test]
+fn growing_pac_discards_obsolete_zero_padding_but_preserves_native_upload_prefix(){
+    let (_,mut source,_,_,_,_)=streamed_fixture();
+    let mut replay=Vram::new();let (end,_)=pac_uploads(&source,&mut replay).unwrap();
+    source.resize((end+4).div_ceil(2048)*2048,0);
+    let incoming=pack(&[tim(0,0x421)]).unwrap();
+    let compiled=append_pac_uploads(&source,&incoming,&mut replay,1024*1024).unwrap();
+    let mut check=Vram::new();let (new_end,tims)=pac_uploads(&compiled,&mut check).unwrap();
+    assert_eq!(&compiled[..end],&source[..end]);assert_eq!(tims.len(),2);
+    assert_eq!(compiled.len(),(new_end+4).max(source.len()).div_ceil(2048)*2048);
+    assert!(compiled[new_end..].iter().all(|b|*b==0));
+}
 #[test]
 fn streamed_pac_rejects_unresolved_contributors_malformed_chunks_and_limits() {
     let (bundle,pac,before,inventory,relocation,_)=streamed_fixture();let saved=before.clone();

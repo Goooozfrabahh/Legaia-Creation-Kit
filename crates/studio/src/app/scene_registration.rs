@@ -171,9 +171,14 @@ fn append_pac_uploads(source:&[u8],incoming:&[u8],vram:&mut Vram,budget:usize)->
     // zero sector padding, never opaque trailer residue, to avoid archive growth.
     if output.len()>source.len() && source[end..].iter().all(|b|*b==0) {
         let used=output.len()-(source.len()-end);
-        if used+4<=source.len(){output.resize(source.len(),0);}
+        // Keep one native terminator and only the sector padding now needed.
+        // Carrying the old padding after inserted uploads can waste a sector
+        // and overflow the runtime arena even when every payload fits.
+        let length=(used+4).max(source.len()).checked_add(2047).context("PAC alignment overflow")?/2048*2048;
+        output.resize(length,0);
     }
     export_check!(output.len()<=budget.min(BUNDLE_ARENA),"Compiled PAC exceeds native arena/explicit budget");
+    if super::super::ps1_export::unrestricted::active(){super::super::ps1_export::unrestricted::diagnostic(format!("NATIVE UPLOAD ORDER: original PAC chunks through offset {end:#x} retained verbatim; {} new TIM members appended in native TIM_LIST before zero terminator; PAC {} -> {} bytes, sector-rounded {}, runtime arena {} bytes",added.len(),source.len(),output.len(),output.len().div_ceil(2048)*2048,BUNDLE_ARENA));}
     let mut readback=before;pac_uploads(&output,&mut readback)?;
     *vram=readback;Ok(output)
 }

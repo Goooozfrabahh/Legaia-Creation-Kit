@@ -11,7 +11,7 @@ pub(in crate::app) fn warn_check(message:String)->bool {
     if active(){note(format!("CHECK BYPASSED: {message}"));true}else{false}
 }
 fn note(message:String){WARNINGS.with(|w|w.borrow_mut().push(message));}
-pub(super) fn diagnostic(message:String){note(message);}
+pub(in crate::app) fn diagnostic(message:String){note(message);}
 
 pub(in crate::app) fn failure_log(output:&Path,manifest:&str,error:&str)->Result<PathBuf>{
     let parent=output.parent().context("No output parent")?;let stamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
@@ -21,6 +21,8 @@ pub(in crate::app) fn failure_log(output:&Path,manifest:&str,error:&str)->Result
 struct Scope(bool);
 impl Drop for Scope {fn drop(&mut self){ACTIVE.with(|v|v.set(self.0));}}
 fn scope()->Scope{Scope(ACTIVE.with(|v|v.replace(true)))}
+#[cfg(test)]
+pub(in crate::app) fn with_test_scope<T>(f:impl FnOnce()->T)->T{let _scope=scope();f()}
 fn attempt<T>(label:&str,log:&mut Vec<String>,f:impl FnOnce()->Result<T>)->Option<T> {
     log.push(format!("ATTEMPT {label}"));
     let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
@@ -35,6 +37,9 @@ fn integer(value:f32)->Result<i32>{
     anyhow::ensure!(value.is_finite() && value.abs()<i32::MAX as f32,"Non-finite/out-of-range native coordinate");
     let encoded=value.round() as i32;
     note(format!("NATIVE PRECISION coordinate: requested {value}; encoded {encoded}; error {} PS1 units",encoded as f32-value));Ok(encoded)
+}
+fn relative_native_translation(requested:[f32;3],donor:[f32;3],encoded:[i32;3])->Result<[f32;3]>{
+    let mut result=[0.;3];for a in 0..3 {result[a]=integer(requested[a]-donor[a])?.checked_sub(encoded[a]).context("Native translation difference overflow")? as f32;}Ok(result)
 }
 fn grid(cell:(u8,u8))->usize {GRID_OFF+(cell.1 as usize*128+cell.0 as usize)*2}
 fn id_at(map:&[u8],cell:(u8,u8))->Result<usize>{
@@ -128,8 +133,28 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
     // Import each requested instance independently using the existing native
     // resource registration writer. No collision/runtime acceptance gate.
     let mut imported_targets=HashMap::new();
+    // Identical donor instances share the registered native resource closure,
+    // while each receives its own descriptor and MAP reference. Cache only the
+    // exact donor identity, never a nearby or merely similar object.
+    let mut prototypes:HashMap<(String,String,usize),((u8,u8),[i32;3])>=HashMap::new();
+    let tiers=Scene::load(index,&scene.name).ok().and_then(|n|n.field_floor_height_lut(index).ok().flatten()).map(|h|h.map(|v|Some(-(v as i32)))).unwrap_or([None;16]);
     for foreign in &doc.foreign {
         let label=format!("IMPORT UID {} from {} {} #{}",foreign.uid,foreign.source,foreign.kind,foreign.record);
+        let identity=(foreign.source.clone(),foreign.kind.clone(),foreign.record);
+        if let Some(&(cell,encoded_translation))=prototypes.get(&identity) {
+            if let Some((candidate,descriptor,allocated))=attempt(&label,log,||{
+                let original=disc.read_entry_footprint(entry)?;let mut map=original.clone();
+                let donor=world.foreign.iter().find(|f|f.uid==foreign.uid).context("Foreign source provenance absent")?;
+                let delta=relative_native_translation(foreign.center,donor.donor_center,encoded_translation)?;
+                let (descriptor,allocated)=copy_record(&mut map,&original,cell,delta,&tiers,None)?;
+                let mut candidate=DiscPatcher::open(disc.image().to_vec())?;candidate.patch_prot_entry(entry,0,&map)?;
+                Ok((candidate,descriptor,allocated))
+            }){
+                *disc=candidate;imported_targets.insert(scene_instances::NameTarget::Created(foreign.uid),allocated);
+                log.push(format!("WRITTEN {label}: independent MAP descriptor {descriptor} at {:#x}, reference {allocated:?}; REUSED exact donor TMD/TIM resource closure from reference {cell:?}; no additional texture uploads or bundle growth",descriptor*32));
+            }
+            continue;
+        }
         if let Some(candidate)=attempt(&label,log,||{
             anyhow::ensure!(matches!(foreign.kind.as_str(),"placement"|"terrain"),"Existing native import writer has no {} descriptor/actor adapter; no different source object substituted",foreign.kind);
             let mut isolated=world.clone();
@@ -140,6 +165,7 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
             NativeExportPlan::compile_saved_imports(DiscPatcher::open(disc.image().to_vec())?,scene,&isolated,index,
                 super::super::native_asset_plan::scene_registration::Limits{max_models:u16::MAX as usize-field_objects::FIELD_ACTOR_PACK_BIAS as usize,max_decoded:usize::MAX,max_encoded:usize::MAX},&[])
         }){for &(uid,descriptor,cell,selector) in &candidate.placements{imported_targets.insert(scene_instances::NameTarget::Created(uid),cell);
+                if let Some(donor)=world.foreign.iter().find(|f|f.uid==uid){prototypes.insert(identity.clone(),(cell,[0,1,2].map(|a|(foreign.center[a]-donor.donor_center[a]).round() as i32)));}
                 log.push(format!("WRITTEN {label}: MAP PROT {entry}, descriptor {descriptor} at {:#x}, grid {cell:?} at {:#x}, TMD selector {selector}",descriptor*32,grid(cell)));}
             for idx in [entry+3,entry+4] {
                 if let (Ok(before),Ok(after))=(disc.read_entry_footprint(idx),candidate.disc.read_entry_footprint(idx)) {
@@ -203,7 +229,10 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
             // Use the existing geometry rasterizer; ignore provenance/ownership
             // permission gates. Explicit open-space edits can clear native walls.
             let recipe=&assignment.recipe;
-            let mut walls=if let Some(g)=&recipe.generated {g.wall_cells(draw.offset,draw.rotation,draw.scale).map_err(anyhow::Error::msg)?}else{Default::default()};
+            // FOREIGN persistence stores an absolute center. Its saved mesh
+            // recipe keeps the original rest-space pivot, so derive translation
+            // from those two actual coordinates (also equals offset before save).
+            let mut walls=if let Some(g)=&recipe.generated {g.wall_cells([0,1,2].map(|a|draw.center[a]-g.pivot[a]),draw.rotation,draw.scale).map_err(anyhow::Error::msg)?}else{Default::default()};
             let (dx,dz)=if recipe.walls.is_empty()&&recipe.nonblocking.is_empty(){(0,0)}else{
                 let dx=integer(draw.offset[0])?;let dz=integer(draw.offset[2])?;
                 anyhow::ensure!(dx%64==0&&dz%64==0,"Manual collision cells require exact 64-unit grid translation; writer cannot encode fractional wall cells");(dx,dz)};
@@ -296,6 +325,13 @@ pub(super) fn publish(plan:NativeExportPlan,output:&Path)->Result<ExportResult>{
 mod tests {
     use super::*;
     #[test]
+    fn shared_resources_round_each_requested_placement_from_its_original_donor()->Result<()>{
+        for (first,next) in [(0.4,0.8),(0.6,0.2),(-0.4,-0.8),(-0.6,-0.2)] {
+            let encoded=integer(first)?;let delta=relative_native_translation([next,0.,0.],[0.;3],[encoded,0,0])?;
+            assert_eq!(encoded+delta[0] as i32,integer(next)?,"resource reuse must not accumulate relative rounding");
+        }Ok(())
+    }
+    #[test]
     fn output_verification_rejects_missing_empty_and_truncated_files()->Result<()>{
         let dir=tempfile::tempdir()?;let path=dir.path().join("output.img");
         assert!(verify_output_file(&path,None).is_err());std::fs::write(&path,[])?;assert!(verify_output_file(&path,None).is_err());
@@ -321,6 +357,40 @@ mod tests {
         let before_map=Scene::load(&library.index,"town01")?.field_map_index(&library.index).context("No MAP")? as usize;
         let planned=DiscPatcher::open(plan.image.clone())?;
         let intended_map=planned.read_entry_footprint(before_map)?;
+        if let Some(baseline)=std::env::var_os("LCK_VRAM_BASELINE"){
+            use crate::app::native_asset_plan::{scene_registration,texture_relocation};
+            use legaia_scene_formats::scene_asset_table;
+            let old=DiscPatcher::open(std::fs::read(baseline)?)?;
+            let verified_map=old.read_entry_footprint(before_map)?;
+            if verified_map!=intended_map {for (at,(a,b)) in verified_map.iter().zip(&intended_map).enumerate().filter(|(_, (a,b))|a!=b).take(100){println!("MAP DIFFERENCE {at:#x}: verified {a:#04x}, candidate {b:#04x}");}}
+            anyhow::ensure!(verified_map==intended_map,"VRAM-only fix changed user-verified MAP placements/collision/floors/bindings");
+            for idx in 0..old.entry_count(){if idx!=before_map+3&&idx!=before_map+4{anyhow::ensure!(old.read_entry_footprint(idx)?==planned.read_entry_footprint(idx)?,"Unrelated PROT entry {idx} changed");}}
+            let limits=scene_registration::Limits{max_models:1024,max_decoded:16*1024*1024,max_encoded:16*1024*1024};
+            let bundle=planned.read_entry_footprint(before_map+3)?;let pac=planned.read_entry_footprint(before_map+4)?;
+            anyhow::ensure!(pac.len()<=0x62c00,"Sector-rounded PAC still exceeds native field arena");
+            let (_,vram)=scene_registration::native_texture_sequence(&bundle,Some(&pac),limits)?;
+            let ob=old.read_entry_footprint(before_map+3)?;let op=old.read_entry_footprint(before_map+4)?;
+            let (_,ov)=scene_registration::native_texture_sequence(&ob,Some(&op),limits)?;
+            let sb=planned.read_entry_footprint(before_map+3)?;
+            let mut clobbered=vram.clone();let mut old_clobbered=ov.clone();
+            for r in texture_relocation::field_runtime_reservations(){let bytes=vec![0xa5;r.w as usize*r.h as usize*2];clobbered.write_block(r.x,r.y,r.w,r.h,&bytes);old_clobbered.write_block(r.x,r.y,r.w,r.h,&bytes);}
+            let source_disc=DiscPatcher::open(std::fs::read(&source)?)?;
+            let source_bundle=source_disc.read_entry_footprint(before_map+3)?;let source_pac=source_disc.read_entry_footprint(before_map+4)?;
+            let (_,source_vram)=scene_registration::native_texture_sequence(&source_bundle,Some(&source_pac),limits)?;
+            anyhow::ensure!((0..1024*512).all(|i|!source_vram.is_written(i%1024,i/1024)||source_vram.as_u16()[i]==vram.as_u16()[i]),"Original native texture/palette upload words changed");
+            let base_models=scene_asset_table::mesh_pool(&source_bundle).len();
+            let old_models=scene_asset_table::mesh_pool(&ob);let new_models=scene_asset_table::mesh_pool(&sb);
+            anyhow::ensure!(old_models.len()==new_models.len(),"Duplicate resources changed registration count");
+            let(mut checked,mut old_corrupted)=(0,0);
+            for i in base_models..new_models.len(){
+                let old_raw=&old_models[i].bytes;let raw=&new_models[i].bytes;
+                let (n,changed)=texture_relocation::texture_sample_changes(old_raw,&ov,raw,&vram)?;checked+=n;anyhow::ensure!(changed==0,"Relocated native TMD texture/palette samples differ");
+                anyhow::ensure!(texture_relocation::texture_sample_changes(raw,&vram,raw,&clobbered)?.1==0,"Framebuffer writes corrupt new allocation");
+                old_corrupted+=texture_relocation::texture_sample_changes(old_raw,&ov,old_raw,&old_clobbered)?.1;
+            }
+            anyhow::ensure!(checked>0&&old_corrupted>0,"Framebuffer corruption regression did not exercise imported materials");
+            println!("VRAM REGRESSION: {checked} imported native TMD UV samples match; {old_corrupted} old samples corrupt under simulated framebuffer writes, zero fixed samples corrupt. MAP/collision/floors/bindings and unrelated entries byte-identical. PAC {} <= {} bytes. Automated simulation, NOT gameplay.",pac.len(),0x62c00);
+        }
         let original_map=DiscPatcher::open(std::fs::read(&source)?)?.read_entry_footprint(before_map)?;
         let new_cells=(0..128).flat_map(|z|(0..128).map(move |x|(x as u8,z as u8))).filter(|&cell|id_at(&original_map,cell).ok()!=id_at(&intended_map,cell).ok()).collect::<Vec<_>>();
         anyhow::ensure!(new_cells.len()==doc.foreign.len(),"Foreign requests not all independently allocated");
