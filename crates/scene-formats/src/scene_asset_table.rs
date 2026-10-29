@@ -160,7 +160,9 @@ const HEADER_COUNT: u32 = 7;
 /// standalone-town scenes (e.g. `town01`, `town0c`) use `count = 6` (first
 /// descriptor `Tmd`/type-0x0A). Both are walked by `FUN_80020224`, which
 /// reads `count` from the file and loops that many descriptors.
-const MAX_DESCRIPTORS: usize = 7;
+/// Bounded reader storage, not a retail engine limit. The native walker uses
+/// the count word; exports may add a TIM_LIST while retaining the mode flag.
+pub const MAX_DESCRIPTORS: usize = 16;
 
 /// Smallest `count` word the detector will consider. Below `HEADER_COUNT - 1`
 /// a table is admitted only when it carries a MAN (see [`detect`]); this floor
@@ -588,7 +590,7 @@ pub fn detect(buf: &[u8]) -> Option<SceneAssetTable> {
     // admits exactly those two entries - the other 13 sub-6 tables (the
     // `count`-4/5 MAN-less v12-family form, `0874`'s `count`-3 party pack) all
     // lack a MAN and keep their existing class.
-    if !(MIN_HEADER_COUNT..=HEADER_COUNT).contains(&count_u32) {
+    if !(MIN_HEADER_COUNT..=MAX_DESCRIPTORS as u32).contains(&count_u32) {
         return None;
     }
     let count = count_u32 as usize;

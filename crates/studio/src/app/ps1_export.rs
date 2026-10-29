@@ -921,6 +921,20 @@ pub(super) struct ExportResult {
     pub path: PathBuf,
     pub patched: Vec<String>,
     pub skipped: Vec<String>,
+    pub imports:Option<ImportCoverage>,
+}
+#[derive(Clone,Copy,Debug,Default,PartialEq,Eq)]
+pub(super) struct ImportCoverage{pub requested:usize,pub written:usize}
+impl ImportCoverage{
+    pub fn failed(self)->usize{self.requested.saturating_sub(self.written)}
+    pub fn failure_message(self)->Option<String>{(self.failed()>0).then(||format!("{} FAILED IMPORTS of {} requested; {} native objects imported. {}",self.failed(),self.requested,self.written,if self.written==0{"NO REQUESTED OBJECTS IMPORTED — scene export is incomplete."}else{"PARTIAL SCENE — inspect debug.txt."}))}
+}
+impl ExportResult{
+    pub fn experimental_summary(&self)->String{
+        let coverage=self.imports.unwrap_or_default();let failures=self.skipped.iter().filter(|s|s.starts_with("FAILED ")).count();
+        let state=if coverage.requested>0&&coverage.written==0{"PARTIAL IMG FILE ONLY — NO REQUESTED OBJECTS IMPORTED"}else if coverage.failed()>0||failures>0{"PARTIAL IMG FILE — INCOMPLETE SCENE"}else{"EXPERIMENTAL IMG FILE VERIFIED — GAMEPLAY UNVERIFIED"};
+        format!("{state}: {}. Native imports {}/{} written; {} FAILED IMPORTS; {failures} failed operations. {}",self.path.display(),coverage.written,coverage.requested,coverage.failed(),self.skipped.last().cloned().unwrap_or_default())
+    }
 }
 
 /// PS1 Rim Elm is not one cell: story states town01 / town0b / town0c
@@ -1407,6 +1421,7 @@ pub(super) struct NativeExportPlan {
     skipped:Vec<String>,
     continuation_receipt:Option<serde_json::Value>,
     unrestricted_log:Option<String>,
+    imports:Option<ImportCoverage>,
 }
 
 pub(super) fn verify_output_file(path:&Path,expected:Option<u64>)->Result<u64>{
@@ -1501,6 +1516,20 @@ impl NativeExportPlan {
         protected:&[super::native_asset_plan::texture_relocation::Rect],
         observations:Option<&super::native_asset_plan::runtime_evidence::VramObservations>,
     )->Result<NativeImportCandidate> {
+        Self::compile_imports_inner(disc,scene,world,index,limits,protected,observations,None)
+    }
+    pub(in crate::app) fn compile_saved_imports_session(
+        disc:DiscPatcher,scene:&AssembledScene,world:&WorldModel,index:&ProtIndex,
+        limits:super::native_asset_plan::scene_registration::Limits,
+        session:&mut Option<(super::native_asset_plan::texture_relocation::Planner,legaia_tim::Vram)>,
+    )->Result<NativeImportCandidate>{Self::compile_imports_inner(disc,scene,world,index,limits,&[],None,Some(session))}
+    fn compile_imports_inner(
+        disc:DiscPatcher,scene:&AssembledScene,world:&WorldModel,index:&ProtIndex,
+        limits:super::native_asset_plan::scene_registration::Limits,
+        protected:&[super::native_asset_plan::texture_relocation::Rect],
+        observations:Option<&super::native_asset_plan::runtime_evidence::VramObservations>,
+        session:Option<&mut Option<(super::native_asset_plan::texture_relocation::Planner,legaia_tim::Vram)>>,
+    )->Result<NativeImportCandidate>{
         use super::native_asset_plan::{NativeAssetPlan,Origin,ResourceKind,texture_relocation::{Planner,multi_tim::{Upload,UploadTrace}},scene_registration};
         let doc=scene_instances::parse(&scene_instances::serialize(&scene.name,world),&scene.name,world).map_err(anyhow::Error::msg)?;
         export_check!(!doc.foreign.is_empty(),"No persisted foreign instances to compile");
@@ -1508,7 +1537,7 @@ impl NativeExportPlan {
         validate_source_archive(&disc,index)?;
         let target=Scene::load(index,&scene.name)?;let map_entry=target.field_map_index(index).context("No destination MAP")? as usize;
         let bundle=disc.read_entry_footprint(map_entry+3)?;
-        let pac=if scene_asset_table::streams_scene_pac(&bundle){Some(disc.read_entry_footprint(map_entry+4)?)}else{None};
+        let pac=if scene_registration::native_stream_mode(&bundle).is_some(){Some(disc.read_entry_footprint(map_entry+4)?)}else{None};
         let (_,mut before)=scene_registration::native_texture_sequence(&bundle,pac.as_deref(),limits)?;
         let tiers=target.field_floor_height_lut(index)?.context("Destination native floor ladder unresolved")?.map(|y|Some(-(y as i32)));
         let mut staged=disc;let mut last=None;let mut placements=Vec::new();let mut foreign=doc.foreign.clone();foreign.sort_by_key(|f|f.uid);
@@ -1517,7 +1546,9 @@ impl NativeExportPlan {
             reservations.push(super::native_asset_plan::texture_relocation::Rect{x:walker.dest_x,y:walker.dest_y,w:16,h:1});
             for frame in walker.frames {reservations.push(super::native_asset_plan::texture_relocation::Rect{x:frame.src_x,y:frame.src_y,w:16,h:1});}
         }}
-        let mut planner=Planner::new(&before,&reservations)?;
+        let mut planner=if let Some((planner,previous))=session.as_ref().and_then(|s|s.as_ref()){
+            anyhow::ensure!(super::naming::material_key(previous)==super::naming::material_key(&before),"Native resource session upload state differs from staged IMG");planner.clone()
+        }else{Planner::new(&before,&reservations)?};
         let mut boot=legaia_tim::Vram::new();index.system_ui_bundle()?.upload_boot_resident_to_vram(&mut boot);planner.reserve_written(&boot);
         planner.reserve_written(&scene.res.vram);
         if unrestricted::active(){unrestricted::diagnostic(format!("VRAM allocation protects {} runtime/CLUT-walk rectangles, existing ordered uploads, assembled destination resources and boot-resident uploads; unrestricted object export remains enabled",reservations.len()));}
@@ -1534,10 +1565,17 @@ impl NativeExportPlan {
             let source_map=index.entry_bytes(donor_map as u32)?;
             let (record_id,_)=record_at_kind(&source_map,placed.cell,(placed.world_x,placed.world_z),placed.env_slot,[placed.rot_x,placed.rot_y,placed.rot_z],terrain)?;
             export_check!(cached.native_record.as_ref().is_some_and(|r|source_map[record_id*32..record_id*32+32]==r[..]),"Saved donor descriptor provenance changed or unresolved");
-            let source_bundle=index.entry_bytes((donor_map+3) as u32)?;
-            let source_pac=if scene_asset_table::streams_scene_pac(&source_bundle){Some(index.entry_bytes((donor_map+4) as u32)?)}else{None};
-            let pool=scene_asset_table::mesh_pool(&source_bundle);let model=pool.get(placed.env_slot).context("Donor selector requires another native model adapter")?;
-            let mut inventory=NativeAssetPlan::default();let id=inventory.register(ResourceKind::Tmd,&model.bytes,Origin{scene:foreign.source.clone(),entry:Some((donor_map+3) as u32),offset:Some(model.offset)},false)?;
+            let source_bundle=if let Some(bundle)=legaia_engine_scene::scene_bundle::find_bundle(&native){bundle.bytes().to_vec()}else{index.entry_bytes((donor_map+3) as u32)?.as_ref().clone()};
+            let source_pac=if scene_registration::native_stream_mode(&source_bundle).is_some(){Some(index.entry_bytes((donor_map+4) as u32)?)}else{None};
+            let bank=legaia_engine_scene::model_bank::SceneModelBank::build(&native);
+            let source=bank.scene_source(u16::try_from(placed.env_slot)?).context("Native scene model selector has no registration source")?;
+            let models=bank.materialise(&native);let model=models.get(placed.env_slot).and_then(|m|m.as_ref()).context("Native model registration source failed to decode")?;
+            anyhow::ensure!(model.starts_with(&cached.raw_tmd)||cached.raw_tmd.starts_with(model),"Native model bank selector does not match selected donor TMD; no different mesh substituted");
+            let model_entry=match source {
+                legaia_engine_scene::model_bank::ModelSource::BundlePack{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::BundleSingle{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::StreamPack{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::StreamSingle{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::WalkedPack{entry_idx,..}=>entry_idx,
+            };
+            let mut inventory=NativeAssetPlan::default();let id=inventory.register(ResourceKind::Tmd,model,Origin{scene:foreign.source.clone(),entry:Some(model_entry),offset:None},false)?;
+            if unrestricted::active(){let (base,table)=scene_registration::native_descriptor_table(&source_bundle)?;unrestricted::diagnostic(format!("NATIVE DONOR RESOLVED UID {}: model selector {} -> {source:?}; TMD {} bytes SHA256 {}; table base {base:#x}, {} descriptors, stream mode {:?}",foreign.uid,placed.env_slot,model.len(),id.sha256,table.count,scene_registration::native_stream_mode(&source_bundle)));}
             let (textures,expected)=scene_registration::native_texture_sequence(&source_bundle,source_pac.as_deref().map(|p|p.as_slice()),limits)?;
             let mut events=Vec::new();
             for (i,raw) in textures.iter().enumerate(){let tim=legaia_tim::parse_native_upload(raw)?;let texture=inventory.register(ResourceKind::Tim,raw,Origin{scene:foreign.source.clone(),entry:None,offset:None},false)?;
@@ -1548,7 +1586,7 @@ impl NativeExportPlan {
             let (compiled,registration)=Self::compile_scene_resources(&staged,map_entry,&inventory,&before,&relocation,limits)?;
             let source_tiers=native.field_floor_height_lut(index)?.context("Donor native floor ladder unresolved")?.map(|y|Some(-(y as i32)));
             let delta=[0,1,2].map(|axis|foreign.center[axis]-cached.donor_center[axis]);
-            let candidate=Self::compile_registered_copy(compiled,map_entry,donor_map,placed.cell,foreign.uid,&id,&registration,delta,&source_tiers,&tiers)?;
+            let candidate=Self::compile_registered_copy(compiled,map_entry,donor_map,placed.cell,foreign.uid,&id,&registration,delta,&source_tiers,&tiers,Some(model))?;
             before=relocation.apply(&before)?;
             let NativeImportCandidate{disc,descriptor,cell,uid,selector,..}=candidate;staged=disc;placements.push((uid,descriptor,cell,selector));last=Some((descriptor,cell,uid,selector));
         }
@@ -1558,6 +1596,7 @@ impl NativeExportPlan {
         if let Err(error)=candidate.compile_collision(scene,world,index) {
             candidate.collision_diagnostics.push(format!("Native collision compilation blocked: {error:#}. No unsupported collision intent was accepted"));
         }
+        if let Some(session)=session{*session=Some((planner,before));}
         Ok(candidate)
     }
     /// Combine a registered donor resource with an independently allocated
@@ -1569,6 +1608,7 @@ impl NativeExportPlan {
         model:&super::native_asset_plan::ResourceId,
         registration:&super::native_asset_plan::scene_registration::SceneRegistration,
         delta:[f32;3],source_tiers:&[Option<i32>;16],destination_tiers:&[Option<i32>;16],
+        verified_donor_model:Option<&[u8]>,
     )->Result<NativeImportCandidate> {
         export_check!(source_cell.0<128&&source_cell.1<128,"Donor source outside native grid");
         let donor=disc.read_entry_footprint(donor_map_entry)?;
@@ -1581,8 +1621,8 @@ impl NativeExportPlan {
         // This supported route has its source models in the descriptor bundle.
         // PAC model contributors need a separate complete selector mapping.
         let source_pool=scene_asset_table::mesh_pool(&donor_bundle);
-        let raw=source_pool.get(pack_index as usize).context("Donor model needs another native selector adapter")?;
-        export_check!(super::collision_recipes::digest(&raw.bytes)==model.sha256,"Registered model does not match the original donor placement");
+        let raw=if let Some(raw)=verified_donor_model {raw}else{&source_pool.get(pack_index as usize).context("Donor model needs another native selector adapter")?.bytes};
+        anyhow::ensure!(super::collision_recipes::digest(raw)==model.sha256,"Registered model does not match the resolved native donor selector");
         let donor_lba=disc.entry_disc_lba(donor_map_entry).context("Donor MAP address")?;
         let loaded=disc.read_disc_sectors(donor_lba,0x28)?;
         let source_bindings=NativeBindings::parse(&loaded[0x10000..0x12000],&loaded[0x12000..])?;
@@ -1604,7 +1644,9 @@ impl NativeExportPlan {
         let raw:[u8;32]=map[copy.id*32..copy.id*32+32].try_into()?;
         map[copy.id*32..copy.id*32+32].copy_from_slice(&registration.bind_record(model,&raw)?);
         let selector=registration.selector(model)?;
-        let destination_bundle=disc.read_entry_footprint(map_entry+3)?;let pool=scene_asset_table::mesh_pool(&destination_bundle);
+        let destination_bundle=disc.read_entry_footprint(map_entry+3)?;
+        let destination_pac=if super::native_asset_plan::scene_registration::native_stream_mode(&destination_bundle).is_some(){Some(disc.read_entry_footprint(map_entry+4)?)}else{None};
+        let pool=super::native_asset_plan::scene_registration::native_model_pool(&destination_bundle,destination_pac.as_deref());
         export_check!(pool.get(selector as usize).is_some(),"Final destination model selector unresolved");
         export_check!(original[WALL_OFF..GRID_OFF]==map[WALL_OFF..GRID_OFF]&&original[0x10000..]==map[0x10000..],"Import altered original walls, floors or bindings");
         for i in 0..MAP_LEN {
@@ -1628,7 +1670,7 @@ impl NativeExportPlan {
         let bundle_entry=map_entry.checked_add(3).context("Scene bundle index overflow")?;
         let bundle=disc.read_entry_footprint(bundle_entry)?;
         let pac_entry=map_entry.checked_add(4).context("Scene PAC index overflow")?;
-        let pac=if scene_asset_table::streams_scene_pac(&bundle){Some(disc.read_entry_footprint(pac_entry)?)}else{None};
+        let pac=if super::native_asset_plan::scene_registration::native_stream_mode(&bundle).is_some(){Some(disc.read_entry_footprint(pac_entry)?)}else{None};
         let registered=super::native_asset_plan::scene_registration::register_scene(inventory,&bundle,pac.as_deref(),before,relocation,limits)?;
         registered.validate_source(&bundle)?;
         let mut payloads=std::collections::BTreeMap::new();payloads.insert(bundle_entry,registered.bytes().to_vec());
@@ -1660,8 +1702,11 @@ impl NativeExportPlan {
         }
         // Reparse actual sector-readback bytes, not only pre-packaging buffers.
         let check=compiled.read_entry_footprint(bundle_entry)?;
-        let expected_pool=scene_asset_table::mesh_pool(registered.bytes());
-        let actual_pool=scene_asset_table::mesh_pool(&check);
+        let expected_pool=super::native_asset_plan::scene_registration::native_model_pool(registered.bytes(),registered.pac_bytes());
+        let actual_pac=if registered.pac_bytes().is_some(){Some(compiled.read_entry_footprint(pac_entry)?)}else{None};
+        let actual_pool=super::native_asset_plan::scene_registration::native_model_pool(&check,actual_pac.as_deref());
+        let (_,uploaded)=super::native_asset_plan::scene_registration::native_texture_sequence(&check,actual_pac.as_deref(),limits)?;
+        anyhow::ensure!(super::naming::material_key(&uploaded)==super::naming::material_key(&relocation.apply(before)?),"Final native descriptor/PAC upload order does not reproduce intended texture words");
         export_check!(actual_pool.len()==expected_pool.len()&&actual_pool.iter().zip(&expected_pool).all(|(a,b)|a.bytes==b.bytes),"Registered model lookup failed after native PROT packaging");
         Ok((compiled,registered))
     }
@@ -1856,7 +1901,7 @@ fn compile_plan(source:PathBuf, mut disc:DiscPatcher, image_length:usize,
             "EXPERIMENTAL SOURCE: verified inserted references are scoped to their recorded MAP; other story-state originals are unchanged. Existing resource/physics/runtime limitations remain; no production approval."
         }.into());
     }
-    Ok(NativeExportPlan {dependencies:Default::default(),source,image:written,patched:names,skipped,continuation_receipt,unrestricted_log:None})
+    Ok(NativeExportPlan {dependencies:Default::default(),source,image:written,patched:names,skipped,continuation_receipt,unrestricted_log:None,imports:None})
 }
 
 /// Write only bytes already compiled and verified by native preflight.
@@ -1902,7 +1947,7 @@ pub(super) fn export(plan:NativeExportPlan, output:&Path) -> Result<ExportResult
     verify_output_file(&output_abs,Some(written.len() as u64))?;
     log::info!("LCK native PS1 Rim Elm export: {}",names.join(", "));
     for entry in &skipped {log::warn!("{entry}");}
-    Ok(ExportResult{path:output_abs,patched:names,skipped})
+    Ok(ExportResult{path:output_abs,patched:names,skipped,imports:None})
 }
 
 #[cfg(test)]

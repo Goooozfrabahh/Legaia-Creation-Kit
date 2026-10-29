@@ -78,19 +78,19 @@ impl<'a> BundleSource<'a> {
         }
     }
 
-    /// The 7 descriptors with their packed `(type_byte, size, data_offset)`.
-    pub fn descriptors(&self) -> [Descriptor; 7] {
+    /// Actual count-prefixed descriptors, without a fixed seven-slot tail.
+    pub fn descriptors(&self) -> Vec<Descriptor> {
         let table = match self {
             BundleSource::Plain { table, .. } => table,
             BundleSource::Scripted { table, .. } => table,
             BundleSource::V12Embedded { table, .. } => table,
         };
-        let mut out = [Descriptor {
+        let mut out = vec![Descriptor {
             type_byte: 0,
             size: 0,
             data_offset: 0,
-        }; 7];
-        for (i, d) in table.descriptors.iter().enumerate() {
+        }; table.count];
+        for (i, d) in table.used().iter().enumerate() {
             out[i] = Descriptor {
                 type_byte: d.type_byte,
                 size: d.size,

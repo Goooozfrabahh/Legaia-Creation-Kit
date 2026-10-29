@@ -1,5 +1,13 @@
 use super::*;
 use super::super::tests::{tim,model,register};
+#[test]
+fn exact_material_footprints_preserve_uvs_and_pack_images_before_palettes(){
+    let (inventory,events,id,expected)=fixture(false);let trace=UploadTrace::verify_replay(&inventory,&events,&expected,"known native fixture order").unwrap();
+    let plan=Planner::new(&Vram::new(),&[]).unwrap().plan_multi(&inventory,&trace,&[id.clone()]).unwrap();
+    let first_palette=plan.uploads.iter().position(|u|u.depth==3).unwrap();assert!(plan.uploads[first_palette..].iter().all(|u|u.depth==3));
+    assert!(plan.uploads.iter().filter(|u|u.depth!=3).all(|u|u.bytes.len()<128));
+    let before=references(payload(&inventory,&id,ResourceKind::Tmd).unwrap()).unwrap();let after=references(&plan.tmds[&id]).unwrap();for(a,b)in before.iter().zip(after){assert_eq!(a.uvs,b.uvs);}
+}
 fn fixture(shared_palette:bool)->(NativeAssetPlan,Vec<Upload>,ResourceId,Vram) {
     let mut inventory=NativeAssetPlan::default();let first=register(&mut inventory,ResourceKind::Tim,&tim(0,31));
     let mut raw=tim(0,992);let header=8+12+32;raw[header+4..header+6].copy_from_slice(&256u16.to_le_bytes());

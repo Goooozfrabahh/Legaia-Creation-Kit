@@ -113,26 +113,29 @@ pub(in crate::app) fn prepare(source_path:&Path,scene:&AssembledScene,world:&Wor
     let overlay=scene_instances::serialize(&scene.name,world);
     let mut log=vec!["UNRESTRICTED IMG EXPORT — EXPERIMENTAL ATTEMPT, NOT A COMPLETE/VERIFIED EXPORT".into(),format!("Source: {}\nScene: {}\nFull requested manifest:\n{overlay}",source_path.display(),scene.name),"WARNING All compatibility/ownership/binding/collision/overlap/spawn-window preflight is disabled. Encoder failures are retained per operation. Original scripts, collision and resources may become inconsistent; no gameplay verification.".into()];
     let mut disc=DiscPatcher::open(image)?;
+    let mut imports=ImportCoverage{requested:world.foreign.len(),written:0};
     let doc=attempt("parse exact editor manifest",&mut log,||scene_instances::parse(&overlay,&scene.name,world).map_err(anyhow::Error::msg));
     if let Some(doc)=doc {
         let native=attempt("resolve selected native cell",&mut log,||Scene::load(index,&scene.name));
         if let Some(native)=native {
             if let Some(entry)=native.field_map_index(index).map(|i|i as usize) {
-                compile(&mut disc,entry,scene,world,index,&doc,&mut log);
+                compile(&mut disc,entry,scene,world,index,&doc,&mut log,&mut imports);
             }else{log.push("FAILED No native MAP writer for selected cell; all requested edits remain unwritten".into());}
         }
     }
     let _=attempt("structural native IMG reparse (not gameplay)",&mut log,||DiscPatcher::open(disc.image().to_vec()));
     let failed=log.iter().filter(|l|l.starts_with("FAILED ")).cloned().collect::<Vec<_>>();
     let written=log.iter().filter(|l|l.starts_with("WRITTEN ")).cloned().collect::<Vec<_>>();
+    log.push(format!("IMPORT COVERAGE: {} requested; {} native objects written; {} FAILED IMPORTS. {}",imports.requested,imports.written,imports.failed(),imports.failure_message().unwrap_or_default()));
     log.push(format!("FINAL STATUS: {}. {} successful writer attempts; {} failures. Read all warnings. No claim of complete native behavior or gameplay compatibility.",if failed.is_empty(){"ATTEMPT WRITTEN / DEPENDENCIES UNVERIFIED"}else{"PARTIAL / REQUESTED CHANGES NOT FULLY WRITTEN"},written.len(),failed.len()));
-    Ok(NativeExportPlan{dependencies:Default::default(),source:source_path,image:disc.into_image(),patched:written,skipped:failed,continuation_receipt:None,unrestricted_log:Some(log.join("\n"))})
+    Ok(NativeExportPlan{dependencies:Default::default(),source:source_path,image:disc.into_image(),patched:written,skipped:failed,continuation_receipt:None,unrestricted_log:Some(log.join("\n")),imports:Some(imports)})
 }
 
-fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldModel,index:&ProtIndex,doc:&scene_instances::SceneDocument,log:&mut Vec<String>){
+fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldModel,index:&ProtIndex,doc:&scene_instances::SceneDocument,log:&mut Vec<String>,coverage:&mut ImportCoverage){
     // Import each requested instance independently using the existing native
     // resource registration writer. No collision/runtime acceptance gate.
     let mut imported_targets=HashMap::new();
+    let mut resource_session=None;
     // Identical donor instances share the registered native resource closure,
     // while each receives its own descriptor and MAP reference. Cache only the
     // exact donor identity, never a nearby or merely similar object.
@@ -151,6 +154,7 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
                 Ok((candidate,descriptor,allocated))
             }){
                 *disc=candidate;imported_targets.insert(scene_instances::NameTarget::Created(foreign.uid),allocated);
+                coverage.written+=1;
                 log.push(format!("WRITTEN {label}: independent MAP descriptor {descriptor} at {:#x}, reference {allocated:?}; REUSED exact donor TMD/TIM resource closure from reference {cell:?}; no additional texture uploads or bundle growth",descriptor*32));
             }
             continue;
@@ -162,9 +166,10 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
             for d in &mut isolated.draws{d.hidden=false;d.offset=[0.;3];d.rotation=[0.;3];d.scale=[1.;3];}
             if let Some(d)=isolated.draws.iter_mut().find(|d|d.editor_uid==Some(foreign.uid)){d.original_center=foreign.center;d.center=foreign.center;}
             isolated.foreign.retain(|f|f.uid==foreign.uid);isolated.collision.recipes.clear();isolated.collision.mesh_recipes.clear();
-            NativeExportPlan::compile_saved_imports(DiscPatcher::open(disc.image().to_vec())?,scene,&isolated,index,
-                super::super::native_asset_plan::scene_registration::Limits{max_models:u16::MAX as usize-field_objects::FIELD_ACTOR_PACK_BIAS as usize,max_decoded:usize::MAX,max_encoded:usize::MAX},&[])
+            NativeExportPlan::compile_saved_imports_session(DiscPatcher::open(disc.image().to_vec())?,scene,&isolated,index,
+                super::super::native_asset_plan::scene_registration::Limits{max_models:u16::MAX as usize-field_objects::FIELD_ACTOR_PACK_BIAS as usize,max_decoded:usize::MAX,max_encoded:usize::MAX},&mut resource_session)
         }){for &(uid,descriptor,cell,selector) in &candidate.placements{imported_targets.insert(scene_instances::NameTarget::Created(uid),cell);
+                coverage.written+=1;
                 if let Some(donor)=world.foreign.iter().find(|f|f.uid==uid){prototypes.insert(identity.clone(),(cell,[0,1,2].map(|a|(foreign.center[a]-donor.donor_center[a]).round() as i32)));}
                 log.push(format!("WRITTEN {label}: MAP PROT {entry}, descriptor {descriptor} at {:#x}, grid {cell:?} at {:#x}, TMD selector {selector}",descriptor*32,grid(cell)));}
             for idx in [entry+3,entry+4] {
@@ -318,12 +323,18 @@ pub(super) fn publish(plan:NativeExportPlan,output:&Path)->Result<ExportResult>{
     match result {Ok(())=>report.push_str("OUTPUT WRITTEN. Experimental native writes only; partial/dependency failures above remain unresolved.\n"),Err(e)=>{report.push_str(&format!("OUTPUT FAILED: {e:#}\n"));std::fs::write(&debug,report)?;return Err(e);}}
     report.push_str(&format!("OUTPUT FILE VERIFIED: {} ({} bytes; disk readback matches intended IMG)\nOutput SHA256: {expected_hash}\n",output.display(),plan.image.len()));std::fs::write(&debug,report)?;
     let mut skipped=plan.skipped;skipped.push(format!("UNRESTRICTED EXPERIMENT — NOT PROVEN COMPLETE. Full debug.txt: {}",debug.display()));
-    Ok(ExportResult{path:output,patched:plan.patched,skipped})
+    Ok(ExportResult{path:output,patched:plan.patched,skipped,imports:plan.imports})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn zero_successful_imports_are_not_confused_with_successful_collision_writes(){
+        let result=ExportResult{path:"partial.img".into(),patched:vec!["WRITTEN collision".into()],skipped:vec!["FAILED IMPORT UID 1".into()],imports:Some(ImportCoverage{requested:3,written:0})};
+        assert!(result.experimental_summary().contains("NO REQUESTED OBJECTS IMPORTED"));assert!(result.experimental_summary().contains("3 FAILED IMPORTS"));
+        assert!(result.imports.unwrap().failure_message().unwrap().contains("scene export is incomplete"));
+    }
     #[test]
     fn shared_resources_round_each_requested_placement_from_its_original_donor()->Result<()>{
         for (first,next) in [(0.4,0.8),(0.6,0.2),(-0.4,-0.8),(-0.6,-0.2)] {
@@ -357,6 +368,13 @@ mod tests {
         let before_map=Scene::load(&library.index,"town01")?.field_map_index(&library.index).context("No MAP")? as usize;
         let planned=DiscPatcher::open(plan.image.clone())?;
         let intended_map=planned.read_entry_footprint(before_map)?;
+        if let Some(baseline)=std::env::var_os("LCK_COLLISION_BASELINE"){
+            let previous=DiscPatcher::open(std::fs::read(baseline)?)?;let map=previous.read_entry_footprint(before_map)?;
+            anyhow::ensure!(map[0x4000..0x8000]==intended_map[0x4000..0x8000]&&map[0x10000..]==intended_map[0x10000..],"User-observed collision/floors/bindings changed");
+            for idx in 0..previous.entry_count(){if ![before_map,before_map+3,before_map+4].contains(&idx){anyhow::ensure!(previous.read_entry_footprint(idx)?==planned.read_entry_footprint(idx)?,"Unrelated native entry changed: {idx}");}}
+            for idx in [before_map+3,before_map+4]{anyhow::ensure!(planned.read_entry_footprint(idx)?.len()<=0x62c00,"Committed native carrier {idx} exceeds actual arena");}
+            println!("MIXED NATIVE AUDIT: observed collision/floors/bindings and unrelated native entries preserved; all committed carriers fit the field arena");
+        }
         if let Some(baseline)=std::env::var_os("LCK_VRAM_BASELINE"){
             use crate::app::native_asset_plan::{scene_registration,texture_relocation};
             use legaia_scene_formats::scene_asset_table;

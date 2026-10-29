@@ -119,26 +119,51 @@ impl Planner {
         export_check!(!required.is_empty(),"No textured dependencies");
         let source_vram=super::super::super::naming::material_key(&self.vram);
         let mut targets=BTreeMap::new();let mut uploads=Vec::new();
+        // Pack image regions before small palettes so a tiny CLUT cannot
+        // fragment the only remaining texture-page-sized space.
+        let mut required=required.into_iter().collect::<Vec<_>>();
+        required.sort_by_key(|owner|(usize::from(!bindings.values().flatten().any(|b|b.image==*owner)),std::cmp::Reverse(trace.blocks[owner].bytes.len())));
         for owner in required {
             let block=&trace.blocks[&owner];let refs=bindings.values().flatten().filter(|b|b.image==owner).map(|b|b.reference.clone()).collect::<Vec<_>>();
-            let target=self.allocate(block.rect,&block.bytes,block.depth,None,&refs)?;
-            targets.insert(owner,target);
+            // Allocate only native words referenced by these primitives or
+            // their complete CLUT windows, rather than transplant an entire
+            // unrelated atlas. Keep UVs unchanged by preserving page congruence.
+            let mut needed=Vec::new();
+            for r in &refs {
+                let divisor=match(r.tsb>>7)&3{0=>4,1=>2,_=>1};
+                let x=(r.tsb&15)*64+r.uvs.iter().map(|p|p.0 as u16/divisor).min().unwrap();
+                let end=(r.tsb&15)*64+r.uvs.iter().map(|p|p.0 as u16/divisor).max().unwrap()+1;
+                let y=((r.tsb>>4)&1)*256+r.uvs.iter().map(|p|p.1 as u16).min().unwrap();
+                let bottom=((r.tsb>>4)&1)*256+r.uvs.iter().map(|p|p.1 as u16).max().unwrap()+1;
+                needed.push(Rect{x,y,w:end-x,h:bottom-y});
+            }
+            for b in bindings.values().flatten().filter(|b|b.palette==Some(owner)) {
+                needed.push(Rect{x:(b.reference.cba&63)*16,y:(b.reference.cba>>6)&511,w:if(b.reference.tsb>>7)&3==0{16}else{256},h:1});
+            }
+            let x=needed.iter().map(|r|r.x).min().context("No required native words")?;let y=needed.iter().map(|r|r.y).min().unwrap();
+            let used=Rect{x,y,w:needed.iter().map(|r|r.x+r.w).max().unwrap()-x,h:needed.iter().map(|r|r.y+r.h).max().unwrap()-y};
+            anyhow::ensure!(block.rect.contains(x as usize,y as usize)&&block.rect.contains((x+used.w-1) as usize,(y+used.h-1) as usize),"Required native texture region leaves its upload owner");
+            let mut bytes=Vec::with_capacity(used.w as usize*used.h as usize*2);
+            for row in y..y+used.h {let at=((row-block.rect.y) as usize*block.rect.w as usize+(x-block.rect.x) as usize)*2;bytes.extend_from_slice(&block.bytes[at..at+used.w as usize*2]);}
+            let role=if refs.is_empty(){3}else{block.depth};
+            let target=self.allocate(used,&bytes,role,None,&refs)?;
+            targets.insert(owner,(used,target));
             // Merge-zero palettes are not promoted to complete original blocks:
             // any skipped source words remain unresolved outside used windows.
             if owner.clut && trace.events[owner.event].merge_clut_zeros {
                 export_check!((block.rect.y..block.rect.y+block.rect.h).all(|y|(block.rect.x..block.rect.x+block.rect.w).all(|x|trace.owners[y as usize*1024+x as usize]==Some(owner))),"Partial merge-zero CLUT cannot be emitted as an authentic complete block");
             }
             let source=trace.events[owner.event].resource.clone();
-            uploads.push(UploadBlock{rect:target,bytes:block.bytes.clone(),depth:block.depth,source:source.clone(),origins:inventory.resources[&source].origins.clone(),flags:trace.tim_flags[&source]});
+            uploads.push(UploadBlock{rect:target,bytes,depth:role,source:source.clone(),origins:inventory.resources[&source].origins.clone(),flags:trace.tim_flags[&source]});
         }
         let mut tmds=BTreeMap::new();let mut samples=0usize;let mut reference_diagnostics=Vec::new();
         for (id,model) in bindings {
             let raw=payload(inventory,&id,ResourceKind::Tmd)?;let mut out=raw.to_vec();let mut allowed=BTreeSet::new();
             for b in &model {
-                let r=&b.reference;let src=trace.blocks[&b.image].rect;let dst=targets[&b.image];
+                let r=&b.reference;let (src,dst)=targets[&b.image];
                 let x=(r.tsb as i32&15)*64+dst.x as i32-src.x as i32;let y=((r.tsb as i32>>4)&1)*256+dst.y as i32-src.y as i32;
                 let tsb=(r.tsb&!31)|(x as u16/64)|((y as u16/256)<<4);
-                let cba=if let Some(owner)=b.palette {let src=trace.blocks[&owner].rect;let dst=targets[&owner];
+                let cba=if let Some(owner)=b.palette {let (src,dst)=targets[&owner];
                     let x=(r.cba&63)*16-src.x+dst.x;let y=((r.cba>>6)&511)-src.y+dst.y;(r.cba&0x8000)|(x/16)|(y<<6)
                 }else{r.cba};
                 reference_diagnostics.push(format!("TMD {} texture block {:#x}: TSB {:#06x} -> {tsb:#06x} (page {},{}), CBA {:#06x} -> {cba:#06x} (CLUT {},{}); UVs {:?} unchanged",id.sha256,r.at,r.tsb,(tsb&15)*64,((tsb>>4)&1)*256,r.cba,(cba&63)*16,(cba>>6)&511,r.uvs));

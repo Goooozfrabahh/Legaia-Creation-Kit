@@ -1,6 +1,52 @@
 use super::*;
 use super::super::{ResourceKind,texture_relocation::{Planner,multi_tim::{Upload,UploadTrace},tests::{tim,model,register as resource}}};
 fn budgets()->Limits {Limits{max_models:1024,max_decoded:16*1024*1024,max_encoded:16*1024*1024}}
+fn typed_bundle(records:&[(u8,Vec<u8>)],base:usize)->Vec<u8>{
+    let mut out=vec![0x5a;base];out.resize(base+8+records.len()*8,0);out[base..base+4].copy_from_slice(&(records.len() as u32).to_le_bytes());
+    out[base+4..base+8].copy_from_slice(&records.iter().map(|(_,r)|r.len() as u32).sum::<u32>().to_le_bytes());
+    for(i,(kind,raw))in records.iter().enumerate(){let at=base+8+i*8;let offset=(out.len()-base) as u32;out[at..at+4].copy_from_slice(&table::encode_size_word(*kind,raw.len() as u32).to_le_bytes());out[at+4..at+8].copy_from_slice(&offset.to_le_bytes());
+        if matches!(*kind,0x0a|0x14){out.extend_from_slice(raw);}else{out.extend_from_slice(&legaia_lzs::compress(raw));}}
+    out
+}
+#[test]
+fn native_small_embedded_and_extended_tables_preserve_registration_and_prefixes(){
+    for base in [0,0x800,0x1000]{
+        let (_,before,inventory,relocation,id)=fixture();
+        let old=model(480<<6,2,vec![(0,0),(7,0),(0,7)]);
+        let source=typed_bundle(&[(1,pack(&[tim(0,31)]).unwrap()),(2,pack(&[old.clone()]).unwrap()),(6,vec![0;4]),(7,vec![0;4])],base);
+        assert_eq!(native_descriptor_table(&source).unwrap().0,base);
+        let registered=super::register(&inventory,&source,&before,&relocation,budgets()).unwrap();
+        assert_eq!(&registered.bytes()[..base],&source[..base]);assert_eq!(registered.selector(&id).unwrap(),1);
+        assert_eq!(native_model_pool(registered.bytes(),None)[0].bytes,old);
+    }
+    let records=(0..8).map(|i|(if i==0{2}else if i==7{0x14}else{(i+2) as u8},if i==0{pack(&[model(0,0,vec![(0,0),(1,0),(0,1)])]).unwrap()}else{vec![0;4]})).collect::<Vec<_>>();
+    let source=typed_bundle(&records,0);assert_eq!(table::detect(&source).unwrap().count,8);assert_eq!(native_model_pool(&source,None).len(),1);
+}
+#[test]
+fn raw_palette_upload_words_are_decoded_and_serialized_without_fabricated_colors(){
+    let colors=(0..256u16).flat_map(|v|v.to_le_bytes()).collect::<Vec<_>>();
+    let mut record=vec![0;8];record.extend_from_slice(&524u32.to_le_bytes());for n in [0u16,504,256,1]{record.extend_from_slice(&n.to_le_bytes());}record.extend_from_slice(&colors);
+    let list=pack(&[record]).unwrap();let normalized=native_tim_members(&list).unwrap();let native=legaia_tim::parse_native_upload(&normalized[0]).unwrap();assert_eq!(native.image.data,colors);
+    let mut vram=Vram::new();upload_pack(&list,&mut vram).unwrap();assert_eq!(&vram.as_u16()[504*1024..504*1024+256],&(0..256u16).collect::<Vec<_>>());
+    assert!(native_tim_members(&pack(&[vec![0;40]]).unwrap()).is_err());
+}
+#[test]
+fn bare_tmd_and_streamed_model_carriers_keep_old_ids_and_append_new_models(){
+    let (_,before,inventory,relocation,id)=fixture();let old=model(480<<6,2,vec![(0,0),(7,0),(0,7)]);
+    let source=typed_bundle(&[(1,pack(&[tim(0,31)]).unwrap()),(9,old.clone())],0);
+    let registered=super::register(&inventory,&source,&before,&relocation,budgets()).unwrap();assert_eq!(native_model_pool(registered.bytes(),None)[0].bytes,old);assert_eq!(registered.selector(&id).unwrap(),1);
+    let source=typed_bundle(&[(1,pack(&[tim(0,31)]).unwrap()),(3,vec![0;4]),(6,vec![0;4]),(0x14,vec![0;4])],0);
+    let packed=pack(&[old.clone()]).unwrap();let mut pac=table::encode_size_word(2,packed.len() as u32).to_le_bytes().to_vec();pac.extend_from_slice(&packed);pac.extend_from_slice(&[0;16]);
+    let registered=register_scene(&inventory,&source,Some(&pac),&before,&relocation,budgets()).unwrap();let pool=native_model_pool(registered.bytes(),registered.pac_bytes());assert_eq!(pool.len(),2);assert_eq!(pool[0].bytes,old);assert_eq!(registered.selector(&id).unwrap(),1);
+}
+#[test]
+fn mode_0a_bare_texture_pack_uses_its_native_reader_and_registration(){
+    let (_,before,inventory,relocation,id)=fixture();let old=model(480<<6,2,vec![(0,0),(7,0),(0,7)]);
+    let source=typed_bundle(&[(2,pack(&[old]).unwrap()),(3,vec![0;4]),(6,vec![0;4]),(0x0a,vec![0;4])],0);
+    let pac=pack(&[tim(0,31)]).unwrap();let (_,actual)=native_texture_sequence(&source,Some(&pac),budgets()).unwrap();assert_eq!(crate::app::naming::material_key(&actual),crate::app::naming::material_key(&before));
+    let registered=register_scene(&inventory,&source,Some(&pac),&before,&relocation,budgets()).unwrap();assert_eq!(registered.selector(&id).unwrap(),1);
+    let (_,replay)=native_texture_sequence(registered.bytes(),registered.pac_bytes(),budgets()).unwrap();assert_eq!(crate::app::naming::material_key(&replay),crate::app::naming::material_key(&relocation.apply(&before).unwrap()));
+}
 fn bundle(payloads:&[Vec<u8>])->Vec<u8> {
     let mut out=vec![0;8+payloads.len()*8];out[..4].copy_from_slice(&(payloads.len() as u32).to_le_bytes());out[4..8].copy_from_slice(&(payloads.iter().map(|p|p.len() as u32).sum::<u32>()).to_le_bytes());
     for (i,payload) in payloads.iter().enumerate(){let at=8+i*8;let offset=out.len() as u32;out[at..at+4].copy_from_slice(&table::encode_size_word(i as u8+1,payload.len() as u32).to_le_bytes());out[at+4..at+8].copy_from_slice(&offset.to_le_bytes());out.extend_from_slice(&legaia_lzs::compress(payload));out.extend_from_slice(&[0xde,0xad,i as u8,0xbe]);}out
@@ -35,7 +81,7 @@ fn streamed_pac_registration_preserves_upload_order_flags_and_selectors() {
     let (_,old)=slots_for_scene(&bundle,budgets(),true).unwrap();let (_,new)=slots_for_scene(result.bytes(),budgets(),true).unwrap();
     for i in 1..old.len(){assert_eq!(old[i].stored,new[i].stored);assert_eq!(old[i].decoded,new[i].decoded);}
     let output=result.pac_bytes().unwrap();assert_eq!(&output[..pac.len()-16],&pac[..pac.len()-16]);assert_eq!(&output[output.len()-16..],&pac[pac.len()-16..]);
-    let mut replay=before.clone();pac_uploads(output,&mut replay).unwrap();assert_eq!(super::super::super::naming::material_key(&replay),super::super::super::naming::material_key(&relocation.apply(&before).unwrap()));
+    let mut replay=before.clone();pac_uploads(output,&mut replay).unwrap();assert_eq!(crate::app::naming::material_key(&replay),crate::app::naming::material_key(&relocation.apply(&before).unwrap()));
     let again=register_scene(&inventory,result.bytes(),Some(output),&before,&relocation,budgets()).unwrap();assert_eq!(again.bytes(),result.bytes());assert_eq!(again.pac_bytes(),Some(output));
     assert_eq!(table::mesh_pool(result.bytes())[0].bytes,table::mesh_pool(&bundle)[0].bytes);
     let mut changed=pac.clone();changed[4]^=1;assert!(result.validate_pac_source(&changed).is_err());
@@ -72,7 +118,7 @@ fn streamed_pac_rejects_unresolved_contributors_malformed_chunks_and_limits() {
         assert!(register_scene(&inventory,&bundle,Some(&bad),&before,&relocation,budgets()).is_err());
     }
     assert!(register_scene(&inventory,&bundle,Some(&pac),&before,&relocation,Limits{max_encoded:pac.len(),..budgets()}).is_err());
-    assert_eq!(super::super::super::naming::material_key(&before),super::super::super::naming::material_key(&saved));
+    assert_eq!(crate::app::naming::material_key(&before),crate::app::naming::material_key(&saved));
 }
 #[test]
 fn production_resource_compiler_patches_transactionally_and_preserves_every_other_entry() {
@@ -141,7 +187,7 @@ fn real_town01_pac_packaging_and_native_donor_gates() -> Result<()> {
         let source_tiers=donor.field_floor_height_lut(&lib.index)?.context("Donor native floor ladder missing")?.map(|y|Some(-(y as i32)));
         let destination_tiers=destination.field_floor_height_lut(&lib.index)?.context("Destination native floor ladder missing")?.map(|y|Some(-(y as i32)));
         let delta=[12096.0-placement.world_x as f32,0.0,10048.0-placement.world_z as f32];
-        let candidate=super::super::super::ps1_export::NativeExportPlan::compile_registered_copy(compiled,destination.start as usize,donor.start as usize,(placement.col,placement.row),73,&id,&registered,delta,&source_tiers,&destination_tiers)?;
+        let candidate=super::super::super::ps1_export::NativeExportPlan::compile_registered_copy(compiled,destination.start as usize,donor.start as usize,(placement.col,placement.row),73,&id,&registered,delta,&source_tiers,&destination_tiers,None)?;
         ensure!(candidate.uid==73&&candidate.selector==registered.selector(&id)?&&!candidate.image_bytes().is_empty(),"Combined candidate identity/readback failed");
         println!("{name} native object #{} model {} source cell ({},{}) world ({},{}) floor tier {:?} -> town01: independent descriptor {}, grid {:?}, selector {}, requested world (12096,10048), bundle {} -> {}, PAC {} -> {}; {}",placement.obj_idx,source_selector,placement.col,placement.row,placement.world_x,placement.world_z,placement.floor_nibble,candidate.descriptor,candidate.cell,candidate.selector,bundle.len(),result.bytes().len(),pac.len(),result.pac_bytes().unwrap().len(),candidate.unresolved());examined+=1;
         let assembled_donor=legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,name).map_err(anyhow::Error::msg)?;

@@ -833,6 +833,7 @@ pub struct App {
     /// Background native test-image export; no edits to the currently open image.
     ps1_export_job: Option<Receiver<anyhow::Result<ps1_export::ExportResult>>>,
     ps1_export_output: Option<PathBuf>,
+    ps1_export_imports:Option<ps1_export::ImportCoverage>,
     unrestricted_img_export: bool,
     /// Source being dragged across the panels (no mouse-driven text selection).
     editor_asset_drag: Option<EditorCatalogItem>,
@@ -1028,6 +1029,7 @@ impl App {
             editor_cell_last_autosave: 0.0,
             ps1_export_job: None,
             ps1_export_output: None,
+            ps1_export_imports:None,
             unrestricted_img_export: true,
             editor_asset_drag: None,
             editor_catalog_active: None,
@@ -3005,6 +3007,7 @@ impl App {
                     if ui.button("Open IMG output folder").clicked(){if let Some(parent)=path.parent(){self.show_folder(parent);}}
                     ui.label(format!("IMG output: {}",path.display()));
                 });}
+                if let Some(coverage)=self.ps1_export_imports {if let Some(message)=coverage.failure_message(){ui.colored_label(Color32::from_rgb(255,90,70),egui::RichText::new(message).strong());}}
                 ui.horizontal_wrapped(|ui| {
                     self.native_view.controls(ui, "Sample original PS1 TIM/CLUT atlas from assembled scene VRAM");
                     ui.checkbox(&mut self.native_ground_visible, "Show walk-ground")
@@ -3161,6 +3164,7 @@ impl App {
                                 if let Some(parent)=source.parent() {dialog=dialog.set_directory(parent);}
                                 if let Some(destination)=dialog.save_file() {
                                     self.ps1_export_output=Some(destination.clone());
+                                    self.ps1_export_imports=None;
                                     self.studio.error=None;
                                     let output_message=destination.display().to_string();
                                     let overlay=scene_instances::serialize(&cell_name,world);
@@ -3181,8 +3185,7 @@ impl App {
                                             anyhow::anyhow!("{message}. {debug}")
                                         });
                                         let outcome=match &result {
-                                            Ok(done)=>format!("{}: {}\nPatched: {}\nSkipped: {}",if done.skipped.iter().any(|s|s.starts_with("UNRESTRICTED EXPERIMENT")){"EXPERIMENTAL IMG ATTEMPT WRITTEN — NOT PROVEN COMPLETE"}else{"NATIVE EXPORT SUCCESS"},
-                                                done.path.display(),done.patched.join(" | "),done.skipped.join(" | ")),
+                                            Ok(done)=>format!("{}\nPatched: {}\nSkipped: {}",if done.imports.is_some(){done.experimental_summary()}else{format!("Native IMG file verified: {}",done.path.display())},done.patched.join(" | "),done.skipped.join(" | ")),
                                             Err(error)=>format!("NATIVE EXPORT FAILED: {}: {error:#}",destination.display()),
                                         };
                                         if let Err(error)=export_integration::write_log(&cell_name,&report,&outcome) {
@@ -5710,11 +5713,13 @@ impl eframe::App for App {
                         self.studio.status=None;self.studio.error=Some(format!("IMG completion verification failed: {error:#}"));self.ps1_export_job=None;return;
                     }
                     self.ps1_export_output=Some(result.path.clone());
+                    self.ps1_export_imports=result.imports;
                     self.last_written=result.path.parent().map(Path::to_path_buf);
                     let details=if result.skipped.is_empty(){String::new()}else{format!(" Not updated: {}",result.skipped.join(" | "))};
                     self.studio.status=Some(format!("Native PS1 image saved: {}. Patched: {}.{} In DuckStation: boot THIS IMG (not an old CUE or save state), then reload Rim Elm. Native writes were read back. Original walls/floors and scripts are preserved unless an explicit supported plan changes them; gameplay verification remains required.",result.path.display(),result.patched.join(", "),details));
                     if result.skipped.iter().any(|s|s.starts_with("UNRESTRICTED EXPERIMENT")) {
-                        self.studio.status=Some(format!("EXPERIMENTAL IMG saved: {}. {} native write reports; {} failed requests. NOT PROVEN COMPLETE. {}",result.path.display(),result.patched.len(),result.skipped.len().saturating_sub(1),result.skipped.last().cloned().unwrap_or_default()));
+                        self.studio.status=Some(result.experimental_summary());
+                        self.studio.error=result.imports.and_then(|coverage|coverage.failure_message());
                     }
                     self.ps1_export_job=None;
                 }
