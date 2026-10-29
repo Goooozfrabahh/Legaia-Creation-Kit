@@ -202,7 +202,9 @@ impl WorldModel {
         }
         let source = self.at(source_key.0, source_key.1)
             .ok_or("Source native mesh was not assembled")?;
-        if source.editor_uid.is_some() { return Err("Source must be an original native record".into()); }
+        let foreign=source.editor_uid.and_then(|uid|self.foreign.iter().find(|f|f.uid==uid)).cloned();
+        if source.editor_uid.is_some() && foreign.is_none() { return Err("Source must be an original native record or actual foreign instance".into()); }
+        let donor_vram=self.foreign_vram.get(&source.id).cloned();
         let source_start = source.vertex_start;
         let source_end = source.vertex_end;
         let source_center = source.original_center;
@@ -256,7 +258,15 @@ impl WorldModel {
         });
         self.instances += 1;
         if let Some(owner)=collision_owner {self.collision.duplicate(&owner,uid);}
-        if npc_source.is_none() {
+        if let Some(mut donor)=foreign {
+            let source_uid=donor.uid;donor.uid=uid;self.foreign.push(donor);
+            if let Some(vram)=donor_vram {self.foreign_vram.insert(new_id,vram);}
+            if let Some(source)=self.collision.foreign_sources.get(&source_uid).cloned(){self.collision.foreign_sources.insert(uid,source);}
+            if let Some(mut recipe)=self.collision.mesh_recipes.get(&source_uid).cloned(){recipe.uid=uid;self.collision.mesh_recipes.insert(uid,recipe);}
+            if let Some(name)=self.naming.foreign.get(&source_uid).cloned(){self.naming.foreign.insert(uid,name);}
+            if let Some(name)=self.naming.foreign_legacy.get(&source_uid).cloned(){self.naming.foreign_legacy.insert(uid,name);}
+            self.draws.last_mut().unwrap().source_ref=Some((false,usize::MAX));
+        }else if npc_source.is_none() {
             if let Err(error)=self.ensure_automatic_collision((false,new_index)) {
                 self.delete_created((false,new_index))?;
                 return Err(error);

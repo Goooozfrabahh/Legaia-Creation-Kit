@@ -114,7 +114,8 @@ pub(super) fn duplicate(world:&mut WorldModel, selected:&BTreeSet<Key>, first_cr
         let d=world.at(key.0,key.1).ok_or("Selected object unavailable")?;
         if d.hidden||d.vertex_start>=d.vertex_end {return Err("Selected object has no visible geometry to duplicate".into());}
         uid=uid.checked_add(1).ok_or("No remaining instance UIDs")?;
-        let source=d.source_ref.unwrap_or(key);
+        let foreign=d.editor_uid.is_some_and(|uid|world.foreign.iter().any(|f|f.uid==uid));
+        let source=if foreign {key}else{d.source_ref.unwrap_or(key)};
         let mut offset=d.offset;offset[0]+=128.0;
         let next=staged.duplicate_native(source,first_created,uid,offset)?;
         if world.collision.source(world,key).is_some() {staged.inherit_collision_recipe(key,next)?;}
@@ -308,5 +309,27 @@ mod tests {
         let before=scene_instances::serialize("test",&world);
         assert!(duplicate(&mut world,&BTreeSet::from([(false,0),(false,999)]),1).is_err());
         assert_eq!(before,scene_instances::serialize("test",&world));
+    }
+
+    #[test]
+    fn foreign_duplication_uses_selected_instance_and_keeps_donor_materials_and_collision(){
+        use std::sync::Arc;
+        let mut w=super::super::collision_recipes::properties_fixture();
+        let key=(false,1);let uid=w.at(false,1).unwrap().editor_uid.unwrap();
+        w.draws.iter_mut().find(|d|(d.terrain,d.index)==key).unwrap().source_ref=Some((false,usize::MAX));
+        let raw=vec![1,2,3,4];w.foreign.push(super::super::world_view::ForeignRef{uid,source:"conc".into(),kind:"placement".into(),record:19,raw_tmd:raw.clone(),native_record:Some([9;32]),donor_wall_bits:vec![(2,3)],donor_center:[5.,6.,7.]});
+        let texture=Arc::new(legaia_tim::Vram::new());let id=w.at(false,1).unwrap().id;w.foreign_vram.insert(id,texture.clone());
+        let provenance=w.collision.sources[&(false,0)].clone();w.collision.foreign_sources.insert(uid,provenance.clone());
+        w.set_rotation(false,1,[0.1,0.2,0.3]);w.set_scale(false,1,[2.,1.,0.5]);
+        let old=scene_instances::serialize("test",&w);
+        let next=duplicate(&mut w,&BTreeSet::from([key]),2).unwrap()[0];
+        let copy=w.at(next.0,next.1).unwrap();let copy_uid=copy.editor_uid.unwrap();
+        assert_ne!(uid,copy_uid);assert!(Arc::ptr_eq(&w.foreign_vram[&copy.id],&texture));
+        assert_eq!(copy.rotation,[0.1,0.2,0.3]);assert_eq!(copy.scale,[2.,1.,0.5]);
+        let donor=w.foreign.iter().find(|f|f.uid==copy_uid).unwrap();assert_eq!(donor.raw_tmd,raw);assert_eq!(donor.native_record,Some([9;32]));assert_eq!(donor.donor_wall_bits,vec![(2,3)]);
+        assert_eq!(w.collision.foreign_sources[&copy_uid],provenance);
+        let text=scene_instances::serialize("test",&w);assert!(text.contains(&format!("FOREIGN\t{copy_uid}\t")));assert!(!text.contains(&format!("INSTANCE\t{copy_uid}\t")));
+        assert_ne!(old,text);let twice=duplicate(&mut w,&BTreeSet::from([next]),2).unwrap();assert_eq!(twice.len(),1);
+        assert_eq!(w.foreign.len(),3);
     }
 }

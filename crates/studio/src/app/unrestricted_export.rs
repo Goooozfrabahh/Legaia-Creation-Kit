@@ -11,6 +11,13 @@ pub(in crate::app) fn warn_check(message:String)->bool {
     if active(){note(format!("CHECK BYPASSED: {message}"));true}else{false}
 }
 fn note(message:String){WARNINGS.with(|w|w.borrow_mut().push(message));}
+pub(super) fn diagnostic(message:String){note(message);}
+
+pub(in crate::app) fn failure_log(output:&Path,manifest:&str,error:&str)->Result<PathBuf>{
+    let parent=output.parent().context("No output parent")?;let stamp=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+    let dir=parent.join(format!("{}_failed_export_{stamp}",output.file_stem().and_then(|s|s.to_str()).unwrap_or("IMG")));std::fs::create_dir(&dir)?;
+    let path=dir.join("debug.txt");std::fs::write(&path,format!("OUTPUT FAILED: {}\n{error}\nFull requested manifest:\n{manifest}\nNo successful output claim. Existing file, if any, is not this completed export.\n",output.display()))?;Ok(path)
+}
 struct Scope(bool);
 impl Drop for Scope {fn drop(&mut self){ACTIVE.with(|v|v.set(self.0));}}
 fn scope()->Scope{Scope(ACTIVE.with(|v|v.replace(true)))}
@@ -26,7 +33,8 @@ fn attempt<T>(label:&str,log:&mut Vec<String>,f:impl FnOnce()->Result<T>)->Optio
 }
 fn integer(value:f32)->Result<i32>{
     anyhow::ensure!(value.is_finite() && value.abs()<i32::MAX as f32,"Non-finite/out-of-range native coordinate");
-    anyhow::ensure!((value-value.round()).abs()<=EPS,"Native MAP coordinate is i16 integer; requested fractional coordinate {value} has no exact encoding in this writer");Ok(value.round() as i32)
+    let encoded=value.round() as i32;
+    note(format!("NATIVE PRECISION coordinate: requested {value}; encoded {encoded}; error {} PS1 units",encoded as f32-value));Ok(encoded)
 }
 fn grid(cell:(u8,u8))->usize {GRID_OFF+(cell.1 as usize*128+cell.0 as usize)*2}
 fn id_at(map:&[u8],cell:(u8,u8))->Result<usize>{
@@ -86,7 +94,7 @@ fn yaw(map:&mut [u8],cell:(u8,u8),rotation:[f32;3],center:[f32;3])->Result<()> {
     let id=detach(map,cell)?;let mut raw=record(map,id)?;let old=ObjectRecord::parse(&raw,0).unwrap();
     anyhow::ensure!(rotation[0].abs()<0.00001&&rotation[2].abs()<0.00001&&old.rot_x&4095==0&&old.rot_z&4095==0,"Available native transform writer cannot compose pitch/roll/tilted matrices; writer missing, not a claimed PS1 engine limit");
     let angle=rotation[1] as f64/std::f64::consts::TAU*4096.;
-    anyhow::ensure!((angle-angle.round()).abs()<0.001,"Requested yaw {angle} PSX ticks cannot be encoded exactly as the native integer angle by the available writer");
+    note(format!("NATIVE PRECISION yaw: requested {} radians ({angle} ticks); encoded {} ticks ({} radians)",rotation[1],angle.round(),angle.round()*std::f64::consts::TAU/4096.));
     let pos=[field_objects::world_x(cell.0,old.x_off) as f32,0.,field_objects::world_z(cell.1,old.z_off) as f32];
     let transformed=world_view::editor_rotate_vertex(pos,[center[0],0.,center[2]],[0.;3],rotation,[1.;3]);
     let x=i16::try_from(integer(transformed[0])?-(cell.0 as i32*128+64))?;let z=i16::try_from(cell.1 as i32*128+64-integer(transformed[2])?)?;
@@ -123,15 +131,21 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
     for foreign in &doc.foreign {
         let label=format!("IMPORT UID {} from {} {} #{}",foreign.uid,foreign.source,foreign.kind,foreign.record);
         if let Some(candidate)=attempt(&label,log,||{
-            anyhow::ensure!(foreign.kind=="placement","Existing native import writer has no {} descriptor/actor adapter; no different source object substituted",foreign.kind);
+            anyhow::ensure!(matches!(foreign.kind.as_str(),"placement"|"terrain"),"Existing native import writer has no {} descriptor/actor adapter; no different source object substituted",foreign.kind);
             let mut isolated=world.clone();
             isolated.draws.retain(|d|d.editor_uid.is_none()||d.editor_uid==Some(foreign.uid));
             for d in &mut isolated.draws{d.hidden=false;d.offset=[0.;3];d.rotation=[0.;3];d.scale=[1.;3];}
             if let Some(d)=isolated.draws.iter_mut().find(|d|d.editor_uid==Some(foreign.uid)){d.original_center=foreign.center;d.center=foreign.center;}
             isolated.foreign.retain(|f|f.uid==foreign.uid);isolated.collision.recipes.clear();isolated.collision.mesh_recipes.clear();
             NativeExportPlan::compile_saved_imports(DiscPatcher::open(disc.image().to_vec())?,scene,&isolated,index,
-                super::super::native_asset_plan::scene_registration::Limits{max_models:65532,max_decoded:usize::MAX,max_encoded:usize::MAX},&[])
-        }){for &(uid,_,cell,_) in &candidate.placements{imported_targets.insert(scene_instances::NameTarget::Created(uid),cell);}
+                super::super::native_asset_plan::scene_registration::Limits{max_models:u16::MAX as usize-field_objects::FIELD_ACTOR_PACK_BIAS as usize,max_decoded:usize::MAX,max_encoded:usize::MAX},&[])
+        }){for &(uid,descriptor,cell,selector) in &candidate.placements{imported_targets.insert(scene_instances::NameTarget::Created(uid),cell);
+                log.push(format!("WRITTEN {label}: MAP PROT {entry}, descriptor {descriptor} at {:#x}, grid {cell:?} at {:#x}, TMD selector {selector}",descriptor*32,grid(cell)));}
+            for idx in [entry+3,entry+4] {
+                if let (Ok(before),Ok(after))=(disc.read_entry_footprint(idx),candidate.disc.read_entry_footprint(idx)) {
+                    if before!=after {log.push(format!("WRITTEN {label}: RESOURCE PROT {idx}, {} -> {} bytes, SHA256 {}",before.len(),after.len(),super::super::collision_recipes::digest(&after)));}
+                }
+            }
             *disc=candidate.disc;log.push(format!("WRITTEN {label}: resource registration and native reference committed to IMG buffer"));}
     }
     let Some(original)=attempt("read native MAP",log,||disc.read_entry_footprint(entry)) else{return};let mut map=original.clone();
@@ -190,8 +204,9 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
             // permission gates. Explicit open-space edits can clear native walls.
             let recipe=&assignment.recipe;
             let mut walls=if let Some(g)=&recipe.generated {g.wall_cells(draw.offset,draw.rotation,draw.scale).map_err(anyhow::Error::msg)?}else{Default::default()};
-            let dx=integer(draw.offset[0])?;let dz=integer(draw.offset[2])?;
-            anyhow::ensure!(dx%64==0&&dz%64==0,"Manual collision cells require exact 64-unit grid translation; writer cannot encode fractional wall cells");
+            let (dx,dz)=if recipe.walls.is_empty()&&recipe.nonblocking.is_empty(){(0,0)}else{
+                let dx=integer(draw.offset[0])?;let dz=integer(draw.offset[2])?;
+                anyhow::ensure!(dx%64==0&&dz%64==0,"Manual collision cells require exact 64-unit grid translation; writer cannot encode fractional wall cells");(dx,dz)};
             for &[x,z] in &recipe.walls {walls.insert([x+dx/64,z+dz/64]);}
             for (cells,blocked) in [(&recipe.nonblocking,false),(&walls.iter().copied().collect::<Vec<_>>(),true)] {
                 for &[x,z] in cells {let (x,z)=if blocked {(x,z)}else{(x+dx/64,z+dz/64)};
@@ -206,6 +221,9 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
     }
     for recipe in &doc.mesh_collision {log.push(format!("FAILED MESH COLLISION: available writer cannot encode mesh-only collision request {recipe:?}"));}
     if map!=original {
+        for id in 0..512 {let at=id*32;if map[at..at+32]!=original[at..at+32]{
+            log.push(format!("ENCODED MAP PROT {entry} descriptor {id} at {at:#x}: before {:02x?}; after {:02x?}",&original[at..at+32],&map[at..at+32]));
+        }}
         if attempt("publish MAP fields to native IMG sectors",log,||disc.patch_prot_entry(entry,0,&map)).is_some(){
             log.push("WRITTEN MAP: all successful MAP operation attempts above committed together to IMG buffer; failed operations were rolled back individually".into());
         }else{log.push("FAILED MAP COMMIT: successful MAP encodings above did not reach IMG; imports/MAN writes are independent".into());}
@@ -240,6 +258,7 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
 }
 fn npc_attempt(disc:&mut DiscPatcher,entry:usize,npc:&world_view::NpcInfo,uid:Option<u64>,delta:[f32;3],log:&mut Vec<String>){
     let label=format!("MAN actor {} copy {uid:?} delta {delta:?}",npc.record);
+    if delta[1].abs()>EPS {log.push(format!("FAILED {label} Y component: existing MAN spawn writer has no elevation field; Y request {0} is not serialized",delta[1]));}
     if let Some(plan)=attempt(&label,log,||{
         let edit=NpcEdit{uid,record:npc.record,source_position:(npc.psx_position[0].round() as i32,npc.psx_position[2].round() as i32),original_model:npc.original_model_index,original_anim:npc.anim_id,model:npc.model_index,anim:npc.clip,delta,kind:npc.kind};
         let plan=compile_plan(PathBuf::new(),DiscPatcher::open(disc.image().to_vec())?,disc.image().len(),entry,&ExportEdits{npcs:vec![edit],..Default::default()})?;
@@ -257,12 +276,18 @@ pub(super) fn publish(plan:NativeExportPlan,output:&Path)->Result<ExportResult>{
     std::fs::create_dir(&logs)?;let debug=logs.join("debug.txt");
     let mut report=plan.unrestricted_log.clone().unwrap_or_default();report.push_str(&format!("\nOutput requested: {}\n",output.display()));
     std::fs::write(&debug,&report)?;
+    let expected_hash=super::super::collision_recipes::digest(&plan.image);
     let result=(||->Result<()>{
         let staging=logs.join("output.lckbuilding");let mut file=std::fs::OpenOptions::new().write(true).create_new(true).open(&staging)?;
         file.write_all(&plan.image)?;file.sync_all()?;drop(file);
-        std::fs::hard_link(&staging,&output).context("Create experimental IMG without replacement")?;std::fs::remove_file(staging)?;Ok(())})();
+        std::fs::hard_link(&staging,&output).context("Create experimental IMG without replacement")?;std::fs::remove_file(staging)?;
+        verify_output_file(&output,Some(plan.image.len() as u64))?;
+        use sha2::Digest;use std::io::Read;
+        let mut input=std::fs::File::open(&output)?;let mut hash=sha2::Sha256::new();let mut buffer=[0u8;65536];
+        loop {let n=input.read(&mut buffer)?;if n==0{break;}hash.update(&buffer[..n]);}
+        anyhow::ensure!(format!("{:x}",hash.finalize())==expected_hash,"Output IMG readback hash mismatch: {}",output.display());Ok(())})();
     match result {Ok(())=>report.push_str("OUTPUT WRITTEN. Experimental native writes only; partial/dependency failures above remain unresolved.\n"),Err(e)=>{report.push_str(&format!("OUTPUT FAILED: {e:#}\n"));std::fs::write(&debug,report)?;return Err(e);}}
-    report.push_str(&format!("Output SHA256: {}\n",super::super::collision_recipes::digest(&plan.image)));std::fs::write(&debug,report)?;
+    report.push_str(&format!("OUTPUT FILE VERIFIED: {} ({} bytes; disk readback matches intended IMG)\nOutput SHA256: {expected_hash}\n",output.display(),plan.image.len()));std::fs::write(&debug,report)?;
     let mut skipped=plan.skipped;skipped.push(format!("UNRESTRICTED EXPERIMENT — NOT PROVEN COMPLETE. Full debug.txt: {}",debug.display()));
     Ok(ExportResult{path:output,patched:plan.patched,skipped})
 }
@@ -270,6 +295,45 @@ pub(super) fn publish(plan:NativeExportPlan,output:&Path)->Result<ExportResult>{
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn output_verification_rejects_missing_empty_and_truncated_files()->Result<()>{
+        let dir=tempfile::tempdir()?;let path=dir.path().join("output.img");
+        assert!(verify_output_file(&path,None).is_err());std::fs::write(&path,[])?;assert!(verify_output_file(&path,None).is_err());
+        std::fs::write(&path,vec![0;2352])?;assert!(verify_output_file(&path,Some(4704)).is_err());assert_eq!(verify_output_file(&path,Some(2352))?,2352);Ok(())
+    }
+    #[test]
+    #[ignore="replay a user-authored foreign export log; never generate an arranged scene"]
+    fn replay_user_foreign_export()->Result<()>{
+        let source=PathBuf::from(std::env::var_os("LCK_FOREIGN_SOURCE").context("Source required")?);
+        let text=std::fs::read_to_string(std::env::var_os("LCK_FOREIGN_LOG").context("User export log required")?)?;
+        let start=text.find("LCK_SCENE_V1\t").context("Manifest missing")?;
+        let manifest=text[start..].lines().take_while(|l|!l.is_empty()).collect::<Vec<_>>().join("\n");
+        let library=crate::library::Library::open(&source)?;
+        let scene=legaia_engine_world_views::scene_staging::assemble_field_scene(&library.index,"town01").map_err(anyhow::Error::msg)?;
+        let mut world=world_view::build_world(&scene,&library.index);
+        let doc=scene_instances::parse(&manifest,"town01",&world).map_err(anyhow::Error::msg)?;
+        scene_instances::apply(&doc,&mut world,scene.placements.len(),&library.index).map_err(anyhow::Error::msg)?;
+        let editor_before=scene_instances::serialize("town01",&world);
+        let plan=prepare(&source,&scene,&world,&library.index)?;
+        anyhow::ensure!(scene_instances::serialize("town01",&world)==editor_before,"Export modified editor transforms");
+        println!("{}",plan.unrestricted_log.as_deref().unwrap_or("NO LOG"));
+        anyhow::ensure!(plan.skipped.is_empty(),"Native writer failures remain: {:?}",plan.skipped);
+        let before_map=Scene::load(&library.index,"town01")?.field_map_index(&library.index).context("No MAP")? as usize;
+        let planned=DiscPatcher::open(plan.image.clone())?;
+        let intended_map=planned.read_entry_footprint(before_map)?;
+        let original_map=DiscPatcher::open(std::fs::read(&source)?)?.read_entry_footprint(before_map)?;
+        let new_cells=(0..128).flat_map(|z|(0..128).map(move |x|(x as u8,z as u8))).filter(|&cell|id_at(&original_map,cell).ok()!=id_at(&intended_map,cell).ok()).collect::<Vec<_>>();
+        anyhow::ensure!(new_cells.len()==doc.foreign.len(),"Foreign requests not all independently allocated");
+        if let Some(output)=std::env::var_os("LCK_FOREIGN_OUTPUT"){
+            let done=super::super::export(plan,Path::new(&output))?;
+            let read=DiscPatcher::open(std::fs::read(&done.path)?)?;anyhow::ensure!(read.read_entry_footprint(before_map)?==intended_map,"On-disk MAP differs");
+            let reopened=crate::library::Library::open(&done.path)?;
+            let assembled=legaia_engine_world_views::scene_staging::assemble_field_scene(&reopened.index,"town01").map_err(anyhow::Error::msg)?;
+            for cell in new_cells {let draw=assembled.placements.iter().chain(&assembled.terrain).find(|p|p.cell==cell).context("New native instance missing after reopening IMG")?;anyhow::ensure!(assembled.res.tmds.get(draw.res_tmd).is_some(),"Imported TMD missing after reopening");}
+            println!("Verified output {}; native scene reparsed and all foreign instances/resources resolved. Gameplay NOT VERIFIED",done.path.display());
+        }
+        Ok(())
+    }
     fn map()->Vec<u8>{
         let mut m=vec![0;0x12000];
         m[32..34].copy_from_slice(&10i16.to_le_bytes());
@@ -298,11 +362,13 @@ mod tests {
         assert_eq!(id_at(&moved,(34,34))?,1);Ok(())
     }
     #[test]
-    fn unsupported_encoder_failure_keeps_other_attempts_and_never_reports_written(){
+    fn native_precision_is_logged_and_encoding_failures_never_report_written(){
         let mut log=Vec::new();let mut m=map();
-        assert!(attempt("fractional coordinate",&mut log,||translate_record(&mut m,(34,34),[0.5,0.,0.])).is_none());
+        assert!(attempt("unrepresentable coordinate",&mut log,||translate_record(&mut m,(34,34),[1e9,0.,0.])).is_none());
+        assert!(attempt("fractional coordinate",&mut log,||translate_record(&mut m,(34,34),[0.5,0.,0.])).is_some());
         assert!(attempt("exact coordinate",&mut log,||translate_record(&mut m,(34,34),[64.,0.,0.])).is_some());
-        assert!(log.iter().any(|s|s.starts_with("FAILED fractional coordinate")));
+        assert!(log.iter().any(|s|s.starts_with("FAILED unrepresentable coordinate")));
+        assert!(log.iter().any(|s|s.contains("NATIVE PRECISION coordinate: requested 0.5; encoded 1")));
         assert!(log.iter().any(|s|s.starts_with("ENCODED/RESOLVED exact coordinate")));
         assert!(!log.iter().any(|s|s.starts_with("WRITTEN")));
     }

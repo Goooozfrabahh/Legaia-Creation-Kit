@@ -625,6 +625,10 @@ fn prepare_with_mode(scene: &AssembledScene, world: &WorldModel, mode: Preparati
 }
 
 fn quantize(value:f32, name:&str) -> Result<i32> {
+    if unrestricted::active(){
+        anyhow::ensure!(value.is_finite()&&value.abs()<i32::MAX as f32,"Non-finite/out-of-range {name} coordinate");
+        let encoded=value.round() as i32;unrestricted::diagnostic(format!("NATIVE PRECISION {name}: requested {value}; encoded {encoded} PS1 units"));return Ok(encoded);
+    }
     export_check!(value.is_finite() && value.abs()<=16384.0,"{name} movement out of test limits (+/-16384 native units)");
     let v = value.round();
     export_check!((v-value).abs()<=EPS,"{name} movement must be a whole PS1 world unit; use grid mode or an integer inspector offset");
@@ -1405,6 +1409,13 @@ pub(super) struct NativeExportPlan {
     unrestricted_log:Option<String>,
 }
 
+pub(super) fn verify_output_file(path:&Path,expected:Option<u64>)->Result<u64>{
+    let meta=std::fs::metadata(path).with_context(||format!("Output IMG does not exist: {}",path.display()))?;
+    anyhow::ensure!(meta.is_file()&&meta.len()>0&&meta.len()%2352==0,"Output is not a nonempty raw IMG: {} ({} bytes)",path.display(),meta.len());
+    if let Some(size)=expected {anyhow::ensure!(meta.len()==size,"Output length mismatch: {}: expected {size}, found {}",path.display(),meta.len());}
+    Ok(meta.len())
+}
+
 /// Serialized resource+placement candidate, deliberately NOT an exportable
 /// NativeExportPlan. Collision/surface and runtime acceptance remain mandatory.
 pub(in crate::app) struct NativeImportCandidate {
@@ -1506,15 +1517,16 @@ impl NativeExportPlan {
         let mut boot=legaia_tim::Vram::new();index.system_ui_bundle()?.upload_boot_resident_to_vram(&mut boot);planner.reserve_written(&boot);
         if let Some(observed)=observations {planner.reserve_observations(observed)?;}
         for foreign in foreign {
-            export_check!(foreign.kind=="placement","Foreign UID {} category {} requires a native actor/terrain/behavior writer",foreign.uid,foreign.kind);
+            export_check!(foreign.kind=="placement" || (unrestricted::active()&&foreign.kind=="terrain"),"Foreign UID {} category {} requires a native actor/terrain/behavior writer",foreign.uid,foreign.kind);
             let cached=world.foreign.iter().find(|f|f.uid==foreign.uid).context("Persisted foreign UID has no provenance")?;
             export_check!(cached.source==foreign.source&&cached.kind==foreign.kind&&cached.record==foreign.record,"Foreign provenance identity mismatch");
             let native=Scene::load(index,&foreign.source)?;
             let assembled=legaia_engine_world_views::scene_staging::assemble_field_scene(index,&foreign.source).map_err(anyhow::Error::msg)?;
-            let placed=assembled.placements.get(foreign.record).context("Persisted donor placement missing")?;
+            let terrain=foreign.kind=="terrain";
+            let placed=if terrain {assembled.terrain.get(foreign.record)}else{assembled.placements.get(foreign.record)}.context("Persisted donor native MAP draw missing")?;
             let donor_map=native.field_map_index(index).context("No donor native MAP")? as usize;
             let source_map=index.entry_bytes(donor_map as u32)?;
-            let (record_id,_)=record_at(&source_map,placed.cell,(placed.world_x,placed.world_z),placed.env_slot,[placed.rot_x,placed.rot_y,placed.rot_z])?;
+            let (record_id,_)=record_at_kind(&source_map,placed.cell,(placed.world_x,placed.world_z),placed.env_slot,[placed.rot_x,placed.rot_y,placed.rot_z],terrain)?;
             export_check!(cached.native_record.as_ref().is_some_and(|r|source_map[record_id*32..record_id*32+32]==r[..]),"Saved donor descriptor provenance changed or unresolved");
             let source_bundle=index.entry_bytes((donor_map+3) as u32)?;
             let source_pac=if scene_asset_table::streams_scene_pac(&source_bundle){Some(index.entry_bytes((donor_map+4) as u32)?)}else{None};
@@ -1526,6 +1538,7 @@ impl NativeExportPlan {
                 events.push(Upload{sequence:Some(i as u32),resource:texture,image:true,clut:tim.clut.is_some(),merge_clut_zeros:false});}
             let trace=UploadTrace::verify_native_replay(&inventory,&events,&expected,"Native descriptor/PAC dispatch order; passive CLUT walker; uploader FUN_800198E0")?;
             let relocation=planner.plan_multi(&inventory,&trace,&[id.clone()])?;
+            if unrestricted::active(){for resource in relocation.resource_diagnostics(){unrestricted::diagnostic(format!("RESOURCE ENCODED for UID {}: {resource}",foreign.uid));}}
             let (compiled,registration)=Self::compile_scene_resources(&staged,map_entry,&inventory,&before,&relocation,limits)?;
             let source_tiers=native.field_floor_height_lut(index)?.context("Donor native floor ladder unresolved")?.map(|y|Some(-(y as i32)));
             let delta=[0,1,2].map(|axis|foreign.center[axis]-cached.donor_center[axis]);
@@ -1557,7 +1570,7 @@ impl NativeExportPlan {
         let grid=GRID_OFF+(source_cell.1 as usize*GRID_DIM+source_cell.0 as usize)*2;
         let source_id=(u16::from_le_bytes(donor[grid..grid+2].try_into()?)&511) as usize;
         let record=ObjectRecord::parse(&donor,source_id).context("Donor record missing")?;
-        let pack_index=field_objects::pack_mesh_index(source_id as u16,&record).context("Donor is not a static MAP model")?;
+        let pack_index=if unrestricted::active()&&!record.is_placed(){record.pack_index_field}else{field_objects::pack_mesh_index(source_id as u16,&record).context("Donor is not a static MAP model")?};
         let donor_bundle=disc.read_entry_footprint(donor_map_entry.checked_add(3).context("Donor bundle overflow")?)?;
         // This supported route has its source models in the descriptor bundle.
         // PAC model contributors need a separate complete selector mapping.
@@ -1880,6 +1893,7 @@ pub(super) fn export(plan:NativeExportPlan, output:&Path) -> Result<ExportResult
     // between preflight and finalization. Never overwrite an existing IMG.
     std::fs::hard_link(&staging,&output_abs).context("Publish new native IMG without replacement")?;
     std::fs::remove_file(&staging).context("Remove own staging link")?;
+    verify_output_file(&output_abs,Some(written.len() as u64))?;
     log::info!("LCK native PS1 Rim Elm export: {}",names.join(", "));
     for entry in &skipped {log::warn!("{entry}");}
     Ok(ExportResult{path:output_abs,patched:names,skipped})

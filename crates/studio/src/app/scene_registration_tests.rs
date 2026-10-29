@@ -40,6 +40,18 @@ fn streamed_pac_registration_preserves_upload_order_flags_and_selectors() {
     assert_eq!(table::mesh_pool(result.bytes())[0].bytes,table::mesh_pool(&bundle)[0].bytes);
     let mut changed=pac.clone();changed[4]^=1;assert!(result.validate_pac_source(&changed).is_err());
 }
+
+#[test]
+fn streamed_flag_size_is_not_a_payload_extent_and_survives_repacking(){
+    let (mut bundle,pac,before,inventory,relocation,id)=streamed_fixture();
+    let table=table::detect(&bundle).unwrap();let i=table.descriptor_index(0x14).unwrap();let old=table.used()[i].size;
+    let declared=1927u32;bundle[8+i*8..12+i*8].copy_from_slice(&table::encode_size_word(0x14,declared).to_le_bytes());
+    let total=u32::from_le_bytes(bundle[4..8].try_into().unwrap())-old+declared;bundle[4..8].copy_from_slice(&total.to_le_bytes());
+    let (_,slots)=slots_for_scene(&bundle,budgets(),true).unwrap();assert!(slots[i].stored.len()<declared as usize);
+    let registered=register_scene(&inventory,&bundle,Some(&pac),&before,&relocation,budgets()).unwrap();
+    let read=table::detect(registered.bytes()).unwrap();assert_eq!(read.used()[i].size,declared);assert_eq!(registered.selector(&id).unwrap(),1);
+    let (_,after)=slots_for_scene(registered.bytes(),budgets(),true).unwrap();assert_eq!(after[i].stored,slots[i].stored);
+}
 #[test]
 fn streamed_pac_rejects_unresolved_contributors_malformed_chunks_and_limits() {
     let (bundle,pac,before,inventory,relocation,_)=streamed_fixture();let saved=before.clone();

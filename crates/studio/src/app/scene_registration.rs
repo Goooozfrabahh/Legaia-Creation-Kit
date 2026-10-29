@@ -76,7 +76,7 @@ impl SceneRegistration {
         export_check!(field_objects::pack_mesh_index(4,&parsed)==Some(selector),"MAP selector readback mismatch");Ok(out)
     }
 }
-struct Slot {kind:u8,decoded:Vec<u8>,stored:Vec<u8>,suffix:Vec<u8>}
+struct Slot {kind:u8,decoded:Vec<u8>,stored:Vec<u8>,suffix:Vec<u8>,declared_size:u32}
 fn slots(source:&[u8],limits:Limits)->Result<(table::SceneAssetTable,Vec<Slot>)> {
     slots_for_scene(source,limits,false)
 }
@@ -93,14 +93,14 @@ fn slots_for_scene(source:&[u8],limits:Limits,streamed:bool)->Result<(table::Sce
         export_check!(start>=8+table.count*8 && start<end && end<=source.len() && d.size>0,"Invalid native payload boundaries");
         let stored=&source[start..end];
         // Flag(0x14) returns the loader mode; its bytes are not LZS data.
-        // Preserve its declared size, opaque payload and padding verbatim.
+        // Its size word is NOT a readable byte extent. Preserve the opaque
+        // stored range and declared word independently (e.g. Conkram).
         let (decoded,consumed)=if d.type_byte==0x14 {
-            export_check!(d.size as usize<=stored.len(),"Flag payload exceeds native extent");
-            (stored[..d.size as usize].to_vec(),d.size as usize)
+            (stored.to_vec(),stored.len())
         }else{legaia_lzs::decompress_tracked(stored,d.size as usize)?};
-        export_check!(decoded.len()==d.size as usize && consumed<=stored.len(),"Invalid compressed payload extent");
+        export_check!(d.type_byte==0x14 || (decoded.len()==d.size as usize && consumed<=stored.len()),"Invalid compressed payload extent");
         if d.type_byte==6 {export_check!(decoded==[0,0,0,0],"Active native CLUT walker requires destination runtime-write closure");}
-        out.push(Slot{kind:d.type_byte,decoded,stored:stored.to_vec(),suffix:stored[consumed..].to_vec()});
+        out.push(Slot{kind:d.type_byte,decoded,stored:stored.to_vec(),suffix:stored[consumed..].to_vec(),declared_size:d.size});
     }
     export_check!(kinds.contains(&2) && if streamed{kinds.contains(&0x14)}else{kinds.contains(&1)},"Bundle needs existing TMD-pack and native texture route");Ok((table,out))
 }
@@ -222,12 +222,12 @@ pub(in crate::app) fn register_scene(inventory:&NativeAssetPlan,source:&[u8],pac
     export_check!(super::super::naming::material_key(&replay)==super::super::naming::material_key(&relocation.apply(before)?),"Destination native TIM-list replay differs from relocated package; upload policy unresolved");
     decoded[mi].decoded=pack(&models)?;
     if let Some(ti)=ti {export_check!(decoded[ti].decoded.len()<=TIM_LIST_BUFFER,"Native TIM-list buffer capacity exhausted");}
-    let total=decoded.iter().try_fold(0usize,|n,s|n.checked_add(s.decoded.len()).context("Decoded size overflow"))?;
+    let total=decoded.iter().try_fold(0usize,|n,s|n.checked_add(if s.kind==0x14{s.declared_size as usize}else{s.decoded.len()}).context("Decoded size overflow"))?;
     export_check!(total<=limits.max_decoded && total<=u32::MAX as usize,"Native decoded memory budget exceeded");
     let mut output=source[..8+header.count*8].to_vec();output[4..8].copy_from_slice(&(total as u32).to_le_bytes());
     for (i,slot) in decoded.iter().enumerate() {
         export_check!(slot.decoded.len()<=0xffffff && output.len()<=u32::MAX as usize,"Native descriptor width exceeded");
-        let at=8+i*8;let offset=output.len() as u32;output[at..at+4].copy_from_slice(&table::encode_size_word(slot.kind,slot.decoded.len() as u32).to_le_bytes());output[at+4..at+8].copy_from_slice(&offset.to_le_bytes());
+        let at=8+i*8;let offset=output.len() as u32;output[at..at+4].copy_from_slice(&table::encode_size_word(slot.kind,if slot.kind==0x14{slot.declared_size}else{slot.decoded.len() as u32}).to_le_bytes());output[at+4..at+8].copy_from_slice(&offset.to_le_bytes());
         if (pac.is_none()&&Some(i)==ti)||i==mi {let compressed=legaia_disc_patch::compress_within(&slot.decoded,limits.max_encoded).context("Native compressed payload budget exceeded")?;output.extend_from_slice(&compressed);output.extend_from_slice(&slot.suffix);}
         else{output.extend_from_slice(&slot.stored);}
     }

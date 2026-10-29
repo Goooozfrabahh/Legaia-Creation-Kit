@@ -81,6 +81,10 @@ pub(in crate::app) struct MultiPlan {
     source_vram:String,output:Vram,pub evidence:String,
 }
 impl MultiPlan {
+    pub(in crate::app) fn resource_diagnostics(&self)->Vec<String>{
+        self.uploads.iter().map(|u|format!("TIM {:?} -> native VRAM {:?}, {} bytes",u.source,u.rect,u.bytes.len()))
+            .chain(self.tmds.iter().map(|(id,bytes)|format!("TMD {id:?} relocated SHA256 {} ({} bytes)",super::super::digest(bytes),bytes.len()))).collect()
+    }
     pub(in crate::app::native_asset_plan) fn source_resources(&self)->BTreeSet<ResourceId> {
         self.uploads.iter().map(|u|u.source.clone()).chain(self.tmds.keys().cloned()).collect()
     }

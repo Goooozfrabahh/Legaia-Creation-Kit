@@ -832,6 +832,7 @@ pub struct App {
     editor_cell_last_autosave: f64,
     /// Background native test-image export; no edits to the currently open image.
     ps1_export_job: Option<Receiver<anyhow::Result<ps1_export::ExportResult>>>,
+    ps1_export_output: Option<PathBuf>,
     unrestricted_img_export: bool,
     /// Source being dragged across the panels (no mouse-driven text selection).
     editor_asset_drag: Option<EditorCatalogItem>,
@@ -1026,6 +1027,7 @@ impl App {
             editor_cell_properties: None,
             editor_cell_last_autosave: 0.0,
             ps1_export_job: None,
+            ps1_export_output: None,
             unrestricted_img_export: true,
             editor_asset_drag: None,
             editor_catalog_active: None,
@@ -2999,6 +3001,10 @@ impl App {
                 }
                 ui.checkbox(&mut self.unrestricted_img_export,"Unrestricted IMG Export Mode (experimental)")
                     .on_hover_text("Attempt available native writers without compatibility preflight. Each export creates debug.txt with warnings and exact failures; an IMG may be incomplete.");
+                if let Some(path)=self.ps1_export_output.clone(){ui.horizontal_wrapped(|ui|{
+                    if ui.button("Open IMG output folder").clicked(){if let Some(parent)=path.parent(){self.show_folder(parent);}}
+                    ui.label(format!("IMG output: {}",path.display()));
+                });}
                 ui.horizontal_wrapped(|ui| {
                     self.native_view.controls(ui, "Sample original PS1 TIM/CLUT atlas from assembled scene VRAM");
                     ui.checkbox(&mut self.native_ground_visible, "Show walk-ground")
@@ -3127,7 +3133,7 @@ impl App {
                     if ui.add_enabled(self.ps1_export_job.is_none(), egui::Button::new("Export PS1 test IMG..."))
                         .on_hover_text("Unrestricted mode attempts native writes without compatibility gates and creates per-export debug.txt. Failed operations produce an explicitly partial IMG; protected source files are never overwritten.")
                         .clicked() {
-                        let prepared = (|| -> anyhow::Result<(PathBuf,ps1_export::NativeExportPlan,String)> {
+                        let prepared = (|| -> anyhow::Result<(PathBuf,String)> {
                             let lib=self.studio.library.as_ref().ok_or_else(||anyhow::anyhow!("No disc image loaded"))?;
                             let source=match &lib.source {
                                 Source::Disc(path) => path.clone(),
@@ -3144,34 +3150,40 @@ impl App {
                                     .map(|p|p.display().to_string()).unwrap_or_else(|e|e);
                                 anyhow::bail!("{note} Integration V1 log: {log_path}");
                             }
-                            let plan=if self.unrestricted_img_export {ps1_export::unrestricted::prepare(&source,scene,world,lib.index.as_ref())}else{ps1_export::plan_export(&source,scene,world,lib.index.as_ref())}
-                                .map_err(|error| {
-                                    let report=export_integration::render_report(name,&overlay,Some(&source));
-                                    let cause=format!("Native export preparation failed: {error:#}");
-                                    let log_path=export_integration::write_log(name,&report,&cause)
-                                        .map(|p|p.display().to_string()).unwrap_or_else(|e|e);
-                                    anyhow::anyhow!("{cause}. Integration V1 log: {log_path}")
-                                })?;
-                            Ok((source,plan,name.to_string()))
+                            Ok((source,name.to_string()))
                         })();
                         match prepared {
-                            Ok((source,plan,cell_name)) => {
+                            Ok((source,cell_name)) => {
                                 let suggestion=format!("{}_LCK_{}.img",
                                     source.file_stem().and_then(|s|s.to_str()).unwrap_or("LegaiaTest"),cell_name);
                                 let mut dialog=rfd::FileDialog::new().set_file_name(&suggestion)
                                     .add_filter("Raw PS1 test image", &["img"]);
                                 if let Some(parent)=source.parent() {dialog=dialog.set_directory(parent);}
                                 if let Some(destination)=dialog.save_file() {
+                                    self.ps1_export_output=Some(destination.clone());
+                                    self.studio.error=None;
+                                    let output_message=destination.display().to_string();
                                     let overlay=scene_instances::serialize(&cell_name,world);
                                     let report=export_integration::render_report(&cell_name,&overlay,Some(&source));
                                     let (tx,rx)=std::sync::mpsc::channel();
                                     let repaint=ctx.clone();
+                                    let export_scene=Arc::clone(scene);let export_world=world.as_ref().clone();
+                                    let export_index=Arc::clone(&self.studio.library.as_ref().unwrap().index);
+                                    let unrestricted=self.unrestricted_img_export;
                                     std::thread::spawn(move|| {
-                                        let result=ps1_export::export(plan,&destination);
+                                        let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||->anyhow::Result<ps1_export::ExportResult>{
+                                            let plan=if unrestricted {ps1_export::unrestricted::prepare(&source,&export_scene,&export_world,&export_index)}else{ps1_export::plan_export(&source,&export_scene,&export_world,&export_index)}?;
+                                            ps1_export::export(plan,&destination)
+                                        })).unwrap_or_else(|_|Err(anyhow::anyhow!("Native export worker panicked; no completed output claimed"))).map_err(|error|{
+                                            let message=format!("Output {}: {error:#}",destination.display());
+                                            let debug=ps1_export::unrestricted::failure_log(&destination,&overlay,&message)
+                                                .map(|p|p.display().to_string()).unwrap_or_else(|e|format!("debug.txt could not be written: {e:#}"));
+                                            anyhow::anyhow!("{message}. {debug}")
+                                        });
                                         let outcome=match &result {
                                             Ok(done)=>format!("{}: {}\nPatched: {}\nSkipped: {}",if done.skipped.iter().any(|s|s.starts_with("UNRESTRICTED EXPERIMENT")){"EXPERIMENTAL IMG ATTEMPT WRITTEN — NOT PROVEN COMPLETE"}else{"NATIVE EXPORT SUCCESS"},
                                                 done.path.display(),done.patched.join(" | "),done.skipped.join(" | ")),
-                                            Err(error)=>format!("NATIVE EXPORT FAILED: {error:#}"),
+                                            Err(error)=>format!("NATIVE EXPORT FAILED: {}: {error:#}",destination.display()),
                                         };
                                         if let Err(error)=export_integration::write_log(&cell_name,&report,&outcome) {
                                             log::warn!("Export Integration V1 diagnostic log unavailable: {error}");
@@ -3180,7 +3192,7 @@ impl App {
                                         repaint.request_repaint();
                                     });
                                     self.ps1_export_job=Some(rx);
-                                    self.studio.status=Some(if self.unrestricted_img_export {"Writing experimental native attempt. Partial failures remain failures; debug.txt will be created.".into()}else{"Writing validated native export plan. PS1 runtime behavior remains unverified.".into()});
+                                    self.studio.status=Some(format!("Writing IMG to {output_message}. Completion requires file existence, length and disk readback verification; native operation failures remain in debug.txt."));
                                 }
                             }
                             Err(error) => {
@@ -5694,6 +5706,10 @@ impl eframe::App for App {
             use std::sync::mpsc::TryRecvError;
             match rx.try_recv() {
                 Ok(Ok(result))=>{
+                    if let Err(error)=ps1_export::verify_output_file(&result.path,None){
+                        self.studio.status=None;self.studio.error=Some(format!("IMG completion verification failed: {error:#}"));self.ps1_export_job=None;return;
+                    }
+                    self.ps1_export_output=Some(result.path.clone());
                     self.last_written=result.path.parent().map(Path::to_path_buf);
                     let details=if result.skipped.is_empty(){String::new()}else{format!(" Not updated: {}",result.skipped.join(" | "))};
                     self.studio.status=Some(format!("Native PS1 image saved: {}. Patched: {}.{} In DuckStation: boot THIS IMG (not an old CUE or save state), then reload Rim Elm. Native writes were read back. Original walls/floors and scripts are preserved unless an explicit supported plan changes them; gameplay verification remains required.",result.path.display(),result.patched.join(", "),details));
@@ -5703,10 +5719,12 @@ impl eframe::App for App {
                     self.ps1_export_job=None;
                 }
                 Ok(Err(error))=>{
+                    self.studio.status=None;
                     self.studio.error=Some(format!("Native IMG export failed: {error:#}"));
                     self.ps1_export_job=None;
                 }
                 Err(TryRecvError::Disconnected)=>{
+                    self.studio.status=None;
                     self.studio.error=Some("Native IMG export worker disconnected without a result".into());
                     self.ps1_export_job=None;
                 }
