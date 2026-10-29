@@ -1608,7 +1608,7 @@ impl NativeExportPlan {
             let (compiled,registration)=Self::compile_scene_resources(&staged,map_entry,&inventory,&before,&relocation,limits)?;
             let source_tiers=native.field_floor_height_lut(index)?.context("Donor native floor ladder unresolved")?.map(|y|Some(-(y as i32)));
             let delta=[0,1,2].map(|axis|foreign.center[axis]-cached.donor_center[axis]);
-            let candidate=Self::compile_registered_copy(compiled,map_entry,donor_map,placed.cell,foreign.uid,&id,&registration,delta,&source_tiers,&tiers,Some(model))?;
+            let candidate=Self::compile_registered_copy(compiled,map_entry,donor_map,placed.cell,foreign.uid,&id,&registration,delta,&source_tiers,&tiers,Some(model),foreign.static_architecture)?;
             before=relocation.apply(&before)?;
             let NativeImportCandidate{disc,descriptor,cell,uid,selector,..}=candidate;staged=disc;placements.push((uid,descriptor,cell,selector));last=Some((descriptor,cell,uid,selector));
         }
@@ -1631,6 +1631,7 @@ impl NativeExportPlan {
         registration:&super::native_asset_plan::scene_registration::SceneRegistration,
         delta:[f32;3],source_tiers:&[Option<i32>;16],destination_tiers:&[Option<i32>;16],
         verified_donor_model:Option<&[u8]>,
+        static_architecture:bool,
     )->Result<NativeImportCandidate> {
         export_check!(source_cell.0<128&&source_cell.1<128,"Donor source outside native grid");
         let donor=disc.read_entry_footprint(donor_map_entry)?;
@@ -1650,7 +1651,8 @@ impl NativeExportPlan {
         let source_bindings=NativeBindings::parse(&loaded[0x10000..0x12000],&loaded[0x12000..])?;
         let anchor=(source_cell.0 as i32+record.col_delta as i32,source_cell.1 as i32+record.row_delta as i32);
         export_check!((0..128).contains(&anchor.0)&&(0..128).contains(&anchor.1),"Invalid donor anchor");
-        export_check!(!anchor_has_bind(&donor,source_cell,&record)&&source_bindings.at((anchor.0 as u8,anchor.1 as u8)).is_none(),"Donor native binding requires MAN/animation relocation");
+        if !static_architecture {export_check!(!anchor_has_bind(&donor,source_cell,&record)&&source_bindings.at((anchor.0 as u8,anchor.1 as u8)).is_none(),"Donor native binding requires MAN/animation relocation");}
+        else {unrestricted::diagnostic(format!("STATIC ARCHITECTURE UID {uid}: exact visible raw TMD retained; donor MAN, ANM playback, story flags, triggers and elevator behavior intentionally detached. Collision recipes/record-local collision retained separately; no live pose or interaction claim"));}
         let original=disc.read_entry_footprint(map_entry)?;export_check!(original.len()==MAP_LEN,"Destination MAP footprint invalid");
         let lba=disc.entry_disc_lba(map_entry).context("Destination MAP address")?;
         let loaded=disc.read_disc_sectors(lba,0x28)?;
@@ -1659,7 +1661,7 @@ impl NativeExportPlan {
             source_position:(field_objects::world_x(source_cell.0,record.x_off),field_objects::world_z(source_cell.1,record.z_off)),
             env_slot:pack_index as usize,source_rotation:[record.rot_x,record.rot_y,record.rot_z],delta};
         let mut map=original.clone();let copies=if unrestricted::active() {
-            let (id,cell)=unrestricted::copy_record(&mut map,&donor,source_cell,delta,destination_tiers,Some(source_tiers))?;
+            let (id,cell)=unrestricted::copy_record_mode(&mut map,&donor,source_cell,delta,destination_tiers,Some(source_tiers),static_architecture.then_some(&bindings))?;
             vec![Inserted{id,col:cell.0,row:cell.1,uid,collider:(0,0)}]
         }else{insert_copies_with_source_tiers(&mut map,&donor,&[edit],destination_tiers,Some(source_tiers),&bindings)?};
         let copy=copies.first().context("Independent donor allocation missing")?;
@@ -2003,7 +2005,7 @@ pub(super) mod tests {
     }
 
     fn add_foreign_preview(world:&mut WorldModel) {
-        world.foreign.push(world_view::ForeignRef {
+        world.foreign.push(world_view::ForeignRef { static_architecture:false,
             uid:7, source:"donor".into(), kind:"placement".into(), record:3,
             raw_tmd:vec![], native_record:None, donor_wall_bits:vec![], donor_center:[0.0;3],
         });
@@ -2071,7 +2073,7 @@ pub(super) mod tests {
     fn foreign_editor_previews_do_not_disable_native_collision_wireframes() {
         use super::scene_instances::{ForeignInstance, NameTarget, SceneDocument};
         let mut doc = SceneDocument::default();
-        doc.foreign.push(ForeignInstance { uid: 123, source: "balden".into(),
+        doc.foreign.push(ForeignInstance { static_architecture:false, uid: 123, source: "balden".into(),
             kind: "TMD".into(), record: 82, center: [400.0,0.0,700.0] });
         doc.rotations.push((NameTarget::Created(123), [0.0,3.14,0.0]));
         assert!(!has_unhandled_native_transforms(&doc, true));

@@ -13,6 +13,7 @@ pub(super) struct NewInstance {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ForeignInstance {
     pub uid:u64,
+    pub static_architecture:bool,
     pub source:String,
     pub kind:String,
     pub record:usize,
@@ -87,6 +88,7 @@ pub(super) fn serialize(scene_name: &str, world: &WorldModel) -> String {
             let center=[0,1,2].map(|axis|d.original_center[axis]+d.offset[axis]);
             out.push_str(&format!("FOREIGN\t{uid}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 hex_name(&foreign.source),foreign.kind,foreign.record,center[0],center[1],center[2]));
+            if foreign.static_architecture {out.push_str(&format!("FOREIGN_STATIC\t{uid}\n"));}
             if let Some(name)=&d.display_name {
                 out.push_str(&format!("INSTANCE_NAME\t{uid}\t{}\n",hex_name(name)));
             }
@@ -326,7 +328,14 @@ pub(super) fn parse(text: &str, scene_name: &str, world: &WorldModel) -> Result<
                     center[axis]=items[5+axis].parse::<f32>().map_err(|_|format!("Invalid foreign coordinate at line {at}"))?;
                 }
                 if center.iter().any(|v|!v.is_finite()||v.abs()>=1_000_000.0){return Err(format!("Foreign placement out of range at line {at}"));}
-                doc.foreign.push(ForeignInstance{uid,source,kind:kind.into(),record,center});
+                doc.foreign.push(ForeignInstance{uid,static_architecture:false,source,kind:kind.into(),record,center});
+            }
+            Some("FOREIGN_STATIC") => {
+                if items.len()!=2 {return Err(format!("Incorrect FOREIGN_STATIC fields at line {at}"));}
+                let uid=items[1].parse::<u64>().map_err(|_|format!("Invalid static copy UID at line {at}"))?;
+                let foreign=doc.foreign.iter_mut().find(|f|f.uid==uid).ok_or("Static architecture requires a preceding FOREIGN record")?;
+                if foreign.static_architecture {return Err("Repeated static architecture declaration".into());}
+                foreign.static_architecture=true;
             }
             Some("MOVE") | Some("INSTANCE") => {
                 let created = items[0]=="INSTANCE";
@@ -507,6 +516,7 @@ fn apply_staged(doc:&SceneDocument, world:&mut WorldModel, native_placements:usi
     }
     for (entry,donor) in doc.foreign.iter().zip(donors.iter()) {
         world.insert_foreign(donor,&entry.kind,entry.record,entry.uid,entry.center,index)?;
+        world.foreign.iter_mut().find(|f|f.uid==entry.uid).unwrap().static_architecture=entry.static_architecture;
     }
     for (target,index) in &doc.models {
         let key=match target {
@@ -810,7 +820,7 @@ mod tests {
         world.set_offset(false,0,[20.0,0.0,0.0]);
         world.duplicate_native((false,0),1,9,[40.0,0.0,0.0]).unwrap();
         world.foreign.push(super::super::world_view::ForeignRef {
-            uid:9,source:"donor".into(),kind:"mesh".into(),record:2,
+            uid:9,static_architecture:true,source:"donor".into(),kind:"mesh".into(),record:2,
             raw_tmd:vec![1,2,3],native_record:Some([7;32]),donor_wall_bits:vec![(2,3)],donor_center:[0.0;3],
         });
         let texture=std::sync::Arc::new(legaia_tim::Vram::new());
@@ -846,6 +856,11 @@ mod tests {
         assert_eq!(doc.foreign.len(),1);
         assert_eq!(doc.foreign[0].source,"balden");
         assert_eq!(doc.foreign[0].center,[25.0,30.0,45.0]);
+        assert!(!doc.foreign[0].static_architecture); // old saves keep their intent
+        let static_doc=parse(&format!("{txt}FOREIGN_STATIC\t77\n"),"cave01",&world).unwrap();
+        assert!(static_doc.foreign[0].static_architecture);
+        assert!(parse(&format!("{txt}FOREIGN_STATIC\t88\n"),"cave01",&world).is_err());
+        assert!(parse(&format!("{txt}FOREIGN_STATIC\t77\nFOREIGN_STATIC\t77\n"),"cave01",&world).is_err());
         assert_eq!(doc.rotations.len(),1);
         assert!(parse(&format!("{txt}FOREIGN\t77\t62616c64656e\tmesh\t1\t0\t0\t0\n"),"cave01",&world).is_err());
         assert!(parse("LCK_SCENE_V1\tcave01\nFOREIGN\t1\t62616c64656e\tactor\t0\t0\t0\t0\n","cave01",&world).is_err());

@@ -187,7 +187,7 @@ fn real_town01_pac_packaging_and_native_donor_gates() -> Result<()> {
         let source_tiers=donor.field_floor_height_lut(&lib.index)?.context("Donor native floor ladder missing")?.map(|y|Some(-(y as i32)));
         let destination_tiers=destination.field_floor_height_lut(&lib.index)?.context("Destination native floor ladder missing")?.map(|y|Some(-(y as i32)));
         let delta=[12096.0-placement.world_x as f32,0.0,10048.0-placement.world_z as f32];
-        let candidate=super::super::super::ps1_export::NativeExportPlan::compile_registered_copy(compiled,destination.start as usize,donor.start as usize,(placement.col,placement.row),73,&id,&registered,delta,&source_tiers,&destination_tiers,None)?;
+        let candidate=super::super::super::ps1_export::NativeExportPlan::compile_registered_copy(compiled,destination.start as usize,donor.start as usize,(placement.col,placement.row),73,&id,&registered,delta,&source_tiers,&destination_tiers,None,false)?;
         ensure!(candidate.uid==73&&candidate.selector==registered.selector(&id)?&&!candidate.image_bytes().is_empty(),"Combined candidate identity/readback failed");
         println!("{name} native object #{} model {} source cell ({},{}) world ({},{}) floor tier {:?} -> town01: independent descriptor {}, grid {:?}, selector {}, requested world (12096,10048), bundle {} -> {}, PAC {} -> {}; {}",placement.obj_idx,source_selector,placement.col,placement.row,placement.world_x,placement.world_z,placement.floor_nibble,candidate.descriptor,candidate.cell,candidate.selector,bundle.len(),result.bytes().len(),pac.len(),result.pac_bytes().unwrap().len(),candidate.unresolved());examined+=1;
         let assembled_donor=legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,name).map_err(anyhow::Error::msg)?;
@@ -361,6 +361,40 @@ fn existing_native_tim_metadata_flags_are_preserved_without_normalization() {
     let flags=u32::from_le_bytes(tims[0][4..8].try_into().unwrap())|0x80010000;tims[0][4..8].copy_from_slice(&flags.to_le_bytes());payloads[0]=pack(&tims).unwrap();
     let native=bundle(&payloads);let result=super::register(&inventory,&native,&before,&relocation,budgets()).unwrap();
     let (_,after)=slots(result.bytes(),budgets()).unwrap();assert_eq!(members(&after[0].decoded).unwrap()[0],tims[0]);
+}
+#[test]
+fn native_tim_member_suffixes_are_retained_but_not_uploaded() {
+    let (source,before,inventory,relocation,_)=fixture();
+    let (_,old)=slots(&source,budgets()).unwrap();
+    let mut payloads=old.iter().map(|s|s.decoded.clone()).collect::<Vec<_>>();
+    let mut tims=members(&payloads[0]).unwrap();
+    tims[0].extend_from_slice(&[0xde,0xad,0xbe,0xef,0x10,0,0,0]);
+    payloads[0]=pack(&tims).unwrap();
+    let native=bundle(&payloads);
+    let (_,replay)=native_texture_sequence(&native,None,budgets()).unwrap();
+    assert_eq!(crate::app::naming::material_key(&replay),crate::app::naming::material_key(&before));
+    let registered=super::register(&inventory,&native,&before,&relocation,budgets()).unwrap();
+    let (_,after)=slots(registered.bytes(),budgets()).unwrap();
+    assert_eq!(members(&after[0].decoded).unwrap()[0],tims[0]);
+    let mut pac=table::encode_size_word(0,tims[0].len() as u32).to_le_bytes().to_vec();
+    pac.extend_from_slice(&tims[0]);pac.extend_from_slice(&[0;4]);
+    let mut uploaded=Vram::new();let (_,uploads)=pac_uploads(&pac,&mut uploaded).unwrap();
+    assert_eq!(uploads[0],tims[0][..legaia_tim::parse_native_upload(&tims[0]).unwrap().byte_extent()]);
+    assert_eq!(crate::app::naming::material_key(&uploaded),crate::app::naming::material_key(&before));
+}
+#[test]
+fn oversized_provisional_pac_selects_compressed_carrier_before_budget_check() {
+    let (bundle,mut pac,before,inventory,relocation,id)=streamed_fixture();
+    // Opaque bytes after the terminator must survive. The appended raw
+    // candidate grows beyond the arena, while the compressed route fits.
+    pac.resize(BUNDLE_ARENA/2048*2048,0);*pac.last_mut().unwrap()=0x5a;
+    let result=register_scene(&inventory,&bundle,Some(&pac),&before,&relocation,budgets()).unwrap();
+    assert_eq!(result.pac_bytes(),Some(pac.as_slice()));
+    assert_eq!(result.selector(&id).unwrap(),1);
+    let (_,header)=native_descriptor_table(result.bytes()).unwrap();
+    assert!(header.descriptor_index(1).is_some());
+    let (_,actual)=native_texture_sequence(result.bytes(),result.pac_bytes(),budgets()).unwrap();
+    assert_eq!(crate::app::naming::material_key(&actual),crate::app::naming::material_key(&relocation.apply(&before).unwrap()));
 }
 #[test]
 fn invalid_boundaries_duplicates_dynamic_dependencies_and_limits_fail_closed() {

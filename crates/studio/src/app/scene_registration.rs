@@ -141,12 +141,23 @@ fn upload_pack(raw:&[u8],vram:&mut Vram)->Result<()> {
     // Newly generated package TIMs are validated strictly before reaching here.
     for (i,member) in native_tim_members(raw)?.into_iter().enumerate() {let tim=legaia_tim::parse(&member).with_context(||format!("Native TIM_LIST member {i}: {} bytes, header {:02x?}",member.len(),&member[..member.len().min(40)]))?;
         export_check!(matches!(tim.mode,legaia_tim::PixelMode::Bpp4|legaia_tim::PixelMode::Bpp8|legaia_tim::PixelMode::Bpp16),"Unsupported destination TIM mode");
-        export_check!(member[tim.byte_extent()..].iter().all(|b|*b==0),"Unknown bytes after native TIM member");vram.upload_tim(&tim);
+        // A TIM_LIST supplies member starts, not per-TIM lengths, to
+        // FUN_800198E0. It consumes the CLUT/image blocks and returns; the
+        // next member comes from the pack offset table. Opaque member suffixes
+        // are retained in the pack, but are not another GPU upload.
+        vram.upload_tim(&tim);
     }Ok(())
 }
 fn native_tim_members(raw:&[u8])->Result<Vec<Vec<u8>>>{
-    members(raw)?.into_iter().map(|member|{
-        if legaia_tim::parse_native_upload(&member).is_ok(){return Ok(member);}
+    members(raw)?.into_iter().map(|mut member|{
+        if let Ok(tim)=legaia_tim::parse_native_upload(&member){
+            // Preserve opaque suffixes in the original carrier. The upload
+            // trace needs only the blocks consumed by FUN_800198E0, not the
+            // following pack member's padding/metadata.
+            let extent=tim.byte_extent();
+            if member[extent..].iter().any(|b|*b!=0)&&super::super::ps1_export::unrestricted::active(){super::super::ps1_export::unrestricted::diagnostic(format!("NATIVE TIM SUFFIX: {} non-upload bytes retained in original carrier; upload extent {extent}; original member SHA256 {}",member.len()-extent,collision_recipes::digest(&member)));}
+            member.truncate(extent);return Ok(member);
+        }
         let wrapped=pack(&[member.clone()])?;let strips=legaia_scene_formats::clut_walk::park_strips(&wrapped);
         let strip=strips.first().context("Native TIM_LIST member is neither TIM nor a structurally decoded raw CLUT upload")?;
         let mut tim=16u32.to_le_bytes().to_vec();tim.extend_from_slice(&2u32.to_le_bytes());tim.extend_from_slice(&(12+strip.data.len() as u32).to_le_bytes());
@@ -179,7 +190,7 @@ fn pac_uploads(source:&[u8],vram:&mut Vram)->Result<(usize,Vec<Vec<u8>>)> {
         let body=source.get(offset+4..offset+4+size).context("PAC chunk exceeds payload boundary")?;
         match header>>24 {
             1=>{export_check!(size<=TIM_LIST_BUFFER,"Native PAC TIM-list buffer capacity exceeded");upload_pack(body,vram)?;textures.extend(native_tim_members(body)?);}
-            0=>{let tim=legaia_tim::parse(body)?;export_check!(matches!(tim.mode,legaia_tim::PixelMode::Bpp4|legaia_tim::PixelMode::Bpp8|legaia_tim::PixelMode::Bpp16),"Unsupported PAC TIM mode");export_check!(body[tim.byte_extent()..].iter().all(|b|*b==0),"Unknown bytes after PAC TIM");vram.upload_tim(&tim);textures.push(body.to_vec());}
+            0=>{let tim=legaia_tim::parse_native_upload(body)?;export_check!(matches!(tim.mode,legaia_tim::PixelMode::Bpp4|legaia_tim::PixelMode::Bpp8|legaia_tim::PixelMode::Bpp16),"Unsupported PAC TIM mode");vram.upload_tim(&tim);textures.push(body[..tim.byte_extent()].to_vec());}
             2=>{for model in members(body)? {legaia_tmd::parse(&model)?;}},
             9=>{legaia_tmd::parse(body)?;},
             3..=8=>{}, // MAN/MES/MOVE/CLUT/VDF chunks do not upload TIMs.
@@ -213,17 +224,20 @@ fn append_pac_uploads(source:&[u8],incoming:&[u8],vram:&mut Vram,budget:usize)->
         let length=(used+4).max(source.len()).checked_add(2047).context("PAC alignment overflow")?/2048*2048;
         output.resize(length,0);
     }
-    export_check!(output.len()<=budget.min(BUNDLE_ARENA),"Provisional raw PAC candidate exceeds arena/explicit budget; not a committed write, compressed-carrier selection follows");
+    // This is a candidate, not the selected carrier. register_scene may put
+    // the additions in a compressed TIM_LIST and retain the original PAC.
+    // Validate the selected PAC only after that choice, in every mode.
     if super::super::ps1_export::unrestricted::active(){super::super::ps1_export::unrestricted::diagnostic(format!("PROVISIONAL PAC ENCODING (not yet committed): original chunks through offset {end:#x} retained; {} new TIM members before terminator; {} -> {} bytes, sector-rounded {}, arena {} bytes",added.len(),source.len(),output.len(),output.len().div_ceil(2048)*2048,BUNDLE_ARENA));}
     let mut readback=before;pac_uploads(&output,&mut readback)?;
     *vram=readback;Ok(output)
 }
-fn append_pac_models(source:&[u8],models:&[Vec<u8>],budget:usize)->Result<Vec<u8>>{
+fn append_pac_models(source:&[u8],models:&[Vec<u8>],_budget:usize)->Result<Vec<u8>>{
     if models.is_empty(){return Ok(source.to_vec());}
     let (end,_)=pac_uploads(source,&mut Vram::new())?;let payload=pack(models)?;
     let mut out=source[..end].to_vec();out.extend_from_slice(&table::encode_size_word(2,payload.len() as u32).to_le_bytes());out.extend_from_slice(&payload);out.extend_from_slice(&source[end..]);
     if source[end..].iter().all(|b|*b==0){let used=out.len()-(source.len()-end);out.resize((used+4).max(source.len()).div_ceil(2048)*2048,0);}
-    export_check!(out.len()<=budget.min(BUNDLE_ARENA),"Native PAC model/texture arena exceeded");Ok(out)
+    // Candidate only; compressed TIM carrier selection can still shrink it.
+    Ok(out)
 }
 
 /// Plain-bundle compatibility entry point. No MAP or behavior acceptance is
@@ -273,10 +287,7 @@ pub(in crate::app) fn register_scene(inventory:&NativeAssetPlan,source:&[u8],pac
         // Keep the original PAC and its mode flag intact. Added uploads use
         // the existing compressed TIM_LIST dispatcher when the raw PAC would
         // exceed its arena; its runtime walker reads the descriptor count.
-        let texture_only=if native_stream_mode(source)==Some(0x0a){true}else{
-            let (end,_)=pac_uploads(&bytes,&mut Vram::new())?;let mut at=0;let mut yes=true;while at<end{let h=u32::from_le_bytes(bytes[at..at+4].try_into()?);yes&=matches!(h>>24,0|1);at+=4+(h as usize&0xffffff);}yes
-        };
-        if (bytes.len().div_ceil(2048)*2048>BUNDLE_ARENA || ti.is_some()) && texture_only && !stream_models {
+        if bytes.len().div_ceil(2048)*2048>limits.max_encoded.min(BUNDLE_ARENA) || ti.is_some() {
             let mut tims=if let Some(ti)=ti{members(&decoded[ti].decoded)?}else{Vec::new()};
             for raw in members(&package.tim_pack)?{if !tims.contains(&raw){tims.push(raw);}}
             let data=pack(&tims)?;export_check!(data.len()<=TIM_LIST_BUFFER,"Compressed TIM_LIST decoded buffer exceeded");
@@ -286,7 +297,11 @@ pub(in crate::app) fn register_scene(inventory:&NativeAssetPlan,source:&[u8],pac
             };
             decoded[slot].decoded=data;promoted_tim=Some(slot);
             if super::super::ps1_export::unrestricted::active(){super::super::ps1_export::unrestricted::diagnostic(format!("NATIVE CARRIER ADAPTER: {} actual uploads in compressed type-1 TIM_LIST descriptor {}; original PAC and mode flag retained byte-for-byte; descriptor count {}; model registration order unchanged",tims.len(),if added_tim==Some(slot){0}else{slot},header.count));}
-            Some((collision_recipes::digest(pac),pac.to_vec()))
+            // A type-1 descriptor registers no model pointers. Keep every
+            // original PAC contributor in order, and append only new models
+            // when the destination's model bank lives in that stream.
+            let retained=if stream_models{append_pac_models(pac,&models[original_models.len()..],limits.max_encoded)?}else{pac.to_vec()};
+            Some((collision_recipes::digest(pac),retained))
         }else{Some((collision_recipes::digest(pac),bytes))}
     }else{
         let ti=ti.context("Missing destination TIM-list")?;
@@ -294,6 +309,7 @@ pub(in crate::app) fn register_scene(inventory:&NativeAssetPlan,source:&[u8],pac
         for tim in members(&package.tim_pack)? {legaia_tim::parse_native_upload(&tim)?;if !tims.contains(&tim){tims.push(tim);}}
         decoded[ti].decoded=pack(&tims)?;upload_pack(&decoded[ti].decoded,&mut replay)?;None
     };
+    if let Some((_,bytes))=&pac_output {validate_stored_extent(bytes.len().div_ceil(2048)*2048,limits)?;}
     export_check!(super::super::naming::material_key(&replay)==super::super::naming::material_key(&relocation.apply(before)?),"Destination native TIM-list replay differs from relocated package; upload policy unresolved");
     if !stream_models {let mi=mi.unwrap();decoded[mi].kind=2;decoded[mi].decoded=pack(&models)?;}
     if let Some(ti)=ti.or(promoted_tim) {export_check!(decoded[ti].decoded.len()<=TIM_LIST_BUFFER,"Native TIM-list buffer capacity exhausted");}

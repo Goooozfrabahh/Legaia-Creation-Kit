@@ -203,7 +203,7 @@ mod tests {
     #[test]
     fn deleting_an_import_releases_only_its_instance_metadata_and_material_view() {
         let mut world=three();let id=world.at(false,1).unwrap().id;
-        world.foreign.push(super::super::world_view::ForeignRef{uid:90,source:"synthetic-donor".into(),kind:"placement".into(),record:0,
+        world.foreign.push(super::super::world_view::ForeignRef{uid:90,static_architecture:true,source:"synthetic-donor".into(),kind:"placement".into(),record:0,
             raw_tmd:vec![],native_record:None,donor_wall_bits:vec![],donor_center:[0.0;3]});
         world.foreign_vram.insert(id,std::sync::Arc::new(legaia_tim::Vram::new()));
         let unrelated=world.at(false,2).unwrap().offset;
@@ -317,7 +317,7 @@ mod tests {
         let mut w=super::super::collision_recipes::properties_fixture();
         let key=(false,1);let uid=w.at(false,1).unwrap().editor_uid.unwrap();
         w.draws.iter_mut().find(|d|(d.terrain,d.index)==key).unwrap().source_ref=Some((false,usize::MAX));
-        let raw=vec![1,2,3,4];w.foreign.push(super::super::world_view::ForeignRef{uid,source:"conc".into(),kind:"placement".into(),record:19,raw_tmd:raw.clone(),native_record:Some([9;32]),donor_wall_bits:vec![(2,3)],donor_center:[5.,6.,7.]});
+        let raw=vec![1,2,3,4];w.foreign.push(super::super::world_view::ForeignRef{uid,static_architecture:true,source:"conc".into(),kind:"placement".into(),record:19,raw_tmd:raw.clone(),native_record:Some([9;32]),donor_wall_bits:vec![(2,3)],donor_center:[5.,6.,7.]});
         let texture=Arc::new(legaia_tim::Vram::new());let id=w.at(false,1).unwrap().id;w.foreign_vram.insert(id,texture.clone());
         let provenance=w.collision.sources[&(false,0)].clone();w.collision.foreign_sources.insert(uid,provenance.clone());
         w.set_rotation(false,1,[0.1,0.2,0.3]);w.set_scale(false,1,[2.,1.,0.5]);
@@ -326,9 +326,11 @@ mod tests {
         let copy=w.at(next.0,next.1).unwrap();let copy_uid=copy.editor_uid.unwrap();
         assert_ne!(uid,copy_uid);assert!(Arc::ptr_eq(&w.foreign_vram[&copy.id],&texture));
         assert_eq!(copy.rotation,[0.1,0.2,0.3]);assert_eq!(copy.scale,[2.,1.,0.5]);
-        let donor=w.foreign.iter().find(|f|f.uid==copy_uid).unwrap();assert_eq!(donor.raw_tmd,raw);assert_eq!(donor.native_record,Some([9;32]));assert_eq!(donor.donor_wall_bits,vec![(2,3)]);
+        let donor=w.foreign.iter().find(|f|f.uid==copy_uid).unwrap();assert!(donor.static_architecture);assert_eq!(donor.raw_tmd,raw);assert_eq!(donor.native_record,Some([9;32]));assert_eq!(donor.donor_wall_bits,vec![(2,3)]);
         assert_eq!(w.collision.foreign_sources[&copy_uid],provenance);
         let text=scene_instances::serialize("test",&w);assert!(text.contains(&format!("FOREIGN\t{copy_uid}\t")));assert!(!text.contains(&format!("INSTANCE\t{copy_uid}\t")));
+        assert!(text.contains(&format!("FOREIGN_STATIC\t{copy_uid}\n")));
+        assert!(scene_instances::parse(&text,"test",&w).unwrap().foreign.iter().any(|f|f.uid==copy_uid&&f.static_architecture));
         assert_ne!(old,text);let twice=duplicate(&mut w,&BTreeSet::from([next]),2).unwrap();assert_eq!(twice.len(),1);
         assert_eq!(w.foreign.len(),3);
     }

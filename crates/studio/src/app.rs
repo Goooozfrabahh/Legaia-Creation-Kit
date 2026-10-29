@@ -2439,6 +2439,7 @@ impl App {
         let mut pending_npc_model: Option<((bool,usize),u8)> = None;
         let mut pending_history_undo=false;
         let mut pending_history_redo=false;
+        let mut pending_static_architecture:Option<(u64,bool)>=None;
         let mut pending_collision_edit:Option<((bool,usize),Option<collision_recipes::Recipe>)>=None;
         let mut finish_drag: Option<EditorDrag> = None;
         let mut finish_rotate: Option<EditorRotateDrag> = None;
@@ -3001,6 +3002,9 @@ impl App {
                     };
                     ui.colored_label(Color32::from_rgb(225,175,70),message)
                         .on_hover_text("This is a source-provenance diagnostic, NOT a claim that the destination PS1 engine will collide with or walk on this object. The retail IMG is unchanged.");
+                    let mut architecture=foreign.static_architecture;
+                    if ui.checkbox(&mut architecture,"Static architecture copy — no donor story scripts or animation").changed(){pending_static_architecture=Some((foreign.uid,architecture));}
+                    ui.small("Copies the visible raw mesh. Elevator movement, interactions and story behavior are detached; collision remains separately reported. New foreign drops use this mode.");
                 }
                 ui.checkbox(&mut self.unrestricted_img_export,"Unrestricted IMG Export Mode (experimental)")
                     .on_hover_text("Attempt available native writers without compatibility preflight. Each export creates debug.txt with warnings and exact failures; an IMG may be incomplete.");
@@ -3503,14 +3507,17 @@ impl App {
                         let hovering=ui.input(|i|i.pointer.latest_pos())
                             .filter(|p|view_rect.contains(*p));
                         if let Some(asset)=self.global_repository.get(global_id) {
-                            let compatible=global_repository::local_source(scene,asset)
+                            // Architecture drops keep their source identity even
+                            // within the same cell. Ctrl+D of existing native
+                            // objects retains its established native-copy path.
+                            let compatible=matches!(asset.kind,global_repository::Kind::Npc(_)).then(||global_repository::local_source(scene,asset)).flatten()
                                 .and_then(|local| placement_drop::native_source_key(scene,world,local).map(|_|local));
                             if let Some(pointer)=hovering {
                                 ui.painter().text(pointer+egui::vec2(12.0,15.0),
                                     egui::Align2::LEFT_TOP,
                                     if compatible.is_some() {"Release: create destination-native instance"}
                                     else if !matches!(asset.kind,global_repository::Kind::Npc(_)) {
-                                        "Release: stage donor geometry and textures (native export requires validation)"
+                                        "Release: create static architecture copy (donor scripts detached)"
                                     } else {"Foreign MAN actors need script/animation importing"},
                                     egui::FontId::proportional(14.0),Color32::YELLOW);
                             }
@@ -3694,7 +3701,7 @@ impl App {
             pending_scale.is_some() || pending_import.is_some() ||
             pending_npc_animation.as_ref().is_some_and(|item|item.3) ||
             pending_npc_model.is_some() ||
-            pending_project.is_some() || pending_collision_edit.is_some() || self.editor_gesture_start.is_some();
+            pending_project.is_some() || pending_collision_edit.is_some() || pending_static_architecture.is_some() || self.editor_gesture_start.is_some();
         let before_frame=if editor_changed_this_frame {
             match (self.native_scene.as_ref(),world.as_deref()) {
                 (Some((name,NativeSceneSlot::Ready(_, _))),Some(w))=>
@@ -3714,6 +3721,11 @@ impl App {
         // Arc::get_mut keeps one writable world, without cloning thousands
         // of vertices on every mouse frame. The original scene remains intact.
         drop(world);
+        if let Some((uid,enabled))=pending_static_architecture {
+            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut(){if let Some(world)=Arc::get_mut(world){
+                if let Some(foreign)=world.foreign.iter_mut().find(|f|f.uid==uid){foreign.static_architecture=enabled;self.studio.status=Some("Copy behavior mode updated. Save LCK scene to persist; native visibility and collision still require manual verification.".into());ctx.request_repaint();}
+            }}
+        }
         if let Some((key,recipe))=pending_collision_edit {
             if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut() {
                 if let Some(world)=Arc::get_mut(world) {

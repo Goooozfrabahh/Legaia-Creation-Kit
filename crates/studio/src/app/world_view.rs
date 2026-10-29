@@ -43,6 +43,8 @@ pub(super) struct WorldModel {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct ForeignRef {
     pub uid: u64,
+    /// Explicitly copy the visible raw architecture; no donor MAN/ANM behavior.
+    pub static_architecture: bool,
     pub source: String,
     pub kind: String,
     pub record: usize,
@@ -363,7 +365,7 @@ impl WorldModel {
             .unwrap_or_else(||Arc::new(donor.res.vram.clone()));
         self.foreign_vram.insert(id,source_texture);
         self.foreign.push(ForeignRef{
-            uid,source:donor.name.clone(),kind:kind.into(),record,
+            uid,static_architecture:true,source:donor.name.clone(),kind:kind.into(),record,
             raw_tmd,native_record,donor_wall_bits,donor_center:original_center
         });
         self.instances+=1;

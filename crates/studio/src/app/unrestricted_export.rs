@@ -71,6 +71,11 @@ fn translate_record(map:&mut [u8],cell:(u8,u8),delta:[f32;3])->Result<usize>{
 /// Allocate a native descriptor/reference anywhere representable. Occupied
 /// world-space positions and distant anchors do not block this allocator.
 pub(in crate::app) fn copy_record(map:&mut [u8],original:&[u8],source_cell:(u8,u8),delta:[f32;3],tiers:&[Option<i32>;16],source_tiers:Option<&[Option<i32>;16]>)->Result<(usize,(u8,u8))>{
+    copy_record_mode(map,original,source_cell,delta,tiers,source_tiers,None)
+}
+/// A static architecture copy must belong to the unbound window sweep.
+/// Select its own reference without clearing another object's bind/trigger.
+pub(in crate::app) fn copy_record_mode(map:&mut [u8],original:&[u8],source_cell:(u8,u8),delta:[f32;3],tiers:&[Option<i32>;16],source_tiers:Option<&[Option<i32>;16]>,static_bindings:Option<&NativeBindings>)->Result<(usize,(u8,u8))>{
     let old_id=id_at(original,source_cell)?;let raw=record(original,old_id)?;let old=ObjectRecord::parse(&raw,0).unwrap();
     let id=blank_object_record(map)?;let dx=integer(delta[0])?;let dy=integer(delta[1])?;let dz=integer(delta[2])?;
     let wx=field_objects::world_x(source_cell.0,old.x_off)+dx;let wz=field_objects::world_z(source_cell.1,old.z_off)+dz;
@@ -78,6 +83,13 @@ pub(in crate::app) fn copy_record(map:&mut [u8],original:&[u8],source_cell:(u8,u
     for row in 0..128 {for col in 0..128 {
         let cell=(col as u8,row as u8);let at=grid(cell);let word=u16::from_le_bytes(map[at..at+2].try_into()?);
         if word&511!=0 {continue;} // one reference per native grid word is a format capacity, not spatial overlap
+        if let Some(bindings)=static_bindings {
+            let anchor=(col+old.col_delta as i32,row+old.row_delta as i32);
+            if !(0..128).contains(&anchor.0)||!(0..128).contains(&anchor.1) {continue;}
+            let anchor=(anchor.0 as u8,anchor.1 as u8);
+            let a=grid(anchor);let anchor_word=u16::from_le_bytes(map[a..a+2].try_into()?);
+            if (word|anchor_word)&field_objects::CELL_BIND_OWNED!=0||bindings.has_trigger(cell)||bindings.has_trigger(anchor){continue;}
+        }
         let xo=wx-(col*128+64);let zo=row*128+64-wz;
         if i16::try_from(xo).is_err()||i16::try_from(zo).is_err(){continue;}
         let score=(xo as i64).pow(2)+(zo as i64).pow(2);
@@ -141,17 +153,20 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
     // Identical donor instances share the registered native resource closure,
     // while each receives its own descriptor and MAP reference. Cache only the
     // exact donor identity, never a nearby or merely similar object.
-    let mut prototypes:HashMap<(String,String,usize),((u8,u8),[i32;3])>=HashMap::new();
+    let mut prototypes:HashMap<(String,String,usize,bool),((u8,u8),[i32;3])>=HashMap::new();
     let tiers=Scene::load(index,&scene.name).ok().and_then(|n|n.field_floor_height_lut(index).ok().flatten()).map(|h|h.map(|v|Some(-(v as i32)))).unwrap_or([None;16]);
     for foreign in &doc.foreign {
         let label=format!("IMPORT UID {} from {} {} #{}",foreign.uid,foreign.source,foreign.kind,foreign.record);
-        let identity=(foreign.source.clone(),foreign.kind.clone(),foreign.record);
+        let identity=(foreign.source.clone(),foreign.kind.clone(),foreign.record,foreign.static_architecture);
         if let Some(&(cell,encoded_translation))=prototypes.get(&identity) {
             if let Some((candidate,descriptor,allocated))=attempt(&label,log,||{
                 let original=disc.read_entry_footprint(entry)?;let mut map=original.clone();
                 let donor=world.foreign.iter().find(|f|f.uid==foreign.uid).context("Foreign source provenance absent")?;
                 let delta=relative_native_translation(foreign.center,donor.donor_center,encoded_translation)?;
-                let (descriptor,allocated)=copy_record(&mut map,&original,cell,delta,&tiers,None)?;
+                let lba=disc.entry_disc_lba(entry).context("Destination MAP LBA")?;
+                let loaded=disc.read_disc_sectors(lba,0x28)?;
+                let bindings=NativeBindings::parse(&loaded[0x10000..0x12000],&loaded[0x12000..])?;
+                let (descriptor,allocated)=copy_record_mode(&mut map,&original,cell,delta,&tiers,None,foreign.static_architecture.then_some(&bindings))?;
                 let mut candidate=DiscPatcher::open(disc.image().to_vec())?;candidate.patch_prot_entry(entry,0,&map)?;
                 Ok((candidate,descriptor,allocated))
             }){
@@ -289,14 +304,23 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
                     "scan_error":record.scan.error,"transplanted":false,"control_flow_closure_verified":false})
             }else{serde_json::Value::Null};
             let mut gaps=vec!["native rendering, heap availability and subsequent runtime writes not observed".to_owned(),"collision encoding does not verify walkability or interaction".into()];
-            if let Some(binding)=binding{gaps.push(format!("MISSING: donor MAN object context {} / ANM clip {} was not relocated; static geometry encoding does not preserve donor behavior",binding.record,binding.anim_id));}
+            if let Some(binding)=binding{if !foreign.static_architecture {gaps.push(format!("MISSING: donor MAN object context {} / ANM clip {} was not relocated; static geometry encoding does not preserve donor behavior",binding.record,binding.anim_id));}}
             if anchor_word.is_none(){gaps.push("Native footprint anchor is outside MAP".into());}
             if anchor_word.is_some_and(|w|w&field_objects::CELL_BIND_OWNED!=0){gaps.push("Native window sweep skips a bind-owned anchor; matching init-sweep MAN binding must be verified".into());}
+            if foreign.static_architecture {
+                let lba=disc.entry_disc_lba(entry).context("Static MAP LBA")?;let loaded=disc.read_disc_sectors(lba,0x28)?;
+                let bindings=NativeBindings::parse(&loaded[0x10000..0x12000],&loaded[0x12000..])?;
+                anyhow::ensure!(anchor_word.is_some_and(|w|w&field_objects::CELL_BIND_OWNED==0),"Static architecture remains owned by init-script sweep");
+                anyhow::ensure!(!bindings.has_trigger(cell)&&!bindings.has_trigger((anchor[0] as u8,anchor[1] as u8)),"Static architecture overlaps an existing trigger binding");
+            }
             let raw=world.foreign.iter().find(|f|f.uid==foreign.uid).context("Donor provenance missing")?;
             let failures=log.iter().filter(|l|l.starts_with("FAILED ")&&(l.contains(&format!("Created({})",foreign.uid))||l.contains(&format!("UID {} ",foreign.uid)))).cloned().collect::<Vec<_>>();
             Ok(serde_json::json!({"uid":foreign.uid,"source_scene":foreign.source,"category":foreign.kind,"source_catalog_ordinal":foreign.record,
                 "source_tmd_sha256":super::super::collision_recipes::digest(&raw.raw_tmd),"encoded_successfully":failures.is_empty(),"native_import_reference_written":true,"operation_failures":failures,"img_write_readback_verified":false,
                 "requested_editor_center":foreign.center,
+                "copy_mode":if foreign.static_architecture{"static_architecture_raw_visible_mesh"}else{"legacy_dependency_request"},
+                "donor_story_scripts_copied":false,"donor_animation_copied":false,
+                "behavior_detachment_requested":foreign.static_architecture,
                 "donor_binding_evidence":binding_evidence,
                 "native_loader_identity":{"status":"independent_static_contract_matched_cumulatively","runtime_verified":false,"relocated_tmd_sha256":actual,"relocated_tmd_bytes":loaded_model.bytes.len(),"scene_selector":r.pack_index_field,"global_slot":r.pack_index_field as usize+5,"pointer_table_address":format!("{:#x}",0x8007c018+(r.pack_index_field as u32+5)*4)},
                 "native_reference":{"map_entry":entry,"descriptor":id,"cell":cell,"anchor":anchor,"anchor_word":anchor_word,"rotation_ticks":[r.rot_x,r.rot_y,r.rot_z],"offsets":[r.x_off,r.y_off,r.z_off],"cull_radius":original.cull_radius},
@@ -390,6 +414,29 @@ pub(super) fn publish(plan:NativeExportPlan,output:&Path)->Result<ExportResult>{
 mod tests {
     use super::*;
     #[test]
+    fn static_architecture_uses_unbound_anchor_without_editing_story_tables()->Result<()> {
+        let mut donor=vec![0;MAP_LEN];let source=(10,10);let at=grid(source);
+        donor[at..at+2].copy_from_slice(&1u16.to_le_bytes());
+        donor[32+18..32+20].copy_from_slice(&0x16u16.to_le_bytes());
+        donor[32+6]=1; // collider/anchor offset must survive
+        let mut map=vec![0;MAP_LEN];
+        // Closest reference is occupied by a story-owned marker; a nearby
+        // empty reference resolves to a scripted anchor. Neither is cleared.
+        let bind_at=grid(source);map[bind_at..bind_at+2].copy_from_slice(&field_objects::CELL_BIND_OWNED.to_le_bytes());
+        let mut block=vec![0;22];block[6..8].copy_from_slice(&18i16.to_le_bytes());block[8..10].copy_from_slice(&1i16.to_le_bytes());block[18..22].copy_from_slice(&[10,9,7,0]);
+        map[0x10000..0x10000+block.len()].copy_from_slice(&block);
+        let bindings=NativeBindings::parse(&map[0x10000..],&[])?;
+        let before=map.clone();let (id,cell)=copy_record_mode(&mut map,&donor,source,[0.;3],&[Some(0);16],None,Some(&bindings))?;
+        let rec=ObjectRecord::parse(&map,id).unwrap();let anchor=((cell.0 as i32+rec.col_delta as i32)as u8,(cell.1 as i32+rec.row_delta as i32)as u8);
+        assert!(!bindings.has_trigger(cell)&&!bindings.has_trigger(anchor));
+        assert_eq!(u16::from_le_bytes(map[grid(anchor)..grid(anchor)+2].try_into()?)&field_objects::CELL_BIND_OWNED,0);
+        assert_eq!(rec.col_delta,1);
+        assert_eq!(field_objects::world_x(cell.0,rec.x_off),field_objects::world_x(source.0,0));
+        assert_eq!(field_objects::world_z(cell.1,rec.z_off),field_objects::world_z(source.1,0));
+        for i in 0..MAP_LEN {assert!(map[i]==before[i]||(id*32..id*32+32).contains(&i)||(grid(cell)..grid(cell)+2).contains(&i));}
+        Ok(())
+    }
+    #[test]
     fn written_import_with_missing_behavior_is_prominently_incomplete(){
         let result=ExportResult{path:"partial.img".into(),patched:vec![],skipped:vec!["MISSING NATIVE DEPENDENCY UID 2: MAN object context and animation".into()],imports:Some(ImportCoverage{requested:3,written:3})};
         assert!(result.experimental_summary().contains("INCOMPLETE NATIVE BEHAVIOR"));
@@ -426,11 +473,15 @@ mod tests {
         let mut world=world_view::build_world(&scene,&library.index);
         let doc=scene_instances::parse(&manifest,"town01",&world).map_err(anyhow::Error::msg)?;
         scene_instances::apply(&doc,&mut world,scene.placements.len(),&library.index).map_err(anyhow::Error::msg)?;
+        if std::env::var_os("LCK_FOREIGN_STATIC").is_some(){for foreign in &mut world.foreign{foreign.static_architecture=true;}}
         let editor_before=scene_instances::serialize("town01",&world);
         let plan=prepare(&source,&scene,&world,&library.index)?;
         anyhow::ensure!(scene_instances::serialize("town01",&world)==editor_before,"Export modified editor transforms");
         println!("{}",plan.unrestricted_log.as_deref().unwrap_or("NO LOG"));
         anyhow::ensure!(plan.skipped.is_empty(),"Native writer failures remain: {:?}",plan.skipped);
+        if std::env::var_os("LCK_FOREIGN_STATIC").is_some(){
+            anyhow::ensure!(plan.object_verification.len()==doc.foreign.len()&&plan.object_verification.iter().all(|r|r["behavior_detachment_requested"]==true&&r["encoded_successfully"]==true),"Static architecture mode not represented for every requested object");
+        }
         let before_map=Scene::load(&library.index,"town01")?.field_map_index(&library.index).context("No MAP")? as usize;
         let planned=DiscPatcher::open(plan.image.clone())?;
         let intended_map=planned.read_entry_footprint(before_map)?;

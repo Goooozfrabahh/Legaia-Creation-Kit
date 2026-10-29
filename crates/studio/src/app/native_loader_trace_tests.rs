@@ -2,6 +2,60 @@ use super::*;
 use legaia_code_hooks::mips_sim::Cpu;
 use serde_json::json;
 
+/// Original TIM uploader through the libgpu LoadImage boundary. GPU queue and
+/// DrawSync are replaced; no display, emulator, or host input is involved.
+fn original_tim_upload(exe:&[u8],raw:&[u8])->Result<legaia_tim::Vram>{
+    let load=word(exe,0x18)?;let mut cpu=Cpu::new();cpu.load_delays=true;cpu.strict_alignment=true;
+    let lo=0x800198e0u32;let end=lo+584;let at=0x800+(lo-load)as usize;cpu.load(lo,&exe[at..at+584]);
+    let base=0x80400000;cpu.load(base,raw);cpu.r[4]=base;cpu.r[29]=0x807ff000;cpu.r[28]=0x8007b318;cpu.r[31]=0x8ffffffc;cpu.pc=lo;
+    let mut result=legaia_tim::Vram::new();
+    while cpu.pc!=0x8ffffffc {
+        ensure!(cpu.steps<200000,"TIM uploader step budget at {:#x}",cpu.pc);
+        match cpu.pc {
+            0x800583c8=>{
+                let rect=cpu.r[4];let data=cpu.r[5];let x=cpu.rd16(rect);let y=cpu.rd16(rect+2);let w=cpu.rd16(rect+4);let h=cpu.rd16(rect+6);
+                let n=w as usize*h as usize*2;ensure!(n<=1024*512*2,"TIM upload extent budget");
+                ensure!(data>=base&&(data-base)as usize+n<=raw.len(),"Native TIM upload outside member");
+                let pixels=(0..n).map(|i|cpu.rd8(data+i as u32)).collect::<Vec<_>>();
+                result.write_block(x,y,w,h,&pixels);cpu.r[2]=0;cpu.pc=cpu.r[31];
+            },
+            0x80058104=>{cpu.r[2]=0;cpu.pc=cpu.r[31];},
+            p if (lo..end).contains(&p)=>{let instruction=cpu.rd32(cpu.pc);cpu.exec(instruction);},
+            p=>anyhow::bail!("Unsubstituted original TIM uploader call {p:#x}"),
+        }
+    }
+    Ok(result)
+}
+
+#[test]
+#[ignore="read-only original TIM uploader on representative field carrier members; GPU substituted"]
+fn original_tim_member_suffixes()->Result<()>{
+    use crate::app::native_asset_plan::scene_registration as reg;
+    let path=std::env::var_os("LCK_AUDIT_SOURCE").context("source")?;
+    let lib=crate::library::Library::open(std::path::Path::new(&path))?;let exe=lib.executable()?;
+    let limits=reg::Limits{max_models:1024,max_decoded:16*1024*1024,max_encoded:16*1024*1024};
+    let mut tails=0;let mut members=0;
+    for name in ["bubu1","balden","urudre1"] {
+        let scene=legaia_engine_scene::scene::Scene::load(&lib.index,name)?;let entry=scene.field_map_index(&lib.index).context("MAP")?;
+        let bundle=lib.index.entry_bytes(entry+3)?;let pac=lib.index.entry_bytes(entry+4)?;
+        let _=limits;
+        let(base,header)=reg::native_descriptor_table(&bundle)?;let mut textures=vec![];
+        let unpack=|raw:&[u8]|->Result<Vec<Vec<u8>>>{Ok(legaia_container_formats::pack::parse_pack(raw)?.iter().map(|m|raw[m.byte_offset..m.byte_offset+m.size].to_vec()).collect())};
+        for d in header.used(){if d.type_byte==1{let raw=legaia_lzs::decompress(&bundle[base+d.data_offset as usize..],d.size as usize)?;textures.extend(unpack(&raw)?);}}
+        if reg::native_stream_mode(&bundle)==Some(0x0a){textures.extend(unpack(&pac)?);}
+        if reg::native_stream_mode(&bundle)==Some(0x14){let mut at=0;loop{let h=word(&pac,at)?;let n=(h&0xffffff)as usize;if n==0{break;}let raw=&pac[at+4..at+4+n];match h>>24{0=>textures.push(raw.to_vec()),1=>textures.extend(unpack(raw)?),_=>{}}at+=4+n;}}
+        for raw in textures {let Ok(tim)=legaia_tim::parse_native_upload(&raw) else{continue};let extent=tim.byte_extent();
+            if raw[extent..].iter().any(|v|*v!=0){tails+=1;}
+            let mut expected=legaia_tim::Vram::new();expected.upload_tim(&tim);
+            let actual=original_tim_upload(&exe,&raw)?;
+            ensure!(actual.as_u16()==expected.as_u16(),"Native TIM GPU words differ in {name}");
+            let stripped=original_tim_upload(&exe,&raw[..extent])?;
+            ensure!(stripped.as_u16()==actual.as_u16(),"Native uploader consumes suffix in {name}");members+=1;
+        }
+    }
+    ensure!(tails>0,"No nonzero suffix exercised");println!("ORIGINAL TIM UPLOADER: {members} members; {tails} nonzero suffixes; full versus truncated extent GPU words identical. GPU queue/DrawSync substituted; no gameplay.");Ok(())
+}
+
 /// Executes ORIGINAL SCUS instructions for both walkers, the type-1/2/9/flag
 /// dispatcher arms, registrar and pointer fixup. OS/heap/LZS/GPU are explicit
 /// host services. This is bounded CPU simulation, not PS1 runtime/gameplay.
@@ -166,6 +220,7 @@ fn cross_cell_family_regressions()->Result<()>{
     let census:serde_json::Value=serde_json::from_slice(&std::fs::read(folder.join("compatibility.json"))?)?;
     let library=crate::library::Library::open(std::path::Path::new(&path))?;
     let representatives=census["loader_families"].as_object().context("families")?.values().filter_map(|v|v[0].as_str()).collect::<Vec<_>>();
+    let exe=library.executable()?;
     let limits=reg::Limits{max_models:1024,max_decoded:16*1024*1024,max_encoded:16*1024*1024};let mut cases=vec![];
     for(destination_index,&destination)in representatives.iter().enumerate(){
         let result=(||->Result<serde_json::Value>{
@@ -198,14 +253,18 @@ fn cross_cell_family_regressions()->Result<()>{
                 witnesses.push((selector,audit.models[selector as usize].sha256.clone()));cells.push(cell);
             }
             let snapshot=map.clone();let(_,duplicate)=unrestricted::copy_record(&mut map,&snapshot,cells[0],[32.,0.,32.],&[Some(0);16],None)?;
+            let before_id=(word(&map,0x8000+(duplicate.1 as usize*128+duplicate.0 as usize)*2)?&511)as usize;
+            let before_yaw=ObjectRecord::parse(&map,before_id).context("duplicate before yaw")?.rot_y;
             // Exercise the actual MAP yaw writer independently of resource slots.
             unrestricted::yaw(&mut map,duplicate,[0.,std::f32::consts::FRAC_PI_2,0.],[0.;3])?;
             let di=(word(&map,0x8000+(duplicate.1 as usize*128+duplicate.0 as usize)*2)?&511)as usize;let duplicate_record=ObjectRecord::parse(&map,di).context("duplicate")?;
-            ensure!(duplicate_record.pack_index_field==witnesses[0].0&&duplicate_record.rot_y&4095==1024,"Duplicate identity/yaw not persistent");
+            ensure!(duplicate_record.pack_index_field==witnesses[0].0&&duplicate_record.rot_y&4095==before_yaw.wrapping_add(1024)&4095,"Duplicate identity/yaw not persistent");
             let(base,_)=reg::native_descriptor_table(&bundle)?;let audit=trace(&bundle,base,pac.as_deref())?;
             ensure!(audit.models.iter().take(original.models.len()).zip(&original.models).all(|(a,b)|a.sha256==b.sha256),"Existing registry shifted");
             for(selector,hash)in &witnesses{ensure!(audit.models[*selector as usize].sha256==*hash,"Later different donor shifted earlier identity");}
-            Ok(json!({"destination":destination,"status":"automated_resource_map_contract_passed","imports":witnesses,"independent_duplicate_reference":duplicate,"yaw_ticks":duplicate_record.rot_y,"native_runtime_verified":false,"render_verified":false,"scene_behavior_dependencies_verified":false}))
+            let executed=execute_original(&exe,&bundle,base,pac.as_deref())?;
+            ensure!(executed.len()==audit.models.len()&&executed.iter().zip(&audit.models).all(|((slot,hash),m)|*slot==m.global_slot&&*hash==m.sha256),"Original SCUS registration instructions disagree with cumulative exported bank");
+            Ok(json!({"destination":destination,"status":"automated_resource_map_contract_passed","imports":witnesses,"independent_duplicate_reference":duplicate,"source_yaw_ticks":before_yaw,"added_yaw_ticks":1024,"yaw_ticks":duplicate_record.rot_y,"original_registration_instructions_matched":true,"instruction_test_substitutions":"heap/LZS/GPU and non-model installers","native_runtime_verified":false,"render_verified":false,"scene_behavior_dependencies_verified":false}))
         })();
         let case=match result{Ok(v)=>v,Err(e)=>json!({"destination":destination,"status":"explicit_capability_gap","error":format!("{e:#}"),"runtime_verified":false})};println!("CROSS FAMILY {case}");cases.push(case);
     }
