@@ -2,6 +2,36 @@ use super::*;
 use legaia_code_hooks::mips_sim::Cpu;
 use serde_json::json;
 
+#[test]
+#[ignore="read-only inherited IMG/resource audit for the user's 222 failure; new report path required"]
+fn crash_222_inheritance_audit()->Result<()>{
+    use crate::app::native_asset_plan::scene_registration as reg;
+    let path=std::env::var_os("LCK_CRASH_OUTPUT").context("report path")?;ensure!(!std::path::Path::new(&path).exists(),"New report path required");
+    let parent=r"D:\AstraRimElmProject\ManualTests\Native_Format_Adapters_20261028_01\LCK_EXPERIMENTAL_MIXED_FORMATS_FIXED.img";
+    let repaired=r"D:\AstraRimElmProject\ManualTests\Runtime_Compatibility_20261029_02\LCK_EXPERIMENTAL_MIXED_RUNTIME_CANDIDATE.img";
+    let baseline=r"D:\AstraRimElmProject\ManualTests\M2_StageE_20261027_01\LCK_EXPERIMENTAL_STAGE_E_town01_floor_x37_z18.img";
+    let mut reports=vec![];let mut footprints=vec![];
+    for(name,file)in [("retail",r"D:\Emulators\Games\Legend of Legaia\LegendOfLegaia.img"),("stage_e",baseline),("parent",parent),("resident_corrected",repaired),("failing",r"D:\AstraRimElmProject\222.img")]{
+        let lib=crate::library::Library::open(std::path::Path::new(file))?;let exe=lib.executable()?;let scene=legaia_engine_scene::scene::Scene::load(&lib.index,"town01")?;let entry=scene.field_map_index(&lib.index).context("MAP")?;
+        let bundle=lib.index.entry_bytes(entry+3)?;let pac=lib.index.entry_bytes(entry+4)?;let map=lib.index.entry_bytes(entry)?;
+        let(base,header)=reg::native_descriptor_table(&bundle)?;let traced=trace(&bundle,base,Some(&pac))?;let original=execute_original(&exe,&bundle,base,Some(&pac))?;
+        ensure!(original.len()==traced.models.len()&&original.iter().zip(&traced.models).all(|((slot,h),m)|*slot==m.global_slot&&*h==m.sha256),"CPU registration differs in {name}");
+        let limits=reg::Limits{max_models:1024,max_decoded:16*1024*1024,max_encoded:16*1024*1024};let(_,vram)=reg::native_texture_sequence(&bundle,Some(&pac),limits)?;
+        let player=lib.index.entry_bytes(legaia_actor_formats::field_char_textures::PROT_ENTRY_INDEX)?;let player=legaia_actor_formats::field_char_textures::parse(&player)?;let mut resident=legaia_tim::Vram::new();player.upload_to_vram(&mut resident,false);
+        let conflicts=(0..1024*512).filter(|i|resident.is_written(i%1024,i/1024)&&vram.is_written(i%1024,i/1024)&&resident.as_u16()[*i]!=vram.as_u16()[*i]).count();
+        let descriptor_report=header.used().iter().map(|d|{let decoded=if matches!(d.type_byte,10|20){vec![]}else{legaia_lzs::decompress(&bundle[base+d.data_offset as usize..],d.size as usize).unwrap()};json!({"type":d.type_byte,"decoded_bytes":d.size,"sha256":digest(&decoded)})}).collect::<Vec<_>>();
+        let placements=legaia_scene_formats::field_objects::parse_placements(&map);let binds=scene.field_object_binds(&lib.index)?;
+        let assembled=legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,"town01").map_err(anyhow::Error::msg)?;
+        let rows=assembled.placements.iter().enumerate().map(|(ordinal,p)|json!({"ordinal":ordinal,"selector":p.env_slot,"cell":p.cell,"anchor":p.anchor,"origin":[p.world_x,p.world_y,p.world_z],"bind":binds.as_ref().and_then(|b|b.get(&p.anchor)).map(|b|[b.record,b.anim_id])})).collect::<Vec<_>>();
+        let mut sizes=vec![];for e in lib.index.entries(){sizes.push((e.index,digest(&lib.index.entry_bytes(e.index)?)));}footprints.push((name,sizes));
+        let report=json!({"name":name,"path":file,"sha256":digest(&std::fs::read(file)?),"entry":entry,"bundle_bytes":bundle.len(),"pac_bytes":pac.len(),"descriptors":descriptor_report,"original_cpu_registration_matched":true,"models":traced.models,"resident_overwrite_words":conflicts,"native_placements":placements.len(),"placement_ordinals":rows,"man_sha256":digest(&scene.field_man_payload(&lib.index)?.context("MAN")?),"map_sha256":digest(&map),"map_records_sha256":digest(&map[..0x4000]),"walls_floor_sha256":digest(&map[0x4000..0x8000]),"grid_sha256":digest(&map[0x8000..0x10000]),"trigger_sha256":digest(&map[0x10000..])});
+        println!("INHERITANCE {name}: {} models, {conflicts} resident overwrite words, bundle {} PAC {}; types {:?}",traced.models.len(),bundle.len(),pac.len(),header.used().iter().map(|d|(d.type_byte,d.size)).collect::<Vec<_>>());reports.push(report);
+        if name=="failing"{let load=word(&exe,0x18)?;for va in (0x8001f05cu32..0x8001f69c).step_by(4){let w=word(&exe,0x800+(va-load)as usize)?;if w>>26==3{println!("DISPATCH CALL {va:#x} -> {:#x}",0x80000000|((w&0x3ffffff)<<2));}}}
+    }
+    let changed=footprints.iter().map(|(name,entries)|json!({"image":name,"versus_stage_e":entries.iter().zip(&footprints[1].1).filter(|(a,b)|a!=b).map(|(a,_)|a.0).collect::<Vec<_>>() })).collect::<Vec<_>>();
+    std::fs::write(path,serde_json::to_vec_pretty(&json!({"images":reports,"changed_entries":changed,"runtime_gameplay_verified":false}))?)?;Ok(())
+}
+
 /// Original TIM uploader through the libgpu LoadImage boundary. GPU queue and
 /// DrawSync are replaced; no display, emulator, or host input is involved.
 fn original_tim_upload(exe:&[u8],raw:&[u8])->Result<legaia_tim::Vram>{
@@ -60,6 +90,9 @@ fn original_tim_member_suffixes()->Result<()>{
 /// dispatcher arms, registrar and pointer fixup. OS/heap/LZS/GPU are explicit
 /// host services. This is bounded CPU simulation, not PS1 runtime/gameplay.
 fn execute_original(exe:&[u8],bundle:&[u8],base:usize,pac:Option<&[u8]>)->Result<Vec<(usize,String)>>{
+    execute_original_allocations(exe,bundle,base,pac,false).map(|v|v.0)
+}
+fn execute_original_allocations(exe:&[u8],bundle:&[u8],base:usize,pac:Option<&[u8]>,all_types:bool)->Result<(Vec<(usize,String)>,Vec<serde_json::Value>)>{
     let load=word(exe,0x18)?;let mut cpu=Cpu::new();cpu.load_delays=true;cpu.strict_alignment=true;
     for(lo,hi)in [(0x80010638u32,0x8001068c),(0x8001f05c,0x8001f69c),(0x80020224,0x80020308),(0x8002541c,0x800255b8),(0x800268dc,0x80026988),(0x80026b4c,0x80026bd8)]{
         let at=0x800+(lo-load)as usize;cpu.load(lo,exe.get(at..at+(hi-lo)as usize).context("SCUS routine missing")?);
@@ -67,7 +100,7 @@ fn execute_original(exe:&[u8],bundle:&[u8],base:usize,pac:Option<&[u8]>)->Result
     ensure!(cpu.rd32(0x80026ba8)==0xac640000 && cpu.rd32(0x800202b4)==0x0c007c17,"Unsupported SCUS loader profile");
     let carrier=0x80400000;cpu.load(carrier,&bundle[base..]);cpu.wr32(0x8007b85c,carrier);cpu.wr32(0x8007b774,5);
     let mut ranges=vec![(carrier,bundle[base..].to_vec())];let mut heap=0x81000000u32;
-    let mut records=vec![];let mut uploads=0;
+    let mut records=vec![];let mut uploads=0;let mut allocations=vec![];
     for phase in 0..2{
         cpu.r[29]=0x807ff000;cpu.r[28]=0x8007b318;cpu.r[31]=0x8ffffffc;
         if phase==0{cpu.r[4]=0;cpu.pc=0x80020224;}else{let mode=cpu.r[2]>>8;if mode==0{break;}cpu.r[4]=mode;cpu.pc=0x8002541c;}
@@ -77,9 +110,9 @@ fn execute_original(exe:&[u8],bundle:&[u8],base:usize,pac:Option<&[u8]>)->Result
             match cpu.pc{
                 0x8001f05c=>{let kind=(cpu.r[5]>>24)as u8;
                     // These dependency installers are NOT claimed verified here.
-                    if !matches!(kind,0|1|2|9|10|15|20){stub=Some(if (3..=8).contains(&kind){1<<(kind-1)}else if kind==11{16}else{0});}
+                    if !all_types&&!matches!(kind,0|1|2|9|10|15|20){stub=Some(if (3..=8).contains(&kind){1<<(kind-1)}else if kind==11{16}else{0});}
                 },
-                0x80017888=>{let size=cpu.r[5]as usize;ensure!(size<16*1024*1024,"Native allocation request too large");let p=heap;heap=heap.checked_add((size as u32+31)&!31).context("Synthetic heap overflow")?;ranges.push((p,vec![0;size]));stub=Some(p);},
+                0x80017888=>{let size=cpu.r[5]as usize;ensure!(size<16*1024*1024,"Native allocation request too large");let p=heap;heap=heap.checked_add((size as u32+31)&!31).context("Synthetic heap overflow")?;ranges.push((p,vec![0;size]));allocations.push(json!({"action":"allocate","size":size,"address":p,"caller":cpu.r[31].wrapping_sub(8)}));stub=Some(p);},
                 0x8001a55c=>{let n=cpu.r[4]as usize;let src=cpu.r[5];let dst=cpu.r[6];
                     let(start,data)=ranges.iter().find(|(s,b)|src>=*s&&((src-*s)as usize)<b.len()).context("LZS source mapping missing")?;
                     let raw=legaia_lzs::decompress(&data[(src-start)as usize..],n)?;cpu.load(dst,&raw);
@@ -95,7 +128,8 @@ fn execute_original(exe:&[u8],bundle:&[u8],base:usize,pac:Option<&[u8]>)->Result
                     ensure!(word(&raw,0)?==0x80000002,"Original registrar received non-TMD");records.push((slot,digest(&raw)));
                 },
                 0x800198e0=>{uploads+=1;ensure!(uploads<16384,"Upload loop budget");stub=Some(0);},
-                0x80058104|0x8005fb84|0x800567a8|0x80017b94|0x8003de7c=>stub=Some(0),
+                0x80017b94=>{allocations.push(json!({"action":"free","address":cpu.r[4],"caller":cpu.r[31].wrapping_sub(8)}));stub=Some(0);},
+                0x8001fbcc|0x80058104|0x8005fb84|0x800567a8|0x8003de7c=>stub=Some(0),
                 _=>{},
             }
             if let Some(v)=stub{cpu.r[2]=v;cpu.pc=cpu.r[31];}else{let instruction=cpu.rd32(cpu.pc);cpu.exec(instruction);}
@@ -103,7 +137,64 @@ fn execute_original(exe:&[u8],bundle:&[u8],base:usize,pac:Option<&[u8]>)->Result
     }
     ensure!(cpu.rd32(0x8007b774)as usize==records.len()+5,"Original registrar final counter disagrees");
     for(slot,_)in &records{ensure!(cpu.rd32(0x8007c018+*slot as u32*4)!=0,"Original registrar failed pointer store");}
-    Ok(records)
+    Ok((records,allocations))
+}
+
+#[test]
+#[ignore="read-only original dispatcher allocation chronology; synthetic allocator, not live heap capacity"]
+fn crash_222_allocation_chronology()->Result<()>{
+    let paths=[("retail",r"D:\Emulators\Games\Legend of Legaia\LegendOfLegaia.img"),("parent",r"D:\AstraRimElmProject\ManualTests\Native_Format_Adapters_20261028_01\LCK_EXPERIMENTAL_MIXED_FORMATS_FIXED.img"),("failing",r"D:\AstraRimElmProject\222.img")];
+    let mut rows=vec![];
+    for(name,path)in paths{let lib=crate::library::Library::open(std::path::Path::new(path))?;let scene=legaia_engine_scene::scene::Scene::load(&lib.index,"town01")?;let entry=scene.field_map_index(&lib.index).context("MAP")?;
+        let b=lib.index.entry_bytes(entry+3)?;let p=lib.index.entry_bytes(entry+4)?;let(base,_)=crate::app::native_asset_plan::scene_registration::native_descriptor_table(&b)?;
+        let(_,ledger)=execute_original_allocations(&lib.executable()?,&b,base,Some(&p),true)?;
+        println!("ALLOCATION {name}: {ledger:?}");rows.push(json!({"image":name,"ledger":ledger,"live_heap_capacity_verified":false}));}
+    let path=std::env::var_os("LCK_ALLOCATION_REPORT").context("new report")?;ensure!(!std::path::Path::new(&path).exists(),"new report");std::fs::write(path,serde_json::to_vec_pretty(&rows)?)?;Ok(())
+}
+
+#[test]
+#[ignore="exact 222 small-buffer carrier through ORIGINAL SCUS, synthetic heap/GPU only"]
+fn exact_222_small_buffer_original_instructions()->Result<()>{
+    use crate::app::native_asset_plan::scene_registration as reg;
+    let lib=crate::library::Library::open(std::path::Path::new(r"D:\AstraRimElmProject\222.img"))?;let scene=legaia_engine_scene::scene::Scene::load(&lib.index,"town01")?;let entry=scene.field_map_index(&lib.index).context("MAP")?;
+    let source=lib.index.entry_bytes(entry+3)?;let pac=lib.index.entry_bytes(entry+4)?;let limits=reg::Limits{max_models:1024,max_decoded:16*1024*1024,max_encoded:16*1024*1024};
+    let(base,_)=reg::native_descriptor_table(&source)?;let exe=lib.executable()?;let(old,old_alloc)=execute_original_allocations(&exe,&source,base,Some(&pac),true)?;
+    let lowered=reg::lower_tim_lists(&source,limits)?;let(base,header)=reg::native_descriptor_table(&lowered)?;
+    let(new,new_alloc)=execute_original_allocations(&exe,&lowered,base,Some(&pac),true)?;
+    ensure!(old==new&&new.len()==119,"Exact model identity/registration changes");
+    ensure!(old_alloc.iter().any(|r|r["action"]=="allocate"&&r["size"]==460800),"Original failure fixture lost giant request");
+    ensure!(!new_alloc.iter().any(|r|r["action"]=="allocate"&&r["size"]==460800),"Giant request remains");
+    let mut uploads=0;for d in header.used(){if d.type_byte==0{let raw=legaia_lzs::decompress(&lowered[base+d.data_offset as usize..],d.size as usize)?;let t=legaia_tim::parse_native_upload(&raw)?;let mut expected=legaia_tim::Vram::new();expected.upload_tim(&t);ensure!(original_tim_upload(&exe,&raw)?.as_u16()==expected.as_u16(),"Original single-TIM GPU words differ");uploads+=1;}}
+    let(_,a)=reg::native_texture_sequence(&source,Some(&pac),limits)?;let(_,b)=reg::native_texture_sequence(&lowered,Some(&pac),limits)?;ensure!(a.as_u16()==b.as_u16(),"Final native ordered VRAM differs");
+    let path=std::env::var_os("LCK_SMALL_STAGING_REPORT").context("new report")?;ensure!(!std::path::Path::new(&path).exists(),"new report");
+    std::fs::write(path,serde_json::to_vec_pretty(&json!({"models":new.len(),"all_native_model_hashes_identical":true,"gpu_words_identical":true,"single_tim_uploads_checked":uploads,"old_allocations":old_alloc,"new_allocations":new_alloc,"heap_allocator_substituted":true,"live_heap_capacity_verified":false,"gameplay_verified":false}))?)?;
+    println!("EXACT 222 ORIGINAL INSTRUCTIONS: 119 model identities retained; {uploads} actual TIM upload bodies checked; 460800-byte temporary request eliminated, single-TIM request71680. No live capacity/gameplay claim.");Ok(())
+}
+
+#[test]
+#[ignore="exact recovered 222 IMG: original loader, all native references and material/character readback; no gameplay"]
+fn exact_222_recovered_candidate_identity()->Result<()>{
+    use crate::app::native_asset_plan::{scene_registration as reg,texture_relocation};
+    let path=std::env::var_os("LCK_CRASH_FIXED_IMG").context("candidate IMG")?;
+    let old=crate::library::Library::open(std::path::Path::new(r"D:\AstraRimElmProject\222.img"))?;let candidate=crate::library::Library::open(std::path::Path::new(&path))?;
+    let scene=legaia_engine_scene::scene::Scene::load(&candidate.index,"town01")?;let entry=scene.field_map_index(&candidate.index).context("MAP")?;
+    ensure!(old.index.entry_bytes(entry)?==candidate.index.entry_bytes(entry)?,"Full user MAP differs");ensure!(old.executable()?==candidate.executable()?,"No engine patch authorized by carrier correction");
+    let b=candidate.index.entry_bytes(entry+3)?;let p=candidate.index.entry_bytes(entry+4)?;let(base,header)=reg::native_descriptor_table(&b)?;
+    ensure!(header.used().iter().all(|d|d.type_byte!=1),"Huge texture staging remains");
+    let tracing=trace(&b,base,Some(&p))?;let(executed,alloc)=execute_original_allocations(&candidate.executable()?,&b,base,Some(&p),true)?;
+    ensure!(tracing.models.len()==119&&executed.len()==tracing.models.len()&&executed.iter().zip(&tracing.models).all(|((slot,h),m)|*slot==m.global_slot&&*h==m.sha256),"Final original loader model identity differs");
+    ensure!(!alloc.iter().any(|a|a["size"]==460800),"Giant transient allocation remains");
+    let limits=reg::Limits{max_models:1024,max_decoded:16*1024*1024,max_encoded:16*1024*1024};let(_,new_vram)=reg::native_texture_sequence(&b,Some(&p),limits)?;
+    let ob=old.index.entry_bytes(entry+3)?;let op=old.index.entry_bytes(entry+4)?;let old_models=reg::native_model_pool(&ob,Some(&op));let(_,old_vram)=reg::native_texture_sequence(&ob,Some(&op),limits)?;
+    ensure!(old_models.len()==tracing.models.len(),"Recovery changed cumulative selector count");
+    let mut samples=0;for(a,b)in old_models.iter().zip(&tracing.models){if a.bytes==b.bytes{continue;}ensure!(texture_relocation::texture_only_model_change(&a.bytes,&b.bytes)?,"User geometry/primitive bytes changed");let(n,changed)=texture_relocation::texture_sample_changes(&a.bytes,&old_vram,&b.bytes,&new_vram)?;ensure!(changed==0,"Intended imported material samples changed");samples+=n;}
+    let raw=candidate.index.entry_bytes(legaia_actor_formats::field_char_textures::PROT_ENTRY_INDEX)?;let textures=legaia_actor_formats::field_char_textures::parse(&raw)?;let mut resident=legaia_tim::Vram::new();textures.upload_to_vram(&mut resident,false);
+    let overwritten=(0..1024*512).filter(|i|resident.is_written(i%1024,i/1024)&&new_vram.is_written(i%1024,i/1024)&&resident.as_u16()[*i]!=new_vram.as_u16()[*i]).count();ensure!(overwritten==0,"Inherited character damage remains");
+    let map=candidate.index.entry_bytes(entry)?;let bindings=scene.field_object_binds(&candidate.index)?;let assembled=legaia_engine_world_views::scene_staging::assemble_field_scene(&candidate.index,"town01").map_err(anyhow::Error::msg)?;
+    ensure!(assembled.env_tmds.len()==119,"Native scene reopen lost registrations");
+    let mut fresh=0;for d in &assembled.placements{ensure!(d.env_slot<tracing.models.len(),"Invalid MAP model reference");if d.env_slot>=117{ensure!(bindings.as_ref().is_none_or(|m|!m.contains_key(&d.anchor)),"Static copy bound to script");let at=0x8000+(d.anchor.1 as usize*128+d.anchor.0 as usize)*2;ensure!(u16::from_le_bytes(map[at..at+2].try_into()?)&0x400==0,"Static bind-owned anchor");let model=&assembled.res.tmds[d.res_tmd].raw;let(_,changed)=texture_relocation::texture_sample_changes(model,&new_vram,model,&assembled.res.vram)?;ensure!(changed==0,"LCK reopen material differs from native upload order");fresh+=1;}}
+    ensure!(fresh==3,"All three static objects must remain represented");
+    println!("RECOVERED 222: full MAP byte-identical; 119 native model identities; 3 static references unbound; {samples} relocated intended samples preserved; 0 resident overwrite words; LCK native reparse/materials passed. Heap/GPU substituted, gameplay NOT verified.");Ok(())
 }
 
 #[test]

@@ -162,7 +162,7 @@ const HEADER_COUNT: u32 = 7;
 /// reads `count` from the file and loops that many descriptors.
 /// Bounded reader storage, not a retail engine limit. The native walker uses
 /// the count word; exports may add a TIM_LIST while retaining the mode flag.
-pub const MAX_DESCRIPTORS: usize = 16;
+pub const MAX_DESCRIPTORS: usize = 256;
 
 /// Smallest `count` word the detector will consider. Below `HEADER_COUNT - 1`
 /// a table is admitted only when it carries a MAN (see [`detect`]); this floor
@@ -207,7 +207,12 @@ pub struct SceneAssetTable {
     pub count: usize,
     /// Per-descriptor `(type_byte, size, data_offset)`. Indices `>= count`
     /// are zero padding (the table is `count`-prefixed, not fixed-7).
+    #[serde(serialize_with = "serialize_descriptor_storage")]
     pub descriptors: [DescriptorRecord; MAX_DESCRIPTORS],
+}
+
+fn serialize_descriptor_storage<S:serde::Serializer>(rows:&[DescriptorRecord;MAX_DESCRIPTORS],serializer:S)->Result<S::Ok,S::Error>{
+    rows.as_slice().serialize(serializer)
 }
 
 impl SceneAssetTable {
@@ -512,7 +517,7 @@ pub fn descriptor_bundle_walk(entry: &[u8]) -> Option<Vec<DescriptorRecord>> {
 /// none; this one only has to be above the corpus maximum (7) by enough that a
 /// buffer whose first word is a small integer cannot walk 1000 descriptors
 /// before failing.
-const MAX_BUNDLE_DESCRIPTORS: usize = 32;
+const MAX_BUNDLE_DESCRIPTORS: usize = MAX_DESCRIPTORS;
 
 /// Byte span each descriptor's payload occupies **on disc**, given the entry
 /// length: descriptor `i` runs from its own `data_offset` to the next

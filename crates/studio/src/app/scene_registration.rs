@@ -23,6 +23,7 @@ use super::texture_relocation::multi_tim::MultiPlan;
 // Existing verified field-loader allocations (scene_asset_table / asset-type).
 const BUNDLE_ARENA:usize=0x62c00;
 const TIM_LIST_BUFFER:usize=0x70800;
+const SINGLE_TIM_BUFFER:usize=0x11800;
 pub(in crate::app) fn validate_stored_extent(size:usize,limits:Limits)->Result<()> {
     export_check!(size<=limits.max_encoded.min(BUNDLE_ARENA),"Sector-rounded native resource exceeds arena/explicit encoded budget");Ok(())
 }
@@ -107,7 +108,8 @@ fn slots_for_scene(source:&[u8],limits:Limits,streamed:bool)->Result<(table::Sce
     export_check!(table.descriptor_size_sum() as usize<=limits.max_decoded && source.len()<=limits.max_encoded.min(BUNDLE_ARENA),"Source bundle exceeds native arena/explicit fixture budgets");
     let mut kinds=BTreeSet::new();let mut out=Vec::new();
     for (i,d) in table.used().iter().enumerate() {
-        export_check!(((1..=7).contains(&d.type_byte)||d.type_byte==9||(streamed&&matches!(d.type_byte,0x0a|0x14))) && kinds.insert(d.type_byte),"Duplicate/unsupported native descriptor");
+        export_check!(((0..=7).contains(&d.type_byte)||d.type_byte==9||(streamed&&matches!(d.type_byte,0x0a|0x14))) && (d.type_byte==0||kinds.insert(d.type_byte)),"Duplicate/unsupported native descriptor");
+        if d.type_byte==0 {kinds.insert(0);export_check!(d.size as usize<=SINGLE_TIM_BUFFER,"Native single-TIM staging buffer exceeded");}
         let start=base+d.data_offset as usize;let end=table.used().get(i+1).map(|d|base+d.data_offset as usize).unwrap_or(source.len());
         if d.type_byte==1 {export_check!(d.size as usize<=TIM_LIST_BUFFER,"Native TIM-list buffer capacity exceeded");}
         export_check!(start>=base+8+table.count*8 && start<end && end<=source.len() && d.size>0,"Invalid native payload boundaries");
@@ -122,7 +124,7 @@ fn slots_for_scene(source:&[u8],limits:Limits,streamed:bool)->Result<(table::Sce
         if d.type_byte==6 {export_check!(decoded==[0,0,0,0],"Active native CLUT walker requires destination runtime-write closure");}
         out.push(Slot{kind:d.type_byte,decoded,stored:stored.to_vec(),suffix:stored[consumed..].to_vec(),declared_size:d.size});
     }
-    export_check!((kinds.contains(&2)||kinds.contains(&9)||streamed) && if streamed{kinds.contains(&0x14)||kinds.contains(&0x0a)}else{kinds.contains(&1)},"Bundle needs native model and texture route");Ok((table,out))
+    export_check!((kinds.contains(&2)||kinds.contains(&9)||streamed) && if streamed{kinds.contains(&0x14)||kinds.contains(&0x0a)}else{kinds.contains(&1)||kinds.contains(&0)},"Bundle needs native model and texture route");Ok((table,out))
 }
 fn members(raw:&[u8])->Result<Vec<Vec<u8>>> {
     let entries=legaia_container_formats::pack::parse_pack(raw)?;
@@ -172,7 +174,9 @@ fn native_tim_members(raw:&[u8])->Result<Vec<Vec<u8>>>{
 /// No scanner order, guessed shared palettes or active CLUT animation.
 pub(in crate::app) fn native_texture_sequence(bundle:&[u8],pac:Option<&[u8]>,limits:Limits)->Result<(Vec<Vec<u8>>,Vram)> {
     let (base,header)=native_descriptor_table(bundle)?;let mut textures=Vec::new();let mut vram=Vram::new();
-    for d in header.used(){if d.type_byte==1{let raw=legaia_lzs::decompress(bundle.get(base+d.data_offset as usize..).context("Native TIM descriptor outside carrier")?,d.size as usize)?;upload_pack(&raw,&mut vram)?;textures.extend(native_tim_members(&raw)?);}}
+    for d in header.used(){if matches!(d.type_byte,0|1){let raw=legaia_lzs::decompress(bundle.get(base+d.data_offset as usize..).context("Native TIM descriptor outside carrier")?,d.size as usize)?;
+        if d.type_byte==1 {upload_pack(&raw,&mut vram)?;textures.extend(native_tim_members(&raw)?);}else{let tim=legaia_tim::parse_native_upload(&raw)?;vram.upload_tim(&tim);textures.push(raw[..tim.byte_extent()].to_vec());}
+    }}
     if let Some(pac)=pac {if native_stream_mode(bundle)==Some(0x0a){upload_pack(pac,&mut vram)?;textures.extend(native_tim_members(pac)?);}else{textures.extend(pac_uploads(pac,&mut vram)?.1);}}
     let _=limits;
     export_check!(!textures.is_empty(),"No verified native texture-upload route");Ok((textures,vram))
@@ -303,11 +307,17 @@ pub(in crate::app) fn register_scene(inventory:&NativeAssetPlan,source:&[u8],pac
             let retained=if stream_models{append_pac_models(pac,&models[original_models.len()..],limits.max_encoded)?}else{pac.to_vec()};
             Some((collision_recipes::digest(pac),retained))
         }else{Some((collision_recipes::digest(pac),bytes))}
-    }else{
-        let ti=ti.context("Missing destination TIM-list")?;
+    }else if let Some(ti)=ti{
         let mut tims=members(&decoded[ti].decoded)?;
         for tim in members(&package.tim_pack)? {legaia_tim::parse_native_upload(&tim)?;if !tims.contains(&tim){tims.push(tim);}}
         decoded[ti].decoded=pack(&tims)?;upload_pack(&decoded[ti].decoded,&mut replay)?;None
+    }else{
+        // Single-TIM descriptor banks need no giant TIM_LIST staging buffer.
+        // Append one temporary list here; final lowering splits it into the
+        // original dispatcher's small-buffer single-TIM arms below.
+        let mut existing=Vec::new();for s in &decoded{if s.kind==0{existing.push(s.decoded.clone());let t=legaia_tim::parse_native_upload(&s.decoded)?;replay.upload_tim(&t);}}
+        let added=members(&package.tim_pack)?.into_iter().filter(|t|!existing.contains(t)).collect::<Vec<_>>();
+        if !added.is_empty(){let data=pack(&added)?;let slot=decoded.len();decoded.push(Slot{kind:1,decoded:data.clone(),stored:vec![],suffix:vec![],declared_size:0});header.count+=1;promoted_tim=Some(slot);upload_pack(&data,&mut replay)?;}None
     };
     if let Some((_,bytes))=&pac_output {validate_stored_extent(bytes.len().div_ceil(2048)*2048,limits)?;}
     export_check!(super::super::naming::material_key(&replay)==super::super::naming::material_key(&relocation.apply(before)?),"Destination native TIM-list replay differs from relocated package; upload policy unresolved");
@@ -338,7 +348,46 @@ pub(in crate::app) fn register_scene(inventory:&NativeAssetPlan,source:&[u8],pac
     let pool=native_model_pool(&output,pac_output.as_ref().map(|p|p.1.as_slice()));export_check!(pool.len()==models.len(),"Native registration count readback failed");
     for (i,raw) in original_models.iter().enumerate(){export_check!(pool[i].bytes==*raw,"Unrelated original model selector shifted");}
     for (id,selector) in &mapping {export_check!(pool[*selector as usize].bytes==incoming[package.model_slots[id] as usize],"New model failed native descriptor lookup");}
+    let output=lower_tim_lists(&output,limits)?;
+    let(_,readback)=native_texture_sequence(&output,pac_output.as_ref().map(|p|p.1.as_slice()),limits)?;
+    anyhow::ensure!(super::super::naming::material_key(&readback)==super::super::naming::material_key(&replay),"Single-TIM lowering changed native upload words");
+    anyhow::ensure!(native_model_pool(&output,pac_output.as_ref().map(|p|p.1.as_slice())).iter().map(|p|&p.bytes).eq(pool.iter().map(|p|&p.bytes)),"Single-TIM lowering changed native model registration order");
     Ok(SceneRegistration{bytes:output,models:mapping,source_sha256:collision_recipes::digest(source),diagnostic,pac:pac_output})
+}
+
+/// The original type-1 decoder mallocs 0x70800 even for a tiny list; type-0
+/// mallocs 0x11800, uploads exactly one TIM, and frees it before the next.
+/// Lower representable lists in place, preserving descriptor/model order,
+/// unmodified stored assets and actual upload words. No engine patch.
+pub(in crate::app) fn lower_tim_lists(source:&[u8],limits:Limits)->Result<Vec<u8>>{
+    let(base,header)=native_descriptor_table(source)?;
+    if !header.used().iter().any(|d|d.type_byte==1){return Ok(source.to_vec());}
+    let(_,slots)=slots_for_scene(source,limits,native_stream_mode(source).is_some())?;
+    let mut output_slots=vec![];let mut lowered=0;
+    for slot in slots{
+        if slot.kind!=1 {output_slots.push(slot);continue;}
+        let tims=members(&slot.decoded)?.into_iter().map(|member|{
+            if legaia_tim::parse_native_upload(&member).is_ok(){Ok(member)}else{Ok(native_tim_members(&pack(&[member])?)?.remove(0))}
+        }).collect::<Result<Vec<_>>>()?;
+        if tims.is_empty()||tims.iter().any(|t|t.len()>SINGLE_TIM_BUFFER){output_slots.push(slot);continue;}
+        lowered+=1;
+        let count=tims.len();for(i,tim)in tims.into_iter().enumerate(){let mut stored=legaia_disc_patch::compress_within(&tim,limits.max_encoded).context("Single-TIM compressed payload budget")?;if i+1==count{stored.extend_from_slice(&slot.suffix);}
+            output_slots.push(Slot{kind:0,declared_size:tim.len()as u32,decoded:tim,stored,suffix:vec![]});
+        }
+    }
+    if lowered==0{return Ok(source.to_vec());}
+    anyhow::ensure!(output_slots.len()<=table::MAX_DESCRIPTORS,"Expanded native descriptor reader storage exceeded");
+    let total=output_slots.iter().map(|s|if matches!(s.kind,10|20){s.declared_size as usize}else{s.decoded.len()}).sum::<usize>();
+    let mut out=source[..base].to_vec();out.resize(base+8+output_slots.len()*8,0);
+    out[base..base+4].copy_from_slice(&(output_slots.len()as u32).to_le_bytes());out[base+4..base+8].copy_from_slice(&(total as u32).to_le_bytes());
+    for(i,slot)in output_slots.iter().enumerate(){let at=base+8+i*8;let offset=out.len()-base;
+        out[at..at+4].copy_from_slice(&table::encode_size_word(slot.kind,if matches!(slot.kind,10|20){slot.declared_size}else{slot.decoded.len()as u32}).to_le_bytes());out[at+4..at+8].copy_from_slice(&(offset as u32).to_le_bytes());
+        out.extend_from_slice(&slot.stored);
+    }
+    out.resize(out.len().div_ceil(2048)*2048,0);
+    validate_stored_extent(out.len(),limits)?;
+    if super::super::ps1_export::unrestricted::active(){super::super::ps1_export::unrestricted::diagnostic(format!("NATIVE STAGING CORRECTION: {lowered} compressed TIM_LIST carriers expanded into ordered single-TIM descriptors; fixed transient request 460800 -> 71680 bytes, freed between uploads. Model identities retained; total {} descriptors. Live heap capacity still unverified",output_slots.len()));}
+    Ok(out)
 }
 
 #[cfg(test)]

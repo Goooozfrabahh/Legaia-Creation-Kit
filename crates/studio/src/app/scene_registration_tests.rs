@@ -1,6 +1,20 @@
 use super::*;
 use super::super::{ResourceKind,texture_relocation::{Planner,multi_tim::{Upload,UploadTrace},tests::{tim,model,register as resource}}};
 fn budgets()->Limits {Limits{max_models:1024,max_decoded:16*1024*1024,max_encoded:16*1024*1024}}
+#[test]
+fn small_native_staging_preserves_order_models_suffixes_and_is_idempotent(){
+    let image_members=(0..24).map(|i|tim(0,i+1)).collect::<Vec<_>>();
+    let geometry=model(0,0,vec![(0,0),(1,0),(0,1)]);
+    let source=typed_bundle(&[(1,pack(&image_members).unwrap()),(2,pack(&[geometry.clone()]).unwrap()),(6,vec![0;4])],0);
+    let lowered=lower_tim_lists(&source,budgets()).unwrap();let(_,table)=native_descriptor_table(&lowered).unwrap();
+    assert_eq!(table.count,26);assert!(table.used()[..24].iter().all(|d|d.type_byte==0&&d.size as usize<=SINGLE_TIM_BUFFER));
+    assert_eq!(lowered.len()%2048,0);let(before,vram_before)=native_texture_sequence(&source,None,budgets()).unwrap();let(after,vram_after)=native_texture_sequence(&lowered,None,budgets()).unwrap();
+    assert_eq!(before,after);assert_eq!(vram_before.as_u16(),vram_after.as_u16());assert_eq!(native_model_pool(&lowered,None)[0].bytes,geometry);
+    assert_eq!(lower_tim_lists(&lowered,budgets()).unwrap(),lowered);
+    let mut oversized=image_members[0].clone();oversized.resize(SINGLE_TIM_BUFFER+4,0x57);
+    let source=typed_bundle(&[(1,pack(&[oversized]).unwrap()),(2,pack(&[geometry]).unwrap())],0);
+    assert_eq!(lower_tim_lists(&source,budgets()).unwrap(),source,"Do not silently truncate an unrepresentable native member suffix");
+}
 fn typed_bundle(records:&[(u8,Vec<u8>)],base:usize)->Vec<u8>{
     let mut out=vec![0x5a;base];out.resize(base+8+records.len()*8,0);out[base..base+4].copy_from_slice(&(records.len() as u32).to_le_bytes());
     out[base+4..base+8].copy_from_slice(&records.iter().map(|(_,r)|r.len() as u32).sum::<u32>().to_le_bytes());
@@ -343,8 +357,11 @@ fn plain_bundle_registration_resolves_native_models_and_preserves_other_slots() 
     let pool=table::mesh_pool(result.bytes());assert_eq!(pool.len(),2);assert_eq!(pool[0].bytes,table::mesh_pool(&source)[0].bytes);
     assert_eq!(field_objects::FIELD_ACTOR_PACK_BIAS+result.selector(&id).unwrap(),6);
     let (_,old)=slots(&source,budgets()).unwrap();let (_,new)=slots(result.bytes(),budgets()).unwrap();
-    for i in 2..7 {assert_eq!(old[i].stored,new[i].stored);assert_eq!(old[i].decoded,new[i].decoded);}
-    assert_eq!(old[0].suffix,new[0].suffix);assert_eq!(old[1].suffix,new[1].suffix);
+    for old_slot in &old[2..7] {let new_slot=new.iter().find(|s|s.kind==old_slot.kind).unwrap();
+        // Sector padding belongs to the final stored span; all original opaque
+        // bytes must remain exact, and only zero alignment bytes may follow.
+        assert!(new_slot.stored.starts_with(&old_slot.stored));assert!(new_slot.stored[old_slot.stored.len()..].iter().all(|b|*b==0));assert_eq!(old_slot.decoded,new_slot.decoded);}
+    assert!(new.iter().any(|s|s.kind==0&&s.suffix==old[0].suffix));assert_eq!(old[1].suffix,new.iter().find(|s|s.kind==2).unwrap().suffix);
     let mut descriptor=[0u8;32];descriptor[18]=4;let updated=result.bind_record(&id,&descriptor).unwrap();
     for i in 0..32 {if i!=16&&i!=17 {assert_eq!(updated[i],descriptor[i]);}}
     let record=field_objects::ObjectRecord::parse(&updated,0).unwrap();let selector=field_objects::pack_mesh_index(4,&record).unwrap();
@@ -360,7 +377,7 @@ fn existing_native_tim_metadata_flags_are_preserved_without_normalization() {
     let mut payloads=old.iter().map(|s|s.decoded.clone()).collect::<Vec<_>>();let mut tims=members(&payloads[0]).unwrap();
     let flags=u32::from_le_bytes(tims[0][4..8].try_into().unwrap())|0x80010000;tims[0][4..8].copy_from_slice(&flags.to_le_bytes());payloads[0]=pack(&tims).unwrap();
     let native=bundle(&payloads);let result=super::register(&inventory,&native,&before,&relocation,budgets()).unwrap();
-    let (_,after)=slots(result.bytes(),budgets()).unwrap();assert_eq!(members(&after[0].decoded).unwrap()[0],tims[0]);
+    let (_,after)=slots(result.bytes(),budgets()).unwrap();assert_eq!(after[0].kind,0);assert_eq!(after[0].decoded,tims[0]);
 }
 #[test]
 fn native_tim_member_suffixes_are_retained_but_not_uploaded() {
@@ -375,7 +392,7 @@ fn native_tim_member_suffixes_are_retained_but_not_uploaded() {
     assert_eq!(crate::app::naming::material_key(&replay),crate::app::naming::material_key(&before));
     let registered=super::register(&inventory,&native,&before,&relocation,budgets()).unwrap();
     let (_,after)=slots(registered.bytes(),budgets()).unwrap();
-    assert_eq!(members(&after[0].decoded).unwrap()[0],tims[0]);
+    assert_eq!(after[0].kind,0);assert_eq!(after[0].decoded,tims[0]);
     let mut pac=table::encode_size_word(0,tims[0].len() as u32).to_le_bytes().to_vec();
     pac.extend_from_slice(&tims[0]);pac.extend_from_slice(&[0;4]);
     let mut uploaded=Vram::new();let (_,uploads)=pac_uploads(&pac,&mut uploaded).unwrap();
@@ -392,7 +409,7 @@ fn oversized_provisional_pac_selects_compressed_carrier_before_budget_check() {
     assert_eq!(result.pac_bytes(),Some(pac.as_slice()));
     assert_eq!(result.selector(&id).unwrap(),1);
     let (_,header)=native_descriptor_table(result.bytes()).unwrap();
-    assert!(header.descriptor_index(1).is_some());
+    assert!(header.descriptor_index(1).is_none());assert!(header.descriptor_index(0).is_some());
     let (_,actual)=native_texture_sequence(result.bytes(),result.pac_bytes(),budgets()).unwrap();
     assert_eq!(crate::app::naming::material_key(&actual),crate::app::naming::material_key(&relocation.apply(&before).unwrap()));
 }

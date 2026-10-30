@@ -127,21 +127,45 @@ pub(in crate::app) fn prepare(source_path:&Path,scene:&AssembledScene,world:&Wor
     let mut disc=DiscPatcher::open(image)?;
     let mut imports=ImportCoverage{requested:world.foreign.len(),written:0};
     let mut object_verification=Vec::new();
+    let mut source_warnings=vec![];
     let doc=attempt("parse exact editor manifest",&mut log,||scene_instances::parse(&overlay,&scene.name,world).map_err(anyhow::Error::msg));
     if let Some(doc)=doc {
         let native=attempt("resolve selected native cell",&mut log,||Scene::load(index,&scene.name));
         if let Some(native)=native {
             if let Some(entry)=native.field_map_index(index).map(|i|i as usize) {
+                match inherited_source_staging(&mut disc,entry,index,&mut log){Ok(Some(w))=>source_warnings.push(w),Ok(None)=>{},Err(e)=>log.push(format!("WARNING Source staging normalization could not be encoded: {e:#}; original resources retained, unrestricted attempts continue"))}
                 compile(&mut disc,entry,scene,world,index,&doc,&mut log,&mut imports,&mut object_verification);
             }else{log.push("FAILED No native MAP writer for selected cell; all requested edits remain unwritten".into());}
         }
     }
     let _=attempt("structural native IMG reparse (not gameplay)",&mut log,||DiscPatcher::open(disc.image().to_vec()));
-    let failed=log.iter().filter(|l|l.starts_with("FAILED ")).cloned().collect::<Vec<_>>();
+    let mut failed=log.iter().filter(|l|l.starts_with("FAILED ")).cloned().collect::<Vec<_>>();
     let written=log.iter().filter(|l|l.starts_with("WRITTEN ")).cloned().collect::<Vec<_>>();
     log.push(format!("IMPORT COVERAGE: {} requested; {} native objects written; {} FAILED IMPORTS. {}",imports.requested,imports.written,imports.failed(),imports.failure_message().unwrap_or_default()));
     log.push(format!("FINAL STATUS: {}. {} successful writer attempts; {} failures. Read all warnings. No claim of complete native behavior or gameplay compatibility.",if failed.is_empty(){"ATTEMPT WRITTEN / DEPENDENCIES UNVERIFIED"}else{"PARTIAL / REQUESTED CHANGES NOT FULLY WRITTEN"},written.len(),failed.len()));
+    failed.extend(source_warnings);
     Ok(NativeExportPlan{dependencies:Default::default(),source:source_path,image:disc.into_image(),patched:written,skipped:failed,continuation_receipt:None,unrestricted_log:Some(log.join("\n")),imports:Some(imports),object_verification})
+}
+
+fn inherited_source_staging(disc:&mut DiscPatcher,entry:usize,index:&ProtIndex,log:&mut Vec<String>)->Result<Option<String>>{
+    use crate::app::native_asset_plan::scene_registration as reg;
+    let limits=reg::Limits{max_models:u16::MAX as usize-field_objects::FIELD_ACTOR_PACK_BIAS as usize,max_decoded:usize::MAX,max_encoded:usize::MAX};
+    let source=disc.read_entry_footprint(entry+3)?;let pac=reg::native_stream_mode(&source).map(|_|disc.read_entry_footprint(entry+4)).transpose()?;
+    let(_,vram)=reg::native_texture_sequence(&source,pac.as_deref(),limits)?;
+    let raw=index.entry_bytes(legaia_actor_formats::field_char_textures::PROT_ENTRY_INDEX)?;let textures=legaia_actor_formats::field_char_textures::parse(&raw)?;let mut resident=legaia_tim::Vram::new();textures.upload_to_vram(&mut resident,false);
+    let conflicts=(0..1024*512).filter(|i|resident.is_written(i%1024,i/1024)&&vram.is_written(i%1024,i/1024)&&resident.as_u16()[*i]!=vram.as_u16()[*i]).count();
+    let warning=(conflicts>0).then(||format!("MISSING NATIVE DEPENDENCY: INHERITED SOURCE RESOURCE CONFLICT — {conflicts} field-character resident words differ under source scene uploads before new edits. Protecting new allocations does not repair these existing upload destinations. Source retained; use a resource-identity-verified corrected parent to preserve scene edits."));
+    if let Some(w)=&warning{log.push(format!("WARNING {w}"));}
+    let normalized=reg::lower_tim_lists(&source,limits)?;
+    if normalized!=source{
+        let(_,after)=reg::native_texture_sequence(&normalized,pac.as_deref(),limits)?;
+        anyhow::ensure!(super::super::naming::material_key(&after)==super::super::naming::material_key(&vram),"Source normalization altered GPU words");
+        anyhow::ensure!(reg::native_model_pool(&source,pac.as_deref()).iter().map(|m|&m.bytes).eq(reg::native_model_pool(&normalized,pac.as_deref()).iter().map(|m|&m.bytes)),"Source normalization changed model identities");
+        let mut staged=DiscPatcher::open(disc.image().to_vec())?;
+        if normalized.len()as u64>disc.entry_footprint(entry+3).context("Source footprint")?{staged.grow_prot_entries(&std::collections::BTreeMap::from([(entry+3,normalized)]))?;}else{staged.patch_prot_entry(entry+3,0,&normalized)?;}
+        *disc=staged;log.push(format!("WRITTEN SOURCE STAGING: native resource PROT {} converted from 460800-byte TIM_LIST temporary allocations to ordered 71680-byte single-TIM allocations; source model bytes/selector order and uploaded pixels unchanged. Not a live heap certificate",entry+3));
+    }
+    Ok(warning)
 }
 
 fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldModel,index:&ProtIndex,doc:&scene_instances::SceneDocument,log:&mut Vec<String>,coverage:&mut ImportCoverage,reports:&mut Vec<serde_json::Value>){
@@ -409,6 +433,10 @@ pub(super) fn publish(plan:NativeExportPlan,output:&Path)->Result<ExportResult>{
     skipped.push(format!("UNRESTRICTED EXPERIMENT — NOT PROVEN COMPLETE. Full debug.txt: {}; per-object report: {}",debug.display(),verification.display()));
     Ok(ExportResult{path:output,patched:plan.patched,skipped,imports:plan.imports})
 }
+
+#[cfg(test)]
+#[path="native_crash222_tests.rs"]
+mod crash_tests;
 
 #[cfg(test)]
 mod tests {

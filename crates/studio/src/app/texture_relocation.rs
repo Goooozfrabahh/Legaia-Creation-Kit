@@ -66,6 +66,15 @@ pub(in crate::app) fn texture_sample_changes(a:&[u8],av:&Vram,b:&[u8],bv:&Vram)-
     }Ok((samples,changed))
 }
 
+#[cfg(test)]
+pub(in crate::app) fn texture_only_model_change(a:&[u8],b:&[u8])->Result<bool>{
+    fn masked(raw:&[u8])->Result<Vec<u8>>{let mut copy=raw.to_vec();for r in references(raw)?{
+        for start in [r.at+2,r.at+6]{copy[start..start+2].fill(0);}
+        for(i,_)in r.uvs.iter().enumerate(){let start=r.at+[0,4,8,10][i];copy[start..start+2].fill(0);}
+    }Ok(copy)}
+    Ok(masked(a)?==masked(b)?)
+}
+
 fn references(raw:&[u8])->Result<Vec<Reference>> {
     let tmd=legaia_tmd::parse(raw)?;
     let table_end=legaia_tmd::HEADER_SIZE+tmd.objects.len()*legaia_tmd::OBJECT_SIZE;
