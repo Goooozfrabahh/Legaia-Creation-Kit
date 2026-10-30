@@ -8,6 +8,35 @@ const RECOVERED:&str=r"D:\AstraRimElmProject\ManualTests\Runtime_Compatibility_2
 const FAILED:&str=r"D:\AstraRimElmProject\222.img";
 
 #[test]
+#[ignore="exact user full scene, retire only deleted appended assets, no engine patch or emulator"]
+fn full_scene_retired_import_storage_candidate()->Result<()>{
+    let output=PathBuf::from(std::env::var_os("LCK_RETIRED_IMPORT_IMG").context("new candidate IMG")?);ensure!(!output.exists(),"New output required");
+    let source=r"D:\AstraRimElmProject\ManualTests\Crash222_Matrix_20261029_02\E_FULL_USER_SCENE_RECOVERED_SOURCE.img";
+    let baseline=r"D:\AstraRimElmProject\ManualTests\M2_StageE_20261027_01\LCK_EXPERIMENTAL_STAGE_E_town01_floor_x37_z18.img";
+    let parent=crate::library::Library::open(Path::new(PARENT))?;let scene=legaia_engine_world_views::scene_staging::assemble_field_scene(&parent.index,"town01").map_err(anyhow::Error::msg)?;let world=world_view::build_world(&scene,&parent.index);
+    let text=std::fs::read_to_string(r"D:\AstraRimElmProject\ManualTests\Crash222_20261029_01\222-full-scene-preserved.lckscene")?;let doc=scene_instances::parse(&text,"town01",&world).map_err(anyhow::Error::msg)?;
+    let entry=Scene::load(&parent.index,"town01")?.field_map_index(&parent.index).context("MAP")?as usize;
+    let old_parent=DiscPatcher::open(std::fs::read(PARENT)?)?;let pm=old_parent.read_entry_footprint(entry)?;
+    let mut requested=std::collections::BTreeSet::new();for key in &doc.hidden{let c=super::source(&scene,*key)?;let id=id_at(&pm,c)?;let rec=ObjectRecord::parse(&pm,id).context("Deleted source record")?;requested.insert(field_objects::pack_mesh_index(id as u16,&rec).context("Deleted model")?as usize);}
+    let base=DiscPatcher::open(std::fs::read(baseline)?)?;let original=DiscPatcher::open(std::fs::read(source)?)?;
+    ensure!(base.read_named_file("SCUS_942.54")==original.read_named_file("SCUS_942.54"),"Baseline engine profile changed");
+    for i in 0..base.entry_count(){if ![entry,entry+3,entry+4].contains(&i){ensure!(base.read_entry_footprint(i)?==original.read_entry_footprint(i)?,"Baseline dependency PROT {i} changed");}}
+    let bb=base.read_entry_footprint(entry+3)?;let bp=base.read_entry_footprint(entry+4)?;let b=original.read_entry_footprint(entry+3)?;let p=original.read_entry_footprint(entry+4)?;let map=original.read_entry_footprint(entry)?;
+    let limits=reg::Limits{max_models:1024,max_decoded:16*1024*1024,max_encoded:16*1024*1024};
+    let retired=reg::prove_retirable_additions(&bb,Some(&bp),&b,Some(&p),&map,&requested,limits)?;ensure!(retired==requested&&!retired.is_empty(),"Deleted model still shared or unresolved");
+    let(new_bundle,new_pac,saved)=reg::retire_model_storage(&b,Some(&p),&retired,limits)?;
+    let lib=crate::library::Library::open(Path::new(source))?;let exe=lib.executable()?;let(old_base,_)=reg::native_descriptor_table(&b)?;let(new_base,_)=reg::native_descriptor_table(&new_bundle)?;
+    let(old_ids,_)=crate::app::native_loader_trace::tests::execute_original_allocations(&exe,&b,old_base,Some(&p),true)?;
+    let(new_ids,_)=crate::app::native_loader_trace::tests::execute_original_allocations(&exe,&new_bundle,new_base,new_pac.as_deref(),true)?;
+    ensure!(old_ids.len()==new_ids.len(),"Selector count changed");for(i,(a,z))in old_ids.iter().zip(&new_ids).enumerate(){if !retired.contains(&i){ensure!(a==z,"Unrelated original-engine model identity changed at {i}");}}
+    let mut disc=DiscPatcher::open(original.image().to_vec())?;disc.patch_prot_entry(entry+3,0,&new_bundle)?;if let Some(pac)=new_pac{disc.patch_prot_entry(entry+4,0,&pac)?;}
+    for i in 0..disc.entry_count(){if ![entry+3,entry+4].contains(&i){ensure!(disc.read_entry_footprint(i)?==original.read_entry_footprint(i)?,"Candidate changed MAP/collision/floor/dependency {i}");}}
+    let log=format!("DELETED IMPORT STORAGE RETIREMENT: baseline {baseline}; requested deleted model selectors {requested:?}, retired {retired:?}; {saved} persistent native bytes reclaimed. Original selectors retained with zero-object TMD tombstones; no unrelated model renumbered. All user MAP/collision/floor/transform data, SCUS and texture uploads unchanged. This does not repair stale collision ownership or prove gameplay. Native binding resources match baseline; dynamic/script behavior remains unverified.");
+    let plan=NativeExportPlan{dependencies:Default::default(),source:source.into(),image:disc.into_image(),patched:vec![log.clone()],skipped:vec!["GAMEPLAY UNVERIFIED: exact user layout retained; stale collision ownership remains unresolved".into()],continuation_receipt:None,unrestricted_log:Some(log),imports:None,object_verification:vec![]};
+    super::super::export(plan,&output)?;println!("RETIRED {retired:?}: {saved} persistent bytes saved; native identities/MAP/texture readback passed");Ok(())
+}
+
+#[test]
 #[ignore="full preserved scene allocation/free/caller trace; create-only IMG, user operates emulator"]
 fn full_scene_heap_caller_trace()->Result<()>{
     let output=PathBuf::from(std::env::var_os("LCK_HEAP_TRACE_IMG").context("new trace IMG")?);ensure!(!output.exists(),"New path required");

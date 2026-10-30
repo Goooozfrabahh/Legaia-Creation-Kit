@@ -20,6 +20,63 @@ fn free_ring(cpu:&Cpu)->Result<(usize,usize)>{
 }
 
 #[test]
+#[ignore="original-allocator forecast through observed failure with R7 resource sizes; no gameplay claim"]
+fn replay_retired_resource_heap()->Result<()>{
+    use crate::app::native_asset_plan::scene_registration as reg;
+    let root=std::path::Path::new(r"D:\AstraRimElmProject\ManualTests\RuntimeRecovery_20261030_01");
+    let output=std::path::PathBuf::from(std::env::var_os("LCK_R7_HEAP_REPORT").context("new report")?);ensure!(!output.exists(),"New report required");
+    let old=crate::library::Library::open(std::path::Path::new(r"D:\AstraRimElmProject\ManualTests\Crash222_Matrix_20261029_02\E_FULL_USER_SCENE_RECOVERED_SOURCE.img"))?;
+    let new=crate::library::Library::open(&root.join("R7_FULL_SCENE_DELETED_RESOURCE_RETIREMENT.img"))?;
+    let entry=legaia_engine_scene::scene::Scene::load(&old.index,"town01")?.field_map_index(&old.index).context("MAP")?;let exe=old.executable()?;
+    let mut plans=vec![];for lib in [&old,&new]{let b=lib.index.entry_bytes(entry+3)?;let p=lib.index.entry_bytes(entry+4)?;let(base,_)=reg::native_descriptor_table(&b)?;let(_,a)=execute_original_allocations(&exe,&b,base,Some(&p),true)?;plans.push(a.into_iter().filter(|e|e["action"]=="allocate").collect::<Vec<_>>());}
+    ensure!(plans[0].len()==plans[1].len(),"Allocation structure changed");let changes=plans[0].iter().zip(&plans[1]).filter_map(|(a,b)|{assert_eq!(a["caller"],b["caller"]);(a["size"]!=b["size"]).then_some((a["caller"].as_u64().unwrap()+8,a["size"].as_u64().unwrap(),b["size"].as_u64().unwrap()))}).collect::<Vec<_>>();
+    ensure!(changes.len()==1&&changes[0].1>changes[0].2,"Expected one smaller persistent resource allocation");
+    let input:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("R6-user-freeze-analysis.json"))?)?;let log=std::fs::read_to_string(root.join("R6-user-freeze.log"))?;let start=log.lines().position(|l|l.contains("map name town01")).context("Observed scene")?+1;
+    let mut cpu=Cpu::new();cpu.load_delays=true;cpu.strict_alignment=true;for(lo,hi)in [(0x80017888u32,0x800178f0),(0x80017b94,0x80017bec),(0x8002b3d4,0x8002b688)]{let at=0x800+(lo-0x80010000)as usize;cpu.load(lo,&exe[at..at+(hi-lo)as usize]);}cpu.r[6]=0x134800;heap_call(&mut cpu,0x8002b3d4,2,0x80091800)?;
+    let mut pointers=std::collections::BTreeMap::new();let mut rows=vec![];let mut substitutions=0;
+    for e in input["heap_events"].as_array().context("events")?.iter().filter(|e|e["line"].as_u64().unwrap_or(0)>=start as u64){let first=e["first_word"].as_u64().context("word")?;let caller=e["caller_return_address"].as_u64().context("caller")?;
+        if e["action"]=="HEAP"{let mut size=first;for(c,a,b)in &changes{if caller==*c&&size==*a{size=*b;substitutions+=1;}}
+            let actual=heap_call(&mut cpu,0x80017888,0,size as u32)?;ensure!(actual!=0,"Candidate still fails allocation {size} at {caller:#x}");let observed=e["second_word"].as_u64().context("pointer")?;
+            if observed!=0{pointers.insert(observed,actual);}rows.push(json!({"line":e["line"],"caller_ra":caller,"original_bytes":first,"candidate_bytes":size,"returned":actual,"original_failed":observed==0,"free_after":free_ring(&cpu)?.0}));
+        }else{let actual=pointers.remove(&first).context("Free without observed allocation")?;heap_call(&mut cpu,0x80017b94,actual,0)?;}
+    }
+    ensure!(substitutions==1,"Native size change did not map uniquely to live request");let free=free_ring(&cpu)?;
+    std::fs::write(output,serde_json::to_vec_pretty(&json!({"schema":1,"candidate":"R7","original_live_sequence_reproduced_separately":true,"native_request_size_changes":changes,"all_allocations_through_observed_failure_succeed":true,"remaining_free":free.0,"largest_free":free.1,"events":rows,"native_gameplay_verified":false,"limitation":"Forecast uses observed R6 control flow through failure; allocations or behavior after that point require manual gameplay verification"}))?)?;Ok(())
+}
+
+#[test]
+#[ignore="replay exact user R6 allocation results through original heap; no emulator"]
+fn replay_user_r6_heap_failure()->Result<()>{
+    let root=std::path::Path::new(r"D:\AstraRimElmProject\ManualTests\RuntimeRecovery_20261030_01");
+    let output=std::path::PathBuf::from(std::env::var_os("LCK_R6_REPLAY_REPORT").context("new report")?);ensure!(!output.exists(),"New evidence path required");
+    let log=std::fs::read_to_string(root.join("R6-user-freeze.log"))?;
+    let start=log.lines().position(|l|l.contains("map name town01")).context("Observed town01 transition")?+1;
+    let input:serde_json::Value=serde_json::from_slice(&std::fs::read(root.join("R6-user-freeze-analysis.json"))?)?;
+    let exe=std::fs::read(r"D:\AstraRimElmProject\assets\SCUS_942.54")?;let mut cpu=Cpu::new();cpu.load_delays=true;cpu.strict_alignment=true;
+    for(lo,hi)in [(0x80017888u32,0x800178f0),(0x80017b94,0x80017bec),(0x8002b3d4,0x8002b688)]{let at=0x800+(lo-0x80010000)as usize;cpu.load(lo,&exe[at..at+(hi-lo)as usize]);}
+    cpu.r[6]=0x134800;heap_call(&mut cpu,0x8002b3d4,2,0x80091800)?;
+    let mut rows=vec![];let mut failures=0;
+    for e in input["heap_events"].as_array().context("heap events")?.iter().filter(|e|e["line"].as_u64().unwrap_or(0)>=start as u64){
+        let before=free_ring(&cpu)?;let first=e["first_word"].as_u64().context("first word")?as u32;
+        if e["action"]=="HEAP"{
+            let actual=heap_call(&mut cpu,0x80017888,0,first)?;let observed=e["second_word"].as_u64().context("observed result")?as u32;
+            ensure!(actual==observed,"Original allocator replay differs at log line {}: actual {actual:#x}, observed {observed:#x}",e["line"]);
+            if actual==0{failures+=1;ensure!(first==8368&&e["caller_return_address"].as_u64()==Some(0x8001f71c),"Different native failure");}
+            rows.push(json!({"line":e["line"],"action":"allocate","bytes":first,"returned":actual,"caller_ra":e["caller_return_address"],"free_before":before.0,"largest_before":before.1,"free_after":free_ring(&cpu)?.0,"largest_after":free_ring(&cpu)?.1}));
+        }else{heap_call(&mut cpu,0x80017b94,first,0)?;rows.push(json!({"line":e["line"],"action":"free","pointer":first,"free_after":free_ring(&cpu)?.0,"largest_after":free_ring(&cpu)?.1}));}
+    }
+    ensure!(failures==1,"Expected exact observed failure");
+    let lib=crate::library::Library::open(std::path::Path::new(r"D:\AstraRimElmProject\ManualTests\Crash222_Matrix_20261029_02\E_FULL_USER_SCENE_RECOVERED_SOURCE.img"))?;
+    let entry=legaia_engine_scene::scene::Scene::load(&lib.index,"town01")?.field_map_index(&lib.index).context("MAP")?;
+    let b=lib.index.entry_bytes(entry+3)?;let p=lib.index.entry_bytes(entry+4)?;let models=crate::app::native_asset_plan::scene_registration::native_model_pool(&b,Some(&p));
+    let mut audit=vec![];
+    for(i,m)in models.iter().enumerate(){let t=legaia_tmd::parse(&m.bytes)?;let used=12+t.objects.len()*28+t.stats().total_bytes_consumed;
+        let normal_unique=t.objects.iter().map(|o|o.normals.iter().map(|v|(v.x,v.y,v.z,v._pad)).collect::<std::collections::BTreeSet<_>>().len()).sum::<usize>();
+        audit.push(json!({"selector":i,"stored":m.bytes.len(),"structural_sections_sum":used,"normals":t.stats().total_normals,"unique_normals_per_group":normal_unique,"sha256":digest(&m.bytes)}));}
+    std::fs::write(output,serde_json::to_vec_pretty(&json!({"schema":1,"evidence":"original allocator instructions reproduce EVERY logged allocation address and the observed failure","all_observed_addresses_match":true,"heap_bytes":0x134800,"events":rows,"models":audit,"native_gameplay_fixed":false}))?)?;Ok(())
+}
+
+#[test]
 #[ignore="historical user RAM fixture and exact IMGs; original allocator only, no live emulator"]
 fn original_heap_recovery_matrix()->Result<()>{
     let output=std::path::PathBuf::from(std::env::var_os("LCK_HEAP_RECOVERY_REPORT").context("new report path")?);

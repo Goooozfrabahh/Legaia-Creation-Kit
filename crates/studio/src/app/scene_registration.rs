@@ -137,6 +137,60 @@ fn pack(items:&[Vec<u8>])->Result<Vec<u8>> {
     for (i,item) in items.iter().enumerate(){export_check!(out.len()/4<=u32::MAX as usize,"Pack offset overflow");let word=(out.len()/4) as u32;out[4+i*4..8+i*4].copy_from_slice(&word.to_le_bytes());out.extend_from_slice(item);while out.len()%4!=0{out.push(0);}}
     export_check!(members(&out)?==items,"Native pack rewrite changed existing member bytes");Ok(out)
 }
+
+/// Retire proven editor-owned, unreferenced model storage without renumbering
+/// any selector. The caller must establish ownership/dependency closure; this
+/// container writer never decides ownership from location or mesh bounds.
+pub(in crate::app) fn retire_model_storage(source:&[u8],pac:Option<&[u8]>,retired:&BTreeSet<usize>,limits:Limits)->Result<(Vec<u8>,Option<Vec<u8>>,usize)>{
+    if retired.is_empty(){return Ok((source.to_vec(),pac.map(<[u8]>::to_vec),0));}
+    let before=native_model_pool(source,pac);anyhow::ensure!(retired.iter().all(|i|*i<before.len()),"Retired selector outside bank");
+    let tombstone=[0x80000002u32,0,0].into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+    let mut selector=0usize;let mut saved=0usize;
+    let mut rewrite=|kind:u8,raw:&[u8]|->Result<Option<Vec<u8>>>{
+        if !matches!(kind,2|9){return Ok(None);}
+        let mut models=if kind==2{members(raw)?}else{vec![raw.to_vec()]};let mut changed=false;
+        for model in &mut models{if retired.contains(&selector){anyhow::ensure!(model.len()>=12,"Truncated retired TMD");saved+=model.len()-12;*model=tombstone.clone();changed=true;}selector+=1;}
+        Ok(if changed{Some(if kind==2{pack(&models)?}else{models.remove(0)})}else{None})
+    };
+    let (base,_)=native_descriptor_table(source)?;
+    let (_,mut entries)=slots_for_scene(source,limits,native_stream_mode(source).is_some())?;
+    for slot in &mut entries{if let Some(raw)=rewrite(slot.kind,&slot.decoded)?{slot.decoded=raw;slot.declared_size=slot.decoded.len()as u32;slot.stored=legaia_lzs::compress(&slot.decoded);slot.stored.extend_from_slice(&slot.suffix);}}
+    let mut output=source[..base].to_vec();output.resize(base+8+entries.len()*8,0);
+    output[base..base+4].copy_from_slice(&(entries.len()as u32).to_le_bytes());
+    let total=entries.iter().try_fold(0u32,|sum,s|sum.checked_add(s.declared_size).context("Bundle size overflow"))?;
+    output[base+4..base+8].copy_from_slice(&total.to_le_bytes());
+    for(i,slot)in entries.iter().enumerate(){let at=base+8+i*8;output[at..at+4].copy_from_slice(&table::encode_size_word(slot.kind,slot.declared_size).to_le_bytes());let offset=output.len()-base;output[at+4..at+8].copy_from_slice(&(offset as u32).to_le_bytes());output.extend_from_slice(&slot.stored);}
+    let pac_output=if let Some(p)=pac{if native_stream_mode(source)==Some(20){let mut at=0;let mut out=vec![];
+        loop{let ts=u32::from_le_bytes(p.get(at..at+4).context("PAC terminator")?.try_into()?);let size=(ts&0xffffff)as usize;if size==0{out.extend_from_slice(&p[at..]);break;}anyhow::ensure!(size%4==0,"Unaligned native PAC");let raw=p.get(at+4..at+4+size).context("PAC body")?;
+            if let Some(new)=rewrite((ts>>24)as u8,raw)?{out.extend_from_slice(&table::encode_size_word((ts>>24)as u8,new.len()as u32).to_le_bytes());out.extend(new);}else{out.extend_from_slice(&p[at..at+4+size]);}at+=4+size;}
+        Some(out)
+    }else{Some(p.to_vec())}}else{None};
+    anyhow::ensure!(selector==before.len(),"Model carrier walk differs from native bank");
+    let after=native_model_pool(&output,pac_output.as_deref());anyhow::ensure!(after.len()==before.len(),"Retirement renumbered native selectors");
+    for(i,(old,new))in before.iter().zip(&after).enumerate(){anyhow::ensure!(new.bytes==if retired.contains(&i){&tombstone[..]}else{&old.bytes[..]},"Retirement changed unrelated model {i}");}
+    let (_,a)=native_texture_sequence(source,pac,limits)?;let(_,b)=native_texture_sequence(&output,pac_output.as_deref(),limits)?;anyhow::ensure!(a.as_u16()==b.as_u16(),"Model retirement changed texture uploads");
+    Ok((output,pac_output,saved))
+}
+
+/// Evidence for retiring resources introduced after an explicitly supplied
+/// baseline. Never infer ownership of original bank slots. Only requested
+/// deletions with no remaining MAP references are eligible; shared models stay.
+pub(in crate::app) fn prove_retirable_additions(baseline:&[u8],baseline_pac:Option<&[u8]>,current:&[u8],current_pac:Option<&[u8]>,map:&[u8],requested:&BTreeSet<usize>,limits:Limits)->Result<BTreeSet<usize>>{
+    let original=native_model_pool(baseline,baseline_pac);let now=native_model_pool(current,current_pac);
+    anyhow::ensure!(!original.is_empty()&&now.len()>=original.len(),"Baseline is not an original model-bank prefix");
+    anyhow::ensure!(original.iter().zip(&now).all(|(a,b)|a.bytes==b.bytes),"Baseline model prefix changed; no inferred retirement");
+    fn scripts(bundle:&[u8],pac:Option<&[u8]>,limits:Limits)->Result<Vec<(u8,Vec<u8>)>>{
+        let(_,slots)=slots_for_scene(bundle,limits,native_stream_mode(bundle).is_some())?;let mut out=slots.into_iter().filter(|s|matches!(s.kind,3..=8|11)).map(|s|(s.kind,s.decoded)).collect::<Vec<_>>();
+        if native_stream_mode(bundle)==Some(20){let p=pac.context("Baseline PAC missing")?;let mut at=0;loop{let ts=u32::from_le_bytes(p.get(at..at+4).context("PAC header")?.try_into()?);let n=(ts&0xffffff)as usize;if n==0{break;}let raw=p.get(at+4..at+4+n).context("PAC extent")?;let kind=(ts>>24)as u8;if matches!(kind,3..=8|11){out.push((kind,raw.to_vec()));}at+=4+(n&!3);}}
+        Ok(out)
+    }
+    anyhow::ensure!(scripts(baseline,baseline_pac,limits)?==scripts(current,current_pac,limits)?,"MAN/MES/MOVE/VDF/CLUT resources differ from baseline; script/model closure requires another adapter");
+    anyhow::ensure!(map.len()>=0x10000,"Truncated field MAP");let mut used=BTreeSet::new();
+    for word in map[field_objects::OBJECT_GRID_OFFSET..0x10000].chunks_exact(2){let id=u16::from_le_bytes([word[0],word[1]])&field_objects::OBJECT_INDEX_MASK;
+        let rec=field_objects::ObjectRecord::parse(map,id as usize).context("MAP descriptor")?;if let Some(index)=field_objects::pack_mesh_index(id,&rec){used.insert(index as usize);}}
+    anyhow::ensure!(requested.iter().all(|i|*i>=original.len()&&*i<now.len()),"Requested retirement includes baseline-owned/out-of-range resource");
+    Ok(requested.difference(&used).copied().collect())
+}
 fn upload_pack(raw:&[u8],vram:&mut Vram)->Result<()> {
     // These are descriptor-declared retail TIMs, not arbitrary scanner hits.
     // The native decoder accepts their upper flag metadata; preserve it raw.

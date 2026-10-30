@@ -1,5 +1,61 @@
 # 222.img crash investigation and reversible recovery
 
+## R6 failure reproduced; R7 resource-retirement candidate
+
+**User result:** R7 works in gameplay; the moved imported object still leaves
+collision at its original exported location, while duplicates retain collision.
+The user did not separately confirm face textures. `R7-user-gameplay.log` is
+preserved and reaches game mode without the earlier allocation error. Native
+loading recovery is user-verified; complete collision/interaction is not.
+The current priority is source collision contribution ownership and relocation.
+
+The R6 user log is preserved as `RuntimeRecovery_20261030_01\R6-user-freeze.log`.
+The failed caller is **0x8001F714**, the second ordering-table allocation in
+`FUN_8001F690`. The preceding 176128-byte primitive-packet allocation succeeds,
+then the first 8368-byte OT succeeds. Only 7872 bytes remain (one contiguous free
+block); the next 8368-byte request also needs a 12-byte heap header. The deficit
+is **508 bytes**, not evidence of a TIM-upload hang or fragmentation at that point.
+
+`replay_user_r6_heap_failure` executes the original heap initializer, allocator
+and free instructions. It reproduces **every logged allocation address** after
+the town01 transition and the final NULL return. Its report is
+`RuntimeRecovery_20261030_01\R6-original-heap-replay.json`.
+
+The full scene still allocates the geometry of the two imported objects the
+user deleted. The reusable native container writer `retire_model_storage`
+replaces explicitly retired TMDs with valid zero-object TMD records, preserving
+their registered selector numbers. It supports compressed packs/single models,
+prefixed descriptor tables, and streamed PAC packs/single models. All remaining
+model bytes and ordered VRAM upload words are checked unchanged. No engine
+patch, heap expansion, primitive-budget reduction, or selector renumbering occurs.
+
+The R7 fixture derives requested deletions from the preserved user manifest and
+the original parent scene, not fixed IDs in production code. Baseline checks
+protect every original model, require identical MAN/MES/MOVE/VDF/CLUT data, and
+retain models with any remaining MAP reference. This exact reconstruction also
+compares SCUS and every unrelated PROT dependency against the preserved Stage E
+baseline. It retires the two deleted appended resources at selectors114/115,
+reclaiming **15448 bytes**. Four duplicates, three new imports, rotation/movement,
+all MAP bytes, collision, floors and texture uploads remain unchanged.
+
+`R7_FULL_SCENE_DELETED_RESOURCE_RETIREMENT.img` SHA256:
+`74a48294df8dfcedaec0ab2e515f7ca27b71960b15dc9d27c049c7b44956275c`.
+Original SCUS instruction simulation verifies unchanged identities for every
+remaining model and unchanged registry count. The resource pack request drops
+from322740 to307292 bytes. `replay_retired_resource_heap` substitutes that one
+verified native request size into the observed R6 allocation/free history,
+relocating free pointers through the original allocator. All allocations through
+the observed failure now succeed, leaving14940 bytes. This is a forecast through
+that point, **not verification of later gameplay allocations or behavior**.
+
+The user has been asked to cold-boot R7 with the same save/logging, walk30 seconds
+and inspect Vahn's face. This is the current correction candidate, superseding
+additional blind diagnostic matrix runs. Latest Build remains e082867 pending
+manual acceptance. The retirement subsystem is not automatically wired into GUI
+exports without baseline/provenance evidence; that integration remains work.
+Stale collision after moving/deleting inherited imports remains unresolved and
+is not removed by guessed proximity or by this resource-storage correction.
+
 ## R5 native evidence received 2026-10-30
 
 The user cold-booted R5 and reported a freeze. The preserved log is

@@ -2,6 +2,30 @@ use super::*;
 use super::super::{ResourceKind,texture_relocation::{Planner,multi_tim::{Upload,UploadTrace},tests::{tim,model,register as resource}}};
 fn budgets()->Limits {Limits{max_models:1024,max_decoded:16*1024*1024,max_encoded:16*1024*1024}}
 #[test]
+fn deleted_resource_retirement_preserves_selectors_shared_references_and_script_evidence(){
+    let original=model(0,0,vec![(0,0),(1,0),(0,1)]);let added=model(0,0,vec![(0,0),(2,0),(0,2)]);
+    let base=typed_bundle(&[(1,pack(&[tim(0,31)]).unwrap()),(2,pack(&[original.clone()]).unwrap()),(3,vec![1,2,3,4]),(6,vec![0;4])],0);
+    let current=typed_bundle(&[(1,pack(&[tim(0,31)]).unwrap()),(2,pack(&[original.clone(),added.clone()]).unwrap()),(3,vec![1,2,3,4]),(6,vec![0;4])],0);
+    let requested=BTreeSet::from([1]);let mut map=vec![0;0x12000];
+    let eligible=prove_retirable_additions(&base,None,&current,None,&map,&requested,budgets()).unwrap();assert_eq!(eligible,requested);
+    let (out,_,saved)=retire_model_storage(&current,None,&eligible,budgets()).unwrap();let bank=native_model_pool(&out,None);assert_eq!(bank.len(),2);assert_eq!(bank[0].bytes,original);assert_eq!(bank[1].bytes.len(),12);assert_eq!(saved,added.len()-12);
+    map[128+16..128+18].copy_from_slice(&1u16.to_le_bytes());map[128+18..128+20].copy_from_slice(&6u16.to_le_bytes());map[0x8000..0x8002].copy_from_slice(&4u16.to_le_bytes());
+    assert!(prove_retirable_additions(&base,None,&current,None,&map,&requested,budgets()).unwrap().is_empty(),"Shared/alive model retained");
+    assert!(prove_retirable_additions(&base,None,&current,None,&map,&BTreeSet::from([0]),budgets()).is_err(),"Original bank never inferred owned");
+    let changed=typed_bundle(&[(1,pack(&[tim(0,31)]).unwrap()),(2,pack(&[bank[0].bytes.clone(),added]).unwrap()),(3,vec![9,2,3,4]),(6,vec![0;4])],0);
+    assert!(prove_retirable_additions(&base,None,&changed,None,&map,&requested,budgets()).is_err(),"Changed actor/script resources need closure");
+}
+#[test]
+fn retired_storage_supports_pac_pack_and_single_tmd_without_shifting_later_selectors(){
+    let a=model(0,0,vec![(0,0),(1,0),(0,1)]);let b=model(0,0,vec![(0,0),(2,0),(0,2)]);let c=model(0,0,vec![(0,0),(3,0),(0,3)]);
+    let bundle=typed_bundle(&[(1,pack(&[tim(0,31)]).unwrap()),(2,pack(&[a.clone()]).unwrap()),(20,vec![0;4])],0x800);
+    let packed=pack(&[b.clone()]).unwrap();let mut pac=table::encode_size_word(2,packed.len()as u32).to_le_bytes().to_vec();pac.extend(packed);pac.extend(table::encode_size_word(9,c.len()as u32).to_le_bytes());pac.extend(&c);pac.extend([0u8;16]);
+    let(out,stream,saved)=retire_model_storage(&bundle,Some(&pac),&BTreeSet::from([1]),budgets()).unwrap();let bank=native_model_pool(&out,stream.as_deref());
+    assert_eq!(bank.len(),3);assert_eq!(bank[0].bytes,a);assert_eq!(bank[1].bytes.len(),12);assert_eq!(bank[2].bytes,c);assert_eq!(saved,b.len()-12);assert_eq!(&out[..0x800],&bundle[..0x800]);
+    let(out,stream,saved)=retire_model_storage(&bundle,Some(&pac),&BTreeSet::from([2]),budgets()).unwrap();let bank=native_model_pool(&out,stream.as_deref());assert_eq!(bank[1].bytes,b);assert_eq!(bank[2].bytes.len(),12);assert_eq!(saved,c.len()-12);
+    assert_eq!(retire_model_storage(&bundle,Some(&pac),&BTreeSet::new(),budgets()).unwrap(),(bundle,Some(pac),0));
+}
+#[test]
 fn small_native_staging_preserves_order_models_suffixes_and_is_idempotent(){
     let image_members=(0..24).map(|i|tim(0,i+1)).collect::<Vec<_>>();
     let geometry=model(0,0,vec![(0,0),(1,0),(0,1)]);
