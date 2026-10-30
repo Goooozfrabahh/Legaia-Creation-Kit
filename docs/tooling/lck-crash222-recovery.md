@@ -1,5 +1,36 @@
 # 222.img crash investigation and reversible recovery
 
+## R5 native evidence received 2026-10-30
+
+The user cold-booted R5 and reported a freeze. The preserved log is
+`ManualTests\RuntimeRecovery_20261030_01\R5-user-freeze.log`. It identifies
+`town01`, completes the resource dispatch/TIM upload calls, prints `tmds 124`,
+then completes map/music setup. At 31.1714 it enters `game mode`; at 31.1716
+the original allocator reports **malloc err size 8368**. Invalid instruction
+fetches at `0x000000A0` and `0x80000080` follow. There is no unmatched loader
+BEGIN at the end. This is live evidence of allocation failure after resource
+loading, not evidence that a TIM upload hangs. It does not yet establish the
+failed allocation's caller, fragmentation state, or the first invalid write.
+
+The log also records a user-created savestate immediately before the transition.
+A copy and independently anchored 2 MiB RAM extraction are preserved in that
+folder as `R5-before-transition.sav` and `R5-before-transition-ram.bin`. The
+allocator has no error in that earlier state; largest free block is 191532 bytes,
+and two existing successful allocations are each 8368 bytes. It is NOT the
+post-failure heap and does not prove the later request can fit.
+
+R6 (`R6_FULL_SCENE_HEAP_CALLERS.img`, SHA256
+`b503c8b5ef178fd21c8130b64bd9662fc3e38ff71411bbeec9be2d6ede707327`)
+preserves every E PROT entry and logs existing malloc/free wrapper calls through
+the original native allocator, including caller return addresses and results.
+The heap size, allocator behavior, failure handling, full scene and resource
+contents are unchanged. Strict MIPS ABI tests preserve arguments, returns, stack
+and saved registers while printf clobbers caller-saved registers. Automated
+IMG readback passed; the user has been asked for one R6 run with logging retained.
+This is a diagnostic, not an engine-memory expansion or crash remedy. The log
+analyzer attributes failures to original call sites; its outstanding-request
+totals explicitly exclude unobserved bulk frees/resets and fragmentation.
+
 ## Manual results received after e082867
 
 The user reports that **E also crashes while loading Rim Elm**. Subsequently

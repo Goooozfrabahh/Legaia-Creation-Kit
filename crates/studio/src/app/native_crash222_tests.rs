@@ -8,6 +8,20 @@ const RECOVERED:&str=r"D:\AstraRimElmProject\ManualTests\Runtime_Compatibility_2
 const FAILED:&str=r"D:\AstraRimElmProject\222.img";
 
 #[test]
+#[ignore="full preserved scene allocation/free/caller trace; create-only IMG, user operates emulator"]
+fn full_scene_heap_caller_trace()->Result<()>{
+    let output=PathBuf::from(std::env::var_os("LCK_HEAP_TRACE_IMG").context("new trace IMG")?);ensure!(!output.exists(),"New path required");
+    let source=r"D:\AstraRimElmProject\ManualTests\Crash222_Matrix_20261029_02\E_FULL_USER_SCENE_RECOVERED_SOURCE.img";
+    let lib=crate::library::Library::open(Path::new(source))?;let exe=lib.executable()?;let edits=legaia_code_hooks::native_load_trace::allocation_plan(&exe)?;
+    let original=DiscPatcher::open(std::fs::read(source)?)?;let mut disc=DiscPatcher::open(original.image().to_vec())?;
+    let mut patched=exe.clone();for edit in edits{ensure!(edit.prot_index.is_none(),"Only SCUS instrumentation");patched[edit.file_off..edit.file_off+edit.bytes.len()].copy_from_slice(&edit.bytes);disc.patch_named_file("SCUS_942.54",edit.file_off as u64,&edit.bytes)?;}
+    ensure!(disc.read_named_file("SCUS_942.54").context("SCUS")?==patched,"SCUS trace readback");
+    for i in 0..disc.entry_count(){ensure!(original.read_entry_footprint(i)?==disc.read_entry_footprint(i)?,"Heap tracing changed PROT entry {i}");}
+    let plan=NativeExportPlan{dependencies:Default::default(),source:source.into(),image:disc.into_image(),patched:vec!["DIAGNOSTIC: original heap allocate/free calls report sizes, returned pointers and original caller RA; all native data unchanged".into()],skipped:vec!["NOT A FIX: no heap expansion or suppression of native allocation failure".into()],continuation_receipt:None,unrestricted_log:Some("LCK HEAP = requested size, returned pointer, original caller return address. LCK FREE = released pointer, return value, original caller return address. All user scene data identical to E. No host emulator launched.".into()),imports:None,object_verification:vec![]};
+    super::super::export(plan,&output)?;Ok(())
+}
+
+#[test]
 #[ignore="reversible full-scene BIOS TTY trace; create-only IMG, user launches emulator"]
 fn full_scene_native_tty_trace()->Result<()>{
     let output=PathBuf::from(std::env::var_os("LCK_TTY_TRACE_IMG").context("new output IMG")?);ensure!(!output.exists(),"New output required");

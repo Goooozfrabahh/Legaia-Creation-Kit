@@ -11,11 +11,34 @@ import re
 from pathlib import Path
 
 EVENT = re.compile(r"LCK (LOAD|GPU) (BEGIN|DONE) ([0-9a-fA-F]{8}) ([0-9a-fA-F]{8}) err=([0-9a-fA-F]{8})")
+HEAP = re.compile(r"LCK (HEAP|FREE) ([0-9a-fA-F]{8}) ([0-9a-fA-F]{8}) RA=([0-9a-fA-F]{8})")
 
 
 def analyze(text):
     events, pending, anomalies = [], [], []
+    heap_events, active, failed_requests = [], {}, []
     for line_number, line in enumerate(text.splitlines(), 1):
+        for match in HEAP.finditer(line):
+            action, first, second, caller = match.groups()
+            first, second, caller = int(first, 16), int(second, 16), int(caller, 16)
+            row = dict(line=line_number, action=action, first_word=first,
+                       second_word=second, caller_return_address=caller,
+                       call_site=caller-8)
+            if action == "HEAP":
+                row.update(requested_bytes=first, returned_pointer=second)
+                if second:
+                    if second in active:
+                        anomalies.append(f"Pointer reused without observed free at line {line_number}; heap reset/bulk-free/trace gap possible")
+                    active[second] = row
+                else:
+                    row["observed_outstanding_requested_bytes"] = sum(r["requested_bytes"] for r in active.values())
+                    row["largest_observed_outstanding_requests"] = sorted(active.values(), key=lambda r: r["requested_bytes"], reverse=True)[:12]
+                    failed_requests.append(row)
+            else:
+                row["freed_pointer"] = first
+                allocation = active.pop(first, None)
+                row["matched_allocation_line"] = allocation["line"] if allocation else None
+            heap_events.append(row)
         for match in EVENT.finditer(line):
             kind, phase, first, second, error = match.groups()
             event = dict(line=line_number, kind=kind, phase=phase,
@@ -39,11 +62,18 @@ def analyze(text):
                 else:
                     anomalies.append(f"Unpaired/out-of-order {kind} DONE at line {line_number}")
             events.append(event)
+    allocation_failures = [int(m.group(1)) for m in re.finditer(r"malloc err size (\d+)", text)]
+    invalid_fetches = [int(m.group(1), 16) for m in re.finditer(r"Instruction read failed at PC=0x([0-9a-fA-F]+)", text)]
     return dict(schema=1, evidence_class="user-supplied native BIOS TTY observations",
                 event_count=len(events), events=events,
                 unfinished_operations=pending, anomalies=anomalies,
                 last_observed_event=events[-1] if events else None,
                 execution_observed=bool(events),
+                native_allocation_failures_bytes=allocation_failures,
+                invalid_instruction_fetch_addresses=invalid_fetches,
+                allocation_failure_observed=bool(allocation_failures),
+                heap_events=heap_events, failed_heap_requests=failed_requests,
+                heap_accounting_scope="Observed wrapper calls only; pool resets/bulk frees, native headers and fragmentation are not reconstructed",
                 successful_scene_load_verified=False, render_verified=False,
                 collision_verified=False, root_cause_proven=False,
                 limitation="Missing DONE localizes last logged work only; obtain RAM/PC or an engine error to prove the freeze mechanism.")
