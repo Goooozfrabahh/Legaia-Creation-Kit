@@ -8,12 +8,16 @@ fn deleted_resource_retirement_preserves_selectors_shared_references_and_script_
     let current=typed_bundle(&[(1,pack(&[tim(0,31)]).unwrap()),(2,pack(&[original.clone(),added.clone()]).unwrap()),(3,vec![1,2,3,4]),(6,vec![0;4])],0);
     let requested=BTreeSet::from([1]);let mut map=vec![0;0x12000];
     let eligible=prove_retirable_additions(&base,None,&current,None,&map,&requested,budgets()).unwrap();assert_eq!(eligible,requested);
+    let fingerprints=resource_baseline(&base,None,budgets()).unwrap();let fingerprints:ResourceBaseline=serde_json::from_slice(&serde_json::to_vec(&fingerprints).unwrap()).unwrap();
+    assert_eq!(prove_retirable_baseline(&fingerprints,&current,None,&map,&requested,budgets()).unwrap(),eligible,"Self-contained baseline release differs");
     let (out,_,saved)=retire_model_storage(&current,None,&eligible,budgets()).unwrap();let bank=native_model_pool(&out,None);assert_eq!(bank.len(),2);assert_eq!(bank[0].bytes,original);assert_eq!(bank[1].bytes.len(),12);assert_eq!(saved,added.len()-12);
     map[128+16..128+18].copy_from_slice(&1u16.to_le_bytes());map[128+18..128+20].copy_from_slice(&6u16.to_le_bytes());map[0x8000..0x8002].copy_from_slice(&4u16.to_le_bytes());
     assert!(prove_retirable_additions(&base,None,&current,None,&map,&requested,budgets()).unwrap().is_empty(),"Shared/alive model retained");
+    assert!(prove_retirable_baseline(&fingerprints,&current,None,&map,&requested,budgets()).unwrap().is_empty(),"Persistent shared reference released");
     assert!(prove_retirable_additions(&base,None,&current,None,&map,&BTreeSet::from([0]),budgets()).is_err(),"Original bank never inferred owned");
     let changed=typed_bundle(&[(1,pack(&[tim(0,31)]).unwrap()),(2,pack(&[bank[0].bytes.clone(),added]).unwrap()),(3,vec![9,2,3,4]),(6,vec![0;4])],0);
     assert!(prove_retirable_additions(&base,None,&changed,None,&map,&requested,budgets()).is_err(),"Changed actor/script resources need closure");
+    assert!(prove_retirable_baseline(&fingerprints,&changed,None,&map,&requested,budgets()).is_err(),"Persistent actor/script closure was bypassed");
 }
 #[test]
 fn retired_storage_supports_pac_pack_and_single_tmd_without_shifting_later_selectors(){

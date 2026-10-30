@@ -8,6 +8,63 @@ const RECOVERED:&str=r"D:\AstraRimElmProject\ManualTests\Runtime_Compatibility_2
 const FAILED:&str=r"D:\AstraRimElmProject\222.img";
 
 #[test]
+#[ignore="exact historical wall-write reconstruction and full user collision recovery; no emulator"]
+fn full_scene_owned_wall_relocation_candidate()->Result<()>{
+    use crate::app::native_wall_journal::{self as walls,Journal,Reference};
+    use crate::app::collision_recipes::ObjectId;
+    let output=PathBuf::from(std::env::var_os("LCK_OWNED_WALL_IMG").context("new collision candidate")?);ensure!(!output.exists(),"Use a new IMG path");
+    let root=Path::new(r"D:\AstraRimElmProject\ManualTests\RuntimeRecovery_20261030_01");let source=root.join("R7_FULL_SCENE_DELETED_RESOURCE_RETIREMENT.img");
+    let baseline=r"D:\AstraRimElmProject\ManualTests\M2_StageE_20261027_01\LCK_EXPERIMENTAL_STAGE_E_town01_floor_x37_z18.img";
+    let legacy_log=std::fs::read_to_string(r"D:\AstraRimElmProject\ManualTests\Native_Format_Adapters_20261028_01\LCK_EXPERIMENTAL_MIXED_FORMATS_FIXED_export_1793237710611489900\debug.txt")?;
+    ensure!(legacy_log.contains(&digest(&std::fs::read(PARENT)?)),"Historical log/image hash mismatch");
+    let start=legacy_log.find("LCK_SCENE_V1\t").context("Legacy manifest")?;let manifest=legacy_log[start..].lines().take_while(|l|!l.is_empty()).collect::<Vec<_>>().join("\n");
+    let base_lib=crate::library::Library::open(Path::new(baseline))?;let base_scene=legaia_engine_world_views::scene_staging::assemble_field_scene(&base_lib.index,"town01").map_err(anyhow::Error::msg)?;
+    let mut legacy_world=world_view::build_world(&base_scene,&base_lib.index);let old_doc=scene_instances::parse(&manifest,"town01",&legacy_world).map_err(anyhow::Error::msg)?;
+    scene_instances::apply(&old_doc,&mut legacy_world,base_scene.placements.len(),&base_lib.index).map_err(anyhow::Error::msg)?;
+    let parent=crate::library::Library::open(Path::new(PARENT))?;let scene=legaia_engine_world_views::scene_staging::assemble_field_scene(&parent.index,"town01").map_err(anyhow::Error::msg)?;
+    let mut full_world=world_view::build_world(&scene,&parent.index);let full_text=std::fs::read_to_string(r"D:\AstraRimElmProject\ManualTests\Crash222_20261029_01\222-full-scene-preserved.lckscene")?;
+    let full=scene_instances::parse(&full_text,"town01",&full_world).map_err(anyhow::Error::msg)?;scene_instances::apply(&full,&mut full_world,scene.placements.len(),&parent.index).map_err(anyhow::Error::msg)?;
+    let entry=Scene::load(&parent.index,"town01")?.field_map_index(&parent.index).context("MAP")?as usize;
+    let base=DiscPatcher::open(std::fs::read(baseline)?)?;let original=DiscPatcher::open(std::fs::read(&source)?)?;let parent_disc=DiscPatcher::open(std::fs::read(PARENT)?)?;
+    let base_map=base.read_entry_footprint(entry)?;let parent_map=parent_disc.read_entry_footprint(entry)?;let source_map=original.read_entry_footprint(entry)?;
+    ensure!(source_map==DiscPatcher::open(std::fs::read(FAILED)?)?.read_entry_footprint(entry)?,"Current full MAP differs from recorded full export");
+    let binding=|text:&str,label:&str|->Result<(usize,(u8,u8))>{let line=text.lines().find(|l|l.contains(label)&&l.contains("Independent descriptor ")).context("Recorded native allocation missing")?;let tail=line.split_once("Independent descriptor ").unwrap().1;let id=tail.split(',').next().unwrap().parse::<usize>()?;let coords=tail.split_once("reference (").context("Recorded reference")?.1.split(')').next().unwrap().split(',').map(|s|s.trim().parse::<u8>()).collect::<std::result::Result<Vec<_>,_>>()?;ensure!(coords.len()==2,"Reference coordinate count");Ok((id,(coords[0],coords[1])))};
+    let r7_bundle=original.read_entry_footprint(entry+3)?;let r7_pac=original.read_entry_footprint(entry+4)?;let r7_models=reg::native_model_pool(&r7_bundle,Some(&r7_pac));
+    let witness=|map:&[u8],id:usize,cell:(u8,u8)|->Result<Reference>{ensure!(id_at(map,cell)?==id,"Historical instance reference does not match actual MAP");let rec=ObjectRecord::parse(map,id).context("Instance descriptor")?;let index=field_objects::pack_mesh_index(id as u16,&rec).context("Instance model")?;Ok(Reference{cell:[cell.0,cell.1],descriptor:id as u16,model_selector:index,descriptor_sha256:digest(&map[id*32..id*32+32]),model_sha256:digest(&r7_models.get(index as usize).context("Instance native model")?.bytes)})};
+    let mut layers=vec![];let mut legacy_refs=std::collections::BTreeMap::new();
+    for assignment in &old_doc.collision_recipes{let ObjectId::Created(uid)=assignment.owner else{bail!("Unexpected legacy native recipe")};let draw=legacy_world.draws.iter().find(|d|d.editor_uid==Some(uid)).context("Legacy collision draw")?;
+        let mut owner=walls::serialized_owner(format!("legacy-import-{uid}"),&assignment.recipe,draw)?;let(id,cell)=binding(&legacy_log,&format!("IMPORT UID {uid} "))?;ensure!(id_at(&parent_map,cell)?==id,"Legacy reference changed");legacy_refs.insert(uid,(id,cell));
+        if id_at(&source_map,cell)?==id{owner.native=Some(witness(&source_map,id,cell)?);}layers.push(owner);
+    }
+    Journal::reconstruct("town01".into(),entry as u32,&base_map,&parent_map,layers.iter().cloned().map(|mut o|{o.native=None;o}).collect())?;
+    let full_log=std::fs::read_to_string(r"D:\AstraRimElmProject\222_export_1793316316530331500\debug.txt")?;
+    for assignment in &full.collision_recipes{let ObjectId::Created(uid)=assignment.owner else{bail!("Unexpected full native recipe")};let draw=full_world.draws.iter().find(|d|d.editor_uid==Some(uid)).context("Full collision draw")?;let mut owner=walls::serialized_owner(format!("current-created-{uid}"),&assignment.recipe,draw)?;
+        let label=if full.created.iter().any(|n|n.uid==uid){format!("DUPLICATE UID {uid} ")}else{format!("IMPORT UID {uid} ")};let(id,cell)=binding(&full_log,&label)?;owner.native=Some(witness(&source_map,id,cell)?);layers.push(owner);
+    }
+    let journal=Journal::reconstruct("town01".into(),entry as u32,&base_map,&source_map,layers)?;
+    let current_lib=crate::library::Library::open(&source)?;let current_scene=legaia_engine_world_views::scene_staging::assemble_field_scene(&current_lib.index,"town01").map_err(anyhow::Error::msg)?;let current_world=world_view::build_world(&current_scene,&current_lib.index);
+    let mut changes=vec![];let mut moved=vec![];
+    for(uid,(id,cell))in legacy_refs{
+        let source_key=scene.placements.iter().position(|p|p.cell==cell).map(|i|(false,i)).context("Historical native source")?;
+        let label=format!("legacy-import-{uid}");
+        if full.hidden.contains(&source_key){ensure!(id_at(&source_map,cell)?!=id,"Requested deletion still has native reference");changes.push((label,None));continue;}
+        let changed=full.moves.iter().any(|(k,_)|*k==source_key)||full.rotations.iter().any(|(k,_)|*k==scene_instances::NameTarget::Native(source_key.0,source_key.1))||full.scales.iter().any(|(k,_)|*k==scene_instances::NameTarget::Native(source_key.0,source_key.1));
+        if changed{let key=(false,current_scene.placements.iter().position(|p|p.cell==cell).context("Moved native reference")?);let recipe=current_world.automatic_collision_recipe(key).map_err(anyhow::Error::msg)?;let draw=current_world.at(key.0,key.1).context("Moved native draw")?;
+            let mut owner=walls::serialized_owner(label.clone(),&recipe,draw)?;owner.native=Some(witness(&source_map,id,cell)?);moved.push(json!({"owner":label,"native_reference":owner.native,"new_center":draw.center,"authored_wall_cells":owner.blocked.len()}));changes.push((label,Some(owner)));
+        }
+    }
+    let (map,next)=journal.revise(&source_map,&changes)?;
+    let before_owners=journal.owners.iter().filter(|o|o.id.starts_with("current-created-")).collect::<Vec<_>>();let after_owners=next.owners.iter().filter(|o|o.id.starts_with("current-created-")).collect::<Vec<_>>();ensure!(before_owners==after_owners,"Duplicate/new import collision contribution changed");
+    let mut removed=0;let mut added=0;for i in 0..map.len(){if(0x4000..0x8000).contains(&i){ensure!(map[i]&15==source_map[i]&15,"Floor nibble changed");removed+=(source_map[i]&!map[i]).count_ones();added+=(map[i]&!source_map[i]).count_ones();}else{ensure!(map[i]==source_map[i],"Unrelated native MAP byte changed at {i:#x}");}}
+    ensure!(removed>0&&added>0,"Collision correction did not move serialized contributions");
+    let mut disc=DiscPatcher::open(original.image().to_vec())?;disc.patch_prot_entry(entry,0,&map)?;for i in 0..disc.entry_count(){if i!=entry{ensure!(disc.read_entry_footprint(i)?==original.read_entry_footprint(i)?,"Unrelated native resource changed");}}
+    let image_hash=digest(disc.image());let sidecar=json!({"schema":"lck-native-wall-journal-v1","image_sha256":image_hash,"baseline_image":baseline,"baseline_image_sha256":digest(base.image()),"baseline_map_sha256":digest(&base_map),"journal":next,"historical_parent":PARENT,"historical_parent_sha256":digest(parent_disc.image()),"historical_full_manifest_sha256":digest(full_text.as_bytes()),"moved":moved,"removed_wall_bits":removed,"added_wall_bits":added,"native_gameplay_verified":false});
+    let log=format!("OWNED WALL RECOMPOSITION: exact original baseline plus all historical3 and current7 serialized owner layers reproduce entire source wall grid. Applied requested moved/deleted owner changes only; removed{removed}, added{added} bits. Surviving duplicate/import contributions unchanged. Floor low nibbles, MAP geometry/records, TMD/TIMs, SCUS, and all other native entries unchanged from user-verified R7. No native ownership inferred by proximity; generated replacement is authored mesh collision, not proof of original retail collider/floor ownership.");
+    let plan=NativeExportPlan{dependencies:Default::default(),source:source.clone(),image:disc.into_image(),patched:vec![log.clone()],skipped:vec!["Native gameplay/collision verification pending; native floor/script ownership not claimed".into()],continuation_receipt:None,unrestricted_log:Some(log),imports:None,object_verification:vec![]};
+    super::super::export(plan,&output)?;let file=std::fs::OpenOptions::new().write(true).create_new(true).open(output.with_extension("lck-collision.json"))?;serde_json::to_writer_pretty(file,&sidecar)?;println!("OWNED COLLISION: removed{removed}, added{added} serialized bits; seven duplicate/import owners retained exactly");Ok(())
+}
+
+#[test]
 #[ignore="exact user full scene, retire only deleted appended assets, no engine patch or emulator"]
 fn full_scene_retired_import_storage_candidate()->Result<()>{
     let output=PathBuf::from(std::env::var_os("LCK_RETIRED_IMPORT_IMG").context("new candidate IMG")?);ensure!(!output.exists(),"New output required");

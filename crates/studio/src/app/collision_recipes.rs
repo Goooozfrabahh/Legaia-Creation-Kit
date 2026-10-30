@@ -73,6 +73,9 @@ pub(super) struct Assignment {
 
 #[derive(Clone, Default)]
 pub(super) struct CollisionState {
+    pub owned_journal: Option<std::sync::Arc<super::native_wall_journal::Journal>>,
+    pub owned_source_map: Option<std::sync::Arc<Vec<u8>>>,
+    pub ownership_warning: Option<String>,
     /// Native source IDs keyed only by the current rendering adapter. Recipes
     /// never persist these transient indices.
     pub sources: HashMap<(bool, usize), SourceProvenance>,

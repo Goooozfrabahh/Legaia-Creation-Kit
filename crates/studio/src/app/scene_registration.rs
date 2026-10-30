@@ -179,16 +179,36 @@ pub(in crate::app) fn prove_retirable_additions(baseline:&[u8],baseline_pac:Opti
     let original=native_model_pool(baseline,baseline_pac);let now=native_model_pool(current,current_pac);
     anyhow::ensure!(!original.is_empty()&&now.len()>=original.len(),"Baseline is not an original model-bank prefix");
     anyhow::ensure!(original.iter().zip(&now).all(|(a,b)|a.bytes==b.bytes),"Baseline model prefix changed; no inferred retirement");
-    fn scripts(bundle:&[u8],pac:Option<&[u8]>,limits:Limits)->Result<Vec<(u8,Vec<u8>)>>{
-        let(_,slots)=slots_for_scene(bundle,limits,native_stream_mode(bundle).is_some())?;let mut out=slots.into_iter().filter(|s|matches!(s.kind,3..=8|11)).map(|s|(s.kind,s.decoded)).collect::<Vec<_>>();
-        if native_stream_mode(bundle)==Some(20){let p=pac.context("Baseline PAC missing")?;let mut at=0;loop{let ts=u32::from_le_bytes(p.get(at..at+4).context("PAC header")?.try_into()?);let n=(ts&0xffffff)as usize;if n==0{break;}let raw=p.get(at+4..at+4+n).context("PAC extent")?;let kind=(ts>>24)as u8;if matches!(kind,3..=8|11){out.push((kind,raw.to_vec()));}at+=4+(n&!3);}}
-        Ok(out)
-    }
-    anyhow::ensure!(scripts(baseline,baseline_pac,limits)?==scripts(current,current_pac,limits)?,"MAN/MES/MOVE/VDF/CLUT resources differ from baseline; script/model closure requires another adapter");
+    anyhow::ensure!(dependency_payloads(baseline,baseline_pac,limits)?==dependency_payloads(current,current_pac,limits)?,"MAN/MES/MOVE/VDF/CLUT resources differ from baseline; script/model closure requires another adapter");
     anyhow::ensure!(map.len()>=0x10000,"Truncated field MAP");let mut used=BTreeSet::new();
     for word in map[field_objects::OBJECT_GRID_OFFSET..0x10000].chunks_exact(2){let id=u16::from_le_bytes([word[0],word[1]])&field_objects::OBJECT_INDEX_MASK;
         let rec=field_objects::ObjectRecord::parse(map,id as usize).context("MAP descriptor")?;if let Some(index)=field_objects::pack_mesh_index(id,&rec){used.insert(index as usize);}}
     anyhow::ensure!(requested.iter().all(|i|*i>=original.len()&&*i<now.len()),"Requested retirement includes baseline-owned/out-of-range resource");
+    Ok(requested.difference(&used).copied().collect())
+}
+
+#[derive(Clone,serde::Serialize,serde::Deserialize)]
+pub(in crate::app) struct ResourceBaseline { pub models:Vec<String>, dependencies:Vec<(u8,String)> }
+fn dependency_payloads(bundle:&[u8],pac:Option<&[u8]>,limits:Limits)->Result<Vec<(u8,Vec<u8>)>>{
+        // Resource release requires complete type evidence even in unrestricted
+        // mode. Failure retains resources; it never rejects geometry export.
+        let(_,table)=native_descriptor_table(bundle)?;
+        anyhow::ensure!(table.used().iter().all(|d|matches!(d.type_byte,0..=7|9|10|20)),"Unknown descriptor dependency type; retain resources");
+        let(_,slots)=slots_for_scene(bundle,limits,native_stream_mode(bundle).is_some())?;let mut out=slots.into_iter().filter(|s|matches!(s.kind,3..=8|11)).map(|s|(s.kind,s.decoded)).collect::<Vec<_>>();
+        if native_stream_mode(bundle)==Some(20){let p=pac.context("Baseline PAC missing")?;let mut at=0;loop{let ts=u32::from_le_bytes(p.get(at..at+4).context("PAC header")?.try_into()?);let n=(ts&0xffffff)as usize;if n==0{break;}let raw=p.get(at+4..at+4+n).context("PAC extent")?;let kind=(ts>>24)as u8;anyhow::ensure!(matches!(kind,0..=9|11),"Unknown PAC dependency type; retain resources");if matches!(kind,3..=8|11){out.push((kind,raw.to_vec()));}at+=4+(n&!3);}}
+        Ok(out)
+    }
+
+pub(in crate::app) fn resource_baseline(bundle:&[u8],pac:Option<&[u8]>,limits:Limits)->Result<ResourceBaseline>{
+    Ok(ResourceBaseline{models:native_model_pool(bundle,pac).iter().map(|m|collision_recipes::digest(&m.bytes)).collect(),dependencies:dependency_payloads(bundle,pac,limits)?.into_iter().map(|(k,b)|(k,collision_recipes::digest(&b))).collect()})
+}
+pub(in crate::app) fn prove_retirable_baseline(base:&ResourceBaseline,current:&[u8],pac:Option<&[u8]>,map:&[u8],requested:&BTreeSet<usize>,limits:Limits)->Result<BTreeSet<usize>>{
+    let now=resource_baseline(current,pac,limits)?;
+    anyhow::ensure!(!base.models.is_empty()&&now.models.starts_with(&base.models),"Protected model prefix changed");
+    anyhow::ensure!(base.dependencies==now.dependencies,"Native script/actor dependency closure changed");
+    anyhow::ensure!(map.len()>=0x10000,"Truncated MAP");let mut used=BTreeSet::new();
+    for word in map[field_objects::OBJECT_GRID_OFFSET..0x10000].chunks_exact(2){let id=u16::from_le_bytes([word[0],word[1]])&field_objects::OBJECT_INDEX_MASK;let record=field_objects::ObjectRecord::parse(map,id as usize).context("MAP descriptor")?;if let Some(i)=field_objects::pack_mesh_index(id,&record){used.insert(i as usize);}}
+    anyhow::ensure!(requested.iter().all(|i|*i>=base.models.len()&&*i<now.models.len()),"Retirement includes protected/out-of-range model");
     Ok(requested.difference(&used).copied().collect())
 }
 fn upload_pack(raw:&[u8],vram:&mut Vram)->Result<()> {

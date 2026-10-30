@@ -32,6 +32,7 @@ const DETAIL_MIN_POINTS: f32 = 12.0;
 // are still represented with their real native floor tier/occupancy strips.
 const MAX_DETAILED_BOXES: usize = 360;
 
+#[derive(Clone)]
 pub(super) struct CollisionGrid {
     pub scene: String,
     pub source_key: String,
@@ -43,6 +44,7 @@ pub(super) struct CollisionGrid {
 }
 
 impl CollisionGrid {
+    pub fn with_owned_map(&self,map:&[u8])->Result<Self>{anyhow::ensure!(map.len()==0x12000,"Incomplete owned MAP preview");let mut next=self.clone();next.bytes=map[0x4000..0x8000].to_vec();Ok(next)}
     pub fn load(index: &ProtIndex, name: &str, source_key: &str) -> Result<Self> {
         let scene = Scene::load(index, name)
             .with_context(|| format!("Find native scene {name}"))?;

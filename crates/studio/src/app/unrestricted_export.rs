@@ -122,6 +122,7 @@ pub(in crate::app) fn yaw(map:&mut [u8],cell:(u8,u8),rotation:[f32;3],center:[f3
 pub(in crate::app) fn prepare(source_path:&Path,scene:&AssembledScene,world:&WorldModel,index:&ProtIndex)->Result<NativeExportPlan>{
     let _scope=scope();WARNINGS.with(|w|w.borrow_mut().clear());
     let source_path=source_path.canonicalize()?;let image=std::fs::read(&source_path)?;
+    let source_hash=super::super::collision_recipes::digest(&image);
     let overlay=scene_instances::serialize(&scene.name,world);
     let mut log=vec!["UNRESTRICTED IMG EXPORT — EXPERIMENTAL ATTEMPT, NOT A COMPLETE/VERIFIED EXPORT".into(),format!("Source: {}\nScene: {}\nFull requested manifest:\n{overlay}",source_path.display(),scene.name),"WARNING All compatibility/ownership/binding/collision/overlap/spawn-window preflight is disabled. Encoder failures are retained per operation. Original scripts, collision and resources may become inconsistent; no gameplay verification.".into()];
     let mut disc=DiscPatcher::open(image)?;
@@ -133,8 +134,14 @@ pub(in crate::app) fn prepare(source_path:&Path,scene:&AssembledScene,world:&Wor
         let native=attempt("resolve selected native cell",&mut log,||Scene::load(index,&scene.name));
         if let Some(native)=native {
             if let Some(entry)=native.field_map_index(index).map(|i|i as usize) {
+                let ownership=attempt("capture serialized collision ownership",&mut log,||super::super::native_wall_export::capture(&source_path,&source_hash,&disc,entry,&scene.name));
                 match inherited_source_staging(&mut disc,entry,index,&mut log){Ok(Some(w))=>source_warnings.push(w),Ok(None)=>{},Err(e)=>log.push(format!("WARNING Source staging normalization could not be encoded: {e:#}; original resources retained, unrestricted attempts continue"))}
-                compile(&mut disc,entry,scene,world,index,&doc,&mut log,&mut imports,&mut object_verification);
+                let mut targets=HashMap::new();
+                compile(&mut disc,entry,scene,world,index,&doc,&mut log,&mut imports,&mut object_verification,&mut targets);
+                if let Some(ownership)=ownership{
+                    let result=super::super::native_wall_export::reconcile(ownership,&disc,scene,world,&doc,&targets,&mut log);
+                    match result{Ok((updated,journal))=>{disc=updated;log.push(format!("WALL_OWNERSHIP_JOURNAL\t{}",serde_json::to_string(&journal)?));},Err(e)=>log.push(format!("FAILED OWNED COLLISION RECONCILIATION: {e:#}; unrestricted output retained, inherited collision may remain incomplete"))}
+                }
                 let profile=(||->Result<_>{let bundle=disc.read_entry_footprint(entry+3)?;let pac=disc.read_entry_footprint(entry+4)?;super::super::native_load_budget::analyze(&bundle,Some(&pac))})();
                 match profile {
                     Ok(profile)=>match serde_json::to_string(&profile){Ok(json)=>log.push(format!("SCENE_RUNTIME_PROFILE\t{json}")),Err(e)=>log.push(format!("WARNING Native request profile serialization failed: {e}"))},
@@ -173,7 +180,7 @@ fn inherited_source_staging(disc:&mut DiscPatcher,entry:usize,index:&ProtIndex,l
     Ok(warning)
 }
 
-fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldModel,index:&ProtIndex,doc:&scene_instances::SceneDocument,log:&mut Vec<String>,coverage:&mut ImportCoverage,reports:&mut Vec<serde_json::Value>){
+fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldModel,index:&ProtIndex,doc:&scene_instances::SceneDocument,log:&mut Vec<String>,coverage:&mut ImportCoverage,reports:&mut Vec<serde_json::Value>,out_targets:&mut HashMap<scene_instances::NameTarget,(u8,u8)>){
     // Import each requested instance independently using the existing native
     // resource registration writer. No collision/runtime acceptance gate.
     let mut imported_targets=HashMap::new();
@@ -361,6 +368,7 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
     // Attempt the existing data-only native floor writer for a terrain source
     // with a real keyed primary row. This is explicit key association, not a
     // claim of mesh ownership. No experimental engine patch is installed here.
+    *out_targets=targets.clone();
     let mut floor_requests=Vec::new();
     for &(key,delta) in &doc.moves {if key.0&&!doc.hidden.contains(&key){floor_requests.push((key,delta,false));}}
     for created in &doc.created {if created.source.0 {floor_requests.push((created.source,created.offset,true));}}
@@ -436,6 +444,10 @@ pub(super) fn publish(plan:NativeExportPlan,output:&Path)->Result<ExportResult>{
     std::fs::write(&debug,&report)?;
     std::fs::write(&verification,serde_json::to_vec_pretty(&serde_json::json!({"schema":1,"output":output,"img_sha256":expected_hash,"objects":objects,"native_runtime_verified":false,"render_verified":false,"interaction_verified":false}))?)?;
     let mut skipped=plan.skipped;
+    if let Some(json)=report.lines().find_map(|l|l.strip_prefix("WALL_OWNERSHIP_JOURNAL\t")){
+        let saved=(||->Result<()>{let value:serde_json::Value=serde_json::from_str(json)?;anyhow::ensure!(value["image_sha256"].as_str()==Some(expected_hash.as_str()),"Collision metadata/image hash mismatch");let file=std::fs::OpenOptions::new().write(true).create_new(true).open(output.with_extension("lck-collision.json"))?;serde_json::to_writer(file,&value)?;Ok(())})();
+        if let Err(e)=saved{let message=format!("FAILED COLLISION OWNERSHIP PERSISTENCE: {e:#}; IMG exists but next-session ownership is unavailable");report.push_str(&format!("{message}\n"));std::fs::write(&debug,&report)?;skipped.push(message);}
+    }
     for object in &objects{if let Some(gaps)=object["missing_or_unverified_dependencies"].as_array(){for gap in gaps{if gap.as_str().is_some_and(|g|g.starts_with("MISSING:")){skipped.push(format!("MISSING NATIVE DEPENDENCY UID {}: {}",object["uid"],gap.as_str().unwrap()));}}}}
     skipped.push(format!("UNRESTRICTED EXPERIMENT — NOT PROVEN COMPLETE. Full debug.txt: {}; per-object report: {}",debug.display(),verification.display()));
     Ok(ExportResult{path:output,patched:plan.patched,skipped,imports:plan.imports})

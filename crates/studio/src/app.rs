@@ -18,6 +18,8 @@ mod native_wall_ownership;
 mod native_cell_inventory;
 mod native_loader_trace;
 mod native_load_budget;
+mod native_wall_journal;
+mod native_wall_export;
 mod native_elevation_codec;
 mod native_floor_patch;
 pub mod native_extended_floor;
@@ -1389,12 +1391,14 @@ impl App {
         let Some(lib) = self.studio.library.as_ref() else { return };
         let index = Arc::clone(&lib.index);
         let requested_name = scene_name.clone();
+        let ownership_path = lib.source.path().to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let result = legaia_engine_world_views::scene_staging::assemble_field_scene(
                 index.as_ref(), &requested_name,
             ).map(|scene| {
-                let world = world_view::build_world(&scene, index.as_ref());
+                let mut world = world_view::build_world(&scene, index.as_ref());
+                native_wall_export::attach_preview(&ownership_path,&scene,&mut world,index.as_ref());
                 (scene, world)
             });
             let _ = tx.send(result);
@@ -3335,6 +3339,12 @@ impl App {
                             }
                         }
                         if let Some(grid) = &self.native_collision_grid {
+                            let owned_preview=native_wall_export::preview(world);
+                            if let Some(warning)=&world.collision.ownership_warning{ui.colored_label(egui::Color32::YELLOW,warning);}
+                            if let Ok(Some(map))=&owned_preview {
+                                if let Ok(live)=grid.with_owned_map(map){collision_wire::paint(ui,view_rect,&self.native_view,model,&live,Ok(ps1_export::ExportEdits::default()));}
+                            } else {
+                            if let Err(error)=owned_preview{ui.colored_label(egui::Color32::YELLOW,format!("Owned collision preview incomplete: {error:#}"));}
                             // The overlay is drawn AFTER the raster image using the
                             // identical camera projection. It never changes
                             // camera gestures, hit testing, or IMG export.
@@ -3368,6 +3378,7 @@ impl App {
                             };
                             collision_wire::paint(ui, view_rect, &self.native_view, model,
                                 grid, edits);
+                            }
                         }
                     }
                     if self.object_collision_draft_visible {
