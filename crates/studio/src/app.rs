@@ -1,6 +1,8 @@
 //! The egui front end over [`Studio`].
 
 mod form_database;
+mod lck_project;
+mod form_legacy;
 mod actors_ui;
 mod multi_selection;
 #[cfg(test)]
