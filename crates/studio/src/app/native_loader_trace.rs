@@ -43,7 +43,9 @@ fn dispatch(trace:&mut Trace,kind:u8,raw:&[u8],label:String)->Result<u32>{
         let selector=trace.models.len();trace.models.push(Model{selector,global_slot:selector+5,pointer_table_address:0x8007c018+(selector as u32+5)*4,
             carrier:label.clone(),member,sha256:digest(&bytes),objects:word(&bytes,8)?,native_flags:word(&bytes,4)?,bytes});
     }
-    Ok(match kind{0|1=>1,2=>2,3..=8=>1<<(kind-1),9=>0,10|15|20=>(kind as u32)<<8,11=>16,_=>{trace.gaps.push(format!("Native dispatcher no-op type {kind:#x} at {label}"));0}})
+    // Type 0 leaves s4 at its entry value zero; type 1 sets bit 0 at
+    // 8001F150. Identical uploads do not imply identical return status.
+    Ok(match kind{0=>0,1=>1,2=>2,3..=8=>1<<(kind-1),9=>0,10|15|20=>(kind as u32)<<8,11=>16,_=>{trace.gaps.push(format!("Native dispatcher no-op type {kind:#x} at {label}"));0}})
 }
 pub(super) fn trace(bundle:&[u8],table_base:usize,pac:Option<&[u8]>)->Result<Trace>{
     let mut out=Trace{models:vec![],dispatch:vec![],stream_mode:0,gaps:vec![],evidence_class:"static native-loader contract; no engine execution/render/interaction verification"};
@@ -70,4 +72,4 @@ pub(super) fn trace(bundle:&[u8],table_base:usize,pac:Option<&[u8]>)->Result<Tra
 
 #[cfg(test)]
 #[path="native_loader_trace_tests.rs"]
-mod tests;
+pub(super) mod tests;

@@ -2,6 +2,9 @@ use super::*;
 use legaia_code_hooks::mips_sim::Cpu;
 use serde_json::json;
 
+#[path="native_runtime_recovery_tests.rs"]
+mod recovery;
+
 #[test]
 #[ignore="read-only inherited IMG/resource audit for the user's 222 failure; new report path required"]
 fn crash_222_inheritance_audit()->Result<()>{
@@ -92,12 +95,14 @@ fn original_tim_member_suffixes()->Result<()>{
 fn execute_original(exe:&[u8],bundle:&[u8],base:usize,pac:Option<&[u8]>)->Result<Vec<(usize,String)>>{
     execute_original_allocations(exe,bundle,base,pac,false).map(|v|v.0)
 }
-fn execute_original_allocations(exe:&[u8],bundle:&[u8],base:usize,pac:Option<&[u8]>,all_types:bool)->Result<(Vec<(usize,String)>,Vec<serde_json::Value>)>{
+pub(in crate::app) fn execute_original_allocations(exe:&[u8],bundle:&[u8],base:usize,pac:Option<&[u8]>,all_types:bool)->Result<(Vec<(usize,String)>,Vec<serde_json::Value>)>{
     let load=word(exe,0x18)?;let mut cpu=Cpu::new();cpu.load_delays=true;cpu.strict_alignment=true;
     for(lo,hi)in [(0x80010638u32,0x8001068c),(0x8001f05c,0x8001f69c),(0x80020224,0x80020308),(0x8002541c,0x800255b8),(0x800268dc,0x80026988),(0x80026b4c,0x80026bd8)]{
         let at=0x800+(lo-load)as usize;cpu.load(lo,exe.get(at..at+(hi-lo)as usize).context("SCUS routine missing")?);
     }
-    ensure!(cpu.rd32(0x80026ba8)==0xac640000 && cpu.rd32(0x800202b4)==0x0c007c17,"Unsupported SCUS loader profile");
+    let call=cpu.rd32(0x800202b4);
+    ensure!(cpu.rd32(0x80026ba8)==0xac640000 && (call==0x0c007c17||call==legaia_code_hooks::mips::jal(legaia_code_hooks::native_load_trace::DISPATCH_CODE)),"Unsupported SCUS loader profile");
+    if call!=0x0c007c17{for va in [legaia_code_hooks::native_load_trace::DISPATCH_CODE,legaia_code_hooks::native_load_trace::UPLOAD_CODE]{let at=0x800+(va-load)as usize;cpu.load(va,&exe[at..at+256]);}}
     let carrier=0x80400000;cpu.load(carrier,&bundle[base..]);cpu.wr32(0x8007b85c,carrier);cpu.wr32(0x8007b774,5);
     let mut ranges=vec![(carrier,bundle[base..].to_vec())];let mut heap=0x81000000u32;
     let mut records=vec![];let mut uploads=0;let mut allocations=vec![];

@@ -17,6 +17,7 @@ mod native_script_dependencies;
 mod native_wall_ownership;
 mod native_cell_inventory;
 mod native_loader_trace;
+mod native_load_budget;
 mod native_elevation_codec;
 mod native_floor_patch;
 pub mod native_extended_floor;

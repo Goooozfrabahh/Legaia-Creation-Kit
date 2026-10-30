@@ -1,5 +1,61 @@
 # 222.img crash investigation and reversible recovery
 
+## Manual results received after e082867
+
+The user reports that **E also crashes while loading Rim Elm**. Subsequently
+the user cold-boot tested **A and reports that A also crashes during loading**.
+Neither result establishes the crash instruction or heap state. Later results:
+
+| Case | User-reported native gameplay result |
+| --- | --- |
+| A | Freezes loading Rim Elm. |
+| B | Loads; walking and duplicated/rotated geometry work. Vahn face textures are corrupted; original import collision persists after move/deletion. |
+| C | Freezes loading Rim Elm, without seven collision recipes or duplicate/move/delete edits. |
+| D | Not tested. |
+| E | Freezes loading Rim Elm despite corrected character-atlas destinations and small texture staging. |
+| R1 (E resources, exact corrected-parent MAP) | Freezes DuckStation; new placements and collision recipes are not necessary to trigger the failure. |
+| R2 (first Geremi import on corrected parent) | Freezes loading Rim Elm. This does not prove Geremi alone is the cause: the corrected parent has not independently passed gameplay. |
+| R3 (Koin4 only), R4 (two Geremi copies) | Not tested. |
+
+R1–R4 are under `ManualTests\RuntimeRecovery_20261029_03`; `isolation.json`
+records their exact scope. Do not infer success or failure for untested cases.
+The previous procedure below is retained as historical artifact documentation.
+E must not be described as gameplay fixed. The reduced staging allocation and
+resident-atlas correction are proven changes, not a demonstrated crash remedy.
+
+The next diagnostic profile is under `ManualTests\RuntimeRecovery_20261030_01`.
+It changes only guarded SCUS call sites/caves to log BIOS TTY resource and TIM
+upload begin/end events; **all PROT entries, full scene edits, collision and
+Stage E floor data are unchanged**. It is instrumentation, not a crash fix.
+The original loader instruction simulation verifies identical model identities
+and allocation chronology with and without these logging shims. The shims are
+also tested for argument/return/stack/callee-saved preservation with load delays.
+The floor-observer trace arena and other occupied engine patches are rejected
+by byte guards; no existing code is overwritten by assuming zero padding is free.
+
+Original SCUS LZS instructions decoded all E descriptors with matching bytes
+and zero output-canary overruns. The original decoder additionally allocates
+4,116 scratch bytes per compressed payload; the older unlimited-loader harness
+substitutes that routine and does not include this nested allocation. Historical
+allocator replays pass the dispatcher requests on the arena-return snapshot;
+both retail and failing images fail on the later preload snapshot. Neither is
+the live failing load state, and neither establishes current heap safety or OOM.
+The independent trace also incorrectly reported single-TIM status as 1; real
+SCUS type 0 returns 0, while type 1 returns 1. That static contract is corrected.
+Their high stream mode is unchanged; this correction is not a demonstrated
+explanation of the observed freeze.
+
+The current one-attempt manual procedure is
+`ManualTests\RuntimeRecovery_20261030_01\READ_ME_FIRST.md`, superseding the
+historical matrix order below. R5 SHA256 is
+`c8e794c0a3ac737212e1c25e431c4663f7bf20159b485f40c5c01068010213d4`.
+`scripts/analyze-native-loader-log.py` pairs nested begin/end observations from
+user-supplied BIOS TTY logs; it never connects to an emulator and never infers a
+proven crash mechanism from a truncated log. Unrestricted export now records
+static native allocation requests, including nested LZS scratch, and publishes
+`scene-verification.json` with live loader/GPU/render/gameplay explicitly false.
+Allocation accounting is not available-memory proof and never blocks export.
+
 ## Status and scope
 
 The user reported a Rim Elm loading crash in `D:\AstraRimElmProject\222.img`.

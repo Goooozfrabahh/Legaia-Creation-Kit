@@ -1,10 +1,57 @@
 use super::*;
 use crate::app::native_asset_plan::{scene_registration as reg,texture_relocation};
 use serde_json::json;
+use crate::app::collision_recipes::digest;
 
 const PARENT:&str=r"D:\AstraRimElmProject\ManualTests\Native_Format_Adapters_20261028_01\LCK_EXPERIMENTAL_MIXED_FORMATS_FIXED.img";
 const RECOVERED:&str=r"D:\AstraRimElmProject\ManualTests\Runtime_Compatibility_20261029_02\LCK_EXPERIMENTAL_MIXED_RUNTIME_CANDIDATE.img";
 const FAILED:&str=r"D:\AstraRimElmProject\222.img";
+
+#[test]
+#[ignore="reversible full-scene BIOS TTY trace; create-only IMG, user launches emulator"]
+fn full_scene_native_tty_trace()->Result<()>{
+    let output=PathBuf::from(std::env::var_os("LCK_TTY_TRACE_IMG").context("new output IMG")?);ensure!(!output.exists(),"New output required");
+    let source=r"D:\AstraRimElmProject\ManualTests\Crash222_Matrix_20261029_02\E_FULL_USER_SCENE_RECOVERED_SOURCE.img";
+    let lib=crate::library::Library::open(Path::new(source))?;let exe=lib.executable()?;let edits=legaia_code_hooks::native_load_trace::plan(&exe)?;let mut disc=DiscPatcher::open(std::fs::read(source)?)?;
+    for edit in &edits{ensure!(edit.prot_index.is_none(),"Diagnostic must only patch SCUS");disc.patch_named_file("SCUS_942.54",edit.file_off as u64,&edit.bytes)?;}
+    let mut patched=exe.clone();for edit in &edits{patched[edit.file_off..edit.file_off+edit.bytes.len()].copy_from_slice(&edit.bytes);}
+    ensure!(disc.read_named_file("SCUS_942.54").context("SCUS")?==patched,"Diagnostic SCUS readback mismatch");
+    let scene=Scene::load(&lib.index,"town01")?;let entry=scene.field_map_index(&lib.index).context("MAP")? as usize;
+    let old=DiscPatcher::open(std::fs::read(source)?)?;for i in 0..disc.entry_count(){ensure!(old.read_entry_footprint(i)?==disc.read_entry_footprint(i)?,"TTY trace changed native data entry {i}");}
+    let b=disc.read_entry_footprint(entry+3)?;let p=disc.read_entry_footprint(entry+4)?;let(base,_)=reg::native_descriptor_table(&b)?;
+    let witness=crate::app::native_loader_trace::tests::execute_original_allocations(&exe,&b,base,Some(&p),true)?;
+    let traced=crate::app::native_loader_trace::tests::execute_original_allocations(&patched,&b,base,Some(&p),true)?;
+    ensure!(witness==traced,"Tracing changed native model identities/allocation chronology");
+    let plan=NativeExportPlan{dependencies:Default::default(),source:source.into(),image:disc.into_image(),patched:vec!["DIAGNOSTIC ONLY: BIOS TTY begin/end around native resource dispatch and TIM upload; all native data entries identical to failing E".into()],skipped:vec!["NOT A CRASH FIX: native gameplay unverified; requires manual BIOS TTY/file logging to observe progress".into()],continuation_receipt:None,unrestricted_log:Some("TRACE PROFILE: LCK LOAD BEGIN/DONE = type_size, source/result, malloc-error accumulator; LCK GPU BEGIN = TIM flags, TIM pointer, malloc-error accumulator. Native functions still execute. All user edits and Stage E floor hook retained. No host emulator launched.".into()),imports:None,object_verification:vec![]};
+    let result=super::super::export(plan,&output)?;println!("Trace IMG {}: all PROT bytes unchanged; original instruction model/allocator chronology identical; NOT runtime verified",result.path.display());Ok(())
+}
+
+#[test]
+#[ignore="exact new-import runtime isolation; create-only outputs, user authored positions, no emulator"]
+fn runtime_new_import_isolation()->Result<()>{
+    let folder=PathBuf::from(std::env::var_os("LCK_NEW_IMPORT_MATRIX").context("new isolation directory")?);
+    ensure!(!folder.exists(),"Use a new directory");std::fs::create_dir(&folder)?;
+    let source=crate::library::Library::open(Path::new(RECOVERED))?;let scene=legaia_engine_world_views::scene_staging::assemble_field_scene(&source.index,"town01").map_err(anyhow::Error::msg)?;
+    let world=world_view::build_world(&scene,&source.index);let text=std::fs::read_to_string(r"D:\AstraRimElmProject\ManualTests\Crash222_20261029_01\222-full-scene-preserved.lckscene")?;
+    let full=scene_instances::parse(&text,"town01",&world).map_err(anyhow::Error::msg)?;
+    let entry=Scene::load(&source.index,"town01")?.field_map_index(&source.index).context("MAP")? as usize;
+    let e=r"D:\AstraRimElmProject\ManualTests\Crash222_Matrix_20261029_02\E_FULL_USER_SCENE_RECOVERED_SOURCE.img";
+    let original=DiscPatcher::open(std::fs::read(RECOVERED)?)?;let exact_map=original.read_entry_footprint(entry)?;
+    let mut disc=DiscPatcher::open(std::fs::read(e)?)?;disc.patch_prot_entry(entry,0,&exact_map)?;
+    ensure!(disc.read_entry_footprint(entry)?==exact_map,"Resource-only diagnostic changed parent MAP");
+    let plan=NativeExportPlan{dependencies:Default::default(),source:e.into(),image:disc.into_image(),patched:vec!["DIAGNOSTIC: E resource bank retained; full parent MAP restored exactly. No new instances spawned.".into()],skipped:vec!["PARTIAL DIAGNOSTIC: no new user edits in MAP; resources only, not a completed scene export".into()],continuation_receipt:None,unrestricted_log:Some("RESOURCE-ONLY DIAGNOSTIC. Exact corrected parent MAP; E's 119-model bank and native texture uploads retained. No new geometry/collision arrangement. Gameplay unverified.".into()),imports:None,object_verification:vec![]};
+    let result=super::super::export(plan,&folder.join("R1_RESOURCES_ONLY_PARENT_MAP.img"))?;let mut rows=vec![json!({"case":"R1","path":result.path,"parent_map_identical":true,"gameplay_verified":false})];
+    for(label,uids)in [("R2_GEREMI_FIRST",vec![5]),("R3_KOIN4_ONLY",vec![7]),("R4_GEREMI_BOTH",vec![5,6])]{
+        let mut doc=full.clone();doc.foreign.retain(|f|uids.contains(&f.uid));doc.created.clear();doc.hidden.clear();doc.moves.clear();doc.rotations.retain(|(t,_)|matches!(t,scene_instances::NameTarget::Created(uid) if uids.contains(uid)));doc.collision_recipes.clear();doc.mesh_collision.clear();
+        let mut world=world_view::build_world(&scene,&source.index);scene_instances::apply(&doc,&mut world,scene.placements.len(),&source.index).map_err(anyhow::Error::msg)?;
+        let plan=prepare(Path::new(RECOVERED),&scene,&world,&source.index)?;ensure!(plan.imports.is_some_and(|r|r.written==uids.len()),"Import isolation writer failed");ensure!(plan.unrestricted_log.as_ref().unwrap().lines().all(|l|!l.starts_with("FAILED ")),"Isolation includes writer failures");
+        let done=super::super::export(plan,&folder.join(format!("{label}.img")))?;rows.push(json!({"case":label,"path":done.path,"new_user_uids":uids,"collision_recipes":0,"gameplay_verified":false}));
+    }
+    let lib=crate::library::Library::open(Path::new(e))?;let b=lib.index.entry_bytes(entry as u32+3)?;let p=lib.index.entry_bytes(entry as u32+4)?;
+    let models=reg::native_model_pool(&b,Some(&p));let headers=models.iter().enumerate().filter(|(i,_)|*i>=117).map(|(i,m)|json!({"selector":i,"sha256":digest(&m.bytes),"bytes":m.bytes.len(),"header_words":m.bytes[..40.min(m.bytes.len())].chunks_exact(4).map(|b|u32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>()})).collect::<Vec<_>>();
+    rows.push(json!({"new_native_models":headers,"scope":"Exact manifest subsets for runtime isolation; no inferred collision ownership"}));
+    std::fs::write(folder.join("isolation.json"),serde_json::to_vec_pretty(&rows)?)?;Ok(())
+}
 
 #[test]
 #[ignore="exact preserved 222 scene and incremental native diagnostics; create-only artifacts, no emulator"]

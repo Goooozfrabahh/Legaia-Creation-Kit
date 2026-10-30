@@ -135,6 +135,11 @@ pub(in crate::app) fn prepare(source_path:&Path,scene:&AssembledScene,world:&Wor
             if let Some(entry)=native.field_map_index(index).map(|i|i as usize) {
                 match inherited_source_staging(&mut disc,entry,index,&mut log){Ok(Some(w))=>source_warnings.push(w),Ok(None)=>{},Err(e)=>log.push(format!("WARNING Source staging normalization could not be encoded: {e:#}; original resources retained, unrestricted attempts continue"))}
                 compile(&mut disc,entry,scene,world,index,&doc,&mut log,&mut imports,&mut object_verification);
+                let profile=(||->Result<_>{let bundle=disc.read_entry_footprint(entry+3)?;let pac=disc.read_entry_footprint(entry+4)?;super::super::native_load_budget::analyze(&bundle,Some(&pac))})();
+                match profile {
+                    Ok(profile)=>match serde_json::to_string(&profile){Ok(json)=>log.push(format!("SCENE_RUNTIME_PROFILE\t{json}")),Err(e)=>log.push(format!("WARNING Native request profile serialization failed: {e}"))},
+                    Err(e)=>log.push(format!("WARNING Native request profile unavailable: {e:#}; unrestricted export continues; live heap and GPU completion unverified")),
+                }
             }else{log.push("FAILED No native MAP writer for selected cell; all requested edits remain unwritten".into());}
         }
     }
@@ -424,6 +429,8 @@ pub(super) fn publish(plan:NativeExportPlan,output:&Path)->Result<ExportResult>{
         anyhow::ensure!(format!("{:x}",hash.finalize())==expected_hash,"Output IMG readback hash mismatch: {}",output.display());Ok(())})();
     match result {Ok(())=>report.push_str("OUTPUT WRITTEN. Experimental native writes only; partial/dependency failures above remain unresolved.\n"),Err(e)=>{report.push_str(&format!("OUTPUT FAILED: {e:#}\n"));std::fs::write(&debug,report)?;return Err(e);}}
     report.push_str(&format!("OUTPUT FILE VERIFIED: {} ({} bytes; disk readback matches intended IMG)\nOutput SHA256: {expected_hash}\n",output.display(),plan.image.len()));
+    let profile=report.lines().find_map(|l|l.strip_prefix("SCENE_RUNTIME_PROFILE\t")).and_then(|s|serde_json::from_str::<serde_json::Value>(s).ok());
+    std::fs::write(logs.join("scene-verification.json"),serde_json::to_vec_pretty(&serde_json::json!({"schema":1,"output":output,"img_sha256":expected_hash,"img_write_readback_verified":true,"static_native_request_profile":profile,"live_loader_verified":false,"gpu_completion_verified":false,"render_verified":false,"native_gameplay_verified":false}))?)?;
     let mut objects=plan.object_verification;
     for object in &mut objects{object["img_write_readback_verified"]=serde_json::json!(object["native_import_reference_written"].as_bool()==Some(true));report.push_str(&format!("FINAL PER-OBJECT VERIFICATION: {object}\n"));}
     std::fs::write(&debug,&report)?;
