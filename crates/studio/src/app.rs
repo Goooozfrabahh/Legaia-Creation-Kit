@@ -1140,6 +1140,12 @@ impl App {
             Err(err)=>{self.editor_cells=CellStore::default();
                 self.editor_cell_selected=None;self.editor_cell_active=None;self.studio.error=Some(format!("Cell catalog: {err}"));},
         }
+        // Never project a previous disc's authoring records through a new index.
+        // Keep its complete unsaved state recoverable without overwriting files.
+        if self.form_session.as_ref().is_some_and(|session|session.source.canonicalize().ok()!=p.canonicalize().ok()) {
+            if let Some(previous)=self.form_session.take(){self.form_recovery.push((previous,self.form_file.take()));}
+            self.form_selected=None;self.form_drag=None;self.form_editor_target=None;
+        }
         // A newly opened disc has a different asset identity / index.
         // Dropping the receiver cancels the old scan on its next send.
         self.global_repository.clear();
@@ -3181,7 +3187,7 @@ impl App {
                             // Integration V1: capture the COMPLETE editor change manifest
                             // before native preflight. Names remain editor-side metadata.
                             let overlay=scene_instances::serialize(name,world);
-                            if !self.unrestricted_img_export && export_integration::only_editor_labels(&overlay) {
+                            if !self.unrestricted_img_export && self.form_session.as_ref().is_none_or(|s|s.export_gaps().is_empty()) && export_integration::only_editor_labels(&overlay) {
                                 let report=export_integration::render_report(name,&overlay,Some(&source));
                                 let note="Only hierarchy labels changed: no native PS1 data needs writing. Save the .lckscene to preserve the labels; IMG unchanged.";
                                 let log_path=export_integration::write_log(name,&report,note)
@@ -3209,9 +3215,10 @@ impl App {
                                     let export_scene=Arc::clone(scene);let export_world=world.as_ref().clone();
                                     let export_index=Arc::clone(&self.studio.library.as_ref().unwrap().index);
                                     let unrestricted=self.unrestricted_img_export;
+                                    let mut export_session=self.form_session.clone();
                                     std::thread::spawn(move|| {
                                         let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||->anyhow::Result<ps1_export::ExportResult>{
-                                            let plan=if unrestricted {ps1_export::unrestricted::prepare(&source,&export_scene,&export_world,&export_index)}else{ps1_export::plan_export(&source,&export_scene,&export_world,&export_index)}?;
+                                            let plan=if let Some(session)=&mut export_session {ps1_export::prepare_project(&source,&export_scene,session,&export_index,unrestricted)}else if unrestricted {ps1_export::unrestricted::prepare(&source,&export_scene,&export_world,&export_index)}else{ps1_export::plan_export(&source,&export_scene,&export_world,&export_index)}?;
                                             ps1_export::export(plan,&destination)
                                         })).unwrap_or_else(|_|Err(anyhow::anyhow!("Native export worker panicked; no completed output claimed"))).map_err(|error|{
                                             let message=format!("Output {}: {error:#}",destination.display());

@@ -238,6 +238,14 @@ ui.small("Save Project preserves FormKeys, overrides, deleted records and shared
                 return Ok(());
             }
             Action::Recover => {
+                if let Some((previous, _)) = self.form_recovery.last() {
+                    let current = self
+                        .form_session
+                        .as_ref()
+                        .context("Open the previous project's source disc first")?;
+                    anyhow::ensure!(current.source_fingerprint==previous.source_fingerprint,
+                        "Previous project retained: open its matching source IMG before restoring it");
+                }
                 if let Some((session, file)) = self.form_recovery.pop() {
                     if let Some(current) = self.form_session.replace(session) {
                         self.form_recovery.push((current, self.form_file.take()));

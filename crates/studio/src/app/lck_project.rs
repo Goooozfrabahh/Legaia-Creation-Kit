@@ -203,6 +203,24 @@ impl LckProject {
                 );
             }
         }
+        let mut render_refs = BTreeSet::new();
+        let mut render_ids = BTreeSet::new();
+        for binding in &self.render_uids {
+            ensure!(
+                self.database.reference(&binding.reference).is_some()
+                    && self.cells.iter().any(|c| c.key == binding.cell)
+                    && binding.uid > 0
+                    && render_refs.insert((&binding.cell, &binding.reference))
+                    && render_ids.insert((&binding.cell, binding.uid)),
+                "Invalid/duplicate render UID mapping"
+            );
+            ensure!(
+                self.next_render_uid
+                    .get(&binding.cell)
+                    .is_some_and(|next| *next > binding.uid),
+                "Render UID allocator would reuse identity"
+            );
+        }
         for (key, _) in &self.base_adapters {
             ensure!(
                 self.database.resolve_base(key).is_some(),

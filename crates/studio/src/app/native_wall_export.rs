@@ -61,6 +61,16 @@ pub(super) fn capture(
     entry: usize,
     scene: &str,
 ) -> Result<Snapshot> {
+    capture_with_metadata(path, source_hash, disc, entry, scene, None)
+}
+pub(super) fn capture_with_metadata(
+    path: &Path,
+    source_hash: &str,
+    disc: &DiscPatcher,
+    entry: usize,
+    scene: &str,
+    preserved: Option<&[u8]>,
+) -> Result<Snapshot> {
     let map = disc.read_entry_footprint(entry)?;
     let file = path.with_extension("lck-collision.json");
     let limits = reg::Limits {
@@ -70,12 +80,17 @@ pub(super) fn capture(
     };
     let mut other_cells = Vec::new();
     let mut cell = None;
-    if file.exists() {
+    if file.exists() || preserved.is_some() {
+        let metadata = if file.exists() {
+            std::fs::read(&file)?
+        } else {
+            preserved.unwrap().to_vec()
+        };
         ensure!(
-            std::fs::metadata(&file)?.len() <= 64 * 1024 * 1024,
+            metadata.len() <= 64 * 1024 * 1024,
             "Collision journal metadata too large"
         );
-        let mut root: serde_json::Value = serde_json::from_slice(&std::fs::read(&file)?)?;
+        let mut root: serde_json::Value = serde_json::from_slice(&metadata)?;
         ensure!(
             root["image_sha256"].as_str() == Some(source_hash),
             "Collision sidecar belongs to another IMG revision"
@@ -465,7 +480,16 @@ pub(super) fn attach_preview(
     world: &mut WorldModel,
     index: &ProtIndex,
 ) {
-    if !path.with_extension("lck-collision.json").exists() {
+    attach_preview_with_metadata(path, scene, world, index, None)
+}
+pub(super) fn attach_preview_with_metadata(
+    path: &Path,
+    scene: &AssembledScene,
+    world: &mut WorldModel,
+    index: &ProtIndex,
+    preserved: Option<&[u8]>,
+) {
+    if !path.with_extension("lck-collision.json").exists() && preserved.is_none() {
         let result = (|| -> Result<_> {
             let entry = legaia_engine_scene::scene::Scene::load(index, &scene.name)?
                 .field_map_index(index)
@@ -493,7 +517,7 @@ pub(super) fn attach_preview(
         let entry = legaia_engine_scene::scene::Scene::load(index, &scene.name)?
             .field_map_index(index)
             .context("MAP")? as usize;
-        capture(path, &hash, &disc, entry, &scene.name)
+        capture_with_metadata(path, &hash, &disc, entry, &scene.name, preserved)
     })();
     match result {
         Ok(s) => {

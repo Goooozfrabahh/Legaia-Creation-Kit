@@ -101,6 +101,10 @@ impl Session {
         project.check_master(Some(&self.source_fingerprint));
         project.validate()?;
         self.project = project;
+        self.native_worlds.clear();
+        self.donor_scenes.clear();
+        self.reference_draws.clear();
+        self.projected_transforms.clear();
         Ok(())
     }
     pub fn migrate_cell_document(
@@ -564,7 +568,14 @@ impl Session {
             (**native).clone()
         } else {
             let mut native = world_view::build_world(scene, index);
-            super::native_wall_export::attach_preview(&self.source, scene, &mut native, index);
+            let metadata = self.preserved_collision_metadata()?;
+            super::native_wall_export::attach_preview_with_metadata(
+                &self.source,
+                scene,
+                &mut native,
+                index,
+                metadata.as_deref(),
+            );
             if self.native_worlds.len() >= 2 {
                 self.native_worlds.clear();
             }
@@ -677,7 +688,8 @@ impl Session {
                         None
                     };
                     let force_foreign = r.properties.get("legacy_instance_kind")
-                        == Some(&Property::Text("foreign".into()));
+                        == Some(&Property::Text("foreign".into()))
+                        || (r.origin.is_none() && r.flags.contains("static_architecture"));
                     let key = if let Some(source_key) = source_key.filter(|_| !force_foreign) {
                         let src = world
                             .at(source_key.0, source_key.1)
@@ -709,8 +721,6 @@ impl Session {
                     .context("Preview draw absent")?
                     .original_center;
                 if reusable.is_some()
-                    && !r.deleted
-                    && !r.disabled
                     && r.transform.position == original
                     && r.transform.rotation == [0.; 3]
                     && r.transform.scale == [1.; 3]
@@ -718,6 +728,9 @@ impl Session {
                         .at(key.0, key.1)
                         .is_some_and(|d| d.vertex_start == d.vertex_end)
                 {
+                    if r.deleted || r.disabled {
+                        world.set_hidden(key, true);
+                    }
                     if let Some(d) = world.draws.iter_mut().find(|d| (d.terrain, d.index) == key) {
                         d.display_name = match r.properties.get("display_name") {
                             Some(Property::Text(name)) => Some(name.clone()),
@@ -727,31 +740,33 @@ impl Session {
                     return Ok(Some(key));
                 }
 
+                // Tombstones retain their authored pose in the legacy manifest.
+                // A hidden native allocation must be restored temporarily because
+                // the existing rotation/scale controls deliberately reject it.
+                if world.at(key.0, key.1).is_some_and(|d| d.hidden) {
+                    ensure!(
+                        world.set_hidden(key, false),
+                        "Cannot restore reference preview"
+                    );
+                }
+                ensure!(
+                    world.set_offset(
+                        key.0,
+                        key.1,
+                        [0, 1, 2].map(|a| r.transform.position[a] - original[a])
+                    ),
+                    "Reference position has no preview adapter"
+                );
+                ensure!(
+                    world.set_rotation(key.0, key.1, r.transform.rotation),
+                    "Reference rotation has no preview adapter"
+                );
+                ensure!(
+                    world.set_scale(key.0, key.1, r.transform.scale),
+                    "Reference scale has no preview adapter"
+                );
                 if r.deleted || r.disabled {
                     world.set_hidden(key, true);
-                } else {
-                    if world.at(key.0, key.1).is_some_and(|d| d.hidden) {
-                        ensure!(
-                            world.set_hidden(key, false),
-                            "Cannot restore reference preview"
-                        );
-                    }
-                    ensure!(
-                        world.set_offset(
-                            key.0,
-                            key.1,
-                            [0, 1, 2].map(|a| r.transform.position[a] - original[a])
-                        ),
-                        "Reference position has no preview adapter"
-                    );
-                    ensure!(
-                        world.set_rotation(key.0, key.1, r.transform.rotation),
-                        "Reference rotation has no preview adapter"
-                    );
-                    ensure!(
-                        world.set_scale(key.0, key.1, r.transform.scale),
-                        "Reference scale has no preview adapter"
-                    );
                 }
                 if let Some(d) = world.draws.iter_mut().find(|d| (d.terrain, d.index) == key) {
                     d.display_name = match r.properties.get("display_name") {
@@ -866,9 +881,49 @@ impl Session {
         self.project.validate()?;
         Ok(world)
     }
+    /// Exact saved journal is a portable fallback only. A physical sidecar is
+    /// authoritative, including its validation failure; never replace it here.
+    pub fn preserved_collision_metadata(&self) -> Result<Option<Vec<u8>>> {
+        if self.source.with_extension("lck-collision.json").exists() {
+            return Ok(None);
+        }
+        let mut found: Option<Vec<u8>> = None;
+        for snapshot in &self.project.sidecars {
+            ensure!(
+                digest(&snapshot.exact_bytes) == snapshot.sha256,
+                "Saved collision evidence changed"
+            );
+            let Ok(root) = serde_json::from_slice::<serde_json::Value>(&snapshot.exact_bytes)
+            else {
+                continue;
+            };
+            if root["image_sha256"].as_str() != Some(&self.source_fingerprint) {
+                continue;
+            }
+            if let Some(old) = &found {
+                ensure!(
+                    old == &snapshot.exact_bytes,
+                    "Conflicting saved collision journals for source revision"
+                );
+            }
+            found = Some(snapshot.exact_bytes.clone());
+        }
+        Ok(found)
+    }
     pub fn export_gaps(&self) -> Vec<String> {
         let mut gaps = vec![];
+        let relevant = self
+            .project
+            .database
+            .references()
+            .into_values()
+            .filter(|r| Some(&r.cell) == self.cell.as_ref() && !r.deleted && !r.disabled)
+            .map(|r| r.base.clone())
+            .collect::<BTreeSet<_>>();
         for (key, b) in self.project.database.bases() {
+            if !relevant.contains(&key) {
+                continue;
+            }
             if !b.materials.is_empty() {
                 gaps.push(format!("Base {key:?}: shared material edit is persisted and previewed; native shared-material override serialization is not verified"));
             }
@@ -889,7 +944,10 @@ impl Session {
             }
         }
         for d in &self.project.diagnostics {
-            if d.message.starts_with("PREVIEW:") || d.message.starts_with("DEPENDENCY:") {
+            if d.message.starts_with("PREVIEW:")
+                || d.message.starts_with("DEPENDENCY:")
+                || d.message.starts_with("MASTER:")
+            {
                 gaps.push(d.message.clone());
             }
         }
@@ -986,9 +1044,7 @@ mod tests {
     #[test]
     #[ignore = "real native Rim Elm/Conkram record, renderer and project acceptance; no GUI or emulator"]
     fn native_base_reference_acceptance_and_reordered_draws() -> Result<()> {
-        let source = Path::new(
-            r"D:\AstraRimElmProject\ManualTests\RuntimeRecovery_20261030_01\R8_FULL_SCENE_OWNED_COLLISION_RECOVERY.img",
-        );
+        let source = Path::new(r"D:\Emulators\Games\Legend of Legaia\LegendOfLegaia.img");
         let lib = crate::library::Library::open(source)?;
         let mut rim =
             legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index, "town01")
@@ -1266,6 +1322,41 @@ mod tests {
         ensure!(
             !session.export_gaps().is_empty(),
             "Unverified shared-material compiler support silently claimed"
+        );
+        // An Object Window static reference needs the existing explicit
+        // FOREIGN_STATIC writer even when its donor is the destination cell.
+        // Legacy native Ctrl+D copies retain their existing INSTANCE routing.
+        let local_base = session
+            .project
+            .base_adapters
+            .iter()
+            .find(|(key, a)| a.source_scene == rim.name && a.kind == "placement" && *key != &base)
+            .map(|(key, _)| key.clone())
+            .context("Local static Base")?;
+        let placed = session.place(
+            local_base,
+            Transform {
+                position: [6000., 0., 6000.],
+                ..Default::default()
+            },
+        )?;
+        let local_world = session.render(&rim, &lib.index)?;
+        let draw = session.reference_draws[&placed];
+        let uid = local_world
+            .at(draw.0, draw.1)
+            .and_then(|d| d.editor_uid)
+            .context("Static UID")?;
+        ensure!(
+            local_world
+                .foreign
+                .iter()
+                .any(|f| f.uid == uid && f.static_architecture && f.source == rim.name),
+            "Same-cell Object Window placement silently lost static architecture state"
+        );
+        let text = scene_instances::serialize(&rim.name, &local_world);
+        ensure!(
+            text.contains(&format!("FOREIGN_STATIC\t{uid}\n")),
+            "Static flag did not reach native writer manifest"
         );
         Ok(())
     }

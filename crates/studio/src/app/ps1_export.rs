@@ -932,8 +932,8 @@ impl ImportCoverage{
 impl ExportResult{
     pub fn verification_warning(&self)->Option<String>{
         self.imports.and_then(|coverage|coverage.failure_message()).or_else(||{
-            let gaps=self.skipped.iter().filter(|s|s.starts_with("MISSING NATIVE DEPENDENCY")).collect::<Vec<_>>();
-            (!gaps.is_empty()).then(||format!("INCOMPLETE NATIVE BEHAVIOR: {} missing dependency reports. Encoded imports are NOT verified working objects. {}",gaps.len(),gaps.into_iter().cloned().collect::<Vec<_>>().join("; ")))
+            let gaps=self.skipped.iter().filter(|s|s.starts_with("MISSING NATIVE DEPENDENCY") || s.starts_with("FAILED ")).collect::<Vec<_>>();
+            (!gaps.is_empty()).then(||format!("INCOMPLETE NATIVE EXPORT: {} failed operation/dependency reports. Encoded imports are NOT verified working objects. {}",gaps.len(),gaps.into_iter().cloned().collect::<Vec<_>>().join("; ")))
         })
     }
     pub fn experimental_summary(&self)->String{
@@ -1430,6 +1430,46 @@ pub(super) struct NativeExportPlan {
     unrestricted_log:Option<String>,
     imports:Option<ImportCoverage>,
     object_verification:Vec<serde_json::Value>,
+}
+
+/// Freeze authoring records, rebuild the legacy projection and use the same
+/// native writers. Saved unsupported edits are explicit partial-export failures.
+pub(super) fn prepare_project(source:&Path, scene:&AssembledScene,
+    session:&mut super::form_bridge::Session, index:&ProtIndex, unrestricted:bool,
+)->Result<NativeExportPlan>{
+    session.project.validate()?;
+    ensure!(source.canonicalize()? == session.source.canonicalize()?, "Project export source differs from mounted master");
+    let world=session.render(scene,index)?;
+    let mut gaps=session.export_gaps();
+    if let Some(warning)=&world.collision.ownership_warning {gaps.push(warning.clone());}
+    if !unrestricted {ensure!(gaps.is_empty(), "Project native serializers unresolved: {}",gaps.join("; "));}
+    let metadata=session.preserved_collision_metadata()?;
+    let mut plan=if unrestricted {unrestricted::prepare_with_metadata(source,scene,&world,index,metadata.as_deref())?}
+        else {plan_export(source,scene,&world,index)?};
+    for gap in &gaps {
+        let line=format!("FAILED PROJECT NATIVE ADAPTER: {gap}. Record preserved in project; requested edit is not claimed complete");
+        plan.skipped.push(line.clone());
+        if let Some(log)=&mut plan.unrestricted_log {log.push_str(&format!("\n{line}"));}
+    }
+    let cell=session.cell.as_ref().context("Project export Cell missing")?;
+    for reference in session.project.database.references().values().filter(|r| &r.cell==cell) {
+        let draw=session.reference_draws.get(&reference.key).and_then(|k|world.at(k.0,k.1));
+        let report=serde_json::json!({
+            "stage_a_reference":reference.key,"base":reference.base,"cell":reference.cell,
+            "deleted":reference.deleted,"disabled":reference.disabled,
+            "legacy_uid":draw.and_then(|d|d.editor_uid),"native_origin":reference.origin,
+            "record_projection":if reference.deleted||reference.disabled {"hidden/tombstone"} else if draw.is_some() {"resolved to existing writer input"} else {"missing preview/native adapter"},
+            "encoded_successfully":"see native per-operation results; projection alone is not encoding proof",
+            "img_write_readback":"pending publish verification",
+            "native_loader_identity":"see native resource reports; not established by FormKey",
+            "render_visibility":"unverified", "collision_interaction":"unverified",
+            "unverified_dependencies":gaps,
+        });
+        if let Some(log)=&mut plan.unrestricted_log {log.push_str(&format!("\nPROJECT_REFERENCE\t{}",serde_json::to_string(&report)?));}
+        plan.object_verification.push(report);
+    }
+    if !gaps.is_empty() {if let Some(log)=&mut plan.unrestricted_log {log.push_str("\nPROJECT FINAL STATUS: PARTIAL — saved authoring operations have unresolved native adapters; no complete export claimed");}}
+    Ok(plan)
 }
 
 pub(super) fn verify_output_file(path:&Path,expected:Option<u64>)->Result<u64>{
@@ -2756,3 +2796,7 @@ mod controlled_verification;
 #[cfg(test)]
 #[path = "native_terrain_tests.rs"]
 mod terrain_tests;
+
+#[cfg(test)]
+#[path="form_export_tests.rs"]
+mod form_export_tests;

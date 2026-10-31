@@ -120,6 +120,9 @@ pub(in crate::app) fn yaw(map:&mut [u8],cell:(u8,u8),rotation:[f32;3],center:[f3
     map[id*32..id*32+32].copy_from_slice(&raw);note("Native yaw and pivot compensation written; arbitrary-angle actor-box/wall transforms are not serialized by this writer".into());Ok(())
 }
 pub(in crate::app) fn prepare(source_path:&Path,scene:&AssembledScene,world:&WorldModel,index:&ProtIndex)->Result<NativeExportPlan>{
+    prepare_with_metadata(source_path,scene,world,index,None)
+}
+pub(in crate::app) fn prepare_with_metadata(source_path:&Path,scene:&AssembledScene,world:&WorldModel,index:&ProtIndex,metadata:Option<&[u8]>)->Result<NativeExportPlan>{
     let _scope=scope();WARNINGS.with(|w|w.borrow_mut().clear());
     let source_path=source_path.canonicalize()?;let image=std::fs::read(&source_path)?;
     let source_hash=super::super::collision_recipes::digest(&image);
@@ -134,7 +137,7 @@ pub(in crate::app) fn prepare(source_path:&Path,scene:&AssembledScene,world:&Wor
         let native=attempt("resolve selected native cell",&mut log,||Scene::load(index,&scene.name));
         if let Some(native)=native {
             if let Some(entry)=native.field_map_index(index).map(|i|i as usize) {
-                let ownership=attempt("capture serialized collision ownership",&mut log,||super::super::native_wall_export::capture(&source_path,&source_hash,&disc,entry,&scene.name));
+                let ownership=attempt("capture serialized collision ownership",&mut log,||super::super::native_wall_export::capture_with_metadata(&source_path,&source_hash,&disc,entry,&scene.name,metadata));
                 match inherited_source_staging(&mut disc,entry,index,&mut log){Ok(Some(w))=>source_warnings.push(w),Ok(None)=>{},Err(e)=>log.push(format!("WARNING Source staging normalization could not be encoded: {e:#}; original resources retained, unrestricted attempts continue"))}
                 let mut targets=HashMap::new();
                 compile(&mut disc,entry,scene,world,index,&doc,&mut log,&mut imports,&mut object_verification,&mut targets);
