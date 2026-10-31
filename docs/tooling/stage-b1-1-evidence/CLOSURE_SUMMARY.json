@@ -1,0 +1,27 @@
+{
+  "baseline": "3ab839b",
+  "initial_passed": 8501,
+  "final_passed": 8501,
+  "cohort": 8546,
+  "remaining": 45,
+  "regressions": [],
+  "raw_payload_classification": {
+    "ModelPack": 103,
+    "Unresolved": 80,
+    "BareModel": 177
+  },
+  "all_360_retained": true,
+  "all_680_source_occurrences_readback_verified": true,
+  "packs_whose_every_geometry_member_matches_existing_scene_sources": 103,
+  "non_geometry_native_consumers": {
+    "Component of native VAB-prefixed audio carrier; not validated TMD": 78,
+    "Native ANM-format animation data": 1,
+    "Native consumer unresolved; not validated TMD": 1
+  },
+  "TIM_payloads_searched": 3290,
+  "unresolved_TIM_tag_candidates": 519,
+  "static_pixel_fix_justified": false,
+  "GUI_verified": false,
+  "gameplay_verified": false,
+  "source_sha256": "750dbcbadb70362feb3468467bbe7efbf3d151a414caa428c66c368d4b0b73e6"
+}

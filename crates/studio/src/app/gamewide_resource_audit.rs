@@ -195,7 +195,7 @@ impl Census {
                 };
                 match result {
                     Ok(raw) => {
-                        self.add(&child,family,"definition",id,at,Some(&raw),json!({"type":d.type_byte,"encoding":"LZS","decoded_length":n,"descriptor_offset":base+8+i*8}),json!([]))?;
+                        self.add(&child,family,"definition",id,at,Some(&raw),json!({"type":d.type_byte,"encoding":"LZS","decoded_length":n,"descriptor_offset":base+8+i*8,"model_payload_evidence":matches!(d.type_byte,2|9).then(||assets::model_payload::inspect(&raw))}),json!([]))?;
                         self.buffer(&child, &raw, depth + 1, budget, gaps)?;
                     }
                     Err(e) => {
@@ -227,7 +227,7 @@ impl Census {
                         id,
                         at,
                         Some(raw),
-                        json!({"type":c.type_byte,"encoding":"raw native stream"}),
+                        json!({"type":c.type_byte,"encoding":"raw native stream","model_payload_evidence":matches!(c.type_byte,2|9).then(||assets::model_payload::inspect(raw))}),
                         json!([]),
                     )?;
                     self.buffer(&child, raw, depth + 1, budget, gaps)?;

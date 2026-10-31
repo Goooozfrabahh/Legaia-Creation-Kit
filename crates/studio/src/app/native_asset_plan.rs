@@ -250,3 +250,10 @@ mod tests {
 
 #[path="static_resources.rs"]
 pub(in crate::app) mod static_resources;
+
+#[path="model_payload.rs"]
+pub(in crate::app) mod model_payload;
+
+#[cfg(test)]
+#[path="static_closure_tests.rs"]
+mod static_closure_tests;
