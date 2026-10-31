@@ -247,3 +247,6 @@ mod tests {
         assert!(plan.resources[&coloured].payload.is_none());
     }
 }
+
+#[path="static_resources.rs"]
+pub(in crate::app) mod static_resources;

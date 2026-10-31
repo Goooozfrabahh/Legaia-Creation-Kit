@@ -114,7 +114,8 @@ fn external_palette_fragmentation_and_failure_rollback() {
     overwrite[h..h+4].copy_from_slice(&28u32.to_le_bytes());overwrite.truncate(h+28);
     let id=register(&mut inventory,ResourceKind::Tim,&overwrite);let mut fragmented=events;fragmented.push(Upload{sequence:Some(2),resource:id,image:true,clut:false,merge_clut_zeros:false});
     let expected=replay(&inventory,&fragmented);let trace=UploadTrace::verify_replay(&inventory,&fragmented,&expected,"Partial image overwrite").unwrap();
-    let mut planner=Planner::new(&Vram::new(),&[]).unwrap();assert!(planner.plan_multi(&inventory,&trace,&[mesh]).is_err());assert!(planner.blocks.is_empty());
+    let mut planner=Planner::new(&Vram::new(),&[]).unwrap();let composed=planner.plan_multi(&inventory,&trace,&[mesh.clone()]).unwrap();composed.package(&Vram::new()).unwrap();
+    assert!(super::super::texture_only_model_change(payload(&inventory,&mesh,ResourceKind::Tmd).unwrap(),&composed.tmds[&mesh]).unwrap());
 }
 
 #[test]
@@ -141,5 +142,39 @@ fn linear_multirow_clut_and_composite_merge_semantics() {
     assert!(Planner::new(&Vram::new(),&[]).unwrap().plan(&inventory,&id,&[mesh.clone()],None).is_ok());
     let next=register(&mut inventory,ResourceKind::Tim,&tim(0,992));events.push(Upload{sequence:Some(1),resource:next,image:false,clut:true,merge_clut_zeros:true});
     let expected=replay(&inventory,&events);let trace=UploadTrace::verify_replay(&inventory,&events,&expected,"Known merge-zero trace").unwrap();
-    assert!(Planner::new(&Vram::new(),&[]).unwrap().plan_multi(&inventory,&trace,&[mesh]).is_err());
+    let resolved=Planner::new(&Vram::new(),&[]).unwrap().plan_multi(&inventory,&trace,&[mesh]).unwrap();
+    resolved.package(&Vram::new()).unwrap(); // final merge-zero words, not a guessed complete palette
+}
+
+#[test]
+fn untextured_geometry_has_empty_native_tim_pack_and_unchanged_vram(){
+ use legaia_tmd::{encode::*,descriptor::PacketShape};
+ let raw=encode(&[ModelObject{vertices:vec![[0,0,0],[32,0,0],[0,32,0]],scale:LEGAIA_OBJECT_SCALE,groups:vec![ModelGroup{shape:PacketShape::F3,semi_transparent:false,prims:vec![ModelPrim{vertices:vec![0,1,2],uvs:vec![],cba:0,tsb:0,colors:vec![[100,80,60]]}]}]}]).unwrap();
+ let mut inv=NativeAssetPlan::default();let model=register(&mut inv,ResourceKind::Tmd,&raw);let empty=Vram::new();
+ let trace=UploadTrace::verify_native_replay(&inv,&[],&empty,"verified empty upload sequence").unwrap();
+ let plan=Planner::new(&empty,&[]).unwrap().plan_multi(&inv,&trace,&[model.clone()]).unwrap();let p=plan.package(&empty).unwrap();
+ assert!(legaia_container_formats::pack::parse_pack(&p.tim_pack).unwrap().is_empty());assert_eq!(plan.tmds[&model],raw);assert_eq!(plan.apply(&empty).unwrap().as_u16(),empty.as_u16());
+}
+#[test]
+fn mixed_depth_and_composite_native_word_reads_preserve_each_contributor(){
+ let mut inv=NativeAssetPlan::default();let mut data=tim(2,31); // 16-bit upload, sampled by a 4-bit TMD.
+ let image=register(&mut inv,ResourceKind::Tim,&data);
+ let palette=tim(0,31);let pal=register(&mut inv,ResourceKind::Tim,&palette);
+ let mut patch=tim(2,992); // Overlay a subset of the same image at a different depth envelope.
+ patch[12..14].copy_from_slice(&129u16.to_le_bytes());patch[16..18].copy_from_slice(&1u16.to_le_bytes());patch[8..12].copy_from_slice(&(12+8*2u32).to_le_bytes());patch.truncate(20+16);
+ let last=register(&mut inv,ResourceKind::Tim,&patch);
+ let events=vec![Upload{sequence:Some(0),resource:image.clone(),image:true,clut:false,merge_clut_zeros:false},Upload{sequence:Some(1),resource:pal.clone(),image:false,clut:true,merge_clut_zeros:false},Upload{sequence:Some(2),resource:last.clone(),image:true,clut:false,merge_clut_zeros:false}];
+ let expected=replay(&inv,&events);let trace=UploadTrace::verify_native_replay(&inv,&events,&expected,"mixed-depth physical-word fixture").unwrap();
+ let mesh=register(&mut inv,ResourceKind::Tmd,&model(480<<6,2,vec![(0,0),(7,0),(0,7)]));let plan=Planner::new(&Vram::new(),&[]).unwrap().plan_multi(&inv,&trace,&[mesh]).unwrap();
+ let used=plan.source_resources();assert!(used.contains(&image)&&used.contains(&last)&&used.contains(&pal));plan.package(&Vram::new()).unwrap();
+ data[0]=0; // Altering source bytes must never change the already frozen plan.
+}
+
+#[test]
+fn native_palette_upload_may_start_unaligned_while_cba_sampling_is_aligned(){
+ let mut inv=NativeAssetPlan::default();let mut raw=tim(0,31);let more=raw[20..52].to_vec();raw.splice(52..52,more);
+ raw[8..12].copy_from_slice(&76u32.to_le_bytes());raw[12..14].copy_from_slice(&1u16.to_le_bytes());raw[16..18].copy_from_slice(&32u16.to_le_bytes());
+ let texture=register(&mut inv,ResourceKind::Tim,&raw);let events=vec![Upload{sequence:Some(0),resource:texture,image:true,clut:true,merge_clut_zeros:false}];let expected=replay(&inv,&events);
+ let trace=UploadTrace::verify_native_replay(&inv,&events,&expected,"LoadImage strip X=1, sampled CBA X=16").unwrap();
+ let mesh=register(&mut inv,ResourceKind::Tmd,&model((480<<6)|1,2,vec![(0,0),(7,0),(0,7)]));let plan=Planner::new(&Vram::new(),&[]).unwrap().plan_multi(&inv,&trace,&[mesh]).unwrap();plan.package(&Vram::new()).unwrap();
 }

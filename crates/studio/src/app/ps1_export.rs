@@ -1451,11 +1451,13 @@ pub(super) fn prepare_project(source:&Path, scene:&AssembledScene,
         plan.skipped.push(line.clone());
         if let Some(log)=&mut plan.unrestricted_log {log.push_str(&format!("\n{line}"));}
     }
+    let static_resources=session.static_base_evidence(index);
     let cell=session.cell.as_ref().context("Project export Cell missing")?;
     for reference in session.project.database.references().values().filter(|r| &r.cell==cell) {
         let draw=session.reference_draws.get(&reference.key).and_then(|k|world.at(k.0,k.1));
         let report=serde_json::json!({
             "stage_a_reference":reference.key,"base":reference.base,"cell":reference.cell,
+            "canonical_static_resources":static_resources.get(&reference.base),
             "deleted":reference.deleted,"disabled":reference.disabled,
             "legacy_uid":draw.and_then(|d|d.editor_uid),"native_origin":reference.origin,
             "record_projection":if reference.deleted||reference.disabled {"hidden/tombstone"} else if draw.is_some() {"resolved to existing writer input"} else {"missing preview/native adapter"},
@@ -1627,8 +1629,6 @@ impl NativeExportPlan {
             let source_map=index.entry_bytes(donor_map as u32)?;
             let (record_id,_)=record_at_kind(&source_map,placed.cell,(placed.world_x,placed.world_z),placed.env_slot,[placed.rot_x,placed.rot_y,placed.rot_z],terrain)?;
             export_check!(cached.native_record.as_ref().is_some_and(|r|source_map[record_id*32..record_id*32+32]==r[..]),"Saved donor descriptor provenance changed or unresolved");
-            let source_bundle=if let Some(bundle)=legaia_engine_scene::scene_bundle::find_bundle(&native){bundle.bytes().to_vec()}else{index.entry_bytes((donor_map+3) as u32)?.as_ref().clone()};
-            let source_pac=if scene_registration::native_stream_mode(&source_bundle).is_some(){Some(index.entry_bytes((donor_map+4) as u32)?)}else{None};
             let bank=legaia_engine_scene::model_bank::SceneModelBank::build(&native);
             let source=bank.scene_source(u16::try_from(placed.env_slot)?).context("Native scene model selector has no registration source")?;
             let models=bank.materialise(&native);let model=models.get(placed.env_slot).and_then(|m|m.as_ref()).context("Native model registration source failed to decode")?;
@@ -1637,12 +1637,11 @@ impl NativeExportPlan {
                 legaia_engine_scene::model_bank::ModelSource::BundlePack{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::BundleSingle{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::StreamPack{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::StreamSingle{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::WalkedPack{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::WalkedSingle{entry_idx,..}=>entry_idx,
             };
             let mut inventory=NativeAssetPlan::default();let id=inventory.register(ResourceKind::Tmd,model,Origin{scene:foreign.source.clone(),entry:Some(model_entry),offset:None},false)?;
-            if unrestricted::active(){let (base,table)=scene_registration::native_descriptor_table(&source_bundle)?;unrestricted::diagnostic(format!("NATIVE DONOR RESOLVED UID {}: model selector {} -> {source:?}; TMD {} bytes SHA256 {}; table base {base:#x}, {} descriptors, stream mode {:?}",foreign.uid,placed.env_slot,model.len(),id.sha256,table.count,scene_registration::native_stream_mode(&source_bundle)));}
-            let (textures,expected)=scene_registration::native_donor_texture_sequence(index,&source_bundle,source_pac.as_deref().map(|p|p.as_slice()),limits)?;
-            let mut events=Vec::new();
-            for (i,raw) in textures.iter().enumerate(){let tim=legaia_tim::parse_native_upload(raw)?;let texture=inventory.register(ResourceKind::Tim,raw,Origin{scene:foreign.source.clone(),entry:None,offset:None},false)?;
-                events.push(Upload{sequence:Some(i as u32),resource:texture,image:true,clut:tim.clut.is_some(),merge_clut_zeros:false});}
-            let trace=UploadTrace::verify_native_replay(&inventory,&events,&expected,"Native descriptor/PAC dispatch order; passive CLUT walker; uploader FUN_800198E0")?;
+            let context=super::native_asset_plan::static_resources::resolve_context(index,&native)?;
+            let canonical=context.dependencies(&native,u16::try_from(placed.env_slot)?,model)?;
+            if unrestricted::active(){unrestricted::diagnostic(format!("NATIVE DONOR RESOLVED UID {}: selector {} -> {source:?}; exact TMD {} bytes SHA256 {}; canonical static dependencies {}",foreign.uid,placed.env_slot,model.len(),id.sha256,serde_json::to_string(&canonical)?));}
+            let events=context.register_uploads(&mut inventory)?;
+            let trace=UploadTrace::verify_native_replay(&inventory,&events,&context.vram,"Canonical native carrier/typed-stream order; boot first; static loader contract only")?;
             let relocation=planner.plan_multi(&inventory,&trace,&[id.clone()])?;
             if unrestricted::active(){for resource in relocation.resource_diagnostics(){unrestricted::diagnostic(format!("RESOURCE ENCODED for UID {}: {resource}",foreign.uid));}}
             let (compiled,registration)=Self::compile_scene_resources(&staged,map_entry,&inventory,&before,&relocation,limits)?;

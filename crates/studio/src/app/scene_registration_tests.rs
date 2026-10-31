@@ -210,7 +210,10 @@ fn real_town01_pac_packaging_and_native_donor_gates() -> Result<()> {
         let trace=UploadTrace::verify_native_replay(&inventory,&events,&expected,"Verified donor descriptor TIM-list member order; native uploader flag masks; passive CLUT walker")?;
         ensure!(table::decode_slot_by_type(source,6).context("Donor CLUT walker")?.map_err(anyhow::Error::msg)?==[0,0,0,0],"Active donor CLUT walker");
         let donor_map=lib.index.entry_bytes(donor.start)?;let pool=table::mesh_pool(source);
-        let mut choices=field_objects::parse_placements(&donor_map);choices.retain(|p|p.anchor_cell&field_objects::CELL_BIND_OWNED==0);
+        let mut choices=field_objects::parse_placements(&donor_map);// These are the historically verified regression witnesses, not a production asset whitelist.
+        // Broader resolver support must not silently select a different, larger test object.
+        let witness=if name=="bylon"{291}else{36};
+        choices.retain(|p|p.anchor_cell&field_objects::CELL_BIND_OWNED==0&&p.obj_idx==witness);
         choices.sort_by_key(|p|{let r=field_objects::ObjectRecord::parse(&donor_map,p.obj_idx as usize).unwrap();field_objects::pack_mesh_index(p.obj_idx,&r).and_then(|i|pool.get(i as usize)).map(|m|m.bytes.len()).unwrap_or(usize::MAX)});
         let mut selected=None;let mut last_error=String::new();
         for placement in choices {
@@ -477,7 +480,13 @@ fn real_plain_bundle_registration_uses_descriptor_lookup() -> Result<()> {
         if let Err(error)=upload_pack(&texture_slot.decoded,&mut before){println!("{name}: native TIM-list adapter rejected {error:#}");continue;}
         let old=table::mesh_pool(source);let (inventory,relocation,id)=incoming(&before);
         let registered=super::super::super::ps1_export::NativeExportPlan::register_resources_fixture(&inventory,source,&before,&relocation,budgets())?;
-        let selector=registered.selector(&id)?;let new=table::mesh_pool(registered.bytes());ensure!(new.len()>=old.len() && new[selector as usize].slot==1,"Native descriptor model lookup failed");
+        let selector=registered.selector(&id)?;let new=table::mesh_pool(registered.bytes());ensure!(new.len()>=old.len(),"Native model registry shrank");
+        let (_,written_slots)=slots_for_scene(registered.bytes(),budgets(),false)?;
+        ensure!(matches!(written_slots.get(new[selector as usize].slot).map(|s|s.kind),Some(2|9)),"Native model selector does not point to a TMD descriptor");
+        let package=relocation.package(&before)?;let expected=&members(&package.tmd_pack)?[package.model_slots[&id]as usize];
+        ensure!(&new[selector as usize].bytes==expected,"Registered model differs from exact requested TMD");
+        let(base,_)=native_descriptor_table(registered.bytes())?;let independent=super::super::super::native_loader_trace::trace(registered.bytes(),base,None)?;
+        ensure!(independent.models[selector as usize].bytes==*expected,"Independent loader model identity differs");
         for (a,b) in old.iter().zip(&new){ensure!(a.bytes==b.bytes && a.member==b.member,"Original registration changed");}
         println!("{name}: PROT {}, models {} -> {}, registered selector {}, field pool index {}, encoded bytes {} -> {}; in-memory only",entry.idx,old.len(),new.len(),selector,field_objects::FIELD_ACTOR_PACK_BIAS+selector,source.len(),registered.bytes().len());accepted+=1;
     }

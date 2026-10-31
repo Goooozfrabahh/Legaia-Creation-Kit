@@ -134,6 +134,8 @@ pub(super) struct BaseForm {
     pub editor_id: String,
     pub kind: FormKind,
     pub resources: Vec<ResourceReference>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    pub static_resources: Option<super::native_asset_plan::static_resources::Dependencies>,
     pub materials: BTreeMap<String, Property>,
     pub collision: BTreeMap<String, Property>,
     pub behavior: Vec<Dependency>,
@@ -149,6 +151,7 @@ impl BaseForm {
             editor_id,
             kind,
             resources: vec![],
+            static_resources: None,
             materials: Default::default(),
             collision: Default::default(),
             behavior: vec![],

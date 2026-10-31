@@ -493,26 +493,9 @@ fn stage_b_complete_gamewide_resource_audit() -> Result<()> {
         };
         let bank = SceneModelBank::build(&scene);
         let models = bank.materialise(&scene);
-        let source_sequence = (|| -> Result<_> {
-            let bundle = legaia_engine_scene::scene_bundle::find_bundle(&scene)
-                .context("No native field descriptor table")?;
-            let b = bundle.bytes().to_vec();
-            let map = scene
-                .field_map_index(&library.index)
-                .context("No field MAP, stream source unestablished")?;
-            let p = reg::native_stream_mode(&b)
-                .map(|_| library.index.entry_bytes(map + 4))
-                .transpose()?;
-            let (uploads, vram) = reg::native_donor_texture_sequence(
-                &library.index,
-                &b,
-                p.as_ref().map(|p| p.as_slice()),
-                limits(),
-            )?;
-            let profile =
-                crate::app::native_load_budget::analyze(&b, p.as_ref().map(|p| p.as_slice()));
-            Ok((b, p, uploads, vram, profile))
-        })();
+        let source_context=assets::static_resources::resolve_context(&library.index,&scene);
+        let source_sequence=(||->Result<_>{let c=source_context.as_ref().map_err(|e|anyhow::anyhow!("{e:#}"))?;
+        Ok((Vec::<u8>::new(),None::<std::sync::Arc<Vec<u8>>>,c.uploads.clone(),c.vram.clone(),Err::<crate::app::native_load_budget::Profile,_>(anyhow::anyhow!("See per-scene static dispatcher profiles; canonical upload context is not a heap certificate"))))})();
         let mut inventory = assets::NativeAssetPlan::default();
         let mut trace = None;
         let mut seq_error = String::new();
@@ -563,6 +546,8 @@ fn stage_b_complete_gamewide_resource_audit() -> Result<()> {
                 )?;
                 continue;
             };
+            if let Ok(context)=&source_context {let canonical=context.dependencies(&scene,selector as u16,raw).map(|c|serde_json::to_value(c).unwrap()).unwrap_or_else(|e|json!({"unresolved":format!("{e:#}"),"behavior_verified":false}));
+            census.add(&format!("{id}/canonical-static-dependencies"),"CanonicalStaticDependencies","definition",&id,0,None,canonical,json!([{"target":id,"relationship":"canonical model source; containing BaseForm retains independent FormKey"}]))?;}
             let hash = digest(raw);
             let valid = legaia_tmd::parse(raw).is_ok();
             let (resolved, encoded, reason) = if let Some(v) = cache.get(&hash) {
@@ -684,7 +669,7 @@ fn stage_b_complete_gamewide_resource_audit() -> Result<()> {
                 boot_users += 1;
             }
             if !encoded {
-                let group = if reason.contains("external image") {
+                let group = if reason.contains("Unresolved native VRAM word") || reason.contains("external image") {
                     "Unresolved texture/CLUT"
                 } else if reason.contains("Fragmented") {
                     "Composite image/palette writer"

@@ -224,7 +224,7 @@ fn upload_pack(raw:&[u8],vram:&mut Vram)->Result<()> {
         vram.upload_tim(&tim);
     }Ok(())
 }
-fn native_tim_members(raw:&[u8])->Result<Vec<Vec<u8>>>{
+pub(in crate::app) fn native_tim_members(raw:&[u8])->Result<Vec<Vec<u8>>>{
     members(raw)?.into_iter().map(|mut member|{
         if let Ok(tim)=legaia_tim::parse_native_upload(&member){
             // Preserve opaque suffixes in the original carrier. The upload
@@ -259,8 +259,7 @@ pub(in crate::app) fn native_texture_sequence(bundle:&[u8],pac:Option<&[u8]>,lim
 /// Boot-resident UI uploads precede field descriptors/PAC. Some environment
 /// primitives sample that real atlas/CLUT rather than a scene-local TIM.
 /// Return complete ordered source words, never fill unwritten donor VRAM.
-pub(in crate::app) fn native_donor_texture_sequence(index:&legaia_engine_scene::scene::ProtIndex,
-    bundle:&[u8],pac:Option<&[u8]>,limits:Limits)->Result<(Vec<Vec<u8>>,Vram)>{
+pub(in crate::app) fn native_boot_texture_sequence(index:&legaia_engine_scene::scene::ProtIndex)->Result<(Vec<Vec<u8>>,Vram)>{
     let boot=index.system_ui_bundle()?;
     let mut textures=Vec::new();
     for member in 0..boot.member_counts[0] {
@@ -284,13 +283,17 @@ pub(in crate::app) fn native_donor_texture_sequence(index:&legaia_engine_scene::
         }else{anyhow::bail!("Missing declared boot upload member {member}");}
     }
     let mut expected=Vram::new();boot.upload_boot_resident_to_vram(&mut expected);
-    let (scene_textures,scene_vram)=native_texture_sequence(bundle,pac,limits)?;
     // Verify the boot adapter independently against the existing native boot
     // uploader, including clipped raw row patches and flattened CLUT strips.
     let mut replay=Vram::new();for raw in &textures{replay.upload_tim(&legaia_tim::parse_native_upload(raw)?);}
     anyhow::ensure!(super::super::naming::material_key(&replay)==super::super::naming::material_key(&expected),"Boot upload adapter differs from native boot pixels/coverage");
+    Ok((textures,expected))
+}
+pub(in crate::app) fn native_donor_texture_sequence(index:&legaia_engine_scene::scene::ProtIndex,
+    bundle:&[u8],pac:Option<&[u8]>,limits:Limits)->Result<(Vec<Vec<u8>>,Vram)>{
+    let(mut textures,mut expected)=native_boot_texture_sequence(index)?;
+    let(scene_textures,scene_vram)=native_texture_sequence(bundle,pac,limits)?;
     for raw in &scene_textures {expected.upload_tim(&legaia_tim::parse_native_upload(raw)?);}
-    // Scene-local writes must remain the last writer, with no boot overwrite.
     anyhow::ensure!((0..1024*512).all(|i|!scene_vram.is_written(i%1024,i/1024)||scene_vram.as_u16()[i]==expected.as_u16()[i]),"Donor scene upload order changed");
     textures.extend(scene_textures);Ok((textures,expected))
 }

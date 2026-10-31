@@ -7,8 +7,10 @@ pub(in crate::app) struct Upload {
     pub image:bool,pub clut:bool,pub merge_clut_zeros:bool,
 }
 #[derive(Clone,Copy,Debug,PartialEq,Eq,PartialOrd,Ord)]
-struct Owner {event:usize,clut:bool}
-struct SourceBlock {rect:Rect,bytes:Vec<u8>,depth:u8}
+struct Owner {event:usize,clut:bool,view:u32}
+#[derive(Clone)]
+struct SourceBlock {rect:Rect,bytes:Vec<u8>,depth:u8,contributors:BTreeSet<usize>}
+#[derive(Clone)]
 pub(in crate::app) struct UploadTrace {
     events:Vec<Upload>,blocks:BTreeMap<Owner,SourceBlock>,
     owners:Vec<Option<Owner>>,vram:Vram,pub replay_evidence:String,
@@ -32,7 +34,7 @@ impl UploadTrace {
         Self::verify(inventory,events,expected,evidence,true)
     }
     fn verify(inventory:&NativeAssetPlan,events:&[Upload],expected:&Vram,evidence:&str,native:bool)->Result<Self> {
-        export_check!(!events.is_empty() && !evidence.trim().is_empty(),"Upload-order evidence missing");
+        export_check!(!evidence.trim().is_empty(),"Upload-order evidence missing");
         let mut trace=Self{events:events.to_vec(),blocks:BTreeMap::new(),owners:vec![None;1024*512],vram:Vram::new(),replay_evidence:evidence.into(),fingerprints:BTreeMap::new(),tim_flags:BTreeMap::new()};
         for (i,event) in events.iter().enumerate() {
             export_check!(event.sequence==Some(i as u32),"Ambiguous or incomplete upload ordering");
@@ -45,12 +47,13 @@ impl UploadTrace {
             if event.clut {
                 let c=tim.clut.as_ref().context("CLUT upload has no palette block")?;
                 let rect=Rect{x:c.fb_x,y:c.fb_y,w:c.w.checked_mul(c.h).context("Linear CLUT overflow")?,h:1}.valid()?;
-                export_check!(rect.x%16==0,"Unaligned native palette");
-                trace.write(Owner{event:i,clut:true},SourceBlock{rect,bytes:c.entries.iter().flat_map(|v|v.to_le_bytes()).collect(),depth:3},event.merge_clut_zeros);
+                // Native LoadImage writes words at its declared X; CBA sampling,
+                // not the upload strip, has 16-word address granularity.
+                trace.write(Owner{event:i,clut:true,view:0},SourceBlock{rect,bytes:c.entries.iter().flat_map(|v|v.to_le_bytes()).collect(),depth:3,contributors:BTreeSet::from([i])},event.merge_clut_zeros);
             }
             if event.image {
                 let rect=Rect{x:tim.image.fb_x,y:tim.image.fb_y,w:tim.image.fb_w,h:tim.image.h}.valid()?;
-                trace.write(Owner{event:i,clut:false},SourceBlock{rect,bytes:tim.image.data,depth},false);
+                trace.write(Owner{event:i,clut:false,view:0},SourceBlock{rect,bytes:tim.image.data,depth,contributors:BTreeSet::from([i])},false);
             }
         }
         export_check!(super::super::super::naming::material_key(&trace.vram)==super::super::super::naming::material_key(expected),"Ordered upload replay differs from reference pixels/coverage");
@@ -64,6 +67,31 @@ impl UploadTrace {
             self.vram.write_block(xx as u16,yy as u16,1,1,bytes);self.owners[yy*1024+xx]=Some(owner);
         }}self.blocks.insert(owner,block);
     }
+    /// Resolve the exact last-written native words, regardless of uploader
+    /// pixel mode or image/CLUT envelope. No unobserved word is synthesized.
+    fn word_view(&mut self,rect:Rect,depth:u8,palette:bool)->Result<Owner>{
+        rect.valid()?;let mut owners=BTreeSet::new();
+        for y in rect.y..rect.y+rect.h {for x in rect.x..rect.x+rect.w {
+            owners.insert(self.owners[y as usize*1024+x as usize].with_context(||format!("Unresolved native VRAM word ({x},{y}) in {rect:?}; palette={palette}; no ordered upload supplies it"))?);
+        }}
+        let first=*owners.first().context("Empty native word footprint")?;
+        let desired=if palette{3}else{depth};
+        if owners.len()==1&&self.blocks[&first].depth==desired {return Ok(first);}
+        // A uniform upload can be interpreted at multiple GPU sampling depths.
+        // Its full observed rectangle remains useful for coalescing references.
+        let mut used=if owners.len()==1{self.blocks[&first].rect}else{rect};
+        let reusable=self.blocks.iter().filter(|(o,b)|o.view!=0&&o.clut==palette&&b.depth==desired&&b.rect.overlaps(used)).find_map(|(o,b)|{
+            let x=used.x.min(b.rect.x);let y=used.y.min(b.rect.y);let r=Rect{x,y,w:(used.x+used.w).max(b.rect.x+b.rect.w)-x,h:(used.y+used.h).max(b.rect.y+b.rect.h)-y};
+            ((r.y..r.y+r.h).all(|yy|(r.x..r.x+r.w).all(|xx|self.owners[yy as usize*1024+xx as usize].is_some()))).then_some((*o,r))
+        });
+        let owner=if let Some((o,r))=reusable{used=r;o}else{Owner{event:first.event,clut:palette,view:self.blocks.len()as u32+1}};
+        let mut bytes=Vec::new();let mut contributors=BTreeSet::new();
+        for y in used.y..used.y+used.h {for x in used.x..used.x+used.w {let at=y as usize*1024+x as usize;
+            let source=self.owners[at].context("Composite native region contains an unobserved word")?;contributors.insert(source.event);
+            bytes.extend(self.vram.as_u16()[at].to_le_bytes());
+        }}
+        self.blocks.insert(owner,SourceBlock{rect:used,bytes,depth:desired,contributors});Ok(owner)
+    }
     fn owner(&self,rect:Rect,clut:bool)->Result<Owner> {
         rect.valid()?;let owner=self.owners[rect.y as usize*1024+rect.x as usize].with_context(||format!("Unresolved external image/palette data at {rect:?}; palette={clut}"))?;
         // CBA addresses raw VRAM words: an image upload may intentionally
@@ -75,7 +103,7 @@ impl UploadTrace {
     }
 }
 
-pub(super) struct UploadBlock {pub rect:Rect,pub bytes:Vec<u8>,pub depth:u8,pub source:ResourceId,pub origins:BTreeSet<Origin>,flags:u32}
+pub(super) struct UploadBlock {pub rect:Rect,pub bytes:Vec<u8>,pub depth:u8,pub source:ResourceId,pub origins:BTreeSet<Origin>,flags:u32,contributors:BTreeSet<ResourceId>}
 pub(in crate::app) struct MultiPlan {
     uploads:Vec<UploadBlock>,tmds:BTreeMap<ResourceId,Vec<u8>>,
     source_vram:String,output:Vram,pub evidence:String,
@@ -84,11 +112,12 @@ pub(in crate::app) struct MultiPlan {
 impl MultiPlan {
     pub(in crate::app) fn resource_diagnostics(&self)->Vec<String>{
         self.uploads.iter().map(|u|format!("TIM {:?} {} -> native VRAM {:?}, {} bytes",u.source,if u.depth==3{"CLUT words"}else{"IMAGE"},u.rect,u.bytes.len()))
+            .chain(self.uploads.iter().map(|u|format!("Native word contribution closure: sampled depth/role {}, actual source resources {:?}; upload metadata is not GPU sampling depth",u.depth,u.contributors)))
             .chain(self.tmds.iter().map(|(id,bytes)|format!("TMD {id:?} relocated SHA256 {} ({} bytes)",super::super::digest(bytes),bytes.len())))
             .chain(self.reference_diagnostics.iter().cloned()).collect()
     }
     pub(in crate::app::native_asset_plan) fn source_resources(&self)->BTreeSet<ResourceId> {
-        self.uploads.iter().map(|u|u.source.clone()).chain(self.tmds.keys().cloned()).collect()
+        self.uploads.iter().flat_map(|u|u.contributors.iter().cloned()).chain(self.tmds.keys().cloned()).collect()
     }
     pub fn apply(&self,destination:&Vram)->Result<Vram> {
         export_check!(super::super::super::naming::material_key(destination)==self.source_vram,"Multi-TIM destination changed");Ok(self.output.clone())
@@ -100,6 +129,7 @@ impl Planner {
         let mut staged=self.clone();let result=staged.compile_multi(inventory,trace,tmd_ids)?;*self=staged;Ok(result)
     }
     fn compile_multi(&mut self,inventory:&NativeAssetPlan,trace:&UploadTrace,tmd_ids:&[ResourceId])->Result<MultiPlan> {
+        let mut resolved=trace.clone();let trace=&mut resolved;
         for (id,hash) in &trace.fingerprints {export_check!(super::super::digest(payload(inventory,id,ResourceKind::Tim)?)==*hash,"Upload trace source changed");}
         export_check!(!tmd_ids.is_empty(),"No model dependencies");
         let mut bindings=BTreeMap::new();let mut required=BTreeSet::new();
@@ -111,12 +141,13 @@ impl Planner {
                 let u0=r.uvs.iter().map(|p|p.0).min().unwrap() as u16;let u1=r.uvs.iter().map(|p|p.0).max().unwrap() as u16;
                 let v0=r.uvs.iter().map(|p|p.1).min().unwrap() as u16;let v1=r.uvs.iter().map(|p|p.1).max().unwrap() as u16;
                 let rect=Rect{x:(r.tsb&15)*64+u0/divisor,y:((r.tsb>>4)&1)*256+v0,w:u1/divisor-u0/divisor+1,h:v1-v0+1};
-                let image=trace.owner(rect,false)?;export_check!(trace.blocks[&image].depth==depth,"Native image depth mismatch");required.insert(image);
-                let palette=if depth<2 {let owner=trace.owner(Rect{x:(r.cba&63)*16,y:(r.cba>>6)&511,w:if depth==0{16}else{256},h:1},true)?;required.insert(owner);Some(owner)}else{None};
+                let image=trace.word_view(rect,depth,false)?;required.insert(image);
+                let palette=if depth<2 {let owner=trace.word_view(Rect{x:(r.cba&63)*16,y:(r.cba>>6)&511,w:if depth==0{16}else{256},h:1},3,true)?;required.insert(owner);Some(owner)}else{None};
                 model.push(Binding{reference:r,image,palette});
             }bindings.insert(id.clone(),model);
         }
-        export_check!(!required.is_empty(),"No textured dependencies");
+        // A structurally verified model may contain only untextured primitives.
+        // Empty texture dependencies require no uploads or invented material.
         let source_vram=super::super::super::naming::material_key(&self.vram);
         let mut images=BTreeMap::new();let mut palettes=BTreeMap::new();let mut uploads=Vec::new();
         let union=|a:Rect,b:Rect|{let x=a.x.min(b.x);let y=a.y.min(b.y);Rect{x,y,w:(a.x+a.w).max(b.x+b.w)-x,h:(a.y+a.h).max(b.y+b.h)-y}};
@@ -150,8 +181,10 @@ impl Planner {
             let role=if palette{3}else{block.depth};
             let target=match self.allocate(used,&bytes,role,None,&refs){Ok(rect)=>rect,Err(error)if !palette=>self.allocate_rebased(used,&bytes,role,&refs).with_context(||format!("UV-preserving allocation failed ({error}); native UV rebasing also failed"))?,Err(error)=>return Err(error)};
             if palette{palettes.insert(owner,(used,target));}else{for r in refs{images.insert((owner,r.tsb,r.uvs),(used,target));}}
-            if owner.clut&&trace.events[owner.event].merge_clut_zeros{export_check!((block.rect.y..block.rect.y+block.rect.h).all(|y|(block.rect.x..block.rect.x+block.rect.w).all(|x|trace.owners[y as usize*1024+x as usize]==Some(owner))),"Partial merge-zero CLUT cannot be emitted as a complete block");}
-            let source=trace.events[owner.event].resource.clone();uploads.push(UploadBlock{rect:target,bytes,depth:role,source:source.clone(),origins:inventory.resources[&source].origins.clone(),flags:trace.tim_flags[&source]});
+            let source=trace.events[owner.event].resource.clone();
+            let contributors=block.contributors.iter().map(|&i|trace.events[i].resource.clone()).collect::<BTreeSet<_>>();
+            let origins=contributors.iter().flat_map(|id|inventory.resources[id].origins.iter().cloned()).collect();
+            uploads.push(UploadBlock{rect:target,bytes,depth:role,source:source.clone(),origins,flags:trace.tim_flags[&source],contributors});
         }
         let mut tmds=BTreeMap::new();let mut samples=0usize;let mut reference_diagnostics=Vec::new();
         for (id,model) in bindings {
@@ -186,7 +219,7 @@ impl Planner {
 /// selector table. Slots here are local pack indexes, not runtime mesh IDs.
 pub(in crate::app) struct SceneResourcePackage {pub tim_pack:Vec<u8>,pub tmd_pack:Vec<u8>,pub model_slots:BTreeMap<ResourceId,u32>}
 fn pack(items:&[Vec<u8>])->Result<Vec<u8>> {
-    export_check!(!items.is_empty() && items.len()<=65536,"Native pack count out of range");
+    export_check!(items.len()<=65536,"Native pack count out of range");
     let mut out=vec![0;4+items.len()*4];out[..4].copy_from_slice(&(items.len() as u32).to_le_bytes());
     for (i,item) in items.iter().enumerate() {export_check!(out.len()/4<=u32::MAX as usize,"Native pack offset overflow");let word=(out.len()/4) as u32;out[4+i*4..8+i*4].copy_from_slice(&word.to_le_bytes());out.extend_from_slice(item);while out.len()%4!=0{out.push(0);}}
     let ranges=legaia_container_formats::pack::parse_pack(&out)?;export_check!(ranges.len()==items.len(),"Native pack count readback");
