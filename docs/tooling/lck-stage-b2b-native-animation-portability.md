@@ -1,5 +1,11 @@
 # Stage B2B — native animated Reference portability
 
+**Subsequent user gameplay result: FAILED.** The experimental IMG froze loading
+Rim Elm. B2B is not runtime verified. See
+[the loading investigation](lck-stage-b2b-loading-investigation.md); the automated
+results below are historical structural/instruction evidence, not a successful
+gameplay result.
+
 Parent: `a29b784cb0316bb3fef6907adc73ae8c0b040445`.
 Development branch: `lck/stage-b2b-native-animation-portability`.
 

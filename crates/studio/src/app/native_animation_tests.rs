@@ -656,6 +656,108 @@ fn clip_banks_share_exact_payloads_and_preserve_existing_indices() -> Result<()>
     assert!(append_clips(&bank, &[vec![0; 3]]).is_err());
     Ok(())
 }
+
+/// Continue the real installer through its previously untested spawn pre-run.
+/// Allocation/GTE remain substituted by original_actor_installer; this proves
+/// bytecode execution only, never live heap or gameplay compatibility.
+fn original_spawn_prerun(cpu: &mut legaia_code_hooks::mips_sim::Cpu, overlay: &[u8]) -> Result<()> {
+    cpu.load(0x801ce818, overlay);
+    let start=cpu.steps;
+    while cpu.pc != 0x8003a4fc {
+        ensure!(cpu.steps-start<100000,"Spawn pre-run stuck at {:#x}",cpu.pc);
+        ensure!((0x80010000..0x8007b318).contains(&cpu.pc)||(0x801ce818..0x801ce818+overlay.len() as u32).contains(&cpu.pc),"Spawn pre-run escaped at {:#x}",cpu.pc);
+        let w=cpu.rd32(cpu.pc);cpu.exec(w);
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore="read-only failed IMG instruction-level startup diagnosis; no emulator"]
+fn stage_b2b_failed_image_startup_probe() -> Result<()> {
+    let lib=crate::library::Library::open(std::path::Path::new(&std::env::var_os("LCK_FAILED_IMG").context("failed IMG")?))?;
+    let exe=lib.executable()?;let scene=Scene::load(&lib.index,"town01")?;
+    let man=scene.field_man_payload(&lib.index)?.context("MAN")?;
+    let bank=legaia_engine_scene::npc_catalog::scene_anm_bundle(&scene).context("ANM")?;
+    let overlay=lib.index.entry_bytes(897)?;
+    let context=assets::static_resources::resolve_actor_context(&lib.index,&scene)?;
+    let mf=man_section::parse(&man).map_err(anyhow::Error::msg)?;
+    for p in mf.actor_placements(&man).into_iter().filter(|p|p.index>=53) {
+        let (_,_,_,mut cpu)=original_actor_installer(&exe,&man,&bank.decoded,p.index,context.models[p.model_index as usize].as_ref().context("model")?,None)?;
+        original_spawn_prerun(&mut cpu,&overlay)?;
+        println!("Completed native spawn pre-run P1[{}], PC {}",p.index,cpu.rd16(0x80600000+p.index as u32*0x100+0x9e));
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore="clean-retail isolated IMG matrix, exact failed project and native loader evidence; no GUI"]
+fn stage_b2b_loading_isolation_matrix() -> Result<()> {
+    use super::super::{form_bridge::Session, world_view, lck_project::ProjectFile, ps1_export};
+    let source=std::path::PathBuf::from(std::env::var_os("LCK_AUDIT_SOURCE").context("retail")?);
+    let failed=std::path::PathBuf::from(std::env::var_os("LCK_FAILED_IMG").context("failed")?);
+    let project=std::path::PathBuf::from(std::env::var_os("LCK_FAILED_PROJECT").context("project")?);
+    let root=std::path::PathBuf::from(std::env::var_os("LCK_ISOLATION_OUTPUT").context("new output")?);
+    ensure!(!root.exists(),"Isolation evidence must use a new directory");std::fs::create_dir_all(&root)?;
+    let lib=crate::library::Library::open(&source)?;
+    let target=legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,"town01").map_err(anyhow::Error::msg)?;
+    let mut session=Session::temporary(&source,&lib.index)?;
+    session.enter(&target,&lib.index,&world_view::build_world(&target,&lib.index),"original:town01".into(),"town01".into(),None)?;
+    let saved=ProjectFile::open(&project,Some(&session.source_fingerprint))?;
+    session.project=saved.project;
+    let keys=session.project.database.references().values().filter(|r|!r.deleted&&r.flags.contains("native_animated_reference")).map(|r|r.key.clone()).collect::<Vec<_>>();
+    ensure!(keys.len()==3,"Expected exact original three-reference failure arrangement, found {}",keys.len());
+    session.cell=Some(session.project.database.reference(&keys[0]).unwrap().cell.clone());
+    let original=session.project.clone();let exe=lib.executable()?;
+    let mut rows=vec![];
+    for(name,keep)in [("A_CONTROL",vec![]),("B_FIRST_BALDEN",vec![0]),("C_SECOND_BUBU1",vec![1]),("D_EXACT_THREE",vec![0,1,2]),("E_TWO_UNIQUE",vec![0,1])] {
+        session.project=original.clone();
+        for(i,key)in keys.iter().enumerate(){if !keep.contains(&i){session.project.database.transaction(|d|d.delete_reference(key))?;}}
+        let plan=ps1_export::prepare_project(&source,&target,&mut session,&lib.index,true)?;
+        let(_,_,failures)=plan.animation_test_inspection();ensure!(!failures.iter().any(|s|s.starts_with("FAILED")),"Isolation export incomplete: {failures:?}");
+        let dir=root.join(name);std::fs::create_dir(&dir)?;
+        let path=dir.join(format!("LCK_EXPERIMENTAL_{name}.img"));
+        ps1_export::export(plan,&path)?;
+        let new=crate::library::Library::open(&path)?;
+        let scene=Scene::load(&new.index,"town01")?;let map=scene.field_map_index(&new.index).context("MAP")?;
+        ensure!(new.index.entry_bytes(map)?==lib.index.entry_bytes(map)?,"Collision/existing MAP changed");
+        let man=scene.field_man_payload(&new.index)?.context("MAN")?;
+        let mf=man_section::parse(&man).map_err(anyhow::Error::msg)?;
+        let retail_man=Scene::load(&lib.index,"town01")?.field_man_payload(&lib.index)?.context("retail MAN")?;
+        let old=man_section::parse(&retail_man).map_err(anyhow::Error::msg)?;
+        ensure!(mf.partitions[1].len()==old.partitions[1].len()+keep.len(),"P1 count differs");
+        let b=new.index.entry_bytes(map+3)?;let p=new.index.entry_bytes(map+4)?;let(base,_)=reg::native_descriptor_table(&b)?;
+        let trace=super::super::native_loader_trace::trace(&b,base,Some(&p))?;
+        let origb=lib.index.entry_bytes(map+3)?;let origp=lib.index.entry_bytes(map+4)?;let(obase,_)=reg::native_descriptor_table(&origb)?;
+        let origtrace=super::super::native_loader_trace::trace(&origb,obase,Some(&origp))?;
+        ensure!(origtrace.models.iter().zip(&trace.models).all(|(a,b)|a.sha256==b.sha256),"Unrelated native models changed");
+        let(_,alloc)=super::super::native_loader_trace::tests::execute_original_allocations(&exe,&b,base,Some(&p),true)?;
+        let bank=legaia_engine_scene::npc_catalog::scene_anm_bundle(&scene).context("ANM")?;
+        let oldbank=legaia_engine_scene::npc_catalog::scene_anm_bundle(&Scene::load(&lib.index,"town01")?).context("retail ANM")?;
+        ensure!((0..oldbank.record_count as usize).all(|i|oldbank.record_bytes(i)==bank.record_bytes(i)),"Original animation bytes changed");
+        let mut actor_rows=vec![];
+        for a in mf.actor_placements(&man).into_iter().filter(|a|a.index>=old.partitions[1].len()) {
+            let (_,_,_,mut cpu)=original_actor_installer(&exe,&man,&bank.decoded,a.index,&trace.models[a.model_index as usize].bytes,None)?;
+            original_spawn_prerun(&mut cpu,&lib.index.entry_bytes(897)?)?;
+            let donor=if keep[actor_rows.len()]==1 {"bubu1"}else{"balden"};let c=resolve(&lib.index,donor,1,None)?;
+            ensure!(bank.record_bytes(a.anim_id as usize-1)==c.clip,"Donor ANM source bytes changed");
+            actor_rows.push(serde_json::json!({"p1":a.index,"context":old.partitions[0].len()+a.index,"model":a.model_index,"animation":a.anim_id,"clip_sha256":digest(&c.clip),"startup_prerun_completed":true}));
+        }
+        let sha=digest(&std::fs::read(&path)?);
+        let pf=dir.join(format!("{name}.lckproject"));ProjectFile::new(session.project.clone(),pf.clone()).save()?;
+        let reopen=ProjectFile::open(&pf,Some(&session.source_fingerprint))?;ensure!(serde_json::to_vec(&reopen.project.database)?==serde_json::to_vec(&session.project.database)?,"Project reopen differs");
+        rows.push(serde_json::json!({"case":name,"path":path,"sha256":sha,"active_original_reference_ordinals":keep,"actors":actor_rows,"native_model_count":trace.models.len(),"native_allocations":alloc,"runtime_profile":super::super::native_load_budget::analyze(&b,Some(&p))?,"map_exact_retail":true,"original_model_prefix_preserved":true,"original_anm_records_preserved":true,"gameplay_verified":false}));
+    }
+    let failedlib=crate::library::Library::open(&failed)?;
+    let failedscene=Scene::load(&failedlib.index,"town01")?;
+    let dm=failedscene.field_man_payload(&failedlib.index)?.context("failed MAN")?;
+    // Before a writer repair, D must reproduce all native scene bytes exactly.
+    let dlib=crate::library::Library::open(std::path::Path::new(rows[3]["path"].as_str().unwrap()))?;
+    let dscene=Scene::load(&dlib.index,"town01")?;
+    let exact=dm==dscene.field_man_payload(&dlib.index)?.context("D MAN")?;
+    let report=serde_json::json!({"schema":1,"starting_checkpoint":"34bb3502e37dc7f92a273ee2e2d8910f10cf539f","user_reported_gameplay":"FAILED: original experimental IMG froze loading Rim Elm","failed_image":failed,"failed_sha256":digest(&std::fs::read(&failed)?),"D_man_matches_failed":exact,"cases":rows,"limitations":["Original startup instructions pass with synthetic actor/node allocation, GTE and RNG substitutions","Allocation requests are not live heap capacity proof","No host GUI/emulator launched; all variants await user gameplay testing"]});
+    std::fs::write(root.join("ISOLATION_REPORT.json"),serde_json::to_vec_pretty(&report)?)?;
+    Ok(())
+}
 #[test]
 #[ignore = "read-only streamed donor class and global/conditional unsupported mechanisms"]
 fn stage_b2b_stream_and_unsupported_inventory() -> Result<()> {
