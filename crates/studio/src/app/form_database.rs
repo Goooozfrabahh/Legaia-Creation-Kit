@@ -230,14 +230,21 @@ impl FormIdAllocator {
         Ok(())
     }
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Indexes {
     pub base_references: BTreeMap<FormKey, BTreeSet<FormKey>>,
     pub cell_references: BTreeMap<FormKey, BTreeSet<FormKey>>,
     pub users: BTreeMap<FormKey, BTreeSet<FormKey>>,
     pub editor_ids: BTreeMap<String, FormKey>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(super) struct MasterSnapshot {
+    pub file: FileId,
+    pub layer: Layer,
+    pub registry: Vec<ImportRegistration>,
+    pub allocator: FormIdAllocator,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(super) struct FormDatabase {
     pub(super) master_file: FileId,
     pub(super) active_file: FileId,
@@ -275,6 +282,108 @@ impl FormDatabase {
             registry: vec![],
             indexes: Default::default(),
         })
+    }
+    pub fn retain_identity_inventory(&mut self, current: &Self) -> Result<()> {
+        ensure!(
+            self.master_file == current.master_file && self.active_file == current.active_file,
+            "Cannot merge another project's history"
+        );
+        for (k, v) in &current.master.bases {
+            self.master
+                .bases
+                .entry(k.clone())
+                .or_insert_with(|| v.clone());
+        }
+        for (k, v) in &current.master.references {
+            self.master
+                .references
+                .entry(k.clone())
+                .or_insert_with(|| v.clone());
+        }
+        for r in &current.registry {
+            if !self
+                .registry
+                .iter()
+                .any(|a| a.source_file == r.source_file && a.source_identity == r.source_identity)
+            {
+                self.registry.push(r.clone());
+            }
+        }
+        self.allocator.retain_high_water(&current.allocator);
+        Ok(())
+    }
+    pub fn retain_context_cell(&mut self, key: &FormKey, current: &Self) -> Result<()> {
+        let base = current.resolve_base(key).context("Context cell missing")?;
+        ensure!(base.kind == FormKind::Cell, "Context import is not a Cell");
+        if self.resolve_base(key).is_none() {
+            self.active.bases.insert(key.clone(), base.clone());
+        }
+        Ok(())
+    }
+    pub fn retain_context_reference(&mut self, key: &FormKey, current: &Self) -> Result<()> {
+        if self.reference(key).is_none() {
+            let reference = current
+                .reference(key)
+                .context("Context reference missing")?
+                .clone();
+            self.active.references.insert(key.clone(), reference);
+        }
+        Ok(())
+    }
+    pub fn master_snapshot(&self) -> MasterSnapshot {
+        let mut allocator = FormIdAllocator::default();
+        if let Some(n) = self.allocator.next.get(&self.master_file) {
+            allocator.next.insert(self.master_file.clone(), *n);
+        }
+        MasterSnapshot {
+            file: self.master_file.clone(),
+            layer: self.master.clone(),
+            registry: self.registry.clone(),
+            allocator,
+        }
+    }
+    pub fn mount_master_snapshot(&mut self, snapshot: &MasterSnapshot) -> Result<()> {
+        ensure!(
+            snapshot.file == self.master_file,
+            "Master snapshot namespace mismatch"
+        );
+        let mut draft = self.clone();
+        for entry in &snapshot.registry {
+            if let Some(old) = draft.registry.iter().find(|r| {
+                r.source_file == entry.source_file && r.source_identity == entry.source_identity
+            }) {
+                ensure!(
+                    old.key == entry.key && old.kind == entry.kind,
+                    "Master registry identity conflict; no rekeying permitted"
+                );
+            } else {
+                draft.registry.push(entry.clone());
+            }
+        }
+        for (k, b) in &snapshot.layer.bases {
+            if let Some(old) = draft.master.bases.get(k) {
+                ensure!(
+                    old == b,
+                    "Master definition changed under an existing identity"
+                );
+            } else {
+                draft.master.bases.insert(k.clone(), b.clone());
+            }
+        }
+        for (k, r) in &snapshot.layer.references {
+            if let Some(old) = draft.master.references.get(k) {
+                ensure!(
+                    old == r,
+                    "Master reference changed under an existing identity"
+                );
+            } else {
+                draft.master.references.insert(k.clone(), r.clone());
+            }
+        }
+        draft.allocator.retain_high_water(&snapshot.allocator);
+        draft.validate()?;
+        *self = draft;
+        Ok(())
     }
     pub fn master_layer(&self) -> &Layer {
         &self.master
@@ -446,7 +555,9 @@ impl FormDatabase {
         let mut r = self.reference(key).context("Reference missing")?.clone();
         edit(&mut r)?;
         ensure!(&r.key == key, "Reference identity cannot change");
-        self.active.references.insert(key.clone(), r);
+        if self.reference(key) != Some(&r) {
+            self.active.references.insert(key.clone(), r);
+        }
         Ok(())
     }
     pub fn move_reference(&mut self, key: &FormKey, transform: Transform) -> Result<()> {

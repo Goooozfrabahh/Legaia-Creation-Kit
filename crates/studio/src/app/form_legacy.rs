@@ -82,8 +82,9 @@ fn source(
     let mesh = if kind == "npc" {
         world
             .and_then(|w| w.npcs.iter().find(|n| n.record == ordinal))
-            .and_then(|n| n.raw_tmd.as_ref())
-            .map(|b| digest(b))
+            .and_then(|n| n.model_pool.get(n.original_model_index as usize))
+            .and_then(|m| m.as_ref())
+            .map(|(raw, _)| digest(raw))
     } else {
         let slot = if kind == "mesh" {
             scene.env_tmds.get(ordinal).copied()
@@ -164,7 +165,29 @@ pub(super) fn scene_input(
         } else {
             (fallback, None, foreign.map(|f| digest(&f.raw_tmd)))
         };
-        let editor_id = format!("BASE_{}", digest(base_identity.as_bytes()));
+        let location = origin
+            .as_ref()
+            .map(|o| {
+                if let Some(id) = o.man_record {
+                    format!("MAN{id}")
+                } else if kind == "terrain" {
+                    o.cell
+                        .map(|c| format!("x{}_z{}", c[0], c[1]))
+                        .unwrap_or_else(|| format!("source{ordinal}"))
+                } else {
+                    o.descriptor
+                        .map(|n| format!("MAP{n}"))
+                        .unwrap_or_else(|| format!("source{ordinal}"))
+                }
+            })
+            .unwrap_or_else(|| format!("source{ordinal}"));
+        let editor_id = format!(
+            "Native_{}_{}_{}_{}",
+            donor_scene,
+            kind,
+            location,
+            &digest(base_identity.as_bytes())[..8]
+        );
         let form_kind = match kind {
             "npc" => FormKind::Actor,
             "terrain" => FormKind::Terrain,
@@ -214,6 +237,20 @@ pub(super) fn scene_input(
             flags.insert("static_architecture".into());
         }
         let mut properties = BTreeMap::new();
+        if draw.editor_uid.is_some() {
+            properties.insert(
+                "legacy_instance_kind".into(),
+                Property::Text(
+                    if foreign.is_some() {
+                        "foreign"
+                    } else {
+                        "native-copy"
+                    }
+                    .into(),
+                ),
+            );
+        }
+
         if let Some(n) = world.npc(key) {
             properties.insert(
                 "npc_model_selection".into(),
@@ -263,6 +300,22 @@ pub(super) fn scene_input(
                 }
             }
         }
+        let mut original_properties = BTreeMap::new();
+        let mut original_flags = BTreeSet::new();
+        if let Some(n) = world.npc(key) {
+            original_properties.insert(
+                "npc_model_selection".into(),
+                Property::Integer(n.original_model_index as i64),
+            );
+            original_properties.insert(
+                "npc_animation_clip".into(),
+                Property::Integer(n.anim_id as i64),
+            );
+            original_properties.insert("npc_animation_frame".into(), Property::Integer(0));
+            if n.conditional {
+                original_flags.insert("native_story_conditional".into());
+            }
+        }
         objects.push(LegacyObjectInput {
             source_identity,
             base_identity,
@@ -271,6 +324,8 @@ pub(super) fn scene_input(
             origin,
             uid: draw.editor_uid,
             original_transform,
+            original_properties,
+            original_flags,
             transform,
             display_name: draw.display_name.clone(),
             hidden: draw.hidden,

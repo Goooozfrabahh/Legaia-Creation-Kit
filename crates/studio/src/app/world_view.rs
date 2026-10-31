@@ -997,3 +997,6 @@ mod ground_texture_tests {
         assert_eq!(m.indices.len(), 6);
     }
 }
+
+/// Render records through the existing native preview pipeline.
+pub(super) fn build_from_forms(session:&mut super::form_bridge::Session,scene:&AssembledScene,index:&legaia_engine_scene::scene::ProtIndex)->anyhow::Result<WorldModel>{session.render(scene,index)}

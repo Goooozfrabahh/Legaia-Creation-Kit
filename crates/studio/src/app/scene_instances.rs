@@ -956,3 +956,6 @@ mod tests {
         assert!(parse("LCK_SCENE_V1\tcave01\nMOVE\tplacement\t1\t0\t0\t0\n","cave01",&world).is_err());
     }
 }
+
+/// Explicit legacy import boundary; permanent identity belongs to the project.
+pub(super) fn migrate_into_project(project:&mut super::lck_project::LckProject,scene:&legaia_engine_scene::scene_assembly::AssembledScene,index:&legaia_engine_scene::scene::ProtIndex,world:&WorldModel,text:&str,identity:String,label:String,copy_id:Option<u64>)->anyhow::Result<super::form_database::FormKey>{super::form_legacy::migrate_document(project,scene,index,world,text,identity,label,copy_id)}

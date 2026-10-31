@@ -3,6 +3,9 @@
 mod form_database;
 mod lck_project;
 mod form_legacy;
+mod form_bridge;
+mod form_master_store;
+mod form_ui;
 mod actors_ui;
 mod multi_selection;
 #[cfg(test)]
@@ -275,6 +278,9 @@ struct EditorRotationEdit {
 
 #[derive(Clone, PartialEq)]
 struct EditorSceneHistory {
+    project:Option<std::sync::Arc<lck_project::LckProject>>,
+    form_selection:Vec<form_database::FormKey>,
+    form_primary:Option<form_database::FormKey>,
     /// Full editor-only scene state: undo can restore deleted duplicates too.
     overlay: String,
     /// Stable selection identity, unaffected by recreated duplicate indices.
@@ -289,7 +295,7 @@ fn editor_history_capture(world: &world_view::WorldModel, scene_name: &str,
             Some(uid) => scene_instances::NameTarget::Created(uid),
             None => scene_instances::NameTarget::Native(key.0,key.1),
         }));
-    EditorSceneHistory {overlay: scene_instances::serialize(scene_name,world), selection: selected.iter().cloned().collect(), selected}
+    EditorSceneHistory {project:None,form_selection:vec![],form_primary:None,overlay: scene_instances::serialize(scene_name,world), selection: selected.iter().cloned().collect(), selected}
 }
 
 fn editor_history_capture_group(world: &world_view::WorldModel, name: &str,
@@ -760,6 +766,14 @@ fn editor_native_item_hint(scene: Option<&legaia_engine_scene::scene_assembly::A
 }
 
 pub struct App {
+    form_session:Option<form_bridge::Session>,
+    form_file:Option<lck_project::ProjectFile>,
+    form_recovery:Vec<(form_bridge::Session,Option<lck_project::ProjectFile>)>,
+    form_panel:bool,
+    form_drag:Option<form_database::FormKey>,
+    form_selected:Option<form_database::FormKey>,
+    form_editor_id:String,
+    form_editor_target:Option<form_database::FormKey>,
     pub studio: Studio,
     mode: Mode,
     tab: Tab,
@@ -971,6 +985,7 @@ impl App {
             Err(error)=>(CellStore::default(),Some(error)),
         };
         let mut app = Self {
+            form_session:None,form_file:None,form_recovery:vec![],form_panel:false,form_drag:None,form_selected:None,form_editor_id:String::new(),form_editor_target:None,
             studio,
             mode,
             tab,
@@ -1421,16 +1436,20 @@ impl App {
         if let Some(result) = completed {
             let (source,cell,_)=self.pending_native_scene.take().expect("completed pending load");
             let restored=result.and_then(|(scene,mut world)| {
-                if let CellSelection::Copy(id)=&cell {
-                    let text=self.editor_cells.read_overlay(*id)?;
+                if let CellSelection::Copy(id)=&cell {if !self.form_session.as_ref().is_some_and(|s|s.project.cells.iter().any(|c|c.identity==cell.form_identity(&source)&&c.resolved)){
+                    let stored=self.form_session.as_ref().and_then(|s|s.project.cells.iter().find(|c|c.identity==cell.form_identity(&source)).and_then(|c|s.project.legacy_documents.get(&c.key))).cloned();
+                    let text=match stored{Some(text)=>text,None=>self.editor_cells.read_overlay(*id)?};
                     let doc=scene_instances::parse(&text,&source,&world)?;
                     let index=self.studio.library.as_ref().ok_or("Original disc index unavailable")?;
                     scene_instances::apply(&doc,&mut world,scene.placements.len(),&index.index)?;
-                }
+                }}
                 Ok((scene,world))
             });
             match restored {
                 Ok((scene,world))=>{
+                    let projected=(||->anyhow::Result<_>{let lib=self.studio.library.as_ref().ok_or_else(||anyhow::anyhow!("Source library missing"))?;let mut session=if let Some(session)=&self.form_session{session.clone()}else{let mut session=form_bridge::Session::new(lib.source.path(),&lib.index)?;for copy in self.editor_cells.copies.values(){let identity=format!("copy:{}:{}",copy.id,copy.source);let raw=self.editor_cells.read_overlay(copy.id);match raw{Ok(text)=>{let migrated=(||->anyhow::Result<_>{let source=legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,&copy.source).map_err(anyhow::Error::msg)?;session.migrate_cell_document(&source,&lib.index,&text,identity.clone(),copy.name.clone(),Some(copy.id))})();if let Err(error)=migrated{let key=session.project.ensure_cell(&identity,&copy.source,&copy.name,Some(copy.id))?;session.project.legacy_documents.insert(key,text);session.project.diagnostics.push(lck_project::Diagnostic{form:None,message:format!("Legacy cell copy {} retained but migration unresolved: {error:#}",copy.name)});}},Err(error)=>{session.project.ensure_cell(&identity,&copy.source,&copy.name,Some(copy.id))?;session.project.diagnostics.push(lck_project::Diagnostic{form:None,message:format!("Legacy cell copy {} unavailable: {error}; metadata retained",copy.name)});}}}session};let identity=cell.form_identity(&source);let label=match &cell{CellSelection::Copy(id)=>self.editor_cells.copies.get(id).map(|c|c.name.clone()).unwrap_or_else(||source.clone()),_=>source.clone()};let copy=match &cell{CellSelection::Copy(id)=>Some(*id),_=>None};let preview=session.enter(&scene,&lib.index,&world,identity,label,copy)?;Ok((session,preview))})();
+                    let (session,world)=match projected{Ok(value)=>value,Err(error)=>{self.studio.error=Some(format!("Project records could not be loaded; previous editor retained: {error:#}"));return;}};
+                    self.form_session=Some(session);
                     self.save_active_editor_cell();
                     self.native_scene=Some((source,NativeSceneSlot::Ready(Arc::new(scene),Arc::new(world))));
                     self.editor_cell_active=Some(cell);
@@ -1459,8 +1478,7 @@ impl App {
         self.native_rotate = None;
         self.native_rotate_undo.clear();
         self.native_rotate_redo.clear();
-        self.editor_undo.clear();
-        self.editor_redo.clear();
+        if self.form_session.is_none(){self.editor_undo.clear();self.editor_redo.clear();}
         self.editor_gesture_start=None;
         self.npc_playing=None;
         self.native_undo.clear();
@@ -2419,6 +2437,7 @@ impl App {
     /// Native PS1 data browser: lists the original instance draws and their transforms.
     /// Editable scene preview with non-destructive mesh transforms.
     fn editor_workspace(&mut self, ctx: &egui::Context) {
+        let mut pending_form=self.form_record_panel(ctx);
         // Escape clears the current highlight and the inspector without
         // changing the camera or the native scene data. Leave the key visible
         // to a focused search field, which also uses Escape to clear its text.
@@ -3089,6 +3108,9 @@ impl App {
                         egui::Button::new("Redo (Ctrl+Y)")).clicked() {
                         pending_history_redo=true;
                     }
+                    if ui.button("Base Forms / References").clicked(){self.form_panel=!self.form_panel;}
+                    if ui.button("Save Project...").clicked(){pending_form=Some(form_ui::Action::Save);}
+                    if ui.button("Open Project...").clicked(){pending_form=Some(form_ui::Action::Open);}
                     if ui.button("Save LCK scene...").on_hover_text("Save original move offsets AND new editor-created instances to an .lckscene file. Does NOT modify the PS1 disc.").clicked() {
                         if let Some((name, _)) = &self.native_scene {
                             if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{name}.lckscene"))
@@ -3293,7 +3315,7 @@ impl App {
                     let view_rect = ui.available_rect_before_wrap();
                     let picked = self.native_view.show_world_limited_with_sources(ui, model, &scene.res.vram,
                         900, 680, selected_id, self.native_ground_visible,
-                        self.editor_asset_drag.is_some(), &world.foreign_vram);
+                        (self.editor_asset_drag.is_some() || self.form_drag.is_some()), &world.foreign_vram);
                     if let Some(draw)=picked.and_then(|id|world.by_id(id)) {
                         let key=(draw.terrain,draw.index);
                         let modifiers=ui.input(|i|i.modifiers);
@@ -3474,7 +3496,7 @@ impl App {
                             }
                         }
                     }
-                    if down && !alt && self.editor_asset_drag.is_none() && self.global_repository_drag.is_none() {
+                    if down && !alt && self.form_drag.is_none() && self.editor_asset_drag.is_none() && self.global_repository_drag.is_none() {
                         if let (Some(key), Some(pos)) = (self.native_selected, pointer) {
                             // A previously selected *visible* mesh must be hit at mouse-down.
                             // Never start moving an object when a drag begins over ground,
@@ -3567,6 +3589,7 @@ impl App {
                             }
                         }
                     }
+                    if let Some(base)=self.form_drag.clone(){let released=ui.input(|i|i.pointer.primary_released());let hovering=ui.input(|i|i.pointer.latest_pos()).filter(|p|view_rect.contains(*p));if released{if let Some(pointer)=hovering{let px=placement_drop::viewport_pixels(view_rect,ui.ctx().pixels_per_point(),[900,680]);let pixel=placement_drop::viewport_pixel(view_rect,pointer,px,self.native_view.world_mirrored);match placement_drop::foreign_drop_center(world,self.native_view.cam,pixel,px,64.,0.,ui.input(|i|i.modifiers.shift)){Ok(center)=>pending_form=Some(form_ui::Action::Place(base,center)),Err(error)=>self.studio.error=Some(error)}}self.form_drag=None;}}
                     if let Some(asset)=self.editor_asset_drag {
                         let released=ui.input(|i|i.pointer.primary_released());
                         let hovering=ui.input(|i|i.pointer.latest_pos())
@@ -3710,20 +3733,21 @@ impl App {
         }
         // Capture lightweight scene metadata before edits, never clone raster
         // vertices per frame. One mouse gesture becomes one undo operation.
-        let editor_changed_this_frame = pending_name.is_some() || pending_restore.is_some() ||
+        let editor_changed_this_frame = pending_form.as_ref().is_some_and(|a|a.is_authoring()) || pending_name.is_some() || pending_restore.is_some() ||
             pending_delete.is_some() || pending_duplicate.is_some() || pending_foreign.is_some() ||
             pending_transform.is_some() || pending_rotation.is_some() ||
             pending_scale.is_some() || pending_import.is_some() ||
             pending_npc_animation.as_ref().is_some_and(|item|item.3) ||
             pending_npc_model.is_some() ||
             pending_project.is_some() || pending_collision_edit.is_some() || pending_static_architecture.is_some() || self.editor_gesture_start.is_some();
-        let before_frame=if editor_changed_this_frame {
+        let mut before_frame=if editor_changed_this_frame {
             match (self.native_scene.as_ref(),world.as_deref()) {
                 (Some((name,NativeSceneSlot::Ready(_, _))),Some(w))=>
                     Some(editor_history_capture_group(w,name,self.native_selected,&self.native_selection)),
                 _=>None,
             }
         } else {None};
+        if let Some(history)=&mut before_frame{self.capture_form_history(history);}
         // Keyboard shortcuts are disabled while entering text or using dialogs.
         if self.editor_modal.is_none() && self.editor_rename.is_none() &&
             !ctx.wants_keyboard_input() {
@@ -3776,10 +3800,10 @@ impl App {
             }
         }
         if let Some(key)=pending_delete {
-            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut() {
+            if let Some((_,NativeSceneSlot::Ready(scene,world)))=self.native_scene.as_mut() {
                 if let Some(world)=Arc::get_mut(world) {
                     let keys=multi_selection::keys(Some(key),&self.native_selection);
-                    let result=multi_selection::delete(world,&keys);
+                    let result=if let(Some(session),Some(lib))=(&mut self.form_session,&self.studio.library){(||->Result<(),String>{let forms=keys.iter().map(|k|session.reference_at(world,*k).ok_or("Selection is not a persistent Reference".to_owned())).collect::<Result<Vec<_>,_>>()?;let mut draft=session.clone();draft.delete(&forms).map_err(|e|format!("{e:#}"))?;let preview=draft.render(scene,&lib.index).map_err(|e|format!("{e:#}"))?;draft.synchronize_gesture(scene,&lib.index,&preview).map_err(|e|format!("{e:#}"))?;*session=draft;*world=preview;Ok(())})()}else{multi_selection::delete(world,&keys)};
                     match result {
                         Ok(())=>{
                             self.native_selected=None; self.native_selection.clear();
@@ -3844,7 +3868,8 @@ impl App {
             let keys=multi_selection::keys(self.native_selected,&self.native_selection);
             if let Some((_,NativeSceneSlot::Ready(scene,world)))=self.native_scene.as_mut() {
                 if let Some(world)=Arc::get_mut(world) {
-                    match multi_selection::duplicate(world,&keys,scene.placements.len()) {
+                    let result=if let(Some(session),Some(lib))=(&mut self.form_session,&self.studio.library){( ||->Result<Vec<(bool,usize)>,String>{let forms=keys.iter().map(|k|session.reference_at(world,*k).ok_or("Selection is not mapped to a persistent Reference".to_owned())).collect::<Result<Vec<_>,_>>()?;let mut draft=session.clone();let created=draft.duplicate(&forms).map_err(|e|format!("{e:#}"))?;let preview=draft.render(scene,&lib.index).map_err(|e|format!("{e:#}"))?;draft.synchronize_gesture(scene,&lib.index,&preview).map_err(|e|format!("{e:#}"))?;let keys=created.iter().filter_map(|k|draft.reference_draws.get(k).copied()).collect();*session=draft;*world=preview;Ok(keys)})()}else{multi_selection::duplicate(world,&keys,scene.placements.len())};
+                    match result {
                         Ok(created)=>{
                             self.native_selected=keys.iter().zip(&created).find_map(|(old,new)|(Some(*old)==old_primary).then_some(*new));
                             self.native_selection=created.into_iter().collect();
@@ -4078,21 +4103,27 @@ impl App {
         }
         // Coalesce live mouse drags (translation, rotation, numeric scale) to
         // one history entry on mouse release. Snapshot captures only metadata.
-        let after_frame=if editor_changed_this_frame || pending_history_undo || pending_history_redo {
+        if editor_changed_this_frame {
+            let synchronized=(||->anyhow::Result<()>{if let(Some(session),Some((_,NativeSceneSlot::Ready(scene,world))),Some(lib))=(&mut self.form_session,&self.native_scene,&self.studio.library){session.synchronize_gesture(scene,&lib.index,world)?;}Ok(())})();
+            if let Err(error)=synchronized{self.studio.error=Some(format!("Record transaction rejected; previous database retained: {error:#}"));self.rebuild_form_preview();}
+        }
+        if let Some(action)=pending_form{if let Err(error)=self.apply_form_action(action){self.studio.error=Some(format!("Project operation failed: {error:#}"));}ctx.request_repaint();}
+        let mut after_frame=if editor_changed_this_frame || pending_history_undo || pending_history_redo {
             self.native_scene.as_ref().and_then(|(name,state)|match state {
                 NativeSceneSlot::Ready(_,w)=>Some(editor_history_capture_group(w,name,self.native_selected,&self.native_selection)),
                 _=>None,
             })
         } else {None};
+        if let Some(history)=&mut after_frame{self.capture_form_history(history);}
         if let (Some(before),Some(after))=(&before_frame,&after_frame) {
-            if before.overlay!=after.overlay && self.editor_gesture_start.is_none() {
+            if (before.overlay!=after.overlay || before.project!=after.project) && self.editor_gesture_start.is_none() {
                 self.editor_gesture_start=Some(before.clone());
             }
         }
         let any_button_down=ctx.input(|i|i.pointer.primary_down() || i.pointer.secondary_down());
         if !any_button_down {
             if let Some(start)=self.editor_gesture_start.take() {
-                if after_frame.as_ref().is_some_and(|after|after.overlay!=start.overlay) {
+                if after_frame.as_ref().is_some_and(|after|(after.overlay!=start.overlay || after.project!=start.project)) {
                     self.editor_undo.push(start);
                     if self.editor_undo.len()>100 {self.editor_undo.remove(0);}
                     self.editor_redo.clear();
@@ -4117,6 +4148,7 @@ impl App {
                             let Some(world)=Arc::get_mut(world) else {
                                 return Err("Scene is still borrowed".into());
                             };
+                            if let(Some(project),Some(session))=(&target.project,&mut self.form_session){session.restore_project((**project).clone()).map_err(|e|format!("{e:#}"))?;let index=index.as_ref().ok_or("Original disc index unavailable")?;*world=session.render(scene,index).map_err(|e|format!("{e:#}"))?;self.native_selection=target.form_selection.iter().filter_map(|r|session.reference_draws.get(r).copied()).collect();self.native_selected=target.form_primary.as_ref().and_then(|r|session.reference_draws.get(r).copied());self.native_hierarchy_anchor=self.native_selected;return Ok(());}
                             let doc=scene_instances::parse(&target.overlay,name,world)?;
                             let index=index.as_ref().ok_or("Original disc index unavailable")?;
                             scene_instances::apply(&doc,world,scene.placements.len(),index)?;
@@ -6292,8 +6324,8 @@ mod catalog_ui_tests {
         let world=Arc::new(world);
         app.native_scene=Some(("synthetic".into(),NativeSceneSlot::Ready(Arc::new(scene),world.clone())));
         app.native_selected=Some((false,world_view::NPC_KEY_BASE+1));
-        app.editor_undo.push(EditorSceneHistory{overlay:"undo".into(),selected:None,selection:vec![]});
-        app.editor_redo.push(EditorSceneHistory{overlay:"redo".into(),selected:None,selection:vec![]});
+        app.editor_undo.push(EditorSceneHistory{project:None,form_selection:vec![],form_primary:None,overlay:"undo".into(),selected:None,selection:vec![]});
+        app.editor_redo.push(EditorSceneHistory{project:None,form_selection:vec![],form_primary:None,overlay:"redo".into(),selected:None,selection:vec![]});
         let version=app.native_view.version;
         let camera=app.native_view.cam;
         let (tx,rx)=std::sync::mpsc::channel();
@@ -6324,7 +6356,7 @@ mod catalog_ui_tests {
         let source = scene_instances::NameTarget::Created(7);
         let native = scene_instances::NameTarget::Native(false,9);
         assert_ne!(source,native);
-        let restored = EditorSceneHistory {overlay:"LCK_SCENE_V1\ttown\n".into(),
+        let restored = EditorSceneHistory {project:None,form_selection:vec![],form_primary:None,overlay:"LCK_SCENE_V1\ttown\n".into(),
             selected:Some(source.clone()),selection:vec![source.clone()]};
         assert_eq!(restored.selected,Some(source));
     }

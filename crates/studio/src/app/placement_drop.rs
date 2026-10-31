@@ -220,3 +220,6 @@ pub(super) fn foreign_drop_center(world:&world_view::WorldModel,cam:Camera,
     }
     Ok(center)
 }
+
+/// Object Window placement creates a reference to an existing shared definition.
+pub(super) fn place_form(session:&mut super::form_bridge::Session,base:super::form_database::FormKey,center:[f32;3])->anyhow::Result<super::form_database::FormKey>{session.place(base,super::form_database::Transform{position:center,..Default::default()})}

@@ -35,8 +35,8 @@ impl Asset {
             Kind::Mesh(_)=>2,Kind::Npc(_)=>3}
     }
     pub fn kind_label(&self)->&'static str {
-        match self.kind {Kind::Placement(_)=>"MAP object",Kind::Terrain(_)=>"terrain/decor",
-            Kind::Mesh(_)=>"TMD mesh",Kind::Npc(_)=>"MAN NPC"}
+        match self.kind {Kind::Placement(_)=>"MAP Base Form",Kind::Terrain(_)=>"terrain Base Form",
+            Kind::Mesh(_)=>"TMD Base Form",Kind::Npc(_)=>"actor Base Form"}
     }
     pub fn matches(&self,term:&str, names:&Catalog)->bool {
         term.is_empty() || self.label.to_lowercase().contains(term) ||
@@ -170,7 +170,7 @@ mod tests {
     fn labels_distinguish_provenance(){
         let a=Asset{source:"town01".into(),source_label:"Rim Elm".into(),label:"Unidentified world object #004".into(),
             key:"cell:town01|placed:4".into(),alias_key:None,kind:Kind::Placement(4),mesh_fingerprint:Some(5)};
-        assert_eq!(a.kind_label(),"MAP object");
+        assert_eq!(a.kind_label(),"MAP Base Form");
         assert_ne!(a.source,"road01");
         assert_eq!(a.group(),0);
     }

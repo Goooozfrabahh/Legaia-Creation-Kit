@@ -8,14 +8,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(super) struct MasterDependency {
     pub file: FileId,
     pub disc_sha256: String,
     pub path_hint: Option<PathBuf>,
 }
+fn resolved_default() -> bool {
+    true
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct CellBinding {
+    #[serde(default = "resolved_default")]
+    pub resolved: bool,
     pub identity: String,
     pub key: FormKey,
     pub source_scene: String,
@@ -37,20 +42,30 @@ pub(super) struct LegacyBaseAdapter {
     pub source_ordinal: usize,
     pub origin: Option<NativeOrigin>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(super) struct SidecarSnapshot {
     pub source_hint: PathBuf,
     pub sha256: String,
     pub exact_bytes: Vec<u8>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(super) struct CollisionAssociation {
     pub reference: FormKey,
     pub family: String,
     pub payload: serde_json::Value,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct RenderUid {
+    pub cell: FormKey,
+    pub reference: FormKey,
+    pub uid: u64,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(super) struct LckProject {
+    #[serde(default)]
+    pub render_uids: Vec<RenderUid>,
+    #[serde(default)]
+    pub next_render_uid: BTreeMap<FormKey, u64>,
     pub format: String,
     pub schema_version: u32,
     pub file_id: FileId,
@@ -80,6 +95,8 @@ pub(super) struct LegacyObjectInput {
     pub origin: Option<NativeOrigin>,
     pub uid: Option<u64>,
     pub original_transform: Transform,
+    pub original_properties: BTreeMap<String, Property>,
+    pub original_flags: BTreeSet<String>,
     pub transform: Transform,
     pub display_name: Option<String>,
     pub hidden: bool,
@@ -119,6 +136,8 @@ impl LckProject {
         let database = FormDatabase::new(master.file.clone(), file_id.clone())?;
         let p = Self {
             format: "LCK_PROJECT_V1".into(),
+            render_uids: vec![],
+            next_render_uid: Default::default(),
             schema_version: 1,
             file_id,
             master,
@@ -166,11 +185,10 @@ impl LckProject {
         }
         let mut identities = BTreeSet::new();
         let mut uids = BTreeSet::new();
-        let mut targets = BTreeSet::new();
+
         for b in &self.legacy_bindings {
             ensure!(
                 identities.insert((&b.cell, &b.source_identity))
-                    && targets.insert(&b.reference)
                     && self.database.reference(&b.reference).is_some(),
                 "Invalid/duplicate legacy binding"
             );
@@ -233,6 +251,7 @@ impl LckProject {
             self.database.create_base(editor, FormKind::Cell)?
         };
         self.cells.push(CellBinding {
+            resolved: false,
             identity: identity.into(),
             key: key.clone(),
             source_scene: scene.into(),
@@ -296,8 +315,8 @@ impl LckProject {
                         editor_id: None,
                         disabled: false,
                         deleted: false,
-                        flags: Default::default(),
-                        properties: Default::default(),
+                        flags: obj.original_flags.clone(),
+                        properties: obj.original_properties.clone(),
                         origin: obj.origin.clone(),
                         collision_owners: obj.collision_owners.clone(),
                     };
@@ -326,6 +345,9 @@ impl LckProject {
                 .context("Imported reference")?
                 .clone();
             reference.base = base;
+            if obj.uid.is_none() {
+                reference.origin = obj.origin.clone();
+            }
             reference.cell = cell.clone();
             reference.transform = obj.transform;
             reference.deleted = obj.hidden;
@@ -337,7 +359,9 @@ impl LckProject {
                     .properties
                     .insert("display_name".into(), Property::Text(name.clone()));
             }
-            reference.collision_owners = obj.collision_owners.clone();
+            reference
+                .collision_owners
+                .extend(obj.collision_owners.iter().cloned());
             if next.database.reference(&key) != Some(&reference) {
                 next.database.edit_reference(&key, |r| {
                     *r = reference;
@@ -368,10 +392,53 @@ impl LckProject {
         }
         next.legacy_documents
             .insert(cell.clone(), input.exact_document.clone());
+        next.cells
+            .iter_mut()
+            .find(|c| c.key == cell)
+            .unwrap()
+            .resolved = true;
         next.deduplicate_diagnostics();
         next.validate()?;
         *self = next;
         Ok(cell)
+    }
+    pub fn render_uid(&mut self, cell: &FormKey, reference: &FormKey) -> Result<u64> {
+        if let Some(b) = self
+            .legacy_bindings
+            .iter()
+            .find(|b| &b.cell == cell && &b.reference == reference && b.uid.is_some())
+        {
+            return Ok(b.uid.unwrap());
+        }
+        if let Some(b) = self
+            .render_uids
+            .iter()
+            .find(|b| &b.cell == cell && &b.reference == reference)
+        {
+            return Ok(b.uid);
+        }
+        let used = self
+            .legacy_bindings
+            .iter()
+            .filter(|b| &b.cell == cell)
+            .filter_map(|b| b.uid)
+            .chain(
+                self.render_uids
+                    .iter()
+                    .filter(|b| &b.cell == cell)
+                    .map(|b| b.uid),
+            )
+            .max()
+            .unwrap_or(0);
+        let next = self.next_render_uid.entry(cell.clone()).or_insert(1);
+        let uid = (*next).max(used.checked_add(1).context("Editor UID exhausted")?);
+        *next = uid.checked_add(1).context("Editor UID exhausted")?;
+        self.render_uids.push(RenderUid {
+            cell: cell.clone(),
+            reference: reference.clone(),
+            uid,
+        });
+        Ok(uid)
     }
     pub fn retain_sidecar(&mut self, path: &Path, bytes: Vec<u8>) -> Result<()> {
         let hash = super::collision_recipes::digest(&bytes);
@@ -495,6 +562,8 @@ mod tests {
             origin: None,
             uid: None,
             original_transform: Default::default(),
+            original_properties: Default::default(),
+            original_flags: Default::default(),
             transform: Transform {
                 position: [128., 96., -256.],
                 rotation: [0., 0.4, 0.],

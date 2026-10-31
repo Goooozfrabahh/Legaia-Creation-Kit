@@ -10,6 +10,8 @@ pub(super) enum CellSelection {
     Copy(u64),
 }
 
+impl CellSelection {pub fn form_identity(&self,source:&str)->String{match self{Self::Original(name)=>format!("original:{name}"),Self::Copy(id)=>format!("copy:{id}:{source}")}}}
+
 #[derive(Debug, Clone)]
 pub(super) struct CellCopy {
     pub id: u64,
