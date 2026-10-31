@@ -1,0 +1,22 @@
+{
+  "DataFieldStreaming": 49,
+  "FieldMap": 101,
+  "SceneV12Table": 97,
+  "SceneEventScripts": 101,
+  "SceneAssetTable": 90,
+  "SceneTmdStream": 182,
+  "Pack": 7,
+  "PochiFiller": 266,
+  "LzsContainer": 18,
+  "SceneVabStream": 218,
+  "AllZeros": 4,
+  "BattleDataPack": 4,
+  "OverlayDataBlob": 25,
+  "EfectPack": 1,
+  "BseBank": 2,
+  "VabMultiBank": 1,
+  "SummonReadef": 2,
+  "InitPak": 1,
+  "OverlayPtrTable": 42,
+  "MipsOverlay": 22
+}

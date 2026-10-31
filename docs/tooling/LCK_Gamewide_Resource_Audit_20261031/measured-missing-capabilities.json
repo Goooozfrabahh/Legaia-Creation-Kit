@@ -1,0 +1,36 @@
+{
+  "counts": {
+    "Untextured geometry import route": 1162,
+    "Native carrier/upload context": 1344,
+    "Mixed-depth native image interpretation": 234,
+    "Unresolved source VRAM words": 11,
+    "Composite VRAM image/palette writer": 91,
+    "Raw palette upload alignment": 107
+  },
+  "examples": {
+    "Untextured geometry import route": [
+      "scene:balden/model:32",
+      "No textured dependencies"
+    ],
+    "Native carrier/upload context": [
+      "scene:balden2/model:0",
+      "Ordered native uploads: No native field descriptor table"
+    ],
+    "Mixed-depth native image interpretation": [
+      "scene:conc/model:14",
+      "Native image depth mismatch"
+    ],
+    "Unresolved source VRAM words": [
+      "scene:conc2/model:53",
+      "Unresolved external image/palette data at Rect { x: 560, y: 128, w: 1, h: 1 }; palette=false"
+    ],
+    "Composite VRAM image/palette writer": [
+      "scene:conc2/model:122",
+      "Fragmented image/composite palette requires a native composite-block writer"
+    ],
+    "Raw palette upload alignment": [
+      "scene:edbalden/model:0",
+      "Ordered native uploads: Unaligned native palette"
+    ]
+  }
+}

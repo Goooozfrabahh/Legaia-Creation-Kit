@@ -1,0 +1,148 @@
+# Audit integrity
+
+- Original disc hash before/after: `750dbcbadb70362feb3468467bbe7efbf3d151a414caa428c66c368d4b0b73e6`; equal.
+- All 1,233 indexed PROT entries are attempted independently, outside the World Objects catalog. All ISO files are hashed in the existing ISO reader's logical 2,048-byte-per-sector view; PROT.DAT is not redundantly parsed as an ISO blob.
+- All named CDNAME blocks are attempted; field identification is based on native structure, not rendering. Failed blocks retain raw entry identities; no scene parse failure removes those entries.
+- Exact source offsets distinguish physical archive offsets, decoded container coordinates, and scene-local registration/record indices. A decompressed child offset is never presented as an on-disc patch address.
+- Graph links qualify scene-local targets. Container hierarchy is represented by source identities; upload ordering, source rows and hashes retained. Hash equality does not merge semantic Base Forms.
+- Raw structural model/TIM scanners are word-aligned and use existing parser plausibility rules; registration is not inferred from a scan hit. Tiny/zero-object models rejected by that scanner may still be listed by native registrars. Arbitrarily unaligned hidden data is not proven absent.
+- Nested decode budget: 64 MiB of cumulative input per top-level container, maximum nesting 6, individual declared decode capped at16 MiB. Strict LZS containers at depth<3; unknown/malformed ranges retained by hash. Limits produce explicit gaps, not silent success.
+- Opaque complement spans in non-recursive leaves include residual headers and padding with nonzero words; some are not separate semantic assets. Container padding/trailers not individually decoded by every family remain within exact parent identities. This is a complete top-level archive census, not proof every logical asset/clip/script instruction has been decoded.
+- ISO logical files over16 MiB are hashed in the complete 2,048-byte view but their multimedia frames/audio sectors are not exhaustively decoded. CD-XA Form2 tails outside that logical view are protected by the full raw-disc SHA256 but are not claimed as decoded individual resources. ISO tree does not establish unallocated-sector content; no claim that filesystem-free sectors contain no data.
+- Models are checked individually with existing strict writers (no unrestricted bypass scope). Failed package planning combines dependency/encoding/allocation failures; visual dependency success is a lower bound, not a diagnosis that source data is absent.
+- Encoder package checks do not test all source/destination combinations or write IMGs for every model. Only bounded fixture exports can prove their own byte-level invariants. No new preview is rendered, no GUI behavior or gameplay is verified here.
+- Classification retains positive evidence only; “static”, “animated only” and “scripted only” are not asserted by absence. Dialogue text, clip splitting, item semantics, effects and audio subresources remain partially typed or opaque.
+- Scan process flushes inventory and compatibility after each block; raw cells are independent checkpoint JSONs. This run reached final source rehash and audit-totals publication. No per-block timeout is claimed.
+
+## Explicit scan gaps (3)
+
+- iso:DMY.DAT: large ISO file hashed in full; deep multimedia sector/frame decoding not attempted
+- iso:MOV/MV3.STR: large ISO file hashed in full; deep multimedia sector/frame decoding not attempted
+- iso:MOV/MV1.STR: large ISO file hashed in full; deep multimedia sector/frame decoding not attempted
+
+## Per-cell unresolved relationships
+
+- balden: 9 explicit gaps; see matching cells JSON and audit-totals.json.
+- balden2: 9 explicit gaps; see matching cells JSON and audit-totals.json.
+- bat_back_dat: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- battle_data: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- befect_data: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- bubu1: 6 explicit gaps; see matching cells JSON and audit-totals.json.
+- bubu2: 6 explicit gaps; see matching cells JSON and audit-totals.json.
+- bylon: 10 explicit gaps; see matching cells JSON and audit-totals.json.
+- card_data: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- cave01: 3 explicit gaps; see matching cells JSON and audit-totals.json.
+- chitei2: 10 explicit gaps; see matching cells JSON and audit-totals.json.
+- conc: 9 explicit gaps; see matching cells JSON and audit-totals.json.
+- conc2: 9 explicit gaps; see matching cells JSON and audit-totals.json.
+- conc3: 9 explicit gaps; see matching cells JSON and audit-totals.json.
+- concend: 4 explicit gaps; see matching cells JSON and audit-totals.json.
+- concnow: 12 explicit gaps; see matching cells JSON and audit-totals.json.
+- deene: 11 explicit gaps; see matching cells JSON and audit-totals.json.
+- deroa: 11 explicit gaps; see matching cells JSON and audit-totals.json.
+- dohaty: 18 explicit gaps; see matching cells JSON and audit-totals.json.
+- dolk: 15 explicit gaps; see matching cells JSON and audit-totals.json.
+- dolk2: 15 explicit gaps; see matching cells JSON and audit-totals.json.
+- doman: 8 explicit gaps; see matching cells JSON and audit-totals.json.
+- dream: 2 explicit gaps; see matching cells JSON and audit-totals.json.
+- edbalden: 96 explicit gaps; see matching cells JSON and audit-totals.json.
+- edbubu: 4 explicit gaps; see matching cells JSON and audit-totals.json.
+- edbylon: 28 explicit gaps; see matching cells JSON and audit-totals.json.
+- eddoman: 6 explicit gaps; see matching cells JSON and audit-totals.json.
+- edkorout: 4 explicit gaps; see matching cells JSON and audit-totals.json.
+- edlast: 4 explicit gaps; see matching cells JSON and audit-totals.json.
+- edretoin: 15 explicit gaps; see matching cells JSON and audit-totals.json.
+- edson: 2 explicit gaps; see matching cells JSON and audit-totals.json.
+- edstati3: 2 explicit gaps; see matching cells JSON and audit-totals.json.
+- edteien: 3 explicit gaps; see matching cells JSON and audit-totals.json.
+- gameover_data: 92 explicit gaps; see matching cells JSON and audit-totals.json.
+- garmel: 22 explicit gaps; see matching cells JSON and audit-totals.json.
+- geremi: 9 explicit gaps; see matching cells JSON and audit-totals.json.
+- init_data: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- izumi: 3 explicit gaps; see matching cells JSON and audit-totals.json.
+- jagaroom: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- jiji: 9 explicit gaps; see matching cells JSON and audit-totals.json.
+- jou: 6 explicit gaps; see matching cells JSON and audit-totals.json.
+- jouina: 6 explicit gaps; see matching cells JSON and audit-totals.json.
+- jouinb: 8 explicit gaps; see matching cells JSON and audit-totals.json.
+- jouinc: 9 explicit gaps; see matching cells JSON and audit-totals.json.
+- jouind: 9 explicit gaps; see matching cells JSON and audit-totals.json.
+- jouine: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- juui1: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- juui2: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- keikoku: 10 explicit gaps; see matching cells JSON and audit-totals.json.
+- koin1: 4 explicit gaps; see matching cells JSON and audit-totals.json.
+- koin1b: 4 explicit gaps; see matching cells JSON and audit-totals.json.
+- koin2: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- koin3: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- koin4: 2 explicit gaps; see matching cells JSON and audit-totals.json.
+- koin6: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- kor: 9 explicit gaps; see matching cells JSON and audit-totals.json.
+- kor3: 6 explicit gaps; see matching cells JSON and audit-totals.json.
+- kor4: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- kor5: 9 explicit gaps; see matching cells JSON and audit-totals.json.
+- korb2: 6 explicit gaps; see matching cells JSON and audit-totals.json.
+- korb3: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- korout: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- level_up: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- map01: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- map02: 2 explicit gaps; see matching cells JSON and audit-totals.json.
+- map03: 2 explicit gaps; see matching cells JSON and audit-totals.json.
+- monster_data: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- monster_se: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- monster_test: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- move_program_no: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- music_01: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- nilboa: 13 explicit gaps; see matching cells JSON and audit-totals.json.
+- nilboa2: 13 explicit gaps; see matching cells JSON and audit-totals.json.
+- noaru: 10 explicit gaps; see matching cells JSON and audit-totals.json.
+- opdeene: 2 explicit gaps; see matching cells JSON and audit-totals.json.
+- opkorout: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- opmap01: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- opstati: 2 explicit gaps; see matching cells JSON and audit-totals.json.
+- opurud: 3 explicit gaps; see matching cells JSON and audit-totals.json.
+- other1: 2 explicit gaps; see matching cells JSON and audit-totals.json.
+- other4: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- other5: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- other6: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- other7: 50 explicit gaps; see matching cells JSON and audit-totals.json.
+- other_game: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- player_data: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- rayman: 13 explicit gaps; see matching cells JSON and audit-totals.json.
+- rayman2: 13 explicit gaps; see matching cells JSON and audit-totals.json.
+- retock: 9 explicit gaps; see matching cells JSON and audit-totals.json.
+- retockin: 10 explicit gaps; see matching cells JSON and audit-totals.json.
+- retona: 14 explicit gaps; see matching cells JSON and audit-totals.json.
+- rikuroa: 15 explicit gaps; see matching cells JSON and audit-totals.json.
+- rikuroa2: 6 explicit gaps; see matching cells JSON and audit-totals.json.
+- ropeway: 6 explicit gaps; see matching cells JSON and audit-totals.json.
+- ropeway2: 6 explicit gaps; see matching cells JSON and audit-totals.json.
+- rugi: 11 explicit gaps; see matching cells JSON and audit-totals.json.
+- son: 7 explicit gaps; see matching cells JSON and audit-totals.json.
+- sound_data: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- sound_data2: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- station: 4 explicit gaps; see matching cells JSON and audit-totals.json.
+- station3: 4 explicit gaps; see matching cells JSON and audit-totals.json.
+- stone: 7 explicit gaps; see matching cells JSON and audit-totals.json.
+- suimon: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- taiku: 10 explicit gaps; see matching cells JSON and audit-totals.json.
+- taiku2: 10 explicit gaps; see matching cells JSON and audit-totals.json.
+- teien: 8 explicit gaps; see matching cells JSON and audit-totals.json.
+- tower: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- town01: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- town0b: 6 explicit gaps; see matching cells JSON and audit-totals.json.
+- town0c: 6 explicit gaps; see matching cells JSON and audit-totals.json.
+- town0d: 7 explicit gaps; see matching cells JSON and audit-totals.json.
+- town0e: 3 explicit gaps; see matching cells JSON and audit-totals.json.
+- tunnela: 9 explicit gaps; see matching cells JSON and audit-totals.json.
+- tunnelb: 12 explicit gaps; see matching cells JSON and audit-totals.json.
+- tunnelc: 12 explicit gaps; see matching cells JSON and audit-totals.json.
+- uru: 6 explicit gaps; see matching cells JSON and audit-totals.json.
+- uru2: 9 explicit gaps; see matching cells JSON and audit-totals.json.
+- urudre1: 2 explicit gaps; see matching cells JSON and audit-totals.json.
+- urudre2: 3 explicit gaps; see matching cells JSON and audit-totals.json.
+- urudre3: 3 explicit gaps; see matching cells JSON and audit-totals.json.
+- vab_01: 5 explicit gaps; see matching cells JSON and audit-totals.json.
+- vell: 16 explicit gaps; see matching cells JSON and audit-totals.json.
+- vozz: 16 explicit gaps; see matching cells JSON and audit-totals.json.
+- xxx_dat: 5 explicit gaps; see matching cells JSON and audit-totals.json.

@@ -219,3 +219,6 @@ fn original_disc_game_wide_native_inventory()->Result<()> {
     ensure!(digest(&std::fs::read(&source)?)==source_hash,"Source disc changed");
     println!("Finished {} named blocks. Source unchanged. Reports: {}",names.len(),destination.display());Ok(())
 }
+
+#[path = "gamewide_resource_audit.rs"]
+mod stage_b_audit;
