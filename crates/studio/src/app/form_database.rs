@@ -136,6 +136,8 @@ pub(super) struct BaseForm {
     pub resources: Vec<ResourceReference>,
     #[serde(default,skip_serializing_if="Option::is_none")]
     pub static_resources: Option<super::native_asset_plan::static_resources::Dependencies>,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub native_behavior: Option<super::behavior_resources::Dependencies>,
     pub materials: BTreeMap<String, Property>,
     pub collision: BTreeMap<String, Property>,
     pub behavior: Vec<Dependency>,
@@ -152,6 +154,7 @@ impl BaseForm {
             kind,
             resources: vec![],
             static_resources: None,
+            native_behavior: None,
             materials: Default::default(),
             collision: Default::default(),
             behavior: vec![],
@@ -724,6 +727,12 @@ impl FormDatabase {
             for r in &b.resources {
                 if let Some(target) = &r.form {
                     dependencies.push((k.clone(), target.clone()));
+                }
+            }
+            if let Some(native) = &b.native_behavior {
+                native.validate()?;
+                for edge in &native.edges {
+                    if let Some(target) = &edge.form { dependencies.push((k.clone(), target.clone())); }
                 }
             }
             for d in &b.behavior {

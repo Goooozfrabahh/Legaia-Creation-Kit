@@ -1,6 +1,7 @@
 //! The egui front end over [`Studio`].
 
 mod form_database;
+mod behavior_resources;
 mod lck_project;
 mod form_legacy;
 mod form_bridge;

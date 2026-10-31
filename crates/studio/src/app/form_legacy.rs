@@ -195,6 +195,24 @@ pub(super) fn scene_input(
         };
         let mut base = BaseForm::empty(dummy.clone(), editor_id, form_kind);
         base.origin = origin.clone();
+        // MAN placement indices belong to partition 1, independently of mesh selectors.
+        if kind == "npc" {
+            let dependencies = (|| -> Result<_> {
+                let donor = Scene::load(index, donor_scene)?;
+                let man = donor.field_man_payload(index)?.context("MAN carrier unavailable")?;
+                let source=format!("{donor_scene}:MAN");
+                let mut deps=super::behavior_resources::Dependencies::from_man(&source, &man, ordinal)?;
+                if let Err(error)=deps.bind_scene_animation(&source,&man,ordinal,&donor) {
+                    deps.unresolved.push(format!("Initial animation binding: {error:#}"));
+                }
+                Ok(deps)
+            })();
+            base.native_behavior = Some(dependencies.unwrap_or_else(|error| super::behavior_resources::Dependencies {
+                unresolved: vec![format!("Native actor dependency inventory: {error:#}")],
+                ..Default::default()
+            }));
+        }
+
         let mut resource_origin = origin.clone();
         if let (Some(hash), Some(o)) = (&hash, &mut resource_origin) {
             o.fingerprints.insert("TMD".into(), hash.clone());

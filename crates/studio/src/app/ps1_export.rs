@@ -1458,6 +1458,8 @@ pub(super) fn prepare_project(source:&Path, scene:&AssembledScene,
         let report=serde_json::json!({
             "stage_a_reference":reference.key,"base":reference.base,"cell":reference.cell,
             "canonical_static_resources":static_resources.get(&reference.base),
+            "native_copy_capabilities":session.project.database.resolve_base(&reference.base).map(|base|base.copy_assessment()),
+            "native_behavior_dependencies":session.project.database.resolve_base(&reference.base).and_then(|base|base.native_behavior.as_ref()),
             "deleted":reference.deleted,"disabled":reference.disabled,
             "legacy_uid":draw.and_then(|d|d.editor_uid),"native_origin":reference.origin,
             "record_projection":if reference.deleted||reference.disabled {"hidden/tombstone"} else if draw.is_some() {"resolved to existing writer input"} else {"missing preview/native adapter"},
