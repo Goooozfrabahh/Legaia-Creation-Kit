@@ -162,7 +162,7 @@ impl WorldModel {
         if self.collision.recipes.iter().any(|a|a.owner==super::collision_recipes::ObjectId::Created(uid)) ||
             self.collision.mesh_recipes.contains_key(&uid) {return Ok(());}
         let foreign=self.foreign.iter().find(|f|f.uid==uid).ok_or("Foreign resource absent")?;
-        let generated=self.mesh_collision_geometry(key,"No independently verified native MAP collider for this donor; exact original TMD retained")?;
+        let generated=self.mesh_wall_geometry(key,"No independently verified native MAP collider for this donor; exact original TMD retained")?;
         let recipe=MeshOnlyRecipe{uid,scene:foreign.source.clone(),kind:foreign.kind.clone(),record:foreign.record,
             tmd_sha256:digest(&foreign.raw_tmd),generated};
         recipe.validate()?;
@@ -199,15 +199,14 @@ impl WorldModel {
         let offset=legaia_scene_formats::field_objects::collision_footprint_offset(&rec);
         // Descriptor offsets identify a native collider center, not its live
         // class, extents, enabled state or walls. Do not invent a native shape.
-        let generated=self.mesh_collision_geometry(key,&format!("Descriptor flags {:#x}, verified collider offset {offset:?}; independent complete native shape/runtime class unavailable. Mesh-derived review proposal; not retail wall ownership or verified walkability",rec.flags))?;
+        let generated=self.mesh_wall_geometry(key,&format!("Descriptor flags {:#x}, verified collider offset {offset:?}; independent complete native shape/runtime class unavailable. Mesh-derived review proposal; not retail wall ownership or verified walkability",rec.flags))?;
         Ok(Recipe{version:1,source,evidence:Evidence::MeshDerived{
             note:"Automatically generated from this object's mesh; requires review, native ownership unresolved".into()},
             walls:vec![],nonblocking:vec![],generated:Some(generated)})
     }
 
-    fn mesh_collision_geometry(&self,key:(bool,usize),inspection:&str)->Result<GeneratedCollision,String> {
+    pub(super) fn mesh_wall_geometry(&self,key:(bool,usize),inspection:&str)->Result<GeneratedCollision,String> {
         let draw=self.at(key.0,key.1).ok_or("Collision target absent")?;
-        if draw.terrain || self.npc(key).is_some() {return Err("Automatic World Object collision does not author terrain or NPC behavior".into());}
         let model=self.model.as_ref().ok_or("Collision mesh unavailable")?;
         let mut triangles=Vec::new();
         for ids in model.indices.chunks_exact(3) {

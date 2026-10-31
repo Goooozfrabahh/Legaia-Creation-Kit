@@ -256,6 +256,45 @@ pub(in crate::app) fn native_texture_sequence(bundle:&[u8],pac:Option<&[u8]>,lim
     export_check!(!textures.is_empty(),"No verified native texture-upload route");Ok((textures,vram))
 }
 
+/// Boot-resident UI uploads precede field descriptors/PAC. Some environment
+/// primitives sample that real atlas/CLUT rather than a scene-local TIM.
+/// Return complete ordered source words, never fill unwritten donor VRAM.
+pub(in crate::app) fn native_donor_texture_sequence(index:&legaia_engine_scene::scene::ProtIndex,
+    bundle:&[u8],pac:Option<&[u8]>,limits:Limits)->Result<(Vec<Vec<u8>>,Vram)>{
+    let boot=index.system_ui_bundle()?;
+    let mut textures=Vec::new();
+    for member in 0..boot.member_counts[0] {
+        if let Some(m)=boot.tims.iter().find(|m|m.raw_entry==0&&m.member==member){
+            let t=&m.tim;let mut raw=16u32.to_le_bytes().to_vec();raw.extend(t.flags.to_le_bytes());
+            if let Some(c)=&t.clut {raw.extend((12+c.entries.len() as u32*2).to_le_bytes());
+                for v in [c.fb_x,c.fb_y,c.w,c.h]{raw.extend(v.to_le_bytes());}for v in &c.entries{raw.extend(v.to_le_bytes());}}
+            raw.extend((12+t.image.data.len() as u32).to_le_bytes());
+            for v in [t.image.fb_x,t.image.fb_y,t.image.fb_w,t.image.h]{raw.extend(v.to_le_bytes());}raw.extend(&t.image.data);
+            legaia_tim::parse_native_upload(&raw)?;
+            if super::super::ps1_export::unrestricted::active(){super::super::ps1_export::unrestricted::diagnostic(format!("NATIVE DONOR BOOT UPLOAD: raw TOC 0 member {} at {:#x}, image ({},{}) {}x{}, CLUT {:?}, upload SHA256 {}; precedes scene descriptors/PAC",m.member,m.entry_offset,t.image.fb_x,t.image.fb_y,t.image.fb_w,t.image.h,m.clut_strip_rect(),collision_recipes::digest(&raw)));}
+            textures.push(raw);
+        } else if let Some(p)=boot.row_patches.iter().find(|p|p.raw_entry==0&&p.member==member){
+            let w=p.w_words.min(1024-p.fb_x);let h=p.h.min(512-p.fb_y);
+            let atlas=boot.tims.iter().rev().find(|m|m.raw_entry==0&&m.member<member&&m.tim.image.fb_x<=p.fb_x
+                &&m.tim.image.fb_y<=p.fb_y&&m.tim.image.fb_x+m.tim.image.fb_w>=p.fb_x+w
+                &&m.tim.image.fb_y+m.tim.image.h>=p.fb_y+h).context("Boot row patch has no declared atlas image")?;
+            let mut bytes=Vec::new();for y in 0..h as usize{let a=y*p.w_words as usize*2;bytes.extend_from_slice(&p.data[a..a+w as usize*2]);}
+            let mut raw=16u32.to_le_bytes().to_vec();raw.extend((atlas.tim.flags&!8).to_le_bytes());raw.extend((12+bytes.len()as u32).to_le_bytes());
+            for v in [p.fb_x,p.fb_y,w,h]{raw.extend(v.to_le_bytes());}raw.extend(bytes);legaia_tim::parse_native_upload(&raw)?;textures.push(raw);
+        }else{anyhow::bail!("Missing declared boot upload member {member}");}
+    }
+    let mut expected=Vram::new();boot.upload_boot_resident_to_vram(&mut expected);
+    let (scene_textures,scene_vram)=native_texture_sequence(bundle,pac,limits)?;
+    // Verify the boot adapter independently against the existing native boot
+    // uploader, including clipped raw row patches and flattened CLUT strips.
+    let mut replay=Vram::new();for raw in &textures{replay.upload_tim(&legaia_tim::parse_native_upload(raw)?);}
+    anyhow::ensure!(super::super::naming::material_key(&replay)==super::super::naming::material_key(&expected),"Boot upload adapter differs from native boot pixels/coverage");
+    for raw in &scene_textures {expected.upload_tim(&legaia_tim::parse_native_upload(raw)?);}
+    // Scene-local writes must remain the last writer, with no boot overwrite.
+    anyhow::ensure!((0..1024*512).all(|i|!scene_vram.is_written(i%1024,i/1024)||scene_vram.as_u16()[i]==expected.as_u16()[i]),"Donor scene upload order changed");
+    textures.extend(scene_textures);Ok((textures,expected))
+}
+
 /// Strict mode-0x14 texture stream. Follow native chunk order, not scanner
 /// order; preserve every original chunk and nonzero trailer bytes.
 fn pac_uploads(source:&[u8],vram:&mut Vram)->Result<(usize,Vec<Vec<u8>>)> {

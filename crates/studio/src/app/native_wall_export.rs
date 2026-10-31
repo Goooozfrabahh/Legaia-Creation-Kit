@@ -189,6 +189,21 @@ pub(super) fn capture_with_metadata(
 /// Transactional: caller commits returned disc only if every ownership/replay
 /// check passes. Existing unrestricted geometry/other writer attempts survive
 /// an error; it must be reported as incomplete collision, never hidden success.
+fn encoded_draw(scene: &AssembledScene, cell: [u8; 2]) -> Result<(bool, usize)> {
+    if let Some(i) = scene
+        .placements
+        .iter()
+        .position(|p| p.cell == (cell[0], cell[1]))
+    {
+        return Ok((false, i));
+    }
+    scene
+        .terrain
+        .iter()
+        .position(|p| p.cell == (cell[0], cell[1]))
+        .map(|i| (true, i))
+        .context("Native mesh reference has no assembled draw")
+}
 pub(super) fn reconcile(
     snapshot: Snapshot,
     disc: &DiscPatcher,
@@ -209,6 +224,14 @@ pub(super) fn reconcile(
             .iter()
             .find(|(_, p)| p.object.cell == r.cell && p.object.descriptor_id == r.descriptor)
             .map(|(k, _)| *k)
+            .or_else(|| {
+                let at = 0x8000 + (r.cell[1] as usize * 128 + r.cell[0] as usize) * 2;
+                let id =
+                    u16::from_le_bytes(snapshot.source_map.get(at..at + 2)?.try_into().ok()?) & 511;
+                (id == r.descriptor)
+                    .then(|| encoded_draw(scene, r.cell).ok())
+                    .flatten()
+            })
     };
     let owner_id = |target: &ObjectId| -> String {
         match target {
@@ -282,6 +305,29 @@ pub(super) fn reconcile(
         }
         written.push(owner);
     }
+    for recipe in &doc.mesh_collision {
+        if log
+            .iter()
+            .any(|l| l.starts_with(&format!("FAILED MESH COLLISION UID {}:", recipe.uid)))
+        {
+            continue;
+        }
+        let cell = *targets
+            .get(&NameTarget::Created(recipe.uid))
+            .context("Mesh collision import reference missing")?;
+        let draw = world
+            .draws
+            .iter()
+            .find(|d| d.editor_uid == Some(recipe.uid) && !d.hidden)
+            .context("Mesh collision draw missing")?;
+        let mut owner = walls::mesh_owner(
+            owner_id(&ObjectId::Created(recipe.uid)),
+            &recipe.generated,
+            draw,
+        )?;
+        owner.native = Some(reference(&current, cell, &model_hashes)?);
+        written.push(owner);
+    }
     // Replay what the existing additive writer actually did, BEFORE replacing
     // any source layer. Rename appended observations to keep identities unique.
     let mut observed = snapshot.journal.owners.clone();
@@ -306,19 +352,20 @@ pub(super) fn reconcile(
     let mut replacements = 0usize;
     // Reparse final native bytes so moved/rotated mesh collision uses encoded
     // PS1 positions/angles rather than unsaved editor floats or nearby meshes.
-    let need_mesh = desired.owners.iter().any(|o| {
-        o.native.as_ref().and_then(source_key).is_some_and(|k| {
-            doc.moves.iter().any(|(a, _)| *a == k)
-                || doc
-                    .rotations
-                    .iter()
-                    .any(|(a, _)| *a == NameTarget::Native(k.0, k.1))
-                || doc
-                    .scales
-                    .iter()
-                    .any(|(a, _)| *a == NameTarget::Native(k.0, k.1))
-        })
-    });
+    let need_mesh = !doc.mesh_collision.is_empty()
+        || desired.owners.iter().any(|o| {
+            o.native.as_ref().and_then(source_key).is_some_and(|k| {
+                doc.moves.iter().any(|(a, _)| *a == k)
+                    || doc
+                        .rotations
+                        .iter()
+                        .any(|(a, _)| *a == NameTarget::Native(k.0, k.1))
+                    || doc
+                        .scales
+                        .iter()
+                        .any(|(a, _)| *a == NameTarget::Native(k.0, k.1))
+            })
+        });
     let native = if need_mesh {
         let prot = disc
             .read_named_file("PROT.DAT")
@@ -335,6 +382,25 @@ pub(super) fn reconcile(
     } else {
         None
     };
+    // New mesh imports use the final encoded placement/model, so native
+    // precision rounding cannot leave physics at the requested float position.
+    for recipe in &doc.mesh_collision {
+        let id = owner_id(&ObjectId::Created(recipe.uid));
+        let Some(owner) = written.iter_mut().find(|o| o.id == id) else {
+            continue;
+        };
+        let cell = owner.native.as_ref().context("Mesh native witness")?.cell;
+        let (assembled, view) = native.as_ref().context("Encoded mesh scene")?;
+        let key = encoded_draw(assembled, cell)?;
+        let draw = view.at(key.0, key.1).context("Encoded mesh draw")?;
+        let mut generated=view.mesh_wall_geometry(key,"Replayed new editor-owned mesh layer from encoded native geometry; no retail ownership or floor-height claim").map_err(anyhow::Error::msg)?;
+        generated.band_height = recipe.generated.band_height;
+        generated.min_face_area = recipe.generated.min_face_area;
+        let witness = owner.native.clone();
+        *owner = walls::mesh_owner(id, &generated, draw)?;
+        owner.native = witness;
+        log.push(format!("ENCODED MESH OWNERSHIP UID {}: {} wall sub-cells from final native geometry; mesh policy {:?}; no walkable floor proof",recipe.uid,owner.blocked.len(),owner.mesh_policy));
+    }
     let mut next_owners = vec![];
     for mut owner in desired.owners {
         let Some(r) = owner.native.clone() else {
@@ -383,24 +449,19 @@ pub(super) fn reconcile(
                 let (assembled, view) = native
                     .as_ref()
                     .context("Final native geometry unavailable")?;
-                let i = assembled
-                    .placements
-                    .iter()
-                    .position(|p| p.cell == (r.cell[0], r.cell[1]))
-                    .context("Owned final native instance missing")?;
-                let mut recipe = view
-                    .automatic_collision_recipe((false, i))
+                let key = encoded_draw(assembled, r.cell)?;
+                let mut generated = view
+                    .mesh_wall_geometry(
+                        key,
+                        "Replayed existing editor-owned mesh layer from final encoded geometry",
+                    )
                     .map_err(anyhow::Error::msg)?;
-                let generated = recipe
-                    .generated
-                    .as_mut()
-                    .context("Owned mesh recipe missing")?;
                 generated.band_height = policy[0];
                 generated.min_face_area = policy[1];
-                owner = walls::serialized_owner(
+                owner = walls::mesh_owner(
                     owner.id,
-                    &recipe,
-                    view.at(false, i).context("Final native draw")?,
+                    &generated,
+                    view.at(key.0, key.1).context("Final native draw")?,
                 )?;
             } else {
                 ensure!(
@@ -521,6 +582,17 @@ pub(super) fn attach_preview_with_metadata(
     })();
     match result {
         Ok(s) => {
+            world.collision.owned_draws = s
+                .journal
+                .owners
+                .iter()
+                .filter_map(|o| {
+                    o.native
+                        .as_ref()
+                        .and_then(|r| encoded_draw(scene, r.cell).ok())
+                        .map(|key| (o.id.clone(), key))
+                })
+                .collect();
             world.collision.owned_journal = Some(std::sync::Arc::new(s.journal));
             world.collision.owned_source_map = Some(std::sync::Arc::new(s.source_map));
         }
@@ -550,7 +622,8 @@ pub(super) fn preview(world: &WorldModel) -> Result<Option<Vec<u8>>> {
                 .sources
                 .iter()
                 .find(|(_, p)| p.object.cell == r.cell && p.object.descriptor_id == r.descriptor)
-                .map(|(k, _)| *k);
+                .map(|(k, _)| *k)
+                .or_else(|| world.collision.owned_draws.get(&original.id).copied());
             if let Some(key) = key {
                 if let Some(draw) = world.at(key.0, key.1) {
                     if draw.hidden {
@@ -558,13 +631,15 @@ pub(super) fn preview(world: &WorldModel) -> Result<Option<Vec<u8>>> {
                     }
                     if draw.offset != [0.; 3] || draw.rotation != [0.; 3] || draw.scale != [1.; 3] {
                         if let Some(policy) = original.mesh_policy {
-                            let mut recipe = world
-                                .automatic_collision_recipe(key)
+                            let mut g = world
+                                .mesh_wall_geometry(
+                                    key,
+                                    "Live replay of a verified editor-owned native mesh layer",
+                                )
                                 .map_err(anyhow::Error::msg)?;
-                            let g = recipe.generated.as_mut().context("Live owned mesh")?;
                             g.band_height = policy[0];
                             g.min_face_area = policy[1];
-                            owner = walls::serialized_owner(original.id.clone(), &recipe, draw)?;
+                            owner = walls::mesh_owner(original.id.clone(), &g, draw)?;
                             owner.native = original.native.clone();
                         } else {
                             ensure!(
@@ -612,6 +687,19 @@ pub(super) fn preview(world: &WorldModel) -> Result<Option<Vec<u8>>> {
             owners[i] = owner;
         } else {
             owners.push(owner);
+        }
+    }
+    for recipe in world.collision.mesh_recipes.values() {
+        if let Some(draw) = world
+            .draws
+            .iter()
+            .find(|d| d.editor_uid == Some(recipe.uid) && !d.hidden)
+        {
+            owners.push(walls::mesh_owner(
+                format!("live-mesh-{}", recipe.uid),
+                &recipe.generated,
+                draw,
+            )?);
         }
     }
     next.owners = owners;

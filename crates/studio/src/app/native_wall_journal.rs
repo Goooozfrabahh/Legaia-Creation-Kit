@@ -121,6 +121,27 @@ pub(super) fn serialized_owner(
         mesh_policy,
     })
 }
+/// New editor mesh contributions, with no fabricated retail MAP provenance.
+pub(super) fn mesh_owner(
+    id: String,
+    generated: &super::collision_generation::GeneratedCollision,
+    draw: &super::world_view::DrawInfo,
+) -> Result<Owner> {
+    let blocked = generated
+        .wall_cells(
+            [0, 1, 2].map(|a| draw.center[a] - generated.pivot[a]),
+            draw.rotation,
+            draw.scale,
+        )
+        .map_err(anyhow::Error::msg)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    for &cell in &blocked {
+        address(cell)?;
+    }
+    Ok(Owner{id,blocked,open:vec![],evidence:"Serialized editor mesh-derived wall proposal; not retail wall ownership or walkable-floor evidence".into(),native:None,
+        mesh_policy:Some([generated.band_height,generated.min_face_area])})
+}
 pub(super) fn apply_owner(map: &mut [u8], owner: &Owner) -> Result<()> {
     check_map(map)?;
     for &cell in &owner.open {

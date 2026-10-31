@@ -287,6 +287,11 @@ pub(super) fn scene_input(
             }
         }
         if draw.editor_uid.is_none() {
+            for (owner, native_key) in &world.collision.owned_draws {
+                if *native_key == key {
+                    collision_owners.insert(owner.clone());
+                }
+            }
             if let (Some(j), Some(p)) = (
                 &world.collision.owned_journal,
                 world.collision.sources.get(&key),

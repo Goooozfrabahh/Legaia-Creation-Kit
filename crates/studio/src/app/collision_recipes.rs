@@ -73,6 +73,8 @@ pub(super) struct Assignment {
 
 #[derive(Clone, Default)]
 pub(super) struct CollisionState {
+    /// Transient lookup from verified serialized owner to this preview draw.
+    pub owned_draws:HashMap<String,(bool,usize)>,
     pub owned_journal: Option<std::sync::Arc<super::native_wall_journal::Journal>>,
     pub owned_source_map: Option<std::sync::Arc<Vec<u8>>>,
     pub ownership_warning: Option<String>,

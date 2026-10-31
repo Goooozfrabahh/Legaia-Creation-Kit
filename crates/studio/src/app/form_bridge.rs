@@ -696,9 +696,51 @@ impl Session {
                             .context("Native preview source unavailable")?;
                         let offset =
                             [0, 1, 2].map(|a| r.transform.position[a] - src.original_center[a]);
-                        world
+                        let copied = world
                             .duplicate_native(source_key, scene.placements.len(), uid, offset)
-                            .map_err(anyhow::Error::msg)?
+                            .map_err(anyhow::Error::msg)?;
+                        // Native terrain can own a serialized editor mesh layer
+                        // without pretending to be a placed MAP collider record.
+                        if source_key.0 {
+                            let policy = world
+                                .collision
+                                .owned_draws
+                                .iter()
+                                .find(|(_, key)| **key == source_key)
+                                .and_then(|(id, _)| {
+                                    world
+                                        .collision
+                                        .owned_journal
+                                        .as_ref()
+                                        .and_then(|j| j.owners.iter().find(|o| &o.id == id))
+                                })
+                                .and_then(|o| o.mesh_policy);
+                            if let Some(policy) = policy {
+                                let mut generated=world.mesh_wall_geometry(copied,"Independent copy of serialized editor-owned mesh wall policy").map_err(anyhow::Error::msg)?;
+                                generated.band_height = policy[0];
+                                generated.min_face_area = policy[1];
+                                let source =
+                                    donor.terrain.get(ordinal).context("Terrain copy source")?;
+                                let raw = &donor
+                                    .res
+                                    .tmds
+                                    .get(source.res_tmd)
+                                    .context("Terrain TMD")?
+                                    .raw;
+                                world.collision.mesh_recipes.insert(
+                                    uid,
+                                    super::collision_generation::MeshOnlyRecipe {
+                                        uid,
+                                        scene: donor.name.clone(),
+                                        kind: "terrain".into(),
+                                        record: ordinal,
+                                        tmd_sha256: digest(raw),
+                                        generated,
+                                    },
+                                );
+                            }
+                        }
+                        copied
                     } else {
                         world
                             .insert_foreign(

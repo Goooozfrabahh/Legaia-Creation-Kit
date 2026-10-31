@@ -1638,7 +1638,7 @@ impl NativeExportPlan {
             };
             let mut inventory=NativeAssetPlan::default();let id=inventory.register(ResourceKind::Tmd,model,Origin{scene:foreign.source.clone(),entry:Some(model_entry),offset:None},false)?;
             if unrestricted::active(){let (base,table)=scene_registration::native_descriptor_table(&source_bundle)?;unrestricted::diagnostic(format!("NATIVE DONOR RESOLVED UID {}: model selector {} -> {source:?}; TMD {} bytes SHA256 {}; table base {base:#x}, {} descriptors, stream mode {:?}",foreign.uid,placed.env_slot,model.len(),id.sha256,table.count,scene_registration::native_stream_mode(&source_bundle)));}
-            let (textures,expected)=scene_registration::native_texture_sequence(&source_bundle,source_pac.as_deref().map(|p|p.as_slice()),limits)?;
+            let (textures,expected)=scene_registration::native_donor_texture_sequence(index,&source_bundle,source_pac.as_deref().map(|p|p.as_slice()),limits)?;
             let mut events=Vec::new();
             for (i,raw) in textures.iter().enumerate(){let tim=legaia_tim::parse_native_upload(raw)?;let texture=inventory.register(ResourceKind::Tim,raw,Origin{scene:foreign.source.clone(),entry:None,offset:None},false)?;
                 events.push(Upload{sequence:Some(i as u32),resource:texture,image:true,clut:tim.clut.is_some(),merge_clut_zeros:false});}
@@ -2800,3 +2800,7 @@ mod terrain_tests;
 #[cfg(test)]
 #[path="form_export_tests.rs"]
 mod form_export_tests;
+
+#[cfg(test)]
+#[path="stage_a_export_repair_tests.rs"]
+mod stage_a_export_repair_tests;

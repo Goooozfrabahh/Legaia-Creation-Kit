@@ -65,7 +65,7 @@ impl UploadTrace {
         }}self.blocks.insert(owner,block);
     }
     fn owner(&self,rect:Rect,clut:bool)->Result<Owner> {
-        rect.valid()?;let owner=self.owners[rect.y as usize*1024+rect.x as usize].context("Unresolved external image/palette data")?;
+        rect.valid()?;let owner=self.owners[rect.y as usize*1024+rect.x as usize].with_context(||format!("Unresolved external image/palette data at {rect:?}; palette={clut}"))?;
         // CBA addresses raw VRAM words: an image upload may intentionally
         // supply a palette. No guessed CLUT ownership is needed in that case.
         if !clut {export_check!(!owner.clut,"Texture image overwritten by a palette upload");}

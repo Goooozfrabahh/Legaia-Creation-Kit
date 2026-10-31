@@ -143,7 +143,24 @@ pub(in crate::app) fn prepare_with_metadata(source_path:&Path,scene:&AssembledSc
                 compile(&mut disc,entry,scene,world,index,&doc,&mut log,&mut imports,&mut object_verification,&mut targets);
                 if let Some(ownership)=ownership{
                     let result=super::super::native_wall_export::reconcile(ownership,&disc,scene,world,&doc,&targets,&mut log);
-                    match result{Ok((updated,journal))=>{disc=updated;log.push(format!("WALL_OWNERSHIP_JOURNAL\t{}",serde_json::to_string(&journal)?));},Err(e)=>log.push(format!("FAILED OWNED COLLISION RECONCILIATION: {e:#}; unrestricted output retained, inherited collision may remain incomplete"))}
+                    match result{Ok((updated,journal))=>{disc=updated;
+                        for report in &mut object_verification {
+                            if let Some(uid)=report["uid"].as_u64(){if let Some(recipe)=doc.mesh_collision.iter().find(|r|r.uid==uid){
+                                let owner=journal["cells"].as_array().into_iter().flatten().flat_map(|c|c["journal"]["owners"].as_array().into_iter().flatten())
+                                    .find(|o|o["id"]==format!("export-{source_hash}-created-{uid}"));
+                                report["native_collision"]=serde_json::json!({"owned_wall_encoding_verified":owner.is_some(),"wall_sub_cells":owner.and_then(|o|o["blocked"].as_array()).map(|v|v.len()),
+                                    "saved_policy": [recipe.generated.band_height,recipe.generated.min_face_area],"face_counts_floor_wall_decorative":recipe.generated.surface_counts(),
+                                    "walkable_surfaces_encoded":false,"runtime_verified":false,"meaning":"saved mesh-derived wall proposal only; no retail ownership or new walkable floor claim"});
+                            }}
+                        }
+                        log.push(format!("WALL_OWNERSHIP_JOURNAL\t{}",serde_json::to_string(&journal)?));},Err(e)=>{
+                        for report in &mut object_verification {if report["uid"].as_u64().is_some_and(|uid|doc.mesh_collision.iter().any(|r|r.uid==uid)){
+                            report["resource_encoded_successfully"]=report["encoded_successfully"].clone();report["encoded_successfully"]=false.into();
+                            report["native_collision"]=serde_json::json!({"owned_wall_encoding_verified":false,"failure":format!("{e:#}"),"runtime_verified":false});
+                            if let Some(f)=report["operation_failures"].as_array_mut(){f.push(serde_json::json!(format!("Owned collision reconciliation failed: {e:#}")));}
+                        }}
+                        log.push(format!("FAILED OWNED COLLISION RECONCILIATION: {e:#}; unrestricted output retained, inherited collision may remain incomplete"))
+                    }}
                 }
                 let profile=(||->Result<_>{let bundle=disc.read_entry_footprint(entry+3)?;let pac=disc.read_entry_footprint(entry+4)?;super::super::native_load_budget::analyze(&bundle,Some(&pac))})();
                 match profile {
@@ -311,7 +328,28 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
             Ok(())
         }).is_none(){map=before;}
     }
-    for recipe in &doc.mesh_collision {log.push(format!("FAILED MESH COLLISION: available writer cannot encode mesh-only collision request {recipe:?}"));}
+    for recipe in &doc.mesh_collision {
+        let before=map.clone();let label=format!("MESH COLLISION UID {}",recipe.uid);
+        if let Some(count)=attempt(&label,log,||{
+            recipe.validate().map_err(anyhow::Error::msg)?;
+            if let Some(foreign)=world.foreign.iter().find(|f|f.uid==recipe.uid){
+                anyhow::ensure!(foreign.source==recipe.scene&&foreign.kind==recipe.kind&&foreign.record==recipe.record
+                    &&super::super::collision_recipes::digest(&foreign.raw_tmd)==recipe.tmd_sha256,"Mesh collision source fingerprint/identity mismatch");
+            }else{
+                let copy=doc.created.iter().find(|c|c.uid==recipe.uid).context("Mesh collision source instance missing")?;
+                anyhow::ensure!(copy.source.0&&recipe.scene==scene.name&&recipe.kind=="terrain"&&recipe.record==copy.source.1,"Mesh copy source identity mismatch");
+                let source=scene.terrain.get(copy.source.1).context("Mesh source terrain missing")?;
+                anyhow::ensure!(super::super::collision_recipes::digest(&scene.res.tmds.get(source.res_tmd).context("Mesh source TMD")?.raw)==recipe.tmd_sha256,"Mesh copy TMD fingerprint changed");
+            }
+            let cell=*targets.get(&scene_instances::NameTarget::Created(recipe.uid)).context("Mesh collision has no committed native reference; no orphan physics written")?;
+            anyhow::ensure!(id_at(&map,cell)?>3,"Mesh collision native reference absent");
+            let draw=world.draws.iter().find(|d|d.editor_uid==Some(recipe.uid)&&!d.hidden).context("Mesh collision draw missing")?;
+            let owner=super::super::native_wall_journal::mesh_owner(format!("created-{}",recipe.uid),&recipe.generated,draw)?;
+            super::super::native_wall_journal::apply_owner(&mut map,&owner)?;
+            Ok(owner.blocked.len())
+        }){log.push(format!("WRITTEN {label}: {count} additive wall sub-cells; authored mesh proposal policy retained. Floor candidates are not serialized as walkable heights; retail floor nibbles unchanged"));}
+        else{map=before;}
+    }
     if map!=original {
         for id in 0..512 {let at=id*32;if map[at..at+32]!=original[at..at+32]{
             log.push(format!("ENCODED MAP PROT {entry} descriptor {id} at {at:#x}: before {:02x?}; after {:02x?}",&original[at..at+32],&map[at..at+32]));
@@ -353,7 +391,7 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
                 anyhow::ensure!(!bindings.has_trigger(cell)&&!bindings.has_trigger((anchor[0] as u8,anchor[1] as u8)),"Static architecture overlaps an existing trigger binding");
             }
             let raw=world.foreign.iter().find(|f|f.uid==foreign.uid).context("Donor provenance missing")?;
-            let failures=log.iter().filter(|l|l.starts_with("FAILED ")&&(l.contains(&format!("Created({})",foreign.uid))||l.contains(&format!("UID {} ",foreign.uid)))).cloned().collect::<Vec<_>>();
+            let failures=log.iter().filter(|l|l.starts_with("FAILED ")&&(l.contains(&format!("Created({})",foreign.uid))||l.contains(&format!("UID {} ",foreign.uid))||l.contains(&format!("UID {}:",foreign.uid)))).cloned().collect::<Vec<_>>();
             Ok(serde_json::json!({"uid":foreign.uid,"source_scene":foreign.source,"category":foreign.kind,"source_catalog_ordinal":foreign.record,
                 "source_tmd_sha256":super::super::collision_recipes::digest(&raw.raw_tmd),"encoded_successfully":failures.is_empty(),"native_import_reference_written":true,"operation_failures":failures,"img_write_readback_verified":false,
                 "requested_editor_center":foreign.center,

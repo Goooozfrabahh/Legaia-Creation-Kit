@@ -1,0 +1,49 @@
+# Stage A export repair: test12345
+
+Baseline source checkpoint: b9e8262, branch lck/stage-a-base-forms-references. Latest Build 4476a72 is not replaced. User project files, test12345.img and its reports are read-only inputs. No LCK/DuckStation/desktop-control application is launched.
+
+## Exact input and root causes
+
+The input is D:\AstraRimElmProject\test12345_export_1793408211327185600\debug.txt, with its object-verification.json and scene-verification.json. Its source is the protected retail LegendOfLegaia.img. Five requests are three independent references to jiji terrain 1, bubu1 terrain 22 and conc2 terrain 107. The fixture reads the exact complete manifest, including the user's saved rotations and mesh recipes, instead of arranging a replacement scene.
+
+The conc2 TMD is SHA256 df8a6b684605d53b92666494baa6339e8d0d33e6934f2c1761cd7bb78ecaa3d9, native selector 104 from bundle PROT 624 descriptor 0/member 104, MAP PROT 621; its scene also uses mode 0x14 PAC loading. The first unresolved primitive image footprint is VRAM (960,496), 1x2 words: TMD block 0x34 uses TSB 0x005f with UVs (0,240)/(1,240)/(0,241), CBA 0x7f84 = CLUT (64,510). Raw TOC 0 member 8 at offset 0xfa18 supplies atlas (960,256), 64x256 words and the (0,510), 256-word palette strip. The corrected allocation maps TSB to 0x004d and CBA to 0x0037, preserving all sampled values and UV shape. Other conc2 faces use the scene-local image at (536,256), 20x60 words and CLUT (64,501). Those are real boot-resident system-UI atlas words, not absent streamed texture data. The exporter previously replayed only the donor's scene descriptors and PAC, omitting boot uploads. The independent field renderer already underlays the boot atlas, explaining why editor preview could texture the donor while native import failed.
+
+The new generic donor sequence serializes central SystemUiBundle raw-TOC-0 members in native order (excluding raw-TOC-1 game-over resources), including clipped raw row patches and flat CLUT strips, then applies the actual scene descriptor/PAC order. It independently compares the boot adapter against the existing boot uploader and checks scene writes remain last. Existing relocation resolves and copies only sampled required image/palette bytes, rewrites TMD TSB/CBA/UV references, and compares material samples. Unwritten donor words still fail with their exact rectangle. Debug output identifies boot member/offset/destination/upload hashes. Resident UI/character reservations remain protected; boot resources are copied into new private allocations, never uploaded over resident character regions.
+
+The collision failure was an unconditional failure branch for every MESH_COLLISION record. A second assumption in ownership replay handled only placed MAP objects; imported terrain can remain a genuine non-placed terrain reference. Both now use reusable geometry/verified-reference adapters. No per-town or per-object production special cases are added.
+
+## Native wall ownership
+
+Mesh-only definitions validate their saved geometry and donor TMD identity, require a committed native reference, and serialize the saved vertical-face/band policy into native wall sub-cells. Each operation rolls back on failure. Journal reconciliation captures the exact additive writes, preserves the original wall baseline and every surviving owner, then derives final wall cells from the actual encoded geometry so native rounding cannot leave walls at an unsaved float pose. Reopened terrain is resolved by verified cell/descriptor/model witnesses, not proximity or a fabricated placed collider. Transient owner-to-draw maps never become permanent FormKeys.
+
+The Base Form/Reference bridge retains native-terrain ownership handles; independent copies retain the owned mesh policy and acquire new identities. Copying a source that is deleted in the same transaction uses its preserved triangles, avoiding a degenerate hidden-mesh copy. Live preview, moves, rotations, deletion and repeated native exports reuse the existing wall journal. Surviving owners, original walls, floor nibbles and binding records are checked explicitly.
+
+This serializes the existing mesh-derived WALL PROPOSAL, not arbitrary triangle collision or new walkable floor heights. The three jiji models have 10 horizontal faces each and zero vertical wall contributions, so their three independently owned empty wall layers are valid. The first corrected export records wall-cell counts 0,0,0,19,4. Their horizontal faces are NOT serialized as new walkable surfaces. This remains conspicuous in per-object native_collision reporting (walkable_surfaces_encoded=false, runtime_verified=false). Engine walkability, vertical layering and interaction remain unverified. No retail wall ownership is inferred or cleared from mesh bounds.
+
+## Memory accounting
+
+The original report's 460,260 bytes are the sum of persistent decoded destination requests: 305,908 TMD-pack + 45,340 MAN + 96,448 MOVE + 4 ANM/CLUT-walk + 12,560 VDF. These are separate heap allocations, not suballocations of the 404,480-byte encoded asset staging arena. The decoder scratch adds 4,116 bytes to the accounted peak: 464,376. Including a simultaneously resident staging arena gives 868,856 against the retail 1,263,616-byte heap, leaving a theoretical 394,760 BEFORE omitted costs. It is not measured free space or a single-block allocation certificate.
+
+With the fifth model included, the first corrected output reports 462,456 persistent bytes, 466,572 peak requested bytes, 871,052 including staging, and a theoretical 392,564 before omitted costs. Its encoded bundle is 231,424 bytes and PAC is 376,832 bytes, each below 404,480. The report now names these allocation domains and lengths explicitly. Allocator headers, fragmentation, resident character/effect data, per-model/render-node/actor allocations, packet/ordering/audio buffers, cleanup and actual GPU completion are not verified. A structurally valid IMG and a positive arithmetic remainder cannot prove the scene will load or render in the retail engine. No engine allocator patch is installed.
+
+## Automated evidence and manual testing
+
+Exact output directory: D:\AstraRimElmProject\ManualTests\StageA_ExportRepair_20261030_01.
+
+- TEST12345_FIVE_TERRAIN_REPAIRED.img preserves the user's exact five-object arrangement.
+- TEST12345_REFERENCE_MOVE_COPY_DELETE.img is an automated lifecycle fixture: move/rotate the conc2 reference, copy the bubu1 reference independently and delete its original.
+- TEST12345_REOPEN_UNCHANGED.img tests another export/reopen of that result.
+
+All outputs are written through the normal publisher, checked by file length/hash readback, opened as native images and validated against their journals. The primary fixture verifies 5/5 registrations, five independent native references, cumulative native-loader hashes, donor material samples, resident VRAM protection, all unrelated PROT records, original floor nibbles/bindings and five owned wall policies. Donor sample counts are 4,960 for each jiji reference, 35,458 for bubu1 and 59,522 for conc2 (109,860 total), with zero differences against independently assembled donor materials. Lifecycle checks preserve surviving owners and the Base/Reference model; another unchanged reopen preserves the MAP exactly.
+
+For manual testing, the user may cold-boot the FIRST image with the established in-game memory-card save. Confirm the loaded Rim Elm variant, 5/5 correct shapes/textures, Vahn's face/UI textures, loading stability and walking near the two vertical props. Do not interpret the three flat jiji models as verified walkable floors. Record visibility and collision separately, including any mismatch or freeze. The second/third images are regression arrangements, not substitutes for the user's first image. Do not use savestates from another IMG as runtime evidence.
+
+The candidate editor is archived separately after regression/build completion. Keep Latest Build unchanged. GUI verification and native gameplay verification: not performed; user testing pending.
+
+## Final verification for this repair
+
+308 Studio regular tests passed, zero failures; 57 opt-in fixtures skipped by the regular run. Seven relevant opt-in fixtures passed separately: original partial-IMG audit, exact five-object/three-output lifecycle fixture, Bylon material regression, legacy project migration, Base/Reference/cell/draw-order acceptance, headless duplicate/undo/redo workspace test, and repeated R8 ownership lifecycle. The other 50 opt-in fixtures were not run for this repair. Bylon again matches 29,164 relocated material samples with unchanged MAP/collision/floor/binding bytes. R8 repeated move/delete/reopen and multi-cell ownership pass. No GUI or gameplay test was performed. Release builds successfully with existing unused-API/import/macro warnings and no errors; selected-module formatting and Git whitespace checks pass.
+
+The original test12345.img SHA256 is still 55d20e9ab4fffbdd0a0f5df82000709f27f43bc57ff74b621d9b535f25dad1c2 and matches both supplied JSON reports. Its native loader trace has 116 scene models, the four reported successful references resolve to the reported hashes, and UID 5 has no registration. Protected retail SHA256 remains 750dbcbadb70362feb3468467bbe7efbf3d151a414caa428c66c368d4b0b73e6. Installed Latest Build remains c3ef8524f780bd720b92e567fca774ad0c7bb68ffad9843fe63ec1d6c55f453c / 4476a72. b9e8262 and all prior checkpoints remain in history.
+
+New fixture: crates/studio/src/app/stage_a_export_repair_tests.rs. Core repairs: scene_registration.rs, multi_tim.rs, ps1_export.rs, unrestricted_export.rs, native_wall_journal.rs and native_wall_export.rs. Owned terrain lifecycle integration: collision_generation.rs, collision_recipes.rs, form_bridge.rs, form_legacy.rs and world_view.rs. Accounting/reporting: native_load_budget.rs. The Base Form/Reference schema and permanent allocation design are retained.

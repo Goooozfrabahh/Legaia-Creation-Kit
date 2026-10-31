@@ -212,6 +212,7 @@ impl WorldModel {
         let source_center = source.original_center;
         let source_radius = source.radius;
         let source_name=source.display_name.clone();
+        let hidden_source_triangles=source.hidden.then(||source.hidden_triangles.iter().map(|(_,tri)|*tri).collect::<Vec<_>>());
         // MAN actors and MAP environmental objects MUST NOT share editor-key
         // namespaces. The old allocator always returned an environment index;
         // clones retained NPC pixels but WorldModel::npc() could not see their
@@ -231,11 +232,11 @@ impl WorldModel {
         let added = source_end - source_start;
         let new_end = original_count.checked_add(added).ok_or("Too many vertices")?;
         if new_end > u32::MAX as usize { return Err("Native preview vertex limit exceeded".into()); }
-        let triangles: Vec<[u32; 3]> = model.indices.chunks_exact(3).filter_map(|tri| {
+        let triangles: Vec<[u32; 3]> = if let Some(tris)=hidden_source_triangles {tris}else{model.indices.chunks_exact(3).filter_map(|tri| {
             let points = [tri[0], tri[1], tri[2]];
             points.iter().all(|&i| (i as usize) >= source_start && (i as usize) < source_end)
                 .then_some(points)
-        }).collect();
+        }).collect()};
         if triangles.is_empty() { return Err("Native source has no independent triangles".into()); }
         let rest = model.rest[source_start..source_end].to_vec();
         model.positions.extend(rest.iter().map(|p| [0,1,2].map(|k| p[k] + offset[k])));
