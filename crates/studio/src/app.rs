@@ -2,6 +2,7 @@
 
 mod form_database;
 mod behavior_resources;
+mod native_animation;
 mod lck_project;
 mod form_legacy;
 mod form_bridge;

@@ -520,6 +520,7 @@ impl FormDatabase {
                 .is_some_and(|b| b.kind == FormKind::Cell),
             "Destination is not a Cell form"
         );
+        let animated=self.resolve_base(&base).is_some_and(|b|b.kind==FormKind::Actor);
         let key = self.allocator.allocate(&self.active_file)?;
         self.active.references.insert(
             key.clone(),
@@ -531,7 +532,7 @@ impl FormDatabase {
                 editor_id: None,
                 disabled: false,
                 deleted: false,
-                flags: Default::default(),
+                flags: if animated {BTreeSet::from(["native_animated_reference".into()])} else {Default::default()},
                 properties: Default::default(),
                 origin: None,
                 collision_owners: Default::default(),
@@ -545,6 +546,7 @@ impl FormDatabase {
         let key = self.allocator.allocate(&self.active_file)?;
         r.key = key.clone();
         r.origin = None;
+        if self.resolve_base(&r.base).is_some_and(|b|b.kind==FormKind::Actor) {r.flags.insert("native_animated_reference".into());}
         r.deleted = false;
         if let Some(id) = &r.editor_id {
             r.editor_id = Some(format!("{id}_Copy_{:06X}", key.local_id));

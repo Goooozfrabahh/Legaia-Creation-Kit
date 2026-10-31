@@ -1432,6 +1432,11 @@ pub(super) struct NativeExportPlan {
     object_verification:Vec<serde_json::Value>,
 }
 
+#[cfg(test)]
+impl NativeExportPlan {
+    pub(in crate::app) fn animation_test_inspection(&self)->(&[u8],&[serde_json::Value],&[String]) {(&self.image,&self.object_verification,&self.skipped)}
+}
+
 /// Freeze authoring records, rebuild the legacy projection and use the same
 /// native writers. Saved unsupported edits are explicit partial-export failures.
 pub(super) fn prepare_project(source:&Path, scene:&AssembledScene,
@@ -1439,13 +1444,46 @@ pub(super) fn prepare_project(source:&Path, scene:&AssembledScene,
 )->Result<NativeExportPlan>{
     session.project.validate()?;
     ensure!(source.canonicalize()? == session.source.canonicalize()?, "Project export source differs from mounted master");
-    let world=session.render(scene,index)?;
+    let mut world=session.render(scene,index)?;
+    let animated=session.project.database.references().values().filter(|r|Some(&r.cell)==session.cell.as_ref()&&!r.deleted&&!r.disabled&&r.flags.contains("native_animated_reference")).map(|r|r.key.clone()).collect::<std::collections::BTreeSet<_>>();
+    let animated_uids=session.project.render_uids.iter().filter(|b|animated.contains(&b.reference)).map(|b|b.uid).collect::<HashSet<_>>();
+    let removed=world.draws.iter().filter(|d|d.editor_uid.is_some_and(|u|animated_uids.contains(&u))).map(|d|d.index).collect::<HashSet<_>>();
+    world.draws.retain(|d|!d.editor_uid.is_some_and(|u|animated_uids.contains(&u)));
+    world.npcs.retain(|n|!removed.contains(&n.key));world.foreign.retain(|f|!animated_uids.contains(&f.uid));
+    world.collision.mesh_recipes.retain(|uid,_|!animated_uids.contains(uid));
     let mut gaps=session.export_gaps();
     if let Some(warning)=&world.collision.ownership_warning {gaps.push(warning.clone());}
     if !unrestricted {ensure!(gaps.is_empty(), "Project native serializers unresolved: {}",gaps.join("; "));}
     let metadata=session.preserved_collision_metadata()?;
     let mut plan=if unrestricted {unrestricted::prepare_with_metadata(source,scene,&world,index,metadata.as_deref())?}
         else {plan_export(source,scene,&world,index)?};
+    let mut animated_reports=std::collections::BTreeMap::new();
+    if !animated.is_empty() {
+        if let Some(coverage)=&mut plan.imports {coverage.requested+=animated.len();}
+        let result=super::native_animation::compile_project(DiscPatcher::open(plan.image.clone())?,session,index).and_then(|(disc,report)|{
+            let updated_log=plan.unrestricted_log.as_ref().map(|log|super::native_animation::finalize_log(log,&plan.image,disc.image(),&report.runtime_profile)).transpose()?;
+            Ok((disc,report,updated_log))
+        });
+        match result {
+            Ok((disc,report,updated_log))=>{
+                plan.unrestricted_log=updated_log;
+                for seat in &report.seats {animated_reports.insert(seat.reference.clone(),serde_json::json!({"status":"encoded native animated Reference","seat":seat,"behavior_preserving":false,"gameplay_verified":false,"limits":report.limitations}));}
+                if let Some(coverage)=&mut plan.imports {coverage.written+=report.seats.len();}
+                plan.image=disc.into_image();
+                let line=format!("NATIVE_ANIMATED_REFERENCES\t{}",serde_json::to_string(&report)?);
+                plan.patched.push(format!("{} independent animated native References",report.seats.len()));
+                if let Some(log)=&mut plan.unrestricted_log {log.push_str(&format!("\n{line}"));}
+                plan.object_verification.push(serde_json::to_value(report)?);
+            },
+            Err(error)=>{
+                for key in &animated {animated_reports.insert(key.clone(),serde_json::json!({"status":"failed","error":format!("{error:#}"),"behavior_preserving":false}));}
+                let line=format!("FAILED NATIVE ANIMATED REFERENCES: {error:#}; no animated actor/resource transaction committed");
+                if let Some(log)=&mut plan.unrestricted_log {log.push_str(&format!("\n{line}"));}
+                plan.skipped.push(line);
+                if !unrestricted {return Err(error);}
+            }
+        }
+    }
     for gap in &gaps {
         let line=format!("FAILED PROJECT NATIVE ADAPTER: {gap}. Record preserved in project; requested edit is not claimed complete");
         plan.skipped.push(line.clone());
@@ -1457,12 +1495,14 @@ pub(super) fn prepare_project(source:&Path, scene:&AssembledScene,
         let draw=session.reference_draws.get(&reference.key).and_then(|k|world.at(k.0,k.1));
         let report=serde_json::json!({
             "stage_a_reference":reference.key,"base":reference.base,"cell":reference.cell,
-            "canonical_static_resources":static_resources.get(&reference.base),
+            "native_animation":animated_reports.get(&reference.key),
+            "native_import_reference_written":animated_reports.get(&reference.key).map(|r|r["status"]=="encoded native animated Reference"),
+            "canonical_static_resources":if animated_reports.get(&reference.key).is_some_and(|r|r["status"]=="encoded native animated Reference") {Some(serde_json::json!({"route":"native animated actor closure; see NATIVE_ANIMATED_REFERENCES resource_dependencies"}))}else{static_resources.get(&reference.base).cloned()},
             "native_copy_capabilities":session.project.database.resolve_base(&reference.base).map(|base|base.copy_assessment()),
             "native_behavior_dependencies":session.project.database.resolve_base(&reference.base).and_then(|base|base.native_behavior.as_ref()),
             "deleted":reference.deleted,"disabled":reference.disabled,
             "legacy_uid":draw.and_then(|d|d.editor_uid),"native_origin":reference.origin,
-            "record_projection":if reference.deleted||reference.disabled {"hidden/tombstone"} else if draw.is_some() {"resolved to existing writer input"} else {"missing preview/native adapter"},
+            "record_projection":if animated_reports.get(&reference.key).is_some_and(|r|r["status"]=="encoded native animated Reference") {"native animated Reference compiler; see native_animation report"} else if reference.deleted||reference.disabled {"hidden/tombstone"} else if draw.is_some() {"resolved to existing writer input"} else {"missing preview/native adapter"},
             "encoded_successfully":"see native per-operation results; projection alone is not encoding proof",
             "img_write_readback":"pending publish verification",
             "native_loader_identity":"see native resource reports; not established by FormKey",

@@ -306,7 +306,15 @@ impl WorldModel {
             return Err("Invalid foreign placement coordinates".into());
         }
         if self.foreign.len()>=512 { return Err("Foreign preview limit is 512 instances per cell".into()); }
-        let (mesh, raw_points)=foreign_original_geometry(donor,kind,record)?;
+        let actor_world=if kind=="npc" {Some(build_world(donor,source_index))}else{None};
+        let mut actor=actor_world.as_ref().and_then(|w|w.npcs.iter().find(|n|n.record==record)).cloned();
+        let (mesh, raw_points)=if let Some(n)=&actor {
+            let raw=n.raw_tmd.as_ref().ok_or("Donor actor geometry unavailable")?;
+            let mut mesh=Model::from_tmd(raw).ok_or("Donor actor model cannot be decoded")?;
+            if let Some(bank)=&n.anm_bank {if let Some(clip)=n.anim_id.checked_sub(1).and_then(|id|bank.record_to_monster_animation(id as usize)) {if let Some(frame)=clip.frames.first(){mesh.pose(frame);}}}
+            let points=mesh.positions.iter().map(|p|[p[0]+n.psx_position[0],-p[1]-n.psx_position[1],p[2]+n.psx_position[2]]).collect();
+            (mesh,points)
+        }else{foreign_original_geometry(donor,kind,record)?};
         if mesh.positions.is_empty() || mesh.indices.is_empty() || mesh.positions.len()>250_000 {
             return Err("Donor has no usable geometry or exceeds preview budget".into());
         }
@@ -315,6 +323,7 @@ impl WorldModel {
         // Q6 adds retained source TMD and native MAP provenance without
         // interfering with that working rendering path.
         let source_slot = match kind {
+            "npc" => actor.as_ref().map(|n|n.original_model_index as usize),
             "placement" => donor.placements.get(record).map(|p|p.res_tmd),
             "terrain" => donor.terrain.get(record).map(|p|p.res_tmd),
             "mesh" => donor.env_tmds.get(record).copied(),
@@ -381,9 +390,14 @@ impl WorldModel {
                 self.delete_created((false,index))?;return Err(error);
             }
         }
-        if let Err(error)=self.ensure_foreign_mesh_collision((false,index)) {
-            self.delete_created((false,index))?;return Err(error);
+        if let Some(mut n)=actor.take() {
+            n.key=index;n.is_copy=true;
+            n.psx_position=[n.psx_position[0]+center[0]-original_center[0],n.psx_position[1]-center[1]+original_center[1],n.psx_position[2]+center[2]-original_center[2]];
+            self.npcs.push(n);
         }
+        if kind!="npc" {if let Err(error)=self.ensure_foreign_mesh_collision((false,index)) {
+            self.delete_created((false,index))?;return Err(error);
+        }}
         Ok((false,index))
     }
 

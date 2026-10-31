@@ -112,6 +112,11 @@ impl Cpu {
                     self.lo = p as u32;
                     self.hi = (p >> 32) as u32;
                 }
+                0x1a => {
+                    let a=self.r[rs] as i32 as i64;let b=self.r[rt] as i32 as i64;
+                    assert_ne!(b,0,"div by zero at {:#x}",self.pc);
+                    self.lo=(a/b) as u32;self.hi=(a%b) as u32;
+                }
                 0x1b => {
                     // Division by zero is undefined on the R3000; the model
                     // keeps it loud so a routine never leans on it.
@@ -235,6 +240,13 @@ mod shift_tests {
         c.exec(lw(T1,T0,0));c.exec(addiu(T1,ZERO,3));assert_eq!(c.r[T1 as usize],3);
         c.exec(lw(T1,T0,0));c.load_words(c.pc+4,&[addu(T2,T1,ZERO)]);
         c.exec(bne(T1,ZERO,2));assert_eq!(c.r[T2 as usize],42);
+    }
+    #[test]
+    fn signed_division_preserves_native_quotient_remainder_and_overflow_bits() {
+        let mut c=Cpu::new();let div=(1<<21)|(2<<16)|0x1a;
+        for(a,b,q,r)in [(-7i32,3i32,-2i32,-1i32),(7,-3,-2,1),(i32::MIN,-1,i32::MIN,0)] {
+            c.r[1]=a as u32;c.r[2]=b as u32;c.exec(div);assert_eq!(c.lo,q as u32);assert_eq!(c.hi,r as u32);
+        }
     }
     #[test]
     fn srav_preserves_sign_and_masks_the_shift_register() {

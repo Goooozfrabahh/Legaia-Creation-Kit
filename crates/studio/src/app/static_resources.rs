@@ -572,3 +572,30 @@ mod tests {
         assert_eq!(base, readback);
     }
 }
+
+/// Actor-only field-resident adapter. Static B1 resolution is unchanged.
+/// Native field character uploads follow boot residency and precede scene assets.
+pub(in crate::app) fn resolve_actor_context(index:&ProtIndex,scene:&Scene)->Result<ContextData> {
+    let mut out=resolve_context(index,scene)?;
+    let originals=out.uploads.drain(..).zip(out.records.drain(..)).collect::<Vec<_>>();
+    out.vram=Vram::new();out.word_sources.fill(u32::MAX);
+    let split=originals.iter().take_while(|(_,r)|r.source.namespace=="raw-toc:0").count();
+    for(raw,record)in &originals[..split]{push(&mut out,raw.clone(),record.source.clone())?;}
+    use legaia_actor_formats::field_char_textures as field;
+    let bytes=index.entry_bytes(field::PROT_ENTRY_INDEX)?;
+    let container=legaia_container_formats::parse_player_lzs(&bytes,field::CONTAINER_DESCRIPTORS)?;
+    let descriptor=container.descriptors.get(field::CONTAINER_SECTION).context("Field resident TIM descriptor missing")?;
+    let decoded=legaia_container_formats::decode(&bytes,descriptor,legaia_container_formats::DecodeMode::Lzs)?;
+    let members=legaia_container_formats::pack::parse_pack(&decoded)?;
+    let mut actual=Vram::new();
+    for member in members {
+        let raw=decoded.get(member.byte_offset..member.byte_offset+member.size).context("Resident TIM member extent")?.to_vec();
+        actual.upload_tim(&legaia_tim::parse_native_upload(&raw)?);
+        push(&mut out,raw.clone(),Address{namespace:"field-character-resident".into(),entry:Some(field::PROT_ENTRY_INDEX),stored_offset:descriptor.data_offset as usize,decoded_offset:member.byte_offset,original_sha256:digest(&raw)})?;
+    }
+    let mut expected=Vram::new();field::parse(&bytes)?.upload_to_vram(&mut expected,false);
+    ensure!(actual.as_u16()==expected.as_u16()&&(0..1024*512).all(|i|actual.is_written(i%1024,i/1024)==expected.is_written(i%1024,i/1024)),"Actor resident adapter differs from complete native field-character upload words");
+    out.carriers.push(serde_json::json!({"namespace":"field-character-resident","entry":field::PROT_ENTRY_INDEX,"descriptor":field::CONTAINER_SECTION,"sha256":digest(&bytes),"decoded_sha256":digest(&decoded)}));
+    for(raw,record)in &originals[split..]{push(&mut out,raw.clone(),record.source.clone())?;}
+    Ok(out)
+}

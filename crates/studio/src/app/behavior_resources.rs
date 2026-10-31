@@ -67,7 +67,7 @@ impl Dependencies {
             .ok_or_else(||anyhow::anyhow!("MAN partition-1 actor record unavailable"))?;
         let mut out=Self::default();
         out.add(Role::ManRecord,format!("{source}:P1:{actor}"),source,man,start,len,"FUN_8003A1E4 / partition_record_span");
-        out.add(Role::ActorBinding,format!("field-actor:+0x50={actor}"),source,man,start,pc0,"FUN_8003A1E4");
+        out.add(Role::ActorBinding,format!("field-actor:+0x50={}",file.partitions[0].len()+actor),source,man,start,pc0,"FUN_8003A1E4");
         for decoded in LinearWalker::new(&man[start..start+len],pc0) {
             let insn=match decoded {Ok(i)=>i,Err((pc,e))=> {out.unresolved.push(format!("Field decode stopped at {}: {e:?}",start+pc));break;}};
             let role=match &insn.info {
@@ -82,7 +82,7 @@ impl Dependencies {
             if let Some(id)=insn.extended {out.add(Role::ScriptContext,format!("MAN:flat:{id}"),source,man,start+insn.pc,insn.size,"field VM cross-context dispatch");}
         }
         for rec in man_motion::motion_records(man,&file) {
-            if !rec.bindings.iter().any(|b| usize::from(b.actor_id)==actor && b.actor_id!=0xf8 && b.actor_id!=0xfb) {continue;}
+            if !rec.bindings.iter().any(|b| usize::from(b.actor_id)==file.partitions[0].len()+actor && b.actor_id!=0xf8 && b.actor_id!=0xfb) {continue;}
             out.add(Role::MotionStream,format!("motion-record:{}",rec.index),source,man,rec.offset,rec.end_offset-rec.offset,"FUN_8003A9D4 / FUN_80038158");
             for variant in man_motion::stream_variants(man,&rec) {
                 if let Some(flag)=variant.gate_flag() {out.add(Role::Condition,format!("system-flag:{flag}:set"),source,man,variant.header_offset,4,"FUN_80038158 variant selection");}
@@ -147,7 +147,7 @@ impl BaseForm {
     pub fn copy_assessment(&self) -> CopyAssessment {
         CopyAssessment {classification:self.dependency_classification(),requested_modes:["Static Visual Copy","Animated Copy","Behavior-Preserving Copy"],
             static_visual:"existing visual writer; consult per-operation material/registration results",
-            animated:"not established: native animation relocation and per-reference binding unverified",
+            animated:if self.kind==super::form_database::FormKind::Actor {"B2B detached field-actor compiler available; consult per-Reference registration/state results"}else{"not established: native animation relocation and per-reference binding unverified"},
             behavior_preserving:"not established: native behavior relocation and independent instance state unverified",
             fully_functional:false,unresolved:self.native_behavior.as_ref().map_or_else(||vec!["Native dependency inventory absent (legacy or undiscovered asset)".into()],|d|d.unresolved.clone())}
     }
