@@ -43,6 +43,7 @@ mod collision_wire;
 mod floor_debug;
 mod object_collision;
 mod global_repository;
+mod floor_tiles;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -845,6 +846,7 @@ pub struct App {
     global_open_category: Option<usize>,
     global_open_branch: Option<bool>, // world objects: towns or other scenes
     global_open_scene: Option<String>,
+    global_floor_face: Option<(String,usize,floor_tiles::Face)>,
     /// Independent left-pane cell browser (separate scroll and drag-to-resize splitter).
     editor_cell_search: String,
     editor_cells: CellStore,
@@ -1044,6 +1046,7 @@ impl App {
             global_open_category: None,
             global_open_branch: None,
             global_open_scene: None,
+            global_floor_face: None,
             editor_cell_search: String::new(),
             editor_cells,
             editor_cell_selected: None,
@@ -1151,6 +1154,7 @@ impl App {
         // A newly opened disc has a different asset identity / index.
         // Dropping the receiver cancels the old scan on its next send.
         self.global_repository.clear();
+        self.global_floor_face=None;
         self.global_repository_rx = None;
         self.global_repository_started = false;
         self.global_repository_completed = 0;
@@ -1992,8 +1996,13 @@ impl App {
                         editor_preview_placed_tmd(&scene, "placement", i),
                     global_repository::Kind::Terrain(i) =>
                         editor_preview_placed_tmd(&scene, "terrain", i),
-                    global_repository::Kind::Mesh(slot) =>
-                        editor_preview_reusable_tmd(&scene, slot),
+                    global_repository::Kind::Mesh(slot) => {
+                        if let Some((source,saved_slot,face))=self.global_floor_face.as_ref() {
+                            if source==&asset.source && *saved_slot==slot {
+                                floor_tiles::preview_model(&scene,slot,*face)
+                            } else {editor_preview_reusable_tmd(&scene,slot)}
+                        } else {editor_preview_reusable_tmd(&scene,slot)}
+                    },
                     global_repository::Kind::Npc(record) =>{
                         // A field actor's posed instance comes from its MAN record.
                         // Do not pass NPC assets through environment TMD indices.
@@ -2065,10 +2074,11 @@ impl App {
         for asset in &self.global_repository {
             if self.repository_matches(asset,&term) { counts[asset.group()]+=1; }
         }
-        let titles=["World objects / MAP", "Terrain / decoration", "Reusable geometry / TMD", "Field NPCs / MAN"];
+        let titles=["World Objects", "Terrain / decoration", "Reusable geometry / TMD", "Field NPCs / MAN"];
         let mut dragging=None;
         let mut selection=None;
         let mut open_dialog=None;
+        let mut floor_choice=None;
         let mut category=self.global_open_category;
         let mut branch=self.global_open_branch;
         let mut open_scene=self.global_open_scene.clone();
@@ -2081,6 +2091,10 @@ impl App {
                 open_scene=None;
             }
             if category!=Some(group) || counts[group]==0 { continue; }
+            if group==0 {
+                floor_choice=floor_tiles::browser(
+                    ui,&self.global_repository,&term);
+            }
             // One tier per original source cell; none depends on the loaded destination.
             // Grouping source provenance keeps similarly numbered TMDs distinct.
             let mut indexed:std::collections::BTreeMap<(String,String),Vec<usize>>=std::collections::BTreeMap::new();
@@ -2162,8 +2176,26 @@ impl App {
         self.global_open_category=category;
         self.global_open_branch=branch;
         self.global_open_scene=open_scene;
-        if let Some(id)=selection {self.global_repository_selected=Some(id);}
-        if let Some(dialog)=open_dialog {self.global_repository_dialog=Some(dialog);}
+        if let Some(id)=selection {
+            self.global_floor_face=None;
+            self.global_repository_preview=None;
+            self.global_repository_selected=Some(id);
+        }
+        if let Some(dialog)=open_dialog {
+            self.global_floor_face=None;
+            self.global_repository_preview=None;
+            self.global_repository_dialog=Some(dialog);
+        }
+        if let Some((id,face))=floor_choice {
+            if let Some(asset)=self.global_repository.get(id) {
+                if let global_repository::Kind::Mesh(slot)=asset.kind {
+                    self.global_floor_face=Some((asset.source.clone(),slot,face));
+                    self.global_repository_selected=Some(id);
+                    self.global_repository_preview=None;
+                    self.global_repository_dialog=Some((id,true));
+                }
+            }
+        }
         if let Some(id)=dragging {
             self.global_repository_selected=Some(id);
             self.global_repository_drag=Some(id);
@@ -2203,6 +2235,14 @@ impl App {
                 ui.separator();
                 ui.label(format!("Source: {} ({})",self.editor_cells.label(&CellSelection::Original(asset.source.clone())).unwrap_or(asset.source_label.clone()),asset.source));
                 ui.label(format!("Record type: {}",asset.kind_label()));
+                if let Some((source,slot,face))=&self.global_floor_face {
+                    if source==&asset.source {
+                        ui.monospace(format!(
+                            "Original floor candidate: TMD {} / OBJ {} / face {}",
+                            slot,face.object,face.primitive));
+                        ui.small("Original textured TMD polygon. Native walkable-floor creation is not yet enabled.");
+                    }
+                }
                 if asset.source!=self.native_scene.as_ref().map(|(name,_)|name.as_str()).unwrap_or("") {
                     ui.label("Foreign preview uses original donor textures. Native collision, scripts and IMG export still require resource import.");
                 }

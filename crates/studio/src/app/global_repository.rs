@@ -20,6 +20,7 @@ pub(super) struct Asset {
     /// Hash of original exact PS1 TMD bytes, not a guessed semantic name.
     /// Any missing or malformed geometry is never offered as placeable.
     pub mesh_fingerprint:Option<u64>,
+    pub floor_faces:Vec<super::floor_tiles::Face>,
 }
 impl Asset {
     pub fn name_key(&self)->String {self.alias_key.clone().unwrap_or_else(||self.key.clone())}
@@ -70,7 +71,7 @@ pub(super) fn catalog_one(index:&ProtIndex,name:&str)->Result<Vec<Asset>,String>
                 d.env_slot,d.world_x,d.world_y,d.world_z),
             key:format!("cell:{name}|placed:{i}|mesh:{}|anchor:{},{}|pos:{},{},{}",
                 d.env_slot,d.anchor.0,d.anchor.1,d.world_x,d.world_y,d.world_z),
-            alias_key:visual_keys.get(d.res_tmd).cloned().flatten(),kind:Kind::Placement(i),mesh_fingerprint:mesh_hash(&scene,d.res_tmd),
+            alias_key:visual_keys.get(d.res_tmd).cloned().flatten(),kind:Kind::Placement(i),mesh_fingerprint:mesh_hash(&scene,d.res_tmd),floor_faces:Vec::new(),
         });
     }
     for (i,d) in scene.terrain.iter().enumerate() {
@@ -78,14 +79,14 @@ pub(super) fn catalog_one(index:&ProtIndex,name:&str)->Result<Vec<Asset>,String>
             source:name.to_string(),source_label:display_source.clone(),label:format!("Terrain / decoration #{i:03} [TMD {}]",d.env_slot),
             key:format!("cell:{name}|terrain:{i}|mesh:{}|anchor:{},{}|pos:{},{},{}",
                 d.env_slot,d.anchor.0,d.anchor.1,d.world_x,d.world_y,d.world_z),
-            alias_key:visual_keys.get(d.res_tmd).cloned().flatten(),kind:Kind::Terrain(i),mesh_fingerprint:mesh_hash(&scene,d.res_tmd),
+            alias_key:visual_keys.get(d.res_tmd).cloned().flatten(),kind:Kind::Terrain(i),mesh_fingerprint:mesh_hash(&scene,d.res_tmd),floor_faces:Vec::new(),
         });
     }
     for (slot,&res_tmd) in scene.env_tmds.iter().enumerate() {
         found.push(Asset {
             source:name.to_string(),source_label:display_source.clone(),label:format!("Reusable original TMD #{slot:03} / resource {res_tmd}"),
             key:format!("cell:{name}|mesh:{slot}|resource:{res_tmd}"),
-            alias_key:visual_keys.get(res_tmd).cloned().flatten(),kind:Kind::Mesh(slot),mesh_fingerprint:mesh_hash(&scene,res_tmd),
+            alias_key:visual_keys.get(res_tmd).cloned().flatten(),kind:Kind::Mesh(slot),mesh_fingerprint:mesh_hash(&scene,res_tmd),floor_faces:scene.res.tmds.get(res_tmd).map(|t|super::floor_tiles::scan_faces(&t.tmd,&t.raw,&scene.res.vram)).unwrap_or_default(),
         });
     }
     // Index original scene actors (including conditionally hidden ones) but
@@ -98,7 +99,7 @@ pub(super) fn catalog_one(index:&ProtIndex,name:&str)->Result<Vec<Asset>,String>
                 npc.record,npc.model_index,npc.anim_id,
                 if npc.conditional {" [conditional]"} else {""}),
             key:format!("cell:{name}|npc:man:{}",npc.record),
-            alias_key:world.naming.assets.get(&(false,npc.key)).cloned(),kind:Kind::Npc(npc.record),mesh_fingerprint:None,
+            alias_key:world.naming.assets.get(&(false,npc.key)).cloned(),kind:Kind::Npc(npc.record),mesh_fingerprint:None,floor_faces:Vec::new(),
         });
     }
     Ok(found)
@@ -147,7 +148,7 @@ mod tests {
     fn foreign_geometry_fingerprint_never_substitutes_a_local_source() {
         let mut asset=Asset { source:"donor".into(), source_label:"donor".into(),
             label:"object".into(), key:"cell:donor|placed:0".into(),
-            alias_key:None,kind:Kind::Placement(0), mesh_fingerprint:fingerprint(&[1,2,3]) };
+            alias_key:None,kind:Kind::Placement(0), mesh_fingerprint:fingerprint(&[1,2,3]),floor_faces:Vec::new() };
         // Geometry equality cannot prove equality of the external TIM/CLUT,
         // native placement record or collision resource. Every foreign kind
         // must use the donor-aware path even with a valid matching fingerprint.
@@ -169,7 +170,7 @@ mod tests {
     #[test]
     fn labels_distinguish_provenance(){
         let a=Asset{source:"town01".into(),source_label:"Rim Elm".into(),label:"Unidentified world object #004".into(),
-            key:"cell:town01|placed:4".into(),alias_key:None,kind:Kind::Placement(4),mesh_fingerprint:Some(5)};
+            key:"cell:town01|placed:4".into(),alias_key:None,kind:Kind::Placement(4),mesh_fingerprint:Some(5),floor_faces:Vec::new()};
         assert_eq!(a.kind_label(),"MAP Base Form");
         assert_ne!(a.source,"road01");
         assert_eq!(a.group(),0);
