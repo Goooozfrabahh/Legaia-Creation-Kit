@@ -8,6 +8,9 @@ That rules out imported actor instantiation as a necessary trigger, not all exis
 Source checkpoint: `e59873c30dccc1d3d84be9a2f5b4ae76a6640799`.
 History: `41ec9d8` -> `a29b784` -> `34bb350` -> `e5eefff` -> `e59873c`.
 Full resource identities/decoded offsets/hashes are in the TSV and allocation JSON.
+The common five resident model and 23 resident ANM source identities from PROT874
+are listed separately. They are not scene-bank IDs or a complete boot-runtime
+replay; native party object-count capping and pointer fixups change runtime bytes.
 
 | Case | User result | Scene/global models | ANM clips | P1 actors | Bundle/PAC bytes | Persistent requests | Peak + fixed arena |
 |---|---|---|---|---|---|---|---|
