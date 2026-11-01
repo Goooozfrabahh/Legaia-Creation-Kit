@@ -195,7 +195,7 @@ mod tests {
         assert_eq!(read.read_entry_footprint(0)?,output[..0x12000]);
         assert_eq!(read.read_entry_footprint(1)?,before.read_entry_footprint(1)?);
         let folder=std::env::current_dir()?.join("target").join(format!("native-floor-synthetic-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
-        std::fs::create_dir(&folder)?;
+        std::fs::create_dir_all(&folder)?;
         std::fs::write(folder.join("synthetic-source.img"),&original)?;std::fs::write(folder.join("synthetic-floor-copy.img"),&changed)?;
         let reread=DiscPatcher::open(std::fs::read(folder.join("synthetic-floor-copy.img"))?)?;
         let map=reread.read_entry_footprint(0)?;

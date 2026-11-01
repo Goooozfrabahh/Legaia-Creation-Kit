@@ -294,7 +294,7 @@ pub(super) fn browser(
                                     .on_hover_text(tip)
                                     .clicked()
                                 {
-                                    choice = Some((*id, **face));
+                                    choice = Some((*id, *face));
                                 }
                             }
                             if local.len() > 150 {

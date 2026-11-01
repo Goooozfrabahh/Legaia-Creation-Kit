@@ -94,7 +94,7 @@ mod tests {
         use super::super::global_repository::{Asset,Kind};
         let dir=tempfile::tempdir().unwrap();let path=dir.path().join("aliases.tsv");let legacy=dir.path().join("legacy.tsv");
         let key=visual_key(&[1,2,3],&digest(&[8,9])).unwrap();
-        let a=Asset{source:"town01".into(),source_label:"Rim Elm".into(),label:"Native A".into(),key:"native:a".into(),alias_key:Some(key.clone()),kind:Kind::Placement(7),mesh_fingerprint:Some(3)};
+        let a=Asset{source:"town01".into(),source_label:"Rim Elm".into(),label:"Native A".into(),key:"native:a".into(),alias_key:Some(key.clone()),kind:Kind::Placement(7),mesh_fingerprint:Some(3),floor_faces:Vec::new()};
         let mut b=a.clone();b.source="town02".into();b.key="native:b".into();b.kind=Kind::Mesh(22);
         let mut names=Catalog::load(&path,&legacy).unwrap();
         names.records.insert(key.clone(),Record{name:"Stone lantern".into(),aliases:"lamp".into(),..Default::default()});names.save(&path).unwrap();
