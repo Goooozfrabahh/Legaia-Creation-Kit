@@ -1,5 +1,6 @@
 use super::super::form_database::{FileId, FormDatabase, FormKind, Property};
 use super::*;
+include!("native_animation_combined_tests.rs");
 fn key(n: u32) -> FormKey {
     FormKey::new(FileId::new("test").unwrap(), n).unwrap()
 }

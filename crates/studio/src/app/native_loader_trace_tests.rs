@@ -96,6 +96,12 @@ fn execute_original(exe:&[u8],bundle:&[u8],base:usize,pac:Option<&[u8]>)->Result
     execute_original_allocations(exe,bundle,base,pac,false).map(|v|v.0)
 }
 pub(in crate::app) fn execute_original_allocations(exe:&[u8],bundle:&[u8],base:usize,pac:Option<&[u8]>,all_types:bool)->Result<(Vec<(usize,String)>,Vec<serde_json::Value>)>{
+    let (models,allocations,_)=execute_original_machine(exe,bundle,base,pac,all_types)?;
+    Ok((models,allocations))
+}
+/// Retain the same machine after original registration, including relocated
+/// model pointers and dependency globals, for cumulative construction probes.
+pub(in crate::app) fn execute_original_machine(exe:&[u8],bundle:&[u8],base:usize,pac:Option<&[u8]>,all_types:bool)->Result<(Vec<(usize,String)>,Vec<serde_json::Value>,Cpu)>{
     let load=word(exe,0x18)?;let mut cpu=Cpu::new();cpu.load_delays=true;cpu.strict_alignment=true;
     for(lo,hi)in [(0x80010638u32,0x8001068c),(0x8001f05c,0x8001f69c),(0x80020224,0x80020308),(0x8002541c,0x800255b8),(0x800268dc,0x80026988),(0x80026b4c,0x80026bd8)]{
         let at=0x800+(lo-load)as usize;cpu.load(lo,exe.get(at..at+(hi-lo)as usize).context("SCUS routine missing")?);
@@ -142,7 +148,7 @@ pub(in crate::app) fn execute_original_allocations(exe:&[u8],bundle:&[u8],base:u
     }
     ensure!(cpu.rd32(0x8007b774)as usize==records.len()+5,"Original registrar final counter disagrees");
     for(slot,_)in &records{ensure!(cpu.rd32(0x8007c018+*slot as u32*4)!=0,"Original registrar failed pointer store");}
-    Ok((records,allocations))
+    Ok((records,allocations,cpu))
 }
 
 #[test]
