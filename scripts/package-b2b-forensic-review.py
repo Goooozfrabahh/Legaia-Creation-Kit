@@ -156,6 +156,24 @@ for case, source in sources.items():
             'Resident resources, scene cleanup, sidecars, GPU packets, audio, heap headers, fragmentation and future allocations omitted',
             'No current live allocation failure proven; source arena is reused, not a sum of bundle plus PAC'],live_heap_failure_proven=False)
 
+resident_carrier = retail.entry(874)
+resident_payloads = []
+for slot in (0,1):
+    tag,offset = struct.unpack_from('<2I',resident_carrier,8+slot*8)
+    resident_payloads.append(decode(resident_carrier[offset:],tag & 0xffffff)[0])
+geometry, animations = resident_payloads
+assert word(geometry,0) == 5 and word(animations,0) == 23
+common_residents = dict(prot_entry=874,carrier_bytes=len(resident_carrier),carrier_sha256=sha(resident_carrier),
+    scope='Exact common boot SOURCE identities; not a complete boot runtime replay or addition to scene allocation totals',models=[],clips=[])
+for raw,key,word_offsets in [(geometry,'models',True),(animations,'clips',False)]:
+    count=word(raw,0);offsets=[word(raw,4+4*i)*(4 if word_offsets else 1) for i in range(count)]+[len(raw)]
+    for i in range(count):
+        b=raw[offsets[i]:offsets[i+1]]
+        common_residents[key].append(dict(index=i,offset=offsets[i],bytes=len(b),sha256=sha(b)))
+        for case in sources:
+            row(case,'RESIDENT_MODEL' if word_offsets else 'RESIDENT_ANM_CLIP',i,874,retail.starts[874]+(0 if case=='A' else 1 if case in ('B','C') else 3),
+                offset=offsets[i],size=len(b),digest=sha(b),native=i if word_offsets else i+1,
+                detail='common boot source; resident bank namespace, not scene clip IDs; source model headers may be capped by native boot initializer')
 details = local/'ALL_PROT_ENTRY_LAYOUT_AND_HASHES.json'
 details.write_text(json.dumps(detailed,indent=2),encoding='utf-8')
 evidence_paths = [old/'ISOLATION_REPORT.json',combined/'Variants_Final/COMBINED_REPORT.json',combined/'UserCapture/STATE_REPORT.json',
@@ -176,7 +194,7 @@ except (OSError,PermissionError) as exc:
     runtime = dict(path=str(runtime_log),available=False,reason=type(exc).__name__+': '+str(exc))
 capture = load(combined/'UserCapture/STATE_REPORT.json')
 data = dict(schema=1,source_checkpoint='e59873c30dccc1d3d84be9a2f5b4ae76a6640799',scope='Read-only packaging only; no fix, IMG generation or new gameplay claim',
-            cases=comparisons,evidence_inventory=inventory,runtime_log=runtime,
+            cases=comparisons,common_resident_source_identities=common_residents,evidence_inventory=inventory,runtime_log=runtime,
             detailed_entry_inventory=dict(path=str(details),bytes=details.stat().st_size,sha256=file_sha(details)),
             saved_state_compact={k:capture[k] for k in ('source_sha256','save_version','media','pc','npc','resident_scene_display_name','man_counts','native_model_count','failed_actor_spawns','transition_actors','native_read','cdrom','cached_TOC_first_4096_bytes_match_target','pending_buffer_first_32_bytes_match_target')})
 (local/'NATIVE_ALLOCATION_COMPARISON.json').write_text(json.dumps(data,indent=2),encoding='utf-8')
@@ -196,6 +214,9 @@ That rules out imported actor instantiation as a necessary trigger, not all exis
 Source checkpoint: `e59873c30dccc1d3d84be9a2f5b4ae76a6640799`.
 History: `41ec9d8` -> `a29b784` -> `34bb350` -> `e5eefff` -> `e59873c`.
 Full resource identities/decoded offsets/hashes are in the TSV and allocation JSON.
+The common five resident model and 23 resident ANM source identities from PROT874
+are listed separately. They are not scene-bank IDs or a complete boot-runtime
+replay; native party object-count capping and pointer fixups change runtime bytes.
 
 '''+table+'''
 The first differing native allocation in M is still the FIRST type-2 model-pack
