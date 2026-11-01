@@ -1,0 +1,791 @@
+case	record_kind	identity	prot_entry	relative_lba	disc_lba	byte_offset	bytes	sha256	native_slot_or_id	detail
+A	DESCRIPTOR	0	4	243	485	56	304116	2e5eea9d413f4865e98e96146e6539d1548f89924796113c9077d496e537be99	2	order=0
+A	DESCRIPTOR	1	4	243	485	154603	45338	85a1ed2fdf79e7bf2e2daa4bf100740a1e18c9f92bc9f82fa4b72c296a3af5b3	3	order=1
+A	DESCRIPTOR	2	4	243	485	179497	96448	7521523a653f950a760a92bcd46b3298d421cd711ea792094d28bd4de2bfe381	5	order=2
+A	DESCRIPTOR	3	4	243	485	221092	4	df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119	6	order=3
+A	DESCRIPTOR	4	4	243	485	221095	12560	1e2addabd9d3749e8b64beeec2d3ceb0e1a2d6639155f631b6e8493caa522856	7	order=4
+A	DESCRIPTOR	5	4	243	485	225329	1927		20	order=5
+A	PAC_CHUNK	0	5	354	596	0	367492	cdd7af9ee01f64441c7b9589668694b0bc40fcb32dc4cf5930d968fbfa084a6b	1	TIM members=96
+A	MODEL	0	4	243	485	460	1916	2bbdaa3df17f75f7cee74b993b0f54aeb7a95a435af98198e5e393f625250aa2	5	decoded type2 member; pointer_table=0x8007c02c; objects=1
+A	MODEL	1	4	243	485	2376	2796	d0a7baa32d8b4fdf7bdeddb18c015c627eae4074e05885bcfa5a819b36ca00e7	6	decoded type2 member; pointer_table=0x8007c030; objects=1
+A	MODEL	2	4	243	485	5172	2012	a27a981433d462061e97e724014386cb68413974937994455a812e9adb6c94f4	7	decoded type2 member; pointer_table=0x8007c034; objects=1
+A	MODEL	3	4	243	485	7184	716	53b4ee1015348f666e54d54a9fb0bf2e501df6d5d30baf5bb8896c0651204d0f	8	decoded type2 member; pointer_table=0x8007c038; objects=1
+A	MODEL	4	4	243	485	7900	6360	ac56c924484964d5762c22d28a532dd7b044dbba58de01a9bc47cd397a01cb68	9	decoded type2 member; pointer_table=0x8007c03c; objects=1
+A	MODEL	5	4	243	485	14260	912	69909813a93402e1835cbaed101ee3b302fd4e3b2ff91d38dc5713c1a2d8d7ba	10	decoded type2 member; pointer_table=0x8007c040; objects=2
+A	MODEL	6	4	243	485	15172	2220	87574ae88fbb7b608a2b955782c3f48ee5e3aa23f0f77c8fde003ac5ce8a34d2	11	decoded type2 member; pointer_table=0x8007c044; objects=1
+A	MODEL	7	4	243	485	17392	1220	4ade3d831a1bfcf6256fcf93caabf5658cab9c71d64aec0bce783adf27d622f4	12	decoded type2 member; pointer_table=0x8007c048; objects=1
+A	MODEL	8	4	243	485	18612	2220	cf22b6faa41c2ec08d242f41ced490102d83d4a719b7e3686fa91f197f0c14a2	13	decoded type2 member; pointer_table=0x8007c04c; objects=1
+A	MODEL	9	4	243	485	20832	4704	0c659a9ee764c57c83c176d52abc0ac8e392349dd27d3db8b9a96c786945cefe	14	decoded type2 member; pointer_table=0x8007c050; objects=4
+A	MODEL	10	4	243	485	25536	1704	76f6ad62ab52668bc0fb752692238a230768a11ecef1160fbfc6031e34e9d7d1	15	decoded type2 member; pointer_table=0x8007c054; objects=1
+A	MODEL	11	4	243	485	27240	6572	a3bddab8ea00126f4ef426fca221feaf2d3135b65e62b14237d26b21147a0ef9	16	decoded type2 member; pointer_table=0x8007c058; objects=1
+A	MODEL	12	4	243	485	33812	6572	49b8cc56e64489802185f4b1ab3875e42939e0fbc903d06164d541fc5eff170f	17	decoded type2 member; pointer_table=0x8007c05c; objects=1
+A	MODEL	13	4	243	485	40384	2128	48c45ff13ced523379f9069afdbc1e196c1aff31c3afc24304c86acd4fe63979	18	decoded type2 member; pointer_table=0x8007c060; objects=2
+A	MODEL	14	4	243	485	42512	220	0556808d41036a02f77ecb75713c27c13aea727b69a59e131954b2e22b4e9720	19	decoded type2 member; pointer_table=0x8007c064; objects=1
+A	MODEL	15	4	243	485	42732	2036	6f926aecf6c71c73eb0b02a002d3693c6a2ef76d7f7b3ee711690a2c4be57d2b	20	decoded type2 member; pointer_table=0x8007c068; objects=3
+A	MODEL	16	4	243	485	44768	1696	363c20c54e107238215ed14636de8275be6d33479c8834c1db33ba13b4a71db1	21	decoded type2 member; pointer_table=0x8007c06c; objects=1
+A	MODEL	17	4	243	485	46464	748	23450d3fc5c8e48d16cda9cc0c2e90aa06122116c0c1193ce15120a5a6b0e3f0	22	decoded type2 member; pointer_table=0x8007c070; objects=1
+A	MODEL	18	4	243	485	47212	7116	28509a7cf48a735a75e39fe04508a37f5ae4655cfc9d480b327bf179e74a25d4	23	decoded type2 member; pointer_table=0x8007c074; objects=2
+A	MODEL	19	4	243	485	54328	444	c949b3d0a5358d790ba01370c2c8a02fa3577254a09d84cc6e520278c0ab31ab	24	decoded type2 member; pointer_table=0x8007c078; objects=1
+A	MODEL	20	4	243	485	54772	1132	158b15fc45f21c20009889bc57d4e266d549876a499aeb83a5a332268b61954b	25	decoded type2 member; pointer_table=0x8007c07c; objects=1
+A	MODEL	21	4	243	485	55904	388	452608246a6bb5e5541ddc89b60160168f4177db00919a15998c359a313b0cb0	26	decoded type2 member; pointer_table=0x8007c080; objects=1
+A	MODEL	22	4	243	485	56292	972	70b787ae2db3acf67cd08de5f70903b6de81cdcd57ed0a218d8f1a4d7bae6fc4	27	decoded type2 member; pointer_table=0x8007c084; objects=1
+A	MODEL	23	4	243	485	57264	972	2ecd8d10e52cb2833525e1df946148082c1cabd109d36cc1d570de8d57e8ddde	28	decoded type2 member; pointer_table=0x8007c088; objects=1
+A	MODEL	24	4	243	485	58236	632	d861f78a33f7985e10572946c5df7d4ff2028a2e2088cd763b6fac13a4ddd342	29	decoded type2 member; pointer_table=0x8007c08c; objects=1
+A	MODEL	25	4	243	485	58868	304	0313a204dc6b63279c1035fe2229a24e5869ce90ba2783661738582aa959b3c1	30	decoded type2 member; pointer_table=0x8007c090; objects=1
+A	MODEL	26	4	243	485	59172	260	fd876a0c8761581cf74a7f8cd345c7a240e158afc838f4cdedc420f7f8120db9	31	decoded type2 member; pointer_table=0x8007c094; objects=1
+A	MODEL	27	4	243	485	59432	1372	11c41429e2cced469126643481fb19c20ae66fb283a3a4c7afc546ebe7adc8fb	32	decoded type2 member; pointer_table=0x8007c098; objects=1
+A	MODEL	28	4	243	485	60804	2260	6d1d1d7afc984f8d0bd8f0e9bf41e181c31ccd023fbdcddd35dd0bb856f520ff	33	decoded type2 member; pointer_table=0x8007c09c; objects=1
+A	MODEL	29	4	243	485	63064	556	2b4e794c65b8844de2db6274bdad99e6075ff8b62cb61eba61212a895923713a	34	decoded type2 member; pointer_table=0x8007c0a0; objects=1
+A	MODEL	30	4	243	485	63620	1300	0e15c7a0d265bf67ba814b908141487de0bdff96c93b293b84b5347a23306577	35	decoded type2 member; pointer_table=0x8007c0a4; objects=1
+A	MODEL	31	4	243	485	64920	1040	9bb8caf3378bca0ab4cc35b6974df17eb7e40d0ce837c1e7a7d2ebe08dd20293	36	decoded type2 member; pointer_table=0x8007c0a8; objects=1
+A	MODEL	32	4	243	485	65960	992	f3f20c4236b22e574693a64facbfe600960f9c18777e85e64873c78af2081124	37	decoded type2 member; pointer_table=0x8007c0ac; objects=2
+A	MODEL	33	4	243	485	66952	732	9041938424f294b8563cd4df79c71a7f7337ef1999616e90cf98cef22874ee17	38	decoded type2 member; pointer_table=0x8007c0b0; objects=1
+A	MODEL	34	4	243	485	67684	1676	db27b8f36010f91f8be0de01496d0eca593ca1c4bc0f19308d1fb8b43bfff456	39	decoded type2 member; pointer_table=0x8007c0b4; objects=1
+A	MODEL	35	4	243	485	69360	1568	d145fbf0d78a98ffa22f72c87f3d8643840c9778443c95a1201450fc62f5eebb	40	decoded type2 member; pointer_table=0x8007c0b8; objects=1
+A	MODEL	36	4	243	485	70928	11152	ec03d11c2db134a1624920673ebb1b9e4d9166899b631822810fca7ea3706672	41	decoded type2 member; pointer_table=0x8007c0bc; objects=2
+A	MODEL	37	4	243	485	82080	924	78e5f4239a1fbd0fb445b35725f07f173f4ab92b887a6352067f079e4ff75371	42	decoded type2 member; pointer_table=0x8007c0c0; objects=1
+A	MODEL	38	4	243	485	83004	1068	b755c456b2c0426c5c29e60692e8498efb45382fe66a5883ddf1b406e80ce993	43	decoded type2 member; pointer_table=0x8007c0c4; objects=1
+A	MODEL	39	4	243	485	84072	912	2bc4166443127909091703fa05eff801715f805a01426112c72712aaf660837a	44	decoded type2 member; pointer_table=0x8007c0c8; objects=1
+A	MODEL	40	4	243	485	84984	2732	d8a6798d8952a8f6eafdd08ac9f6e459081f311ae9ecba62329ed1edbd94b3c2	45	decoded type2 member; pointer_table=0x8007c0cc; objects=1
+A	MODEL	41	4	243	485	87716	2016	d32ab142461ff362d79a93f304a2cb54a18c968f89f404744817cc0039f499f8	46	decoded type2 member; pointer_table=0x8007c0d0; objects=1
+A	MODEL	42	4	243	485	89732	7040	f10e96c934eec30dda5b09a9659b22a310aabddc930bc00637d3bd6fe668a236	47	decoded type2 member; pointer_table=0x8007c0d4; objects=2
+A	MODEL	43	4	243	485	96772	4376	a4b7eac2f150fa1919e82298c2670bd8c33287f4767d472e68aed6e2e7ffbc2e	48	decoded type2 member; pointer_table=0x8007c0d8; objects=1
+A	MODEL	44	4	243	485	101148	1080	bb6dc68a7ef22745cb6c1cdcdbb007056ca487a1dd1aa64575584db048669f41	49	decoded type2 member; pointer_table=0x8007c0dc; objects=1
+A	MODEL	45	4	243	485	102228	1096	56554cca3c9b2127d00424a44b7a715ad7b04486d72cb1ad4b7104a6cc6ac4ec	50	decoded type2 member; pointer_table=0x8007c0e0; objects=1
+A	MODEL	46	4	243	485	103324	700	99920bb0a19c9260bc06b96333b30bb8d81d096b18f4f3a29095a33afa58ff86	51	decoded type2 member; pointer_table=0x8007c0e4; objects=1
+A	MODEL	47	4	243	485	104024	1300	a56f5f7db44a9ee9d3e54480597f0b85ceb17837764943e0f8938ba006efdf02	52	decoded type2 member; pointer_table=0x8007c0e8; objects=1
+A	MODEL	48	4	243	485	105324	1460	2c982a25f53fa6b943e984491c56bfdeabfd18145088082f1058d0a1849fa6a4	53	decoded type2 member; pointer_table=0x8007c0ec; objects=1
+A	MODEL	49	4	243	485	106784	1332	f949001145c875b8cca5b4805cb7a0adddb11c994245fde4147744698c1dfdb3	54	decoded type2 member; pointer_table=0x8007c0f0; objects=1
+A	MODEL	50	4	243	485	108116	5296	991b67009b2c02c99869b719a7af8e0636a5aa0fb87e9e5acba83dd6f71befe0	55	decoded type2 member; pointer_table=0x8007c0f4; objects=2
+A	MODEL	51	4	243	485	113412	252	5184f531ad695ad203ae47af7425b49dda815482b2d05260291ce43ac91aef7d	56	decoded type2 member; pointer_table=0x8007c0f8; objects=1
+A	MODEL	52	4	243	485	113664	752	b43fb829508c395595ace62c72474468d1f8a366959924ff4e8d43f5b4a570a2	57	decoded type2 member; pointer_table=0x8007c0fc; objects=1
+A	MODEL	53	4	243	485	114416	3408	51c488676e1f94396f4675a9a019a528947916b6320fde8f834a9d8b16503986	58	decoded type2 member; pointer_table=0x8007c100; objects=2
+A	MODEL	54	4	243	485	117824	3132	e7f1aa0b176cf9830e57412b78b078523d831b4338d9c7b874357684edd02d9d	59	decoded type2 member; pointer_table=0x8007c104; objects=1
+A	MODEL	55	4	243	485	120956	1016	159090ba5bc8bc850f883406c7a5dae63acd97f1c9febbf8260585e564e67922	60	decoded type2 member; pointer_table=0x8007c108; objects=1
+A	MODEL	56	4	243	485	121972	1696	c800b144d4ca56b21f864c8fac11a883f339c5908d5fb74221aa6565c59d1dbc	61	decoded type2 member; pointer_table=0x8007c10c; objects=1
+A	MODEL	57	4	243	485	123668	740	5497430c91d6524fd7dccc8f525f952f44df346cade55b2c0b58ee7f6e7a509b	62	decoded type2 member; pointer_table=0x8007c110; objects=1
+A	MODEL	58	4	243	485	124408	1988	96f2f33787eeef0531cc25f134d86a83a5a58b44fb5b11a35a2a303d4d4d9c11	63	decoded type2 member; pointer_table=0x8007c114; objects=1
+A	MODEL	59	4	243	485	126396	2176	577e0817d841ee7e325c4838a474e31b8274e303454638938cfec255f4a8189e	64	decoded type2 member; pointer_table=0x8007c118; objects=1
+A	MODEL	60	4	243	485	128572	1696	58aa9f2242072ac838ed86f23b381df43217cf40e3f4900918834f42c955f41c	65	decoded type2 member; pointer_table=0x8007c11c; objects=1
+A	MODEL	61	4	243	485	130268	3064	1d9e2294036143f928ce4a3fb86e6108e40c796d0edda5a1fae2bfce5ef66b91	66	decoded type2 member; pointer_table=0x8007c120; objects=1
+A	MODEL	62	4	243	485	133332	3008	4541c74192250275e05b615ffb094b6cc33ff527bdc96c281a971cfd43ddd011	67	decoded type2 member; pointer_table=0x8007c124; objects=1
+A	MODEL	63	4	243	485	136340	1740	89c7e58fdea5eeda0b83cac087036e6531b283bcb2122d49990cf65aa7600455	68	decoded type2 member; pointer_table=0x8007c128; objects=1
+A	MODEL	64	4	243	485	138080	4608	a0cd2f9ce7caa465bb42640912db22b2bd8f9ab9952b3f905154cecf9a2b570a	69	decoded type2 member; pointer_table=0x8007c12c; objects=1
+A	MODEL	65	4	243	485	142688	3528	38eae7b973c0c9e5e458a440d6e6bcf8d5b79d53dfd5850847e248f1199f441c	70	decoded type2 member; pointer_table=0x8007c130; objects=1
+A	MODEL	66	4	243	485	146216	1312	9130e61717c4cfd918c446c797b3f07aaca4dadfbf96c65cbf967bcc0d7d473d	71	decoded type2 member; pointer_table=0x8007c134; objects=1
+A	MODEL	67	4	243	485	147528	244	914d9f0b6a7286aa847c95e12f7e78e4485c259e95ac2913dc073ab1d339807e	72	decoded type2 member; pointer_table=0x8007c138; objects=1
+A	MODEL	68	4	243	485	147772	1396	7a3876fc5cfacdb04e2688c7962acfebf00d3c7998a64ad1361794c627c44ce8	73	decoded type2 member; pointer_table=0x8007c13c; objects=1
+A	MODEL	69	4	243	485	149168	580	93c12bde7211bf75eb6a3ca99c389631f6e0c4326bc3845669a54a30dcfdedc8	74	decoded type2 member; pointer_table=0x8007c140; objects=1
+A	MODEL	70	4	243	485	149748	2796	8b6620ed701c8ab4b81518453e2140edaec186bc46d8e7c560e30439df90c795	75	decoded type2 member; pointer_table=0x8007c144; objects=1
+A	MODEL	71	4	243	485	152544	676	f766485af453978e7f411fdaaecad927fee426bc5dac23cd63399a71d03f5243	76	decoded type2 member; pointer_table=0x8007c148; objects=1
+A	MODEL	72	4	243	485	153220	7380	43533bcd02739010f12c26775687efc47118733d66dfe9df7013d37a87d736b0	77	decoded type2 member; pointer_table=0x8007c14c; objects=1
+A	MODEL	73	4	243	485	160600	964	1aaddab2abafed78b3b845e1b03e1ad63e004264085e7092aafa33f5ca78c7bf	78	decoded type2 member; pointer_table=0x8007c150; objects=1
+A	MODEL	74	4	243	485	161564	316	e458f5a22b4d59bf114d4330e4256d9fe2ccb7569d5d8045884f781a9504cc5e	79	decoded type2 member; pointer_table=0x8007c154; objects=1
+A	MODEL	75	4	243	485	161880	2056	d05187e218a430082b2ea894fe3d842c3f97a5b6a594d5a7763cb83ed22f0f0a	80	decoded type2 member; pointer_table=0x8007c158; objects=1
+A	MODEL	76	4	243	485	163936	4696	3415a1cbc56e58097037cba2dedd1c075b0612d09b8378727eabb876db44de6e	81	decoded type2 member; pointer_table=0x8007c15c; objects=1
+A	MODEL	77	4	243	485	168632	1696	69ebc438e5e0071d82a54fbf6b61e95ddd6a9452e903f2303a9d9745c484dcb2	82	decoded type2 member; pointer_table=0x8007c160; objects=1
+A	MODEL	78	4	243	485	170328	4396	1b97afdec60c4cb9f2afc2319591b6152f52846c9a049d96486888dd396e80da	83	decoded type2 member; pointer_table=0x8007c164; objects=1
+A	MODEL	79	4	243	485	174724	1224	fa11f425d6edf2abf2294ce923ab9373046065aedba3a26ee4d9e2206b7607c1	84	decoded type2 member; pointer_table=0x8007c168; objects=1
+A	MODEL	80	4	243	485	175948	692	33db31725deb03dfd63c632d8447d99f6b137503c1543012402d8111b16fdde7	85	decoded type2 member; pointer_table=0x8007c16c; objects=1
+A	MODEL	81	4	243	485	176640	492	4909a269c488c9b4966e851ab83a70042e0e3a5932cdec791c74ad70c31beb45	86	decoded type2 member; pointer_table=0x8007c170; objects=1
+A	MODEL	82	4	243	485	177132	3452	d4de691903f1a28df41b06ff0c0ac0239b25dc66bf9afda47101e8893f25f4c0	87	decoded type2 member; pointer_table=0x8007c174; objects=1
+A	MODEL	83	4	243	485	180584	640	ac1903a1ab837977392f537ebd2f4516b9deff310bb8106178f339da06dc2ef2	88	decoded type2 member; pointer_table=0x8007c178; objects=1
+A	MODEL	84	4	243	485	181224	724	5ca97bf28aa65e645fe7a6720833f5a7dcd5a48923cc0ea55dfd423b7989437e	89	decoded type2 member; pointer_table=0x8007c17c; objects=1
+A	MODEL	85	4	243	485	181948	748	60d3f7d04116ac75a0ba1127425fc57130b472eabb2f62fc195dfd3cc3284864	90	decoded type2 member; pointer_table=0x8007c180; objects=1
+A	MODEL	86	4	243	485	182696	732	2531146a8421f682c4c0f53c026a6d18fb6cf0d7c1b69520cb0793329e807e8e	91	decoded type2 member; pointer_table=0x8007c184; objects=1
+A	MODEL	87	4	243	485	183428	132	f20dbe02740fd4c27ae9755010bb5a470fdafc79922195e328b2dcf2ca74bd59	92	decoded type2 member; pointer_table=0x8007c188; objects=1
+A	MODEL	88	4	243	485	183560	9864	90151bd457b0e787f1bedf7151c74e98732ea5a86e3e35fc4ae507aa24a2ee9c	93	decoded type2 member; pointer_table=0x8007c18c; objects=1
+A	MODEL	89	4	243	485	193424	2648	beb8bd6a8b9922cd9b7e3161a36fd2b0adf02683128e336c9a093fa86ce41e33	94	decoded type2 member; pointer_table=0x8007c190; objects=1
+A	MODEL	90	4	243	485	196072	1400	c99f556dfd2b40749d2e13fa405fb699789e8cbd38fec5b00f99391032dff2bb	95	decoded type2 member; pointer_table=0x8007c194; objects=1
+A	MODEL	91	4	243	485	197472	6412	d040f75e0887d1ff72339e39370f59fc3f76c5f8b159544e35bd0f0935d1658b	96	decoded type2 member; pointer_table=0x8007c198; objects=7
+A	MODEL	92	4	243	485	203884	5076	86c9bd1c9b7a7d1e5ef839d6417c0b06da45e09b296ed8abbcb041badb51f6e6	97	decoded type2 member; pointer_table=0x8007c19c; objects=6
+A	MODEL	93	4	243	485	208960	5864	6010393a116d65cb2c2eb7d12107c0d2f99a318557b53bfb2c1b756d86d3d1b3	98	decoded type2 member; pointer_table=0x8007c1a0; objects=10
+A	MODEL	94	4	243	485	214824	6280	f90db9aab20749e0352ec295030bc7570d72d5cd7e24734c0289adab763019f7	99	decoded type2 member; pointer_table=0x8007c1a4; objects=10
+A	MODEL	95	4	243	485	221104	5008	b8e1eaf626da23bf32791f7a14254a9b4af1faec009f34b097956d4611de9c61	100	decoded type2 member; pointer_table=0x8007c1a8; objects=7
+A	MODEL	96	4	243	485	226112	6884	8e999aa328010d1e88c978857d93bad13712e87020258f6ba5e0fd41145221f6	101	decoded type2 member; pointer_table=0x8007c1ac; objects=10
+A	MODEL	97	4	243	485	232996	912	60a3e568c155f5b6b1ef0d5b7a2b6e5570398923d6929ea02aeffeddc4f2967c	102	decoded type2 member; pointer_table=0x8007c1b0; objects=1
+A	MODEL	98	4	243	485	233908	7264	152cad7ae7c1f73d752f9405c8804d331f822f7961b9b165cc44598aa6b2097f	103	decoded type2 member; pointer_table=0x8007c1b4; objects=10
+A	MODEL	99	4	243	485	241172	5552	0ead58518c97ed790e8c0f2905167ee726307a167f9bd9c2be68d9e85b0a4d23	104	decoded type2 member; pointer_table=0x8007c1b8; objects=6
+A	MODEL	100	4	243	485	246724	4328	02c76dddb88c0ddbdaea605872cd46e24b9a322c0ce7ad05c694c00badf8cf75	105	decoded type2 member; pointer_table=0x8007c1bc; objects=6
+A	MODEL	101	4	243	485	251052	4976	7006ef8d80e2a35ed11be6b54cc52fe7b1a9396bbfb9be9e7734f87fadc5b1c0	106	decoded type2 member; pointer_table=0x8007c1c0; objects=6
+A	MODEL	102	4	243	485	256028	4892	6fbc568cf49073442843ab60edf8631b4bfc8e9b9e321d5a59b20a7072e58bf1	107	decoded type2 member; pointer_table=0x8007c1c4; objects=6
+A	MODEL	103	4	243	485	260920	6028	a8173840bcecd39c678807f626fd3d6a6449b6bf927fca5e2a0e40c4f5725fed	108	decoded type2 member; pointer_table=0x8007c1c8; objects=10
+A	MODEL	104	4	243	485	266948	5892	80de23068506d0d66e98690aa90822534ed73c3cc7a1aaa11badc3290ca7e410	109	decoded type2 member; pointer_table=0x8007c1cc; objects=10
+A	MODEL	105	4	243	485	272840	5088	73ea5614177a36c329c1659a3c7b979761e6f3422a2abf3dc39a99dc8d4a1e78	110	decoded type2 member; pointer_table=0x8007c1d0; objects=6
+A	MODEL	106	4	243	485	277928	5912	2c6180be565faeccc4f3fd6897209e0d1ad9961f44ffda26d01ff6744c6f368b	111	decoded type2 member; pointer_table=0x8007c1d4; objects=10
+A	MODEL	107	4	243	485	283840	6680	0c807b7eb417dbb82875ec8765eb9c5d5c299eace7eff83bd3c043b88450076b	112	decoded type2 member; pointer_table=0x8007c1d8; objects=10
+A	MODEL	108	4	243	485	290520	3608	f741d6d0dc36f1b8ce1daba796b5c4fc8e5f0b3f051eae4001795a7d2d9d7cbb	113	decoded type2 member; pointer_table=0x8007c1dc; objects=1
+A	MODEL	109	4	243	485	294128	1056	fa2fb29899f62420c293be58e5606ed020dfb550863b385f183d9514d2167307	114	decoded type2 member; pointer_table=0x8007c1e0; objects=7
+A	MODEL	110	4	243	485	295184	1524	d56441929dcaf2f95d9a97e2391ec88868ef1ae847111dc8b7e8a4499537537a	115	decoded type2 member; pointer_table=0x8007c1e4; objects=1
+A	MODEL	111	4	243	485	296708	2016	17e08016b426f1968781e4c0262633dcc1cb061658a7446e6153b927950fdb26	116	decoded type2 member; pointer_table=0x8007c1e8; objects=4
+A	MODEL	112	4	243	485	298724	4992	a71db83533003fdc1796c6f247961100dd9b5af559a0d9153c1fd1183ef41ebc	117	decoded type2 member; pointer_table=0x8007c1ec; objects=6
+A	MODEL	113	4	243	485	303716	400	59c0518ae2f67b760f08906ffa5b6b6ce90fce86faa5004968fb8a0327a3eb0d	118	decoded type2 member; pointer_table=0x8007c1f0; objects=1
+A	ANM_CLIP	0	4	243	485	280	496	aa7e99a3c825847f07ea928c47ad9989e33fc25e0effcb3becc580ea65c1fd05	1	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	1	4	243	485	776	736	af8aba27342858c1ecc3cd4802faef703d025484c54fefcf05a534d3eb47dd9e	2	decoded bank-relative offset; bones=3; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	2	4	243	485	1512	496	01d50506a2eabdd3597d31dbbb78154b92daec83ca1f8b9cf6b2f7e8b28c864b	3	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	3	4	243	485	2008	976	ff52c29266b202ce94e0e740e4f341fc4a89367ca247133306023d4ab3323f20	4	decoded bank-relative offset; bones=4; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	4	4	243	485	2984	256	6b6607cf86763b02ff0e16198f961b8002ea80c4e518503092095a067284ba80	5	decoded bank-relative offset; bones=2; frames=15; marker=0x80c; rate_word=2
+A	ANM_CLIP	5	4	243	485	3240	496	017071fdc5b3ebc553b3c26d9b797c0fe85e808903047b43f4ad08c3337804e9	6	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	6	4	243	485	3736	496	7ac7448e78deac7fdee42db6aab3e23b35405e6c68d0c1a95c9f957acee77def	7	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	7	4	243	485	4232	496	1a4f957084caf711695be00b5d8cba5f8ffa1aa95b6e54554b1733bd64e64d95	8	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	8	4	243	485	4728	1216	c0a2aab0186848d77c40e59384143f1a16cc8c29f54dbdfdfed6e1877d929694	9	decoded bank-relative offset; bones=6; frames=25; marker=0x80c; rate_word=2
+A	ANM_CLIP	9	4	243	485	5944	736	21c32f0694e763ec9bc33918ad48be466ab2a46d8c88536af297a8ba132d2f68	10	decoded bank-relative offset; bones=6; frames=15; marker=0x80c; rate_word=4
+A	ANM_CLIP	10	4	243	485	6680	496	59a215c4a82a53459490b8d8b19b2de66e128e28a41d148854922186ae271339	11	decoded bank-relative offset; bones=6; frames=10; marker=0x80c; rate_word=4
+A	ANM_CLIP	11	4	243	485	7176	976	2c6db54c09391605777ca141a7511aec502625edce8a93cceec98db89e24b96e	12	decoded bank-relative offset; bones=6; frames=20; marker=0x80c; rate_word=4
+A	ANM_CLIP	12	4	243	485	8152	736	1169a0108e2623dfc2d23b02c6fb7fad998eb6497ef7fa1b7db37a2092a53c5b	13	decoded bank-relative offset; bones=6; frames=15; marker=0x80c; rate_word=4
+A	ANM_CLIP	13	4	243	485	8888	736	f9f58c144d1e29bebd85c93664413232513b9abd571bc9c27f41288c2917b1b8	14	decoded bank-relative offset; bones=6; frames=15; marker=0x80c; rate_word=2
+A	ANM_CLIP	14	4	243	485	9624	1216	0850c882c9824210507b0d1da8c66039779f80c6863dba2370e898bcb9575f91	15	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+A	ANM_CLIP	15	4	243	485	10840	816	b9f4cd1bd0c5f73f35fc8338a0e57975f29b82189e585b32f34e0a3507c854f2	16	decoded bank-relative offset; bones=10; frames=10; marker=0x80c; rate_word=2
+A	ANM_CLIP	16	4	243	485	11656	816	e434d4c542aef046935e479b11aad1e268b50899f3456e77718f3c6552910ce9	17	decoded bank-relative offset; bones=10; frames=10; marker=0x80c; rate_word=4
+A	ANM_CLIP	17	4	243	485	12472	2416	a9f0cb1e847e57acde3799ee3da5723cf9d47e23885a549a72f55d130de1286f	18	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	18	4	243	485	14888	2096	fc91f7df879aaa42751d07b0aae1d8a2fb9ed2656b3a9578ebba92785ab6c940	19	decoded bank-relative offset; bones=10; frames=26; marker=0x80c; rate_word=2
+A	ANM_CLIP	19	4	243	485	16984	1856	a6d93d14aad0f480cc814f72fb9be1fc5f8fb4e1b9b27c8805ed5c2dda816e5a	20	decoded bank-relative offset; bones=10; frames=23; marker=0x80c; rate_word=2
+A	ANM_CLIP	20	4	243	485	18840	2016	5f831f3ad263281a818340573ec3dc7416004bff16ffe844faeb0f67012761fc	21	decoded bank-relative offset; bones=10; frames=25; marker=0x80c; rate_word=2
+A	ANM_CLIP	21	4	243	485	20856	2416	ba9e72fd0184d1ff5234e68e6bf893b8540b0a658d563cb494d071c006ab83c9	22	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	22	4	243	485	23272	2416	1fee7d0a5b3e06e26f49137d79a84237764ba6a72b212dcaa26d606779e1d969	23	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	23	4	243	485	25688	256	1370d3d95919560374e13964a7e00464830758a6e5b586276d3e2d2057e9624d	24	decoded bank-relative offset; bones=10; frames=3; marker=0x80c; rate_word=2
+A	ANM_CLIP	24	4	243	485	25944	2096	58db4361a889cd6e598d2820e4e4fd0bd4b7986e1f590067b4bef0607d25fa7d	25	decoded bank-relative offset; bones=10; frames=26; marker=0x80c; rate_word=2
+A	ANM_CLIP	25	4	243	485	28040	1216	3b446fa1d79d2c5e209fb93589eda2757c9b7691da2250082ee44f0614b6e1ba	26	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+A	ANM_CLIP	26	4	243	485	29256	816	cc6fd28ca2786928c46fb62979fa17edea4731d1775573bb8ed9106cde8bd58f	27	decoded bank-relative offset; bones=10; frames=10; marker=0x80c; rate_word=2
+A	ANM_CLIP	27	4	243	485	30072	1216	a4b4fd87e967665bc9478bc1f405f1471d6afe3ed96ecbe025d402e2965f5b8a	28	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+A	ANM_CLIP	28	4	243	485	31288	1024	f06b826013db880ab02d293329e5700e24c26e66ad9c1f661822adfb757759c7	29	decoded bank-relative offset; bones=7; frames=18; marker=0x80c; rate_word=2
+A	ANM_CLIP	29	4	243	485	32312	1080	12f8521e701672c151f8dfa1544d568d5ca424fbf51e9dc05ebbfdc3a3f1d8bb	30	decoded bank-relative offset; bones=7; frames=19; marker=0x80c; rate_word=2
+A	ANM_CLIP	30	4	243	485	33392	800	3d7785abc4fd14250b31b2b9bf90fa7cfaf15d47cbad9cf2af5d267bfbb6bfd4	31	decoded bank-relative offset; bones=7; frames=14; marker=0x80c; rate_word=2
+A	ANM_CLIP	31	4	243	485	34192	2536	31207e8fec568c48aa5d252c7b06ea16ce61ab95aa594d9e8b65a680d6cc1aa0	32	decoded bank-relative offset; bones=7; frames=45; marker=0x80c; rate_word=2
+A	ANM_CLIP	32	4	243	485	36728	2256	6f5e936b1a35d3dba11010d9a2119c144118f4211e0350b152ec034af17770dc	33	decoded bank-relative offset; bones=7; frames=40; marker=0x80c; rate_word=2
+A	ANM_CLIP	33	4	243	485	38984	2416	5602c36f4ba6d0af5fac1957915e8d0f057bf4dd05b89f384d95874ba0f42633	34	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	34	4	243	485	41400	1216	6b2d844859b0ed04740422ddd6492c15fe23c6749c5e127ab3240634eacfc4dd	35	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+A	ANM_CLIP	35	4	243	485	42616	2416	0e2badaf4799a4e67787281c09862b565bf9c4755123b366122bbd70a1330891	36	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	36	4	243	485	45032	2416	831cf0062c2008d6290c4c310cfe0a580e57c875cd857e4a5ff62ad0616b8d27	37	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	37	4	243	485	47448	496	3cac985d0e604880cae019ee4baaa64ed8091927bb07a35768c96f8fe0b4165c	38	decoded bank-relative offset; bones=1; frames=60; marker=0x80c; rate_word=2
+A	ANM_CLIP	38	4	243	485	47944	496	fd2ee64a107fb03f1f36a767e22eb88518450d6fcf51757e2c8daf1dc69c0b42	39	decoded bank-relative offset; bones=1; frames=60; marker=0x80c; rate_word=2
+A	ANM_CLIP	39	4	243	485	48440	1696	58512c754167fa1a8fee624c8e183b601492176403e36db1379b7143fc4538d9	40	decoded bank-relative offset; bones=7; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	40	4	243	485	50136	3216	36e051975d68dadb7520763e3305e063312fea1e97032dc747ac83650b758b50	41	decoded bank-relative offset; bones=10; frames=40; marker=0x80c; rate_word=2
+A	ANM_CLIP	41	4	243	485	53352	1616	0d52031cfccb5092b6bcf55732b2936c898ac540c8cee0671236848842f73c6c	42	decoded bank-relative offset; bones=10; frames=20; marker=0x80c; rate_word=2
+A	ANM_CLIP	42	4	243	485	54968	1616	bcfa40a92777938fd0efa0e8a2a12d2664cfa5b34463e9cb89b90666c87c5e6b	43	decoded bank-relative offset; bones=10; frames=20; marker=0x80c; rate_word=2
+A	ANM_CLIP	43	4	243	485	56584	2016	7c9d7bf4000c46746522e60f431956649dd8b01575d649d6f435be9c6bcd368c	44	decoded bank-relative offset; bones=10; frames=25; marker=0x80c; rate_word=2
+A	ANM_CLIP	44	4	243	485	58600	4016	d327ebc32a3cf3114f9148c52eb99cb4b08e5e402169f7d0e25087ce3598c64f	45	decoded bank-relative offset; bones=10; frames=50; marker=0x80c; rate_word=2
+A	ANM_CLIP	45	4	243	485	62616	816	64f5d76c1184ec76beb2535306275e047a691e8d9635be80a63581ce9f598810	46	decoded bank-relative offset; bones=10; frames=10; marker=0x80c; rate_word=4
+A	ANM_CLIP	46	4	243	485	63432	1216	e0949905dff147f89a74aa880306f9e7986e6ad29600195852e06c5975b4f00d	47	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=4
+A	ANM_CLIP	47	4	243	485	64648	1216	94c7c8a1502c7f84de72c8fc838e7cc3f9b44093886be6c8be0c08732a04487b	48	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=4
+A	ANM_CLIP	48	4	243	485	65864	1616	1d191810559ab895ba9a37655added79d3da0ddc8ea29cb18be19a60521126af	49	decoded bank-relative offset; bones=10; frames=20; marker=0x80c; rate_word=4
+A	ANM_CLIP	49	4	243	485	67480	1216	e4439838a748b4fe617eb6f702314802786f03189a8dd52c4bdf0246d164c419	50	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+A	ANM_CLIP	50	4	243	485	68696	1216	d439cd0c3612103624190c24082ff849a50de324167646199c5009534f659e75	51	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+A	ANM_CLIP	51	4	243	485	69912	96	993da27e28f49d599b101b01b5eab3982bb2f6d17d68771921a72bc05c490630	52	decoded bank-relative offset; bones=10; frames=1; marker=0x80c; rate_word=2
+A	ANM_CLIP	52	4	243	485	70008	1616	0cf4d1cf93a17f2a50a8eb1146323120c22dd9a4d32afb4f3991fb80d7566bec	53	decoded bank-relative offset; bones=10; frames=20; marker=0x80c; rate_word=2
+A	ANM_CLIP	53	4	243	485	71624	496	d807b6984c56f2cb057181a53ccbb1d3b805f832323fb1c3ee15abf036e6923c	54	decoded bank-relative offset; bones=10; frames=6; marker=0x80c; rate_word=2
+A	ANM_CLIP	54	4	243	485	72120	976	e828574cf72b56a47931c77e3204afa5268d3cc4436dda3f7060756388cb915e	55	decoded bank-relative offset; bones=4; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	55	4	243	485	73096	496	eee108138f738d3ef815616bfa03393e1c749e577cb80aca48611e1912996b13	56	decoded bank-relative offset; bones=4; frames=15; marker=0x80c; rate_word=2
+A	ANM_CLIP	56	4	243	485	73592	1456	e93fd4062853b2e242f0f839c1e9087d4522b235df078eea64a243d6f9ee5f9c	57	decoded bank-relative offset; bones=6; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	57	4	243	485	75048	1456	3bb576d2a7bf2ca5d8b81ab2c5187ccea914722c6e4fdf8adc0da151412e5b44	58	decoded bank-relative offset; bones=6; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	58	4	243	485	76504	2816	6d0aca594ed3936c2994e1601a43ef8bb7b2c3bf31944da9422337cdc088933f	59	decoded bank-relative offset; bones=7; frames=50; marker=0x80c; rate_word=2
+A	ANM_CLIP	59	4	243	485	79320	1696	fa1ded82489bc6857679210945d6512fa3fcfc248460ee25d2f59b9b90d41fc5	60	decoded bank-relative offset; bones=7; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	60	4	243	485	81016	1696	89f983bafe189e95a1ee004edd06766f388e4206a88e60672722f5eeea8b7d3e	61	decoded bank-relative offset; bones=7; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	61	4	243	485	82712	3376	3fbabdc52ace3dbb095e289258cfe7b8c2bf7b1e40ec3c39d9ac6e34a4a74098	62	decoded bank-relative offset; bones=7; frames=60; marker=0x80c; rate_word=2
+A	ANM_CLIP	62	4	243	485	86088	2704	b348b07103c8610a54e8460d27b75ddbdafb395e6ddc4e2496d6d714b984b804	63	decoded bank-relative offset; bones=7; frames=48; marker=0x80c; rate_word=2
+A	ANM_CLIP	63	4	243	485	88792	1416	b981dc3feddd591a5cf58f6a6a094aade8f61ceef4a91890e7a17321bd3e3c1e	64	decoded bank-relative offset; bones=7; frames=25; marker=0x80c; rate_word=2
+A	ANM_CLIP	64	4	243	485	90208	1136	d233a4f0b4790fba0f2bf08d546d9f68e302ac1dec4c1fb226a361b90f6dd918	65	decoded bank-relative offset; bones=7; frames=20; marker=0x80c; rate_word=2
+A	ANM_CLIP	65	4	243	485	91344	1416	ef29e5ad890a7126e2876124d909cd3ae67869dc1b8800416fb837b1d99789be	66	decoded bank-relative offset; bones=7; frames=25; marker=0x80c; rate_word=2
+A	ANM_CLIP	66	4	243	485	92760	1696	eb3655b860f8d7f6cf27564a688774cd9a6c2c3cb4834ced4bae7235368f2fe1	67	decoded bank-relative offset; bones=7; frames=30; marker=0x80c; rate_word=2
+A	ANM_CLIP	67	4	243	485	94456	576	4e036c9e9182a7855b2bbb84f203cff89ed4040532fb99422b9f6bcbbb633084	68	decoded bank-relative offset; bones=7; frames=10; marker=0x80c; rate_word=2
+A	ANM_CLIP	68	4	243	485	95032	1416	4ddf5ef7bbe34a4863387e642cd005354acab81b10cb2693b3f9aec673330690	69	decoded bank-relative offset; bones=7; frames=25; marker=0x80c; rate_word=2
+A	IMG	LCK_EXPERIMENTAL_A_CONTROL.img					466714416	750dbcbadb70362feb3468467bbe7efbf3d151a414caa428c66c368d4b0b73e6		user result: LOADS
+A	BUNDLE	4	4	243	485	0	227328	34844ba248e9373bba3c3a34e71c1bedcc56282e31e9c187b834f539e22c9e73		-
+A	PAC	5	5	354	596	0	368640	45aec0de8cc4c1898064f11711491ed90cdeca2cdd6605e4eaf7de90e37aa9d6		-
+B	CHANGED_PROT	4	4	243	485	0	227328	95157a5864ae6ec535ce77f96519d6f0030d8fc3f89a90384979fc9fcd769c4b		retail_sha256=34844ba248e9373bba3c3a34e71c1bedcc56282e31e9c187b834f539e22c9e73
+B	CHANGED_PROT	5	5	354	596	0	370688	5f245ceb12326dc8b12342c47d2b0f8e28f8154e557b2a844a9dc4bf1953889f		retail_sha256=45aec0de8cc4c1898064f11711491ed90cdeca2cdd6605e4eaf7de90e37aa9d6
+B	DESCRIPTOR	0	4	243	485	56	310900	98bcb18e1ee63f6b64cc277e9f2204ad662e7c994f7c79bb69dacac89c633f95	2	order=0
+B	DESCRIPTOR	1	4	243	485	154244	45383	9d4f8b1bcd1b34cc79e74ebd5ab5764a484eaafb6cdd68ed56a7d0bdf75281e0	3	order=1
+B	DESCRIPTOR	2	4	243	485	178890	97668	a6e779f3b81dfa4d1469792947e54063bf1e28efe37fc7c703d5d6a3fa9c8676	5	order=2
+B	DESCRIPTOR	3	4	243	485	220314	4	df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119	6	order=3
+B	DESCRIPTOR	4	4	243	485	220317	12560	1e2addabd9d3749e8b64beeec2d3ceb0e1a2d6639155f631b6e8493caa522856	7	order=4
+B	DESCRIPTOR	5	4	243	485	224551	1927		20	order=5
+B	PAC_CHUNK	0	5	354	596	0	367492	cdd7af9ee01f64441c7b9589668694b0bc40fcb32dc4cf5930d968fbfa084a6b	1	TIM members=96
+B	PAC_CHUNK	1	5	354	596	367496	1604	4484092bca69f6bebef92e78f9e5af2b86fe7b72aa8b8d20018dbcc174c1ead9	1	TIM members=5
+B	MODEL	0	4	243	485	464	1916	2bbdaa3df17f75f7cee74b993b0f54aeb7a95a435af98198e5e393f625250aa2	5	decoded type2 member; pointer_table=0x8007c02c; objects=1
+B	MODEL	1	4	243	485	2380	2796	d0a7baa32d8b4fdf7bdeddb18c015c627eae4074e05885bcfa5a819b36ca00e7	6	decoded type2 member; pointer_table=0x8007c030; objects=1
+B	MODEL	2	4	243	485	5176	2012	a27a981433d462061e97e724014386cb68413974937994455a812e9adb6c94f4	7	decoded type2 member; pointer_table=0x8007c034; objects=1
+B	MODEL	3	4	243	485	7188	716	53b4ee1015348f666e54d54a9fb0bf2e501df6d5d30baf5bb8896c0651204d0f	8	decoded type2 member; pointer_table=0x8007c038; objects=1
+B	MODEL	4	4	243	485	7904	6360	ac56c924484964d5762c22d28a532dd7b044dbba58de01a9bc47cd397a01cb68	9	decoded type2 member; pointer_table=0x8007c03c; objects=1
+B	MODEL	5	4	243	485	14264	912	69909813a93402e1835cbaed101ee3b302fd4e3b2ff91d38dc5713c1a2d8d7ba	10	decoded type2 member; pointer_table=0x8007c040; objects=2
+B	MODEL	6	4	243	485	15176	2220	87574ae88fbb7b608a2b955782c3f48ee5e3aa23f0f77c8fde003ac5ce8a34d2	11	decoded type2 member; pointer_table=0x8007c044; objects=1
+B	MODEL	7	4	243	485	17396	1220	4ade3d831a1bfcf6256fcf93caabf5658cab9c71d64aec0bce783adf27d622f4	12	decoded type2 member; pointer_table=0x8007c048; objects=1
+B	MODEL	8	4	243	485	18616	2220	cf22b6faa41c2ec08d242f41ced490102d83d4a719b7e3686fa91f197f0c14a2	13	decoded type2 member; pointer_table=0x8007c04c; objects=1
+B	MODEL	9	4	243	485	20836	4704	0c659a9ee764c57c83c176d52abc0ac8e392349dd27d3db8b9a96c786945cefe	14	decoded type2 member; pointer_table=0x8007c050; objects=4
+B	MODEL	10	4	243	485	25540	1704	76f6ad62ab52668bc0fb752692238a230768a11ecef1160fbfc6031e34e9d7d1	15	decoded type2 member; pointer_table=0x8007c054; objects=1
+B	MODEL	11	4	243	485	27244	6572	a3bddab8ea00126f4ef426fca221feaf2d3135b65e62b14237d26b21147a0ef9	16	decoded type2 member; pointer_table=0x8007c058; objects=1
+B	MODEL	12	4	243	485	33816	6572	49b8cc56e64489802185f4b1ab3875e42939e0fbc903d06164d541fc5eff170f	17	decoded type2 member; pointer_table=0x8007c05c; objects=1
+B	MODEL	13	4	243	485	40388	2128	48c45ff13ced523379f9069afdbc1e196c1aff31c3afc24304c86acd4fe63979	18	decoded type2 member; pointer_table=0x8007c060; objects=2
+B	MODEL	14	4	243	485	42516	220	0556808d41036a02f77ecb75713c27c13aea727b69a59e131954b2e22b4e9720	19	decoded type2 member; pointer_table=0x8007c064; objects=1
+B	MODEL	15	4	243	485	42736	2036	6f926aecf6c71c73eb0b02a002d3693c6a2ef76d7f7b3ee711690a2c4be57d2b	20	decoded type2 member; pointer_table=0x8007c068; objects=3
+B	MODEL	16	4	243	485	44772	1696	363c20c54e107238215ed14636de8275be6d33479c8834c1db33ba13b4a71db1	21	decoded type2 member; pointer_table=0x8007c06c; objects=1
+B	MODEL	17	4	243	485	46468	748	23450d3fc5c8e48d16cda9cc0c2e90aa06122116c0c1193ce15120a5a6b0e3f0	22	decoded type2 member; pointer_table=0x8007c070; objects=1
+B	MODEL	18	4	243	485	47216	7116	28509a7cf48a735a75e39fe04508a37f5ae4655cfc9d480b327bf179e74a25d4	23	decoded type2 member; pointer_table=0x8007c074; objects=2
+B	MODEL	19	4	243	485	54332	444	c949b3d0a5358d790ba01370c2c8a02fa3577254a09d84cc6e520278c0ab31ab	24	decoded type2 member; pointer_table=0x8007c078; objects=1
+B	MODEL	20	4	243	485	54776	1132	158b15fc45f21c20009889bc57d4e266d549876a499aeb83a5a332268b61954b	25	decoded type2 member; pointer_table=0x8007c07c; objects=1
+B	MODEL	21	4	243	485	55908	388	452608246a6bb5e5541ddc89b60160168f4177db00919a15998c359a313b0cb0	26	decoded type2 member; pointer_table=0x8007c080; objects=1
+B	MODEL	22	4	243	485	56296	972	70b787ae2db3acf67cd08de5f70903b6de81cdcd57ed0a218d8f1a4d7bae6fc4	27	decoded type2 member; pointer_table=0x8007c084; objects=1
+B	MODEL	23	4	243	485	57268	972	2ecd8d10e52cb2833525e1df946148082c1cabd109d36cc1d570de8d57e8ddde	28	decoded type2 member; pointer_table=0x8007c088; objects=1
+B	MODEL	24	4	243	485	58240	632	d861f78a33f7985e10572946c5df7d4ff2028a2e2088cd763b6fac13a4ddd342	29	decoded type2 member; pointer_table=0x8007c08c; objects=1
+B	MODEL	25	4	243	485	58872	304	0313a204dc6b63279c1035fe2229a24e5869ce90ba2783661738582aa959b3c1	30	decoded type2 member; pointer_table=0x8007c090; objects=1
+B	MODEL	26	4	243	485	59176	260	fd876a0c8761581cf74a7f8cd345c7a240e158afc838f4cdedc420f7f8120db9	31	decoded type2 member; pointer_table=0x8007c094; objects=1
+B	MODEL	27	4	243	485	59436	1372	11c41429e2cced469126643481fb19c20ae66fb283a3a4c7afc546ebe7adc8fb	32	decoded type2 member; pointer_table=0x8007c098; objects=1
+B	MODEL	28	4	243	485	60808	2260	6d1d1d7afc984f8d0bd8f0e9bf41e181c31ccd023fbdcddd35dd0bb856f520ff	33	decoded type2 member; pointer_table=0x8007c09c; objects=1
+B	MODEL	29	4	243	485	63068	556	2b4e794c65b8844de2db6274bdad99e6075ff8b62cb61eba61212a895923713a	34	decoded type2 member; pointer_table=0x8007c0a0; objects=1
+B	MODEL	30	4	243	485	63624	1300	0e15c7a0d265bf67ba814b908141487de0bdff96c93b293b84b5347a23306577	35	decoded type2 member; pointer_table=0x8007c0a4; objects=1
+B	MODEL	31	4	243	485	64924	1040	9bb8caf3378bca0ab4cc35b6974df17eb7e40d0ce837c1e7a7d2ebe08dd20293	36	decoded type2 member; pointer_table=0x8007c0a8; objects=1
+B	MODEL	32	4	243	485	65964	992	f3f20c4236b22e574693a64facbfe600960f9c18777e85e64873c78af2081124	37	decoded type2 member; pointer_table=0x8007c0ac; objects=2
+B	MODEL	33	4	243	485	66956	732	9041938424f294b8563cd4df79c71a7f7337ef1999616e90cf98cef22874ee17	38	decoded type2 member; pointer_table=0x8007c0b0; objects=1
+B	MODEL	34	4	243	485	67688	1676	db27b8f36010f91f8be0de01496d0eca593ca1c4bc0f19308d1fb8b43bfff456	39	decoded type2 member; pointer_table=0x8007c0b4; objects=1
+B	MODEL	35	4	243	485	69364	1568	d145fbf0d78a98ffa22f72c87f3d8643840c9778443c95a1201450fc62f5eebb	40	decoded type2 member; pointer_table=0x8007c0b8; objects=1
+B	MODEL	36	4	243	485	70932	11152	ec03d11c2db134a1624920673ebb1b9e4d9166899b631822810fca7ea3706672	41	decoded type2 member; pointer_table=0x8007c0bc; objects=2
+B	MODEL	37	4	243	485	82084	924	78e5f4239a1fbd0fb445b35725f07f173f4ab92b887a6352067f079e4ff75371	42	decoded type2 member; pointer_table=0x8007c0c0; objects=1
+B	MODEL	38	4	243	485	83008	1068	b755c456b2c0426c5c29e60692e8498efb45382fe66a5883ddf1b406e80ce993	43	decoded type2 member; pointer_table=0x8007c0c4; objects=1
+B	MODEL	39	4	243	485	84076	912	2bc4166443127909091703fa05eff801715f805a01426112c72712aaf660837a	44	decoded type2 member; pointer_table=0x8007c0c8; objects=1
+B	MODEL	40	4	243	485	84988	2732	d8a6798d8952a8f6eafdd08ac9f6e459081f311ae9ecba62329ed1edbd94b3c2	45	decoded type2 member; pointer_table=0x8007c0cc; objects=1
+B	MODEL	41	4	243	485	87720	2016	d32ab142461ff362d79a93f304a2cb54a18c968f89f404744817cc0039f499f8	46	decoded type2 member; pointer_table=0x8007c0d0; objects=1
+B	MODEL	42	4	243	485	89736	7040	f10e96c934eec30dda5b09a9659b22a310aabddc930bc00637d3bd6fe668a236	47	decoded type2 member; pointer_table=0x8007c0d4; objects=2
+B	MODEL	43	4	243	485	96776	4376	a4b7eac2f150fa1919e82298c2670bd8c33287f4767d472e68aed6e2e7ffbc2e	48	decoded type2 member; pointer_table=0x8007c0d8; objects=1
+B	MODEL	44	4	243	485	101152	1080	bb6dc68a7ef22745cb6c1cdcdbb007056ca487a1dd1aa64575584db048669f41	49	decoded type2 member; pointer_table=0x8007c0dc; objects=1
+B	MODEL	45	4	243	485	102232	1096	56554cca3c9b2127d00424a44b7a715ad7b04486d72cb1ad4b7104a6cc6ac4ec	50	decoded type2 member; pointer_table=0x8007c0e0; objects=1
+B	MODEL	46	4	243	485	103328	700	99920bb0a19c9260bc06b96333b30bb8d81d096b18f4f3a29095a33afa58ff86	51	decoded type2 member; pointer_table=0x8007c0e4; objects=1
+B	MODEL	47	4	243	485	104028	1300	a56f5f7db44a9ee9d3e54480597f0b85ceb17837764943e0f8938ba006efdf02	52	decoded type2 member; pointer_table=0x8007c0e8; objects=1
+B	MODEL	48	4	243	485	105328	1460	2c982a25f53fa6b943e984491c56bfdeabfd18145088082f1058d0a1849fa6a4	53	decoded type2 member; pointer_table=0x8007c0ec; objects=1
+B	MODEL	49	4	243	485	106788	1332	f949001145c875b8cca5b4805cb7a0adddb11c994245fde4147744698c1dfdb3	54	decoded type2 member; pointer_table=0x8007c0f0; objects=1
+B	MODEL	50	4	243	485	108120	5296	991b67009b2c02c99869b719a7af8e0636a5aa0fb87e9e5acba83dd6f71befe0	55	decoded type2 member; pointer_table=0x8007c0f4; objects=2
+B	MODEL	51	4	243	485	113416	252	5184f531ad695ad203ae47af7425b49dda815482b2d05260291ce43ac91aef7d	56	decoded type2 member; pointer_table=0x8007c0f8; objects=1
+B	MODEL	52	4	243	485	113668	752	b43fb829508c395595ace62c72474468d1f8a366959924ff4e8d43f5b4a570a2	57	decoded type2 member; pointer_table=0x8007c0fc; objects=1
+B	MODEL	53	4	243	485	114420	3408	51c488676e1f94396f4675a9a019a528947916b6320fde8f834a9d8b16503986	58	decoded type2 member; pointer_table=0x8007c100; objects=2
+B	MODEL	54	4	243	485	117828	3132	e7f1aa0b176cf9830e57412b78b078523d831b4338d9c7b874357684edd02d9d	59	decoded type2 member; pointer_table=0x8007c104; objects=1
+B	MODEL	55	4	243	485	120960	1016	159090ba5bc8bc850f883406c7a5dae63acd97f1c9febbf8260585e564e67922	60	decoded type2 member; pointer_table=0x8007c108; objects=1
+B	MODEL	56	4	243	485	121976	1696	c800b144d4ca56b21f864c8fac11a883f339c5908d5fb74221aa6565c59d1dbc	61	decoded type2 member; pointer_table=0x8007c10c; objects=1
+B	MODEL	57	4	243	485	123672	740	5497430c91d6524fd7dccc8f525f952f44df346cade55b2c0b58ee7f6e7a509b	62	decoded type2 member; pointer_table=0x8007c110; objects=1
+B	MODEL	58	4	243	485	124412	1988	96f2f33787eeef0531cc25f134d86a83a5a58b44fb5b11a35a2a303d4d4d9c11	63	decoded type2 member; pointer_table=0x8007c114; objects=1
+B	MODEL	59	4	243	485	126400	2176	577e0817d841ee7e325c4838a474e31b8274e303454638938cfec255f4a8189e	64	decoded type2 member; pointer_table=0x8007c118; objects=1
+B	MODEL	60	4	243	485	128576	1696	58aa9f2242072ac838ed86f23b381df43217cf40e3f4900918834f42c955f41c	65	decoded type2 member; pointer_table=0x8007c11c; objects=1
+B	MODEL	61	4	243	485	130272	3064	1d9e2294036143f928ce4a3fb86e6108e40c796d0edda5a1fae2bfce5ef66b91	66	decoded type2 member; pointer_table=0x8007c120; objects=1
+B	MODEL	62	4	243	485	133336	3008	4541c74192250275e05b615ffb094b6cc33ff527bdc96c281a971cfd43ddd011	67	decoded type2 member; pointer_table=0x8007c124; objects=1
+B	MODEL	63	4	243	485	136344	1740	89c7e58fdea5eeda0b83cac087036e6531b283bcb2122d49990cf65aa7600455	68	decoded type2 member; pointer_table=0x8007c128; objects=1
+B	MODEL	64	4	243	485	138084	4608	a0cd2f9ce7caa465bb42640912db22b2bd8f9ab9952b3f905154cecf9a2b570a	69	decoded type2 member; pointer_table=0x8007c12c; objects=1
+B	MODEL	65	4	243	485	142692	3528	38eae7b973c0c9e5e458a440d6e6bcf8d5b79d53dfd5850847e248f1199f441c	70	decoded type2 member; pointer_table=0x8007c130; objects=1
+B	MODEL	66	4	243	485	146220	1312	9130e61717c4cfd918c446c797b3f07aaca4dadfbf96c65cbf967bcc0d7d473d	71	decoded type2 member; pointer_table=0x8007c134; objects=1
+B	MODEL	67	4	243	485	147532	244	914d9f0b6a7286aa847c95e12f7e78e4485c259e95ac2913dc073ab1d339807e	72	decoded type2 member; pointer_table=0x8007c138; objects=1
+B	MODEL	68	4	243	485	147776	1396	7a3876fc5cfacdb04e2688c7962acfebf00d3c7998a64ad1361794c627c44ce8	73	decoded type2 member; pointer_table=0x8007c13c; objects=1
+B	MODEL	69	4	243	485	149172	580	93c12bde7211bf75eb6a3ca99c389631f6e0c4326bc3845669a54a30dcfdedc8	74	decoded type2 member; pointer_table=0x8007c140; objects=1
+B	MODEL	70	4	243	485	149752	2796	8b6620ed701c8ab4b81518453e2140edaec186bc46d8e7c560e30439df90c795	75	decoded type2 member; pointer_table=0x8007c144; objects=1
+B	MODEL	71	4	243	485	152548	676	f766485af453978e7f411fdaaecad927fee426bc5dac23cd63399a71d03f5243	76	decoded type2 member; pointer_table=0x8007c148; objects=1
+B	MODEL	72	4	243	485	153224	7380	43533bcd02739010f12c26775687efc47118733d66dfe9df7013d37a87d736b0	77	decoded type2 member; pointer_table=0x8007c14c; objects=1
+B	MODEL	73	4	243	485	160604	964	1aaddab2abafed78b3b845e1b03e1ad63e004264085e7092aafa33f5ca78c7bf	78	decoded type2 member; pointer_table=0x8007c150; objects=1
+B	MODEL	74	4	243	485	161568	316	e458f5a22b4d59bf114d4330e4256d9fe2ccb7569d5d8045884f781a9504cc5e	79	decoded type2 member; pointer_table=0x8007c154; objects=1
+B	MODEL	75	4	243	485	161884	2056	d05187e218a430082b2ea894fe3d842c3f97a5b6a594d5a7763cb83ed22f0f0a	80	decoded type2 member; pointer_table=0x8007c158; objects=1
+B	MODEL	76	4	243	485	163940	4696	3415a1cbc56e58097037cba2dedd1c075b0612d09b8378727eabb876db44de6e	81	decoded type2 member; pointer_table=0x8007c15c; objects=1
+B	MODEL	77	4	243	485	168636	1696	69ebc438e5e0071d82a54fbf6b61e95ddd6a9452e903f2303a9d9745c484dcb2	82	decoded type2 member; pointer_table=0x8007c160; objects=1
+B	MODEL	78	4	243	485	170332	4396	1b97afdec60c4cb9f2afc2319591b6152f52846c9a049d96486888dd396e80da	83	decoded type2 member; pointer_table=0x8007c164; objects=1
+B	MODEL	79	4	243	485	174728	1224	fa11f425d6edf2abf2294ce923ab9373046065aedba3a26ee4d9e2206b7607c1	84	decoded type2 member; pointer_table=0x8007c168; objects=1
+B	MODEL	80	4	243	485	175952	692	33db31725deb03dfd63c632d8447d99f6b137503c1543012402d8111b16fdde7	85	decoded type2 member; pointer_table=0x8007c16c; objects=1
+B	MODEL	81	4	243	485	176644	492	4909a269c488c9b4966e851ab83a70042e0e3a5932cdec791c74ad70c31beb45	86	decoded type2 member; pointer_table=0x8007c170; objects=1
+B	MODEL	82	4	243	485	177136	3452	d4de691903f1a28df41b06ff0c0ac0239b25dc66bf9afda47101e8893f25f4c0	87	decoded type2 member; pointer_table=0x8007c174; objects=1
+B	MODEL	83	4	243	485	180588	640	ac1903a1ab837977392f537ebd2f4516b9deff310bb8106178f339da06dc2ef2	88	decoded type2 member; pointer_table=0x8007c178; objects=1
+B	MODEL	84	4	243	485	181228	724	5ca97bf28aa65e645fe7a6720833f5a7dcd5a48923cc0ea55dfd423b7989437e	89	decoded type2 member; pointer_table=0x8007c17c; objects=1
+B	MODEL	85	4	243	485	181952	748	60d3f7d04116ac75a0ba1127425fc57130b472eabb2f62fc195dfd3cc3284864	90	decoded type2 member; pointer_table=0x8007c180; objects=1
+B	MODEL	86	4	243	485	182700	732	2531146a8421f682c4c0f53c026a6d18fb6cf0d7c1b69520cb0793329e807e8e	91	decoded type2 member; pointer_table=0x8007c184; objects=1
+B	MODEL	87	4	243	485	183432	132	f20dbe02740fd4c27ae9755010bb5a470fdafc79922195e328b2dcf2ca74bd59	92	decoded type2 member; pointer_table=0x8007c188; objects=1
+B	MODEL	88	4	243	485	183564	9864	90151bd457b0e787f1bedf7151c74e98732ea5a86e3e35fc4ae507aa24a2ee9c	93	decoded type2 member; pointer_table=0x8007c18c; objects=1
+B	MODEL	89	4	243	485	193428	2648	beb8bd6a8b9922cd9b7e3161a36fd2b0adf02683128e336c9a093fa86ce41e33	94	decoded type2 member; pointer_table=0x8007c190; objects=1
+B	MODEL	90	4	243	485	196076	1400	c99f556dfd2b40749d2e13fa405fb699789e8cbd38fec5b00f99391032dff2bb	95	decoded type2 member; pointer_table=0x8007c194; objects=1
+B	MODEL	91	4	243	485	197476	6412	d040f75e0887d1ff72339e39370f59fc3f76c5f8b159544e35bd0f0935d1658b	96	decoded type2 member; pointer_table=0x8007c198; objects=7
+B	MODEL	92	4	243	485	203888	5076	86c9bd1c9b7a7d1e5ef839d6417c0b06da45e09b296ed8abbcb041badb51f6e6	97	decoded type2 member; pointer_table=0x8007c19c; objects=6
+B	MODEL	93	4	243	485	208964	5864	6010393a116d65cb2c2eb7d12107c0d2f99a318557b53bfb2c1b756d86d3d1b3	98	decoded type2 member; pointer_table=0x8007c1a0; objects=10
+B	MODEL	94	4	243	485	214828	6280	f90db9aab20749e0352ec295030bc7570d72d5cd7e24734c0289adab763019f7	99	decoded type2 member; pointer_table=0x8007c1a4; objects=10
+B	MODEL	95	4	243	485	221108	5008	b8e1eaf626da23bf32791f7a14254a9b4af1faec009f34b097956d4611de9c61	100	decoded type2 member; pointer_table=0x8007c1a8; objects=7
+B	MODEL	96	4	243	485	226116	6884	8e999aa328010d1e88c978857d93bad13712e87020258f6ba5e0fd41145221f6	101	decoded type2 member; pointer_table=0x8007c1ac; objects=10
+B	MODEL	97	4	243	485	233000	912	60a3e568c155f5b6b1ef0d5b7a2b6e5570398923d6929ea02aeffeddc4f2967c	102	decoded type2 member; pointer_table=0x8007c1b0; objects=1
+B	MODEL	98	4	243	485	233912	7264	152cad7ae7c1f73d752f9405c8804d331f822f7961b9b165cc44598aa6b2097f	103	decoded type2 member; pointer_table=0x8007c1b4; objects=10
+B	MODEL	99	4	243	485	241176	5552	0ead58518c97ed790e8c0f2905167ee726307a167f9bd9c2be68d9e85b0a4d23	104	decoded type2 member; pointer_table=0x8007c1b8; objects=6
+B	MODEL	100	4	243	485	246728	4328	02c76dddb88c0ddbdaea605872cd46e24b9a322c0ce7ad05c694c00badf8cf75	105	decoded type2 member; pointer_table=0x8007c1bc; objects=6
+B	MODEL	101	4	243	485	251056	4976	7006ef8d80e2a35ed11be6b54cc52fe7b1a9396bbfb9be9e7734f87fadc5b1c0	106	decoded type2 member; pointer_table=0x8007c1c0; objects=6
+B	MODEL	102	4	243	485	256032	4892	6fbc568cf49073442843ab60edf8631b4bfc8e9b9e321d5a59b20a7072e58bf1	107	decoded type2 member; pointer_table=0x8007c1c4; objects=6
+B	MODEL	103	4	243	485	260924	6028	a8173840bcecd39c678807f626fd3d6a6449b6bf927fca5e2a0e40c4f5725fed	108	decoded type2 member; pointer_table=0x8007c1c8; objects=10
+B	MODEL	104	4	243	485	266952	5892	80de23068506d0d66e98690aa90822534ed73c3cc7a1aaa11badc3290ca7e410	109	decoded type2 member; pointer_table=0x8007c1cc; objects=10
+B	MODEL	105	4	243	485	272844	5088	73ea5614177a36c329c1659a3c7b979761e6f3422a2abf3dc39a99dc8d4a1e78	110	decoded type2 member; pointer_table=0x8007c1d0; objects=6
+B	MODEL	106	4	243	485	277932	5912	2c6180be565faeccc4f3fd6897209e0d1ad9961f44ffda26d01ff6744c6f368b	111	decoded type2 member; pointer_table=0x8007c1d4; objects=10
+B	MODEL	107	4	243	485	283844	6680	0c807b7eb417dbb82875ec8765eb9c5d5c299eace7eff83bd3c043b88450076b	112	decoded type2 member; pointer_table=0x8007c1d8; objects=10
+B	MODEL	108	4	243	485	290524	3608	f741d6d0dc36f1b8ce1daba796b5c4fc8e5f0b3f051eae4001795a7d2d9d7cbb	113	decoded type2 member; pointer_table=0x8007c1dc; objects=1
+B	MODEL	109	4	243	485	294132	1056	fa2fb29899f62420c293be58e5606ed020dfb550863b385f183d9514d2167307	114	decoded type2 member; pointer_table=0x8007c1e0; objects=7
+B	MODEL	110	4	243	485	295188	1524	d56441929dcaf2f95d9a97e2391ec88868ef1ae847111dc8b7e8a4499537537a	115	decoded type2 member; pointer_table=0x8007c1e4; objects=1
+B	MODEL	111	4	243	485	296712	2016	17e08016b426f1968781e4c0262633dcc1cb061658a7446e6153b927950fdb26	116	decoded type2 member; pointer_table=0x8007c1e8; objects=4
+B	MODEL	112	4	243	485	298728	4992	a71db83533003fdc1796c6f247961100dd9b5af559a0d9153c1fd1183ef41ebc	117	decoded type2 member; pointer_table=0x8007c1ec; objects=6
+B	MODEL	113	4	243	485	303720	400	59c0518ae2f67b760f08906ffa5b6b6ce90fce86faa5004968fb8a0327a3eb0d	118	decoded type2 member; pointer_table=0x8007c1f0; objects=1
+B	MODEL	114	4	243	485	304120	6780	b0d0acbb1e7ddeb91a1051d6a4e2bcac5f03b35a5c16d9c652bdde81632985c8	119	decoded type2 member; pointer_table=0x8007c1f4; objects=10
+B	ANM_CLIP	0	4	243	485	284	496	aa7e99a3c825847f07ea928c47ad9989e33fc25e0effcb3becc580ea65c1fd05	1	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	1	4	243	485	780	736	af8aba27342858c1ecc3cd4802faef703d025484c54fefcf05a534d3eb47dd9e	2	decoded bank-relative offset; bones=3; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	2	4	243	485	1516	496	01d50506a2eabdd3597d31dbbb78154b92daec83ca1f8b9cf6b2f7e8b28c864b	3	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	3	4	243	485	2012	976	ff52c29266b202ce94e0e740e4f341fc4a89367ca247133306023d4ab3323f20	4	decoded bank-relative offset; bones=4; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	4	4	243	485	2988	256	6b6607cf86763b02ff0e16198f961b8002ea80c4e518503092095a067284ba80	5	decoded bank-relative offset; bones=2; frames=15; marker=0x80c; rate_word=2
+B	ANM_CLIP	5	4	243	485	3244	496	017071fdc5b3ebc553b3c26d9b797c0fe85e808903047b43f4ad08c3337804e9	6	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	6	4	243	485	3740	496	7ac7448e78deac7fdee42db6aab3e23b35405e6c68d0c1a95c9f957acee77def	7	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	7	4	243	485	4236	496	1a4f957084caf711695be00b5d8cba5f8ffa1aa95b6e54554b1733bd64e64d95	8	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	8	4	243	485	4732	1216	c0a2aab0186848d77c40e59384143f1a16cc8c29f54dbdfdfed6e1877d929694	9	decoded bank-relative offset; bones=6; frames=25; marker=0x80c; rate_word=2
+B	ANM_CLIP	9	4	243	485	5948	736	21c32f0694e763ec9bc33918ad48be466ab2a46d8c88536af297a8ba132d2f68	10	decoded bank-relative offset; bones=6; frames=15; marker=0x80c; rate_word=4
+B	ANM_CLIP	10	4	243	485	6684	496	59a215c4a82a53459490b8d8b19b2de66e128e28a41d148854922186ae271339	11	decoded bank-relative offset; bones=6; frames=10; marker=0x80c; rate_word=4
+B	ANM_CLIP	11	4	243	485	7180	976	2c6db54c09391605777ca141a7511aec502625edce8a93cceec98db89e24b96e	12	decoded bank-relative offset; bones=6; frames=20; marker=0x80c; rate_word=4
+B	ANM_CLIP	12	4	243	485	8156	736	1169a0108e2623dfc2d23b02c6fb7fad998eb6497ef7fa1b7db37a2092a53c5b	13	decoded bank-relative offset; bones=6; frames=15; marker=0x80c; rate_word=4
+B	ANM_CLIP	13	4	243	485	8892	736	f9f58c144d1e29bebd85c93664413232513b9abd571bc9c27f41288c2917b1b8	14	decoded bank-relative offset; bones=6; frames=15; marker=0x80c; rate_word=2
+B	ANM_CLIP	14	4	243	485	9628	1216	0850c882c9824210507b0d1da8c66039779f80c6863dba2370e898bcb9575f91	15	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+B	ANM_CLIP	15	4	243	485	10844	816	b9f4cd1bd0c5f73f35fc8338a0e57975f29b82189e585b32f34e0a3507c854f2	16	decoded bank-relative offset; bones=10; frames=10; marker=0x80c; rate_word=2
+B	ANM_CLIP	16	4	243	485	11660	816	e434d4c542aef046935e479b11aad1e268b50899f3456e77718f3c6552910ce9	17	decoded bank-relative offset; bones=10; frames=10; marker=0x80c; rate_word=4
+B	ANM_CLIP	17	4	243	485	12476	2416	a9f0cb1e847e57acde3799ee3da5723cf9d47e23885a549a72f55d130de1286f	18	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	18	4	243	485	14892	2096	fc91f7df879aaa42751d07b0aae1d8a2fb9ed2656b3a9578ebba92785ab6c940	19	decoded bank-relative offset; bones=10; frames=26; marker=0x80c; rate_word=2
+B	ANM_CLIP	19	4	243	485	16988	1856	a6d93d14aad0f480cc814f72fb9be1fc5f8fb4e1b9b27c8805ed5c2dda816e5a	20	decoded bank-relative offset; bones=10; frames=23; marker=0x80c; rate_word=2
+B	ANM_CLIP	20	4	243	485	18844	2016	5f831f3ad263281a818340573ec3dc7416004bff16ffe844faeb0f67012761fc	21	decoded bank-relative offset; bones=10; frames=25; marker=0x80c; rate_word=2
+B	ANM_CLIP	21	4	243	485	20860	2416	ba9e72fd0184d1ff5234e68e6bf893b8540b0a658d563cb494d071c006ab83c9	22	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	22	4	243	485	23276	2416	1fee7d0a5b3e06e26f49137d79a84237764ba6a72b212dcaa26d606779e1d969	23	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	23	4	243	485	25692	256	1370d3d95919560374e13964a7e00464830758a6e5b586276d3e2d2057e9624d	24	decoded bank-relative offset; bones=10; frames=3; marker=0x80c; rate_word=2
+B	ANM_CLIP	24	4	243	485	25948	2096	58db4361a889cd6e598d2820e4e4fd0bd4b7986e1f590067b4bef0607d25fa7d	25	decoded bank-relative offset; bones=10; frames=26; marker=0x80c; rate_word=2
+B	ANM_CLIP	25	4	243	485	28044	1216	3b446fa1d79d2c5e209fb93589eda2757c9b7691da2250082ee44f0614b6e1ba	26	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+B	ANM_CLIP	26	4	243	485	29260	816	cc6fd28ca2786928c46fb62979fa17edea4731d1775573bb8ed9106cde8bd58f	27	decoded bank-relative offset; bones=10; frames=10; marker=0x80c; rate_word=2
+B	ANM_CLIP	27	4	243	485	30076	1216	a4b4fd87e967665bc9478bc1f405f1471d6afe3ed96ecbe025d402e2965f5b8a	28	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+B	ANM_CLIP	28	4	243	485	31292	1024	f06b826013db880ab02d293329e5700e24c26e66ad9c1f661822adfb757759c7	29	decoded bank-relative offset; bones=7; frames=18; marker=0x80c; rate_word=2
+B	ANM_CLIP	29	4	243	485	32316	1080	12f8521e701672c151f8dfa1544d568d5ca424fbf51e9dc05ebbfdc3a3f1d8bb	30	decoded bank-relative offset; bones=7; frames=19; marker=0x80c; rate_word=2
+B	ANM_CLIP	30	4	243	485	33396	800	3d7785abc4fd14250b31b2b9bf90fa7cfaf15d47cbad9cf2af5d267bfbb6bfd4	31	decoded bank-relative offset; bones=7; frames=14; marker=0x80c; rate_word=2
+B	ANM_CLIP	31	4	243	485	34196	2536	31207e8fec568c48aa5d252c7b06ea16ce61ab95aa594d9e8b65a680d6cc1aa0	32	decoded bank-relative offset; bones=7; frames=45; marker=0x80c; rate_word=2
+B	ANM_CLIP	32	4	243	485	36732	2256	6f5e936b1a35d3dba11010d9a2119c144118f4211e0350b152ec034af17770dc	33	decoded bank-relative offset; bones=7; frames=40; marker=0x80c; rate_word=2
+B	ANM_CLIP	33	4	243	485	38988	2416	5602c36f4ba6d0af5fac1957915e8d0f057bf4dd05b89f384d95874ba0f42633	34	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	34	4	243	485	41404	1216	6b2d844859b0ed04740422ddd6492c15fe23c6749c5e127ab3240634eacfc4dd	35	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+B	ANM_CLIP	35	4	243	485	42620	2416	0e2badaf4799a4e67787281c09862b565bf9c4755123b366122bbd70a1330891	36	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	36	4	243	485	45036	2416	831cf0062c2008d6290c4c310cfe0a580e57c875cd857e4a5ff62ad0616b8d27	37	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	37	4	243	485	47452	496	3cac985d0e604880cae019ee4baaa64ed8091927bb07a35768c96f8fe0b4165c	38	decoded bank-relative offset; bones=1; frames=60; marker=0x80c; rate_word=2
+B	ANM_CLIP	38	4	243	485	47948	496	fd2ee64a107fb03f1f36a767e22eb88518450d6fcf51757e2c8daf1dc69c0b42	39	decoded bank-relative offset; bones=1; frames=60; marker=0x80c; rate_word=2
+B	ANM_CLIP	39	4	243	485	48444	1696	58512c754167fa1a8fee624c8e183b601492176403e36db1379b7143fc4538d9	40	decoded bank-relative offset; bones=7; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	40	4	243	485	50140	3216	36e051975d68dadb7520763e3305e063312fea1e97032dc747ac83650b758b50	41	decoded bank-relative offset; bones=10; frames=40; marker=0x80c; rate_word=2
+B	ANM_CLIP	41	4	243	485	53356	1616	0d52031cfccb5092b6bcf55732b2936c898ac540c8cee0671236848842f73c6c	42	decoded bank-relative offset; bones=10; frames=20; marker=0x80c; rate_word=2
+B	ANM_CLIP	42	4	243	485	54972	1616	bcfa40a92777938fd0efa0e8a2a12d2664cfa5b34463e9cb89b90666c87c5e6b	43	decoded bank-relative offset; bones=10; frames=20; marker=0x80c; rate_word=2
+B	ANM_CLIP	43	4	243	485	56588	2016	7c9d7bf4000c46746522e60f431956649dd8b01575d649d6f435be9c6bcd368c	44	decoded bank-relative offset; bones=10; frames=25; marker=0x80c; rate_word=2
+B	ANM_CLIP	44	4	243	485	58604	4016	d327ebc32a3cf3114f9148c52eb99cb4b08e5e402169f7d0e25087ce3598c64f	45	decoded bank-relative offset; bones=10; frames=50; marker=0x80c; rate_word=2
+B	ANM_CLIP	45	4	243	485	62620	816	64f5d76c1184ec76beb2535306275e047a691e8d9635be80a63581ce9f598810	46	decoded bank-relative offset; bones=10; frames=10; marker=0x80c; rate_word=4
+B	ANM_CLIP	46	4	243	485	63436	1216	e0949905dff147f89a74aa880306f9e7986e6ad29600195852e06c5975b4f00d	47	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=4
+B	ANM_CLIP	47	4	243	485	64652	1216	94c7c8a1502c7f84de72c8fc838e7cc3f9b44093886be6c8be0c08732a04487b	48	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=4
+B	ANM_CLIP	48	4	243	485	65868	1616	1d191810559ab895ba9a37655added79d3da0ddc8ea29cb18be19a60521126af	49	decoded bank-relative offset; bones=10; frames=20; marker=0x80c; rate_word=4
+B	ANM_CLIP	49	4	243	485	67484	1216	e4439838a748b4fe617eb6f702314802786f03189a8dd52c4bdf0246d164c419	50	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+B	ANM_CLIP	50	4	243	485	68700	1216	d439cd0c3612103624190c24082ff849a50de324167646199c5009534f659e75	51	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+B	ANM_CLIP	51	4	243	485	69916	96	993da27e28f49d599b101b01b5eab3982bb2f6d17d68771921a72bc05c490630	52	decoded bank-relative offset; bones=10; frames=1; marker=0x80c; rate_word=2
+B	ANM_CLIP	52	4	243	485	70012	1616	0cf4d1cf93a17f2a50a8eb1146323120c22dd9a4d32afb4f3991fb80d7566bec	53	decoded bank-relative offset; bones=10; frames=20; marker=0x80c; rate_word=2
+B	ANM_CLIP	53	4	243	485	71628	496	d807b6984c56f2cb057181a53ccbb1d3b805f832323fb1c3ee15abf036e6923c	54	decoded bank-relative offset; bones=10; frames=6; marker=0x80c; rate_word=2
+B	ANM_CLIP	54	4	243	485	72124	976	e828574cf72b56a47931c77e3204afa5268d3cc4436dda3f7060756388cb915e	55	decoded bank-relative offset; bones=4; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	55	4	243	485	73100	496	eee108138f738d3ef815616bfa03393e1c749e577cb80aca48611e1912996b13	56	decoded bank-relative offset; bones=4; frames=15; marker=0x80c; rate_word=2
+B	ANM_CLIP	56	4	243	485	73596	1456	e93fd4062853b2e242f0f839c1e9087d4522b235df078eea64a243d6f9ee5f9c	57	decoded bank-relative offset; bones=6; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	57	4	243	485	75052	1456	3bb576d2a7bf2ca5d8b81ab2c5187ccea914722c6e4fdf8adc0da151412e5b44	58	decoded bank-relative offset; bones=6; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	58	4	243	485	76508	2816	6d0aca594ed3936c2994e1601a43ef8bb7b2c3bf31944da9422337cdc088933f	59	decoded bank-relative offset; bones=7; frames=50; marker=0x80c; rate_word=2
+B	ANM_CLIP	59	4	243	485	79324	1696	fa1ded82489bc6857679210945d6512fa3fcfc248460ee25d2f59b9b90d41fc5	60	decoded bank-relative offset; bones=7; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	60	4	243	485	81020	1696	89f983bafe189e95a1ee004edd06766f388e4206a88e60672722f5eeea8b7d3e	61	decoded bank-relative offset; bones=7; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	61	4	243	485	82716	3376	3fbabdc52ace3dbb095e289258cfe7b8c2bf7b1e40ec3c39d9ac6e34a4a74098	62	decoded bank-relative offset; bones=7; frames=60; marker=0x80c; rate_word=2
+B	ANM_CLIP	62	4	243	485	86092	2704	b348b07103c8610a54e8460d27b75ddbdafb395e6ddc4e2496d6d714b984b804	63	decoded bank-relative offset; bones=7; frames=48; marker=0x80c; rate_word=2
+B	ANM_CLIP	63	4	243	485	88796	1416	b981dc3feddd591a5cf58f6a6a094aade8f61ceef4a91890e7a17321bd3e3c1e	64	decoded bank-relative offset; bones=7; frames=25; marker=0x80c; rate_word=2
+B	ANM_CLIP	64	4	243	485	90212	1136	d233a4f0b4790fba0f2bf08d546d9f68e302ac1dec4c1fb226a361b90f6dd918	65	decoded bank-relative offset; bones=7; frames=20; marker=0x80c; rate_word=2
+B	ANM_CLIP	65	4	243	485	91348	1416	ef29e5ad890a7126e2876124d909cd3ae67869dc1b8800416fb837b1d99789be	66	decoded bank-relative offset; bones=7; frames=25; marker=0x80c; rate_word=2
+B	ANM_CLIP	66	4	243	485	92764	1696	eb3655b860f8d7f6cf27564a688774cd9a6c2c3cb4834ced4bae7235368f2fe1	67	decoded bank-relative offset; bones=7; frames=30; marker=0x80c; rate_word=2
+B	ANM_CLIP	67	4	243	485	94460	576	4e036c9e9182a7855b2bbb84f203cff89ed4040532fb99422b9f6bcbbb633084	68	decoded bank-relative offset; bones=7; frames=10; marker=0x80c; rate_word=2
+B	ANM_CLIP	68	4	243	485	95036	1416	4ddf5ef7bbe34a4863387e642cd005354acab81b10cb2693b3f9aec673330690	69	decoded bank-relative offset; bones=7; frames=25; marker=0x80c; rate_word=2
+B	ANM_CLIP	69	4	243	485	96452	1216	904ac824a4fdb81373f90f49c3432222ea6ef69ccabc8d4d39da1cd423f1e17f	70	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=4
+B	IMG	LCK_EXPERIMENTAL_B_FIRST_BALDEN.img					466716768	dc84ddf7ff1e75bbb58dad1ae8eefd539c8b38dbec0d8d2abe1044d3c566f13d		user result: LOADS
+B	BUNDLE	4	4	243	485	0	227328	95157a5864ae6ec535ce77f96519d6f0030d8fc3f89a90384979fc9fcd769c4b		-
+B	PAC	5	5	354	596	0	370688	5f245ceb12326dc8b12342c47d2b0f8e28f8154e557b2a844a9dc4bf1953889f		-
+C	CHANGED_PROT	4	4	243	485	0	229376	1d950774edb4f58855fa7014e9304256797f00ff9ca335c2204313fea88c268e		retail_sha256=34844ba248e9373bba3c3a34e71c1bedcc56282e31e9c187b834f539e22c9e73
+C	CHANGED_PROT	5	5	355	597	0	368640	335855d6a619a1923eb3a02c33541a2c21570bebeebd467038e19233a640b874		retail_sha256=45aec0de8cc4c1898064f11711491ed90cdeca2cdd6605e4eaf7de90e37aa9d6
+C	DESCRIPTOR	0	4	243	485	56	313500	391893498268fc37ec82a9b1fd59fef777cab5a15bb47b6448c27da76563ee1d	2	order=0
+C	DESCRIPTOR	1	4	243	485	155427	45383	b6271725c2ea67a2b3d7a2f12326ae32d149ec3575c8b9bbe95dbcdb49891c82	3	order=1
+C	DESCRIPTOR	2	4	243	485	180073	97668	abc2501f09641e88e8a3d53166fda831fa2cf15a91c8b6fecbfb0787985175a0	5	order=2
+C	DESCRIPTOR	3	4	243	485	221353	4	df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119	6	order=3
+C	DESCRIPTOR	4	4	243	485	221356	12560	1e2addabd9d3749e8b64beeec2d3ceb0e1a2d6639155f631b6e8493caa522856	7	order=4
+C	DESCRIPTOR	5	4	243	485	225590	1927		20	order=5
+C	PAC_CHUNK	0	5	355	597	0	367492	cdd7af9ee01f64441c7b9589668694b0bc40fcb32dc4cf5930d968fbfa084a6b	1	TIM members=96
+C	PAC_CHUNK	1	5	355	597	367496	844	43b46ea3c76b9f530c008bb73d4b5803d28a4412bc92fb999205906bcad22119	1	TIM members=3
+C	MODEL	0	4	243	485	464	1916	2bbdaa3df17f75f7cee74b993b0f54aeb7a95a435af98198e5e393f625250aa2	5	decoded type2 member; pointer_table=0x8007c02c; objects=1
+C	MODEL	1	4	243	485	2380	2796	d0a7baa32d8b4fdf7bdeddb18c015c627eae4074e05885bcfa5a819b36ca00e7	6	decoded type2 member; pointer_table=0x8007c030; objects=1
+C	MODEL	2	4	243	485	5176	2012	a27a981433d462061e97e724014386cb68413974937994455a812e9adb6c94f4	7	decoded type2 member; pointer_table=0x8007c034; objects=1
+C	MODEL	3	4	243	485	7188	716	53b4ee1015348f666e54d54a9fb0bf2e501df6d5d30baf5bb8896c0651204d0f	8	decoded type2 member; pointer_table=0x8007c038; objects=1
+C	MODEL	4	4	243	485	7904	6360	ac56c924484964d5762c22d28a532dd7b044dbba58de01a9bc47cd397a01cb68	9	decoded type2 member; pointer_table=0x8007c03c; objects=1
+C	MODEL	5	4	243	485	14264	912	69909813a93402e1835cbaed101ee3b302fd4e3b2ff91d38dc5713c1a2d8d7ba	10	decoded type2 member; pointer_table=0x8007c040; objects=2
+C	MODEL	6	4	243	485	15176	2220	87574ae88fbb7b608a2b955782c3f48ee5e3aa23f0f77c8fde003ac5ce8a34d2	11	decoded type2 member; pointer_table=0x8007c044; objects=1
+C	MODEL	7	4	243	485	17396	1220	4ade3d831a1bfcf6256fcf93caabf5658cab9c71d64aec0bce783adf27d622f4	12	decoded type2 member; pointer_table=0x8007c048; objects=1
+C	MODEL	8	4	243	485	18616	2220	cf22b6faa41c2ec08d242f41ced490102d83d4a719b7e3686fa91f197f0c14a2	13	decoded type2 member; pointer_table=0x8007c04c; objects=1
+C	MODEL	9	4	243	485	20836	4704	0c659a9ee764c57c83c176d52abc0ac8e392349dd27d3db8b9a96c786945cefe	14	decoded type2 member; pointer_table=0x8007c050; objects=4
+C	MODEL	10	4	243	485	25540	1704	76f6ad62ab52668bc0fb752692238a230768a11ecef1160fbfc6031e34e9d7d1	15	decoded type2 member; pointer_table=0x8007c054; objects=1
+C	MODEL	11	4	243	485	27244	6572	a3bddab8ea00126f4ef426fca221feaf2d3135b65e62b14237d26b21147a0ef9	16	decoded type2 member; pointer_table=0x8007c058; objects=1
+C	MODEL	12	4	243	485	33816	6572	49b8cc56e64489802185f4b1ab3875e42939e0fbc903d06164d541fc5eff170f	17	decoded type2 member; pointer_table=0x8007c05c; objects=1
+C	MODEL	13	4	243	485	40388	2128	48c45ff13ced523379f9069afdbc1e196c1aff31c3afc24304c86acd4fe63979	18	decoded type2 member; pointer_table=0x8007c060; objects=2
+C	MODEL	14	4	243	485	42516	220	0556808d41036a02f77ecb75713c27c13aea727b69a59e131954b2e22b4e9720	19	decoded type2 member; pointer_table=0x8007c064; objects=1
+C	MODEL	15	4	243	485	42736	2036	6f926aecf6c71c73eb0b02a002d3693c6a2ef76d7f7b3ee711690a2c4be57d2b	20	decoded type2 member; pointer_table=0x8007c068; objects=3
+C	MODEL	16	4	243	485	44772	1696	363c20c54e107238215ed14636de8275be6d33479c8834c1db33ba13b4a71db1	21	decoded type2 member; pointer_table=0x8007c06c; objects=1
+C	MODEL	17	4	243	485	46468	748	23450d3fc5c8e48d16cda9cc0c2e90aa06122116c0c1193ce15120a5a6b0e3f0	22	decoded type2 member; pointer_table=0x8007c070; objects=1
+C	MODEL	18	4	243	485	47216	7116	28509a7cf48a735a75e39fe04508a37f5ae4655cfc9d480b327bf179e74a25d4	23	decoded type2 member; pointer_table=0x8007c074; objects=2
+C	MODEL	19	4	243	485	54332	444	c949b3d0a5358d790ba01370c2c8a02fa3577254a09d84cc6e520278c0ab31ab	24	decoded type2 member; pointer_table=0x8007c078; objects=1
+C	MODEL	20	4	243	485	54776	1132	158b15fc45f21c20009889bc57d4e266d549876a499aeb83a5a332268b61954b	25	decoded type2 member; pointer_table=0x8007c07c; objects=1
+C	MODEL	21	4	243	485	55908	388	452608246a6bb5e5541ddc89b60160168f4177db00919a15998c359a313b0cb0	26	decoded type2 member; pointer_table=0x8007c080; objects=1
+C	MODEL	22	4	243	485	56296	972	70b787ae2db3acf67cd08de5f70903b6de81cdcd57ed0a218d8f1a4d7bae6fc4	27	decoded type2 member; pointer_table=0x8007c084; objects=1
+C	MODEL	23	4	243	485	57268	972	2ecd8d10e52cb2833525e1df946148082c1cabd109d36cc1d570de8d57e8ddde	28	decoded type2 member; pointer_table=0x8007c088; objects=1
+C	MODEL	24	4	243	485	58240	632	d861f78a33f7985e10572946c5df7d4ff2028a2e2088cd763b6fac13a4ddd342	29	decoded type2 member; pointer_table=0x8007c08c; objects=1
+C	MODEL	25	4	243	485	58872	304	0313a204dc6b63279c1035fe2229a24e5869ce90ba2783661738582aa959b3c1	30	decoded type2 member; pointer_table=0x8007c090; objects=1
+C	MODEL	26	4	243	485	59176	260	fd876a0c8761581cf74a7f8cd345c7a240e158afc838f4cdedc420f7f8120db9	31	decoded type2 member; pointer_table=0x8007c094; objects=1
+C	MODEL	27	4	243	485	59436	1372	11c41429e2cced469126643481fb19c20ae66fb283a3a4c7afc546ebe7adc8fb	32	decoded type2 member; pointer_table=0x8007c098; objects=1
+C	MODEL	28	4	243	485	60808	2260	6d1d1d7afc984f8d0bd8f0e9bf41e181c31ccd023fbdcddd35dd0bb856f520ff	33	decoded type2 member; pointer_table=0x8007c09c; objects=1
+C	MODEL	29	4	243	485	63068	556	2b4e794c65b8844de2db6274bdad99e6075ff8b62cb61eba61212a895923713a	34	decoded type2 member; pointer_table=0x8007c0a0; objects=1
+C	MODEL	30	4	243	485	63624	1300	0e15c7a0d265bf67ba814b908141487de0bdff96c93b293b84b5347a23306577	35	decoded type2 member; pointer_table=0x8007c0a4; objects=1
+C	MODEL	31	4	243	485	64924	1040	9bb8caf3378bca0ab4cc35b6974df17eb7e40d0ce837c1e7a7d2ebe08dd20293	36	decoded type2 member; pointer_table=0x8007c0a8; objects=1
+C	MODEL	32	4	243	485	65964	992	f3f20c4236b22e574693a64facbfe600960f9c18777e85e64873c78af2081124	37	decoded type2 member; pointer_table=0x8007c0ac; objects=2
+C	MODEL	33	4	243	485	66956	732	9041938424f294b8563cd4df79c71a7f7337ef1999616e90cf98cef22874ee17	38	decoded type2 member; pointer_table=0x8007c0b0; objects=1
+C	MODEL	34	4	243	485	67688	1676	db27b8f36010f91f8be0de01496d0eca593ca1c4bc0f19308d1fb8b43bfff456	39	decoded type2 member; pointer_table=0x8007c0b4; objects=1
+C	MODEL	35	4	243	485	69364	1568	d145fbf0d78a98ffa22f72c87f3d8643840c9778443c95a1201450fc62f5eebb	40	decoded type2 member; pointer_table=0x8007c0b8; objects=1
+C	MODEL	36	4	243	485	70932	11152	ec03d11c2db134a1624920673ebb1b9e4d9166899b631822810fca7ea3706672	41	decoded type2 member; pointer_table=0x8007c0bc; objects=2
+C	MODEL	37	4	243	485	82084	924	78e5f4239a1fbd0fb445b35725f07f173f4ab92b887a6352067f079e4ff75371	42	decoded type2 member; pointer_table=0x8007c0c0; objects=1
+C	MODEL	38	4	243	485	83008	1068	b755c456b2c0426c5c29e60692e8498efb45382fe66a5883ddf1b406e80ce993	43	decoded type2 member; pointer_table=0x8007c0c4; objects=1
+C	MODEL	39	4	243	485	84076	912	2bc4166443127909091703fa05eff801715f805a01426112c72712aaf660837a	44	decoded type2 member; pointer_table=0x8007c0c8; objects=1
+C	MODEL	40	4	243	485	84988	2732	d8a6798d8952a8f6eafdd08ac9f6e459081f311ae9ecba62329ed1edbd94b3c2	45	decoded type2 member; pointer_table=0x8007c0cc; objects=1
+C	MODEL	41	4	243	485	87720	2016	d32ab142461ff362d79a93f304a2cb54a18c968f89f404744817cc0039f499f8	46	decoded type2 member; pointer_table=0x8007c0d0; objects=1
+C	MODEL	42	4	243	485	89736	7040	f10e96c934eec30dda5b09a9659b22a310aabddc930bc00637d3bd6fe668a236	47	decoded type2 member; pointer_table=0x8007c0d4; objects=2
+C	MODEL	43	4	243	485	96776	4376	a4b7eac2f150fa1919e82298c2670bd8c33287f4767d472e68aed6e2e7ffbc2e	48	decoded type2 member; pointer_table=0x8007c0d8; objects=1
+C	MODEL	44	4	243	485	101152	1080	bb6dc68a7ef22745cb6c1cdcdbb007056ca487a1dd1aa64575584db048669f41	49	decoded type2 member; pointer_table=0x8007c0dc; objects=1
+C	MODEL	45	4	243	485	102232	1096	56554cca3c9b2127d00424a44b7a715ad7b04486d72cb1ad4b7104a6cc6ac4ec	50	decoded type2 member; pointer_table=0x8007c0e0; objects=1
+C	MODEL	46	4	243	485	103328	700	99920bb0a19c9260bc06b96333b30bb8d81d096b18f4f3a29095a33afa58ff86	51	decoded type2 member; pointer_table=0x8007c0e4; objects=1
+C	MODEL	47	4	243	485	104028	1300	a56f5f7db44a9ee9d3e54480597f0b85ceb17837764943e0f8938ba006efdf02	52	decoded type2 member; pointer_table=0x8007c0e8; objects=1
+C	MODEL	48	4	243	485	105328	1460	2c982a25f53fa6b943e984491c56bfdeabfd18145088082f1058d0a1849fa6a4	53	decoded type2 member; pointer_table=0x8007c0ec; objects=1
+C	MODEL	49	4	243	485	106788	1332	f949001145c875b8cca5b4805cb7a0adddb11c994245fde4147744698c1dfdb3	54	decoded type2 member; pointer_table=0x8007c0f0; objects=1
+C	MODEL	50	4	243	485	108120	5296	991b67009b2c02c99869b719a7af8e0636a5aa0fb87e9e5acba83dd6f71befe0	55	decoded type2 member; pointer_table=0x8007c0f4; objects=2
+C	MODEL	51	4	243	485	113416	252	5184f531ad695ad203ae47af7425b49dda815482b2d05260291ce43ac91aef7d	56	decoded type2 member; pointer_table=0x8007c0f8; objects=1
+C	MODEL	52	4	243	485	113668	752	b43fb829508c395595ace62c72474468d1f8a366959924ff4e8d43f5b4a570a2	57	decoded type2 member; pointer_table=0x8007c0fc; objects=1
+C	MODEL	53	4	243	485	114420	3408	51c488676e1f94396f4675a9a019a528947916b6320fde8f834a9d8b16503986	58	decoded type2 member; pointer_table=0x8007c100; objects=2
+C	MODEL	54	4	243	485	117828	3132	e7f1aa0b176cf9830e57412b78b078523d831b4338d9c7b874357684edd02d9d	59	decoded type2 member; pointer_table=0x8007c104; objects=1
+C	MODEL	55	4	243	485	120960	1016	159090ba5bc8bc850f883406c7a5dae63acd97f1c9febbf8260585e564e67922	60	decoded type2 member; pointer_table=0x8007c108; objects=1
+C	MODEL	56	4	243	485	121976	1696	c800b144d4ca56b21f864c8fac11a883f339c5908d5fb74221aa6565c59d1dbc	61	decoded type2 member; pointer_table=0x8007c10c; objects=1
+C	MODEL	57	4	243	485	123672	740	5497430c91d6524fd7dccc8f525f952f44df346cade55b2c0b58ee7f6e7a509b	62	decoded type2 member; pointer_table=0x8007c110; objects=1
+C	MODEL	58	4	243	485	124412	1988	96f2f33787eeef0531cc25f134d86a83a5a58b44fb5b11a35a2a303d4d4d9c11	63	decoded type2 member; pointer_table=0x8007c114; objects=1
+C	MODEL	59	4	243	485	126400	2176	577e0817d841ee7e325c4838a474e31b8274e303454638938cfec255f4a8189e	64	decoded type2 member; pointer_table=0x8007c118; objects=1
+C	MODEL	60	4	243	485	128576	1696	58aa9f2242072ac838ed86f23b381df43217cf40e3f4900918834f42c955f41c	65	decoded type2 member; pointer_table=0x8007c11c; objects=1
+C	MODEL	61	4	243	485	130272	3064	1d9e2294036143f928ce4a3fb86e6108e40c796d0edda5a1fae2bfce5ef66b91	66	decoded type2 member; pointer_table=0x8007c120; objects=1
+C	MODEL	62	4	243	485	133336	3008	4541c74192250275e05b615ffb094b6cc33ff527bdc96c281a971cfd43ddd011	67	decoded type2 member; pointer_table=0x8007c124; objects=1
+C	MODEL	63	4	243	485	136344	1740	89c7e58fdea5eeda0b83cac087036e6531b283bcb2122d49990cf65aa7600455	68	decoded type2 member; pointer_table=0x8007c128; objects=1
+C	MODEL	64	4	243	485	138084	4608	a0cd2f9ce7caa465bb42640912db22b2bd8f9ab9952b3f905154cecf9a2b570a	69	decoded type2 member; pointer_table=0x8007c12c; objects=1
+C	MODEL	65	4	243	485	142692	3528	38eae7b973c0c9e5e458a440d6e6bcf8d5b79d53dfd5850847e248f1199f441c	70	decoded type2 member; pointer_table=0x8007c130; objects=1
+C	MODEL	66	4	243	485	146220	1312	9130e61717c4cfd918c446c797b3f07aaca4dadfbf96c65cbf967bcc0d7d473d	71	decoded type2 member; pointer_table=0x8007c134; objects=1
+C	MODEL	67	4	243	485	147532	244	914d9f0b6a7286aa847c95e12f7e78e4485c259e95ac2913dc073ab1d339807e	72	decoded type2 member; pointer_table=0x8007c138; objects=1
+C	MODEL	68	4	243	485	147776	1396	7a3876fc5cfacdb04e2688c7962acfebf00d3c7998a64ad1361794c627c44ce8	73	decoded type2 member; pointer_table=0x8007c13c; objects=1
+C	MODEL	69	4	243	485	149172	580	93c12bde7211bf75eb6a3ca99c389631f6e0c4326bc3845669a54a30dcfdedc8	74	decoded type2 member; pointer_table=0x8007c140; objects=1
+C	MODEL	70	4	243	485	149752	2796	8b6620ed701c8ab4b81518453e2140edaec186bc46d8e7c560e30439df90c795	75	decoded type2 member; pointer_table=0x8007c144; objects=1
+C	MODEL	71	4	243	485	152548	676	f766485af453978e7f411fdaaecad927fee426bc5dac23cd63399a71d03f5243	76	decoded type2 member; pointer_table=0x8007c148; objects=1
+C	MODEL	72	4	243	485	153224	7380	43533bcd02739010f12c26775687efc47118733d66dfe9df7013d37a87d736b0	77	decoded type2 member; pointer_table=0x8007c14c; objects=1
+C	MODEL	73	4	243	485	160604	964	1aaddab2abafed78b3b845e1b03e1ad63e004264085e7092aafa33f5ca78c7bf	78	decoded type2 member; pointer_table=0x8007c150; objects=1
+C	MODEL	74	4	243	485	161568	316	e458f5a22b4d59bf114d4330e4256d9fe2ccb7569d5d8045884f781a9504cc5e	79	decoded type2 member; pointer_table=0x8007c154; objects=1
+C	MODEL	75	4	243	485	161884	2056	d05187e218a430082b2ea894fe3d842c3f97a5b6a594d5a7763cb83ed22f0f0a	80	decoded type2 member; pointer_table=0x8007c158; objects=1
+C	MODEL	76	4	243	485	163940	4696	3415a1cbc56e58097037cba2dedd1c075b0612d09b8378727eabb876db44de6e	81	decoded type2 member; pointer_table=0x8007c15c; objects=1
+C	MODEL	77	4	243	485	168636	1696	69ebc438e5e0071d82a54fbf6b61e95ddd6a9452e903f2303a9d9745c484dcb2	82	decoded type2 member; pointer_table=0x8007c160; objects=1
+C	MODEL	78	4	243	485	170332	4396	1b97afdec60c4cb9f2afc2319591b6152f52846c9a049d96486888dd396e80da	83	decoded type2 member; pointer_table=0x8007c164; objects=1
+C	MODEL	79	4	243	485	174728	1224	fa11f425d6edf2abf2294ce923ab9373046065aedba3a26ee4d9e2206b7607c1	84	decoded type2 member; pointer_table=0x8007c168; objects=1
+C	MODEL	80	4	243	485	175952	692	33db31725deb03dfd63c632d8447d99f6b137503c1543012402d8111b16fdde7	85	decoded type2 member; pointer_table=0x8007c16c; objects=1
+C	MODEL	81	4	243	485	176644	492	4909a269c488c9b4966e851ab83a70042e0e3a5932cdec791c74ad70c31beb45	86	decoded type2 member; pointer_table=0x8007c170; objects=1
+C	MODEL	82	4	243	485	177136	3452	d4de691903f1a28df41b06ff0c0ac0239b25dc66bf9afda47101e8893f25f4c0	87	decoded type2 member; pointer_table=0x8007c174; objects=1
+C	MODEL	83	4	243	485	180588	640	ac1903a1ab837977392f537ebd2f4516b9deff310bb8106178f339da06dc2ef2	88	decoded type2 member; pointer_table=0x8007c178; objects=1
+C	MODEL	84	4	243	485	181228	724	5ca97bf28aa65e645fe7a6720833f5a7dcd5a48923cc0ea55dfd423b7989437e	89	decoded type2 member; pointer_table=0x8007c17c; objects=1
+C	MODEL	85	4	243	485	181952	748	60d3f7d04116ac75a0ba1127425fc57130b472eabb2f62fc195dfd3cc3284864	90	decoded type2 member; pointer_table=0x8007c180; objects=1
+C	MODEL	86	4	243	485	182700	732	2531146a8421f682c4c0f53c026a6d18fb6cf0d7c1b69520cb0793329e807e8e	91	decoded type2 member; pointer_table=0x8007c184; objects=1
+C	MODEL	87	4	243	485	183432	132	f20dbe02740fd4c27ae9755010bb5a470fdafc79922195e328b2dcf2ca74bd59	92	decoded type2 member; pointer_table=0x8007c188; objects=1
+C	MODEL	88	4	243	485	183564	9864	90151bd457b0e787f1bedf7151c74e98732ea5a86e3e35fc4ae507aa24a2ee9c	93	decoded type2 member; pointer_table=0x8007c18c; objects=1
+C	MODEL	89	4	243	485	193428	2648	beb8bd6a8b9922cd9b7e3161a36fd2b0adf02683128e336c9a093fa86ce41e33	94	decoded type2 member; pointer_table=0x8007c190; objects=1
+C	MODEL	90	4	243	485	196076	1400	c99f556dfd2b40749d2e13fa405fb699789e8cbd38fec5b00f99391032dff2bb	95	decoded type2 member; pointer_table=0x8007c194; objects=1
+C	MODEL	91	4	243	485	197476	6412	d040f75e0887d1ff72339e39370f59fc3f76c5f8b159544e35bd0f0935d1658b	96	decoded type2 member; pointer_table=0x8007c198; objects=7
+C	MODEL	92	4	243	485	203888	5076	86c9bd1c9b7a7d1e5ef839d6417c0b06da45e09b296ed8abbcb041badb51f6e6	97	decoded type2 member; pointer_table=0x8007c19c; objects=6
+C	MODEL	93	4	243	485	208964	5864	6010393a116d65cb2c2eb7d12107c0d2f99a318557b53bfb2c1b756d86d3d1b3	98	decoded type2 member; pointer_table=0x8007c1a0; objects=10
+C	MODEL	94	4	243	485	214828	6280	f90db9aab20749e0352ec295030bc7570d72d5cd7e24734c0289adab763019f7	99	decoded type2 member; pointer_table=0x8007c1a4; objects=10
+C	MODEL	95	4	243	485	221108	5008	b8e1eaf626da23bf32791f7a14254a9b4af1faec009f34b097956d4611de9c61	100	decoded type2 member; pointer_table=0x8007c1a8; objects=7
+C	MODEL	96	4	243	485	226116	6884	8e999aa328010d1e88c978857d93bad13712e87020258f6ba5e0fd41145221f6	101	decoded type2 member; pointer_table=0x8007c1ac; objects=10
+C	MODEL	97	4	243	485	233000	912	60a3e568c155f5b6b1ef0d5b7a2b6e5570398923d6929ea02aeffeddc4f2967c	102	decoded type2 member; pointer_table=0x8007c1b0; objects=1
+C	MODEL	98	4	243	485	233912	7264	152cad7ae7c1f73d752f9405c8804d331f822f7961b9b165cc44598aa6b2097f	103	decoded type2 member; pointer_table=0x8007c1b4; objects=10
+C	MODEL	99	4	243	485	241176	5552	0ead58518c97ed790e8c0f2905167ee726307a167f9bd9c2be68d9e85b0a4d23	104	decoded type2 member; pointer_table=0x8007c1b8; objects=6
+C	MODEL	100	4	243	485	246728	4328	02c76dddb88c0ddbdaea605872cd46e24b9a322c0ce7ad05c694c00badf8cf75	105	decoded type2 member; pointer_table=0x8007c1bc; objects=6
+C	MODEL	101	4	243	485	251056	4976	7006ef8d80e2a35ed11be6b54cc52fe7b1a9396bbfb9be9e7734f87fadc5b1c0	106	decoded type2 member; pointer_table=0x8007c1c0; objects=6
+C	MODEL	102	4	243	485	256032	4892	6fbc568cf49073442843ab60edf8631b4bfc8e9b9e321d5a59b20a7072e58bf1	107	decoded type2 member; pointer_table=0x8007c1c4; objects=6
+C	MODEL	103	4	243	485	260924	6028	a8173840bcecd39c678807f626fd3d6a6449b6bf927fca5e2a0e40c4f5725fed	108	decoded type2 member; pointer_table=0x8007c1c8; objects=10
+C	MODEL	104	4	243	485	266952	5892	80de23068506d0d66e98690aa90822534ed73c3cc7a1aaa11badc3290ca7e410	109	decoded type2 member; pointer_table=0x8007c1cc; objects=10
+C	MODEL	105	4	243	485	272844	5088	73ea5614177a36c329c1659a3c7b979761e6f3422a2abf3dc39a99dc8d4a1e78	110	decoded type2 member; pointer_table=0x8007c1d0; objects=6
+C	MODEL	106	4	243	485	277932	5912	2c6180be565faeccc4f3fd6897209e0d1ad9961f44ffda26d01ff6744c6f368b	111	decoded type2 member; pointer_table=0x8007c1d4; objects=10
+C	MODEL	107	4	243	485	283844	6680	0c807b7eb417dbb82875ec8765eb9c5d5c299eace7eff83bd3c043b88450076b	112	decoded type2 member; pointer_table=0x8007c1d8; objects=10
+C	MODEL	108	4	243	485	290524	3608	f741d6d0dc36f1b8ce1daba796b5c4fc8e5f0b3f051eae4001795a7d2d9d7cbb	113	decoded type2 member; pointer_table=0x8007c1dc; objects=1
+C	MODEL	109	4	243	485	294132	1056	fa2fb29899f62420c293be58e5606ed020dfb550863b385f183d9514d2167307	114	decoded type2 member; pointer_table=0x8007c1e0; objects=7
+C	MODEL	110	4	243	485	295188	1524	d56441929dcaf2f95d9a97e2391ec88868ef1ae847111dc8b7e8a4499537537a	115	decoded type2 member; pointer_table=0x8007c1e4; objects=1
+C	MODEL	111	4	243	485	296712	2016	17e08016b426f1968781e4c0262633dcc1cb061658a7446e6153b927950fdb26	116	decoded type2 member; pointer_table=0x8007c1e8; objects=4
+C	MODEL	112	4	243	485	298728	4992	a71db83533003fdc1796c6f247961100dd9b5af559a0d9153c1fd1183ef41ebc	117	decoded type2 member; pointer_table=0x8007c1ec; objects=6
+C	MODEL	113	4	243	485	303720	400	59c0518ae2f67b760f08906ffa5b6b6ce90fce86faa5004968fb8a0327a3eb0d	118	decoded type2 member; pointer_table=0x8007c1f0; objects=1
+C	MODEL	114	4	243	485	304120	9380	6406c0324dcdc6015dff55faf9c4e3c8d8ab075bfe115b9627ba6b7541594c06	119	decoded type2 member; pointer_table=0x8007c1f4; objects=10
+C	ANM_CLIP	0	4	243	485	284	496	aa7e99a3c825847f07ea928c47ad9989e33fc25e0effcb3becc580ea65c1fd05	1	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	1	4	243	485	780	736	af8aba27342858c1ecc3cd4802faef703d025484c54fefcf05a534d3eb47dd9e	2	decoded bank-relative offset; bones=3; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	2	4	243	485	1516	496	01d50506a2eabdd3597d31dbbb78154b92daec83ca1f8b9cf6b2f7e8b28c864b	3	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	3	4	243	485	2012	976	ff52c29266b202ce94e0e740e4f341fc4a89367ca247133306023d4ab3323f20	4	decoded bank-relative offset; bones=4; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	4	4	243	485	2988	256	6b6607cf86763b02ff0e16198f961b8002ea80c4e518503092095a067284ba80	5	decoded bank-relative offset; bones=2; frames=15; marker=0x80c; rate_word=2
+C	ANM_CLIP	5	4	243	485	3244	496	017071fdc5b3ebc553b3c26d9b797c0fe85e808903047b43f4ad08c3337804e9	6	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	6	4	243	485	3740	496	7ac7448e78deac7fdee42db6aab3e23b35405e6c68d0c1a95c9f957acee77def	7	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	7	4	243	485	4236	496	1a4f957084caf711695be00b5d8cba5f8ffa1aa95b6e54554b1733bd64e64d95	8	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	8	4	243	485	4732	1216	c0a2aab0186848d77c40e59384143f1a16cc8c29f54dbdfdfed6e1877d929694	9	decoded bank-relative offset; bones=6; frames=25; marker=0x80c; rate_word=2
+C	ANM_CLIP	9	4	243	485	5948	736	21c32f0694e763ec9bc33918ad48be466ab2a46d8c88536af297a8ba132d2f68	10	decoded bank-relative offset; bones=6; frames=15; marker=0x80c; rate_word=4
+C	ANM_CLIP	10	4	243	485	6684	496	59a215c4a82a53459490b8d8b19b2de66e128e28a41d148854922186ae271339	11	decoded bank-relative offset; bones=6; frames=10; marker=0x80c; rate_word=4
+C	ANM_CLIP	11	4	243	485	7180	976	2c6db54c09391605777ca141a7511aec502625edce8a93cceec98db89e24b96e	12	decoded bank-relative offset; bones=6; frames=20; marker=0x80c; rate_word=4
+C	ANM_CLIP	12	4	243	485	8156	736	1169a0108e2623dfc2d23b02c6fb7fad998eb6497ef7fa1b7db37a2092a53c5b	13	decoded bank-relative offset; bones=6; frames=15; marker=0x80c; rate_word=4
+C	ANM_CLIP	13	4	243	485	8892	736	f9f58c144d1e29bebd85c93664413232513b9abd571bc9c27f41288c2917b1b8	14	decoded bank-relative offset; bones=6; frames=15; marker=0x80c; rate_word=2
+C	ANM_CLIP	14	4	243	485	9628	1216	0850c882c9824210507b0d1da8c66039779f80c6863dba2370e898bcb9575f91	15	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+C	ANM_CLIP	15	4	243	485	10844	816	b9f4cd1bd0c5f73f35fc8338a0e57975f29b82189e585b32f34e0a3507c854f2	16	decoded bank-relative offset; bones=10; frames=10; marker=0x80c; rate_word=2
+C	ANM_CLIP	16	4	243	485	11660	816	e434d4c542aef046935e479b11aad1e268b50899f3456e77718f3c6552910ce9	17	decoded bank-relative offset; bones=10; frames=10; marker=0x80c; rate_word=4
+C	ANM_CLIP	17	4	243	485	12476	2416	a9f0cb1e847e57acde3799ee3da5723cf9d47e23885a549a72f55d130de1286f	18	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	18	4	243	485	14892	2096	fc91f7df879aaa42751d07b0aae1d8a2fb9ed2656b3a9578ebba92785ab6c940	19	decoded bank-relative offset; bones=10; frames=26; marker=0x80c; rate_word=2
+C	ANM_CLIP	19	4	243	485	16988	1856	a6d93d14aad0f480cc814f72fb9be1fc5f8fb4e1b9b27c8805ed5c2dda816e5a	20	decoded bank-relative offset; bones=10; frames=23; marker=0x80c; rate_word=2
+C	ANM_CLIP	20	4	243	485	18844	2016	5f831f3ad263281a818340573ec3dc7416004bff16ffe844faeb0f67012761fc	21	decoded bank-relative offset; bones=10; frames=25; marker=0x80c; rate_word=2
+C	ANM_CLIP	21	4	243	485	20860	2416	ba9e72fd0184d1ff5234e68e6bf893b8540b0a658d563cb494d071c006ab83c9	22	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	22	4	243	485	23276	2416	1fee7d0a5b3e06e26f49137d79a84237764ba6a72b212dcaa26d606779e1d969	23	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	23	4	243	485	25692	256	1370d3d95919560374e13964a7e00464830758a6e5b586276d3e2d2057e9624d	24	decoded bank-relative offset; bones=10; frames=3; marker=0x80c; rate_word=2
+C	ANM_CLIP	24	4	243	485	25948	2096	58db4361a889cd6e598d2820e4e4fd0bd4b7986e1f590067b4bef0607d25fa7d	25	decoded bank-relative offset; bones=10; frames=26; marker=0x80c; rate_word=2
+C	ANM_CLIP	25	4	243	485	28044	1216	3b446fa1d79d2c5e209fb93589eda2757c9b7691da2250082ee44f0614b6e1ba	26	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+C	ANM_CLIP	26	4	243	485	29260	816	cc6fd28ca2786928c46fb62979fa17edea4731d1775573bb8ed9106cde8bd58f	27	decoded bank-relative offset; bones=10; frames=10; marker=0x80c; rate_word=2
+C	ANM_CLIP	27	4	243	485	30076	1216	a4b4fd87e967665bc9478bc1f405f1471d6afe3ed96ecbe025d402e2965f5b8a	28	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+C	ANM_CLIP	28	4	243	485	31292	1024	f06b826013db880ab02d293329e5700e24c26e66ad9c1f661822adfb757759c7	29	decoded bank-relative offset; bones=7; frames=18; marker=0x80c; rate_word=2
+C	ANM_CLIP	29	4	243	485	32316	1080	12f8521e701672c151f8dfa1544d568d5ca424fbf51e9dc05ebbfdc3a3f1d8bb	30	decoded bank-relative offset; bones=7; frames=19; marker=0x80c; rate_word=2
+C	ANM_CLIP	30	4	243	485	33396	800	3d7785abc4fd14250b31b2b9bf90fa7cfaf15d47cbad9cf2af5d267bfbb6bfd4	31	decoded bank-relative offset; bones=7; frames=14; marker=0x80c; rate_word=2
+C	ANM_CLIP	31	4	243	485	34196	2536	31207e8fec568c48aa5d252c7b06ea16ce61ab95aa594d9e8b65a680d6cc1aa0	32	decoded bank-relative offset; bones=7; frames=45; marker=0x80c; rate_word=2
+C	ANM_CLIP	32	4	243	485	36732	2256	6f5e936b1a35d3dba11010d9a2119c144118f4211e0350b152ec034af17770dc	33	decoded bank-relative offset; bones=7; frames=40; marker=0x80c; rate_word=2
+C	ANM_CLIP	33	4	243	485	38988	2416	5602c36f4ba6d0af5fac1957915e8d0f057bf4dd05b89f384d95874ba0f42633	34	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	34	4	243	485	41404	1216	6b2d844859b0ed04740422ddd6492c15fe23c6749c5e127ab3240634eacfc4dd	35	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+C	ANM_CLIP	35	4	243	485	42620	2416	0e2badaf4799a4e67787281c09862b565bf9c4755123b366122bbd70a1330891	36	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	36	4	243	485	45036	2416	831cf0062c2008d6290c4c310cfe0a580e57c875cd857e4a5ff62ad0616b8d27	37	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	37	4	243	485	47452	496	3cac985d0e604880cae019ee4baaa64ed8091927bb07a35768c96f8fe0b4165c	38	decoded bank-relative offset; bones=1; frames=60; marker=0x80c; rate_word=2
+C	ANM_CLIP	38	4	243	485	47948	496	fd2ee64a107fb03f1f36a767e22eb88518450d6fcf51757e2c8daf1dc69c0b42	39	decoded bank-relative offset; bones=1; frames=60; marker=0x80c; rate_word=2
+C	ANM_CLIP	39	4	243	485	48444	1696	58512c754167fa1a8fee624c8e183b601492176403e36db1379b7143fc4538d9	40	decoded bank-relative offset; bones=7; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	40	4	243	485	50140	3216	36e051975d68dadb7520763e3305e063312fea1e97032dc747ac83650b758b50	41	decoded bank-relative offset; bones=10; frames=40; marker=0x80c; rate_word=2
+C	ANM_CLIP	41	4	243	485	53356	1616	0d52031cfccb5092b6bcf55732b2936c898ac540c8cee0671236848842f73c6c	42	decoded bank-relative offset; bones=10; frames=20; marker=0x80c; rate_word=2
+C	ANM_CLIP	42	4	243	485	54972	1616	bcfa40a92777938fd0efa0e8a2a12d2664cfa5b34463e9cb89b90666c87c5e6b	43	decoded bank-relative offset; bones=10; frames=20; marker=0x80c; rate_word=2
+C	ANM_CLIP	43	4	243	485	56588	2016	7c9d7bf4000c46746522e60f431956649dd8b01575d649d6f435be9c6bcd368c	44	decoded bank-relative offset; bones=10; frames=25; marker=0x80c; rate_word=2
+C	ANM_CLIP	44	4	243	485	58604	4016	d327ebc32a3cf3114f9148c52eb99cb4b08e5e402169f7d0e25087ce3598c64f	45	decoded bank-relative offset; bones=10; frames=50; marker=0x80c; rate_word=2
+C	ANM_CLIP	45	4	243	485	62620	816	64f5d76c1184ec76beb2535306275e047a691e8d9635be80a63581ce9f598810	46	decoded bank-relative offset; bones=10; frames=10; marker=0x80c; rate_word=4
+C	ANM_CLIP	46	4	243	485	63436	1216	e0949905dff147f89a74aa880306f9e7986e6ad29600195852e06c5975b4f00d	47	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=4
+C	ANM_CLIP	47	4	243	485	64652	1216	94c7c8a1502c7f84de72c8fc838e7cc3f9b44093886be6c8be0c08732a04487b	48	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=4
+C	ANM_CLIP	48	4	243	485	65868	1616	1d191810559ab895ba9a37655added79d3da0ddc8ea29cb18be19a60521126af	49	decoded bank-relative offset; bones=10; frames=20; marker=0x80c; rate_word=4
+C	ANM_CLIP	49	4	243	485	67484	1216	e4439838a748b4fe617eb6f702314802786f03189a8dd52c4bdf0246d164c419	50	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+C	ANM_CLIP	50	4	243	485	68700	1216	d439cd0c3612103624190c24082ff849a50de324167646199c5009534f659e75	51	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+C	ANM_CLIP	51	4	243	485	69916	96	993da27e28f49d599b101b01b5eab3982bb2f6d17d68771921a72bc05c490630	52	decoded bank-relative offset; bones=10; frames=1; marker=0x80c; rate_word=2
+C	ANM_CLIP	52	4	243	485	70012	1616	0cf4d1cf93a17f2a50a8eb1146323120c22dd9a4d32afb4f3991fb80d7566bec	53	decoded bank-relative offset; bones=10; frames=20; marker=0x80c; rate_word=2
+C	ANM_CLIP	53	4	243	485	71628	496	d807b6984c56f2cb057181a53ccbb1d3b805f832323fb1c3ee15abf036e6923c	54	decoded bank-relative offset; bones=10; frames=6; marker=0x80c; rate_word=2
+C	ANM_CLIP	54	4	243	485	72124	976	e828574cf72b56a47931c77e3204afa5268d3cc4436dda3f7060756388cb915e	55	decoded bank-relative offset; bones=4; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	55	4	243	485	73100	496	eee108138f738d3ef815616bfa03393e1c749e577cb80aca48611e1912996b13	56	decoded bank-relative offset; bones=4; frames=15; marker=0x80c; rate_word=2
+C	ANM_CLIP	56	4	243	485	73596	1456	e93fd4062853b2e242f0f839c1e9087d4522b235df078eea64a243d6f9ee5f9c	57	decoded bank-relative offset; bones=6; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	57	4	243	485	75052	1456	3bb576d2a7bf2ca5d8b81ab2c5187ccea914722c6e4fdf8adc0da151412e5b44	58	decoded bank-relative offset; bones=6; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	58	4	243	485	76508	2816	6d0aca594ed3936c2994e1601a43ef8bb7b2c3bf31944da9422337cdc088933f	59	decoded bank-relative offset; bones=7; frames=50; marker=0x80c; rate_word=2
+C	ANM_CLIP	59	4	243	485	79324	1696	fa1ded82489bc6857679210945d6512fa3fcfc248460ee25d2f59b9b90d41fc5	60	decoded bank-relative offset; bones=7; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	60	4	243	485	81020	1696	89f983bafe189e95a1ee004edd06766f388e4206a88e60672722f5eeea8b7d3e	61	decoded bank-relative offset; bones=7; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	61	4	243	485	82716	3376	3fbabdc52ace3dbb095e289258cfe7b8c2bf7b1e40ec3c39d9ac6e34a4a74098	62	decoded bank-relative offset; bones=7; frames=60; marker=0x80c; rate_word=2
+C	ANM_CLIP	62	4	243	485	86092	2704	b348b07103c8610a54e8460d27b75ddbdafb395e6ddc4e2496d6d714b984b804	63	decoded bank-relative offset; bones=7; frames=48; marker=0x80c; rate_word=2
+C	ANM_CLIP	63	4	243	485	88796	1416	b981dc3feddd591a5cf58f6a6a094aade8f61ceef4a91890e7a17321bd3e3c1e	64	decoded bank-relative offset; bones=7; frames=25; marker=0x80c; rate_word=2
+C	ANM_CLIP	64	4	243	485	90212	1136	d233a4f0b4790fba0f2bf08d546d9f68e302ac1dec4c1fb226a361b90f6dd918	65	decoded bank-relative offset; bones=7; frames=20; marker=0x80c; rate_word=2
+C	ANM_CLIP	65	4	243	485	91348	1416	ef29e5ad890a7126e2876124d909cd3ae67869dc1b8800416fb837b1d99789be	66	decoded bank-relative offset; bones=7; frames=25; marker=0x80c; rate_word=2
+C	ANM_CLIP	66	4	243	485	92764	1696	eb3655b860f8d7f6cf27564a688774cd9a6c2c3cb4834ced4bae7235368f2fe1	67	decoded bank-relative offset; bones=7; frames=30; marker=0x80c; rate_word=2
+C	ANM_CLIP	67	4	243	485	94460	576	4e036c9e9182a7855b2bbb84f203cff89ed4040532fb99422b9f6bcbbb633084	68	decoded bank-relative offset; bones=7; frames=10; marker=0x80c; rate_word=2
+C	ANM_CLIP	68	4	243	485	95036	1416	4ddf5ef7bbe34a4863387e642cd005354acab81b10cb2693b3f9aec673330690	69	decoded bank-relative offset; bones=7; frames=25; marker=0x80c; rate_word=2
+C	ANM_CLIP	69	4	243	485	96452	1216	c637856ca57e273756d52cd2a383b0288b03364e6c38dcb361e93c4890ece581	70	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=4
+C	IMG	LCK_EXPERIMENTAL_C_SECOND_BUBU1.img					466716768	9b13a75ae0c0f2efc96b0009bab09a13d9d2c3701c3e0c1919c6e4b7da0ca5ac		user result: LOADS
+C	BUNDLE	4	4	243	485	0	229376	1d950774edb4f58855fa7014e9304256797f00ff9ca335c2204313fea88c268e		-
+C	PAC	5	5	355	597	0	368640	335855d6a619a1923eb3a02c33541a2c21570bebeebd467038e19233a640b874		-
+M	CHANGED_PROT	4	4	243	485	0	231424	77ebc0867e12e023a1d34cf215cca699fd46f407c14217b74cab6821e64d1889		retail_sha256=34844ba248e9373bba3c3a34e71c1bedcc56282e31e9c187b834f539e22c9e73
+M	CHANGED_PROT	5	5	356	598	0	370688	ff4ad1aa1f6f707681e29fd2206ab60c3dcb4f99d04d4ffbf26a5a8512c39154		retail_sha256=45aec0de8cc4c1898064f11711491ed90cdeca2cdd6605e4eaf7de90e37aa9d6
+M	DESCRIPTOR	0	4	243	485	56	320284	cf7dcdf3f98754e79c8665247cf2b5959366ccd1d46ccd7defbff2fb75cb4be1	2	order=0
+M	DESCRIPTOR	1	4	243	485	158171	45338	85a1ed2fdf79e7bf2e2daa4bf100740a1e18c9f92bc9f82fa4b72c296a3af5b3	3	order=1
+M	DESCRIPTOR	2	4	243	485	182782	98888	c36136e274bae994c30509da0907db6d91acda319ecf7ec227792db4ed815bcf	5	order=2
+M	DESCRIPTOR	3	4	243	485	224537	4	df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119	6	order=3
+M	DESCRIPTOR	4	4	243	485	224540	12560	1e2addabd9d3749e8b64beeec2d3ceb0e1a2d6639155f631b6e8493caa522856	7	order=4
+M	DESCRIPTOR	5	4	243	485	228774	1927		20	order=5
+M	PAC_CHUNK	0	5	356	598	0	367492	cdd7af9ee01f64441c7b9589668694b0bc40fcb32dc4cf5930d968fbfa084a6b	1	TIM members=96
+M	PAC_CHUNK	1	5	356	598	367496	1604	4484092bca69f6bebef92e78f9e5af2b86fe7b72aa8b8d20018dbcc174c1ead9	1	TIM members=5
+M	PAC_CHUNK	2	5	356	598	369104	844	5422d5fa44756d0c847a7ebb2a6b5dd27831b1faba21b270e44377b0b0fd2765	1	TIM members=3
+M	MODEL	0	4	243	485	468	1916	2bbdaa3df17f75f7cee74b993b0f54aeb7a95a435af98198e5e393f625250aa2	5	decoded type2 member; pointer_table=0x8007c02c; objects=1
+M	MODEL	1	4	243	485	2384	2796	d0a7baa32d8b4fdf7bdeddb18c015c627eae4074e05885bcfa5a819b36ca00e7	6	decoded type2 member; pointer_table=0x8007c030; objects=1
+M	MODEL	2	4	243	485	5180	2012	a27a981433d462061e97e724014386cb68413974937994455a812e9adb6c94f4	7	decoded type2 member; pointer_table=0x8007c034; objects=1
+M	MODEL	3	4	243	485	7192	716	53b4ee1015348f666e54d54a9fb0bf2e501df6d5d30baf5bb8896c0651204d0f	8	decoded type2 member; pointer_table=0x8007c038; objects=1
+M	MODEL	4	4	243	485	7908	6360	ac56c924484964d5762c22d28a532dd7b044dbba58de01a9bc47cd397a01cb68	9	decoded type2 member; pointer_table=0x8007c03c; objects=1
+M	MODEL	5	4	243	485	14268	912	69909813a93402e1835cbaed101ee3b302fd4e3b2ff91d38dc5713c1a2d8d7ba	10	decoded type2 member; pointer_table=0x8007c040; objects=2
+M	MODEL	6	4	243	485	15180	2220	87574ae88fbb7b608a2b955782c3f48ee5e3aa23f0f77c8fde003ac5ce8a34d2	11	decoded type2 member; pointer_table=0x8007c044; objects=1
+M	MODEL	7	4	243	485	17400	1220	4ade3d831a1bfcf6256fcf93caabf5658cab9c71d64aec0bce783adf27d622f4	12	decoded type2 member; pointer_table=0x8007c048; objects=1
+M	MODEL	8	4	243	485	18620	2220	cf22b6faa41c2ec08d242f41ced490102d83d4a719b7e3686fa91f197f0c14a2	13	decoded type2 member; pointer_table=0x8007c04c; objects=1
+M	MODEL	9	4	243	485	20840	4704	0c659a9ee764c57c83c176d52abc0ac8e392349dd27d3db8b9a96c786945cefe	14	decoded type2 member; pointer_table=0x8007c050; objects=4
+M	MODEL	10	4	243	485	25544	1704	76f6ad62ab52668bc0fb752692238a230768a11ecef1160fbfc6031e34e9d7d1	15	decoded type2 member; pointer_table=0x8007c054; objects=1
+M	MODEL	11	4	243	485	27248	6572	a3bddab8ea00126f4ef426fca221feaf2d3135b65e62b14237d26b21147a0ef9	16	decoded type2 member; pointer_table=0x8007c058; objects=1
+M	MODEL	12	4	243	485	33820	6572	49b8cc56e64489802185f4b1ab3875e42939e0fbc903d06164d541fc5eff170f	17	decoded type2 member; pointer_table=0x8007c05c; objects=1
+M	MODEL	13	4	243	485	40392	2128	48c45ff13ced523379f9069afdbc1e196c1aff31c3afc24304c86acd4fe63979	18	decoded type2 member; pointer_table=0x8007c060; objects=2
+M	MODEL	14	4	243	485	42520	220	0556808d41036a02f77ecb75713c27c13aea727b69a59e131954b2e22b4e9720	19	decoded type2 member; pointer_table=0x8007c064; objects=1
+M	MODEL	15	4	243	485	42740	2036	6f926aecf6c71c73eb0b02a002d3693c6a2ef76d7f7b3ee711690a2c4be57d2b	20	decoded type2 member; pointer_table=0x8007c068; objects=3
+M	MODEL	16	4	243	485	44776	1696	363c20c54e107238215ed14636de8275be6d33479c8834c1db33ba13b4a71db1	21	decoded type2 member; pointer_table=0x8007c06c; objects=1
+M	MODEL	17	4	243	485	46472	748	23450d3fc5c8e48d16cda9cc0c2e90aa06122116c0c1193ce15120a5a6b0e3f0	22	decoded type2 member; pointer_table=0x8007c070; objects=1
+M	MODEL	18	4	243	485	47220	7116	28509a7cf48a735a75e39fe04508a37f5ae4655cfc9d480b327bf179e74a25d4	23	decoded type2 member; pointer_table=0x8007c074; objects=2
+M	MODEL	19	4	243	485	54336	444	c949b3d0a5358d790ba01370c2c8a02fa3577254a09d84cc6e520278c0ab31ab	24	decoded type2 member; pointer_table=0x8007c078; objects=1
+M	MODEL	20	4	243	485	54780	1132	158b15fc45f21c20009889bc57d4e266d549876a499aeb83a5a332268b61954b	25	decoded type2 member; pointer_table=0x8007c07c; objects=1
+M	MODEL	21	4	243	485	55912	388	452608246a6bb5e5541ddc89b60160168f4177db00919a15998c359a313b0cb0	26	decoded type2 member; pointer_table=0x8007c080; objects=1
+M	MODEL	22	4	243	485	56300	972	70b787ae2db3acf67cd08de5f70903b6de81cdcd57ed0a218d8f1a4d7bae6fc4	27	decoded type2 member; pointer_table=0x8007c084; objects=1
+M	MODEL	23	4	243	485	57272	972	2ecd8d10e52cb2833525e1df946148082c1cabd109d36cc1d570de8d57e8ddde	28	decoded type2 member; pointer_table=0x8007c088; objects=1
+M	MODEL	24	4	243	485	58244	632	d861f78a33f7985e10572946c5df7d4ff2028a2e2088cd763b6fac13a4ddd342	29	decoded type2 member; pointer_table=0x8007c08c; objects=1
+M	MODEL	25	4	243	485	58876	304	0313a204dc6b63279c1035fe2229a24e5869ce90ba2783661738582aa959b3c1	30	decoded type2 member; pointer_table=0x8007c090; objects=1
+M	MODEL	26	4	243	485	59180	260	fd876a0c8761581cf74a7f8cd345c7a240e158afc838f4cdedc420f7f8120db9	31	decoded type2 member; pointer_table=0x8007c094; objects=1
+M	MODEL	27	4	243	485	59440	1372	11c41429e2cced469126643481fb19c20ae66fb283a3a4c7afc546ebe7adc8fb	32	decoded type2 member; pointer_table=0x8007c098; objects=1
+M	MODEL	28	4	243	485	60812	2260	6d1d1d7afc984f8d0bd8f0e9bf41e181c31ccd023fbdcddd35dd0bb856f520ff	33	decoded type2 member; pointer_table=0x8007c09c; objects=1
+M	MODEL	29	4	243	485	63072	556	2b4e794c65b8844de2db6274bdad99e6075ff8b62cb61eba61212a895923713a	34	decoded type2 member; pointer_table=0x8007c0a0; objects=1
+M	MODEL	30	4	243	485	63628	1300	0e15c7a0d265bf67ba814b908141487de0bdff96c93b293b84b5347a23306577	35	decoded type2 member; pointer_table=0x8007c0a4; objects=1
+M	MODEL	31	4	243	485	64928	1040	9bb8caf3378bca0ab4cc35b6974df17eb7e40d0ce837c1e7a7d2ebe08dd20293	36	decoded type2 member; pointer_table=0x8007c0a8; objects=1
+M	MODEL	32	4	243	485	65968	992	f3f20c4236b22e574693a64facbfe600960f9c18777e85e64873c78af2081124	37	decoded type2 member; pointer_table=0x8007c0ac; objects=2
+M	MODEL	33	4	243	485	66960	732	9041938424f294b8563cd4df79c71a7f7337ef1999616e90cf98cef22874ee17	38	decoded type2 member; pointer_table=0x8007c0b0; objects=1
+M	MODEL	34	4	243	485	67692	1676	db27b8f36010f91f8be0de01496d0eca593ca1c4bc0f19308d1fb8b43bfff456	39	decoded type2 member; pointer_table=0x8007c0b4; objects=1
+M	MODEL	35	4	243	485	69368	1568	d145fbf0d78a98ffa22f72c87f3d8643840c9778443c95a1201450fc62f5eebb	40	decoded type2 member; pointer_table=0x8007c0b8; objects=1
+M	MODEL	36	4	243	485	70936	11152	ec03d11c2db134a1624920673ebb1b9e4d9166899b631822810fca7ea3706672	41	decoded type2 member; pointer_table=0x8007c0bc; objects=2
+M	MODEL	37	4	243	485	82088	924	78e5f4239a1fbd0fb445b35725f07f173f4ab92b887a6352067f079e4ff75371	42	decoded type2 member; pointer_table=0x8007c0c0; objects=1
+M	MODEL	38	4	243	485	83012	1068	b755c456b2c0426c5c29e60692e8498efb45382fe66a5883ddf1b406e80ce993	43	decoded type2 member; pointer_table=0x8007c0c4; objects=1
+M	MODEL	39	4	243	485	84080	912	2bc4166443127909091703fa05eff801715f805a01426112c72712aaf660837a	44	decoded type2 member; pointer_table=0x8007c0c8; objects=1
+M	MODEL	40	4	243	485	84992	2732	d8a6798d8952a8f6eafdd08ac9f6e459081f311ae9ecba62329ed1edbd94b3c2	45	decoded type2 member; pointer_table=0x8007c0cc; objects=1
+M	MODEL	41	4	243	485	87724	2016	d32ab142461ff362d79a93f304a2cb54a18c968f89f404744817cc0039f499f8	46	decoded type2 member; pointer_table=0x8007c0d0; objects=1
+M	MODEL	42	4	243	485	89740	7040	f10e96c934eec30dda5b09a9659b22a310aabddc930bc00637d3bd6fe668a236	47	decoded type2 member; pointer_table=0x8007c0d4; objects=2
+M	MODEL	43	4	243	485	96780	4376	a4b7eac2f150fa1919e82298c2670bd8c33287f4767d472e68aed6e2e7ffbc2e	48	decoded type2 member; pointer_table=0x8007c0d8; objects=1
+M	MODEL	44	4	243	485	101156	1080	bb6dc68a7ef22745cb6c1cdcdbb007056ca487a1dd1aa64575584db048669f41	49	decoded type2 member; pointer_table=0x8007c0dc; objects=1
+M	MODEL	45	4	243	485	102236	1096	56554cca3c9b2127d00424a44b7a715ad7b04486d72cb1ad4b7104a6cc6ac4ec	50	decoded type2 member; pointer_table=0x8007c0e0; objects=1
+M	MODEL	46	4	243	485	103332	700	99920bb0a19c9260bc06b96333b30bb8d81d096b18f4f3a29095a33afa58ff86	51	decoded type2 member; pointer_table=0x8007c0e4; objects=1
+M	MODEL	47	4	243	485	104032	1300	a56f5f7db44a9ee9d3e54480597f0b85ceb17837764943e0f8938ba006efdf02	52	decoded type2 member; pointer_table=0x8007c0e8; objects=1
+M	MODEL	48	4	243	485	105332	1460	2c982a25f53fa6b943e984491c56bfdeabfd18145088082f1058d0a1849fa6a4	53	decoded type2 member; pointer_table=0x8007c0ec; objects=1
+M	MODEL	49	4	243	485	106792	1332	f949001145c875b8cca5b4805cb7a0adddb11c994245fde4147744698c1dfdb3	54	decoded type2 member; pointer_table=0x8007c0f0; objects=1
+M	MODEL	50	4	243	485	108124	5296	991b67009b2c02c99869b719a7af8e0636a5aa0fb87e9e5acba83dd6f71befe0	55	decoded type2 member; pointer_table=0x8007c0f4; objects=2
+M	MODEL	51	4	243	485	113420	252	5184f531ad695ad203ae47af7425b49dda815482b2d05260291ce43ac91aef7d	56	decoded type2 member; pointer_table=0x8007c0f8; objects=1
+M	MODEL	52	4	243	485	113672	752	b43fb829508c395595ace62c72474468d1f8a366959924ff4e8d43f5b4a570a2	57	decoded type2 member; pointer_table=0x8007c0fc; objects=1
+M	MODEL	53	4	243	485	114424	3408	51c488676e1f94396f4675a9a019a528947916b6320fde8f834a9d8b16503986	58	decoded type2 member; pointer_table=0x8007c100; objects=2
+M	MODEL	54	4	243	485	117832	3132	e7f1aa0b176cf9830e57412b78b078523d831b4338d9c7b874357684edd02d9d	59	decoded type2 member; pointer_table=0x8007c104; objects=1
+M	MODEL	55	4	243	485	120964	1016	159090ba5bc8bc850f883406c7a5dae63acd97f1c9febbf8260585e564e67922	60	decoded type2 member; pointer_table=0x8007c108; objects=1
+M	MODEL	56	4	243	485	121980	1696	c800b144d4ca56b21f864c8fac11a883f339c5908d5fb74221aa6565c59d1dbc	61	decoded type2 member; pointer_table=0x8007c10c; objects=1
+M	MODEL	57	4	243	485	123676	740	5497430c91d6524fd7dccc8f525f952f44df346cade55b2c0b58ee7f6e7a509b	62	decoded type2 member; pointer_table=0x8007c110; objects=1
+M	MODEL	58	4	243	485	124416	1988	96f2f33787eeef0531cc25f134d86a83a5a58b44fb5b11a35a2a303d4d4d9c11	63	decoded type2 member; pointer_table=0x8007c114; objects=1
+M	MODEL	59	4	243	485	126404	2176	577e0817d841ee7e325c4838a474e31b8274e303454638938cfec255f4a8189e	64	decoded type2 member; pointer_table=0x8007c118; objects=1
+M	MODEL	60	4	243	485	128580	1696	58aa9f2242072ac838ed86f23b381df43217cf40e3f4900918834f42c955f41c	65	decoded type2 member; pointer_table=0x8007c11c; objects=1
+M	MODEL	61	4	243	485	130276	3064	1d9e2294036143f928ce4a3fb86e6108e40c796d0edda5a1fae2bfce5ef66b91	66	decoded type2 member; pointer_table=0x8007c120; objects=1
+M	MODEL	62	4	243	485	133340	3008	4541c74192250275e05b615ffb094b6cc33ff527bdc96c281a971cfd43ddd011	67	decoded type2 member; pointer_table=0x8007c124; objects=1
+M	MODEL	63	4	243	485	136348	1740	89c7e58fdea5eeda0b83cac087036e6531b283bcb2122d49990cf65aa7600455	68	decoded type2 member; pointer_table=0x8007c128; objects=1
+M	MODEL	64	4	243	485	138088	4608	a0cd2f9ce7caa465bb42640912db22b2bd8f9ab9952b3f905154cecf9a2b570a	69	decoded type2 member; pointer_table=0x8007c12c; objects=1
+M	MODEL	65	4	243	485	142696	3528	38eae7b973c0c9e5e458a440d6e6bcf8d5b79d53dfd5850847e248f1199f441c	70	decoded type2 member; pointer_table=0x8007c130; objects=1
+M	MODEL	66	4	243	485	146224	1312	9130e61717c4cfd918c446c797b3f07aaca4dadfbf96c65cbf967bcc0d7d473d	71	decoded type2 member; pointer_table=0x8007c134; objects=1
+M	MODEL	67	4	243	485	147536	244	914d9f0b6a7286aa847c95e12f7e78e4485c259e95ac2913dc073ab1d339807e	72	decoded type2 member; pointer_table=0x8007c138; objects=1
+M	MODEL	68	4	243	485	147780	1396	7a3876fc5cfacdb04e2688c7962acfebf00d3c7998a64ad1361794c627c44ce8	73	decoded type2 member; pointer_table=0x8007c13c; objects=1
+M	MODEL	69	4	243	485	149176	580	93c12bde7211bf75eb6a3ca99c389631f6e0c4326bc3845669a54a30dcfdedc8	74	decoded type2 member; pointer_table=0x8007c140; objects=1
+M	MODEL	70	4	243	485	149756	2796	8b6620ed701c8ab4b81518453e2140edaec186bc46d8e7c560e30439df90c795	75	decoded type2 member; pointer_table=0x8007c144; objects=1
+M	MODEL	71	4	243	485	152552	676	f766485af453978e7f411fdaaecad927fee426bc5dac23cd63399a71d03f5243	76	decoded type2 member; pointer_table=0x8007c148; objects=1
+M	MODEL	72	4	243	485	153228	7380	43533bcd02739010f12c26775687efc47118733d66dfe9df7013d37a87d736b0	77	decoded type2 member; pointer_table=0x8007c14c; objects=1
+M	MODEL	73	4	243	485	160608	964	1aaddab2abafed78b3b845e1b03e1ad63e004264085e7092aafa33f5ca78c7bf	78	decoded type2 member; pointer_table=0x8007c150; objects=1
+M	MODEL	74	4	243	485	161572	316	e458f5a22b4d59bf114d4330e4256d9fe2ccb7569d5d8045884f781a9504cc5e	79	decoded type2 member; pointer_table=0x8007c154; objects=1
+M	MODEL	75	4	243	485	161888	2056	d05187e218a430082b2ea894fe3d842c3f97a5b6a594d5a7763cb83ed22f0f0a	80	decoded type2 member; pointer_table=0x8007c158; objects=1
+M	MODEL	76	4	243	485	163944	4696	3415a1cbc56e58097037cba2dedd1c075b0612d09b8378727eabb876db44de6e	81	decoded type2 member; pointer_table=0x8007c15c; objects=1
+M	MODEL	77	4	243	485	168640	1696	69ebc438e5e0071d82a54fbf6b61e95ddd6a9452e903f2303a9d9745c484dcb2	82	decoded type2 member; pointer_table=0x8007c160; objects=1
+M	MODEL	78	4	243	485	170336	4396	1b97afdec60c4cb9f2afc2319591b6152f52846c9a049d96486888dd396e80da	83	decoded type2 member; pointer_table=0x8007c164; objects=1
+M	MODEL	79	4	243	485	174732	1224	fa11f425d6edf2abf2294ce923ab9373046065aedba3a26ee4d9e2206b7607c1	84	decoded type2 member; pointer_table=0x8007c168; objects=1
+M	MODEL	80	4	243	485	175956	692	33db31725deb03dfd63c632d8447d99f6b137503c1543012402d8111b16fdde7	85	decoded type2 member; pointer_table=0x8007c16c; objects=1
+M	MODEL	81	4	243	485	176648	492	4909a269c488c9b4966e851ab83a70042e0e3a5932cdec791c74ad70c31beb45	86	decoded type2 member; pointer_table=0x8007c170; objects=1
+M	MODEL	82	4	243	485	177140	3452	d4de691903f1a28df41b06ff0c0ac0239b25dc66bf9afda47101e8893f25f4c0	87	decoded type2 member; pointer_table=0x8007c174; objects=1
+M	MODEL	83	4	243	485	180592	640	ac1903a1ab837977392f537ebd2f4516b9deff310bb8106178f339da06dc2ef2	88	decoded type2 member; pointer_table=0x8007c178; objects=1
+M	MODEL	84	4	243	485	181232	724	5ca97bf28aa65e645fe7a6720833f5a7dcd5a48923cc0ea55dfd423b7989437e	89	decoded type2 member; pointer_table=0x8007c17c; objects=1
+M	MODEL	85	4	243	485	181956	748	60d3f7d04116ac75a0ba1127425fc57130b472eabb2f62fc195dfd3cc3284864	90	decoded type2 member; pointer_table=0x8007c180; objects=1
+M	MODEL	86	4	243	485	182704	732	2531146a8421f682c4c0f53c026a6d18fb6cf0d7c1b69520cb0793329e807e8e	91	decoded type2 member; pointer_table=0x8007c184; objects=1
+M	MODEL	87	4	243	485	183436	132	f20dbe02740fd4c27ae9755010bb5a470fdafc79922195e328b2dcf2ca74bd59	92	decoded type2 member; pointer_table=0x8007c188; objects=1
+M	MODEL	88	4	243	485	183568	9864	90151bd457b0e787f1bedf7151c74e98732ea5a86e3e35fc4ae507aa24a2ee9c	93	decoded type2 member; pointer_table=0x8007c18c; objects=1
+M	MODEL	89	4	243	485	193432	2648	beb8bd6a8b9922cd9b7e3161a36fd2b0adf02683128e336c9a093fa86ce41e33	94	decoded type2 member; pointer_table=0x8007c190; objects=1
+M	MODEL	90	4	243	485	196080	1400	c99f556dfd2b40749d2e13fa405fb699789e8cbd38fec5b00f99391032dff2bb	95	decoded type2 member; pointer_table=0x8007c194; objects=1
+M	MODEL	91	4	243	485	197480	6412	d040f75e0887d1ff72339e39370f59fc3f76c5f8b159544e35bd0f0935d1658b	96	decoded type2 member; pointer_table=0x8007c198; objects=7
+M	MODEL	92	4	243	485	203892	5076	86c9bd1c9b7a7d1e5ef839d6417c0b06da45e09b296ed8abbcb041badb51f6e6	97	decoded type2 member; pointer_table=0x8007c19c; objects=6
+M	MODEL	93	4	243	485	208968	5864	6010393a116d65cb2c2eb7d12107c0d2f99a318557b53bfb2c1b756d86d3d1b3	98	decoded type2 member; pointer_table=0x8007c1a0; objects=10
+M	MODEL	94	4	243	485	214832	6280	f90db9aab20749e0352ec295030bc7570d72d5cd7e24734c0289adab763019f7	99	decoded type2 member; pointer_table=0x8007c1a4; objects=10
+M	MODEL	95	4	243	485	221112	5008	b8e1eaf626da23bf32791f7a14254a9b4af1faec009f34b097956d4611de9c61	100	decoded type2 member; pointer_table=0x8007c1a8; objects=7
+M	MODEL	96	4	243	485	226120	6884	8e999aa328010d1e88c978857d93bad13712e87020258f6ba5e0fd41145221f6	101	decoded type2 member; pointer_table=0x8007c1ac; objects=10
+M	MODEL	97	4	243	485	233004	912	60a3e568c155f5b6b1ef0d5b7a2b6e5570398923d6929ea02aeffeddc4f2967c	102	decoded type2 member; pointer_table=0x8007c1b0; objects=1
+M	MODEL	98	4	243	485	233916	7264	152cad7ae7c1f73d752f9405c8804d331f822f7961b9b165cc44598aa6b2097f	103	decoded type2 member; pointer_table=0x8007c1b4; objects=10
+M	MODEL	99	4	243	485	241180	5552	0ead58518c97ed790e8c0f2905167ee726307a167f9bd9c2be68d9e85b0a4d23	104	decoded type2 member; pointer_table=0x8007c1b8; objects=6
+M	MODEL	100	4	243	485	246732	4328	02c76dddb88c0ddbdaea605872cd46e24b9a322c0ce7ad05c694c00badf8cf75	105	decoded type2 member; pointer_table=0x8007c1bc; objects=6
+M	MODEL	101	4	243	485	251060	4976	7006ef8d80e2a35ed11be6b54cc52fe7b1a9396bbfb9be9e7734f87fadc5b1c0	106	decoded type2 member; pointer_table=0x8007c1c0; objects=6
+M	MODEL	102	4	243	485	256036	4892	6fbc568cf49073442843ab60edf8631b4bfc8e9b9e321d5a59b20a7072e58bf1	107	decoded type2 member; pointer_table=0x8007c1c4; objects=6
+M	MODEL	103	4	243	485	260928	6028	a8173840bcecd39c678807f626fd3d6a6449b6bf927fca5e2a0e40c4f5725fed	108	decoded type2 member; pointer_table=0x8007c1c8; objects=10
+M	MODEL	104	4	243	485	266956	5892	80de23068506d0d66e98690aa90822534ed73c3cc7a1aaa11badc3290ca7e410	109	decoded type2 member; pointer_table=0x8007c1cc; objects=10
+M	MODEL	105	4	243	485	272848	5088	73ea5614177a36c329c1659a3c7b979761e6f3422a2abf3dc39a99dc8d4a1e78	110	decoded type2 member; pointer_table=0x8007c1d0; objects=6
+M	MODEL	106	4	243	485	277936	5912	2c6180be565faeccc4f3fd6897209e0d1ad9961f44ffda26d01ff6744c6f368b	111	decoded type2 member; pointer_table=0x8007c1d4; objects=10
+M	MODEL	107	4	243	485	283848	6680	0c807b7eb417dbb82875ec8765eb9c5d5c299eace7eff83bd3c043b88450076b	112	decoded type2 member; pointer_table=0x8007c1d8; objects=10
+M	MODEL	108	4	243	485	290528	3608	f741d6d0dc36f1b8ce1daba796b5c4fc8e5f0b3f051eae4001795a7d2d9d7cbb	113	decoded type2 member; pointer_table=0x8007c1dc; objects=1
+M	MODEL	109	4	243	485	294136	1056	fa2fb29899f62420c293be58e5606ed020dfb550863b385f183d9514d2167307	114	decoded type2 member; pointer_table=0x8007c1e0; objects=7
+M	MODEL	110	4	243	485	295192	1524	d56441929dcaf2f95d9a97e2391ec88868ef1ae847111dc8b7e8a4499537537a	115	decoded type2 member; pointer_table=0x8007c1e4; objects=1
+M	MODEL	111	4	243	485	296716	2016	17e08016b426f1968781e4c0262633dcc1cb061658a7446e6153b927950fdb26	116	decoded type2 member; pointer_table=0x8007c1e8; objects=4
+M	MODEL	112	4	243	485	298732	4992	a71db83533003fdc1796c6f247961100dd9b5af559a0d9153c1fd1183ef41ebc	117	decoded type2 member; pointer_table=0x8007c1ec; objects=6
+M	MODEL	113	4	243	485	303724	400	59c0518ae2f67b760f08906ffa5b6b6ce90fce86faa5004968fb8a0327a3eb0d	118	decoded type2 member; pointer_table=0x8007c1f0; objects=1
+M	MODEL	114	4	243	485	304124	6780	b0d0acbb1e7ddeb91a1051d6a4e2bcac5f03b35a5c16d9c652bdde81632985c8	119	decoded type2 member; pointer_table=0x8007c1f4; objects=10
+M	MODEL	115	4	243	485	310904	9380	675cc1e63a921437450d519301c7df335dc2db47c34dc0282181a100b72818e3	120	decoded type2 member; pointer_table=0x8007c1f8; objects=10
+M	ANM_CLIP	0	4	243	485	288	496	aa7e99a3c825847f07ea928c47ad9989e33fc25e0effcb3becc580ea65c1fd05	1	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	1	4	243	485	784	736	af8aba27342858c1ecc3cd4802faef703d025484c54fefcf05a534d3eb47dd9e	2	decoded bank-relative offset; bones=3; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	2	4	243	485	1520	496	01d50506a2eabdd3597d31dbbb78154b92daec83ca1f8b9cf6b2f7e8b28c864b	3	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	3	4	243	485	2016	976	ff52c29266b202ce94e0e740e4f341fc4a89367ca247133306023d4ab3323f20	4	decoded bank-relative offset; bones=4; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	4	4	243	485	2992	256	6b6607cf86763b02ff0e16198f961b8002ea80c4e518503092095a067284ba80	5	decoded bank-relative offset; bones=2; frames=15; marker=0x80c; rate_word=2
+M	ANM_CLIP	5	4	243	485	3248	496	017071fdc5b3ebc553b3c26d9b797c0fe85e808903047b43f4ad08c3337804e9	6	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	6	4	243	485	3744	496	7ac7448e78deac7fdee42db6aab3e23b35405e6c68d0c1a95c9f957acee77def	7	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	7	4	243	485	4240	496	1a4f957084caf711695be00b5d8cba5f8ffa1aa95b6e54554b1733bd64e64d95	8	decoded bank-relative offset; bones=2; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	8	4	243	485	4736	1216	c0a2aab0186848d77c40e59384143f1a16cc8c29f54dbdfdfed6e1877d929694	9	decoded bank-relative offset; bones=6; frames=25; marker=0x80c; rate_word=2
+M	ANM_CLIP	9	4	243	485	5952	736	21c32f0694e763ec9bc33918ad48be466ab2a46d8c88536af297a8ba132d2f68	10	decoded bank-relative offset; bones=6; frames=15; marker=0x80c; rate_word=4
+M	ANM_CLIP	10	4	243	485	6688	496	59a215c4a82a53459490b8d8b19b2de66e128e28a41d148854922186ae271339	11	decoded bank-relative offset; bones=6; frames=10; marker=0x80c; rate_word=4
+M	ANM_CLIP	11	4	243	485	7184	976	2c6db54c09391605777ca141a7511aec502625edce8a93cceec98db89e24b96e	12	decoded bank-relative offset; bones=6; frames=20; marker=0x80c; rate_word=4
+M	ANM_CLIP	12	4	243	485	8160	736	1169a0108e2623dfc2d23b02c6fb7fad998eb6497ef7fa1b7db37a2092a53c5b	13	decoded bank-relative offset; bones=6; frames=15; marker=0x80c; rate_word=4
+M	ANM_CLIP	13	4	243	485	8896	736	f9f58c144d1e29bebd85c93664413232513b9abd571bc9c27f41288c2917b1b8	14	decoded bank-relative offset; bones=6; frames=15; marker=0x80c; rate_word=2
+M	ANM_CLIP	14	4	243	485	9632	1216	0850c882c9824210507b0d1da8c66039779f80c6863dba2370e898bcb9575f91	15	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+M	ANM_CLIP	15	4	243	485	10848	816	b9f4cd1bd0c5f73f35fc8338a0e57975f29b82189e585b32f34e0a3507c854f2	16	decoded bank-relative offset; bones=10; frames=10; marker=0x80c; rate_word=2
+M	ANM_CLIP	16	4	243	485	11664	816	e434d4c542aef046935e479b11aad1e268b50899f3456e77718f3c6552910ce9	17	decoded bank-relative offset; bones=10; frames=10; marker=0x80c; rate_word=4
+M	ANM_CLIP	17	4	243	485	12480	2416	a9f0cb1e847e57acde3799ee3da5723cf9d47e23885a549a72f55d130de1286f	18	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	18	4	243	485	14896	2096	fc91f7df879aaa42751d07b0aae1d8a2fb9ed2656b3a9578ebba92785ab6c940	19	decoded bank-relative offset; bones=10; frames=26; marker=0x80c; rate_word=2
+M	ANM_CLIP	19	4	243	485	16992	1856	a6d93d14aad0f480cc814f72fb9be1fc5f8fb4e1b9b27c8805ed5c2dda816e5a	20	decoded bank-relative offset; bones=10; frames=23; marker=0x80c; rate_word=2
+M	ANM_CLIP	20	4	243	485	18848	2016	5f831f3ad263281a818340573ec3dc7416004bff16ffe844faeb0f67012761fc	21	decoded bank-relative offset; bones=10; frames=25; marker=0x80c; rate_word=2
+M	ANM_CLIP	21	4	243	485	20864	2416	ba9e72fd0184d1ff5234e68e6bf893b8540b0a658d563cb494d071c006ab83c9	22	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	22	4	243	485	23280	2416	1fee7d0a5b3e06e26f49137d79a84237764ba6a72b212dcaa26d606779e1d969	23	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	23	4	243	485	25696	256	1370d3d95919560374e13964a7e00464830758a6e5b586276d3e2d2057e9624d	24	decoded bank-relative offset; bones=10; frames=3; marker=0x80c; rate_word=2
+M	ANM_CLIP	24	4	243	485	25952	2096	58db4361a889cd6e598d2820e4e4fd0bd4b7986e1f590067b4bef0607d25fa7d	25	decoded bank-relative offset; bones=10; frames=26; marker=0x80c; rate_word=2
+M	ANM_CLIP	25	4	243	485	28048	1216	3b446fa1d79d2c5e209fb93589eda2757c9b7691da2250082ee44f0614b6e1ba	26	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+M	ANM_CLIP	26	4	243	485	29264	816	cc6fd28ca2786928c46fb62979fa17edea4731d1775573bb8ed9106cde8bd58f	27	decoded bank-relative offset; bones=10; frames=10; marker=0x80c; rate_word=2
+M	ANM_CLIP	27	4	243	485	30080	1216	a4b4fd87e967665bc9478bc1f405f1471d6afe3ed96ecbe025d402e2965f5b8a	28	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+M	ANM_CLIP	28	4	243	485	31296	1024	f06b826013db880ab02d293329e5700e24c26e66ad9c1f661822adfb757759c7	29	decoded bank-relative offset; bones=7; frames=18; marker=0x80c; rate_word=2
+M	ANM_CLIP	29	4	243	485	32320	1080	12f8521e701672c151f8dfa1544d568d5ca424fbf51e9dc05ebbfdc3a3f1d8bb	30	decoded bank-relative offset; bones=7; frames=19; marker=0x80c; rate_word=2
+M	ANM_CLIP	30	4	243	485	33400	800	3d7785abc4fd14250b31b2b9bf90fa7cfaf15d47cbad9cf2af5d267bfbb6bfd4	31	decoded bank-relative offset; bones=7; frames=14; marker=0x80c; rate_word=2
+M	ANM_CLIP	31	4	243	485	34200	2536	31207e8fec568c48aa5d252c7b06ea16ce61ab95aa594d9e8b65a680d6cc1aa0	32	decoded bank-relative offset; bones=7; frames=45; marker=0x80c; rate_word=2
+M	ANM_CLIP	32	4	243	485	36736	2256	6f5e936b1a35d3dba11010d9a2119c144118f4211e0350b152ec034af17770dc	33	decoded bank-relative offset; bones=7; frames=40; marker=0x80c; rate_word=2
+M	ANM_CLIP	33	4	243	485	38992	2416	5602c36f4ba6d0af5fac1957915e8d0f057bf4dd05b89f384d95874ba0f42633	34	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	34	4	243	485	41408	1216	6b2d844859b0ed04740422ddd6492c15fe23c6749c5e127ab3240634eacfc4dd	35	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+M	ANM_CLIP	35	4	243	485	42624	2416	0e2badaf4799a4e67787281c09862b565bf9c4755123b366122bbd70a1330891	36	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	36	4	243	485	45040	2416	831cf0062c2008d6290c4c310cfe0a580e57c875cd857e4a5ff62ad0616b8d27	37	decoded bank-relative offset; bones=10; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	37	4	243	485	47456	496	3cac985d0e604880cae019ee4baaa64ed8091927bb07a35768c96f8fe0b4165c	38	decoded bank-relative offset; bones=1; frames=60; marker=0x80c; rate_word=2
+M	ANM_CLIP	38	4	243	485	47952	496	fd2ee64a107fb03f1f36a767e22eb88518450d6fcf51757e2c8daf1dc69c0b42	39	decoded bank-relative offset; bones=1; frames=60; marker=0x80c; rate_word=2
+M	ANM_CLIP	39	4	243	485	48448	1696	58512c754167fa1a8fee624c8e183b601492176403e36db1379b7143fc4538d9	40	decoded bank-relative offset; bones=7; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	40	4	243	485	50144	3216	36e051975d68dadb7520763e3305e063312fea1e97032dc747ac83650b758b50	41	decoded bank-relative offset; bones=10; frames=40; marker=0x80c; rate_word=2
+M	ANM_CLIP	41	4	243	485	53360	1616	0d52031cfccb5092b6bcf55732b2936c898ac540c8cee0671236848842f73c6c	42	decoded bank-relative offset; bones=10; frames=20; marker=0x80c; rate_word=2
+M	ANM_CLIP	42	4	243	485	54976	1616	bcfa40a92777938fd0efa0e8a2a12d2664cfa5b34463e9cb89b90666c87c5e6b	43	decoded bank-relative offset; bones=10; frames=20; marker=0x80c; rate_word=2
+M	ANM_CLIP	43	4	243	485	56592	2016	7c9d7bf4000c46746522e60f431956649dd8b01575d649d6f435be9c6bcd368c	44	decoded bank-relative offset; bones=10; frames=25; marker=0x80c; rate_word=2
+M	ANM_CLIP	44	4	243	485	58608	4016	d327ebc32a3cf3114f9148c52eb99cb4b08e5e402169f7d0e25087ce3598c64f	45	decoded bank-relative offset; bones=10; frames=50; marker=0x80c; rate_word=2
+M	ANM_CLIP	45	4	243	485	62624	816	64f5d76c1184ec76beb2535306275e047a691e8d9635be80a63581ce9f598810	46	decoded bank-relative offset; bones=10; frames=10; marker=0x80c; rate_word=4
+M	ANM_CLIP	46	4	243	485	63440	1216	e0949905dff147f89a74aa880306f9e7986e6ad29600195852e06c5975b4f00d	47	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=4
+M	ANM_CLIP	47	4	243	485	64656	1216	94c7c8a1502c7f84de72c8fc838e7cc3f9b44093886be6c8be0c08732a04487b	48	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=4
+M	ANM_CLIP	48	4	243	485	65872	1616	1d191810559ab895ba9a37655added79d3da0ddc8ea29cb18be19a60521126af	49	decoded bank-relative offset; bones=10; frames=20; marker=0x80c; rate_word=4
+M	ANM_CLIP	49	4	243	485	67488	1216	e4439838a748b4fe617eb6f702314802786f03189a8dd52c4bdf0246d164c419	50	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+M	ANM_CLIP	50	4	243	485	68704	1216	d439cd0c3612103624190c24082ff849a50de324167646199c5009534f659e75	51	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=2
+M	ANM_CLIP	51	4	243	485	69920	96	993da27e28f49d599b101b01b5eab3982bb2f6d17d68771921a72bc05c490630	52	decoded bank-relative offset; bones=10; frames=1; marker=0x80c; rate_word=2
+M	ANM_CLIP	52	4	243	485	70016	1616	0cf4d1cf93a17f2a50a8eb1146323120c22dd9a4d32afb4f3991fb80d7566bec	53	decoded bank-relative offset; bones=10; frames=20; marker=0x80c; rate_word=2
+M	ANM_CLIP	53	4	243	485	71632	496	d807b6984c56f2cb057181a53ccbb1d3b805f832323fb1c3ee15abf036e6923c	54	decoded bank-relative offset; bones=10; frames=6; marker=0x80c; rate_word=2
+M	ANM_CLIP	54	4	243	485	72128	976	e828574cf72b56a47931c77e3204afa5268d3cc4436dda3f7060756388cb915e	55	decoded bank-relative offset; bones=4; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	55	4	243	485	73104	496	eee108138f738d3ef815616bfa03393e1c749e577cb80aca48611e1912996b13	56	decoded bank-relative offset; bones=4; frames=15; marker=0x80c; rate_word=2
+M	ANM_CLIP	56	4	243	485	73600	1456	e93fd4062853b2e242f0f839c1e9087d4522b235df078eea64a243d6f9ee5f9c	57	decoded bank-relative offset; bones=6; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	57	4	243	485	75056	1456	3bb576d2a7bf2ca5d8b81ab2c5187ccea914722c6e4fdf8adc0da151412e5b44	58	decoded bank-relative offset; bones=6; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	58	4	243	485	76512	2816	6d0aca594ed3936c2994e1601a43ef8bb7b2c3bf31944da9422337cdc088933f	59	decoded bank-relative offset; bones=7; frames=50; marker=0x80c; rate_word=2
+M	ANM_CLIP	59	4	243	485	79328	1696	fa1ded82489bc6857679210945d6512fa3fcfc248460ee25d2f59b9b90d41fc5	60	decoded bank-relative offset; bones=7; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	60	4	243	485	81024	1696	89f983bafe189e95a1ee004edd06766f388e4206a88e60672722f5eeea8b7d3e	61	decoded bank-relative offset; bones=7; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	61	4	243	485	82720	3376	3fbabdc52ace3dbb095e289258cfe7b8c2bf7b1e40ec3c39d9ac6e34a4a74098	62	decoded bank-relative offset; bones=7; frames=60; marker=0x80c; rate_word=2
+M	ANM_CLIP	62	4	243	485	86096	2704	b348b07103c8610a54e8460d27b75ddbdafb395e6ddc4e2496d6d714b984b804	63	decoded bank-relative offset; bones=7; frames=48; marker=0x80c; rate_word=2
+M	ANM_CLIP	63	4	243	485	88800	1416	b981dc3feddd591a5cf58f6a6a094aade8f61ceef4a91890e7a17321bd3e3c1e	64	decoded bank-relative offset; bones=7; frames=25; marker=0x80c; rate_word=2
+M	ANM_CLIP	64	4	243	485	90216	1136	d233a4f0b4790fba0f2bf08d546d9f68e302ac1dec4c1fb226a361b90f6dd918	65	decoded bank-relative offset; bones=7; frames=20; marker=0x80c; rate_word=2
+M	ANM_CLIP	65	4	243	485	91352	1416	ef29e5ad890a7126e2876124d909cd3ae67869dc1b8800416fb837b1d99789be	66	decoded bank-relative offset; bones=7; frames=25; marker=0x80c; rate_word=2
+M	ANM_CLIP	66	4	243	485	92768	1696	eb3655b860f8d7f6cf27564a688774cd9a6c2c3cb4834ced4bae7235368f2fe1	67	decoded bank-relative offset; bones=7; frames=30; marker=0x80c; rate_word=2
+M	ANM_CLIP	67	4	243	485	94464	576	4e036c9e9182a7855b2bbb84f203cff89ed4040532fb99422b9f6bcbbb633084	68	decoded bank-relative offset; bones=7; frames=10; marker=0x80c; rate_word=2
+M	ANM_CLIP	68	4	243	485	95040	1416	4ddf5ef7bbe34a4863387e642cd005354acab81b10cb2693b3f9aec673330690	69	decoded bank-relative offset; bones=7; frames=25; marker=0x80c; rate_word=2
+M	ANM_CLIP	69	4	243	485	96456	1216	904ac824a4fdb81373f90f49c3432222ea6ef69ccabc8d4d39da1cd423f1e17f	70	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=4
+M	ANM_CLIP	70	4	243	485	97672	1216	c637856ca57e273756d52cd2a383b0288b03364e6c38dcb361e93c4890ece581	71	decoded bank-relative offset; bones=10; frames=15; marker=0x80c; rate_word=4
+M	IMG	LCK_EXPERIMENTAL_M_BOTH_RESOURCES_NO_IMPORT_ACTORS.img					466721472	6842f78fb771b0a5c77fc9efe4ad903c6f2a36932d8194279fa91c3704b49aac		user result: FREEZES
+M	BUNDLE	4	4	243	485	0	231424	77ebc0867e12e023a1d34cf215cca699fd46f407c14217b74cab6821e64d1889		-
+M	PAC	5	5	356	598	0	370688	ff4ad1aa1f6f707681e29fd2206ab60c3dcb4f99d04d4ffbf26a5a8512c39154		-
