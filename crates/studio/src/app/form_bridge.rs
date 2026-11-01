@@ -192,13 +192,21 @@ impl Session {
         let Some(cell)=&self.cell else{return result;};
         let bases=self.project.database.references().values().filter(|r|&r.cell==cell&&!r.deleted&&!r.disabled).map(|r|r.base.clone()).collect::<BTreeSet<_>>();
         for key in bases {let evidence=(||->Result<_>{let mut base=self.project.database.resolve_base(&key).context("Base Form missing")?.clone();let adapter=self.project.base_adapters.get(&key).context("Native registration adapter unresolved")?;
-            ensure!(matches!(adapter.kind.as_str(),"terrain"|"placement"),"Static Base Form selector adapter unresolved for {}",adapter.kind);
+            ensure!(matches!(adapter.kind.as_str(),"terrain"|"placement"|"mesh"),"Static Base Form selector adapter unresolved for {}",adapter.kind);
             let scene=legaia_engine_scene::scene::Scene::load(index,&adapter.source_scene)?;
             let origin=adapter.origin.as_ref().context("Original record provenance unresolved")?;let entry=origin.prot_entry.context("Native MAP identity unresolved")?;
-            ensure!(scene.field_map_index(index)==Some(entry),"Base Form native MAP provenance changed");let descriptor=origin.descriptor.context("Native descriptor identity unresolved")?;
-            let bytes=index.entry_bytes(entry)?;let record=legaia_scene_formats::field_objects::ObjectRecord::parse(&bytes,descriptor as usize).context("Native descriptor missing")?;
+            ensure!(scene.field_map_index(index)==Some(entry),"Base Form native MAP provenance changed");
+            let selector=if adapter.kind=="mesh" {
+                // Reusable TMD resources have no native MAP descriptor.
+                u16::try_from(adapter.source_ordinal)?
+            }else{
+                let descriptor=origin.descriptor.context("Native descriptor identity unresolved")?;
+                let bytes=index.entry_bytes(entry)?;
+                legaia_scene_formats::field_objects::ObjectRecord::parse(&bytes,descriptor as usize)
+                    .context("Native descriptor missing")?.pack_index_field
+            };
             if !contexts.contains_key(&adapter.source_scene){contexts.insert(adapter.source_scene.clone(),super::native_asset_plan::static_resources::resolve_context(index,&scene)?);}
-            base.resolve_static_resources(&contexts[&adapter.source_scene],&scene,record.pack_index_field)?;
+            base.resolve_static_resources(&contexts[&adapter.source_scene],&scene,selector)?;
             Ok(serde_json::json!({"base":key,"static_resources":base.static_resources,"behavior_verified":false}))})();
             result.insert(key.clone(),match evidence {Ok(v)=>v,Err(e)=>serde_json::json!({"base":key,"unresolved":format!("{e:#}"),"behavior_verified":false})});
         }result

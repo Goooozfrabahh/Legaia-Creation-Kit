@@ -76,6 +76,21 @@ impl SceneRegistration {
         let parsed=field_objects::ObjectRecord::parse(&out,0).context("Registered record readback")?;
         export_check!(field_objects::pack_mesh_index(4,&parsed)==Some(selector),"MAP selector readback mismatch");Ok(out)
     }
+    /// Bind an explicitly authored static-decoration MAP record. Unlike the
+    /// placed-actor route above, this does NOT install an actor or MAN script.
+    /// The 0x0012 family is documented by the original field decoration
+    /// sweep; only the registration selector is modified here.
+    pub fn bind_static_decoration(&self,id:&ResourceId,source:&[u8;32])->Result<[u8;32]> {
+        let rec=field_objects::ObjectRecord::parse(source,0).context("Static decoration record")?;
+        ensure!(rec.flags==0x0012 && !rec.is_placed() && rec.col_delta==0 && rec.row_delta==0,
+            "Static-decoration binder requires unscripted 0x0012 reference template");
+        let selector=self.selector(id)?;let mut out=*source;
+        out[16..18].copy_from_slice(&selector.to_le_bytes());
+        let check=field_objects::ObjectRecord::parse(&out,0).context("Static-decoration selector readback")?;
+        ensure!(check.flags==0x0012 && field_objects::pack_mesh_index(4,&check)==Some(selector),
+            "Static-decoration registration changed record semantics");
+        Ok(out)
+    }
 }
 struct Slot {kind:u8,decoded:Vec<u8>,stored:Vec<u8>,suffix:Vec<u8>,declared_size:u32}
 fn slots(source:&[u8],limits:Limits)->Result<(table::SceneAssetTable,Vec<Slot>)> {

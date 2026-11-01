@@ -106,6 +106,57 @@ pub(in crate::app) fn copy_record_mode(map:&mut [u8],original:&[u8],source_cell:
     map[at..at+2].copy_from_slice(&((oldword&!511)|id as u16|if old.is_placed(){0}else{field_objects::CELL_VISIBLE}).to_le_bytes());
     note(format!("Independent descriptor {id}, reference {cell:?}, native offsets ({x},{z}); occupied visual locations allowed; spawn-window/physics/runtime behavior unverified"));Ok((id,cell))
 }
+/// Author a fresh static decoration reference for geometry without any
+/// original placed MAP record. 0x0012 is the original unbound mesh-drawing
+/// decoration family; CELL_VISIBLE causes the native decoration sweep to draw.
+/// Does not infer collision, floor ownership, MAN binds or behavior.
+/// A zero-world-origin template is used ONLY as a coordinate/flag serializer,
+/// not as a fabricated donor record or ownership claim.
+pub(in crate::app) fn copy_static_mesh_record(
+    map:&mut [u8], delta:[f32;3], anchor_center:[f32;3], radius:f32,
+    tiers:&[Option<i32>;16], bindings:&NativeBindings,
+)->Result<(usize,(u8,u8))> {
+    anyhow::ensure!(map.len()==MAP_LEN,"Static mesh destination MAP window invalid");
+    anyhow::ensure!(radius.is_finite() && radius>=0.,"Static mesh radius invalid");
+    let mut template=vec![0u8;MAP_LEN];
+    let source=(0u8,0u8);let id=4usize;let at=id*32;
+    template[at..at+2].copy_from_slice(&(-64i16).to_le_bytes());
+    template[at+4..at+6].copy_from_slice(&(64i16).to_le_bytes());
+    template[at+18..at+20].copy_from_slice(&0x0012u16.to_le_bytes());
+    template[at+30]=((radius/64.).ceil() as i32).clamp(0,255) as u8;
+    template[grid(source)..grid(source)+2].copy_from_slice(&(id as u16).to_le_bytes());
+    // TMD vertices may retain baked donor coordinates. Allocate the grid
+    // anchor near the visible geometry, not near its translation vector:
+    // original 801f74dc..801f75dc only visits camera-near grid anchors.
+    let anchor=[anchor_center[0],delta[1],anchor_center[2]];
+    let (descriptor,cell)=copy_record_mode(map,&template,source,anchor,tiers,Some(tiers),Some(bindings))?;
+    let x=integer(delta[0])?.checked_sub(cell.0 as i32*128+64).context("Static X overflow")?;
+    let z=(cell.1 as i32*128+64).checked_sub(integer(delta[2])?).context("Static Z overflow")?;
+    map[descriptor*32..descriptor*32+2].copy_from_slice(&i16::try_from(x).context("Static X offset exceeds i16")?.to_le_bytes());
+    map[descriptor*32+4..descriptor*32+6].copy_from_slice(&i16::try_from(z).context("Static Z offset exceeds i16")?.to_le_bytes());
+    // Unlike placed MAP actors, these static decorations resolve their floor
+    // from four corner tiers. Match that exact native integer mean so the
+    // requested editor world Y is preserved, not quietly snapped to a slope.
+    anyhow::ensure!(cell.0<127 && cell.1<127,"Static decoration floor corners reach MAP boundary");
+    let floor=WALL_OFF+cell.1 as usize*128+cell.0 as usize;
+    let corners=[0,1,128,129].map(|off| {
+        tiers[(map[floor+off]&15) as usize]
+            .context("Static decoration floor-height ladder is unresolved")
+    });
+    let corner_heights=corners.into_iter().collect::<Result<Vec<_>>>()?;
+    // Original overlay 900, 0x801f76cc..0x801f76d8: signed /4 toward zero.
+    let mean=corner_heights.iter().sum::<i32>()/4;
+    let native_y=integer(delta[1])?.checked_neg()
+        .and_then(|n|n.checked_sub(mean)).context("Static decoration native Y overflow")?;
+    map[descriptor*32+2..descriptor*32+4].copy_from_slice(&i16::try_from(native_y)
+        .context("Static decoration Y cannot be encoded in i16 MAP record")?.to_le_bytes());
+    let parsed=ObjectRecord::parse(map,descriptor).context("Static decoration readback missing")?;
+    anyhow::ensure!(!parsed.is_placed() && parsed.flags==0x0012,
+        "Static decoration transformed into an actor-dependent MAP record");
+    note(format!("STATIC TMD MAP: independent unbound decoration slot {descriptor} at {cell:?}; no MAN, triggers, wall ownership or walkable floor claim"));
+    Ok((descriptor,cell))
+}
+
 pub(in crate::app) fn yaw(map:&mut [u8],cell:(u8,u8),rotation:[f32;3],center:[f32;3])->Result<()> {
     anyhow::ensure!(rotation.iter().all(|v|v.is_finite()),"Non-finite rotation");
     let id=detach(map,cell)?;let mut raw=record(map,id)?;let old=ObjectRecord::parse(&raw,0).unwrap();
@@ -222,7 +273,14 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
                 let lba=disc.entry_disc_lba(entry).context("Destination MAP LBA")?;
                 let loaded=disc.read_disc_sectors(lba,0x28)?;
                 let bindings=NativeBindings::parse(&loaded[0x10000..0x12000],&loaded[0x12000..])?;
-                let (descriptor,allocated)=copy_record_mode(&mut map,&original,cell,delta,&tiers,None,foreign.static_architecture.then_some(&bindings))?;
+                let (descriptor,allocated)=if foreign.kind=="mesh" {
+                    let translation=[0,1,2].map(|a|delta[a]+encoded_translation[a] as f32);
+                    let radius=world.draws.iter().find(|d|d.editor_uid==Some(foreign.uid)).context("Standalone copy preview missing")?.radius;
+                    let result=copy_static_mesh_record(&mut map,translation,foreign.center,radius,&tiers,&bindings)?;
+                    let prototype=ObjectRecord::parse(&original,id_at(&original,cell)?).context("Static prototype missing")?;
+                    map[result.0*32+16..result.0*32+18].copy_from_slice(&prototype.pack_index_field.to_le_bytes());
+                    result
+                }else{copy_record_mode(&mut map,&original,cell,delta,&tiers,None,foreign.static_architecture.then_some(&bindings))?};
                 let mut candidate=DiscPatcher::open(disc.image().to_vec())?;candidate.patch_prot_entry(entry,0,&map)?;
                 Ok((candidate,descriptor,allocated))
             }){
@@ -234,7 +292,7 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
             continue;
         }
         if let Some(candidate)=attempt(&label,log,||{
-            anyhow::ensure!(matches!(foreign.kind.as_str(),"placement"|"terrain"),"Existing native import writer has no {} descriptor/actor adapter; no different source object substituted",foreign.kind);
+            anyhow::ensure!(matches!(foreign.kind.as_str(),"placement"|"terrain"|"mesh"),"Existing native import writer has no {} descriptor/actor adapter; no different source object substituted",foreign.kind);
             let mut isolated=world.clone();
             isolated.draws.retain(|d|d.editor_uid.is_none()||d.editor_uid==Some(foreign.uid));
             for d in &mut isolated.draws{d.hidden=false;d.offset=[0.;3];d.rotation=[0.;3];d.scale=[1.;3];}
@@ -368,9 +426,9 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
             let anchor=[cell.0 as i32+r.col_delta as i32,cell.1 as i32+r.row_delta as i32];
             let anchor_word=if (0..128).contains(&anchor[0])&&(0..128).contains(&anchor[1]){Some(u16::from_le_bytes(map[grid((anchor[0]as u8,anchor[1]as u8))..][..2].try_into()?))}else{None};
             let donor=legaia_engine_world_views::scene_staging::assemble_field_scene(index,&foreign.source).map_err(anyhow::Error::msg)?;
-            let original=if foreign.kind=="terrain"{donor.terrain.get(foreign.record)}else{donor.placements.get(foreign.record)}.context("Donor draw missing")?;
+            let original=if foreign.kind=="mesh" {None}else{Some(if foreign.kind=="terrain"{donor.terrain.get(foreign.record)}else{donor.placements.get(foreign.record)}.context("Donor draw missing")?)};
             let donor_native=Scene::load(index,&foreign.source)?;
-            let binding=donor_native.field_object_binds(index)?.and_then(|b|b.get(&original.anchor).copied());
+            let binding=if let Some(original)=original {donor_native.field_object_binds(index)?.and_then(|b|b.get(&original.anchor).copied())}else{None};
             let binding_evidence=if let Some(binding)=binding{
                 let man=donor_native.field_man_payload(index)?.context("Donor bound object has no MAN")?;
                 let inventory=super::super::native_script_dependencies::SceneInventory::read(&man).map_err(anyhow::Error::msg)?;
@@ -400,7 +458,7 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
                 "behavior_detachment_requested":foreign.static_architecture,
                 "donor_binding_evidence":binding_evidence,
                 "native_loader_identity":{"status":"independent_static_contract_matched_cumulatively","runtime_verified":false,"relocated_tmd_sha256":actual,"relocated_tmd_bytes":loaded_model.bytes.len(),"scene_selector":r.pack_index_field,"global_slot":r.pack_index_field as usize+5,"pointer_table_address":format!("{:#x}",0x8007c018+(r.pack_index_field as u32+5)*4)},
-                "native_reference":{"map_entry":entry,"descriptor":id,"cell":cell,"anchor":anchor,"anchor_word":anchor_word,"rotation_ticks":[r.rot_x,r.rot_y,r.rot_z],"offsets":[r.x_off,r.y_off,r.z_off],"cull_radius":original.cull_radius},
+                "native_reference":{"map_entry":entry,"descriptor":id,"cell":cell,"anchor":anchor,"anchor_word":anchor_word,"rotation_ticks":[r.rot_x,r.rot_y,r.rot_z],"offsets":[r.x_off,r.y_off,r.z_off],"cull_radius":r.cull_radius},
                 "render_visibility_verified":false,"collision_interaction_verified":false,"missing_or_unverified_dependencies":gaps}))
         })();
         let value=match result{Ok(value)=>value,Err(e)=>{log.push(format!("FAILED FINAL IDENTITY UID {}: {e:#}",foreign.uid));serde_json::json!({"uid":foreign.uid,"source_scene":foreign.source,"category":foreign.kind,"encoded_successfully":false,"img_write_readback_verified":false,"native_loader_identity":{"status":"failed_or_unavailable","runtime_verified":false},"render_visibility_verified":false,"collision_interaction_verified":false,"missing_or_unverified_dependencies":[format!("{e:#}")]})}};
@@ -522,6 +580,34 @@ mod tests {
         assert_eq!(field_objects::world_x(cell.0,rec.x_off),field_objects::world_x(source.0,0));
         assert_eq!(field_objects::world_z(cell.1,rec.z_off),field_objects::world_z(source.1,0));
         for i in 0..MAP_LEN {assert!(map[i]==before[i]||(id*32..id*32+32).contains(&i)||(grid(cell)..grid(cell)+2).contains(&i));}
+        Ok(())
+    }
+    #[test]
+    fn standalone_mesh_uses_independent_unbound_records_and_keeps_retail_walls()->Result<()> {
+        let mut map=vec![0u8;MAP_LEN];
+        let before=map.clone();
+        let binding=NativeBindings::parse(&map[0x10000..0x12000],&map[0x12000..])?;
+        let (a,cell_a)=copy_static_mesh_record(&mut map,[400.,0.,400.],[400.,0.,400.],80.,&[Some(0);16],&binding)?;
+        let (b,cell_b)=copy_static_mesh_record(&mut map,[600.,0.,600.],[600.,0.,600.],80.,&[Some(0);16],&binding)?;
+        assert_ne!(a,b);assert_ne!(cell_a,cell_b);
+        for (id,cell,world) in [(a,cell_a,400),(b,cell_b,600)] {
+            let rec=ObjectRecord::parse(&map,id).unwrap();
+            assert_eq!(rec.flags,0x0012);
+            assert_eq!(field_objects::world_x(cell.0,rec.x_off),world);
+            assert_eq!(field_objects::world_z(cell.1,rec.z_off),world);
+            assert_ne!(u16::from_le_bytes(map[grid(cell)..grid(cell)+2].try_into()?)&field_objects::CELL_VISIBLE,0);
+        }
+        assert_eq!(&map[WALL_OFF..GRID_OFF],&before[WALL_OFF..GRID_OFF]);
+        assert_eq!(&map[0x10000..],&before[0x10000..]);
+        Ok(())
+    }
+    #[test]
+    fn standalone_mesh_rejects_unencodable_y_without_mutating_source()->Result<()> {
+        let original=vec![0u8;MAP_LEN];let binding=NativeBindings::parse(&original[0x10000..0x12000],&original[0x12000..])?;
+        let mut staged=original.clone();
+        let error=copy_static_mesh_record(&mut staged,[400.,100000.,400.],[400.,100000.,400.],0.,&[Some(0);16],&binding).unwrap_err();
+        assert!(format!("{error:#}").contains("i16"));
+        assert_eq!(original,vec![0u8;MAP_LEN]);
         Ok(())
     }
     #[test]

@@ -37,10 +37,11 @@ fn multiple_towns_and_categories_share_one_native_dependency_inventory() -> Resu
         let request=&first.requests[&InstanceId::Created(foreign.uid)];
         ensure!(request.resources.iter().any(|id|id.kind==ResourceKind::Tmd && first.resources[id].payload.as_deref()==Some(foreign.raw_tmd.as_slice())),"Donor bytes lost");
     }
-    ensure!(first.validate_routes().is_err(),"Unsupported terrain/raw mesh routes accepted");
+    ensure!(first.requests.values().filter(|r|r.category==Category::RawMesh).all(|r|r.adapter==native_asset_plan::Adapter::ResidentStaticBridge),"Standalone mesh registration route missing");
+    ensure!(first.validate_routes().is_err(),"Unsupported terrain route accepted");
     let mut unsupported=world.clone();unsupported.collision.recipes.clear();unsupported.collision.mesh_recipes.clear();
     let error=plan_export(&source,&target,&unsupported,&lib.index).err().context("Unsupported categories generated a writable plan")?;
-    let text=format!("{error:#}");ensure!(text.contains("TerrainTile") && text.contains("RawMesh") && text.contains("No requested instance was omitted"),"Incomplete category rejection: {text}");
+    let text=format!("{error:#}");ensure!(text.contains("TerrainTile") && !text.contains("RawMesh") && text.contains("No requested instance was omitted"),"Incomplete category rejection: {text}");
     let mut stale=world.clone();stale.foreign[0].raw_tmd[0]^=1;
     ensure!(native_asset_plan::collect(&target,&stale,&lib.index).is_err(),"Stale native donor bytes accepted");
     ensure!(scene_instances::serialize(&target.name,&world)==saved,"Inventory changed document");

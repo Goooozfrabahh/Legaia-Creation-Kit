@@ -1660,36 +1660,56 @@ impl NativeExportPlan {
         if unrestricted::active(){unrestricted::diagnostic(format!("VRAM allocation protects {} runtime/CLUT-walk rectangles, existing ordered uploads, assembled destination resources and boot-resident uploads; unrestricted object export remains enabled",reservations.len()));}
         if let Some(observed)=observations {planner.reserve_observations(observed)?;}
         for foreign in foreign {
-            export_check!(foreign.kind=="placement" || (unrestricted::active()&&foreign.kind=="terrain"),"Foreign UID {} category {} requires a native actor/terrain/behavior writer",foreign.uid,foreign.kind);
+            export_check!(foreign.kind=="placement" || foreign.kind=="mesh" || (unrestricted::active()&&foreign.kind=="terrain"),"Foreign UID {} category {} requires a native actor/terrain/behavior writer",foreign.uid,foreign.kind);
             let cached=world.foreign.iter().find(|f|f.uid==foreign.uid).context("Persisted foreign UID has no provenance")?;
             export_check!(cached.source==foreign.source&&cached.kind==foreign.kind&&cached.record==foreign.record,"Foreign provenance identity mismatch");
             let native=Scene::load(index,&foreign.source)?;
             let assembled=legaia_engine_world_views::scene_staging::assemble_field_scene(index,&foreign.source).map_err(anyhow::Error::msg)?;
             let terrain=foreign.kind=="terrain";
-            let placed=if terrain {assembled.terrain.get(foreign.record)}else{assembled.placements.get(foreign.record)}.context("Persisted donor native MAP draw missing")?;
+            let mesh=foreign.kind=="mesh";
+            let placed=if mesh {None}else if terrain {assembled.terrain.get(foreign.record)}else{assembled.placements.get(foreign.record)};
+            export_check!(mesh || placed.is_some(),"Persisted donor native MAP draw missing");
             let donor_map=native.field_map_index(index).context("No donor native MAP")? as usize;
-            let source_map=index.entry_bytes(donor_map as u32)?;
-            let (record_id,_)=record_at_kind(&source_map,placed.cell,(placed.world_x,placed.world_z),placed.env_slot,[placed.rot_x,placed.rot_y,placed.rot_z],terrain)?;
-            export_check!(cached.native_record.as_ref().is_some_and(|r|source_map[record_id*32..record_id*32+32]==r[..]),"Saved donor descriptor provenance changed or unresolved");
+            let selector=if mesh {
+                // World Object Mesh ordinal is the environment pool selector,
+                // not a MAP descriptor and not a scene-resource array index.
+                assembled.env_tmds.get(foreign.record).context("Standalone TMD is not in donor environment pool")?;
+                foreign.record
+            }else{
+                let placed=placed.context("MAP source missing")?;
+                let source_map=index.entry_bytes(donor_map as u32)?;
+                let (record_id,_)=record_at_kind(&source_map,placed.cell,(placed.world_x,placed.world_z),placed.env_slot,[placed.rot_x,placed.rot_y,placed.rot_z],terrain)?;
+                export_check!(cached.native_record.as_ref().is_some_and(|r|source_map[record_id*32..record_id*32+32]==r[..]),"Saved donor descriptor provenance changed or unresolved");
+                placed.env_slot
+            };
+            if mesh {export_check!(foreign.static_architecture && cached.native_record.is_none(),
+                "Standalone TMD Reference must have no original MAP script/placement identity");}
             let bank=legaia_engine_scene::model_bank::SceneModelBank::build(&native);
-            let source=bank.scene_source(u16::try_from(placed.env_slot)?).context("Native scene model selector has no registration source")?;
-            let models=bank.materialise(&native);let model=models.get(placed.env_slot).and_then(|m|m.as_ref()).context("Native model registration source failed to decode")?;
+            let source=bank.scene_source(u16::try_from(selector)?).context("Native scene model selector has no registration source")?;
+            let models=bank.materialise(&native);let model=models.get(selector).and_then(|m|m.as_ref()).context("Native model registration source failed to decode")?;
             anyhow::ensure!(model.starts_with(&cached.raw_tmd)||cached.raw_tmd.starts_with(model),"Native model bank selector does not match selected donor TMD; no different mesh substituted");
             let model_entry=match source {
                 legaia_engine_scene::model_bank::ModelSource::BundlePack{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::BundleSingle{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::StreamPack{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::StreamSingle{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::WalkedPack{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::WalkedSingle{entry_idx,..}=>entry_idx,
             };
             let mut inventory=NativeAssetPlan::default();let id=inventory.register(ResourceKind::Tmd,model,Origin{scene:foreign.source.clone(),entry:Some(model_entry),offset:None},false)?;
             let context=super::native_asset_plan::static_resources::resolve_context(index,&native)?;
-            let canonical=context.dependencies(&native,u16::try_from(placed.env_slot)?,model)?;
-            if unrestricted::active(){unrestricted::diagnostic(format!("NATIVE DONOR RESOLVED UID {}: selector {} -> {source:?}; exact TMD {} bytes SHA256 {}; canonical static dependencies {}",foreign.uid,placed.env_slot,model.len(),id.sha256,serde_json::to_string(&canonical)?));}
+            let canonical=context.dependencies(&native,u16::try_from(selector)?,model)?;
+            if unrestricted::active(){unrestricted::diagnostic(format!("NATIVE DONOR RESOLVED UID {}: selector {} -> {source:?}; exact TMD {} bytes SHA256 {}; canonical static dependencies {}",foreign.uid,selector,model.len(),id.sha256,serde_json::to_string(&canonical)?));}
             let events=context.register_uploads(&mut inventory)?;
             let trace=UploadTrace::verify_native_replay(&inventory,&events,&context.vram,"Canonical native carrier/typed-stream order; boot first; static loader contract only")?;
             let relocation=planner.plan_multi(&inventory,&trace,&[id.clone()])?;
             if unrestricted::active(){for resource in relocation.resource_diagnostics(){unrestricted::diagnostic(format!("RESOURCE ENCODED for UID {}: {resource}",foreign.uid));}}
             let (compiled,registration)=Self::compile_scene_resources(&staged,map_entry,&inventory,&before,&relocation,limits)?;
-            let source_tiers=native.field_floor_height_lut(index)?.context("Donor native floor ladder unresolved")?.map(|y|Some(-(y as i32)));
             let delta=[0,1,2].map(|axis|foreign.center[axis]-cached.donor_center[axis]);
-            let candidate=Self::compile_registered_copy(compiled,map_entry,donor_map,placed.cell,foreign.uid,&id,&registration,delta,&source_tiers,&tiers,Some(model),foreign.static_architecture)?;
+            let candidate=if mesh {
+                let radius=world.draws.iter().find(|d|d.editor_uid==Some(foreign.uid))
+                    .context("Standalone TMD preview instance missing")?.radius;
+                Self::compile_registered_static_mesh(compiled,map_entry,foreign.uid,&id,&registration,delta,foreign.center,radius,&tiers)?
+            }else{
+                let placed=placed.context("MAP source missing")?;
+                let source_tiers=native.field_floor_height_lut(index)?.context("Donor native floor ladder unresolved")?.map(|y|Some(-(y as i32)));
+                Self::compile_registered_copy(compiled,map_entry,donor_map,placed.cell,foreign.uid,&id,&registration,delta,&source_tiers,&tiers,Some(model),foreign.static_architecture)?
+            };
             before=relocation.apply(&before)?;
             let NativeImportCandidate{disc,descriptor,cell,uid,selector,..}=candidate;staged=disc;placements.push((uid,descriptor,cell,selector));last=Some((descriptor,cell,uid,selector));
         }
@@ -1701,6 +1721,46 @@ impl NativeExportPlan {
         }
         if let Some(session)=session{*session=Some((planner,before));}
         Ok(candidate)
+    }
+    /// A catalogued bare/static TMD has an exact registered scene selector,
+    /// but no original MAP placement to clone. Author a new unbound 0x0012
+    /// decoration reference and bind ONLY the verified registered model ID.
+    /// This explicitly excludes MAN behavior, native wall/floor ownership,
+    /// runtime-generated geometry and unverified draw/heap compatibility.
+    pub(in crate::app) fn compile_registered_static_mesh(
+        mut disc:DiscPatcher,map_entry:usize,uid:u64,
+        model:&super::native_asset_plan::ResourceId,
+        registration:&super::native_asset_plan::scene_registration::SceneRegistration,
+        delta:[f32;3],anchor_center:[f32;3],radius:f32,destination_tiers:&[Option<i32>;16],
+    )->Result<NativeImportCandidate>{
+        let original=disc.read_entry_footprint(map_entry)?;
+        export_check!(original.len()==MAP_LEN,"Destination MAP footprint invalid");
+        let lba=disc.entry_disc_lba(map_entry).context("Destination MAP LBA")?;
+        let loaded=disc.read_disc_sectors(lba,0x28)?;
+        let bindings=NativeBindings::parse(&loaded[0x10000..0x12000],&loaded[0x12000..])?;
+        let mut map=original.clone();
+        let (descriptor,cell)=unrestricted::copy_static_mesh_record(&mut map,delta,anchor_center,radius,destination_tiers,&bindings)?;
+        let raw:[u8;32]=map[descriptor*32..descriptor*32+32].try_into()?;
+        map[descriptor*32..descriptor*32+32].copy_from_slice(&registration.bind_static_decoration(model,&raw)?);
+        let selector=registration.selector(model)?;
+        let bundle=disc.read_entry_footprint(map_entry+3)?;
+        let pac=if super::native_asset_plan::scene_registration::native_stream_mode(&bundle).is_some(){Some(disc.read_entry_footprint(map_entry+4)?)}else{None};
+        let pool=super::native_asset_plan::scene_registration::native_model_pool(&bundle,pac.as_deref());
+        export_check!(pool.get(selector as usize).is_some(),"Static TMD is not registered in final destination bank");
+        let written=ObjectRecord::parse(&map,descriptor).context("Static TMD native record readback")?;
+        export_check!(written.pack_index_field==selector && written.flags==0x0012 && !written.is_placed(),"Static TMD MAP descriptor changed class/selector");
+        export_check!(original[WALL_OFF..GRID_OFF]==map[WALL_OFF..GRID_OFF] && original[0x10000..]==map[0x10000..],
+            "Standalone static TMD import modified native walls, floors or MAN/trigger dependencies");
+        let grid=GRID_OFF+(cell.1 as usize*GRID_DIM+cell.0 as usize)*2;
+        for i in 0..MAP_LEN {
+            export_check!(original[i]==map[i] || (descriptor*32..descriptor*32+32).contains(&i) || (grid..grid+2).contains(&i),
+                "Standalone TMD import changed unrelated MAP byte {i:#x}");
+        }
+        disc.patch_prot_entry(map_entry,0,&map)?;
+        export_check!(disc.read_entry_footprint(map_entry)?==map,"Standalone TMD disc sector readback differs");
+        Ok(NativeImportCandidate{disc,descriptor,cell,uid,selector,pending_collision_recipes:0,
+            placements:vec![(uid,descriptor,cell,selector)],native_walls:None,collision_diagnostics:vec![
+                "Standalone TMD: unbound static decoration; behavior, walkable floors and gameplay unverified".into()]})
     }
     /// Combine a registered donor resource with an independently allocated
     /// native MAP descriptor. Uses real donor records, never destination donor
@@ -2845,3 +2905,7 @@ mod form_export_tests;
 #[cfg(test)]
 #[path="stage_a_export_repair_tests.rs"]
 mod stage_a_export_repair_tests;
+
+#[cfg(test)]
+#[path="static_placement_tests.rs"]
+mod static_placement_tests;

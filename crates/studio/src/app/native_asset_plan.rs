@@ -106,6 +106,7 @@ fn route(category:Category,foreign:bool)->Adapter {
     match (category,foreign) {
         (Category::MapPlacement,false)=>Adapter::NativeMap,
         (Category::MapPlacement,true)=>Adapter::ResidentStaticBridge,
+        (Category::RawMesh,true)=>Adapter::ResidentStaticBridge,
         (Category::TerrainTile,false)=>Adapter::NativeTerrain,
         (Category::Actor,false)=>Adapter::NativeMan,
         _=>Adapter::Unsupported,
@@ -219,7 +220,7 @@ mod tests {
     #[test]
     fn category_adapters_fail_closed_without_a_native_writer() {
         for (category,local,foreign) in [(Category::MapPlacement,Adapter::NativeMap,Adapter::ResidentStaticBridge),
-            (Category::TerrainTile,Adapter::NativeTerrain,Adapter::Unsupported),(Category::RawMesh,Adapter::Unsupported,Adapter::Unsupported),
+            (Category::TerrainTile,Adapter::NativeTerrain,Adapter::Unsupported),(Category::RawMesh,Adapter::Unsupported,Adapter::ResidentStaticBridge),
             (Category::Actor,Adapter::NativeMan,Adapter::Unsupported)] {
             assert_eq!(route(category,false),local);assert_eq!(route(category,true),foreign);
             let request=Request{id:InstanceId::Created(9),source:"donor".into(),category,source_record:0,adapter:foreign,resources:BTreeSet::new(),requirements:requirements(category)};
