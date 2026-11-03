@@ -319,7 +319,8 @@ pub(super) fn parse(text: &str, scene_name: &str, world: &WorldModel) -> Result<
                 if uid==0 || !seen_ids.insert(uid){return Err(format!("Duplicate or zero foreign UID at line {at}"));}
                 let source=decode_name(items[2])?;
                 let kind=items[3];
-                if !matches!(kind,"placement"|"terrain"|"mesh") {
+                if !matches!(kind,"placement"|"terrain"|"mesh") &&
+                    super::floor_tiles::decode_floor_kind(kind).is_none() {
                     return Err(format!("Unsupported FOREIGN donor kind at line {at}"));
                 }
                 let record=items[4].parse::<usize>().map_err(|_|format!("Invalid donor record at line {at}"))?;

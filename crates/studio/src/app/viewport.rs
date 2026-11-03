@@ -15,6 +15,10 @@ pub(crate) struct Viewport {
     /// ID captured at primary mouse-down on the already selected mesh.
     /// While held, LMB moves that instance instead of panning the camera.
     pub world_left_drag_selected: Option<u32>,
+    // LCK_G5_PAN_WITHOUT_SELECTION
+    // Sticky until the next mouse-down, including the release frame.
+    pub world_pan_dragged: bool,
+    pub world_ground_edit: bool,
     pub world_selected: Vec<u32>,
     rendered_selection: Vec<u32>,
     rendered: Option<(Camera, Shading, [usize; 2], u64, Option<u32>, bool, bool)>,
@@ -40,6 +44,7 @@ impl Viewport {
             world_mirrored: true,
             world_orbit_anchor: None,
             world_left_drag_selected: None,
+            world_pan_dragged: false,world_ground_edit:false,
             world_selected: Vec::new(), rendered_selection: Vec::new(),
             rendered: None, tex: None,
         }
@@ -108,6 +113,9 @@ impl Viewport {
             ((rect.height() * ppp) as usize).clamp(16, max_h.max(16)),
         ];
         if world {
+            if ui.input(|i|i.pointer.primary_pressed()) {
+                self.world_pan_dragged=false;
+            }
             // Capture on mouse-down, BEFORE handling any camera movement.
             // Egui's dragged_by fires later, but the press must reserve the
             // gesture immediately so the camera never jumps at drag start.
@@ -119,7 +127,11 @@ impl Viewport {
                     resp.interact_pointer_pos().and_then(|pos| {
                         let point = world_screen_pick_point(rect, pos, px, mirror);
                         let hit = raster::pick_instance(model, self.cam, px[0], px[1], point);
-                        hit.filter(|id|selected==Some(*id)||self.world_selected.contains(id)||ui.input(|i|i.modifiers.shift))
+                        hit.filter(|id|if self.world_ground_edit {
+                            *id>=0xE000_0000 && self.world_selected.contains(id)
+                        }else{
+                            selected==Some(*id)||self.world_selected.contains(id)
+                        })
                     })
                 } else { None };
             }
@@ -136,6 +148,9 @@ impl Viewport {
                 // An asset held from All Objects owns the pointer until release;
                 // do not pan/orbit/dolly a scene while placing it.
             } else if (middle && shift) || (left && !alt && self.world_left_drag_selected.is_none()) {
+                if left && !alt && self.world_left_drag_selected.is_none() {
+                    self.world_pan_dragged=true;
+                }
                 // Shift the camera's orbit pivot parallel to the view plane;
                 // dragging right/down moves the scenery right/down.
                 let (sy, cy) = self.cam.yaw.sin_cos();

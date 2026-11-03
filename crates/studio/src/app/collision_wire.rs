@@ -44,6 +44,13 @@ pub(super) struct CollisionGrid {
 }
 
 impl CollisionGrid {
+    pub(super) fn with_wall_overrides(&self,walls:&std::collections::BTreeMap<(i32,i32),bool>)->Self{
+        let mut next=self.clone();
+        for (&(x,z),&occupied) in walls {
+            if let Some((idx,bit))=wall_offset(x,z){if occupied{next.bytes[idx]|=bit;}else{next.bytes[idx]&=!bit;}}
+        }
+        next
+    }
     pub fn with_owned_map(&self,map:&[u8])->Result<Self>{anyhow::ensure!(map.len()==0x12000,"Incomplete owned MAP preview");let mut next=self.clone();next.bytes=map[0x4000..0x8000].to_vec();Ok(next)}
     pub fn load(index: &ProtIndex, name: &str, source_key: &str) -> Result<Self> {
         let scene = Scene::load(index, name)
@@ -56,12 +63,12 @@ impl CollisionGrid {
         Ok(Self { scene: name.to_string(), source_key: source_key.to_string(), bytes, lut })
     }
 
-    fn native_wall(&self, sx: i32, sz: i32) -> bool {
+    pub(super) fn native_wall(&self, sx: i32, sz: i32) -> bool {
         wall_offset(sx, sz)
             .is_some_and(|(idx, bit)| self.bytes[idx] & bit != 0)
     }
 
-    fn ground_y(&self, wx: f32, wz: f32) -> f32 {
+    pub(super) fn ground_y(&self, wx: f32, wz: f32) -> f32 {
         let col = ((wx / 128.0).floor() as i32).clamp(0, 127) as usize;
         let row = ((wz / 128.0).floor() as i32).clamp(0, 127) as usize;
         self.lut[(self.bytes[row * DIM + col] & 15) as usize] as f32
@@ -70,7 +77,7 @@ impl CollisionGrid {
 
 /// The 2-bit sub-cell selector occupies the UPPER nibble. The Z +2
 /// offset exactly matches the live retail wall query and Stage M3 exporter.
-fn wall_offset(sx: i32, sz: i32) -> Option<(usize, u8)> {
+pub(super) fn wall_offset(sx: i32, sz: i32) -> Option<(usize, u8)> {
     if !(0..SUB_DIM).contains(&sx) || !(0..SUB_DIM).contains(&sz) {
         return None;
     }

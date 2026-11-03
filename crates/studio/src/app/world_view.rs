@@ -327,6 +327,8 @@ impl WorldModel {
             "placement" => donor.placements.get(record).map(|p|p.res_tmd),
             "terrain" => donor.terrain.get(record).map(|p|p.res_tmd),
             "mesh" => donor.env_tmds.get(record).copied(),
+            _ if super::floor_tiles::decode_floor_kind(kind).is_some() =>
+                donor.env_tmds.get(record).copied(),
             _ => None,
         }.ok_or("Could not identify the donor source TMD slot")?;
         let raw_tmd = donor.res.tmds.get(source_slot)
@@ -777,12 +779,26 @@ pub(super) fn foreign_original_geometry(donor:&AssembledScene,kind:&str,record:u
         "placement"=>Some(donor.placements.get(record).ok_or("Original MAP object missing")?),
         "terrain"=>Some(donor.terrain.get(record).ok_or("Original terrain object missing")?),
         "mesh"=>None,
+        _ if super::floor_tiles::decode_floor_kind(kind).is_some()=>None,
         _=>return Err("Only original MAP/terrain/TMD assets can be imported as geometry; MAN actors still need animation/script and model relocation".into()),
     };
     let slot=if let Some(d)=draw {d.res_tmd}
         else {*donor.env_tmds.get(record).ok_or("Original TMD slot missing")?};
     let raw=donor.res.tmds.get(slot).ok_or("Original donor TMD missing")?;
-    let mesh=Model::from_tmd(&raw.raw).ok_or("Original donor TMD could not be decoded")?;
+    let mesh=if let Some((object,primitive))=
+        super::floor_tiles::decode_floor_kind(kind) {
+        let face=super::floor_tiles::scan_faces(
+            &raw.tmd,&raw.raw,&donor.res.vram
+        ).into_iter()
+            .find(|f|f.object==object && f.primitive==primitive)
+            .ok_or("Original floor face no longer exists")?;
+
+        super::floor_tiles::preview_model(donor,record,face)
+            .ok_or("Cannot isolate original floor face")?
+    } else {
+        Model::from_tmd(&raw.raw)
+            .ok_or("Original donor TMD could not be decoded")?
+    };
     let points=if let Some(d)=draw {
         let native=donor.draw_world_position(d);
         let lift=[native[0]-d.world_x as f32,native[1]-d.world_y as f32,

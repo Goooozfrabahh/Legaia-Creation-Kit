@@ -34,7 +34,8 @@ pub(super) struct MeshOnlyRecipe {
 impl MeshOnlyRecipe {
     pub fn validate(&self)->Result<(),String> {
         if self.uid==0 || self.scene.is_empty() || self.scene.len()>128 ||
-            !matches!(self.kind.as_str(),"mesh"|"placement"|"terrain") ||
+            !(matches!(self.kind.as_str(),"mesh"|"placement"|"terrain") ||
+                super::floor_tiles::decode_floor_kind(&self.kind).is_some()) ||
             self.tmd_sha256.len()!=64 || !self.tmd_sha256.bytes().all(|b|b.is_ascii_hexdigit()) {
             return Err("Invalid mesh-only collision provenance".into());
         }

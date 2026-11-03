@@ -1910,6 +1910,12 @@ fn validate_source_archive(disc:&DiscPatcher,index:&ProtIndex)->Result<()> {
 
 pub(super) fn plan_export(source:&Path, scene:&AssembledScene, world:&WorldModel,
     index:&ProtIndex) -> Result<NativeExportPlan> {
+    if world.foreign.iter().any(|f|
+        super::floor_tiles::decode_floor_kind(&f.kind).is_some()) {
+        anyhow::bail!(
+            "Original floor-face instances are editor-staged only.              Native TMD submesh and MAP walkability export are not yet implemented."
+        );
+    }
     let dependencies=super::native_asset_plan::collect(scene,world,index);
     let inventory=match &dependencies {Ok(plan)=>plan.summary(),Err(error)=>format!("Native asset inventory unresolved: {error:#}")};
     export_check!(world.collision.recipes.is_empty() && world.collision.mesh_recipes.is_empty(),"Authored collision recipes are in-memory only; native IMG export is not enabled for these edits. No collision intent was discarded.\n{}",
