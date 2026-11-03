@@ -23,6 +23,19 @@ pub(super) struct State {
 #[derive(serde::Serialize,serde::Deserialize)]
 struct Document {version:u32,scene:String,walls:Vec<(i32,i32,bool)>,heights:Vec<(i32,i32,i32)>}
 impl State {
+    pub(super) fn native_edit_snapshot(
+        &self
+    )->(Vec<(i32,i32,bool)>,Vec<(i32,i32,i32)>) {
+        let walls=self.walls.iter()
+            .map(|(&(x,z),&occupied)|(x,z,occupied))
+            .collect();
+        let heights=self.heights.iter()
+            .filter(|(_,offset)| **offset!=0)
+            .map(|(&(x,z),&offset)|(x,z,offset))
+            .collect();
+        (walls,heights)
+    }
+
     pub fn has_edits(&self)->bool { !self.walls.is_empty() || self.heights.values().any(|&y|y!=0) }
     pub fn has_selection(&self)->bool { !self.selected.is_empty() }
     pub fn clear_for_scene(&mut self,scene:&str){ if self.scene!=scene {*self=Self{scene:scene.into(),..Self::default()};} }

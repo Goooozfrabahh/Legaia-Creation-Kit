@@ -39,6 +39,7 @@ mod placement_drop;
 mod cell_catalog;
 mod ps1_export;
 mod export_integration;
+mod export_manifest;
 mod collision_wire;
 mod collision_edit;
 mod floor_debug;
@@ -48,6 +49,7 @@ mod floor_tiles;
 mod ground_select;
 mod ground_edit_ops;
 mod native_ground_delete;
+mod unified_ground_export;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -3610,14 +3612,123 @@ impl App {
                     // LCK_UI_UNIVERSAL_EXPORT
                     let lck_has_floor_edits = !self.ground_edits.copies.is_empty() || !self.ground_edits.originals.is_empty();
                     let lck_has_floor_deletions = !self.ground_edits.deleted.is_empty();
+                    // LCK_U1B1_MANIFEST_SNAPSHOT
+                    let lck_u1b_manifest=export_manifest::capture(
+                        &scene.name,world,&self.ground_edits,&self.collision_edit
+                    );
+                    ui.collapsing("U1B.1 - Pending edit manifest",|ui|{
+                        ui.small(lck_u1b_manifest.summary());
+                        ui.small("Audit only: current U1A export routing is unchanged.");
+                        for notice in lck_u1b_manifest.notices.iter().take(5){
+                            ui.label(notice);
+                        }
+                    });
                     let lck_export_pressed = ui.add_enabled(self.ps1_export_job.is_none(), egui::Button::new("Export IMG..."))
-                        .on_hover_text("Experimental export: chooses floor edits, floor deletions, or object/NPC export. Mixed edits are not yet combined.")
+                        .on_hover_text("U1B.2: mixed object, aligned native ground, and collision export is experimental. Unsupported floor operations are reported instead of silently omitted.")
                         .clicked();
-                    if lck_export_pressed && self.collision_edit.has_edits()
-                        && (lck_has_floor_edits || lck_has_floor_deletions) {
-                        self.studio.error=Some(
-                            "Collision + floor edits cannot yet be combined by U1A. No incomplete IMG was written. Save the scene and use the separate test paths until U1B.".into()
-                        );
+                    // Freeze an audit snapshot at the exact export click.
+                    // This does not yet replace U1A's native compiler.
+                    if lck_export_pressed {
+                        if let Err(error)=export_manifest::write_report(
+                            &lck_u1b_manifest
+                        ){
+                            log::warn!(
+                                "U1B.1 edit manifest report unavailable: {error}"
+                            );
+                        }
+                    }
+
+                    // LCK_U1B2_MIXED_EXPORT
+                    let lck_native_edits=
+                        collision_edit::scene_has_instance_edits(&scene.name,world);
+
+                    if lck_export_pressed
+                        && self.ground_edits.has_edits()
+                        && (lck_native_edits || self.collision_edit.has_edits())
+                    {
+                        let result=(||->anyhow::Result<Option<()>>{
+                            let lib=self.studio.library.as_ref()
+                                .ok_or_else(||anyhow::anyhow!("Open a native PS1 IMG"))?;
+
+                            let source=match &lib.source {
+                                Source::Disc(path)=>path.clone(),
+                                _=>anyhow::bail!("Open the raw PS1 IMG"),
+                            };
+
+                            let suggestion=format!(
+                                "{}_{}_U1B2_MIXED.img",
+                                source.file_stem()
+                                    .and_then(|s|s.to_str())
+                                    .unwrap_or("Legaia"),
+                                scene.name
+                            );
+
+                            let mut dialog=rfd::FileDialog::new()
+                                .set_file_name(&suggestion)
+                                .add_filter("Raw PS1 IMG",&["img"]);
+
+                            if let Some(parent)=source.parent(){
+                                dialog=dialog.set_directory(parent);
+                            }
+
+                            let Some(output)=dialog.save_file()
+                            else {return Ok(None);};
+
+                            let export_scene=Arc::clone(scene);
+                            let export_world=world.as_ref().clone();
+                            let export_index=Arc::clone(&lib.index);
+
+                            let ground_snapshot=self.ground_edits.clone();
+                            let collision_snapshot=self.collision_edit.clone();
+                            let export_session=self.form_session.clone();
+
+                            let unrestricted=self.unrestricted_img_export;
+                            let native_edits=lck_native_edits;
+                            let output_label=output.display().to_string();
+
+                            let (tx,rx)=std::sync::mpsc::channel();
+                            let repaint=ctx.clone();
+
+                            std::thread::spawn(move||{
+                                let result=std::panic::catch_unwind(
+                                    std::panic::AssertUnwindSafe(||{
+                                        unified_ground_export::execute(
+                                            &source,
+                                            &output,
+                                            &export_scene,
+                                            &export_world,
+                                            &export_index,
+                                            &ground_snapshot,
+                                            &collision_snapshot,
+                                            native_edits,
+                                            unrestricted,
+                                            export_session,
+                                        )
+                                    })
+                                ).unwrap_or_else(|_|
+                                    Err(anyhow::anyhow!(
+                                        "U1B.2 worker panicked. No completed export claimed."
+                                    ))
+                                );
+
+                                let _=tx.send(result);
+                                repaint.request_repaint();
+                            });
+
+                            self.ps1_export_job=Some(rx);
+                            self.studio.error=None;
+                            self.studio.status=Some(format!(
+                                "U1B.2 mixed export running: {output_label}.                                  Final IMG will be published only after all stages pass."
+                            ));
+
+                            Ok(Some(()))
+                        })();
+
+                        if let Err(error)=result {
+                            self.studio.error=Some(format!(
+                                "U1B.2 mixed export failed to start: {error:#}"
+                            ));
+                        }
                     }
                     if lck_export_pressed && self.collision_edit.has_edits()
                         && !lck_has_floor_edits && !lck_has_floor_deletions
@@ -3638,7 +3749,7 @@ impl App {
                             match result {Ok(Some(s))=>self.studio.status=Some(s),Ok(None)=>{},Err(e)=>self.studio.error=Some(format!("Collision IMG export failed: {e:#}"))}
                         }
                     }
-                    if lck_export_pressed && !self.collision_edit.has_edits() && lck_has_floor_edits {
+                    if lck_export_pressed && !self.collision_edit.has_edits() && !lck_native_edits && lck_has_floor_edits {
                         let result=(||->anyhow::Result<Option<String>>{
                             let lib=self.studio.library.as_ref()
                                 .ok_or_else(||anyhow::anyhow!("Open a disc"))?;
@@ -3685,7 +3796,7 @@ impl App {
                         }
                     }
 
-                    if lck_export_pressed && !self.collision_edit.has_edits() && !lck_has_floor_edits && lck_has_floor_deletions {
+                    if lck_export_pressed && !self.collision_edit.has_edits() && !lck_native_edits && !lck_has_floor_edits && lck_has_floor_deletions {
                         let result=(|| -> anyhow::Result<Option<String>> {
                             let lib=self.studio.library.as_ref()
                                 .ok_or_else(||anyhow::anyhow!("Open original disc"))?;
@@ -3733,7 +3844,7 @@ impl App {
                     }
                     if self.ground_edits.has_edits() {
                         ui.colored_label(egui::Color32::YELLOW,
-                            "Native IMG walkability is NOT supported for edited floor tiles. Save the .lckscene instead.");
+                            "U1B.2: aligned native floor edits can export with objects and collision. Unsupported floor transforms require further native work.");
                     }
                     if ui.add_enabled(!self.ground_edits.has_edits(),egui::Button::new("Check IMG"))
                         .on_hover_text("Unrestricted mode bypasses compatibility preflight. With the checkbox off, run strict preparation without writing a file. Neither mode verifies gameplay.")

@@ -15,6 +15,235 @@ fn offset(cell:Cell)->usize {
     0x8000+(usize::from(cell[1])*128+usize::from(cell[0]))*2
 }
 
+
+// LCK_U1B2A_VISUAL_DELETE
+//
+// Retail regenerates ground visibility from descriptor flags.
+// A deleted floor needs a dedicated non-rendering descriptor
+// when its original is shared with neighboring ground cells.
+//
+// Do not alter wall collision, elevation, or shared originals.
+
+fn visual_delete(
+    before:&[u8],
+    after:&mut [u8],
+    deleted:&BTreeSet<Cell>,
+    replaced:&BTreeSet<Cell>,
+)->Result<BTreeSet<usize>>{
+    ensure!(
+        before.len()>=0x12000 && before.len()==after.len(),
+        "Native MAP is incomplete"
+    );
+
+    let mut used=BTreeSet::new();
+
+    for at in (0x8000..0x10000).step_by(2){
+        let word=u16::from_le_bytes(
+            before[at..at+2].try_into()?
+        );
+        used.insert(usize::from(word&0x01ff));
+    }
+
+    let mut clones=std::collections::BTreeMap::new();
+    let mut allocated=BTreeSet::new();
+
+    for &cell in deleted {
+        if replaced.contains(&cell) {
+            continue;
+        }
+
+        let at=offset(cell);
+        let old_word=u16::from_le_bytes(
+            before[at..at+2].try_into()?
+        );
+        let original_id=usize::from(old_word&0x01ff);
+        let original_at=original_id*32;
+
+        let flags=u16::from_le_bytes(
+            before[original_at+0x12..original_at+0x14]
+                .try_into()?
+        );
+
+        ensure!(
+            old_word&CELL_WALK_VISIBLE!=0 || flags&1!=0,
+            "Deleted cell {:?} is not native walk-ground",
+            cell
+        );
+
+        let mut word=u16::from_le_bytes(
+            after[at..at+2].try_into()?
+        );
+
+        word &= !CELL_WALK_VISIBLE;
+
+        if flags&1!=0 {
+            ensure!(
+                flags&0x0004==0,
+                "Tile {:?} references a placed object. \
+                 Actor-aware floor isolation is not implemented.",
+                cell
+            );
+
+            let id=if let Some(&existing)=clones.get(&original_id){
+                existing
+            }else{
+                let free=(4usize..512).find(|&candidate|{
+                    let at=candidate*32;
+
+                    !used.contains(&candidate)
+                        && before[at..at+32].iter().all(|&b|b==0)
+                        && after[at..at+32].iter().all(|&b|b==0)
+                }).context(
+                    "No unused native descriptor slot for floor deletion"
+                )?;
+
+                let target=free*32;
+
+                after[target..target+32].copy_from_slice(
+                    &before[original_at..original_at+32]
+                );
+
+                after[target+0x12..target+0x14]
+                    .copy_from_slice(
+                        &(flags&!1u16).to_le_bytes()
+                    );
+
+                used.insert(free);
+                allocated.insert(free);
+                clones.insert(original_id,free);
+
+                free
+            };
+
+            word=(word&!0x01ff)|(id as u16);
+        }
+
+        after[at..at+2].copy_from_slice(
+            &word.to_le_bytes()
+        );
+    }
+
+    // Validate the same derived visibility flags used
+    // by retail field initialization.
+    let mut runtime=after.to_vec();
+
+    legaia_engine_field::field_regions::refresh_object_grid_marks(
+        &mut runtime
+    );
+
+    for &cell in deleted {
+        if replaced.contains(&cell) {
+            continue;
+        }
+
+        let at=offset(cell);
+        let word=u16::from_le_bytes(
+            runtime[at..at+2].try_into()?
+        );
+
+        ensure!(
+            word&CELL_WALK_VISIBLE==0,
+            "Scene initialization restored deleted floor {:?}",
+            cell
+        );
+    }
+
+    // This operation must not modify any wall bits.
+    // Existing stamping can legitimately modify low
+    // floor-tier nibbles, so preserve upper nibbles only.
+    for (&a,&b) in before[0x4000..0x8000]
+        .iter().zip(&after[0x4000..0x8000])
+    {
+        ensure!(
+            a&0xf0==b&0xf0,
+            "Visual-floor operation changed collision bits"
+        );
+    }
+
+    Ok(allocated)
+}
+
+// U1B.2 mixed exporter must accept ONLY independently
+// allocated non-rendering descriptor clones.
+pub(super) fn validate_visual_descriptor_delta(
+    before:&[u8],
+    after:&[u8],
+    owned:&BTreeSet<Cell>,
+)->Result<BTreeSet<usize>>{
+    ensure!(
+        before.len()==after.len() && before.len()>=0x12000,
+        "Native MAP size mismatch"
+    );
+
+    let mut used=BTreeSet::new();
+
+    for at in (0x8000..0x10000).step_by(2){
+        let word=u16::from_le_bytes(
+            before[at..at+2].try_into()?
+        );
+        used.insert(usize::from(word&0x01ff));
+    }
+
+    let mut allowed=BTreeSet::new();
+
+    for &cell in owned {
+        let at=offset(cell);
+
+        let old=u16::from_le_bytes(
+            before[at..at+2].try_into()?
+        );
+        let new=u16::from_le_bytes(
+            after[at..at+2].try_into()?
+        );
+
+        let old_id=usize::from(old&0x01ff);
+        let new_id=usize::from(new&0x01ff);
+
+        if old_id==new_id || used.contains(&new_id) {
+            continue;
+        }
+
+        let a=old_id*32;
+        let b=new_id*32;
+
+        if !before[b..b+32].iter().all(|&v|v==0){
+            continue;
+        }
+
+        let flags=u16::from_le_bytes(
+            before[a+0x12..a+0x14].try_into()?
+        );
+
+        if flags&1==0 || flags&4!=0 {
+            continue;
+        }
+
+        let mut expected=before[a..a+32].to_vec();
+
+        expected[0x12..0x14].copy_from_slice(
+            &(flags&!1u16).to_le_bytes()
+        );
+
+        if after[b..b+32]==expected {
+            allowed.insert(new_id);
+        }
+    }
+
+    for id in 0..512usize {
+        let at=id*32;
+
+        if before[at..at+32]!=after[at..at+32]{
+            ensure!(
+                allowed.contains(&id),
+                "Unexpected native descriptor modification #{}",
+                id
+            );
+        }
+    }
+
+    Ok(allowed)
+}
+
 pub(super) fn compile(map:&[u8],deleted:&BTreeSet<Cell>)->Result<Vec<u8>> {
     ensure!(
         map.len()>=0x12000 && !deleted.is_empty(),
@@ -44,8 +273,15 @@ pub(super) fn compile(map:&[u8],deleted:&BTreeSet<Cell>)->Result<Vec<u8>> {
     }
 
     // Verify ONLY selected native grid words changed.
+    let allocated=visual_delete(
+        map,&mut output,deleted,&BTreeSet::new()
+    )?;
+
     for (i,(&old,&new)) in map.iter().zip(output.iter()).enumerate() {
         if old==new {continue;}
+        if i<0x4000 && allocated.contains(&(i/32)){
+            continue;
+        }
 
         let owned=deleted.iter().any(|&cell| {
             let at=offset(cell);
@@ -105,6 +341,15 @@ pub(super) fn export(
     let mut disc=DiscPatcher::open(original)?;
     let map=disc.read_entry_footprint(entry)?;
     let patched=compile(&map,deleted)?;
+
+    for id in 0..512usize{
+        let at=id*32;
+        if map[at..at+32]!=patched[at..at+32]{
+            disc.patch_prot_entry(
+                entry,at as u64,&patched[at..at+32]
+            )?;
+        }
+    }
 
     for &cell in deleted {
         let at=offset(cell);
@@ -268,6 +513,21 @@ fn w2b_compile(map:&[u8],deleted:&BTreeSet<Cell>,stamps:&[(Cell,Cell)])
             ));
         }
     }
+    let replaced=stamps.iter()
+        .map(|&(_,target)|target)
+        .collect::<BTreeSet<_>>();
+
+    let allocated=visual_delete(
+        map,&mut out,deleted,&replaced
+    )?;
+
+    if !allocated.is_empty(){
+        notes.push(format!(
+            "VISUAL FLOOR DELETE: {} isolated descriptors",
+            allocated.len()
+        ));
+    }
+
     Ok((out,notes))
 }
 
@@ -368,8 +628,19 @@ fn compile_stamps(
     }
 
     // Verify only specifically owned grid words changed.
+    let replaced=stamps.iter()
+        .map(|&(_,target)|target)
+        .collect::<BTreeSet<_>>();
+
+    let allocated=visual_delete(
+        map,&mut output,deleted,&replaced
+    )?;
+
     for (i,(&a,&b)) in map.iter().zip(output.iter()).enumerate(){
         if a==b {continue;}
+        if i<0x4000 && allocated.contains(&(i/32)){
+            continue;
+        }
 
         let covered=touched.iter().any(|&c|
             i==offset(c)||i==offset(c)+1
@@ -481,6 +752,14 @@ pub(super) fn export_ground(
             )?;
         }
     }else{
+        for id in 0..512usize {
+            let at=id*32;
+            if before[at..at+32]!=after[at..at+32]{
+                disc.patch_prot_entry(
+                    entry,at as u64,&after[at..at+32]
+                )?;
+            }
+        }
         for cell in touched {
             let at=offset(cell);
             disc.patch_prot_entry(entry,at as u64,&after[at..at+2])?;
@@ -678,6 +957,89 @@ mod tests {
         );
 
         assert_eq!(output[0x4000+5*128+4],7);
+
+        Ok(())
+    }
+
+
+    #[test]
+    fn visual_delete_survives_retail_initialization()->Result<()>{
+        let mut map=vec![0u8;0x12000];
+        let deleted=[12u8,13u8];
+        let neighbor=[13u8,13u8];
+        let id=17usize;
+        let base=id*32;
+
+        map[base+0x12..base+0x14]
+            .copy_from_slice(&1u16.to_le_bytes());
+
+        map[base+0x16..base+0x18]
+            .copy_from_slice(&10u16.to_le_bytes());
+
+        for cell in [deleted,neighbor]{
+            let at=offset(cell);
+            map[at..at+2].copy_from_slice(
+                &(CELL_WALK_VISIBLE|id as u16).to_le_bytes()
+            );
+        }
+
+        map[0x4000+13*128+12]=0xa7;
+
+        let output=compile(
+            &map,&BTreeSet::from([deleted])
+        )?;
+
+        assert_eq!(
+            &map[0x4000..0x8000],
+            &output[0x4000..0x8000]
+        );
+
+        assert_eq!(
+            &map[base..base+32],
+            &output[base..base+32]
+        );
+
+        let mut live=output.clone();
+
+        legaia_engine_field::field_regions::refresh_object_grid_marks(
+            &mut live
+        );
+
+        assert_eq!(
+            native_word(&live,deleted)?&CELL_WALK_VISIBLE,0
+        );
+
+        assert_ne!(
+            native_word(&live,neighbor)?&CELL_WALK_VISIBLE,0
+        );
+
+        assert_ne!(
+            native_word(&output,deleted)?&0x01ff,
+            id as u16
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn visual_delete_rejects_placed_actor_dependency()->Result<()>{
+        let mut map=vec![0u8;0x12000];
+        let cell=[9u8,9u8];
+        let id=20usize;
+        let base=id*32;
+
+        map[base+0x12..base+0x14]
+            .copy_from_slice(&5u16.to_le_bytes());
+
+        let at=offset(cell);
+
+        map[at..at+2].copy_from_slice(
+            &(CELL_WALK_VISIBLE|id as u16).to_le_bytes()
+        );
+
+        assert!(
+            compile(&map,&BTreeSet::from([cell])).is_err()
+        );
 
         Ok(())
     }

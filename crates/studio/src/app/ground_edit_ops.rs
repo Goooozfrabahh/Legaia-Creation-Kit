@@ -29,7 +29,7 @@ struct PendingPress {
     ctrl:bool,
     was_selected:bool,
 }
-#[derive(Default)]
+#[derive(Clone,Default)]
 pub(super) struct State {
     pub originals:BTreeMap<Cell,Transform>,
     pub deleted:BTreeSet<Cell>,
