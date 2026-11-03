@@ -2081,6 +2081,7 @@ fn compile_plan(source:PathBuf, mut disc:DiscPatcher, image_length:usize,
 /// Write only bytes already compiled and verified by native preflight.
 /// No resource resolution, allocation or compression occurs here.
 pub(super) fn export(plan:NativeExportPlan, output:&Path) -> Result<ExportResult> {
+    super::ps1_original_guard::ensure_new_output(&plan.source,output)?;
     if plan.unrestricted_log.is_some(){return unrestricted::publish(plan,output);}
     let output_abs=if output.is_absolute(){output.to_path_buf()}else{std::env::current_dir()?.join(output)};
     export_check!(output_abs!=plan.source,"Refusing to overwrite the source image");

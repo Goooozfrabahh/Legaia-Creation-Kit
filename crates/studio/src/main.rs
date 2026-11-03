@@ -8,7 +8,6 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use legaia_studio::Studio;
@@ -45,11 +44,10 @@ fn main() -> eframe::Result {
         _ => {}
     }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let initial = std::env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty() && !p.to_string_lossy().starts_with('-'))
-        .or_else(|| std::env::var_os("LEGAIA_STUDIO_OPEN").map(PathBuf::from));
+    // LCK_MASTER_STARTUP: always open the designated retail IMG.
+    let initial = Some(
+        legaia_studio::app::ps1_original_guard::original_path()
+    );
     let studio = Studio::new(Settings::default_path());
     let auto = Automation::from_env();
     // The size the window had when it last closed (the settings file).

@@ -222,6 +222,7 @@ pub(super) fn execute(
         output.parent().is_some_and(|p|p.is_dir()),
         "Output directory unavailable"
     );
+    super::ps1_original_guard::ensure_new_output(source,output)?;
     ensure!(floors.has_edits(),"No native ground edits requested");
     ensure!(
         floors.scene.is_empty()||floors.scene==scene.name,

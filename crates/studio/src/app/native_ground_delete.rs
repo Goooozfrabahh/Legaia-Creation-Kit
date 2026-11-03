@@ -319,6 +319,7 @@ pub(super) fn export(
     index:&ProtIndex,
     deleted:&BTreeSet<Cell>
 )->Result<String> {
+    super::ps1_original_guard::ensure_new_output(source,output)?;
     ensure!(source!=output,"Cannot overwrite source IMG");
     ensure!(
         !output.exists(),
@@ -702,6 +703,7 @@ pub(super) fn export_ground(
         (a,b,Vec::new())
     };
 
+    super::ps1_original_guard::ensure_new_output(source,output)?;
     ensure!(source!=output,"Cannot overwrite source IMG");
     ensure!(!output.exists(),"Choose a NEW output IMG");
     ensure!(

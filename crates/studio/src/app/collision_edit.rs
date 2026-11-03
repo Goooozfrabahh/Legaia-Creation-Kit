@@ -207,6 +207,7 @@ impl State {
     }
 
     pub fn overlay_existing(&self,target:&Path,name:&str,index:&ProtIndex)->Result<String>{
+        super::ps1_original_guard::ensure_existing_overlay(target)?;
         ensure!(self.scene==name,"Collision layer/scene mismatch");
         ensure!(target.exists(),"Exported IMG not found");
         ensure!(!self.walls.is_empty(),"No X/Z collision changes to overlay");
@@ -249,7 +250,13 @@ impl State {
         let tmp=target.with_extension("u1a_collision_overlaying");
         ensure!(!tmp.exists(),"Temporary overlay output already exists");
 
-        fs::write(&tmp,&bytes)?;
+        {
+            use std::io::Write as _;
+            let mut file=fs::OpenOptions::new()
+                .write(true).create_new(true).open(&tmp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
         let verified=(||->Result<()>{
             let disc=DiscPatcher::open(fs::read(&tmp)?)?;
             ensure!(disc.read_entry_footprint(entry)?==after,"Published collision overlay IMG differs");
@@ -324,6 +331,7 @@ impl State {
     }
 
     pub fn export(&self,source:&Path,output:&Path,name:&str,index:&ProtIndex)->Result<String>{
+        super::ps1_original_guard::ensure_new_output(source,output)?;
         ensure!(self.scene==name,"Collision layer/scene mismatch");
         ensure!(!self.walls.is_empty(),"No X/Z collision changes to export");
         ensure!(source!=output,"Cannot overwrite input IMG");
@@ -346,10 +354,20 @@ impl State {
         ensure!(disc.read_entry_footprint(entry)?==after,"MAP readback mismatch");
         let bytes=disc.into_image();ensure!(bytes.len()==len,"IMG length changed");
         let tmp=output.with_extension("lckcollision_building");ensure!(!tmp.exists(),"Temporary output already exists");
-        fs::write(&tmp,&bytes)?;
+        {
+            use std::io::Write as _;
+            let mut file=fs::OpenOptions::new()
+                .write(true).create_new(true).open(&tmp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
         let verified=(||->Result<()> {let disc=DiscPatcher::open(fs::read(&tmp)?)?;ensure!(disc.read_entry_footprint(entry)?==after,"Published collision IMG differs");Ok(())})();
         if let Err(e)=verified{let _=fs::remove_file(&tmp);return Err(e);}
-        if let Err(e)=fs::rename(&tmp,output){let _=fs::remove_file(&tmp);return Err(e.into());}
+        if let Err(e)=fs::hard_link(&tmp,output){
+            let _=fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        fs::remove_file(&tmp)?;
         let unsupported=self.heights.values().filter(|&&y|y!=0).count();
         let note=format!("C1 native wall edits: {} coordinates; {} vertical offsets NOT exported (retail MAP does not encode wall height). No collision ownership inferred. Gameplay unverified.",self.walls.len(),unsupported);
         let _=fs::write(output.with_extension("collision_debug.txt"),&note);

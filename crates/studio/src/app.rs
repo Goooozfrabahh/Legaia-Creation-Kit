@@ -50,6 +50,7 @@ mod ground_select;
 mod ground_edit_ops;
 mod native_ground_delete;
 mod unified_ground_export;
+pub mod ps1_original_guard;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1025,7 +1026,7 @@ impl App {
             Ok(catalog) => (catalog, None),
             Err(error) => (Catalog::default(), Some(error)),
         };
-        let (editor_cells, cell_catalog_error)=match CellStore::open(studio.settings.last_source.as_deref()) {
+        let (editor_cells, cell_catalog_error)=match CellStore::open(open.as_deref()) {
             Ok(cells)=>(cells,None),
             Err(error)=>(CellStore::default(),Some(error)),
         };

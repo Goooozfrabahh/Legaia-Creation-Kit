@@ -513,6 +513,7 @@ fn npc_attempt(disc:&mut DiscPatcher,entry:usize,npc:&world_view::NpcInfo,uid:Op
 }
 
 pub(super) fn publish(plan:NativeExportPlan,output:&Path)->Result<ExportResult>{
+    crate::app::ps1_original_guard::ensure_new_output(&plan.source,output)?;
     // Filesystem preservation stays mandatory even when native acceptance is disabled.
     let output=if output.is_absolute(){output.to_path_buf()}else{std::env::current_dir()?.join(output)};
     anyhow::ensure!(!output.exists()&&output!=plan.source,"Choose a new output file; source and existing artifacts are never overwritten");
