@@ -76,7 +76,7 @@ fn validate_draws(world:&WorldModel, edits:&[(Key,[f32;3])], scale:bool)->Result
     for &(key,value) in edits {
         let d=world.at(key.0,key.1).ok_or("Selected member no longer exists")?;
         if !seen.insert(key)||d.hidden||d.vertex_start>=d.vertex_end||d.vertex_end>model.positions.len()||d.vertex_end>model.rest.len()
-            ||value.iter().any(|v|!v.is_finite()||if scale {!(0.05..=20.0).contains(v)}else{v.abs()>=1000.0}) {
+            ||value.iter().any(|v|!v.is_finite()||if scale {!(0.05..=20.0).contains(&v.abs())}else{v.abs()>=1000.0}) {
             return Err("Invalid group transform; no objects changed".into());
         }
     }

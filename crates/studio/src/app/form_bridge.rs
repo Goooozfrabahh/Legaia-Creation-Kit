@@ -1084,7 +1084,7 @@ fn resolve_ordinal(scene: &AssembledScene, a: &LegacyBaseAdapter) -> Result<usiz
 fn validate_geometry(scene: &AssembledScene, a: &LegacyBaseAdapter, ordinal: usize) -> Result<()> {
     if let Some(expected) = a.origin.as_ref().and_then(|o| o.fingerprints.get("TMD")) {
         if a.kind != "npc" {
-            let slot = if a.kind == "mesh" {
+            let slot = if a.kind == "mesh" || super::floor_tiles::decode_floor_kind(&a.kind).is_some() {
                 scene.env_tmds.get(ordinal).copied()
             } else {
                 if a.kind == "terrain" {

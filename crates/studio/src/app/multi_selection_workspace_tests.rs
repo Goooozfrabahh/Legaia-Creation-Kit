@@ -36,6 +36,20 @@ fn click(app:&mut App,ctx:&egui::Context,pos:egui::Pos2,shift:bool,ctrl:bool) {
     frame(app,ctx,vec![egui::Event::PointerMoved(pos),egui::Event::PointerButton{pos,button:egui::PointerButton::Primary,pressed:true,modifiers}],modifiers);
     frame(app,ctx,vec![egui::Event::PointerButton{pos,button:egui::PointerButton::Primary,pressed:false,modifiers}],modifiers);
 }
+// Recompute viewport coordinates after each UI state change.
+// Selection may change viewport layout without moving the camera.
+fn click_viewport_id(
+    app:&mut App,
+    ctx:&egui::Context,
+    id:u32,
+    shift:bool,
+    ctrl:bool
+){
+    let output=frame(app,ctx,vec![],Default::default());
+    let position=viewport_hit(app,&output,id);
+    click(app,ctx,position,shift,ctrl);
+}
+
 fn key(app:&mut App,ctx:&egui::Context,key:egui::Key) {
     let modifiers=egui::Modifiers{ctrl:true,command:true,..Default::default()};
     frame(app,ctx,vec![egui::Event::Key{key,physical_key:None,pressed:true,repeat:false,modifiers}],modifiers);
@@ -45,17 +59,17 @@ fn key(app:&mut App,ctx:&egui::Context,key:egui::Key) {
 #[test]
 fn real_viewport_events_add_toggle_plain_click_and_highlight_without_editing_geometry() {
     let (mut app,ctx)=fixture();let initial=scene_instances::serialize("synthetic",world(&app));
-    let output=frame(&mut app,&ctx,vec![],Default::default());let camera=app.native_view.cam;
-    let points=[0,1,2].map(|id|viewport_hit(&app,&output,id));
-    click(&mut app,&ctx,points[0],false,false);
+    let _output=frame(&mut app,&ctx,vec![],Default::default());let camera=app.native_view.cam;
+    // Targets are recalculated before every simulated click.
+    click_viewport_id(&mut app,&ctx,0,false,false);
     assert_eq!(app.native_selection,BTreeSet::from([(false,0)]));
-    click(&mut app,&ctx,points[1],true,false);
+    click_viewport_id(&mut app,&ctx,1,true,false);
     assert_eq!(app.native_selection,BTreeSet::from([(false,0),(false,1)]));
-    click(&mut app,&ctx,points[1],true,false);assert_eq!(app.native_selection.len(),2);
-    click(&mut app,&ctx,points[2],false,true);assert_eq!(app.native_selection.len(),3);
-    click(&mut app,&ctx,points[1],false,true);assert_eq!(app.native_selection,BTreeSet::from([(false,0),(false,2)]));
+    click_viewport_id(&mut app,&ctx,1,true,false);assert_eq!(app.native_selection.len(),2);
+    click_viewport_id(&mut app,&ctx,2,false,true);assert_eq!(app.native_selection.len(),3);
+    click_viewport_id(&mut app,&ctx,1,false,true);assert_eq!(app.native_selection,BTreeSet::from([(false,0),(false,2)]));
     frame(&mut app,&ctx,vec![],Default::default());assert_eq!(app.native_view.world_selected.len(),2);
-    click(&mut app,&ctx,points[0],false,false);assert_eq!(app.native_selection,BTreeSet::from([(false,0)]));
+    click_viewport_id(&mut app,&ctx,0,false,false);assert_eq!(app.native_selection,BTreeSet::from([(false,0)]));
     assert_eq!(app.native_view.cam,camera);assert_eq!(scene_instances::serialize("synthetic",world(&app)),initial);
     assert!(app.editor_undo.is_empty());
 }

@@ -20,7 +20,11 @@ struct FileData {version:u8, originals:Vec<(Cell,Transform)>, copies:Vec<CopyPie
 #[derive(Clone,Copy,Debug,PartialEq,Eq,PartialOrd,Ord)]
 pub(super) enum Key {Native(Cell),Copy(u64)}
 #[derive(Clone)]
-struct Drag {pointer:egui::Pos2, bases:Vec<(Key,Transform)>}
+struct Drag {
+    pointer:egui::Pos2,
+    bases:Vec<(Key,Transform)>,
+    anchor:Option<[f32;3]>,
+}
 // LCK_G4_DEFER_GROUND_SELECTION
 #[derive(Clone,Copy)]
 struct PendingPress {
@@ -56,7 +60,10 @@ impl State {
         match key {Key::Native(c)=>Some(*self.originals.get(&c).unwrap_or(&Transform::default())),
                    Key::Copy(uid)=>self.copies.iter().find(|p|p.uid==uid).map(|p|p.transform)}
     }
-    pub fn set_transform(&mut self,key:Key,transform:Transform) {
+    pub fn set_transform(&mut self,key:Key,mut transform:Transform) {
+        for v in &mut transform.offset {
+            if v.abs()<0.005 {*v=0.0;}
+        }
         match key {Key::Native(c)=>{if transform==Transform::default(){self.originals.remove(&c);}else{self.originals.insert(c,transform);}},
                    Key::Copy(uid)=>{if let Some(p)=self.copies.iter_mut().find(|p|p.uid==uid){p.transform=transform;}}}
     }
@@ -71,6 +78,52 @@ impl State {
         self.pending_press=None;
         self.drag_moved=false;
     }
+}
+
+/// Native mirror exporter must handle negative floor scales separately from
+/// the existing grid-stamp writer. This method refuses approximations and
+/// returns every destination cell requiring a physically mirrored 4bpp tile.
+pub(super) fn native_mirror_targets(state:&State)
+    ->Result<Vec<(Cell,bool,bool)>,String>{
+    fn visit(source:Cell,t:Transform,out:&mut Vec<(Cell,bool,bool)>)->Result<(),String>{
+        let flip_x=t.scale[0]<0.;let flip_z=t.scale[2]<0.;
+        if !flip_x && !flip_z{return Ok(());}
+        if t.turns.rem_euclid(4)!=0{return Err("Native ground texture rotation requires a separate 90-degree UV encoder".into());}
+        if t.offset[1].abs()>0.01||(t.scale[1]-1.).abs()>0.0001{
+            return Err("Mirrored floor vertical shift/scale is not a native ground-grid feature".into());
+        }
+        if !t.scale.iter().all(|v|v.is_finite()&&v.abs()>0.0001)
+            ||!t.offset.iter().all(|v|v.is_finite()){
+            return Err("Non-finite or zero mirrored floor transform".into());
+        }
+        let center=[source[0] as f32*128.+64.+t.offset[0],
+                    source[1] as f32*128.+64.+t.offset[2]];
+        let extent=[64.*t.scale[0].abs(),64.*t.scale[2].abs()];
+        let lo=[(center[0]-extent[0])/128.,(center[1]-extent[1])/128.];
+        let hi=[(center[0]+extent[0])/128.,(center[1]+extent[1])/128.];
+        if lo.iter().chain(hi.iter()).any(|v|(v-v.round()).abs()>0.0001){
+            return Err(format!("Mirrored floor {source:?} is not aligned to the 128-unit native grid"));
+        }
+        let (x0,x1,z0,z1)=(lo[0].round() as i32,hi[0].round() as i32,
+                            lo[1].round() as i32,hi[1].round() as i32);
+        if x0<0||z0<0||x1>127||z1>127||x0>=x1||z0>=z1{
+            return Err(format!("Mirrored floor {source:?} leaves the encodable native grid"));
+        }
+        if ((x1-x0)*(z1-z0))>256{return Err("Mirrored floor exceeds 256 native cells".into());}
+        for z in z0..z1{for x in x0..x1{out.push(([x as u8,z as u8],flip_x,flip_z));}}
+        Ok(())
+    }
+    let mut out=Vec::new();
+    for (&source,&transform) in &state.originals {
+        if state.deleted.contains(&source) && (transform.scale[0]<0. || transform.scale[2]<0.) {
+            return Err("Cannot mirror deleted native floor".into());
+        }
+        visit(source,transform,&mut out)?;
+    }
+    for copy in &state.copies {visit(copy.source,copy.transform,&mut out)?;}
+    let mut unique=BTreeSet::new();
+    for (cell,_,_) in &out {if !unique.insert(*cell){return Err(format!("Multiple mirrored tiles share native floor cell {cell:?}"));}}
+    Ok(out)
 }
 
 // W1: Compile only floor changes exactly representable in
@@ -92,15 +145,15 @@ pub(super) fn native_128_plan(
             );
         }
 
-        if t.scale[0]<=0. || t.scale[2]<=0.
+        if t.scale[0]==0. || t.scale[2]==0.
             || !t.scale.iter().all(|v|v.is_finite())
             || !t.offset.iter().all(|v|v.is_finite()) {
             return Err("Invalid native floor transform".into());
         }
 
         let odd=t.turns.rem_euclid(2)!=0;
-        let sx=if odd{t.scale[2]}else{t.scale[0]};
-        let sz=if odd{t.scale[0]}else{t.scale[2]};
+        let sx=if odd{t.scale[2].abs()}else{t.scale[0].abs()};
+        let sz=if odd{t.scale[0].abs()}else{t.scale[2].abs()};
 
         let cx=source[0] as f32*128.+64.+t.offset[0];
         let cz=source[1] as f32*128.+64.+t.offset[2];
@@ -195,9 +248,11 @@ pub(super) fn native_128_plan(
     }
 
     if removals.is_empty() && stamps.is_empty() {
-        return Err(
-            "No native footprint changes to export".into()
-        );
+        // Texture-only X/Z mirrors keep the same grid footprint but require
+        // an independently registered native TIM overlay.
+        if native_mirror_targets(state)?.is_empty() {
+            return Err("No native footprint changes to export".into());
+        }
     }
 
     Ok((removals,stamps))
@@ -208,8 +263,8 @@ pub(super) fn native_128_plan(
 // Experimental native-grid approximation, not exact polygons.
 fn w2b_cells(source:Cell,t:Transform,notes:&mut Vec<String>)->Vec<Cell>{
     let odd=t.turns.rem_euclid(2)!=0;
-    let sx=if odd{t.scale[2]}else{t.scale[0]};
-    let sz=if odd{t.scale[0]}else{t.scale[2]};
+    let sx=if odd{t.scale[2].abs()}else{t.scale[0].abs()};
+    let sz=if odd{t.scale[0].abs()}else{t.scale[2].abs()};
 
     if !sx.is_finite()||!sz.is_finite()||sx<=0.||sz<=0.||
         !t.offset.iter().all(|v|v.is_finite()) {
@@ -242,8 +297,8 @@ fn w2b_cells(source:Cell,t:Transform,notes:&mut Vec<String>)->Vec<Cell>{
     }
 
     let mut result=Vec::new();
-    for z in za.max(0)..zb.min(127){
-        for x in xa.max(0)..xb.min(127){
+    for z in za.max(0)..zb.min(128){
+        for x in xa.max(0)..xb.min(128){
             result.push([x as u8,z as u8]);
         }
     }
@@ -413,6 +468,7 @@ pub(super) fn press(
     state.drag=if was_selected {
         Some(Drag{
             pointer:pos,
+            anchor:None,
             bases:state.all_selected(originals)
                 .into_iter()
                 .filter_map(|key|
@@ -490,51 +546,173 @@ pub(super) fn release(
     }
     true
 }
-pub(super) fn drag(state:&mut State,cam:crate::raster::Camera,
-    model:&Model,rect:egui::Rect,at:egui::Pos2,ctrl:bool,mirror:bool)->bool{
+pub(super) fn drag(
+    state:&mut State,ui:&Ui,cam:crate::raster::Camera,
+    model:&Model,rect:egui::Rect,at:egui::Pos2,
+    ctrl:bool,mirror:bool,snap:Option<f32>
+)->bool{
     let Some(session)=state.drag.clone() else{return false;};
-    let delta=at-session.pointer;
-    if delta.length_sq()<=36.0{return false;}
-    let fov=45f32.to_radians()*0.5;
-    let dist=model.radius/fov.sin()*cam.zoom.max(0.0000001);
-    let step=(2.0*dist*fov.tan()/rect.height().max(1.0)).max(0.35);
-    let (sy,cy)=cam.yaw.sin_cos();let (sp,_cp)=cam.pitch.sin_cos();
-    let x=if mirror {-delta.x}else{delta.x};
-    let (shift_x,shift_y,shift_z)=if ctrl {(0.0,-delta.y*step,0.0)}
-        else {((x*cy+delta.y*sy*sp)*step,0.0,(x*sy-delta.y*cy*sp)*step)};
-    for (key,base) in session.bases {
+    if (at-session.pointer).length_sq()<=36.0{return false;}
+
+    let anchor=session.anchor.or_else(||{
+        let (key,_)=session.bases.first()?;
+        let id=match key {
+            Key::Native(cell)=>{
+                let q=model.object_ids.iter()
+                    .enumerate()
+                    .find(|(i,id)|{
+                        **id>=ORIGINAL_BASE &&
+                        **id<COPY_BASE &&
+                        model.positions.get(*i).is_some_and(|p|
+                            (p[0]/128.0).round() as i32==cell[0] as i32 &&
+                            (p[2]/128.0).round() as i32==cell[1] as i32
+                        )
+                    })?;
+                *q.1
+            }
+            Key::Copy(uid)=>{
+                let index=state.copies.iter()
+                    .position(|p|p.uid==*uid)?;
+                COPY_BASE+index as u32
+            }
+        };
+        let first=model.object_ids.iter().position(|v|*v==id)?;
+        let mut center=[0.0;3];
+        for j in 0..4 {
+            let p=model.positions.get(first+j)?;
+            for k in 0..3 {center[k]+=p[k]*0.25;}
+        }
+        Some(center)
+    }).unwrap_or(model.center);
+
+    if let Some(drag)=state.drag.as_mut(){
+        if drag.anchor.is_none(){drag.anchor=Some(anchor);}
+    }
+
+    let displacement=if ctrl{
+        [0.0,super::drag_anchor::vertical_delta(
+            ui,rect,model,cam,session.pointer,at,anchor,mirror
+        ),0.0]
+    }else{
+        super::drag_anchor::horizontal_delta(
+            ui,rect,model,cam,session.pointer,at,anchor,mirror
+        )
+    };
+
+    for (key,base) in session.bases{
         let mut updated=base;
-        updated.offset[0]+=shift_x;updated.offset[1]+=shift_y;updated.offset[2]+=shift_z;
+        for k in 0..3{
+            updated.offset[k]+=super::drag_anchor::snapped(
+                displacement[k],snap
+            );
+        }
         state.set_transform(key,updated);
     }
+
     state.drag_moved=true;
     true
 }
+/// Rotate every selected native/copied tile around their common X/Z center.
+/// Baselines are captured on mouse-down; rebuilding from them prevents drift
+/// while the pointer moves back and forth during one gesture.
+/// Positive turns match transform_point's (+90 = x:-z, z:x).
+pub(super) fn rotate_group_snapshot(
+    state:&mut State,
+    baselines:&[(Key,Transform)],
+    requested_turns:i32,
+)->Result<bool,String>{
+    if baselines.is_empty(){return Ok(false);}
+    let turn=requested_turns.rem_euclid(4);
+    let mut pieces=Vec::with_capacity(baselines.len());
+    let mut low=[f32::INFINITY;2];
+    let mut high=[f32::NEG_INFINITY;2];
+
+    for &(key,start) in baselines {
+        let source=match key {
+            Key::Native(cell)=>{
+                if state.deleted.contains(&cell){
+                    return Err(format!("Deleted native floor {cell:?} cannot rotate"));
+                }
+                cell
+            },
+            Key::Copy(uid)=>state.copies.iter()
+                .find(|copy|copy.uid==uid)
+                .ok_or_else(||format!("Missing floor copy #{uid}"))?.source,
+        };
+        let center=[
+            source[0] as f32*128.0+64.0+start.offset[0],
+            source[1] as f32*128.0+64.0+start.offset[2],
+        ];
+        if !center.iter().all(|v|v.is_finite()) {
+            return Err("Non-finite floor center".into());
+        }
+        for axis in 0..2 {
+            low[axis]=low[axis].min(center[axis]);
+            high[axis]=high[axis].max(center[axis]);
+        }
+        pieces.push((key,start,center));
+    }
+    let pivot=[
+        low[0]+(high[0]-low[0])*0.5,
+        low[1]+(high[1]-low[1])*0.5,
+    ];
+    let mut updates=Vec::with_capacity(pieces.len());
+    for (key,mut start,center) in pieces {
+        let dx=center[0]-pivot[0];
+        let dz=center[1]-pivot[1];
+        let (rx,rz)=match turn {
+            0=>(dx,dz),
+            1=>(-dz,dx),
+            2=>(-dx,-dz),
+            _=>(dz,-dx),
+        };
+        start.offset[0]+=rx-dx;
+        start.offset[2]+=rz-dz;
+        start.turns=(start.turns+turn).rem_euclid(4);
+        if !start.offset.iter().all(|v|v.is_finite() && v.abs()<1_000_000.0){
+            return Err("Rotated floor leaves editor transform limits".into());
+        }
+        updates.push((key,start));
+    }
+    // No edits occur until every member is validated.
+    for (key,transform) in updates {
+        state.set_transform(key,transform);
+    }
+    Ok(true)
+}
+
 pub(super) fn rotate(state:&mut State,selected:&BTreeSet<Cell>,delta:i32)->bool{
     let keys=state.all_selected(selected);
     if keys.is_empty(){return false;}
     for key in keys {if let Some(mut t)=state.transform(key){t.turns=(t.turns+delta).rem_euclid(4);state.set_transform(key,t);}}
     true
 }
-pub(super) fn duplicate(state:&mut State,selected:&mut BTreeSet<Cell>,active:&mut Option<Cell>,hf:&WalkHeightfield)->usize{
+/// Duplicate selected tiles and return precise old->new identity mappings.
+/// Skipped/missing tiles never shift group membership to another duplicate.
+pub(super) fn duplicate_linked(state:&mut State,selected:&mut BTreeSet<Cell>,active:&mut Option<Cell>,hf:&WalkHeightfield)->Vec<(Key,Key)>{
     let keys=state.all_selected(selected);
     let mut added=Vec::new();
+    let mut links=Vec::new();
     for key in keys {
         if state.copies.len()+added.len()>=4096 {break;}
         let source=match key {Key::Native(c)=>c,Key::Copy(uid)=>match state.copies.iter().find(|p|p.uid==uid){Some(p)=>p.source,None=>continue}};
         if !is_valid(hf,source){continue;}
         let Some(mut transform)=state.transform(key) else{continue;};
         transform.offset[0]+=128.0;
-        state.next_uid+=1;
-        added.push(CopyPiece{uid:state.next_uid,source,transform});
+        let Some(uid)=state.next_uid.checked_add(1) else {break};
+        state.next_uid=uid;
+        added.push(CopyPiece{uid,source,transform});
+        links.push((key,Key::Copy(uid)));
     }
-    let count=added.len();
-    if count!=0 {
+    if !added.is_empty() {
         selected.clear();*active=None;state.selected_copies.clear();
         for p in &added {state.selected_copies.insert(p.uid);state.active_copy=Some(p.uid);}
         state.copies.extend(added);
     }
-    count
+    links
+}
+pub(super) fn duplicate(state:&mut State,selected:&mut BTreeSet<Cell>,active:&mut Option<Cell>,hf:&WalkHeightfield)->usize{
+    duplicate_linked(state,selected,active,hf).len()
 }
 // LCK_G3_NATIVE_FLOOR_DELETE
 pub(super) fn delete_selected(
@@ -561,14 +739,16 @@ pub(super) fn delete_selected(
     count
 }
 
-pub(super) fn controls(ui:&mut Ui,state:&mut State,originals:&mut BTreeSet<Cell>,active:&mut Option<Cell>,hf:&WalkHeightfield)->bool{
+pub(super) fn controls(ui:&mut Ui,state:&mut State,originals:&mut BTreeSet<Cell>,active:&mut Option<Cell>,hf:&WalkHeightfield,group_links:&mut Vec<(Key,Key)>)->bool{
     let mut changed=false;
     ui.horizontal_wrapped(|ui|{
         if ui.button("Delete floor (Del)").clicked(){
             changed|=delete_selected(state,originals,active)>0;
         }
         if ui.button("Duplicate floor (Ctrl+D)").clicked(){
-            changed|=duplicate(state,originals,active,hf)>0;
+            let links=duplicate_linked(state,originals,active,hf);
+            changed|=!links.is_empty();
+            group_links.extend(links);
         }
         if ui.button("Rotate -90 (Q)").clicked(){changed|=rotate(state,originals,-1);}
         if ui.button("Rotate +90 (E)").clicked(){changed|=rotate(state,originals,1);}
@@ -614,7 +794,7 @@ pub(super) fn serialize(state:&State)->String {
     format!("GROUND_EDIT\t{}\n",serde_json::to_string(&data).expect("Ground edit data is serializable"))
 }
 pub(super) fn strip(source:&str)->String {
-    source.lines().filter(|line|!line.starts_with("GROUND_EDIT\t"))
+    source.lines().filter(|line|!line.starts_with("GROUND_EDIT\t")&&!line.starts_with("COLLISION_EDIT\t"))
         .map(|line|format!("{line}\n")).collect()
 }
 pub(super) fn parse(source:&str,hf:Option<&WalkHeightfield>,scene:&str)->Result<State,String>{
@@ -624,6 +804,7 @@ pub(super) fn parse(source:&str,hf:Option<&WalkHeightfield>,scene:&str)->Result<
     let Some(value)=lines.first() else{return Ok(state);};
     let data:FileData=serde_json::from_str(value).map_err(|e|format!("Invalid ground edit record: {e}"))?;
     if data.version!=1{return Err("Unsupported ground edit version".into());}
+    if data.originals.is_empty()&&data.copies.is_empty()&&data.deleted.is_empty(){return Ok(state);}
     let hf=hf.ok_or("Scene has ground edit records but no original MAP ground".to_string())?;
     let mut ids=BTreeSet::new();
     let mut originals=BTreeMap::new();
@@ -652,7 +833,7 @@ pub(super) fn parse(source:&str,hf:Option<&WalkHeightfield>,scene:&str)->Result<
     Ok(state)
 }
 fn valid_transform(t:Transform)->bool {
-    t.offset.iter().all(|n|n.is_finite()&&n.abs()<=65536.) && t.scale.iter().all(|n|n.is_finite()&&(0.05..=20.).contains(n)) && (-10000..10000).contains(&t.turns)
+    t.offset.iter().all(|n|n.is_finite()&&n.abs()<=65536.) && t.scale.iter().all(|n|n.is_finite()&&(0.05..=20.).contains(&n.abs())) && (-10000..10000).contains(&t.turns)
 }
 #[cfg(test)]mod tests {
  use super::*;
@@ -665,6 +846,21 @@ fn valid_transform(t:Transform)->bool {
     state.set_transform(Key::Copy(1),Transform{offset:[256.,0.,0.],turns:2,scale:unit_scale()});
     assert_eq!(state.transform(Key::Native(c)).unwrap().offset[0],128.);
     assert_eq!(state.transform(Key::Copy(1)).unwrap().turns,2);
+ }
+ #[test]fn group_duplicate_retains_old_new_uid_mapping(){
+    let mut hf=WalkHeightfield::default();
+    hf.positions=vec![[0.,0.,0.],[128.,0.,0.],[0.,0.,128.],[128.,0.,128.]];
+    let mut state=State::default();
+    let mut selected=BTreeSet::from([[0,0]]);
+    let mut active=Some([0,0]);
+    let links=duplicate_linked(&mut state,&mut selected,&mut active,&hf);
+    assert_eq!(links.len(),1);
+    assert_eq!(links[0].0,Key::Native([0,0]));
+    assert_eq!(links[0].1,Key::Copy(state.copies[0].uid));
+    let next=duplicate_linked(&mut state,&mut selected,&mut active,&hf);
+    assert_eq!(next.len(),1);
+    assert_eq!(next[0].0,links[0].1);
+    assert_ne!(next[0].1,links[0].1);
  }
  #[test]fn persistence_roundtrip(){
     let mut hf=WalkHeightfield::default();
@@ -907,5 +1103,89 @@ mod w2b_raster_tests {
         assert!(deleted.is_empty());
         assert_eq!(writes.len(),4);
         assert!(notes.iter().any(|n|n.contains("fractional")));
+    }
+}
+
+#[cfg(test)] mod native_mirror_grid_tests {
+    use super::*;
+    #[test] fn mirror_only_native_tile_is_exportable_without_grid_delta() {
+        let mut edits=State::default();
+        edits.originals.insert([5,6],Transform{scale:[-1.,1.,1.],..Transform::default()});
+        let (deleted,stamps)=native_128_plan(&edits).unwrap();
+        assert!(deleted.is_empty()&&stamps.is_empty());
+        assert_eq!(native_mirror_targets(&edits).unwrap(),vec![([5,6],true,false)]);
+    }
+    #[test] fn mirrored_copy_resolves_independent_native_target() {
+        let mut edits=State::default();
+        edits.copies.push(CopyPiece{uid:7,source:[5,6],
+            transform:Transform{offset:[128.,0.,0.],turns:0,scale:[1.,1.,-1.]}});
+        assert_eq!(native_mirror_targets(&edits).unwrap(),vec![([6,6],false,true)]);
+        assert_eq!(native_128_plan(&edits).unwrap().1,vec![([5,6],[6,6])]);
+    }
+    #[test] fn fractional_mirror_is_not_silently_rounded() {
+        let mut edits=State::default();
+        edits.originals.insert([5,6],Transform{offset:[32.,0.,0.],
+            scale:[-1.,1.,1.],..Transform::default()});
+        assert!(native_mirror_targets(&edits).is_err());
+    }
+}
+
+#[cfg(test)]
+mod lck_shared_floor_orbit_tests {
+    use super::*;
+
+    #[test]
+    fn two_native_tiles_rotate_about_one_pivot() {
+        let mut state=State::default();
+        let keys=[Key::Native([0,0]),Key::Native([1,0])];
+        let baselines=keys.iter().map(|&key|(key,Transform::default()))
+            .collect::<Vec<_>>();
+        assert!(rotate_group_snapshot(&mut state,&baselines,1).unwrap());
+        let left=state.transform(keys[0]).unwrap();
+        let right=state.transform(keys[1]).unwrap();
+        assert_eq!(left.offset,[64.0,0.0,-64.0]);
+        assert_eq!(right.offset,[-64.0,0.0,64.0]);
+        assert_eq!([left.turns,right.turns],[1,1]);
+    }
+
+    #[test]
+    fn dragged_gesture_rebuilds_from_original_positions() {
+        let mut state=State::default();
+        let keys=[Key::Native([0,0]),Key::Native([1,0])];
+        let baselines=keys.iter().map(|&key|(key,Transform::default()))
+            .collect::<Vec<_>>();
+        rotate_group_snapshot(&mut state,&baselines,1).unwrap();
+        rotate_group_snapshot(&mut state,&baselines,2).unwrap();
+        assert_eq!(state.transform(keys[0]).unwrap().offset,[128.0,0.0,0.0]);
+        assert_eq!(state.transform(keys[1]).unwrap().offset,[-128.0,0.0,0.0]);
+        rotate_group_snapshot(&mut state,&baselines,0).unwrap();
+        assert_eq!(state.transform(keys[0]).unwrap(),Transform::default());
+        assert_eq!(state.transform(keys[1]).unwrap(),Transform::default());
+    }
+
+    #[test]
+    fn copied_and_native_tile_share_the_same_pivot() {
+        let mut state=State::default();
+        state.copies.push(CopyPiece{
+            uid:7,source:[1,0],transform:Transform::default(),
+        });
+        let baselines=vec![
+            (Key::Native([0,0]),Transform::default()),
+            (Key::Copy(7),Transform::default()),
+        ];
+        rotate_group_snapshot(&mut state,&baselines,1).unwrap();
+        assert_eq!(state.transform(Key::Native([0,0])).unwrap().offset,[64.0,0.0,-64.0]);
+        assert_eq!(state.transform(Key::Copy(7)).unwrap().offset,[-64.0,0.0,64.0]);
+    }
+
+    #[test]
+    fn missing_copy_does_not_partially_move_other_members() {
+        let mut state=State::default();
+        let baselines=vec![
+            (Key::Native([0,0]),Transform::default()),
+            (Key::Copy(999),Transform::default()),
+        ];
+        assert!(rotate_group_snapshot(&mut state,&baselines,1).is_err());
+        assert!(state.originals.is_empty());
     }
 }

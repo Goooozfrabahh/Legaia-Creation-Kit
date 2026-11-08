@@ -42,12 +42,12 @@ fn relative_native_translation(requested:[f32;3],donor:[f32;3],encoded:[i32;3])-
     let mut result=[0.;3];for a in 0..3 {result[a]=integer(requested[a]-donor[a])?.checked_sub(encoded[a]).context("Native translation difference overflow")? as f32;}Ok(result)
 }
 fn grid(cell:(u8,u8))->usize {GRID_OFF+(cell.1 as usize*128+cell.0 as usize)*2}
-fn id_at(map:&[u8],cell:(u8,u8))->Result<usize>{
+pub(in crate::app) fn id_at(map:&[u8],cell:(u8,u8))->Result<usize>{
     anyhow::ensure!(cell.0<128&&cell.1<128,"Native reference outside 128x128 MAP");let at=grid(cell);
     Ok((u16::from_le_bytes(map.get(at..at+2).context("Native grid truncated")?.try_into()?)&511) as usize)
 }
 fn record(map:&[u8],id:usize)->Result<[u8;32]>{Ok(map.get(id*32..id*32+32).context("Native descriptor truncated")?.try_into()?)}
-fn detach(map:&mut [u8],cell:(u8,u8))->Result<usize>{
+pub(in crate::app) fn detach(map:&mut [u8],cell:(u8,u8))->Result<usize>{
     let id=id_at(map,cell)?;
     let refs=map[GRID_OFF..0x10000].chunks_exact(2).filter(|w|u16::from_le_bytes([w[0],w[1]])&511==id as u16).count();
     if refs<=1{return Ok(id);}
@@ -170,6 +170,294 @@ pub(in crate::app) fn yaw(map:&mut [u8],cell:(u8,u8),rotation:[f32;3],center:[f3
     let value=(old.rot_y&0xf000)|((old.rot_y as i32+angle.round() as i32).rem_euclid(4096) as u16);raw[10..12].copy_from_slice(&value.to_le_bytes());
     map[id*32..id*32+32].copy_from_slice(&raw);note("Native yaw and pivot compensation written; arbitrary-angle actor-box/wall transforms are not serialized by this writer".into());Ok(())
 }
+// LCK_NATIVE_VISUAL_FLOOR_ALIGNMENT_V1
+// Align an imported floor's visible TMD with the editor's final Y.
+// PS1 native Y is down; editor Y is up. The TMD retains its
+// own local Y coordinates, which must be included exactly once.
+fn native_floor_visual_offset(
+    editor_y:f32,
+    local_native_y:f32,
+    native_floor_y:i32,
+)->Result<i16>{
+    anyhow::ensure!(
+        editor_y.is_finite()&&local_native_y.is_finite(),
+        "Nonfinite visual floor coordinate"
+    );
+    let requested=-(editor_y as f64)
+        -(local_native_y as f64)
+        -(native_floor_y as f64);
+    anyhow::ensure!(
+        requested.is_finite() &&
+        requested.round()>=i16::MIN as f64 &&
+        requested.round()<=i16::MAX as f64,
+        "Visual floor Y needs a wider native representation"
+    );
+    Ok(requested.round() as i16)
+}
+
+fn align_imported_floor_visuals(
+    disc:&mut DiscPatcher,
+    entry:usize,
+    scene:&AssembledScene,
+    world:&WorldModel,
+    index:&ProtIndex,
+    doc:&scene_instances::SceneDocument,
+    targets:&HashMap<scene_instances::NameTarget,(u8,u8)>,
+    log:&mut Vec<String>,
+){
+    let result=(||->Result<[i32;16]>{
+        let native=Scene::load(index,&scene.name)?;
+        Ok(native.field_floor_height_lut(index)?
+            .context("Destination floor height LUT missing")?
+            .map(|y|-(y as i32)))
+    })();
+
+    let lut=match result {
+        Ok(v)=>v,
+        Err(e)=>{
+            log.push(format!(
+                "FAILED VISUAL FLOOR ALIGNMENT LUT: {e:#}; native export retained"
+            ));
+            return;
+        }
+    };
+
+    let original=match disc.read_entry_footprint(entry){
+        Ok(v)=>v,
+        Err(e)=>{
+            log.push(format!(
+                "FAILED VISUAL FLOOR ALIGNMENT MAP: {e:#}; export retained"
+            ));
+            return;
+        }
+    };
+
+    let mut map=original.clone();
+    let mut results=Vec::new();
+
+    for foreign in &doc.foreign {
+        let Some((source_object,source_primitive))=
+            super::super::floor_tiles::decode_floor_kind(&foreign.kind)
+        else {continue};
+
+        let uid=foreign.uid;
+
+        let attempt=(||->Result<String>{
+            let cell=*targets.get(
+                &scene_instances::NameTarget::Created(uid)
+            ).context("Imported floor has no native reference")?;
+
+            anyhow::ensure!(
+                cell.0<127&&cell.1<127,
+                "Native corner lookup exceeds MAP"
+            );
+
+            let descriptor=id_at(&map,cell)?;
+            let record=ObjectRecord::parse(&map,descriptor)
+                .context("Imported floor descriptor missing")?;
+
+            // Read the ACTUAL registered native TMD, not an
+            // assumed donor center or a guessed height offset.
+            let registered=independent_model(disc,entry,cell)?;
+            let tmd=legaia_tmd::parse(&registered.bytes)?;
+
+            let mut faces=Vec::new();
+            for (object_id,object) in tmd.objects.iter().enumerate(){
+                for group in legaia_tmd::legaia_prims::iter_groups_lenient(
+                    &registered.bytes,
+                    object.primitives_byte_offset,
+                    object.primitives_byte_size,
+                ){
+                    for primitive in group.prims{
+                        faces.push((object_id,primitive.vertex_indices()));
+                    }
+                }
+            }
+
+            let selected=if faces.len()==1 {
+                faces.pop()
+            }else{
+                faces.into_iter()
+                    .filter(|(object,_)|*object==source_object)
+                    .nth(source_primitive)
+            };
+
+            let (object_id,vertex_ids)=selected
+                .context("Registered floor primitive missing")?;
+
+            anyhow::ensure!(
+                !vertex_ids.is_empty(),
+                "Registered floor has no vertices"
+            );
+
+            let object=&tmd.objects[object_id];
+            let mut local_sum=0.0f32;
+
+            for vertex_id in &vertex_ids{
+                let v=object.vertices.get(*vertex_id as usize)
+                    .context("Native TMD vertex missing")?;
+
+                // Honor any rotation already encoded in the MAP.
+                let rotated=legaia_engine_scene::field_env::rotate_euler(
+                    [record.rot_x,record.rot_y,record.rot_z],
+                    [v.x as f32,v.y as f32,v.z as f32],
+                );
+
+                local_sum+=rotated[1];
+            }
+
+            let local_y=local_sum/vertex_ids.len() as f32;
+
+            // The editor's final vertex positions are authoritative.
+            let draw=world.draws.iter()
+                .find(|d|d.editor_uid==Some(uid)&&!d.hidden)
+                .context("Editor floor instance unavailable")?;
+
+            let model=world.model.as_ref()
+                .context("Editor geometry unavailable")?;
+
+            let positions=model.positions
+                .get(draw.vertex_start..draw.vertex_end)
+                .context("Editor floor vertex range invalid")?;
+
+            anyhow::ensure!(
+                !positions.is_empty() &&
+                positions.iter().all(|p|p[1].is_finite()),
+                "Invalid editor floor height"
+            );
+
+            let editor_y=positions.iter()
+                .map(|p|p[1]).sum::<f32>()
+                /positions.len() as f32;
+
+            // Retail static decorations derive visual Y from the
+            // four native corner floor tiers, plus MAP y_off.
+            let at=WALL_OFF+
+                cell.1 as usize*128+
+                cell.0 as usize;
+
+            let floor_y=[0usize,1,128,129]
+                .iter()
+                .map(|&offset|{
+                    lut[(map[at+offset]&15) as usize]
+                })
+                .sum::<i32>()/4;
+
+            let previous=record.y_off;
+
+            let corrected=native_floor_visual_offset(
+                editor_y,local_y,floor_y
+            )?;
+
+            let predicted_y=-
+                (floor_y as f32+
+                 corrected as f32+
+                 local_y);
+
+            anyhow::ensure!(
+                (predicted_y-editor_y).abs()<=0.55,
+                "Native visual height readback differs from editor"
+            );
+
+            let offset=descriptor*32+2;
+            map[offset..offset+2]
+                .copy_from_slice(&corrected.to_le_bytes());
+
+            Ok(format!(
+                "UID {uid}: editor Y {editor_y:.2}; native local TMD Y {local_y:.2}; native floor base {floor_y}; MAP Y offset {previous} -> {corrected}; reconstructed editor Y {predicted_y:.2}; descriptor {descriptor}"
+            ))
+        })();
+
+        match attempt {
+            Ok(message)=>results.push(message),
+            Err(error)=>log.push(format!(
+                "FAILED VISUAL FLOOR ALIGNMENT UID {uid}: {error:#}; other floor and IMG writes retained"
+            )),
+        }
+    }
+
+    if map==original{
+        for result in results {
+            log.push(format!("VERIFIED VISUAL FLOOR ALIGNMENT {result}"));
+        }
+        return;
+    }
+
+    // One MAP commit after all independent corrections.
+    // Do not touch collision high nibbles or walk-height rows.
+    let committed=(||->Result<DiscPatcher>{
+        let mut candidate=DiscPatcher::open(disc.image().to_vec())?;
+        candidate.patch_prot_entry(entry,0,&map)?;
+
+        anyhow::ensure!(
+            candidate.read_entry_footprint(entry)?==map,
+            "Visual floor MAP readback mismatch"
+        );
+
+        Ok(candidate)
+    })();
+
+    match committed {
+        Ok(candidate)=>{
+            *disc=candidate;
+            for result in results {
+                log.push(format!(
+                    "WRITTEN VISUAL FLOOR ALIGNMENT {result}"
+                ));
+            }
+        },
+        Err(error)=>log.push(format!(
+            "FAILED VISUAL FLOOR ALIGNMENT MAP COMMIT: {error:#}; existing IMG data retained"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod native_floor_visual_y_tests {
+    use super::*;
+
+    #[test]
+    fn source_local_height_is_not_inverted_twice()->Result<()> {
+        // The three floor heights from the reported gameplay test.
+        for (editor_y,expected_offset) in [
+            (156.0,228i16),
+            (220.0,164i16),
+            (284.0,100i16),
+        ] {
+            let local_y=-384.0;
+            let floor_y=0;
+
+            let offset=native_floor_visual_offset(
+                editor_y,local_y,floor_y
+            )?;
+
+            assert_eq!(offset,expected_offset);
+
+            let reconstructed=-
+                (floor_y as f32+offset as f32+local_y);
+
+            assert_eq!(reconstructed,editor_y);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nonzero_native_floor_anchor_is_compensated()->Result<()>{
+        let offset=native_floor_visual_offset(
+            220.0,-384.0,-80
+        )?;
+
+        assert_eq!(offset,244);
+
+        assert_eq!(
+            -(-80.0+offset as f32-384.0),
+            220.0
+        );
+
+        Ok(())
+    }
+}
+
 pub(in crate::app) fn prepare(source_path:&Path,scene:&AssembledScene,world:&WorldModel,index:&ProtIndex)->Result<NativeExportPlan>{
     prepare_with_metadata(source_path,scene,world,index,None)
 }
@@ -192,6 +480,30 @@ pub(in crate::app) fn prepare_with_metadata(source_path:&Path,scene:&AssembledSc
                 match inherited_source_staging(&mut disc,entry,index,&mut log){Ok(Some(w))=>source_warnings.push(w),Ok(None)=>{},Err(e)=>log.push(format!("WARNING Source staging normalization could not be encoded: {e:#}; original resources retained, unrestricted attempts continue"))}
                 let mut targets=HashMap::new();
                 compile(&mut disc,entry,scene,world,index,&doc,&mut log,&mut imports,&mut object_verification,&mut targets);
+                // LCK_FLOOR_EXPERIMENT_V13
+                // Export geometry even when MAP walkability is unencoded.
+                // Retain all failed native floor diagnostics.
+                let floor_failures=log.iter()
+                    .filter(|m|m.starts_with("FAILED NATIVE FLOOR UID "))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !floor_failures.is_empty() {
+                    log.push(format!(
+                        "WARNING EXPERIMENTAL GEOMETRY-ONLY FLOOR EXPORT: {} native walkability writes failed. Imported geometry and resource attempts may still be written. NOT VERIFIED WALKABLE. {}",
+                        floor_failures.len(),
+                        floor_failures.join("; ")
+                    ));
+                }
+                // LCK_COLLISION_JOURNAL_ORDER_FIX_V1
+                // Complete floor serialization before computing the
+                // collision ownership journal and final image digest.
+                super::super::native_flat_import::apply_imports(&mut disc,entry,scene,world,index,&doc,&targets,&mut log,&mut object_verification);
+                align_imported_floor_visuals(&mut disc,entry,scene,world,index,&doc,&targets,&mut log);
+                // LCK_NATIVE_MIRROR_TMD_V1: an exported negative X/Z scale
+                // must own a real independently registered TMD. A failure is
+                // fatal here instead of quietly writing a non-mirrored IMG.
+                super::super::native_mirror_export::apply(
+                    &mut disc,entry,scene,world,index,&doc,&targets,&mut log)?;
                 if let Some(ownership)=ownership{
                     let result=super::super::native_wall_export::reconcile(ownership,&disc,scene,world,&doc,&targets,&mut log);
                     match result{Ok((updated,journal))=>{disc=updated;
@@ -273,7 +585,7 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
                 let lba=disc.entry_disc_lba(entry).context("Destination MAP LBA")?;
                 let loaded=disc.read_disc_sectors(lba,0x28)?;
                 let bindings=NativeBindings::parse(&loaded[0x10000..0x12000],&loaded[0x12000..])?;
-                let (descriptor,allocated)=if foreign.kind=="mesh" {
+                let (descriptor,allocated)=if foreign.kind=="mesh" || super::super::floor_tiles::decode_floor_kind(&foreign.kind).is_some() {
                     let translation=[0,1,2].map(|a|delta[a]+encoded_translation[a] as f32);
                     let radius=world.draws.iter().find(|d|d.editor_uid==Some(foreign.uid)).context("Standalone copy preview missing")?.radius;
                     let result=copy_static_mesh_record(&mut map,translation,foreign.center,radius,&tiers,&bindings)?;
@@ -292,7 +604,7 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
             continue;
         }
         if let Some(candidate)=attempt(&label,log,||{
-            anyhow::ensure!(matches!(foreign.kind.as_str(),"placement"|"terrain"|"mesh"),"Existing native import writer has no {} descriptor/actor adapter; no different source object substituted",foreign.kind);
+            anyhow::ensure!(matches!(foreign.kind.as_str(),"placement"|"terrain"|"mesh") || super::super::floor_tiles::decode_floor_kind(&foreign.kind).is_some(),"Existing native import writer has no {} descriptor/actor adapter; no different source object substituted",foreign.kind);
             let mut isolated=world.clone();
             isolated.draws.retain(|d|d.editor_uid.is_none()||d.editor_uid==Some(foreign.uid));
             for d in &mut isolated.draws{d.hidden=false;d.offset=[0.;3];d.rotation=[0.;3];d.scale=[1.;3];}
@@ -337,11 +649,36 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
             yaw(&mut map,cell,*rotation,draw.center)
         }).is_none(){map=before;}
     }
-    for (target,scale) in &doc.scales {log.push(format!("ATTEMPT SCALE {target:?} {scale:?}"));log.push(format!("FAILED SCALE {target:?}: available MAP descriptor has no scale field; no native TMD vertex/normal transform registration writer is implemented for this edit. No replacement edit was made"));}
+    for (target,scale) in &doc.scales {
+        if scale[0]<0. || scale[2]<0. {
+            log.push(format!("QUEUED NATIVE MIRROR {target:?} {scale:?}: independent TMD registration required before publish"));
+        } else {
+            log.push(format!("ATTEMPT SCALE {target:?} {scale:?}"));
+            log.push(format!("FAILED SCALE {target:?}: positive-only object scaling still needs its separate native transform adapter"));
+        }
+    }
+    let mut deleted_man_actors = Vec::new();
     for &key in &doc.hidden {
-        let label=format!("DELETE {key:?}");
-        attempt(&label,log,||{anyhow::ensure!(world.npc(key).is_none(),"No native MAN actor/script deletion serializer implemented");let cell=source(scene,key)?;let at=grid(cell);let word=u16::from_le_bytes(map[at..at+2].try_into()?);map[at..at+2].copy_from_slice(&(word&!511).to_le_bytes());Ok(())});
-        log.push(format!("WARNING {label}: geometry/spawn reference removed; standalone walls/floors/scripts were not deleted by an inferred ownership rule"));
+        let label = format!("DELETE {key:?}");
+        if let Some(npc) = world.npc(key) {
+            deleted_man_actors.push(npc.record);
+            log.push(format!("QUEUED MAN DELETION: actor record #{}", npc.record));
+        } else {
+            attempt(&label, log, || {
+                let cell = source(scene, key)?;
+                let at = grid(cell);
+                let word = u16::from_le_bytes(map[at..at+2].try_into()?);
+                map[at..at+2].copy_from_slice(&(word & !511).to_le_bytes());
+                Ok(())
+            });
+            log.push(format!("WARNING {label}: MAP reference removed; unrelated collision/scripts retained"));
+        }
+    }
+    if !deleted_man_actors.is_empty() {
+        let label = format!("DELETE NATIVE MAN ACTORS {:?}", deleted_man_actors);
+        if let Some(message) = attempt(&label, log, || {
+            super::experimental_remove_native_npcs(disc, entry, &deleted_man_actors)
+        }) { log.push(message); }
     }
     let mut appearance=HashSet::new();
     for (target,clip,frame) in &doc.animations {
@@ -426,7 +763,7 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
             let anchor=[cell.0 as i32+r.col_delta as i32,cell.1 as i32+r.row_delta as i32];
             let anchor_word=if (0..128).contains(&anchor[0])&&(0..128).contains(&anchor[1]){Some(u16::from_le_bytes(map[grid((anchor[0]as u8,anchor[1]as u8))..][..2].try_into()?))}else{None};
             let donor=legaia_engine_world_views::scene_staging::assemble_field_scene(index,&foreign.source).map_err(anyhow::Error::msg)?;
-            let original=if foreign.kind=="mesh" {None}else{Some(if foreign.kind=="terrain"{donor.terrain.get(foreign.record)}else{donor.placements.get(foreign.record)}.context("Donor draw missing")?)};
+            let original=if foreign.kind=="mesh" || super::super::floor_tiles::decode_floor_kind(&foreign.kind).is_some() {None}else{Some(if foreign.kind=="terrain"{donor.terrain.get(foreign.record)}else{donor.placements.get(foreign.record)}.context("Donor draw missing")?)};
             let donor_native=Scene::load(index,&foreign.source)?;
             let binding=if let Some(original)=original {donor_native.field_object_binds(index)?.and_then(|b|b.get(&original.anchor).copied())}else{None};
             let binding_evidence=if let Some(binding)=binding{
@@ -545,7 +882,57 @@ pub(super) fn publish(plan:NativeExportPlan,output:&Path)->Result<ExportResult>{
     std::fs::write(&verification,serde_json::to_vec_pretty(&serde_json::json!({"schema":1,"output":output,"img_sha256":expected_hash,"objects":objects,"native_runtime_verified":false,"render_verified":false,"interaction_verified":false}))?)?;
     let mut skipped=plan.skipped;
     if let Some(json)=report.lines().find_map(|l|l.strip_prefix("WALL_OWNERSHIP_JOURNAL\t")){
-        let saved=(||->Result<()>{let value:serde_json::Value=serde_json::from_str(json)?;anyhow::ensure!(value["image_sha256"].as_str()==Some(expected_hash.as_str()),"Collision metadata/image hash mismatch");let file=std::fs::OpenOptions::new().write(true).create_new(true).open(output.with_extension("lck-collision.json"))?;serde_json::to_writer(file,&value)?;Ok(())})();
+        let saved=(||->Result<()>{
+    let mut value:serde_json::Value=serde_json::from_str(json)?;
+    anyhow::ensure!(
+        value["schema"]=="lck-native-wall-journal-v2",
+        "Unknown collision journal schema"
+    );
+    let final_disc=DiscPatcher::open(plan.image.clone())?;
+    let cells=value["cells"].as_array_mut()
+        .context("Final collision journal has no cells")?;
+
+    for cell in cells {
+        let mut journal:super::super::native_wall_journal::Journal=
+            serde_json::from_value(cell["journal"].clone())?;
+        let entry=journal.map_entry as usize;
+        let map=final_disc.read_entry_footprint(entry)?;
+
+        // Rebind the MAP digest, then verify all wall ownership.
+        journal.source_map_sha256=
+            super::super::collision_recipes::digest(&map);
+        journal.validate(&map)?;
+
+        if journal.owners.iter().any(|o|o.native.is_some()){
+            let bundle=final_disc.read_entry_footprint(entry+3)?;
+            let pac=final_disc.read_entry_footprint(entry+4)?;
+            let models=super::super::native_asset_plan::scene_registration::
+                native_model_pool(&bundle,Some(&pac))
+                .iter()
+                .map(|m|super::super::collision_recipes::digest(&m.bytes))
+                .collect::<Vec<_>>();
+
+            for owner in &journal.owners {
+                if let Some(witness)=&owner.native {
+                    anyhow::ensure!(
+                        models.get(witness.model_selector as usize)
+                            ==Some(&witness.model_sha256),
+                        "Final collision model changed: owner {} / PROT {}",
+                        owner.id,entry
+                    );
+                }
+            }
+        }
+        cell["journal"]=serde_json::to_value(journal)?;
+    }
+
+    value["image_sha256"]=serde_json::json!(expected_hash);
+    let file=std::fs::OpenOptions::new()
+        .write(true).create_new(true)
+        .open(output.with_extension("lck-collision.json"))?;
+    serde_json::to_writer(file,&value)?;
+    Ok(())
+})();
         if let Err(e)=saved{let message=format!("FAILED COLLISION OWNERSHIP PERSISTENCE: {e:#}; IMG exists but next-session ownership is unavailable");report.push_str(&format!("{message}\n"));std::fs::write(&debug,&report)?;skipped.push(message);}
     }
     for object in &objects{if let Some(gaps)=object["missing_or_unverified_dependencies"].as_array(){for gap in gaps{if gap.as_str().is_some_and(|g|g.starts_with("MISSING:")){skipped.push(format!("MISSING NATIVE DEPENDENCY UID {}: {}",object["uid"],gap.as_str().unwrap()));}}}}

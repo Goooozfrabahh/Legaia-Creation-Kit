@@ -49,3 +49,22 @@ Completed means the named implementation milestone, not universal gameplay certi
 - No history rewriting or force-pushing.
 - Original retail IMG and Latest Build remain protected.
 - Experimental automated verification is distinct from gameplay testing.
+
+## November 8, 2026 - Current editor interaction checkpoint
+
+The newer local editor snapshot has now been captured in a
+dedicated Git branch following successful library tests and build.
+
+Includes object/floor/collision grouping, selection, duplication,
+shared-center rotation, updated RMB handling, and empty-click
+deselection.
+
+The earlier items for marquee selection and the two-mouse-button
+shortcut are implemented in this checkpoint. Continue GUI
+regression testing before considering them fully closed.
+
+Floor walkability, original native collision ownership,
+NPC/MAN/script portability and general retail runtime export
+remain active or unresolved.
+
+See LCK_CHECKPOINT_2026-11-08.md for verification and limits.

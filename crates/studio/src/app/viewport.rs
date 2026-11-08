@@ -19,6 +19,7 @@ pub(crate) struct Viewport {
     // Sticky until the next mouse-down, including the release frame.
     pub world_pan_dragged: bool,
     pub world_ground_edit: bool,
+    pub world_marquee_enabled: bool,
     pub world_selected: Vec<u32>,
     rendered_selection: Vec<u32>,
     rendered: Option<(Camera, Shading, [usize; 2], u64, Option<u32>, bool, bool)>,
@@ -37,6 +38,52 @@ fn upright_default_camera() -> Camera {
     cam
 }
 
+// LCK_PREVIEW_LEFT_RIGHT_CAMERA_V1
+// Camera-only rotation, never modifies a model, project, or IMG.
+fn lck_rotate_preview_camera(cam:&mut Camera,direction:i32) {
+    if direction==0 {return;}
+    let angle=(direction.signum() as f32)
+        *std::f32::consts::PI/12.0;
+    cam.yaw=(cam.yaw+angle)
+        .rem_euclid(std::f32::consts::TAU);
+}
+
+#[cfg(test)]
+mod lck_preview_left_right_tests {
+    use super::*;
+
+    #[test]
+    fn arrows_rotate_only_the_preview_yaw() {
+        let mut cam=Camera::default();
+        let original=cam;
+
+        lck_rotate_preview_camera(&mut cam,1);
+
+        let expected=(original.yaw+
+            std::f32::consts::PI/12.0)
+            .rem_euclid(std::f32::consts::TAU);
+
+        assert!((cam.yaw-expected).abs()<0.00001);
+        assert_eq!(cam.pitch,original.pitch);
+        assert_eq!(cam.zoom,original.zoom);
+        assert_eq!(cam.target_offset,original.target_offset);
+
+        lck_rotate_preview_camera(&mut cam,-1);
+        assert!((cam.yaw-original.yaw).abs()<0.00001);
+    }
+
+    #[test]
+    fn complete_rotation_returns_to_start() {
+        let mut cam=Camera::default();
+        let start=cam.yaw;
+        for _ in 0..24 {
+            lck_rotate_preview_camera(&mut cam,1);
+        }
+        let difference=(cam.yaw-start).abs();
+        assert!(difference<0.0001 ||
+            (difference-std::f32::consts::TAU).abs()<0.0001);
+    }
+}
 impl Viewport {
     pub fn new(shading: Shading) -> Self {
         Self {
@@ -44,7 +91,7 @@ impl Viewport {
             world_mirrored: true,
             world_orbit_anchor: None,
             world_left_drag_selected: None,
-            world_pan_dragged: false,world_ground_edit:false,
+            world_pan_dragged: false,world_ground_edit:false,world_marquee_enabled:false,
             world_selected: Vec::new(), rendered_selection: Vec::new(),
             rendered: None, tex: None,
         }
@@ -56,6 +103,31 @@ impl Viewport {
 
     /// Existing per-asset preview behavior; left-drag orbits, wheel zooms.
     pub fn show_limited(&mut self, ui: &mut egui::Ui, model: &Model, vram: &Vram, max_w: usize, max_h: usize) {
+        // Preview-only keyboard orbit. Up/Down remains owned by the
+        // repository's item-selection navigation.
+        if !ui.ctx().wants_keyboard_input() {
+            let direction=ui.ctx().input_mut(|input| {
+                if input.consume_key(
+                    egui::Modifiers::NONE,
+                    egui::Key::ArrowLeft
+                ) {
+                    -1
+                } else if input.consume_key(
+                    egui::Modifiers::NONE,
+                    egui::Key::ArrowRight
+                ) {
+                    1
+                } else {
+                    0
+                }
+            });
+
+            if direction!=0 {
+                lck_rotate_preview_camera(&mut self.cam,direction);
+                ui.ctx().request_repaint();
+            }
+        }
+
         let _ = self.show_internal(ui, model, vram, max_w, max_h, false, None, true, false);
     }
 
@@ -123,12 +195,12 @@ impl Viewport {
                 self.world_left_drag_selected = None;
             } else if ui.input(|i| i.pointer.primary_pressed()) {
                 let alt = ui.input(|i| i.modifiers.alt);
-                self.world_left_drag_selected = if !repository_drag && !alt && resp.hovered() {
+                self.world_left_drag_selected = if !repository_drag && !alt && !self.world_marquee_enabled && resp.hovered() {
                     resp.interact_pointer_pos().and_then(|pos| {
                         let point = world_screen_pick_point(rect, pos, px, mirror);
-                        let hit = raster::pick_instance(model, self.cam, px[0], px[1], point);
+                        let hit = raster::pick_instance_prefer(model, self.cam, px[0], px[1], point, selected);
                         hit.filter(|id|if self.world_ground_edit {
-                            *id>=0xE000_0000 && self.world_selected.contains(id)
+                            self.world_selected.contains(id)
                         }else{
                             selected==Some(*id)||self.world_selected.contains(id)
                         })
@@ -147,7 +219,7 @@ impl Viewport {
             if repository_drag {
                 // An asset held from All Objects owns the pointer until release;
                 // do not pan/orbit/dolly a scene while placing it.
-            } else if (middle && shift) || (left && !alt && self.world_left_drag_selected.is_none()) {
+            } else if (middle && shift) || (left && !alt && !self.world_marquee_enabled && self.world_left_drag_selected.is_none()) {
                 if left && !alt && self.world_left_drag_selected.is_none() {
                     self.world_pan_dragged=true;
                 }
@@ -234,7 +306,7 @@ impl Viewport {
         if world && !repository_drag && resp.hovered() && ui.input(|i|i.pointer.primary_pressed() && !i.modifiers.alt) {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let screen_point = world_screen_pick_point(rect, pos, px, mirror);
-                picked = raster::pick_instance(model, self.cam, px[0], px[1], screen_point);
+                picked = raster::pick_instance_prefer(model, self.cam, px[0], px[1], screen_point, selected);
             }
         }
         picked

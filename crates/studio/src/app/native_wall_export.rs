@@ -80,7 +80,51 @@ pub(super) fn capture_with_metadata(
     };
     let mut other_cells = Vec::new();
     let mut cell = None;
-    if file.exists() || preserved.is_some() {
+
+    // LCK_EXPERIMENTAL_STALE_SIDECAR_BYPASS
+    // A journal for a different IMG must never be trusted as
+    // ownership evidence for the currently loaded revision.
+    // In unrestricted mode, ignore that journal and build
+    // a fresh baseline from the current native MAP.
+    let mut ignore_stale_metadata = false;
+
+    if super::ps1_export::unrestricted::active()
+        && (file.exists() || preserved.is_some())
+    {
+        let metadata = if file.exists() {
+            std::fs::read(&file)?
+        } else {
+            preserved.expect("Metadata availability checked").to_vec()
+        };
+
+        ensure!(
+            metadata.len() <= 64 * 1024 * 1024,
+            "Collision journal metadata too large"
+        );
+
+        let root: serde_json::Value =
+            serde_json::from_slice(&metadata)?;
+
+        if root["image_sha256"].as_str() != Some(source_hash) {
+            ignore_stale_metadata = true;
+
+            let recorded = root["image_sha256"]
+                .as_str()
+                .unwrap_or("(missing)");
+
+            super::ps1_export::unrestricted::diagnostic(
+                format!(
+                    "STALE COLLISION SIDECAR BYPASSED: current IMG SHA256 {}; journal IMG SHA256 {}. Discarding stale ownership evidence for this experimental export. Native MAP collision remains the baseline; old object-owned wall associations are NOT inferred or restored. Test gameplay and collision manually.",
+                    source_hash,
+                    recorded
+                )
+            );
+        }
+    }
+
+    if !ignore_stale_metadata
+        && (file.exists() || preserved.is_some())
+    {
         let metadata = if file.exists() {
             std::fs::read(&file)?
         } else {

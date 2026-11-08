@@ -385,6 +385,10 @@ pub(super) fn paint(
         }
     }
 
+    // The debug overlay is disabled for normal editing.
+    // All actual collision wireframe drawing above is retained.
+    const SHOW_COLLISION_INFO_OVERLAY: bool = false;
+    if SHOW_COLLISION_INFO_OVERLAY {
     let bg = Rect::from_min_size(rect.min + Vec2::new(7.0, 7.0),
         Vec2::new(465.0, if note.is_some(){95.0}else{78.0}));
     painter.rect_filled(bg.intersect(rect), 3.0, Color32::from_black_alpha(190));
@@ -410,6 +414,8 @@ pub(super) fn paint(
         painter.text(bg.min + Vec2::new(8.0, 76.0), egui::Align2::LEFT_TOP,
             head, egui::FontId::monospace(9.0), Color32::YELLOW);
     }
+    }
+
 }
 
 #[cfg(test)]

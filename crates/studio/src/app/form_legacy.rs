@@ -36,6 +36,9 @@ fn source(
         format!("{}:MAN:{ordinal}", scene.name)
     } else if kind == "mesh" {
         format!("{}:TMD-resource:{ordinal}", scene.name)
+    } else if super::floor_tiles::decode_floor_kind(kind).is_some() {
+        // Each polygon has its own reusable Base identity.
+        format!("{}:TMD-resource:{ordinal}:{kind}", scene.name)
     } else {
         let draw = if kind == "terrain" {
             scene.terrain.get(ordinal)
@@ -86,7 +89,7 @@ fn source(
             .and_then(|m| m.as_ref())
             .map(|(raw, _)| digest(raw))
     } else {
-        let slot = if kind == "mesh" {
+        let slot = if kind == "mesh" || super::floor_tiles::decode_floor_kind(kind).is_some() {
             scene.env_tmds.get(ordinal).copied()
         } else {
             if kind == "terrain" {
@@ -251,6 +254,9 @@ pub(super) fn scene_input(
             scale: draw.scale,
         };
         let mut flags = BTreeSet::new();
+        if kind == "npc" && foreign.is_some() {
+            flags.insert("native_animated_reference".into());
+        }
         if foreign.is_some_and(|f| f.static_architecture) {
             flags.insert("static_architecture".into());
         }

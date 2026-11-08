@@ -1,15 +1,39 @@
 # LCK Development Status
 
-The active published development baseline is `lck/development`.
+## Current editor checkpoint - November 8, 2026
 
-This branch carries the cumulative C2 history and project documentation.
-It is not a declaration that all features have passed gameplay testing.
+A verified local editor-interaction snapshot has been prepared
+on a dedicated checkpoint branch based on lck/development.
 
-- [Completed, active, research and blocked workstreams](docs/LCK_WORKSTREAMS.md)
-- [Standalone World Editor development plan](docs/LCK_STANDALONE_WORLD_EDITOR_PLAN.md)
+The checkpoint includes the current Rust editor source,
+persistent mixed-category groups, selection and marquee tools,
+floor and collision authoring, group duplication, shared-center
+rotation, and empty-space deselection.
 
-Latest local marquee-selection changes still need their own verified
-commit and push.
+## Verification
 
-The repository default remains `foundation-02` until the development
-baseline passes its build and regression checks.
+- Studio library regression tests: passed during checkpoint.
+- Optimized studio build: passed during checkpoint.
+- User-confirmed editor interactions: ongoing.
+- Retail PS1 gameplay certification: not established.
+- Original retail IMG: not modified by checkpoint.
+- DuckStation: not launched by checkpoint.
+
+## Git organization
+
+- foundation-02 remains the historical default branch.
+- lck/development remains the cumulative published baseline.
+- The new checkpoint is separate until reviewed and merged.
+- Historical branch references have not been removed.
+- No force push or history rewrite was performed.
+
+## Remaining work
+
+- Universal native object/resource placement and export.
+- Original retail collision and terrain ownership.
+- Verified native floor walkability in all supported scenes.
+- NPC, MAN, animation, trigger and script portability.
+- Full GUI and DuckStation gameplay regression testing.
+
+See docs/LCK_WORKSTREAMS.md and
+docs/LCK_CHECKPOINT_2026-11-08.md.

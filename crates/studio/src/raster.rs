@@ -442,7 +442,13 @@ pub fn render_highlights_with_sources(model:&Model,vram:&Vram,cam:Camera,shading
                 }
                 let z = w0 * s[0][2] + w1 * s[1][2] + w2 * s[2][2];
                 let di = y * w + x;
-                if z >= depth[di] {
+                // Stable selection depth bias for coplanar
+                // editor floor copies. Native geometry unchanged.
+                let display_depth=if highlighted {
+                    z-(z.abs()*0.00001).max(0.001)
+                }else{z};
+
+                if display_depth >= depth[di] {
                     continue;
                 }
                 let lerp3 = |c: &[[u8; 3]]| -> [f32; 3] {
@@ -469,7 +475,7 @@ pub fn render_highlights_with_sources(model:&Model,vram:&Vram,cam:Camera,shading
                 } else {
                     lerp3(&model.fill)
                 };
-                depth[di] = z;
+                depth[di] = display_depth;
                 let rgb = if highlighted {
                     // Gold instance highlight: keep enough of the underlying
                     // original texture to recognize the selected mesh.
@@ -491,7 +497,8 @@ pub fn render_highlights_with_sources(model:&Model,vram:&Vram,cam:Camera,shading
 /// Hit-test original world triangles at a viewport pixel; nearest depth wins.
 /// IDs are stored in `Model::object_ids` for the editor's assembled world.
 /// Synthetic walk-ground is tagged `u32::MAX` and is not selectable here.
-pub fn pick_instance(model: &Model, cam: Camera, w: usize, h: usize, pixel: [f32; 2]) -> Option<u32> {
+// LCK_FOREIGN_FLOOR_PICK_PRIORITY_V1
+fn pick_instance_depth(model: &Model, cam: Camera, w: usize, h: usize, pixel: [f32; 2], only: Option<u32>) -> Option<(u32,f32)> {
     if w == 0 || h == 0 { return None; }
     let (sy, cy) = cam.yaw.sin_cos();
     let (sp, cp) = cam.pitch.sin_cos();
@@ -516,7 +523,7 @@ pub fn pick_instance(model: &Model, cam: Camera, w: usize, h: usize, pixel: [f32
         let i = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
         if i.iter().any(|&k| k >= projected.len()) { continue; }
         let id = model.object_ids.get(i[0]).copied().unwrap_or(u32::MAX);
-        if id == u32::MAX { continue; }
+        if id == u32::MAX || only.is_some_and(|requested|requested != id) { continue; }
         let s = [projected[i[0]], projected[i[1]], projected[i[2]]];
         if s.iter().any(|p| !p[2].is_finite() || p[2] < near) { continue; }
         let area = (s[1][0] - s[0][0]) * (s[2][1] - s[0][1])
@@ -529,7 +536,37 @@ pub fn pick_instance(model: &Model, cam: Camera, w: usize, h: usize, pixel: [f32
         let z = w0 * s[0][2] + w1 * s[1][2] + w2 * s[2][2];
         if z < nearest { nearest = z; winner = Some(id); }
     }
-    winner
+    winner.map(|id|(id,nearest))
+}
+
+/// Preserve ordinary nearest-depth picking.
+pub fn pick_instance(model: &Model, cam: Camera, w: usize, h: usize, pixel: [f32; 2]) -> Option<u32> {
+    pick_instance_depth(model,cam,w,h,pixel,None).map(|(id,_)|id)
+}
+
+/// Prefer the selected surface when it is nearly coplanar with another.
+/// Do not select through substantially closer opaque geometry.
+pub fn pick_instance_prefer(
+    model:&Model,
+    cam:Camera,
+    w:usize,
+    h:usize,
+    pixel:[f32;2],
+    preferred:Option<u32>
+)->Option<u32> {
+    let front=pick_instance_depth(model,cam,w,h,pixel,None);
+    let selected=preferred.and_then(
+        |id|pick_instance_depth(model,cam,w,h,pixel,Some(id))
+    );
+
+    match (front,selected) {
+        (Some((_,z)),Some((chosen,selected_z)))
+            if selected_z <= z + (z.abs()*0.0005).max(0.25)
+                => Some(chosen),
+        (Some((id,_)),_) => Some(id),
+        (None,Some((id,_))) => Some(id),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
