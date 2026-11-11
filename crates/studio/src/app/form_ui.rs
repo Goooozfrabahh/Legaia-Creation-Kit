@@ -10,6 +10,7 @@ pub(super) enum Action {
     DeleteReference(FormKey),
     SwitchCell(FormKey),
     Save,
+    SaveAs,
     Open,
     Recover,
     Place(FormKey, [f32; 3]),
@@ -27,11 +28,109 @@ impl Action {
     pub fn is_authoring(&self) -> bool {
         !matches!(
             self,
-            Self::Save | Self::Open | Self::Recover | Self::SwitchCell(_)
+            Self::Save | Self::SaveAs | Self::Open | Self::Recover | Self::SwitchCell(_)
         )
     }
 }
 impl App {
+    fn save_unified_project(&mut self, save_as: bool) -> Result<()> {
+        self.save_active_editor_cell();
+
+        let project=self.form_session.as_ref()
+            .context("Open a source cell before saving")?
+            .project.clone();
+
+        let existing=if save_as {
+            None
+        } else {
+            self.form_file.as_ref().map(|f|f.path.clone())
+        };
+
+        let path=if let Some(path)=existing {
+            path
+        } else {
+            let Some(path)=rfd::FileDialog::new()
+                .set_file_name("Legaia.lckproject")
+                .add_filter("LCK project",&["lckproject"])
+                .save_file()
+            else {
+                return Ok(());
+            };
+            path.with_extension("lckproject")
+        };
+
+        if self.form_file.as_ref().is_none_or(|f|f.path!=path) {
+            self.form_file=Some(ProjectFile::new(
+                project.clone(),path.clone()
+            ));
+        }
+
+        let file=self.form_file.as_mut().unwrap();
+        file.project=project;
+        file.save()?;
+
+        self.studio.status=Some(format!(
+            "Saved LCK project: {}",path.display()
+        ));
+        Ok(())
+    }
+
+    fn restore_unified_project(&mut self) -> Result<()> {
+        let Some((name,NativeSceneSlot::Ready(scene,world)))=
+            self.native_scene.as_ref()
+        else {
+            return Ok(());
+        };
+
+        let name=name.clone();
+        let scene=Arc::clone(scene);
+        let world=Arc::clone(world);
+
+        let identity=self.editor_cell_active.as_ref()
+            .map(|cell|cell.form_identity(&name))
+            .unwrap_or_else(||format!("original:{name}"));
+
+        let snapshot=self.form_session.as_ref()
+            .and_then(|session|
+                session.project.cell_snapshots.get(&identity)
+            ).cloned();
+
+        let Some(raw)=snapshot else {
+            self.ground_edits=super::ground_edit_ops::State::default();
+            self.ground_edits.scene=name;
+            return Ok(());
+        };
+
+        let lib=self.studio.library.as_ref()
+            .context("Source IMG unavailable")?;
+
+        let mut restored=(*world).clone();
+        let overlay=super::ground_edit_ops::strip(&raw);
+        let document=super::scene_instances::parse(
+            &overlay,&name,&restored
+        ).map_err(anyhow::Error::msg)?;
+
+        super::scene_instances::apply(
+            &document,&mut restored,
+            scene.placements.len(),&lib.index
+        ).map_err(anyhow::Error::msg)?;
+
+        let ground=super::ground_edit_ops::parse(
+            &raw,scene.ground.as_ref(),&name
+        ).map_err(anyhow::Error::msg)?;
+
+        if let Some((_,NativeSceneSlot::Ready(_,current)))=
+            self.native_scene.as_mut()
+        {
+            *current=Arc::new(restored);
+        }
+
+        self.ground_edits=ground;
+        self.native_view.version=
+            self.native_view.version.wrapping_add(1);
+        Ok(())
+    }
+
     pub(super) fn capture_form_history(&self, history: &mut EditorSceneHistory) {
         if let Some(session) = &self.form_session {
             history.project = Some(Arc::new(session.project.clone()));
@@ -84,7 +183,7 @@ impl App {
             ui.label(format!("Active file: {}",session.project.file_id.as_str()));
             egui::ComboBox::from_id_salt("active-project-cell").selected_text("Open project cell...").show_ui(ui,|ui|{for cell in &session.project.cells{if ui.selectable_label(session.cell.as_ref()==Some(&cell.key),&cell.label).clicked(){action=Some(Action::SwitchCell(cell.key.clone()));}}});
 ui.small("Save Project preserves FormKeys, overrides, deleted records and shared definitions. Legacy scene files are compatibility exports.");
-            ui.horizontal(|ui|{if ui.button("Save Project...").clicked(){action=Some(Action::Save);}if ui.button("Open Project...").clicked(){action=Some(Action::Open);}if !self.form_recovery.is_empty()&&ui.button("Previous project").clicked(){action=Some(Action::Recover);}});
+            ui.horizontal(|ui|{if !self.form_recovery.is_empty()&&ui.button("Previous project").clicked(){action=Some(Action::Recover);}});
             if let Some(reference)=selected.as_ref().and_then(|k|session.project.database.reference(k)){
                 let base=session.project.database.resolve_base(&reference.base).unwrap();let order=[session.project.master.file.clone(),session.project.file_id.clone()];
                 ui.separator();ui.heading("Placed Reference");ui.monospace(format!("{:08X}  {:?}",reference.key.display_id(&order).unwrap_or(0),reference.key));
@@ -172,34 +271,8 @@ ui.small("Save Project preserves FormKeys, overrides, deleted records and shared
                 self.load_native_scene(cell.source_scene, selection);
                 return Ok(());
             }
-            Action::Save => {
-                let project = self
-                    .form_session
-                    .as_ref()
-                    .context("Active project missing")?
-                    .project
-                    .clone();
-                let path = if let Some(file) = &self.form_file {
-                    file.path.clone()
-                } else {
-                    let Some(path) = rfd::FileDialog::new()
-                        .set_file_name("Legaia.lckproject")
-                        .add_filter("LCK project", &["lckproject"])
-                        .save_file()
-                    else {
-                        return Ok(());
-                    };
-                    path.with_extension("lckproject")
-                };
-                if self.form_file.is_none() {
-                    self.form_file = Some(ProjectFile::new(project.clone(), path.clone()));
-                }
-                let file = self.form_file.as_mut().unwrap();
-                file.project = project;
-                file.save()?;
-                self.studio.status = Some(format!("Saved active LCK project: {}", path.display()));
-                return Ok(());
-            }
+            Action::Save => return self.save_unified_project(false),
+            Action::SaveAs => return self.save_unified_project(true),
             Action::Open => {
                 let Some(path) = rfd::FileDialog::new()
                     .add_filter("LCK project", &["lckproject"])
@@ -244,6 +317,7 @@ ui.small("Save Project preserves FormKeys, overrides, deleted records and shared
                 self.native_selection.clear();
                 self.native_selected = None;
                 self.rebuild_form_preview();
+                self.restore_unified_project()?;
                 self.studio.status = Some(format!("Opened LCK project {}", path.display()));
                 return Ok(());
             }

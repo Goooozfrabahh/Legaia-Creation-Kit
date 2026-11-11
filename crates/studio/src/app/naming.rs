@@ -12,6 +12,7 @@ pub(super) struct Inventory {
     pub meshes:Vec<Option<String>>,
     pub foreign:BTreeMap<u64,String>,
     pub foreign_legacy:BTreeMap<u64,String>,
+    pub descriptions:BTreeMap<String,String>,
 }
 
 pub(super) fn visual_key(tmd:&[u8],vram_hash:&str)->Option<String> {
@@ -36,6 +37,7 @@ pub(super) fn visual_keys(scene:&AssembledScene)->Vec<Option<String>> {
 pub(super) fn inventory(scene:&AssembledScene,index:&ProtIndex,npcs:&[NpcInfo])->Inventory {
     let visuals=visual_keys(scene);
     let mut names=Inventory{meshes:scene.env_tmds.iter().map(|&i|visuals.get(i).cloned().flatten()).collect(),..Default::default()};
+    names.descriptions=super::descriptive_names::for_scene(scene,index,&visuals);
     let native=Scene::load(index,&scene.name).ok();
     let map=native.as_ref().and_then(|s|s.field_map_index(index)).and_then(|id|index.entry_bytes(id).ok()).filter(|bytes|bytes.len()==0x12000);
     let map_hash=map.as_ref().map(|m|digest(m));

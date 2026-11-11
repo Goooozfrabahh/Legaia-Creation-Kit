@@ -28,6 +28,7 @@ use super::{
     collision_edit,
     form_bridge,
     ground_edit_ops,
+    native_floor_mirror,
     native_ground_delete,
     ps1_export,
     world_view,
@@ -209,6 +210,7 @@ pub(super) fn execute(
     object_edits:bool,
     unrestricted:bool,
     mut session:Option<form_bridge::Session>,
+    extension_side:usize,
 )->Result<ps1_export::ExportResult>{
     ensure!(
         source!=output,
@@ -231,7 +233,33 @@ pub(super) fn execute(
 
     // U1B.2 currently supports exact 128-unit native ground
     // changes only. No arbitrary UV/height approximations.
-    let (removed,stamps)=validate_ground(floors)?;
+    let mut permissive_notes=Vec::<String>::new();
+
+    // A pure X/Z reflection changes the terrain texture, NOT the native
+    // ground footprint. The 4bpp TIM writer handles it after this stage.
+    let pure_texture_mirror=ground_edit_ops::native_128_plan(floors)
+        .ok().is_some_and(|(a,b)|a.is_empty()&&b.is_empty());
+
+    let (removed,stamps)=if pure_texture_mirror {
+        (BTreeSet::new(),Vec::new())
+    }else if unrestricted {
+        match ground_edit_ops::w46_plan(floors) {
+            Ok((removed,stamps,notes))=>{
+                permissive_notes.extend(
+                    notes.into_iter().map(|n|format!("GROUND EXPERIMENT: {n}"))
+                );
+                (removed,stamps)
+            }
+            Err(error)=>{
+                permissive_notes.push(format!(
+                    "GROUND EXPERIMENT could not rasterize: {error}. Other edits continue."
+                ));
+                (BTreeSet::new(),Vec::new())
+            }
+        }
+    }else{
+        validate_ground(floors)?
+    };
 
     let mut touched=removed.clone();
 
@@ -297,10 +325,15 @@ pub(super) fn execute(
 
     // Continuation receipts depend on the exact IMG hash and
     // cannot simply be copied after another patch changes it.
-    ensure!(
-        !stage_object.with_extension("json").exists(),
-        "Object export requires a continuation receipt. U1B.2 cannot yet regenerate it after ground edits. No final IMG published."
-    );
+    if stage_object.with_extension("json").exists() {
+        if unrestricted {
+            permissive_notes.push(
+                "OBJECT CONTINUATION: receipt not regenerated after ground changes; runtime unverified".into()
+            );
+        }else{
+            anyhow::bail!("Object continuation receipt requires regeneration");
+        }
+    }
 
     let base_path=base.as_ref()
         .map(|r|r.path.as_path())
@@ -315,40 +348,100 @@ pub(super) fn execute(
 
     // Use the existing tested native-ground writer. Its exact
     // mode refuses unsupported overlaps and floor geometry.
-    let ground_note=native_ground_delete::export_ground(
-        base_path,
-        &stage_ground,
-        &scene.name,
-        index,
-        floors,
-        false,
-    )?;
+    let ground_note=if pure_texture_mirror {
+        fs::copy(base_path,&stage_ground).context("Stage mirror-only native floor IMG")?;
+        "Native ground grid unchanged; reflected TIM writer follows".to_string()
+    }else {match native_ground_delete::export_ground(
+        base_path,&stage_ground,&scene.name,index,floors,unrestricted
+    ){
+        Ok(note)=>note,
+        Err(error) if unrestricted=>{
+            permissive_notes.push(format!(
+                "FAILED NATIVE GROUND: {error:#}; floor changes were NOT written; independent encoded edits retained"
+            ));
+            fs::copy(base_path,&stage_ground)
+                .context("Stage remaining encoded IMG data")?;
 
+            format!("GROUND NOT ENCODED: {error:#}")
+        }
+        Err(error)=>return Err(error),
+    }};
+
+    let after_grid=map_from_image(&stage_ground,entry)?;
+
+    if !unrestricted {
+        verify_ground_delta(&before_ground,&after_grid,&touched)?;
+    }else{
+        permissive_notes.push(
+            "GROUND CHECK: exact ownership/geometry acceptance disabled; disk readback retained".into()
+        );
+    }
+
+    // Native floor texture mirroring is a separate resource + MAP descriptor
+    // pass. Errors are fatal even in best-effort mode: never publish a visually
+    // unmirrored IMG as though it contained the user's reflection.
+    // LCK_R46_GROUND_COMPOSITOR
+    // Preserve the last good staging bytes if optional texture
+    // allocation fails during unrestricted experimental export.
+    let before_texture_attempt=if unrestricted {
+        Some(fs::read(&stage_ground)?)
+    }else{
+        None
+    };
+
+    let mirror_note=match native_floor_mirror::overlay_existing(
+        &stage_ground,&scene.name,index,floors
+    ){
+        Ok(note)=>note,
+
+        Err(error) if unrestricted=>{
+            if let Some(bytes)=before_texture_attempt {
+                fs::write(&stage_ground,bytes)
+                    .context("Restore pre-texture staging IMG")?;
+            }
+
+            permissive_notes.push(format!(
+                "FAILED NATIVE FLOOR TEXTURES: {error:#}; ground geometry retained, texture rotation was NOT written"
+            ));
+
+            None
+        },
+
+        Err(error)=>return Err(error),
+    };
     let after_ground=map_from_image(&stage_ground,entry)?;
 
-    verify_ground_delta(
-        &before_ground,
-        &after_ground,
-        &touched,
-    )?;
-
     let collision_note=if collision.has_edits(){
-        let note=collision.overlay_existing(
-            &stage_ground,
-            &scene.name,
-            index
-        )?;
+        let target=if unrestricted {
+            let candidate=stage_ground.with_extension("collisionattempt");
+            fs::copy(&stage_ground,&candidate)?;
+            candidate
+        }else{
+            stage_ground.clone()
+        };
 
-        let after_collision=map_from_image(
-            &stage_ground,entry
-        )?;
+        match collision.overlay_existing(&target,&scene.name,index){
+            Ok(note)=>{
+                if unrestricted {
+                    fs::copy(&target,&stage_ground)?;
+                    let _=fs::remove_file(&target);
+                }else{
+                    let changed=map_from_image(&stage_ground,entry)?;
+                    verify_collision_delta(&after_ground,&changed)?;
+                }
+                Some(note)
+            }
+            Err(error) if unrestricted=>{
+                let _=fs::remove_file(&target);
 
-        verify_collision_delta(
-            &after_ground,
-            &after_collision
-        )?;
+                permissive_notes.push(format!(
+                    "COLLISION WRITE FAILED: {error:#}; other edits retained"
+                ));
 
-        Some(note)
+                Some(format!("COLLISION NOT ENCODED: {error:#}"))
+            }
+            Err(error)=>return Err(error),
+        }
     }else{
         None
     };
@@ -388,19 +481,63 @@ pub(super) fn execute(
         .map(|r|r.patched.clone())
         .unwrap_or_default();
 
-    let skipped=base.as_ref()
+    let mut skipped=base.as_ref()
         .map(|r|r.skipped.clone())
         .unwrap_or_default();
+
+    skipped.extend(permissive_notes.iter().cloned());
+
+    // LCK_R50A_EXPORT_MANIFEST
+    // Companion to the published IMG, not a native runtime patch.
+    match super::native_extended_manifest::write_manifest(
+        output,
+        &scene.name,
+        world,
+        floors,
+        extension_side,
+    ) {
+        Ok(report)=>{
+            patched.push(format!(
+                "R5.0A extended manifest: {} additional floor cells, {} edited objects crossing retail bounds; {}",
+                report.extended_floors,
+                report.extended_objects,
+                report.path.display()
+            ));
+
+            if report.extended_floors>0 || report.extended_objects>0 {
+                skipped.push(format!(
+                    "R5.0A RUNTIME GAP: {} extended floor cells and {} edited objects cross the retail boundary. They are recorded in the manifest but are NOT made playable by this IMG.",
+                    report.extended_floors,
+                    report.extended_objects
+                ));
+            }
+
+            if report.clipped>0 {
+                skipped.push(format!(
+                    "R5.0A AUTHORING GRID: {} floor requests extend beyond the selected grid",
+                    report.clipped
+                ));
+            }
+        }
+        Err(error)=>{
+            skipped.push(format!(
+                "R5.0A extension manifest could not be saved: {error}"
+            ));
+        }
+    }
 
     let imports=base.as_ref()
         .and_then(|r|r.imports);
 
-    patched.push(format!(
-        "U1B.2 native ground: {} removed source cells; {} destination stamps; exact grid writer",
-        removed.len(),stamps.len()
-    ));
+    if !ground_note.starts_with("GROUND NOT ENCODED:") {
+        patched.push(format!(
+            "U1B.2 native ground: {} removed cells; {} destination stamps; experimental best-effort grid writer",
+            removed.len(),stamps.len()
+        ));
+    }
 
     patched.push(ground_note);
+    if let Some(note)=mirror_note{patched.push(note);}
 
     if let Some(note)=collision_note{
         patched.push(note);
@@ -409,6 +546,16 @@ pub(super) fn execute(
     patched.push(
         "U1B.2 mixed MAP readback verified; DuckStation gameplay NOT verified".into()
     );
+
+    if unrestricted {
+        let _=fs::write(
+            output.with_extension("best_effort_debug.txt"),
+            format!(
+                "LCK DEFAULT BEST-EFFORT EXPORT\n{}\n",
+                permissive_notes.join("\n")
+            )
+        );
+    }
 
     Ok(ps1_export::ExportResult{
         path:output.to_path_buf(),

@@ -301,15 +301,30 @@ pub fn render_highlight_with_sources(
 }
 
 /// Same texture/depth path with independent highlighted object IDs.
+// LCK_R54_VISIBLE_PICK
+// Retain the original color-only API for existing callers.
 pub fn render_highlights_with_sources(model:&Model,vram:&Vram,cam:Camera,shading:Shading,
     w:usize,h:usize,selected:&[u32],show_ground:bool,
     donor_vram:Option<&std::collections::HashMap<u32,std::sync::Arc<Vram>>>) -> Vec<u8> {
+    render_highlights_with_sources_and_ids(
+        model,vram,cam,shading,w,h,selected,show_ground,donor_vram
+    ).0
+}
+
+// The visible ID is written only when the same pixel passes
+// texture transparency and depth testing as the color renderer.
+pub fn render_highlights_with_sources_and_ids(
+    model:&Model,vram:&Vram,cam:Camera,shading:Shading,
+    w:usize,h:usize,selected:&[u32],show_ground:bool,
+    donor_vram:Option<&std::collections::HashMap<u32,std::sync::Arc<Vram>>>
+) -> (Vec<u8>,Vec<u32>) {
     let mut rgba = vec![0u8; w * h * 4];
+    let mut visible_ids = vec![u32::MAX; w * h];
     for px in rgba.as_chunks_mut::<4>().0 {
         px.copy_from_slice(&[30, 32, 36, 255]);
     }
     if w == 0 || h == 0 {
-        return rgba;
+        return (rgba,visible_ids);
     }
     let mut depth = vec![f32::INFINITY; w * h];
 
@@ -442,7 +457,13 @@ pub fn render_highlights_with_sources(model:&Model,vram:&Vram,cam:Camera,shading
                 }
                 let z = w0 * s[0][2] + w1 * s[1][2] + w2 * s[2][2];
                 let di = y * w + x;
-                if z >= depth[di] {
+                // Stable selection depth bias for coplanar
+                // editor floor copies. Native geometry unchanged.
+                let display_depth=if highlighted {
+                    z-(z.abs()*0.00001).max(0.001)
+                }else{z};
+
+                if display_depth >= depth[di] {
                     continue;
                 }
                 let lerp3 = |c: &[[u8; 3]]| -> [f32; 3] {
@@ -469,7 +490,10 @@ pub fn render_highlights_with_sources(model:&Model,vram:&Vram,cam:Camera,shading
                 } else {
                     lerp3(&model.fill)
                 };
-                depth[di] = z;
+                depth[di] = display_depth;
+                // LCK_R54_VISIBLE_PICK
+                visible_ids[di] =
+                    model.object_ids.get(i[0]).copied().unwrap_or(u32::MAX);
                 let rgb = if highlighted {
                     // Gold instance highlight: keep enough of the underlying
                     // original texture to recognize the selected mesh.
@@ -485,13 +509,14 @@ pub fn render_highlights_with_sources(model:&Model,vram:&Vram,cam:Camera,shading
             }
         }
     }
-    rgba
+    (rgba,visible_ids)
 }
 
 /// Hit-test original world triangles at a viewport pixel; nearest depth wins.
 /// IDs are stored in `Model::object_ids` for the editor's assembled world.
 /// Synthetic walk-ground is tagged `u32::MAX` and is not selectable here.
-pub fn pick_instance(model: &Model, cam: Camera, w: usize, h: usize, pixel: [f32; 2]) -> Option<u32> {
+// LCK_FOREIGN_FLOOR_PICK_PRIORITY_V1
+fn pick_instance_depth(model: &Model, cam: Camera, w: usize, h: usize, pixel: [f32; 2], only: Option<u32>) -> Option<(u32,f32)> {
     if w == 0 || h == 0 { return None; }
     let (sy, cy) = cam.yaw.sin_cos();
     let (sp, cp) = cam.pitch.sin_cos();
@@ -511,12 +536,15 @@ pub fn pick_instance(model: &Model, cam: Camera, w: usize, h: usize, pixel: [f32
     }).collect();
     let mut winner = None;
     let mut nearest = f32::INFINITY;
-    let [px, py] = pixel;
+    // LCK_R51_ALIGNMENT
+    // The CPU renderer samples integer pixels at +0.5.
+    let px = pixel[0].floor() + 0.5;
+    let py = pixel[1].floor() + 0.5;
     for tri in model.indices.as_chunks::<3>().0 {
         let i = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
         if i.iter().any(|&k| k >= projected.len()) { continue; }
         let id = model.object_ids.get(i[0]).copied().unwrap_or(u32::MAX);
-        if id == u32::MAX { continue; }
+        if id >= u32::MAX-1 || only.is_some_and(|requested|requested != id) { continue; } // LCK_R49_WORLD_FIXED_GRID
         let s = [projected[i[0]], projected[i[1]], projected[i[2]]];
         if s.iter().any(|p| !p[2].is_finite() || p[2] < near) { continue; }
         let area = (s[1][0] - s[0][0]) * (s[2][1] - s[0][1])
@@ -529,7 +557,37 @@ pub fn pick_instance(model: &Model, cam: Camera, w: usize, h: usize, pixel: [f32
         let z = w0 * s[0][2] + w1 * s[1][2] + w2 * s[2][2];
         if z < nearest { nearest = z; winner = Some(id); }
     }
-    winner
+    winner.map(|id|(id,nearest))
+}
+
+/// Preserve ordinary nearest-depth picking.
+pub fn pick_instance(model: &Model, cam: Camera, w: usize, h: usize, pixel: [f32; 2]) -> Option<u32> {
+    pick_instance_depth(model,cam,w,h,pixel,None).map(|(id,_)|id)
+}
+
+/// Prefer the selected surface when it is nearly coplanar with another.
+/// Do not select through substantially closer opaque geometry.
+pub fn pick_instance_prefer(
+    model:&Model,
+    cam:Camera,
+    w:usize,
+    h:usize,
+    pixel:[f32;2],
+    preferred:Option<u32>
+)->Option<u32> {
+    let front=pick_instance_depth(model,cam,w,h,pixel,None);
+    let selected=preferred.and_then(
+        |id|pick_instance_depth(model,cam,w,h,pixel,Some(id))
+    );
+
+    match (front,selected) {
+        (Some((_,z)),Some((chosen,selected_z)))
+            if selected_z <= z + (z.abs()*0.0005).max(0.25)
+                => Some(chosen),
+        (Some((id,_)),_) => Some(id),
+        (None,Some((id,_))) => Some(id),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -580,5 +638,82 @@ mod tests {
         assert_eq!(bgr555(0x7FFF), [255, 255, 255]);
         assert_eq!(bgr555(0x001F), [255, 0, 0]);
         assert_eq!(bgr555(0x7C00), [0, 0, 255]);
+    }
+}
+
+
+// LCK_R54_VISIBLE_PICK
+#[cfg(test)]
+mod lck_r54_visible_pick_tests {
+    use super::*;
+
+    fn triangle(textured:bool)->Model {
+        Model {
+            positions:vec![
+                [-1.0,-1.0,0.0],
+                [ 1.0,-1.0,0.0],
+                [-1.0, 1.0,0.0]
+            ],
+            rest:vec![
+                [-1.0,-1.0,0.0],
+                [ 1.0,-1.0,0.0],
+                [-1.0, 1.0,0.0]
+            ],
+            object_ids:vec![71337;3],
+            uvs:vec![[0,0];3],
+            cba_tsb:vec![[0,0];3],
+            modulation:vec![[128;3];3],
+            fill:vec![[200;3];3],
+            textured:vec![if textured {1}else{0};3],
+            indices:vec![0,1,2],
+            center:[0.0;3],
+            radius:1.0
+        }
+    }
+
+    fn camera()->Camera {
+        Camera {
+            yaw:0.0,
+            pitch:0.0,
+            zoom:1.0,
+            target_offset:[0.0;3]
+        }
+    }
+
+    #[test]
+    fn visible_surface_has_same_id_as_drawn_pixel() {
+        let model=triangle(false);
+        let vram=Vram::new();
+
+        let (rgba,ids)=render_highlights_with_sources_and_ids(
+            &model,&vram,camera(),Shading::Textured,
+            64,64,&[],true,None
+        );
+
+        let pixel=31*64+31;
+
+        assert_eq!(ids[pixel],71337);
+        assert_eq!(rgba[pixel*4+3],255);
+
+        assert_eq!(
+            rgba,
+            render_highlights_with_sources(
+                &model,&vram,camera(),Shading::Textured,
+                64,64,&[],true,None
+            )
+        );
+    }
+
+    #[test]
+    fn transparent_texture_cannot_steal_a_click() {
+        let model=triangle(true);
+        let vram=Vram::new();
+
+        let (_,ids)=render_highlights_with_sources_and_ids(
+            &model,&vram,camera(),Shading::Textured,
+            64,64,&[],true,None
+        );
+
+        assert!(ids.iter().all(|&id|id==u32::MAX));
     }
 }

@@ -77,13 +77,25 @@ fn visual_delete(
         word &= !CELL_WALK_VISIBLE;
 
         if flags&1!=0 {
-            ensure!(
-                flags&0x0004==0,
-                "Tile {:?} references a placed object. \
-                 Actor-aware floor isolation is not implemented.",
-                cell
-            );
-
+            // A placement descriptor may also carry its ground surface. If
+            // every reference loses that surface, keep the descriptor ID and
+            // all actor/script data intact; only disable its floor flag.
+            if flags&4!=0 {
+                let all_removed=(0..128u8).all(|z| (0..128u8).all(|x| {
+                    let c=[x,z];
+                    let at=offset(c);
+                    let id=u16::from_le_bytes([before[at],before[at+1]])&0x1ff;
+                    id as usize!=original_id || (deleted.contains(&c)&&!replaced.contains(&c))
+                }));
+                ensure!(all_removed,
+                    "Floor {:?} shares placement descriptor #{} with retained ground; independent surface isolation required",
+                    cell,original_id);
+                after[original_at+0x12..original_at+0x14]
+                    .copy_from_slice(&(flags&!1u16).to_le_bytes());
+                allocated.insert(original_id);
+                after[at..at+2].copy_from_slice(&word.to_le_bytes());
+                continue;
+            }
             let id=if let Some(&existing)=clones.get(&original_id){
                 existing
             }else{
@@ -185,6 +197,27 @@ pub(super) fn validate_visual_descriptor_delta(
     }
 
     let mut allowed=BTreeSet::new();
+
+    // In-place floor removal on an exclusively removed placement descriptor.
+    // IDs and every actor byte remain stable, including the spawn flag.
+    for id in 0..512usize {
+        let at=id*32;
+        let flags=u16::from_le_bytes([before[at+0x12],before[at+0x13]]);
+        if flags&5!=5 { continue; }
+        let mut expected=before[at..at+32].to_vec();
+        expected[0x12..0x14].copy_from_slice(&(flags&!1u16).to_le_bytes());
+        if after[at..at+32]!=expected { continue; }
+        let mut references=0;
+        let valid=(0..128u8).all(|z| (0..128u8).all(|x| {
+            let cell=[x,z];let p=offset(cell);
+            let old=u16::from_le_bytes([before[p],before[p+1]]);
+            if old&0x1ff!=id as u16 { return true; }
+            references+=1;
+            let new=u16::from_le_bytes([after[p],after[p+1]]);
+            owned.contains(&cell)&&new&0x1ff==id as u16&&new&CELL_WALK_VISIBLE==0
+        }));
+        if valid&&references>0 { allowed.insert(id); }
+    }
 
     for &cell in owned {
         let at=offset(cell);
@@ -442,6 +475,62 @@ fn four_tiers(map:&[u8],cell:Cell)->Result<[u8;4]>{
 }
 
 
+// Retire old elevation contributions only where the edited surface replaces
+// them. Repack the native chained table so scene initialization cannot restore
+// their 0x800 flags. Teleport, actor and region records remain byte-identical.
+fn remove_replaced_overrides(map:&mut [u8],cells:&BTreeSet<Cell>)->Result<usize>{
+    use legaia_scene_formats::field_map;
+    let block=map[0x10000..0x12000].to_vec();
+    if block[..18].iter().all(|&b|b==0) { return Ok(0); }
+    let parsed=field_map::detect(&map[..0x12000]).context("Invalid native trigger header")?;
+    let header=parsed.trigger_block().context("Missing native trigger tables")?;
+    let table=&header.tables[2];
+    let rows=block[table.body_range()].chunks_exact(4)
+        .filter(|r|!cells.contains(&[r[0],r[1]])).flatten().copied().collect::<Vec<_>>();
+    let removed=table.count-rows.len()/4;
+    let old_end=header.end_offset;
+    let mut replacement=vec![0u8;18];
+    for kind in 0..4 {
+        let table=&header.tables[kind];
+        let body=if kind==2 {rows.as_slice()}else{&block[table.body_range()]};
+        let cursor=replacement.len();
+        replacement[kind*4+2..kind*4+4].copy_from_slice(&(cursor as u16).to_le_bytes());
+        replacement[kind*4+4..kind*4+6].copy_from_slice(&((body.len()/table.stride) as u16).to_le_bytes());
+        replacement.extend_from_slice(body);
+        let end=table.offset+table.count*table.stride;
+        replacement.extend_from_slice(&block[end..end+2]);
+    }
+    let end=replacement.len();replacement[..2].copy_from_slice(&(end as u16).to_le_bytes());
+    let retained=[0,1,3].map(|k|parsed.trigger_records(k).into_iter().map(|r|r.to_vec()).collect::<Vec<_>>());
+    map[0x10000..0x10000+old_end].fill(0);
+    map[0x10000..0x10000+end].copy_from_slice(&replacement);
+    for &cell in cells {
+        let p=offset(cell);let word=u16::from_le_bytes([map[p],map[p+1]])&!0x800;
+        map[p..p+2].copy_from_slice(&word.to_le_bytes());
+    }
+    let checked=field_map::detect(&map[..0x12000]).context("Repacked MAP failed parsing")?;
+    for (i,k) in [0,1,3].into_iter().enumerate() {
+        ensure!(checked.trigger_records(k)==retained[i],"Unrelated trigger kind {k} changed");
+    }
+    Ok(removed)
+}
+
+fn verify_runtime_surfaces(map:&[u8],deleted:&BTreeSet<Cell>,stamps:&[(Cell,Cell)])->Result<()> {
+    let replaced=stamps.iter().map(|&(_,c)|c).collect::<BTreeSet<_>>();
+    let mut initialized=map.to_vec();
+    legaia_engine_field::field_regions::refresh_object_grid_marks(&mut initialized);
+    for &c in deleted.difference(&replaced) {
+        ensure!(native_word(&initialized,c)?&CELL_WALK_VISIBLE==0,
+            "Scene initialization restored deleted floor {c:?}");
+    }
+    for &c in &replaced {
+        let word=native_word(&initialized,c)?;
+        ensure!(word&CELL_WALK_VISIBLE!=0,"Scene initialization removed replacement floor {c:?}");
+        ensure!(word&0x800==0,"Old elevation override survived on replacement floor {c:?}");
+    }
+    Ok(())
+}
+
 // Unrestricted native projection. Occupied cells use last-wins
 // semantics. Exact source geometry is NOT serialized.
 fn w2b_compile(map:&[u8],deleted:&BTreeSet<Cell>,stamps:&[(Cell,Cell)])
@@ -529,9 +618,237 @@ fn w2b_compile(map:&[u8],deleted:&BTreeSet<Cell>,stamps:&[(Cell,Cell)])
         ));
     }
 
+    let touched=deleted.iter().copied().chain(replaced.iter().copied()).collect();
+    let removed=remove_replaced_overrides(&mut out,&touched)?;
+    notes.push(format!("REPLACED ELEVATION: removed {removed} old native override records"));
     Ok((out,notes))
 }
 
+// LCK_R46_GROUND_COMPOSITOR
+// Reconstruct height using each original floor tile's four
+// corner heights, world-space transform, and native LUT.
+
+fn w46_height(
+    original:&[u8],
+    stamp:super::ground_edit_ops::W46Stamp,
+    at_x:f32,
+    at_z:f32,
+    lut:&[i16;16]
+)->Result<f32>
+{
+    let [a,b,c,d]=four_tiers(original,stamp.source)?;
+
+    let h=[
+        lut[a as usize] as f32,
+        lut[b as usize] as f32,
+        lut[c as usize] as f32,
+        lut[d as usize] as f32
+    ];
+
+    let t=stamp.transform;
+
+    ensure!(
+        t.scale.iter().all(|v|v.is_finite()&&v.abs()>0.00001),
+        "Native floor has invalid or zero scale"
+    );
+
+    let cx=stamp.source[0] as f32*128.+64.+t.offset[0];
+    let cz=stamp.source[1] as f32*128.+64.+t.offset[2];
+
+    let (rx,rz)=(at_x-cx,at_z-cz);
+
+    let (sx,sz)=match t.turns.rem_euclid(4) {
+        0=>(rx,rz),
+        1=>(rz,-rx),
+        2=>(-rx,-rz),
+        _=>(-rz,rx)
+    };
+
+    let u=((sx/t.scale[0]+64.)/128.).clamp(0.,1.);
+    let v=((sz/t.scale[2]+64.)/128.).clamp(0.,1.);
+
+    let y=h[0]*(1.-u)*(1.-v)
+        +h[1]*u*(1.-v)
+        +h[2]*(1.-u)*v
+        +h[3]*u*v;
+
+    let mid=(h[0]+h[1]+h[2]+h[3])/4.;
+
+    Ok(mid+(y-mid)*t.scale[1]+t.offset[1])
+}
+
+fn w46_reconcile(
+    original:&[u8],
+    mut out:Vec<u8>,
+    stamps:&[super::ground_edit_ops::W46Stamp],
+    lut:&[i16;16]
+)->Result<(Vec<u8>,Vec<String>)>
+{
+    let mut last=std::collections::BTreeMap::<
+        Cell,
+        super::ground_edit_ops::W46Stamp
+    >::new();
+
+    for &stamp in stamps {
+        last.insert(stamp.target,stamp);
+    }
+
+    let mut corners=std::collections::BTreeMap::<
+        usize,(f32,usize)
+    >::new();
+
+    let mut composed=0usize;
+    let mut preserved_binds=0usize;
+    let mut clipped_border=0usize;
+    let mut notes=Vec::new();
+
+    for (priority,(target,stamp)) in
+        last.into_iter().enumerate()
+    {
+        let word=native_word(original,stamp.source)?;
+        let previous=native_word(original,target)?;
+        let at=offset(target);
+
+        let desc=if previous
+            &legaia_scene_formats::field_objects::CELL_BIND_OWNED!=0
+        {
+            preserved_binds+=1;
+            previous&0x01ff
+        } else {
+            word&0x01ff
+        };
+
+        let merged=(previous&!(0x01ff|0x0800))|desc|CELL_WALK_VISIBLE;
+
+        out[at..at+2].copy_from_slice(
+            &merged.to_le_bytes()
+        );
+
+        composed+=1;
+
+        if target[0]==127||target[1]==127||
+           stamp.source[0]==127||stamp.source[1]==127
+        {
+            clipped_border+=1;
+            continue;
+        }
+
+        let base=0x4000
+            +target[1] as usize*128
+            +target[0] as usize;
+
+        for (dx,dz,delta) in [
+            (0f32,0f32,0usize),
+            (1.,0.,1),
+            (0.,1.,128),
+            (1.,1.,129)
+        ] {
+            let height=w46_height(
+                original,
+                stamp,
+                (target[0] as f32+dx)*128.,
+                (target[1] as f32+dz)*128.,
+                lut
+            )?;
+
+            let idx=base+delta;
+            corners.insert(idx,(height,priority));
+        }
+    }
+
+    let min=lut.iter().copied().min().unwrap_or(0) as f32;
+    let max=lut.iter().copied().max().unwrap_or(0) as f32;
+
+    let mut approximate=0usize;
+    let mut out_of_ladder=0usize;
+    let mut max_error=0f32;
+
+    for (idx,(height,_)) in corners {
+        if height<min-0.5||height>max+0.5 {
+            out_of_ladder+=1;
+        }
+
+        let (tier,error)=lut.iter()
+            .enumerate()
+            .map(|(i,&v)|(i,(v as f32-height).abs()))
+            .min_by(|a,b|a.1.total_cmp(&b.1))
+            .context("Native height ladder unavailable")?;
+
+        max_error=max_error.max(error);
+
+        if error>0.5 {
+            approximate+=1;
+        }
+
+        out[idx]=(out[idx]&0xf0)|tier as u8;
+    }
+
+    notes.push(format!(
+        "W46 HEIGHT COMPOSITE: {} unique native floor cells, {} approximate height corners, {} outside existing 16-level ladder, max height error {:.2} PS1 units; walkability NOT gameplay-verified",
+        composed,
+        approximate,
+        out_of_ladder,
+        max_error
+    ));
+
+    if preserved_binds>0 {
+        notes.push(format!(
+            "W46 SCRIPT OWNERSHIP: {} destination object links preserved; these cells gain a walk flag but retain their existing script-owned descriptor",
+            preserved_binds
+        ));
+    }
+
+    if clipped_border>0 {
+        notes.push(format!(
+            "W46 BORDER: {} final row/column cells lack four writable height corners",
+            clipped_border
+        ));
+    }
+
+    Ok((out,notes))
+}
+
+#[cfg(test)]
+mod lck_r46_height_tests {
+    use super::*;
+
+    #[test]
+    fn equal_height_overlap_remains_walkable() -> Result<()> {
+        let mut map=vec![0u8;0x12000];
+
+        let source=[18u8,19u8];
+        let target=[20u8,21u8];
+
+        let source_at=offset(source);
+
+        map[source_at..source_at+2].copy_from_slice(
+            &(CELL_WALK_VISIBLE|7u16).to_le_bytes()
+        );
+
+        let stamp=crate::app::ground_edit_ops::W46Stamp {
+            source,
+            target,
+            transform:crate::app::ground_edit_ops::Transform::default(),
+            uid:Some(1)
+        };
+
+        let lut=[0i16;16];
+
+        let (output,_)=w46_reconcile(
+            &map,
+            map.clone(),
+            &[stamp],
+            &lut
+        )?;
+
+        assert_ne!(
+            native_word(&output,target)?&CELL_WALK_VISIBLE,
+            0
+        );
+
+        Ok(())
+    }
+}
 fn compile_stamps(
     map:&[u8],
     deleted:&BTreeSet<Cell>,
@@ -696,7 +1013,7 @@ pub(super) fn export_ground(
     index:&ProtIndex,
         edits:&super::ground_edit_ops::State,unrestricted:bool)->Result<String>{
         let (deleted,stamps,mut notes)=if unrestricted {
-        super::ground_edit_ops::w2b_plan(edits).map_err(anyhow::Error::msg)?
+        super::ground_edit_ops::w46_plan(edits).map_err(anyhow::Error::msg)?
     }else{
         let (a,b)=super::ground_edit_ops::native_128_plan(edits)
             .map_err(anyhow::Error::msg)?;
@@ -732,6 +1049,24 @@ pub(super) fn export_ground(
     let after=if unrestricted {
         let (bytes,extra)=w2b_compile(&before,&deleted,&stamps)?;
         notes.extend(extra);
+
+        let (_,detailed,_)=super::ground_edit_ops::
+            w46_plan_detailed(edits)
+            .map_err(anyhow::Error::msg)?;
+
+        let lut=scene.field_floor_height_lut(index)?
+            .context("Selected scene has no native height ladder")?;
+
+        let (bytes,extra)=w46_reconcile(
+            &before,
+            bytes,
+            &detailed,
+            &lut
+        )?;
+
+        notes.extend(extra);
+        verify_runtime_surfaces(&bytes,&deleted,&stamps)?;
+        notes.push("RUNTIME FLOOR CHECK: deleted surfaces stay absent; replacement surfaces remain walkable; replaced elevation overrides are absent after initialization".into());
         bytes
     }else{
         compile_stamps(&before,&deleted,&stamps)?
@@ -828,7 +1163,7 @@ pub(super) fn export_ground(
         );
 
         report.push_str(
-            "NOT EXACT: partial cells become full 128-unit cells; Y offsets ignored; overlapping edits overwrite cells; textures repeat.\n"
+            "NOT EXACT: partial cells become full 128-unit cells; heights rounded to the native ladder; overlapping edits overwrite cells; textures repeat.\n"
         );
 
         for &(a,b) in &stamps {
@@ -1024,7 +1359,7 @@ mod tests {
     }
 
     #[test]
-    fn visual_delete_rejects_placed_actor_dependency()->Result<()>{
+    fn visual_delete_preserves_exclusive_placement_identity()->Result<()>{
         let mut map=vec![0u8;0x12000];
         let cell=[9u8,9u8];
         let id=20usize;
@@ -1039,9 +1374,17 @@ mod tests {
             &(CELL_WALK_VISIBLE|id as u16).to_le_bytes()
         );
 
-        assert!(
-            compile(&map,&BTreeSet::from([cell])).is_err()
-        );
+        let deleted=BTreeSet::from([cell]);
+        let out=compile(&map,&deleted)?;
+        assert_eq!(native_word(&out,cell)?&0x1ff,id as u16);
+        assert_eq!(u16::from_le_bytes(out[base+0x12..base+0x14].try_into()?),4);
+        assert_eq!(validate_visual_descriptor_delta(&map,&out,&deleted)?,BTreeSet::from([id]));
+        let before_spawns=legaia_engine_field::field_regions::window_rebuild_spawns(&map,(0,0,128,128),[0;16]);
+        let after_spawns=legaia_engine_field::field_regions::window_rebuild_spawns(&out,(0,0,128,128),[0;16]);
+        assert_eq!(format!("{before_spawns:?}"),format!("{after_spawns:?}"));
+        let other=offset([10,9]);
+        map[other..other+2].copy_from_slice(&(CELL_WALK_VISIBLE|id as u16).to_le_bytes());
+        assert!(compile(&map,&deleted).is_err(),"Shared retained surface must not be removed");
 
         Ok(())
     }
@@ -1082,6 +1425,78 @@ mod w2b_unrestricted_tests {
         assert_ne!(out[t..t+2],map[t..t+2]);
         assert!(native_word(&out,target)?&CELL_WALK_VISIBLE!=0);
         assert!(notes.iter().any(|n|n.contains("OVERWRITE")));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lowering_regression {
+    use super::*;
+    #[test]
+    #[ignore = "Requires LCK_FLOOR_PROJECT, LCK_RETAIL_SOURCE and LCK_FLOOR_OUTPUT"]
+    fn saved_project_ground_exports_and_survives_initialization() -> Result<()> {
+        let project:serde_json::Value=serde_json::from_slice(&fs::read(std::env::var("LCK_FLOOR_PROJECT")?)?)?;
+        let raw=project["cell_snapshots"]["original:town01"].as_str().context("town01 snapshot missing")?;
+        let source=std::path::PathBuf::from(std::env::var("LCK_RETAIL_SOURCE")?);
+        let output=std::path::PathBuf::from(std::env::var("LCK_FLOOR_OUTPUT")?);
+        let library=crate::library::Library::open(&source)?;
+        let index=&library.index;
+        let scene=Scene::load(index,"town01")?;
+        let entry=scene.field_map_index(index).context("MAP missing")? as usize;
+        let before=DiscPatcher::open(fs::read(&source)?)?.read_entry_footprint(entry)?;
+        let lut=scene.field_floor_height_lut(index)?.context("LUT missing")?;
+        let hf=legaia_scene_formats::field_objects::build_walk_heightfield(&before,&lut);
+        let edits=super::super::ground_edit_ops::parse(raw,Some(&hf),"town01").map_err(anyhow::Error::msg)?;
+        let (deleted,stamps,_)=super::super::ground_edit_ops::w46_plan(&edits).map_err(anyhow::Error::msg)?;
+        let replaced=stamps.iter().map(|&(_,c)|c).collect::<BTreeSet<_>>();
+        let (bytes,notes)=w2b_compile(&before,&deleted,&stamps)?;
+        let (_,detailed,_)=super::super::ground_edit_ops::w46_plan_detailed(&edits).map_err(anyhow::Error::msg)?;
+        let (expected,height_notes)=w46_reconcile(&before,bytes,&detailed,&lut)?;
+        println!("{}\n{}",notes.join("\n"),height_notes.join("\n"));
+        // Exercise the production compiler and raw-sector writer. The test uses
+        // create_new directly because this sandbox cannot canonicalize paths.
+        let mut disc=DiscPatcher::open(fs::read(&source)?)?;
+        disc.patch_prot_entry(entry,0,&expected)?;
+        let mut file=fs::OpenOptions::new().write(true).create_new(true).open(&output)?;
+        file.write_all(&disc.into_image())?;file.sync_all()?;drop(file);
+        let after=DiscPatcher::open(fs::read(&output)?)?.read_entry_footprint(entry)?;
+        ensure!(after==expected,"Physical IMG MAP differs from compiled ground");
+        ensure!(after!=before,"Ground exporter returned unchanged MAP");
+        let mut runtime=after.clone();
+        legaia_engine_field::field_regions::refresh_object_grid_marks(&mut runtime);
+        for c in deleted.difference(&replaced) {
+            ensure!(native_word(&runtime,*c)?&CELL_WALK_VISIBLE==0,"Deleted floor {c:?} returned at initialization");
+        }
+        for c in &replaced {
+            ensure!(native_word(&runtime,*c)?&CELL_WALK_VISIBLE!=0,"Replacement {c:?} lost walking surface at initialization");
+        }
+        let old_override=replaced.iter().filter(|&&c|native_word(&runtime,c).unwrap()&0x800!=0).count();
+        println!("Deleted {} / replacement {} cells checked; {} retained height overrides",deleted.len(),replaced.len(),old_override);
+        ensure!(old_override==0,"Replacement retains an old elevation override");
+        // Execute the original retail height routine against the exported MAP.
+        let exe=library.iso_files.iter().find(|f|f.path.eq_ignore_ascii_case("SCUS_942.54")).context("SCUS executable required")?;
+        let bytes=library.iso_file_bytes(exe)?;
+        let base=u32::from_le_bytes(bytes[0x18..0x1c].try_into()?);
+        let mut cpu=legaia_code_hooks::mips_sim::Cpu::new();
+        cpu.load(base,&bytes[0x800..]);cpu.load(0x801ce818,&index.entry_bytes(897)?);
+        const MAP:u32=0x80100000;const ACTOR:u32=0x801b0000;const STOP:u32=0x80000080;
+        cpu.load(MAP,&runtime);cpu.wr32(0x1f8003ec,MAP);cpu.load(0x8007b318,&[4,4,4,8]);
+        for (i,&y) in lut.iter().enumerate(){cpu.wr16(0x1f80035c+i as u32*2,y as u16);}
+        let mut checked=0;
+        for &cell in &replaced {
+            if cell[0]==127||cell[1]==127 {continue;}
+            let h=four_tiers(&runtime,cell)?.map(|i|lut[i as usize] as i32);
+            for (dx,dz) in [(32,32),(96,32),(32,96),(96,96)] {
+                let expected=(h[0]*(128-dx)*(128-dz)+h[1]*dx*(128-dz)+h[2]*(128-dx)*dz+h[3]*dx*dz)>>14;
+                cpu.r=[0;32];cpu.r[4]=ACTOR;cpu.r[28]=0x8007b318;cpu.r[29]=0x801bff00;cpu.r[31]=STOP;
+                cpu.wr32(ACTOR+0x10,0);cpu.wr16(ACTOR+0x14,cell[0] as u16*128+dx as u16);
+                cpu.wr16(ACTOR+0x18,cell[1] as u16*128+dz as u16);
+                cpu.pc=0x80019278;cpu.steps=0;cpu.run_until(&[STOP]);
+                ensure!((cpu.r[2] as i32-expected).abs()<=1,"Retail height differs at {cell:?}: {} vs {expected}",cpu.r[2] as i32);
+                checked+=1;
+            }
+        }
+        println!("Retail MIPS height routine matched {checked} exported floor samples");
         Ok(())
     }
 }

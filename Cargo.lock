@@ -3097,6 +3097,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "eframe",
+ "encoding_rs",
  "env_logger",
  "legaia-actor-formats",
  "legaia-app-theme",

@@ -10,16 +10,26 @@ mod form_master_store;
 mod form_ui;
 mod actors_ui;
 mod multi_selection;
+mod authoring_group;
+mod native_mirror_export;
+mod door_teleport;
+mod native_floor_mirror;
 #[cfg(test)]
 mod multi_selection_workspace_tests;
 mod media_ui;
 mod viewport;
+mod native_warps; // LCK_R57_NATIVE_WARPS
+mod lck_cell_camera; // LCK_R52_CELL_CAMERA
+mod native_map_bounds;
+mod native_extended_manifest; // LCK_R50A_EXPORT_MANIFEST // LCK_R47_NATIVE_MAP_BOUNDS
 mod world_view;
+mod story_preview;
 mod scene_instances;
 mod collision_recipes;
 mod collision_authoring;
 mod collision_generation;
 mod naming;
+mod descriptive_names;
 mod native_dependency_report;
 mod native_script_dependencies;
 mod native_wall_ownership;
@@ -30,6 +40,7 @@ mod native_wall_journal;
 mod native_wall_export;
 mod native_elevation_codec;
 mod native_floor_patch;
+mod native_flat_import;
 pub mod native_extended_floor;
 mod native_script_relocation;
 #[cfg(test)]
@@ -48,6 +59,8 @@ mod global_repository;
 mod floor_tiles;
 mod ground_select;
 mod ground_edit_ops;
+mod marquee_selection;
+mod drag_anchor;
 mod native_ground_delete;
 mod unified_ground_export;
 pub mod ps1_original_guard;
@@ -282,11 +295,58 @@ enum NativeSceneSlot {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EditorMoveMode { Fluid, Grid }
 
+#[derive(Clone,Copy,PartialEq,Eq)]
+enum GroundMenu { Floor, Collision }
+
+/// Defers the popup until RMB-up. Floor drag uses captured transforms so the
+/// gesture cannot accumulate rotation drift or steal clicks from the popup.
+struct GroundRightGesture {
+    start:egui::Pos2,
+    kind:GroundMenu,
+    baselines:Vec<(ground_edit_ops::Key,ground_edit_ops::Transform)>,
+    collision_source:Option<collision_edit::State>,
+    collision_members:std::collections::BTreeSet<(i32,i32)>,
+    collision_current:Vec<((i32,i32),(i32,i32))>,
+    moved:bool,
+    turns:i32,
+}
+
+// Movement properties are editor-only. Native serialization
+// still validates each PS1 format independently.
+fn lck_movement_ui(
+    ui:&mut egui::Ui,
+    mode:&mut EditorMoveMode,
+    size:&mut f32,
+    native:f32,
+    label:&str,
+){
+    ui.horizontal(|ui|{
+        ui.label(format!("{label} movement:"));
+        ui.selectable_value(mode,EditorMoveMode::Fluid,"Fluid");
+        ui.selectable_value(mode,EditorMoveMode::Grid,"Grid Snap");
+        ui.label("Step:");
+        if !size.is_finite(){*size=native;}
+        ui.add(
+            egui::DragValue::new(size)
+                .range(1.0..=512.0)
+                .speed(1.0)
+                .max_decimals(0)
+        );
+        if ui.small_button("Native default").clicked(){
+            *mode=EditorMoveMode::Grid;
+            *size=native;
+        }
+    });
+}
+
+
+
 #[derive(Clone, Copy)]
 struct EditorDrag {
     key: (bool, usize),
     pointer_start: egui::Pos2,
     offset_start: [f32; 3],
+    grab:[f32;3],
 }
 
 #[derive(Clone, Copy)]
@@ -342,6 +402,15 @@ fn editor_history_capture_group(world: &world_view::WorldModel, name: &str,
             Some(uid)=>scene_instances::NameTarget::Created(uid),
             None=>scene_instances::NameTarget::Native(key.0,key.1),
         })).collect();
+    history
+}
+
+fn editor_history_capture_with_layers(world: &world_view::WorldModel, name: &str,
+    primary:Option<(bool,usize)>, selection:&std::collections::BTreeSet<(bool,usize)>,
+    ground:&ground_edit_ops::State, collision:&collision_edit::State)->EditorSceneHistory {
+    let mut history=editor_history_capture_group(world,name,primary,selection);
+    history.overlay.push_str(&ground_edit_ops::serialize(ground));
+    history.overlay.push_str(&collision.embedded_record(name));
     history
 }
 
@@ -533,6 +602,34 @@ fn catalog_pointer_pressed_on(ui: &egui::Ui, rect: egui::Rect) -> bool {
         i.pointer.interact_pos().is_some_and(|p| rect.contains(p)))
 }
 
+// LCK_REPO_CLAMPED_NAV_V1
+fn lck_repo_next(rows:&[usize], current:usize, step:i32)->Option<usize>{
+    let index=rows.iter().position(|&id|id==current)?;
+    let next=if step>0 {
+        index.saturating_add(1).min(rows.len()-1)
+    }else if step<0 {
+        index.saturating_sub(1)
+    }else{
+        index
+    };
+    rows.get(next).copied()
+}
+
+#[cfg(test)]
+mod lck_repo_arrow_tests {
+    use super::lck_repo_next;
+
+    #[test]
+    fn stops_at_subgroup_boundaries(){
+        let rows=[4,9,17,31];
+        assert_eq!(lck_repo_next(&rows,9,1),Some(17));
+        assert_eq!(lck_repo_next(&rows,9,-1),Some(4));
+        assert_eq!(lck_repo_next(&rows,4,-1),Some(4));
+        assert_eq!(lck_repo_next(&rows,31,1),Some(31));
+        assert_eq!(lck_repo_next(&rows,99,1),None);
+        assert_eq!(lck_repo_next(&[],4,1),None);
+    }
+}
 /// One indexed subgroup: the search filters locally and only expanded groups
 /// draw their rows; opening a context menu never changes the camera.
 fn editor_catalog_group(ui: &mut egui::Ui, title: &str,
@@ -548,7 +645,7 @@ fn editor_catalog_group(ui: &mut egui::Ui, title: &str,
     if matches == 0 { return; }
     egui::CollapsingHeader::new(format!("{title} ({matches})"))
         .id_salt(("editor_catalog_group", title))
-        .default_open(title == "Placed objects")
+        .default_open(false)
         .show(ui, |ui| {
             for (label, item) in rows {
                 if !term.is_empty() && !label.to_lowercase().contains(&term) { continue; }
@@ -612,7 +709,7 @@ fn editor_duplicate_request(
     let key = selected?;
     let draw = world.at(key.0, key.1)?;
     if draw.hidden || draw.vertex_start==draw.vertex_end { return None; }
-    let source = draw.source_ref.unwrap_or(key);
+    let source = if lck_is_imported_floor(world,key) {key} else {draw.source_ref.unwrap_or(key)};
     let mut offset = draw.offset;
     offset[0] += 128.0;
     let actor=world.npc(key).map(|n|(n.model_index,n.clip,n.frame));
@@ -661,6 +758,17 @@ fn editor_cell_row(ui: &mut egui::Ui, id: CellSelection, label: String,
 /// Perspective-aware screen drag, projected onto the horizontal XZ plane.
 /// Ctrl+left-drag instead moves on the vertical axis. Flip the view's horizontal
 /// drag only in the editor's presentation layer, as v0.4.3.1 already does.
+// LCK_IMPORTED_GROUND_V41
+fn lck_is_imported_floor(
+    world:&world_view::WorldModel,
+    key:(bool,usize)
+)->bool {
+    world.at(key.0,key.1)
+        .and_then(|d|d.editor_uid)
+        .and_then(|uid|world.foreign.iter().find(|f|f.uid==uid))
+        .is_some_and(|f|
+            floor_tiles::decode_floor_kind(&f.kind).is_some())
+}
 fn editor_drag_offset(start: [f32; 3], pixels: egui::Vec2,
                       cam: crate::raster::Camera, radius: f32,
                       view_height: f32, mirror: bool, vertical: bool) -> [f32; 3] {
@@ -819,9 +927,28 @@ pub struct App {
     native_selected: Option<(bool, usize)>, // false = placement; true = terrain
     native_hierarchy_anchor: Option<(bool,usize)>,
     native_selection_click: Option<((bool,usize),egui::Pos2,egui::Modifiers)>,
+    // Mouse-down on empty viewport; cleared only on a short, unmodified click.
+    lck_empty_viewport_press: Option<(String,egui::Pos2,bool)>,
+    doors: door_teleport::State,
+    story_flag_index: usize,
+    story_flag_scene: String,
+    story_flag_stages: Vec<story_preview::Stage>,
+    story_preview: Option<story_preview::Preview>,
+    story_flag_camera_restore: Option<crate::raster::Camera>,
     native_view: Viewport,
     native_ground_visible: bool,
+    native_map_grid_visible: bool,
+    native_map_grid_y: f32,
+    native_map_grid_step: usize,
+    native_map_extension_side: usize,
+    native_map_extension: native_map_bounds::ExtendedGridAuthoring,
     ground_edit_mode: bool,
+    // LCK_C3_MARQUEE
+    marquee_enabled: bool,
+    // LCK_C3_DUAL_MOUSE
+    // Temporary marquee gesture, independent of the checkbox.
+    marquee_chord: bool,
+    marquee_state: marquee_selection::State,
     ground_selected: std::collections::BTreeSet<[u8;2]>,
     ground_active: Option<[u8;2]>,
     ground_hierarchy_reveal: Option<[u8;2]>,
@@ -845,6 +972,14 @@ pub struct App {
     native_collision_preview_cache: Option<(String, Result<ps1_export::ExportEdits,String>)>,
     native_move_mode: EditorMoveMode,
     native_grid_size: f32,
+    floor_move_mode: EditorMoveMode,
+    floor_grid_size: f32,
+    collision_move_mode: EditorMoveMode,
+    collision_grid_size: f32,
+    ground_context_menu: Option<(egui::Pos2,GroundMenu)>,
+    ground_right_gesture:Option<GroundRightGesture>,
+    floor_properties_open: bool,
+    collision_properties_open: bool,
     native_anchor_snap: bool,
     /// None = free X/Z dragging; Some(0) = X-only; Some(2) = Z-only.
     geck_drag_axis: Option<usize>,
@@ -856,6 +991,8 @@ pub struct App {
     native_drag_group: Vec<((bool,usize),[f32;3])>,
     native_drag: Option<EditorDrag>,
     native_rotate: Option<EditorRotateDrag>,
+    native_rotate_moved: bool,
+    native_rotate_orbit: authoring_group::ObjectOrbit,
     native_rotate_undo: Vec<EditorRotationEdit>,
     native_rotate_redo: Vec<EditorRotationEdit>,
     editor_undo: Vec<EditorSceneHistory>,
@@ -889,7 +1026,9 @@ pub struct App {
     global_open_scene: Option<String>,
     global_floor_face: Option<(String,usize,floor_tiles::Face)>,
     global_floor_scroll_target: Option<(usize,floor_tiles::Face)>,
+    global_repository_scroll_target: Option<usize>,
     /// Independent left-pane cell browser (separate scroll and drag-to-resize splitter).
+    editor_tree_generation: u64,
     editor_cell_search: String,
     editor_cells: CellStore,
     editor_cell_selected: Option<CellSelection>,
@@ -900,6 +1039,8 @@ pub struct App {
     /// Background native test-image export; no edits to the currently open image.
     ps1_export_job: Option<Receiver<anyhow::Result<ps1_export::ExportResult>>>,
     ps1_export_output: Option<PathBuf>,
+    // LCK_R57_NATIVE_WARPS
+    native_warp_editor: native_warps::Editor,
     ps1_export_imports:Option<ps1_export::ImportCoverage>,
     unrestricted_img_export: bool,
     /// Source being dragged across the panels (no mouse-driven text selection).
@@ -919,6 +1060,9 @@ pub struct App {
     editor_properties_target: Option<(bool, usize)>,
     /// Right-click context menu appears only for an un-dragged selected mesh.
     editor_context_menu: Option<(egui::Pos2, (bool, usize))>,
+    /// Temporary cross-mode selection basket for mixed object/floor/collision groups.
+    group_basket: std::collections::BTreeSet<authoring_group::Member>,
+    group_wall_remainder: [f32;2],
     editor_name_edit_key: Option<String>,
     editor_name_draft: Record,
     editor_name_apply_mesh: bool,
@@ -967,6 +1111,14 @@ pub struct App {
     status_seen: Option<(String, std::time::Instant)>,
     /// Theme and zoom from the settings have been pushed into egui.
     appearance_applied: bool,
+    lck_menu_project: Option<form_ui::Action>,
+    lck_menu_undo: bool,
+    lck_menu_redo: bool,
+    lck_menu_duplicate: bool,
+    lck_menu_delete: bool,
+    lck_shortcuts_open: bool,
+    lck_menu_export: bool,
+    lck_menu_check: bool,
     // Automation.
     auto: Automation,
     auto_selected: bool,
@@ -1010,12 +1162,7 @@ impl App {
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         // The view and tab open when the app last closed.
-        let mode = studio
-            .settings
-            .mode
-            .as_deref()
-            .and_then(Mode::parse)
-            .unwrap_or(Mode::Browse);
+        let mode = Mode::Editor;
         let tab = studio
             .settings
             .tab
@@ -1041,9 +1188,24 @@ impl App {
             native_selected: None,
             native_hierarchy_anchor: None,
             native_selection_click: None,
+            lck_empty_viewport_press: None,
+            doors: door_teleport::State::default(),
+            story_flag_index: 0,
+            story_flag_scene: String::new(),
+            story_flag_stages: Vec::new(),
+            story_preview: None,
+            story_flag_camera_restore: None,
             native_view: Viewport::new(Shading::Textured),
             native_ground_visible: true,
+            native_map_grid_visible: false,
+            native_map_grid_y: 0.0,
+            native_map_grid_step: 8,
+            native_map_extension_side: 128,
+            native_map_extension: native_map_bounds::ExtendedGridAuthoring::default(),
             ground_edit_mode: false,
+            marquee_enabled: false,
+            marquee_chord: false,
+            marquee_state: marquee_selection::State::default(),
             ground_selected: Default::default(),
             ground_active: None,
             ground_hierarchy_reveal: None,
@@ -1061,6 +1223,14 @@ impl App {
             native_collision_preview_cache: None,
             native_move_mode: EditorMoveMode::Grid,
             native_grid_size: 32.0,
+            floor_move_mode: EditorMoveMode::Grid,
+            floor_grid_size: 128.0,
+            collision_move_mode: EditorMoveMode::Grid,
+            collision_grid_size: 64.0,
+            ground_context_menu: None,
+            ground_right_gesture: None,
+            floor_properties_open: false,
+            collision_properties_open: false,
             native_anchor_snap: false,
             geck_drag_axis: None,
             geck_angle_snap: 0.0,
@@ -1069,6 +1239,8 @@ impl App {
             native_drag_group: Vec::new(),
             native_drag: None,
             native_rotate: None,
+            native_rotate_moved: false,
+            native_rotate_orbit: Default::default(),
             native_rotate_undo: Vec::new(),
             native_rotate_redo: Vec::new(),
             editor_undo: Vec::new(),
@@ -1098,6 +1270,8 @@ impl App {
             global_open_scene: None,
             global_floor_face: None,
             global_floor_scroll_target: None,
+            global_repository_scroll_target: None,
+            editor_tree_generation: 0,
             editor_cell_search: String::new(),
             editor_cells,
             editor_cell_selected: None,
@@ -1107,6 +1281,7 @@ impl App {
             editor_cell_last_autosave: 0.0,
             ps1_export_job: None,
             ps1_export_output: None,
+            native_warp_editor: native_warps::Editor::default(),
             ps1_export_imports:None,
             unrestricted_img_export: true,
             editor_asset_drag: None,
@@ -1122,6 +1297,8 @@ impl App {
             editor_rename: None,
             editor_properties_target: None,
             editor_context_menu: None,
+            group_basket: Default::default(),
+            group_wall_remainder: [0.;2],
             editor_name_edit_key: None,
             editor_name_draft: Record::default(),
             editor_name_apply_mesh: false,
@@ -1156,6 +1333,14 @@ impl App {
             last_written: None,
             status_seen: None,
             appearance_applied: false,
+            lck_menu_project: None,
+            lck_menu_undo: false,
+            lck_menu_redo: false,
+            lck_menu_duplicate: false,
+            lck_menu_delete: false,
+            lck_shortcuts_open: false,
+            lck_menu_export: false,
+            lck_menu_check: false,
             auto,
             auto_selected: false,
             auto_extract_started: false,
@@ -1207,6 +1392,7 @@ impl App {
         self.global_repository.clear();
         self.global_floor_face=None;
         self.global_floor_scroll_target=None;
+        self.global_repository_scroll_target=None;
         self.global_repository_rx = None;
         self.global_repository_started = false;
         self.global_repository_completed = 0;
@@ -1450,7 +1636,7 @@ impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let cmd = |k| egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, k);
         if ctx.input_mut(|i| i.consume_shortcut(&cmd(egui::Key::O))) {
-            self.pick_disc();
+            self.lck_menu_project=Some(form_ui::Action::Open);
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F5)) {
             self.start_game();
@@ -1511,12 +1697,39 @@ impl App {
             });
             match restored {
                 Ok((scene,world))=>{
-                    let projected=(||->anyhow::Result<_>{let lib=self.studio.library.as_ref().ok_or_else(||anyhow::anyhow!("Source library missing"))?;let mut session=if let Some(session)=&self.form_session{session.clone()}else{let mut session=form_bridge::Session::new(lib.source.path(),&lib.index)?;for copy in self.editor_cells.copies.values(){let identity=format!("copy:{}:{}",copy.id,copy.source);let raw=self.editor_cells.read_overlay(copy.id);match raw{Ok(text)=>{let migrated=(||->anyhow::Result<_>{let source=legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,&copy.source).map_err(anyhow::Error::msg)?;session.migrate_cell_document(&source,&lib.index,&text,identity.clone(),copy.name.clone(),Some(copy.id))})();if let Err(error)=migrated{let key=session.project.ensure_cell(&identity,&copy.source,&copy.name,Some(copy.id))?;session.project.legacy_documents.insert(key,text);session.project.diagnostics.push(lck_project::Diagnostic{form:None,message:format!("Legacy cell copy {} retained but migration unresolved: {error:#}",copy.name)});}},Err(error)=>{session.project.ensure_cell(&identity,&copy.source,&copy.name,Some(copy.id))?;session.project.diagnostics.push(lck_project::Diagnostic{form:None,message:format!("Legacy cell copy {} unavailable: {error}; metadata retained",copy.name)});}}}session};let identity=cell.form_identity(&source);let label=match &cell{CellSelection::Copy(id)=>self.editor_cells.copies.get(id).map(|c|c.name.clone()).unwrap_or_else(||source.clone()),_=>source.clone()};let copy=match &cell{CellSelection::Copy(id)=>Some(*id),_=>None};let preview=session.enter(&scene,&lib.index,&world,identity,label,copy)?;Ok((session,preview))})();
-                    let (session,world)=match projected{Ok(value)=>value,Err(error)=>{self.studio.error=Some(format!("Project records could not be loaded; previous editor retained: {error:#}"));return;}};
+                    let projected=(||->anyhow::Result<_>{let lib=self.studio.library.as_ref().ok_or_else(||anyhow::anyhow!("Source library missing"))?;let mut session=if let Some(session)=&self.form_session{session.clone()}else{let mut session=form_bridge::Session::new(lib.source.path(),&lib.index)?;for copy in self.editor_cells.copies.values(){let identity=format!("copy:{}:{}",copy.id,copy.source);let raw=self.editor_cells.read_overlay(copy.id);match raw{Ok(text)=>{let migrated=(||->anyhow::Result<_>{let source=legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,&copy.source).map_err(anyhow::Error::msg)?;session.migrate_cell_document(&source,&lib.index,&text,identity.clone(),copy.name.clone(),Some(copy.id))})();if let Err(error)=migrated{let key=session.project.ensure_cell(&identity,&copy.source,&copy.name,Some(copy.id))?;session.project.legacy_documents.insert(key,text);session.project.diagnostics.push(lck_project::Diagnostic{form:None,message:format!("Legacy cell copy {} retained but migration unresolved: {error:#}",copy.name)});}},Err(error)=>{session.project.ensure_cell(&identity,&copy.source,&copy.name,Some(copy.id))?;session.project.diagnostics.push(lck_project::Diagnostic{form:None,message:format!("Legacy cell copy {} unavailable: {error}; metadata retained",copy.name)});}}}session};let identity=cell.form_identity(&source);let label=match &cell{CellSelection::Copy(id)=>self.editor_cells.copies.get(id).map(|c|c.name.clone()).unwrap_or_else(||source.clone()),_=>source.clone()};let copy=match &cell{CellSelection::Copy(id)=>Some(*id),_=>None};let snapshot=session.project.cell_snapshots.get(&identity).cloned();
+                    let mut preview=session.enter(
+                        &scene,&lib.index,&world,identity,label,copy
+                    )?;
+                    let mut restored_ground=ground_edit_ops::State::default();
+                    restored_ground.scene=source.clone();
+                    let mut restored_collision=collision_edit::State::from_embedded_record("",&source).map_err(anyhow::Error::msg)?;
+                    let mut restored_doors=door_teleport::State::load(&lib.index,&source).map_err(anyhow::Error::msg)?;
+
+                    if let Some(raw)=snapshot {
+                        let overlay=ground_edit_ops::strip(&raw);
+                        let document=scene_instances::parse(
+                            &overlay,&source,&preview
+                        ).map_err(anyhow::Error::msg)?;
+                        scene_instances::apply(
+                            &document,&mut preview,
+                            scene.placements.len(),&lib.index
+                        ).map_err(anyhow::Error::msg)?;
+                        restored_ground=ground_edit_ops::parse(
+                            &raw,scene.ground.as_ref(),&source
+                        ).map_err(anyhow::Error::msg)?;
+                        restored_collision=collision_edit::State::from_embedded_record(&raw,&source).map_err(anyhow::Error::msg)?;
+                        restored_doors.restore(&raw).map_err(anyhow::Error::msg)?;
+                    }
+                    Ok((session,preview,restored_ground,restored_collision,restored_doors))})();
+                    let (session,world,restored_ground,restored_collision,restored_doors)=match projected{Ok(value)=>value,Err(error)=>{self.studio.error=Some(format!("Project records could not be loaded; previous editor retained: {error:#}"));return;}};
                     self.form_session=Some(session);
                     self.save_active_editor_cell();
                     self.native_scene=Some((source,NativeSceneSlot::Ready(Arc::new(scene),Arc::new(world))));
                     self.editor_cell_active=Some(cell);
+                    self.ground_edits=restored_ground;
+                    self.collision_edit=restored_collision;
+                    self.doors=restored_doors;
                     self.finish_native_scene_load();
                 },
                 Err(error)=>{
@@ -1536,10 +1749,36 @@ impl App {
 
     /// Reset document-local UI only after a replacement scene is ready.
     fn finish_native_scene_load(&mut self) {
+        // Each loaded scene starts with a clean hierarchy tree.
+        self.editor_tree_generation =
+            self.editor_tree_generation.wrapping_add(1);
+
+        self.editor_search.clear();
+        self.editor_cell_search.clear();
+        self.editor_hierarchy_filter.clear();
+
+        self.global_open_category=None;
+        self.global_open_branch=None;
+        self.global_open_scene=None;
+
+        self.story_flag_index=0;
+        self.story_flag_scene.clear();
+        self.story_flag_stages.clear();
+        self.story_preview=None;
+        self.story_flag_camera_restore=None;
+        self.ground_selected.clear();
+        self.ground_active=None;
+        self.ground_hierarchy_reveal=None;
+        self.ground_edits.active_copy=None;
+
+        self.group_basket.clear();
         self.native_collision_preview_cache = None;
         self.native_selected = None; self.native_selection.clear(); self.native_hierarchy_anchor=None; self.native_selection_click=None;
         self.native_drag = None;
         self.native_rotate = None;
+        self.native_rotate_moved = false;
+        self.ground_right_gesture = None;
+        self.ground_context_menu = None;
         self.native_rotate_undo.clear();
         self.native_rotate_redo.clear();
         if self.form_session.is_none(){self.editor_undo.clear();self.editor_redo.clear();}
@@ -1555,6 +1794,33 @@ impl App {
         // The normal Frame All reset now uses the upright Euler branch.
         // Frame Selected / F uses frame_instance and is deliberately unchanged.
         self.native_view.frame_all();
+
+        // LCK_R52_CELL_CAMERA
+        // Each newly loaded cell starts with scene markers hidden.
+        self.doors.show_markers = false;
+
+        // Restore only after native geometry and project edits
+        // have been successfully loaded into the editor.
+        if let Some((source, NativeSceneSlot::Ready(..))) =
+            self.native_scene.as_ref()
+        {
+            let key=lck_cell_camera::key(
+                source,
+                self.editor_cell_active.as_ref()
+            );
+
+            match lck_cell_camera::load(&key) {
+                Ok(Some(camera))=>{
+                    self.native_view.cam=camera;
+                }
+                Ok(None)=>{}
+                Err(error)=>{
+                    self.studio.error=Some(format!(
+                        "Startup camera settings: {error}"
+                    ));
+                }
+            }
+        }
         self.native_view.version = self.native_view.version.wrapping_add(1);
     }
 
@@ -1580,9 +1846,13 @@ impl App {
                         if let Some(name)=world.base_name_key((t,i)).and_then(|key|self.editor_names.get(key)) {return name.clone();}
                         if let Some(uid)=draw.editor_uid {
                             if let Some(name)=world.naming.foreign_legacy.get(&uid).and_then(|key|self.editor_names.get(key)) {return name.clone();}
-                            if let Some(foreign)=world.foreign.iter().find(|f|f.uid==uid) {return format!("Foreign {} #{} from {}",foreign.kind,foreign.record,foreign.source);}
+                            if let Some(foreign)=world.foreign.iter().find(|f|f.uid==uid) {
+                                if let Some(name)=world.base_name_key((t,i)).and_then(|key|world.naming.descriptions.get(key)) {return name.clone();}
+                                return format!("Foreign {} #{} from {}",foreign.kind,foreign.record,foreign.source);
+                            }
                             if let Some(origin)=draw.source_ref {
                                 if let Some(name)=editor_item_name_key(scene,EditorCatalogItem::Draw(origin.0,origin.1)).and_then(|key|self.editor_names.get(&key)) {return name.clone();}
+                                if let Some(name)=world.base_name_key((t,i)).and_then(|key|world.naming.descriptions.get(key)) {return name.clone();}
                                 return editor_native_item_hint(scene,EditorCatalogItem::Draw(origin.0,origin.1));
                             }
                         }
@@ -1613,6 +1883,16 @@ impl App {
                 if let Some(key) = editor_mesh_name_key(s, draw.env_slot) {
                     if let Some(name) = self.editor_names.get(&key) { return name.clone(); }
                 }
+            }
+        }
+        if let Some((_,NativeSceneSlot::Ready(loaded,world)))=&self.native_scene {
+            if scene.is_some_and(|s|s.name==loaded.name) {
+                let key=match item {
+                    EditorCatalogItem::Draw(t,i)=>world.base_name_key((t,i)),
+                    EditorCatalogItem::Mesh(i)=>world.naming.meshes.get(i).and_then(Option::as_deref),
+                    _=>None,
+                };
+                if let Some(name)=key.and_then(|key|world.naming.descriptions.get(key)) {return name.clone();}
             }
         }
         match item {
@@ -1795,6 +2075,28 @@ impl App {
     /// Invoked when changing cells, closing the application and periodically
     /// while editing a project copy (avoids losing unsaved scene changes).
     fn save_active_editor_cell(&mut self) {
+        if let (
+            Some(cell),
+            Some((source, NativeSceneSlot::Ready(_, world))),
+            Some(session)
+        ) = (
+            self.editor_cell_active.as_ref(),
+            self.native_scene.as_ref(),
+            self.form_session.as_mut()
+        ) {
+            let identity = cell.form_identity(source);
+            if session.project.cells.iter().any(|entry|
+                entry.identity == identity &&
+                entry.source_scene.as_str() == source.as_str()
+            ) {
+                let snapshot =
+                    scene_instances::serialize(source, world) +
+                    &ground_edit_ops::serialize(&self.ground_edits) +
+                    &self.collision_edit.embedded_record(source) +
+                    &self.doors.embedded_record(source);
+                session.project.cell_snapshots.insert(identity, snapshot);
+            }
+        }
         let Some(CellSelection::Copy(id))=self.editor_cell_active.as_ref() else {return};
         let Some((source,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_ref() else {return};
         let overlay=scene_instances::serialize(source,world);
@@ -1861,7 +2163,6 @@ impl App {
         });
         ui.add(egui::TextEdit::singleline(&mut self.editor_cell_search)
             .hint_text("Search cell names, native IDs..."));
-        ui.small("Select to load Â· RMB: Properties / Duplicate / Rename Â· Ctrl+D");
         ui.separator();
         let mut choose=None;
         let mut duplicate=None;
@@ -1873,7 +2174,7 @@ impl App {
         egui::ScrollArea::vertical().id_salt("lck_cell_scroll")
             .auto_shrink([false,false]).show(ui, |ui| {
                 egui::CollapsingHeader::new(format!("Original PS1 cells ({})", self.studio.blocks.len()))
-                    .id_salt("lck_cell_original_tree").default_open(true).show(ui,|ui| {
+                    .id_salt("lck_cell_original_tree").default_open(false).show(ui,|ui| {
                         // Group all source variants under their original location. Native
                         // CDNAME scene IDs remain independent; this is a browser-only tree.
                         // The grouping key is derived from the ORIGINAL ID, never a
@@ -1947,7 +2248,7 @@ impl App {
                         }
                     });
                 egui::CollapsingHeader::new(format!("Project cell copies ({})",copies.len()))
-                    .id_salt("lck_cell_copy_tree").default_open(true).show(ui,|ui| {
+                    .id_salt("lck_cell_copy_tree").default_open(false).show(ui,|ui| {
                         for cell in &copies {
                             let id=CellSelection::Copy(cell.id);
                             let label=format!("{}  [copy #{} of {}]",cell.name,cell.id,cell.source);
@@ -2037,7 +2338,17 @@ impl App {
             self.global_repository_preview=Some(preview);
             return;
         };
-        match legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,&asset.source) {
+        let cached=self.global_repository_preview.as_ref()
+            .and_then(|p|p.scene.as_ref())
+            .filter(|s|s.name==asset.source)
+            .cloned();
+        let donor=match cached {
+            Some(scene)=>Ok(scene),
+            None=>legaia_engine_world_views::scene_staging::
+                assemble_field_scene(&lib.index,&asset.source)
+                .map(Arc::new),
+        };
+        match donor {
             Err(e)=>preview.issue=Some(format!("Cannot assemble source scene: {e}")),
             Ok(scene)=>{
                 preview.model=match asset.kind {
@@ -2068,7 +2379,7 @@ impl App {
                 if preview.model.is_none() {
                     preview.issue=Some("This source has no decodable visible TMD in its original scene; original record metadata is still accessible.".into());
                 }
-                preview.scene=Some(Arc::new(scene));
+                preview.scene=Some(scene);
             }
         }
         self.global_repository_preview=Some(preview);
@@ -2087,8 +2398,6 @@ impl App {
         } else {"Open a disc to scan original game content.".into()});
         ui.add(egui::TextEdit::singleline(&mut self.editor_search)
             .hint_text("Search any source cell, object ID or identified name..."));
-        ui.small("Select for details | RMB for Preview / Properties | Drag to place");
-        ui.small("Same-cell source | Donor preview | Foreign MAN actor");
         if let Some(error)=&self.editor_catalog_error {
             ui.colored_label(Color32::LIGHT_RED,format!("Identification catalog: {error}"));
         }
@@ -2153,7 +2462,6 @@ impl App {
         let mut category=self.global_open_category;
         let mut branch=self.global_open_branch;
         let mut open_scene=self.global_open_scene.clone();
-        ui.small("Verified town groupings from the original scene table; names require evidence.");
         for group in 0..4 {
             if counts[group]==0 {continue;}
             let expanded=egui::CollapsingHeader::new(
@@ -2185,6 +2493,7 @@ impl App {
                 let (clicked,scrolled) = floor_tiles::browser(
                     ui,
                     &self.global_repository,
+                    &self.editor_names,
                     &term,
                     selected_floor,
                     self.global_floor_scroll_target,
@@ -2329,10 +2638,20 @@ impl App {
                     .body_response.is_some();
 
                     if !active {continue;}
+                    let list_start=if items.len()>125 {
+                        self.global_repository_selected
+                            .and_then(|id|items.iter().position(|&r|r==id))
+                            .map(|p|p.saturating_sub(50)
+                                .min(items.len().saturating_sub(125)))
+                            .unwrap_or(0)
+                    }else{0};
                     if items.len()>125 {
-                        ui.small(format!("Showing first 125 of {}. Search above to narrow.",items.len()));
+                        ui.small(format!(
+                            "Showing 125 of {} near selection; arrows browse the full subgroup.",
+                            items.len()
+                        ));
                     }
-                    for &id in items.iter().take(125) {
+                    for &id in items.iter().skip(list_start).take(125) {
                         let asset=&self.global_repository[id];
                         let usable=scene.is_some_and(|s|global_repository::local_source(s,asset).is_some());
                         let name=asset.display_name(&self.editor_names);
@@ -2351,6 +2670,10 @@ impl App {
                             dragging=Some(id);
                         }
                         if response.clicked() {selection=Some(id);}
+                        if self.global_repository_scroll_target==Some(id) {
+                            response.scroll_to_me(Some(egui::Align::Center));
+                            self.global_repository_scroll_target=None;
+                        }
                         response.context_menu(|ui| {
                             if ui.button("Preview original 3D model...").clicked() {
                                 selection=Some(id);open_dialog=Some((id,true));ui.close();
@@ -2451,90 +2774,106 @@ impl App {
     /// Separate source-asset window. Names/categories are user-maintained
     /// evidence records, never false verified identifications.
     fn editor_global_repository_dialog(&mut self,ctx:&egui::Context) {
-        // Up/Down navigates the selected floor polygon, not the
-        // world viewport. Leave text-edit keyboard input untouched.
+        // LCK_REPO_ARROW_UNIFIED_V1
+        // All preview categories navigate within their active leaf subgroup.
+        // No wraparound; do not capture keys while text is being edited.
         if self.global_repository_dialog.is_some_and(|(_,preview)|preview)
-            && self.global_floor_face.is_some()
             && !ctx.wants_keyboard_input()
         {
-            let direction=ctx.input_mut(|input| {
+            let direction=ctx.input_mut(|input|{
                 if input.consume_key(
-                    egui::Modifiers::NONE, egui::Key::ArrowDown
-                ) {
-                    1
-                } else if input.consume_key(
-                    egui::Modifiers::NONE, egui::Key::ArrowUp
-                ) {
-                    -1
-                } else {
-                    0
-                }
+                    egui::Modifiers::NONE,egui::Key::ArrowDown
+                ){1}
+                else if input.consume_key(
+                    egui::Modifiers::NONE,egui::Key::ArrowUp
+                ){-1}
+                else{0}
             });
 
-            if direction != 0 {
-                if let (Some(id),Some((_,_,face)))=(
-                    self.global_repository_selected,
-                    self.global_floor_face.clone(),
-                ) {
-                    if let Some((next_id,next_face))=
-                        floor_tiles::adjacent(
-                            &self.global_repository,
-                            self.editor_search.trim(),
-                            (id,face),
-                            direction,
-                        )
-                    {
-                        if (next_id,next_face)!=(id,face) {
-                            if let Some(asset)=self.global_repository.get(next_id) {
-                                if let global_repository::Kind::Mesh(slot)=asset.kind {
-                                    let source=asset.source.clone();
+            if direction!=0 {
+                if let Some((id,_))=self.global_repository_dialog {
+                    let current_floor=self.global_floor_face.clone()
+                        .filter(|(source,slot,_)|
+                            self.global_repository.get(id).is_some_and(
+                                |asset|asset.source==*source &&
+                                    matches!(asset.kind,
+                                        global_repository::Kind::Mesh(s)
+                                        if s==*slot)
+                            )
+                        );
 
-                                    // Preserve the already decoded source
-                                    // and donor TIM/CLUT/VRAM when possible.
-                                    let cached_source=
-                                        self.global_repository_preview
-                                            .as_ref()
-                                            .and_then(|p|p.scene.as_ref())
-                                            .is_some_and(|s|s.name==source);
+                    if let Some((_,_,face))=current_floor {
+                        if let Some((next_id,next_face))=
+                            floor_tiles::adjacent(
+                                &self.global_repository,
+                                &self.editor_names,
+                                self.editor_search.trim(),
+                                (id,face),
+                                direction,
+                            )
+                        {
+                            if (next_id,next_face)!=(id,face) {
+                                if let Some(asset)=self.global_repository.get(next_id){
+                                    if let global_repository::Kind::Mesh(slot)=asset.kind{
+                                        let source=asset.source.clone();
 
-                                    if cached_source {
-                                        if let Some(preview)=
-                                            self.global_repository_preview.as_mut()
-                                        {
-                                            preview.id=next_id;
-                                            preview.model=preview.scene.as_ref()
-                                                .and_then(|scene|
-                                                    floor_tiles::preview_model(
-                                                        scene,slot,next_face
-                                                    )
-                                                );
-                                            preview.issue=
-                                                preview.model.is_none().then(||
-                                                    "Original floor polygon \
-                                                     could not be decoded."
-                                                        .to_owned()
-                                                );
+                                        // One mesh may have many floor faces:
+                                        // refresh its preview even when ID is unchanged.
+                                        if next_id==id {
+                                            if let Some(preview)=
+                                                self.global_repository_preview.as_mut()
+                                            {
+                                                preview.model=preview.scene.as_ref()
+                                                    .and_then(|s|
+                                                        floor_tiles::preview_model(
+                                                            s,slot,next_face
+                                                        )
+                                                    );
+                                                preview.issue=preview.model.is_none()
+                                                    .then(||"Floor preview could not be decoded.".to_owned());
+                                            }
                                         }
-                                    } else {
-                                        self.global_repository_preview=None;
+
+                                        self.global_repository_selected=Some(next_id);
+                                        self.global_floor_face=
+                                            Some((source,slot,next_face));
+                                        self.global_floor_scroll_target=
+                                            Some((next_id,next_face));
+                                        self.global_repository_dialog=
+                                            Some((next_id,true));
+                                        self.global_repository_preview_view=
+                                            Viewport::new(Shading::Textured);
+                                        ctx.request_repaint();
                                     }
-
-                                    self.global_repository_selected=Some(next_id);
-                                    self.global_floor_face=
-                                        Some((source,slot,next_face));
-                                    self.global_floor_scroll_target=
-                                        Some((next_id,next_face));
-                                    self.global_repository_dialog=
-                                        Some((next_id,true));
-
-                                    // Fresh camera framing for each actual
-                                    // 128x128 polygon, including TMDs whose
-                                    // local polygon coordinates differ.
-                                    self.global_repository_preview_view=
-                                        Viewport::new(Shading::Textured);
-
-                                    ctx.request_repaint();
                                 }
+                            }
+                        }
+                    }else if let Some(asset)=self.global_repository.get(id){
+                        let source=&asset.source;
+                        let group=asset.group();
+                        let term=self.editor_search.trim().to_lowercase();
+
+                        // Exactly the rows shown for this source and
+                        // repository category, including active search.
+                        let rows:Vec<usize>=self.global_repository.iter()
+                            .enumerate()
+                            .filter(|(_,candidate)|
+                                candidate.source==*source &&
+                                candidate.group()==group &&
+                                self.repository_matches(candidate,&term)
+                            )
+                            .map(|(index,_)|index)
+                            .collect();
+
+                        if let Some(next_id)=lck_repo_next(&rows,id,direction){
+                            if next_id!=id {
+                                self.global_repository_selected=Some(next_id);
+                                self.global_repository_dialog=
+                                    Some((next_id,true));
+                                self.global_repository_scroll_target=Some(next_id);
+                                self.global_repository_preview_view=
+                                    Viewport::new(Shading::Textured);
+                                ctx.request_repaint();
                             }
                         }
                     }
@@ -2547,13 +2886,18 @@ impl App {
             self.global_repository_dialog=None;return;
         };
         if preview_mode {self.editor_load_global_asset_preview(id);}
-        let name_key=asset.name_key();
+        let floor_face=self.global_floor_face.as_ref().filter(|(source,slot,_)|
+            asset.source==*source && matches!(asset.kind,global_repository::Kind::Mesh(s) if s==*slot))
+            .map(|(_,_,face)|*face);
+        let name_key=floor_face.map(|face|floor_tiles::face_name_key(&asset.name_key(),face.object,face.primitive))
+            .unwrap_or_else(||asset.name_key());
         if !preview_mode && self.global_name_edit_key.as_deref()!=Some(&name_key) {
             self.global_name_edit_key=Some(name_key.clone());
-            self.global_name_draft=asset.name_record(&self.editor_names);
+            self.global_name_draft=if floor_face.is_some() {self.editor_names.record(&name_key)} else {asset.name_record(&self.editor_names)};
             self.global_name_status=None;
         }
-        let title=asset.display_name(&self.editor_names);
+        let title=floor_face.map(|face|floor_tiles::display_name(&asset,face,&self.editor_names))
+            .unwrap_or_else(||asset.display_name(&self.editor_names));
         let mut open=true;
         egui::Window::new(format!("{} â€” {title}",if preview_mode {"Preview"}else{"Asset Properties"}))
             .id(egui::Id::new("lck_global_asset_details"))
@@ -2581,7 +2925,7 @@ impl App {
                 if asset.source!=self.native_scene.as_ref().map(|(name,_)|name.as_str()).unwrap_or("") {
                     ui.label("Foreign preview uses original donor textures. Native collision, scripts and IMG export still require resource import.");
                 }
-                ui.small(format!("Native record: {}",asset.label));
+                ui.small(format!("Default description: {}",asset.label));
                 ui.collapsing("Immutable original identifiers", |ui| {
                     ui.monospace(&asset.key);
                     ui.monospace(format!("Shared naming identity: {name_key}"));
@@ -2591,7 +2935,7 @@ impl App {
                 ui.separator();
                 if preview_mode {
                     if self.global_floor_face.is_some() {
-                        ui.label("Up / Down: previous or next floor tile  |  Wraps at ends");
+                        ui.label("Up / Down: previous or next floor in this subgroup | Stops at ends");
                     }
                     if let Some(model_preview)=self.global_repository_preview.as_ref() {
                         if let (Some(scene),Some(model))=(&model_preview.scene,&model_preview.model) {
@@ -2631,7 +2975,7 @@ impl App {
                             let remove=ui.button("Restore default name").clicked();
                             if save||remove {
                                 let mut next=self.editor_names.clone();
-                                if remove {next.records.remove(&name_key);next.records.remove(&asset.key);}
+                                if remove {next.records.remove(&name_key);if floor_face.is_none(){next.records.remove(&asset.key);}}
                                 else {
                                     let mut record=self.global_name_draft.clone();
                                     record.name=record.name.trim().to_owned();
@@ -2824,12 +3168,21 @@ impl App {
     /// Editable scene preview with non-destructive mesh transforms.
     fn editor_workspace(&mut self, ctx: &egui::Context) {
         let mut pending_form=self.form_record_panel(ctx);
+        if pending_form.is_none() {
+            pending_form = self.lck_menu_project.take();
+        }
+        let menu_duplicate = std::mem::take(&mut self.lck_menu_duplicate);
+        let menu_delete = std::mem::take(&mut self.lck_menu_delete);
         // G2: Toggle native ground vs object editing without changing saved edits.
         if !ctx.wants_keyboard_input() && self.editor_modal.is_none() &&
            self.editor_rename.is_none() && self.global_repository_dialog.is_none() &&
            ctx.input_mut(|i|i.consume_key(egui::Modifiers::NONE,egui::Key::Tab)) {
             self.ground_edit_mode=!self.ground_edit_mode;
-            if self.ground_edit_mode {self.native_selected=None;self.native_selection.clear();}
+            self.native_rotate=None;
+            self.native_rotate_moved=false;
+            self.ground_right_gesture=None;
+            // Keep object selection available for mixed-category Group Selected.
+            // Active editing mode still determines which input controls move pieces.
             self.native_view.version=self.native_view.version.wrapping_add(1);
             ctx.request_repaint();
         }
@@ -2858,14 +3211,24 @@ impl App {
             self.ground_active=None;
             self.ground_hierarchy_reveal=None;
             self.ground_click=None;
+            self.ground_edits.selected_copies.clear();
+            self.ground_edits.active_copy=None;
+            self.collision_edit.replace_selected(Default::default());
+            self.lck_empty_viewport_press=None;
+            self.native_view.world_selected.clear();
         }
+        let mut pending_group_translation: Option<(u64,authoring_group::Mover,[f32;3],Vec<((i32,i32),(i32,i32))>)> = None;
+        let mut pending_group_action: Option<bool> = None;
+        let mut pending_add_group_basket=false; // true=group, false=ungroup
+        let mut pending_mirror_action: Option<(usize,bool)> = None; // world axis; together
         let mut pending_transform: Option<((bool, usize), [f32; 3], bool)> = None;
         let mut pending_rotation: Option<((bool, usize), [f32; 3], bool)> = None;
+        let mut pending_orbit: Option<(usize,f32)> = None;
         let mut pending_scale: Option<((bool, usize), [f32; 3])> = None;
         let mut pending_npc_animation: Option<((bool,usize),u8,usize,bool)> = None;
         let mut pending_npc_model: Option<((bool,usize),u8)> = None;
-        let mut pending_history_undo=false;
-        let mut pending_history_redo=false;
+        let mut pending_history_undo=std::mem::take(&mut self.lck_menu_undo);
+        let mut pending_history_redo=std::mem::take(&mut self.lck_menu_redo);
         let mut pending_static_architecture:Option<(u64,bool)>=None;
         let mut pending_collision_edit:Option<((bool,usize),Option<collision_recipes::Recipe>)>=None;
         let mut finish_drag: Option<EditorDrag> = None;
@@ -2874,6 +3237,9 @@ impl App {
         let mut pending_project: Option<scene_instances::SceneDocument> = None;
         let mut pending_ground_project:Option<ground_edit_ops::State>=None;
         let mut pending_duplicate: Option<((bool, usize), [f32; 3], [f32; 3], Option<(u8,u8,usize)>)> = None;
+        let mut pending_floor_group_links:Vec<(ground_edit_ops::Key,ground_edit_ops::Key)>=Vec::new();
+        let mut pending_collision_group_links:Vec<((i32,i32),(i32,i32))>=Vec::new();
+        let mut pending_collision_rotation_remap:Vec<((i32,i32),(i32,i32))>=Vec::new();
         let mut pending_repository_drop = false;
         let mut pending_foreign: Option<(usize,[f32;2],[usize;2],bool)> = None;
         let mut pending_delete: Option<(bool,usize)> = None;
@@ -2890,6 +3256,106 @@ impl App {
             NativeSceneSlot::Ready(_, world) => Some(Arc::clone(world)),
             _ => None,
         });
+        // LCK_R57_NATIVE_WARPS
+        if self.native_warp_editor.open {
+            if let (Some(scene),Some(lib))=(
+                ready.as_deref(),
+                self.studio.library.as_ref()
+            ){
+                let old=self.form_session.as_ref()
+                    .and_then(|session|
+                        session.project.native_warps.iter()
+                            .find(|entry|entry.scene==scene.name)
+                    ).cloned();
+
+                let command=native_warps::window(
+                    ctx,
+                    &mut self.native_warp_editor,
+                    lib.index.as_ref(),
+                    &scene.name,
+                    old.as_ref()
+                );
+
+                if let Some(edited)=command {
+                    if self.form_session.is_some(){
+                        if let Some(world)=world.as_deref(){
+                            let mut history=editor_history_capture_with_layers(
+                                world,&scene.name,
+                                self.native_selected,
+                                &self.native_selection,
+                                &self.ground_edits,
+                                &self.collision_edit
+                            );
+                            self.capture_form_history(&mut history);
+                            self.editor_undo.push(history);
+                            if self.editor_undo.len()>100 {
+                                self.editor_undo.remove(0);
+                            }
+                            self.editor_redo.clear();
+                        }
+
+                        if let Some(session)=self.form_session.as_mut(){
+                            session.project.native_warps.retain(
+                                |entry|entry.scene!=scene.name
+                            );
+                            session.project.native_warps.push(edited);
+                        }
+
+                        self.studio.status=Some(format!(
+                            "Native MAP warps updated for {}. Save Project before exporting.",
+                            scene.name
+                        ));
+                    }else{
+                        self.studio.error=Some(
+                            "Load or create a unified LCK project to edit native warps."
+                                .into()
+                        );
+                    }
+                }
+            }
+        }
+        if menu_duplicate {
+            if self.ground_edit_mode {
+                if let Some(hf) = ready.as_deref().and_then(|s| s.ground.as_ref()) {
+                    let links = ground_edit_ops::duplicate_linked(
+                        &mut self.ground_edits,
+                        &mut self.ground_selected,
+                        &mut self.ground_active,
+                        hf,
+                    );
+                    let count=links.len();
+                    pending_floor_group_links.extend(links);
+                    if count > 0 {
+                        self.native_view.version =
+                            self.native_view.version.wrapping_add(1);
+                        ctx.request_repaint();
+                    }
+                }
+            } else if let Some(key) = self.native_selected {
+                pending_duplicate = world.as_deref().and_then(|w|
+                    editor_duplicate_request(w, Some(key)));
+            } else if let Some(cell) = self.editor_cell_selected.clone() {
+                self.duplicate_editor_cell(cell);
+            }
+        }
+
+        if menu_delete {
+            if self.ground_edit_mode {
+                let count = ground_edit_ops::delete_selected(
+                    &mut self.ground_edits,
+                    &mut self.ground_selected,
+                    &mut self.ground_active,
+                );
+                if count > 0 {
+                    self.ground_hierarchy_reveal = None;
+                    self.native_view.version =
+                        self.native_view.version.wrapping_add(1);
+                    ctx.request_repaint();
+                }
+            } else {
+                pending_delete = self.native_selected;
+            }
+        }
         if let Some(scene)=ready.as_deref() {
             if self.ground_edits.scene!=scene.name {
                 self.ground_edits.clear_for_scene(&scene.name);
@@ -2905,10 +3371,18 @@ impl App {
             .show(ctx, |ui| {
                 // A nested resizable bottom panel creates a persistent divider.
                 // Its ScrollArea is independent of the top All Objects list.
-                egui::TopBottomPanel::bottom("lck_editor_cell_split")
-                    .resizable(true).default_height(205.0).min_height(105.0)
-                    .show_inside(ui, |ui| self.editor_cells_panel(ui));
-                self.editor_catalog(ui, ready.as_deref());
+                egui::TopBottomPanel::bottom("lck_editor_cell_split_cleanup_435")
+                    .resizable(true).default_height(435.0).min_height(105.0)
+                    .show_inside(ui, |ui| {
+                        let generation=self.editor_tree_generation;
+                        ui.push_id(("lck_closed_cells_v3",generation),|ui|{
+                            self.editor_cells_panel(ui);
+                        });
+                    });
+                let generation=self.editor_tree_generation;
+                ui.push_id(("lck_closed_assets_v3",generation),|ui|{
+                    self.editor_catalog(ui,ready.as_deref());
+                });
             });
         egui::SidePanel::right("native_instance_tree")
             .resizable(true)
@@ -2916,7 +3390,6 @@ impl App {
             .min_width(230.0)
             .show(ctx, |ui| {
                 ui.heading("Scene hierarchy");
-                ui.small("Click: single â€¢ Ctrl: toggle â€¢ Shift: range â€¢ Ctrl+Shift: add range");
                 if self.ground_edit_mode {
                     ui.label(format!("{} floor tile(s) selected",self.ground_selected.len()));
                 } else {
@@ -2945,6 +3418,8 @@ impl App {
                         ui.label(format!("Terrain tiles: {}", scene.terrain.len()));
                         ui.label(format!("Walk-ground: {}", if scene.ground.is_some() { "loaded" } else { "unavailable" }));
                         ui.separator();
+                        let generation=self.editor_tree_generation;
+                        ui.push_id(("lck_closed_hierarchy_v3",generation),|ui|{
                         egui::ScrollArea::vertical().id_salt("native_scene_instance_scroll").show(ui, |ui| {
                             if let Some(hf)=scene.ground.as_ref() {
                                 let chosen=ground_select::hierarchy(
@@ -2967,7 +3442,7 @@ impl App {
                                 }
                             }
                             egui::CollapsingHeader::new(format!("Placements ({})", scene.placements.len()))
-                                .default_open(true).show(ui, |ui| {
+                                .default_open(false).show(ui, |ui| {
                                     for (i, d) in scene.placements.iter().enumerate() {
                                         let key=(false,i);
                                         if world.as_ref().and_then(|w|w.at(false,i)).is_some_and(|d|d.hidden) {continue;}
@@ -2999,8 +3474,57 @@ impl App {
                                     }
                                 });
                             if let Some(world) = &world {
+                                if !world.groups.is_empty() {
+                                    egui::CollapsingHeader::new(format!("Relationships / Groups ({})",world.groups.len()))
+                                        .default_open(false).show(ui,|ui|{
+                                        for group in &world.groups {
+                                            egui::CollapsingHeader::new(format!("Group #{} ({} members)",group.id,group.members.len()))
+                                                .id_salt(("lck_group_relationship",group.id)).show(ui,|ui|{
+                                                if ui.small_button("Select group").clicked() {
+                                                    let additive=ui.input(|i|i.modifiers.ctrl || i.modifiers.shift);
+                                                    if !additive {
+                                                        self.native_selection.clear();
+                                                        self.ground_selected.clear();
+                                                        self.ground_edits.selected_copies.clear();
+                                                        self.collision_edit.replace_selected(Default::default());
+                                                    }
+                                                    let mut walls=std::collections::BTreeSet::new();
+                                                    for member in &group.members {
+                                                        if let Some(key)=authoring_group::member_draw(world,member) {
+                                                            self.native_selection.insert(key);
+                                                        } else {match member {
+                                                            authoring_group::Member::NativeFloor(cell)=>{self.ground_selected.insert(*cell);},
+                                                            authoring_group::Member::CopiedFloor(uid)=>{self.ground_edits.selected_copies.insert(*uid);},
+                                                            authoring_group::Member::Wall([x,z])=>{walls.insert((*x,*z));},
+                                                            _=>{},
+                                                        }}
+                                                    }
+                                                    self.collision_edit.include_selected(&walls);
+                                                    self.native_selected=self.native_selection.iter().next_back().copied();
+                                                    self.native_view.version=self.native_view.version.wrapping_add(1);
+                                                    ui.ctx().request_repaint();
+                                                }
+                                                for member in &group.members {ui.small(format!("{member:?}"));}
+                                            });
+                                        }
+                                    });
+                                }
+                                // LCK R2: real MAP and MAN door/teleport records, separate from editor groups.
+                                if let Some(lib)=&self.studio.library {
+                                    if let Some(position)=self.doors.ui(ui,lib.index.as_ref(),lib.source.path()) {
+                                        if let Some(model)=world.model.as_ref() {
+                                            self.native_view.cam.target_offset=[
+                                                position[0]-model.center[0],
+                                                position[1]-model.center[1],
+                                                position[2]-model.center[2],
+                                            ];
+                                            self.native_view.version=self.native_view.version.wrapping_add(1);
+                                            ui.ctx().request_repaint();
+                                        }
+                                    }
+                                }
                                 egui::CollapsingHeader::new(format!("NPCs / field actors ({})",world.npcs.iter().filter(|n|!n.is_copy).count()))
-                                    .default_open(true).show(ui, |ui| {
+                                    .default_open(false).show(ui, |ui| {
                                         for npc in world.npcs.iter().filter(|n|!n.is_copy) {
                                             let key=(false,npc.key);
                                             let Some(draw)=world.at(false,npc.key) else {continue};
@@ -3025,7 +3549,7 @@ impl App {
                                 let created: Vec<_> = world.draws.iter()
                                     .filter(|d| d.editor_uid.is_some()).collect();
                                 egui::CollapsingHeader::new(format!("New editor instances ({})", created.len()))
-                                    .default_open(true).show(ui, |ui| {
+                                    .default_open(false).show(ui, |ui| {
                                         for d in created {
                                             let label=format!("{}  [copy #{}]",self.editor_name_for(Some(scene),EditorCatalogItem::Draw(d.terrain,d.index)),d.editor_uid.unwrap_or(0));
                                             if !hierarchy_filter.is_empty() &&
@@ -3059,6 +3583,7 @@ impl App {
                                             self.editor_name_for(Some(scene), EditorCatalogItem::Mesh(slot))));
                                     }
                                 });
+                        });
                         });
                     }
                     _ => { ui.label("Waiting for native scene data..."); }
@@ -3442,8 +3967,64 @@ impl App {
             }
         }
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("World Viewport");
             if let (Some(scene), Some(world)) = (&ready, &world) {
+                // LCK_R55_VIEWPORT_SPLIT
+                // World Viewport information occupies a dedicated
+                // fixed-height, independently scrollable pane.
+
+                let panel_id=egui::Id::new(
+                    "lck_world_viewport_controls_height_r55"
+                );
+
+                let requested=ui.ctx().data_mut(|data|
+                    data.get_persisted::<f32>(panel_id)
+                        .unwrap_or(238.0)
+                );
+
+                let panel_height=lck_r55_controls_height(
+                    requested,
+                    ui.available_height()
+                );
+
+                let (info_rect,_)=ui.allocate_exact_size(
+                    egui::vec2(
+                        ui.available_width(),
+                        panel_height
+                    ),
+                    egui::Sense::hover()
+                );
+
+                // LCK_R56_FIXED_CONTROLS
+                // The rectangle above is the ONLY space allocated
+                // to the parent. Child text cannot enlarge it.
+                {
+                    let mut fixed_info=ui.new_child(
+                        egui::UiBuilder::new()
+                            .id_salt("lck_r56_fixed_information")
+                            .max_rect(info_rect)
+                    );
+
+                    let ui=&mut fixed_info;
+                    ui.set_clip_rect(info_rect);
+                    ui.set_width(info_rect.width());
+
+                    ui.style_mut().wrap_mode=
+                        Some(egui::TextWrapMode::Wrap);
+
+                    egui::ScrollArea::vertical()
+                        .id_salt("lck_world_viewport_controls_scroll")
+                        .auto_shrink([false,false])
+                        .show(ui,|ui|{
+                            // Reserve space for the scrollbar.
+                            // Long labels wrap within this width.
+                            ui.set_width(
+                                (info_rect.width()-20.0).max(64.0)
+                            );
+
+                            ui.style_mut().wrap_mode=
+                                Some(egui::TextWrapMode::Wrap);
+
+                            ui.heading("World Viewport");
                 ui.small(format!("Native '{}' | {} environmental instances | {} unique TMDs | {} unavailable",
                     scene.name, world.instances, world.unique_models, world.unavailable));
                 ui.small(format!("MAN field actors: {} catalogued | {} initially rendered | {} conditional",
@@ -3471,23 +4052,22 @@ impl App {
                     if ui.checkbox(&mut architecture,"Static architecture copy â€” no donor story scripts or animation").changed(){pending_static_architecture=Some((foreign.uid,architecture));}
                     ui.small("Copies the visible raw mesh. Elevator movement, interactions and story behavior are detached; collision remains separately reported. New foreign drops use this mode.");
                 }
-                ui.checkbox(&mut self.unrestricted_img_export,"Unrestricted IMG Export Mode (experimental)")
-                    .on_hover_text("Attempt available native writers without compatibility preflight. Each export creates debug.txt with warnings and exact failures; an IMG may be incomplete.");
+                self.unrestricted_img_export=true;
+                ui.label("IMG export: BEST EFFORT (default). Predictive compatibility checks cannot block export.");
                 if let Some(path)=self.ps1_export_output.clone(){ui.horizontal_wrapped(|ui|{
                     if ui.button("Open IMG output folder").clicked(){if let Some(parent)=path.parent(){self.show_folder(parent);}}
                     ui.label(format!("IMG output: {}",path.display()));
                 });}
                 if let Some(coverage)=self.ps1_export_imports {if let Some(message)=coverage.failure_message(){ui.colored_label(Color32::from_rgb(255,90,70),egui::RichText::new(message).strong());}}
-                ui.horizontal_wrapped(|ui| {
-                    self.native_view.controls(ui, "Sample original PS1 TIM/CLUT atlas from assembled scene VRAM");
-                    ui.checkbox(&mut self.native_ground_visible, "Show walk-ground")
-                        .on_hover_text("Original per-cell PS1 walkable terrain: UV, CLUT and texture page are read from the disc's native heightfield and scene VRAM.");
-                    if ui.checkbox(&mut self.ground_edit_mode,
-                        "Ground Edit Mode (select only)")
-                        .on_hover_text("Click native MAP ground cells; Shift adds and Ctrl toggles. No MAP or IMG writes.")
-                        .changed() {
+                // LCK_R4_STORY_FLAG_TOOLBAR
+                ui.horizontal(|ui| {
+                    let mut select_floors=self.ground_edit_mode && !self.native_collision_wire_visible;
+                    if ui.checkbox(&mut select_floors,"Select Floors").changed() {
+                        self.ground_edit_mode=select_floors;
+                        self.native_collision_wire_visible=false;
                         self.ground_click=None;
-                        if self.ground_edit_mode {
+                        self.ground_active=None;
+                        if select_floors {
                             self.native_ground_visible=true;
                             self.native_selected=None;
                             self.native_selection.clear();
@@ -3497,38 +4077,132 @@ impl App {
                         }
                         ui.ctx().request_repaint();
                     }
-                    ui.checkbox(&mut self.native_floor_debug_visible, "Native floor comparison");
-                    ui.checkbox(&mut self.native_collision_wire_visible, "Collision wireframe")
-                        .on_hover_text("View native MAP wall collision at its actual 64-unit resolution. Orange: original walls; cyan: newly positioned wall cells for supported object moves/copies. Does not modify the disc. NPC collider shapes and script-painted walls are not shown.");
+
+                    let mut select_collision=self.ground_edit_mode && self.native_collision_wire_visible;
+                    if ui.checkbox(&mut select_collision,"Select Collision").changed() {
+                        self.ground_edit_mode=select_collision;
+                        self.native_collision_wire_visible=select_collision;
+                        self.ground_click=None;
+                        self.ground_active=None;
+                        if select_collision {
+                            self.native_ground_visible=true;
+                            self.native_selected=None;
+                            self.native_selection.clear();
+                            self.native_selection_click=None;
+                            self.native_drag=None;
+                            self.native_view.world_selected.clear();
+                        }
+                        ui.ctx().request_repaint();
+                    }
+
+                    ui.checkbox(&mut self.doors.show_markers,"Triggers / Scenes / Warps")
+                        .on_hover_text("View and inspect native MAP/MAN markers. Right-click a marker for Properties. No story flags are changed.");
+
+                    ui.separator();
+
+                    // R43A_STORY_BUTTONS: source-native flag state preview.
+                    if self.story_flag_scene!=scene.name {
+                        self.story_flag_scene=scene.name.clone();
+                        self.story_flag_index=0;
+                        self.story_preview=None;
+                        self.story_flag_stages=self.studio.library.as_ref()
+                            .map(|lib|story_preview::stages_for(&scene.name,lib.index.as_ref()))
+                            .unwrap_or_else(||vec![story_preview::Stage::start()]);
+                    }
+                    let count=self.story_flag_stages.len().max(1);
+                    self.story_flag_index=self.story_flag_index.min(count-1);
+                    // LCK_R43C_CAMERA_HOLD
+                    // Story changes must never move the editor camera.
+                    // Keep stage description/status out of toolbar sizing.
+                    let story_stage_description=
+                        self.story_flag_stages[self.story_flag_index].label.clone();
+
+                    let story_door_description=
+                        if matches!(scene.name.as_str(),"town01"|"town0b"|"town0c") {
+                            story_preview::vahn_door_status(
+                                &self.story_flag_stages[self.story_flag_index].flags
+                            )
+                        } else {
+                            "No verified door-state summary for this cell"
+                        };
+
+                    let story_npc_description=
+                        self.story_preview.as_ref().map(|preview|format!(
+                            "NPCs: {} moved, {} shown, {} hidden, {} unavailable",
+                            preview.moved,
+                            preview.shown,
+                            preview.hidden,
+                            preview.unresolved
+                        )).unwrap_or_else(||
+                            "Original scene view; no preview transformations".to_string()
+                        );
+
+                    let story_tooltip=format!(
+                        "{}\n{}\n{}\nRead-only scene-entry preview.",
+                        story_stage_description,
+                        story_door_description,
+                        story_npc_description
+                    );
+
+                    let mut requested=self.story_flag_index;
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {
+                        if ui.add_enabled(requested+1<count,
+                            egui::Button::new("Next Flag")).clicked(){requested+=1;}
+                        ui.label(format!("{}/{}",self.story_flag_index+1,count));
+                        if ui.add_enabled(requested>0,
+                            egui::Button::new("Last Flag")).clicked(){requested=requested.saturating_sub(1);}
+                        // Fixed-width ID; the full title is in its tooltip.
+                        let flag_name=if self.story_flag_index==0 {
+                            "Start"
+                        }else{
+                            self.story_flag_stages[self.story_flag_index]
+                                .label.split_whitespace().next().unwrap_or("Flag")
+                        };
+                        ui.add_sized([86.0,22.0],egui::Label::new(flag_name))
+                            .on_hover_text(story_tooltip.as_str());
+                    });
+                    if requested!=self.story_flag_index {
+                        self.story_flag_camera_restore=Some(self.native_view.cam);
+                        if requested==0 {
+                            self.story_preview=None;
+                            self.story_flag_index=0;
+                        }else if let Some(lib)=self.studio.library.as_ref() {
+                            match story_preview::build_model(world,scene,lib.index.as_ref(),
+                                &self.story_flag_stages[requested].flags) {
+                                Ok(preview)=>{
+                                    self.story_preview=Some(preview);
+                                    self.story_flag_index=requested;
+                                },
+                                Err(error)=>self.studio.error=Some(format!(
+                                    "Native story-state preview: {error}")),
+                            }
+                        }
+                        self.native_view.version=self.native_view.version.wrapping_add(1);
+                        ui.ctx().request_repaint();
+                    }
+                    if self.story_flag_index>0 {
+                        // Prevent base-scene object editing while a derived
+                        // story state is on screen. Project/export data is not changed.
+                        self.native_selected=None;
+                        self.native_selection.clear();
+                        self.native_drag=None;
+                        self.native_rotate=None;
+                        self.ground_edit_mode=false;
+                        self.native_collision_wire_visible=false;
+                        self.native_view.world_selected.clear();
+                        // Read-only status lives in the flag tooltip.
+                    }
+                    // Variable-length per-state status stays in the tooltip
+                    // so the central viewport has a constant layout footprint.
+                });
+                ui.horizontal_wrapped(|ui| {
+                    self.native_view.controls(ui, "Sample original PS1 TIM/CLUT atlas from assembled scene VRAM");
                     if ui.checkbox(&mut self.object_collision_draft_visible, "Selected mesh collider DRAFT")
                         .on_hover_text("Shows saved generated collision when available, otherwise the selected mesh draft. Purple = steep faces; green = unverified floor candidates. Separate from native MAP walls.").changed() {
                         self.generated_collision_target=None;
                     }
-                    ui.checkbox(&mut self.native_view.world_mirrored, "Mirror view (X)")
-                        .on_hover_text("Checked by default to restore your previous left/right view. Display only: native PS1 world coordinates, geometry and textured materials are not modified. Uncheck to compare orientations.");
                     if false && ui.button("Frame all").clicked() { self.native_view.frame_all(); }
-                    ui.menu_button("Camera marks", |ui| {
-                        ui.small("Session-only; no PS1 or .lckscene changes.");
-                        for index in 0..3 {
-                            ui.horizontal(|ui| {
-                                if ui.small_button(format!("Save {}", index + 1)).clicked() {
-                                    self.geck_camera_bookmarks[index] = Some(self.native_view.cam);
-                                    self.studio.status = Some(format!("Camera bookmark {} saved for this session.", index + 1));
-                                    ui.close();
-                                }
-                                if ui.add_enabled(self.geck_camera_bookmarks[index].is_some(),
-                                    egui::Button::new(format!("Go {}", index + 1))).clicked() {
-                                    if let Some(cam) = self.geck_camera_bookmarks[index] {
-                                        self.native_view.cam = cam;
-                                        self.native_view.version = self.native_view.version.wrapping_add(1);
-                                        ui.ctx().request_repaint();
-                                    }
-                                    ui.close();
-                                }
-                            });
-                        }
-                    });
-                    if ui.button("Save layout...").on_hover_text("Save editor move offsets as a separate .lgmove file; doesn't write to game disc.").clicked() {
+                    if false && ui.button("Save layout...").on_hover_text("Save editor move offsets as a separate .lgmove file; doesn't write to game disc.").clicked() {
                         if let Some((name, _)) = &self.native_scene {
                             if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{name}.lgmove"))
                                 .add_filter("Legaia placement sidecar", &["lgmove"]).save_file() {
@@ -3540,7 +4214,7 @@ impl App {
                             }
                         }
                     }
-                    if ui.button("Open layout...").on_hover_text("Load a saved .lgmove offset overlay for this cell; doesn't change PS1 disc.").clicked() {
+                    if false && ui.button("Open layout...").on_hover_text("Load a saved .lgmove offset overlay for this cell; doesn't change PS1 disc.").clicked() {
                         if let Some((name, _)) = &self.native_scene {
                             if let Some(path) = rfd::FileDialog::new().add_filter("Legaia placement sidecar", &["lgmove"]).pick_file() {
                                 let parsed = std::fs::read_to_string(&path)
@@ -3561,10 +4235,9 @@ impl App {
                         egui::Button::new("Redo (Ctrl+Y)")).clicked() {
                         pending_history_redo=true;
                     }
-                    if ui.button("Base Forms / References").clicked(){self.form_panel=!self.form_panel;}
-                    if ui.button("Save Project...").clicked(){pending_form=Some(form_ui::Action::Save);}
-                    if ui.button("Open Project...").clicked(){pending_form=Some(form_ui::Action::Open);}
-                    if ui.button("Save LCK scene...").on_hover_text("Save original move offsets AND new editor-created instances to an .lckscene file. Does NOT modify the PS1 disc.").clicked() {
+                    if false && ui.button("Save Project...").clicked(){pending_form=Some(form_ui::Action::Save);}
+                    if false && ui.button("Open Project...").clicked(){pending_form=Some(form_ui::Action::Open);}
+                    if false && ui.button("Save LCK scene...").on_hover_text("Save original move offsets AND new editor-created instances to an .lckscene file. Does NOT modify the PS1 disc.").clicked() {
                         if let Some((name, _)) = &self.native_scene {
                             if let Some(path) = rfd::FileDialog::new().set_file_name(format!("{name}.lckscene"))
                                 .add_filter("LCK scene overlay", &["lckscene"]).save_file() {
@@ -3575,7 +4248,9 @@ impl App {
                                     Err(e)=>{self.studio.error=Some(format!("Cannot read existing LCK scene: {e}"));None}
                                 };
                                 let text=scene_instances::serialize(name,world)+
-                                    &ground_edit_ops::serialize(&self.ground_edits);
+                                    &ground_edit_ops::serialize(&self.ground_edits)+
+                                    &self.collision_edit.embedded_record(name) +
+                                    &self.doors.embedded_record(name);
                                 let result=if text.len()>2_000_000 {Err("LCK scene exceeds 2MB".to_string())}
                                     else {crate::asset_catalog::atomic_write(&path,text.as_bytes(),old.as_deref())};
                                 match result {
@@ -3624,10 +4299,12 @@ impl App {
                             ui.label(notice);
                         }
                     });
-                    let lck_export_pressed = ui.add_enabled(self.ps1_export_job.is_none(), egui::Button::new("Export IMG..."))
-                        .on_hover_text("U1B.2: mixed object, aligned native ground, and collision export is experimental. Unsupported floor operations are reported instead of silently omitted.")
-                        .clicked();
-                    // Freeze an audit snapshot at the exact export click.
+                    // LCK_C3_VISIBLE_TOOLBAR_FIX
+                    // Allow the existing wrapping layout to place
+                    // both controls, without nesting a clipping row.
+                    let mut lck_export_pressed =
+                        std::mem::take(&mut self.lck_menu_export)
+                        && self.ps1_export_job.is_none();                    // Freeze an audit snapshot at the exact export click.
                     // This does not yet replace U1A's native compiler.
                     if lck_export_pressed {
                         if let Err(error)=export_manifest::write_report(
@@ -3642,6 +4319,27 @@ impl App {
                     // LCK_U1B2_MIXED_EXPORT
                     let lck_native_edits=
                         collision_edit::scene_has_instance_edits(&scene.name,world);
+
+                    // Native door-only exports do not need a dummy mesh edit.
+                    if lck_export_pressed && self.doors.has_native_changes()
+                        && !self.ground_edits.has_edits() && !self.collision_edit.has_edits()
+                        && !lck_native_edits {
+                        let exported=(|| -> anyhow::Result<Option<String>> {
+                            let lib=self.studio.library.as_ref().ok_or_else(||anyhow::anyhow!("Open an original PS1 IMG"))?;
+                            let source=lib.source.path();
+                            let name=format!("LCK_{}_DOORS_EXPERIMENTAL.img",scene.name);
+                            let Some(path)=rfd::FileDialog::new().set_file_name(name)
+                                .add_filter("Raw PS1 IMG", &["img"]).save_file()
+                            else {return Ok(None);};
+                            Ok(Some(self.doors.export_new(source,&path,lib.index.as_ref())?))
+                        })();
+                        match exported {
+                            Ok(Some(report))=>self.studio.status=Some(report),
+                            Ok(None)=>{},
+                            Err(error)=>self.studio.error=Some(format!("Native door export: {error:#}")),
+                        }
+                        lck_export_pressed=false;
+                    }
 
                     if lck_export_pressed
                         && self.ground_edits.has_edits()
@@ -3668,9 +4366,7 @@ impl App {
                                 .set_file_name(&suggestion)
                                 .add_filter("Raw PS1 IMG",&["img"]);
 
-                            if let Some(parent)=source.parent(){
-                                dialog=dialog.set_directory(parent);
-                            }
+                            dialog=dialog.set_directory(r"D:\AstraRimElmProject\1TestImgfiles");
 
                             let Some(output)=dialog.save_file()
                             else {return Ok(None);};
@@ -3681,7 +4377,9 @@ impl App {
 
                             let ground_snapshot=self.ground_edits.clone();
                             let collision_snapshot=self.collision_edit.clone();
+                            let door_snapshot=self.doors.clone();
                             let export_session=self.form_session.clone();
+                            let native_grid_side=self.native_map_extension_side;
 
                             let unrestricted=self.unrestricted_img_export;
                             let native_edits=lck_native_edits;
@@ -3693,7 +4391,7 @@ impl App {
                             std::thread::spawn(move||{
                                 let result=std::panic::catch_unwind(
                                     std::panic::AssertUnwindSafe(||{
-                                        unified_ground_export::execute(
+                                        let mut done=unified_ground_export::execute(
                                             &source,
                                             &output,
                                             &export_scene,
@@ -3704,7 +4402,13 @@ impl App {
                                             native_edits,
                                             unrestricted,
                                             export_session,
-                                        )
+                                            native_grid_side,
+                                        )?;
+                                        if door_snapshot.has_native_changes(){
+                                            let report=door_snapshot.overlay_existing(&done.path,&export_index)?;
+                                            done.patched.push(report);
+                                        }
+                                        Ok(done)
                                     })
                                 ).unwrap_or_else(|_|
                                     Err(anyhow::anyhow!(
@@ -3742,9 +4446,12 @@ impl App {
                                 let source=match &lib.source { Source::Disc(path)=>path, _=>anyhow::bail!("Open raw PS1 IMG") };
                                 let proposed=format!("{}_{}_COLLISION_TEST.img",source.file_stem().and_then(|s|s.to_str()).unwrap_or("Legaia"),scene.name);
                                 let mut dialog=rfd::FileDialog::new().set_file_name(&proposed).add_filter("Raw PS1 IMG", &["img"]);
-                                if let Some(parent)=source.parent(){dialog=dialog.set_directory(parent);}
+                                dialog=dialog.set_directory(r"D:\AstraRimElmProject\1TestImgfiles");
                                 let Some(output)=dialog.save_file() else {return Ok(None);};
-                                let result=self.collision_edit.export(source,&output,&scene.name,lib.index.as_ref())?;
+                                let mut result=self.collision_edit.export(source,&output,&scene.name,lib.index.as_ref())?;
+                                if self.doors.has_native_changes(){
+                                    result.push_str(&format!("; {}",self.doors.overlay_existing(&output,lib.index.as_ref())?));
+                                }
                                 Ok(Some(result))
                             })();
                             match result {Ok(Some(s))=>self.studio.status=Some(s),Ok(None)=>{},Err(e)=>self.studio.error=Some(format!("Collision IMG export failed: {e:#}"))}
@@ -3774,14 +4481,42 @@ impl App {
                                 .set_file_name(&suggestion)
                                 .add_filter("Raw PS1 IMG",&["img"]);
 
-                            if let Some(parent)=source.parent(){
-                                dialog=dialog.set_directory(parent);
-                            }
+                            dialog=dialog.set_directory(r"D:\AstraRimElmProject\1TestImgfiles");
 
                             let Some(output)=dialog.save_file()
                             else {return Ok(None);};
 
-                            Ok(Some(native_ground_delete::export_ground(&source,&output,name,&lib.index,&self.ground_edits,self.unrestricted_img_export)?))
+                            ps1_original_guard::ensure_new_output(&source,&output)?;
+                            anyhow::ensure!(!output.exists(),"Choose a NEW output IMG filename");
+                            let stamp=std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+                            let staging=output.with_file_name(format!(
+                                "LCK_GROUND_MIRROR_STAGE_{}_{}.img",std::process::id(),stamp));
+                            anyhow::ensure!(!staging.exists(),"Floor mirror staging IMG already exists");
+                            let published=(||->anyhow::Result<String>{
+                                let pure=ground_edit_ops::native_128_plan(&self.ground_edits)
+                                    .ok().is_some_and(|(a,b)|a.is_empty()&&b.is_empty());
+                                let note=if pure{
+                                    std::fs::copy(&source,&staging)?;
+                                    "Native floor grid unchanged; reflected texture export follows".to_string()
+                                }else{
+                                    native_ground_delete::export_ground(
+                                        &source,&staging,name,&lib.index,&self.ground_edits,
+                                        self.unrestricted_img_export)?
+                                };
+                                let mirror=native_floor_mirror::overlay_existing(
+                                    &staging,name,&lib.index,&self.ground_edits)?;
+                                if self.doors.has_native_changes(){
+                                    self.doors.overlay_existing(&staging,lib.index.as_ref())?;
+                                }
+                                ps1_export::verify_output_file(
+                                    &staging,Some(std::fs::metadata(&source)?.len()))?;
+                                std::fs::hard_link(&staging,&output)?;
+                                Ok(format!("{note}. {}. Native gameplay not yet verified.",
+                                    mirror.unwrap_or_else(||"No mirrored ground textures".into())))
+                            })();
+                            let _=std::fs::remove_file(&staging);
+                            Ok(Some(published?))
                         })();
 
                         match result {
@@ -3817,20 +4552,14 @@ impl App {
                                 .set_file_name(&suggestion)
                                 .add_filter("Raw PlayStation image",&["img"]);
 
-                            if let Some(parent)=source.parent(){
-                                dialog=dialog.set_directory(parent);
-                            }
+                            dialog=dialog.set_directory(r"D:\AstraRimElmProject\1TestImgfiles");
 
                             let Some(output)=dialog.save_file() else {
                                 return Ok(None);
                             };
 
-                            let message=native_ground_delete::export(
-                                &source,
-                                &output,
-                                name,
-                                &lib.index,
-                                &self.ground_edits.deleted
+                            let message=native_ground_delete::export_ground(
+                                &source,&output,name,&lib.index,&self.ground_edits,true
                             )?;
                             Ok(Some(message))
                         })();
@@ -3844,12 +4573,11 @@ impl App {
                         }
                     }
                     if self.ground_edits.has_edits() {
-                        ui.colored_label(egui::Color32::YELLOW,
+                        ui.label(
                             "U1B.2: aligned native floor edits can export with objects and collision. Unsupported floor transforms require further native work.");
                     }
-                    if ui.add_enabled(!self.ground_edits.has_edits(),egui::Button::new("Check IMG"))
-                        .on_hover_text("Unrestricted mode bypasses compatibility preflight. With the checkbox off, run strict preparation without writing a file. Neither mode verifies gameplay.")
-                        .clicked() {
+                    if std::mem::take(&mut self.lck_menu_check)
+                        && !self.ground_edits.has_edits() {
                         let result = (|| -> anyhow::Result<String> {
                             let lib = self.studio.library.as_ref()
                                 .ok_or_else(||anyhow::anyhow!("No disc image loaded"))?;
@@ -3897,7 +4625,7 @@ impl App {
                                     source.file_stem().and_then(|s|s.to_str()).unwrap_or("LegaiaTest"),cell_name);
                                 let mut dialog=rfd::FileDialog::new().set_file_name(&suggestion)
                                     .add_filter("Raw PS1 test image", &["img"]);
-                                if let Some(parent)=source.parent() {dialog=dialog.set_directory(parent);}
+                                dialog=dialog.set_directory(r"D:\AstraRimElmProject\1TestImgfiles");
                                 if let Some(destination)=dialog.save_file() {
                                     self.ps1_export_output=Some(destination.clone());
                                     self.ps1_export_imports=None;
@@ -3914,10 +4642,50 @@ impl App {
                                     // LCK_U1A_WORKER_MERGE
                                     // Snapshot wall edits at export-start.
                                     let collision_snapshot=self.collision_edit.clone();
+                                    // LCK_R57_NATIVE_WARPS
+                                    let warp_snapshot=self.form_session.as_ref()
+                                        .and_then(|session|
+                                            session.project.native_warps.iter()
+                                                .find(|edit|edit.scene==cell_name)
+                                        ).cloned();
+                                     let door_snapshot=self.doors.clone();
                                     std::thread::spawn(move|| {
                                         let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||->anyhow::Result<ps1_export::ExportResult>{
-                                            let plan=if let Some(session)=&mut export_session {ps1_export::prepare_project(&source,&export_scene,session,&export_index,unrestricted)}else if unrestricted {ps1_export::unrestricted::prepare(&source,&export_scene,&export_world,&export_index)}else{ps1_export::plan_export(&source,&export_scene,&export_world,&export_index)}?;
-                                            let mut done=ps1_export::export(plan,&destination)?;
+                                            // LCK_R57_NATIVE_WARPS
+                                            let planned=if let Some(session)=&mut export_session {
+                                                ps1_export::prepare_project(
+                                                    &source,&export_scene,session,
+                                                    &export_index,unrestricted
+                                                )
+                                            }else if unrestricted {
+                                                ps1_export::unrestricted::prepare(
+                                                    &source,&export_scene,&export_world,&export_index
+                                                )
+                                            }else{
+                                                ps1_export::plan_export(
+                                                    &source,&export_scene,&export_world,&export_index
+                                                )
+                                            };
+
+                                            let warp_only=planned.as_ref().err().is_some_and(|error|{
+                                                let message=format!("{error:#}").to_lowercase();
+                                                message.contains("nothing to export")
+                                                    || message.contains("no native edits")
+                                            });
+
+                                            let mut warp_already_written=false;
+
+                                            let mut done=match planned {
+                                                Ok(plan)=>ps1_export::export(plan,&destination)?,
+                                                Err(error) if warp_only && warp_snapshot.is_some()=>{
+                                                    warp_already_written=true;
+                                                    native_warps::publish_warp_only(
+                                                        &source,&destination,&export_index,
+                                                        warp_snapshot.as_ref().unwrap()
+                                                    )?
+                                                },
+                                                Err(error)=>return Err(error),
+                                            };
 
                                             if collision_snapshot.has_edits() {
                                                 // Patch the IMG returned by the normal
@@ -3928,6 +4696,20 @@ impl App {
                                                     &export_index
                                                 )?;
                                                 done.patched.push(note);
+                                            }
+
+                                            if door_snapshot.has_native_changes() {
+                                                let note=door_snapshot.overlay_existing(&done.path,&export_index)?;
+                                                done.patched.push(note);
+                                            }
+                                            // LCK_R57_NATIVE_WARPS
+                                            if !warp_already_written {
+                                                if let Some(edit)=&warp_snapshot {
+                                                    let note=native_warps::overlay_existing(
+                                                        &done.path,&export_index,edit
+                                                    )?;
+                                                    done.patched.push(note);
+                                                }
                                             }
 
                                             Ok(done)
@@ -3963,7 +4745,7 @@ impl App {
                             },
                         }
                     }
-                    if ui.button("Open LCK scene...").on_hover_text("Rebuild the preview from an editor-only .lckscene file. Does NOT write the game disc.").clicked() {
+                    if false && ui.button("Open LCK scene...").on_hover_text("Rebuild the preview from an editor-only .lckscene file. Does NOT write the game disc.").clicked() {
                         if let Some((name, _)) = &self.native_scene {
                             if let Some(path) = rfd::FileDialog::new()
                                 .add_filter("LCK scene overlay", &["lckscene"]).pick_file() {
@@ -4004,7 +4786,6 @@ impl App {
                         }
                     }
                 });
-                ui.small("Click: single | Shift+click: add | Ctrl+click: toggle | Drag selected: move group | Ctrl+drag selected: move Y | RMB drag: rotate group at individual pivots | Ctrl+D: duplicate group | Del: delete group | Ctrl+Z/Y: undo/redo | LMB elsewhere: pan | MMB/Alt+LMB: orbit | Esc: deselect | F: frame | Home: frame all");
                 // World-space camera eye: live scene coordinates, NOT selection/pivot.
                 // Keep the current v0.4.5.4 camera framing and movement unchanged.
                 if let Some(model) = world.model.as_ref() {
@@ -4017,7 +4798,87 @@ impl App {
                         .on_hover_text("Native scene world-space camera location (Y up). Mirror view is visual only.");
                     });
                 }
-                ui.separator();
+                // LCK_CURSOR_ANCHOR_V1
+                if self.ground_edit_mode {
+                    if self.native_collision_wire_visible {
+                        lck_movement_ui(
+                            ui,&mut self.collision_move_mode,
+                            &mut self.collision_grid_size,64.0,"Collision"
+                        );
+                    }else{
+                        lck_movement_ui(
+                            ui,&mut self.floor_move_mode,
+                            &mut self.floor_grid_size,128.0,"Floor"
+                        );
+                    }
+                }else{
+                    lck_movement_ui(
+                        ui,&mut self.native_move_mode,
+                        &mut self.native_grid_size,32.0,"Object"
+                    );
+                }
+                                ui.separator();
+                        });
+                }
+
+                // LCK_R55_VIEWPORT_SPLIT
+                // Both scopes above are now closed. The viewport
+                // below is laid out independently of content size.
+
+                let (divider_rect,divider_response)=
+                    ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(),12.0),
+                        egui::Sense::click_and_drag()
+                    );
+
+                let divider_color=
+                    ui.visuals().widgets.noninteractive.bg_stroke.color;
+
+                ui.painter().line_segment(
+                    [
+                        divider_rect.left_center(),
+                        divider_rect.right_center()
+                    ],
+                    egui::Stroke::new(1.0,divider_color)
+                );
+
+                let grip_width=(divider_rect.width()*0.12)
+                    .clamp(56.0,140.0);
+
+                ui.painter().rect_filled(
+                    egui::Rect::from_center_size(
+                        divider_rect.center(),
+                        egui::vec2(grip_width,4.0)
+                    ),
+                    2.0,
+                    ui.visuals().widgets.hovered.bg_stroke.color
+                );
+
+                if divider_response.hovered()
+                    || divider_response.dragged()
+                {
+                    ui.ctx().set_cursor_icon(
+                        egui::CursorIcon::ResizeVertical
+                    );
+                }
+
+                if divider_response.dragged() {
+                    let delta=ui.input(|i|i.pointer.delta().y);
+
+                    let desired=lck_r55_controls_height(
+                        panel_height+delta,
+                        ui.available_height()+panel_height
+                    );
+
+                    ui.ctx().data_mut(|data|
+                        data.insert_persisted(panel_id,desired)
+                    );
+
+                    ui.ctx().request_repaint();
+                }
+
+                ui.strong("Render Window");
+
                 if let Some(base_model) = &world.model {
                     let ground_composite=scene.ground.as_ref().and_then(|hf| {
                         (self.ground_edit_mode || self.ground_edits.has_edits()).then(||
@@ -4025,6 +4886,74 @@ impl App {
                         )
                     });
                     let model=ground_composite.as_ref().unwrap_or(base_model);
+
+                    // LCK_R49_WORLD_FIXED_GRID
+                    // Build the authoring grid from world coordinates BEFORE
+                    // the viewport render. No post-render floating overlay.
+                    if self.native_map_grid_visible {
+                        self.native_map_extension.stage(
+                            &scene.name,
+                            &self.ground_edits,
+                            self.native_map_extension_side
+                        );
+                    }
+
+                    let r49_render_grid=self.native_map_grid_visible.then(||{
+                        native_map_bounds::render_fixed_grid(
+                            model,
+                            self.native_map_grid_y,
+                            self.native_map_grid_step,
+                            self.native_map_extension_side
+                        )
+                    });
+
+                    let model=r49_render_grid.as_ref().unwrap_or(model);
+                    // R43A_PREVIEW_RENDER: an independent raster snapshot;
+                    // original WorldModel and native export remain untouched.
+                    let lck_story_model=self.story_preview.as_ref()
+                        .filter(|p|p.scene==scene.name && self.story_flag_index>0)
+                        .map(|p|std::sync::Arc::clone(&p.model));
+                    let model=lck_story_model.as_deref().unwrap_or(model);
+
+                    // LCK_R58_WORLD_MARKERS
+                    // Insert trigger geometry into the SAME scene
+                    // model before the rasterizer renders its pixels.
+                    let marker_revision_id=egui::Id::new((
+                        "lck_r58_world_marker_revision",
+                        &scene.name
+                    ));
+
+                    let marker_revision=
+                        self.doors.world_marker_revision();
+
+                    let old_marker_revision=ui.ctx().data(|data|
+                        data.get_temp::<u64>(marker_revision_id)
+                    );
+
+                    if old_marker_revision!=Some(marker_revision){
+                        ui.ctx().data_mut(|data|
+                            data.insert_temp(
+                                marker_revision_id,
+                                marker_revision
+                            )
+                        );
+
+                        self.native_view.version=
+                            self.native_view.version.wrapping_add(1);
+
+                        ui.ctx().request_repaint();
+                    }
+
+                    let marker_world_model=
+                        self.doors.show_markers.then(||
+                            self.doors.world_marker_model(
+                                model,
+                                scene.ground.as_ref()
+                            )
+                        );
+
+                    let model=marker_world_model
+                        .as_ref().unwrap_or(model);
                     // F works from Scene Hierarchy, Render Window, or toolbar.
                     // Never steal the F key from text fields or modal editors.
                     let frame_key = !ctx.wants_keyboard_input()
@@ -4038,62 +4967,93 @@ impl App {
                     ) {
                         ui.ctx().request_repaint();
                     }
-                    // Read-only selection of original MAP ground cells.
-                    if self.ground_scene.as_deref()!=Some(scene.name.as_str()) {
-                        self.ground_scene=Some(scene.name.clone());
-                        self.ground_selected.clear();
-                        self.ground_active=None;
-                        self.ground_hierarchy_reveal=None;
-                        self.ground_click=None;
+                    // LCK_CLEAN_VIEWPORT_V1
+                    // Main viewport: no duplicate floor toolbars or
+                    // diagnostic statistics. Hotkeys and Properties
+                    // remain available.
+                    if self.ground_edit_mode && scene.ground.is_none() {
+                        ui.small("Native MAP walk-ground unavailable.");
                     }
-                    if self.ground_edit_mode {
-                        if let Some(hf)=scene.ground.as_ref() {
-                            ui.horizontal(|ui| {
-                                if ui.small_button("Clear ground selection").clicked() {
-                                    self.ground_selected.clear();
-                                    self.ground_active=None;
-                                    ui.ctx().request_repaint();
-                                }
-                                ui.strong(format!("Ground cells: {}",self.ground_selected.len()));
-                            });
-                            ground_select::inspector(ui,hf,self.ground_active);
-                            if ground_edit_ops::controls(ui,&mut self.ground_edits,
-                                &mut self.ground_selected,&mut self.ground_active,hf) {
-                                self.native_view.version=self.native_view.version.wrapping_add(1);
-                                ui.ctx().request_repaint();
-                            }
-                        } else {
-                            ui.small("This scene has no resolved native MAP walk-ground.");
-                        }
-                    }
-                    ui.small(format!("{} vertices, {} triangles ({} native walk-ground) | {} original TIM uploads",
-                        model.positions.len(), model.triangles(), world.ground_triangles, scene.res.tim_count));
-                    ui.small(format!("Native ground atlas: {} / {} textured triangles have VRAM coverage ({} ground triangles total).",
-                        world.ground_vram_covered, world.ground_textured, world.ground_triangles));
-                    ui.small("Native ground uses original per-cell UVs, CLUT palettes and VRAM texture pages. Mirror view is editor-only.");
                     // The orbit pivot follows the actual EDITED position of the
                     // selected native object. No selection means camera free-look:
                     // the camera eye stays fixed when MMB/Alt+LMB rotates.
                     self.native_view.world_orbit_anchor = self.native_selected.and_then(|(terrain, index)|
                         world.at(terrain, index).map(|d| d.center));
                     self.native_view.world_ground_edit=self.ground_edit_mode;
+                    self.native_view.world_marquee_enabled=self.marquee_enabled || self.marquee_chord;
                     self.native_view.world_selected=if self.ground_edit_mode {
-                        scene.ground.as_ref().map(|hf|ground_edit_ops::highlighted_ids(
-                            &self.ground_edits,hf,&self.ground_selected)).unwrap_or_default()
+                        let mut ids=scene.ground.as_ref().map(|hf|ground_edit_ops::highlighted_ids(
+                            &self.ground_edits,hf,&self.ground_selected)).unwrap_or_default();
+                        ids.extend(multi_selection::keys(
+                            self.native_selected,&self.native_selection
+                        ).iter().filter(|&&key|lck_is_imported_floor(world,key))
+                            .filter_map(|&key|world.at(key.0,key.1).map(|d|d.id)));
+                        ids
                     } else {
-                        multi_selection::keys(self.native_selected,&self.native_selection).iter()
+                        multi_selection::keys(self.native_selected,&self.native_selection).iter().filter(|key|!lck_is_imported_floor(world,**key))
                           .filter_map(|key|world.at(key.0,key.1).filter(|d|!d.hidden).map(|d|d.id)).collect()
                     };
-                    let selected_id = self.native_selected.and_then(|(terrain, index)|
+                    let selected_id = self.native_selected
+                        .filter(|&key|
+                            self.ground_edit_mode==
+                            lck_is_imported_floor(world,key))
+                        .and_then(|(terrain, index)|
                         world.at(terrain, index).map(|d| d.id));
                     // Gesture is determined at mouse-down from the actual rasterized
                     // mesh hit: dragging the selected mesh edits it, elsewhere pans.
                     // The viewport suppresses camera navigation for captured edits.
                     // LCK_C1_COLLISION_EDITOR
-                    if self.ground_edit_mode && self.native_collision_wire_visible {
-                        self.collision_edit.controls(ui,self.native_collision_grid.as_ref());
-                    }
+                    // Collision controls remain in Properties.
+                    // Native wireframe rendering and interaction stay active.
                     let view_rect = ui.available_rect_before_wrap();
+                    let lck_popup_hover=lck_pointer_over_foreground(ctx);
+
+                    // LCK_C3_DUAL_MOUSE
+                    // The second mouse-button press captures the
+                    // gesture only if it occurs inside the viewport.
+                    let chord_pressed=ui.input(|i|{
+                        i.pointer.primary_down()
+                            && i.pointer.secondary_down()
+                            && (i.pointer.primary_pressed()
+                                || i.pointer.secondary_pressed())
+                            && !i.modifiers.alt
+                            && i.pointer.interact_pos()
+                                .is_some_and(|p|view_rect.contains(p))
+                    });
+
+                    let chord_blocked=
+                        self.editor_asset_drag.is_some()
+                        || self.form_drag.is_some()
+                        || self.global_repository_drag.is_some();
+
+                    if !self.marquee_chord
+                        && chord_pressed && !chord_blocked && !lck_popup_hover
+                    {
+                        self.marquee_chord=true;
+
+                        // Do not let this gesture become an
+                        // object move, floor move, collision
+                        // drag, camera pan or object rotation.
+                        self.native_drag=None;
+                        self.native_rotate=None;
+                        self.native_selection_click=None;
+                        self.native_view.world_left_drag_selected=None;
+                        self.ground_edits.clear_drag();
+                        self.collision_edit.cancel_pointer_gesture();
+                    }
+
+                    // The checkbox itself remains unchanged.
+                    self.native_view.world_marquee_enabled=
+                        self.marquee_enabled || self.marquee_chord;
+
+                    // LCK_R57_NATIVE_WARPS
+                    let warp_capture=native_warps::interact(
+                        ui,view_rect,model,self.native_view.cam,
+                        self.native_view.world_mirrored,
+                        scene.ground.as_ref(),
+                        &mut self.native_warp_editor
+                    );
+
                     let collision_capture=if self.ground_edit_mode && self.native_collision_wire_visible {
                         let source_key=self.studio.library.as_ref().map(|lib|lib.source.path().display().to_string()).unwrap_or_default();
                         if self.native_collision_grid.as_ref().is_none_or(|g|g.scene!=scene.name || g.source_key!=source_key){
@@ -4101,13 +5061,814 @@ impl App {
                                 self.native_collision_grid=collision_wire::CollisionGrid::load(lib.index.as_ref(),&scene.name,&source_key).ok();
                             }
                         }
-                        self.collision_edit.begin(ui,view_rect,&self.native_view,model,self.native_collision_grid.as_ref(),&scene.name)
+                        if self.marquee_enabled || self.marquee_chord || lck_popup_hover { false } else {
+                            self.collision_edit.begin(
+                                ui,view_rect,&self.native_view,model,
+                                self.native_collision_grid.as_ref(),&scene.name
+                            )
+                        }
                     }else{false};
                     let picked = self.native_view.show_world_limited_with_sources(ui, model, &scene.res.vram,
                         900, 680, selected_id, self.native_ground_visible,
-                        (self.editor_asset_drag.is_some() || self.form_drag.is_some() || collision_capture), &world.foreign_vram);
-                    if !self.ground_edit_mode {
-                    if let Some(draw)=picked.and_then(|id|world.by_id(id)) {
+                        (self.editor_asset_drag.is_some() || self.form_drag.is_some() || collision_capture || warp_capture || lck_popup_hover), &world.foreign_vram);
+
+                    // Exact camera-pose invariant for Last Flag / Next Flag.
+                    // No yaw, pitch, zoom, or target offset may carry over
+                    // from an unintended input/viewport interaction.
+                    if let Some(saved_camera)=self.story_flag_camera_restore.take() {
+                        if self.native_view.cam!=saved_camera {
+                            self.native_view.cam=saved_camera;
+                            self.native_view.version=
+                                self.native_view.version.wrapping_add(1);
+                            ui.ctx().request_repaint();
+                        }
+                    }
+
+                    // Native teleports are technical markers, not geometry meshes.
+                    // A marker click captures the event before empty-space deselection.
+                    let door_marker_pressed=if self.ground_edit_mode {false} else {
+                        self.doors.viewport(ui,&self.native_view,model,scene.ground.as_ref())
+                    };
+                    if door_marker_pressed {
+                        // LCK_R58_WORLD_MARKERS
+                        ui.ctx().request_repaint();
+                        self.lck_empty_viewport_press=None;
+                        self.native_view.world_left_drag_selected=None;
+                        self.native_view.world_marker_drag_capture=true;
+                    }
+                    let picked=if door_marker_pressed {None} else {picked};
+
+                    // LCK_R54_VISIBLE_PICK
+                    // Double-click a real visible surface to frame it.
+                    // Camera-only: no scene transform or history mutation.
+                    let lck_r54_double_click=ui.input(|i|
+                        i.pointer.button_double_clicked(
+                            egui::PointerButton::Primary
+                        )
+                        && i.modifiers==egui::Modifiers::NONE
+                        && !i.pointer.any_down()
+                    );
+
+                    if lck_r54_double_click
+                        && !self.native_view.world_pan_dragged
+                        && !self.marquee_enabled
+                        && !self.marquee_chord
+                        && !lck_popup_hover
+                        && self.editor_modal.is_none()
+                        && self.editor_rename.is_none()
+                        && self.editor_context_menu.is_none()
+                        && self.ground_context_menu.is_none()
+                        && self.editor_asset_drag.is_none()
+                        && self.global_repository_drag.is_none()
+                        && self.form_drag.is_none()
+                    {
+                        if let Some(pos)=ui.input(|i|
+                            i.pointer.interact_pos()
+                        ).filter(|pos|
+                            view_rect.contains(*pos)
+                            && ctx.layer_id_at(*pos)
+                                .is_none_or(|layer|layer==ui.layer_id())
+                        ){
+                            let mut framed=false;
+
+                            if self.ground_edit_mode
+                                && self.native_collision_wire_visible
+                            {
+                                if let Some(grid)=self.native_collision_grid.as_ref(){
+                                    if let Some(cell)=self.collision_edit.context_hit(
+                                        ui,view_rect,&self.native_view,
+                                        model,grid,pos
+                                    ){
+                                        self.collision_edit.context_select(cell);
+
+                                        let center=self.collision_edit.frame_center(
+                                            grid,cell
+                                        );
+
+                                        self.native_view.frame_instance(
+                                            model,center,96.0,
+                                            [0.0,0.0,0.0,1.0],
+                                            [0.0;3]
+                                        );
+
+                                        framed=true;
+                                    }
+                                }
+                            }else{
+                                let visible=self.native_view.pick_visible(
+                                    view_rect,pos
+                                );
+
+                                if let Some(draw)=visible
+                                    .and_then(|id|world.by_id(id))
+                                    .filter(|draw|!draw.hidden
+                                        && draw.vertex_start<draw.vertex_end)
+                                    .filter(|draw|
+                                        self.ground_edit_mode==
+                                            lck_is_imported_floor(
+                                                world,
+                                                (draw.terrain,draw.index)
+                                            )
+                                    )
+                                {
+                                    let key=(draw.terrain,draw.index);
+
+                                    self.native_selected=Some(key);
+                                    self.native_selection.clear();
+                                    self.native_selection.insert(key);
+                                    self.native_hierarchy_anchor=Some(key);
+
+                                    framed=frame_editor_selection(
+                                        &mut self.native_view,
+                                        world,
+                                        scene,
+                                        Some(key),
+                                        None,
+                                        &self.ground_edits
+                                    );
+                                }else if self.ground_edit_mode {
+                                    if let Some(hf)=scene.ground.as_ref(){
+                                        if let Some(key)=visible.and_then(|id|
+                                            ground_edit_ops::from_pick(
+                                                id,hf,&self.ground_edits
+                                            )
+                                        ){
+                                            self.native_selected=None;
+                                            self.native_selection.clear();
+
+                                            self.ground_selected.clear();
+                                            self.ground_edits.selected_copies.clear();
+
+                                            match key {
+                                                ground_edit_ops::Key::Native(cell)=>{
+                                                    self.ground_selected.insert(cell);
+                                                    self.ground_active=Some(cell);
+                                                    self.ground_edits.active_copy=None;
+                                                },
+                                                ground_edit_ops::Key::Copy(uid)=>{
+                                                    self.ground_active=None;
+                                                    self.ground_edits.selected_copies.insert(uid);
+                                                    self.ground_edits.active_copy=Some(uid);
+                                                },
+                                            }
+
+                                            framed=frame_editor_selection(
+                                                &mut self.native_view,
+                                                world,
+                                                scene,
+                                                None,
+                                                self.ground_active,
+                                                &self.ground_edits
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            if framed {
+                                self.native_view.version=
+                                    self.native_view.version.wrapping_add(1);
+                                ctx.request_repaint();
+                            }
+                        }
+                    }
+                    // LCK_R57_NATIVE_WARPS
+                    native_warps::paint(
+                        ui,view_rect,model,self.native_view.cam,
+                        self.native_view.world_mirrored,
+                        scene.ground.as_ref(),
+                        &self.native_warp_editor
+                    );
+
+                    // Empty-click deselection shares the normal picking path.
+                    // Never infer a click from an unpaired mouse-up: capture only
+                    // a plain LMB-down inside the viewport on empty space.
+                    if ui.input(|i|i.pointer.primary_pressed()) {
+                        self.lck_empty_viewport_press=None;
+                        let plain=ui.input(|i|!i.modifiers.alt &&
+                            !i.modifiers.ctrl && !i.modifiers.shift &&
+                            !i.pointer.secondary_down());
+                        // An egui Window can cover the viewport rectangle.
+                        // Only interact with the scene if its own layer is topmost.
+                        let covered=ui.input(|i|i.pointer.interact_pos())
+                            .and_then(|pos|ctx.layer_id_at(pos))
+                            .is_some_and(|layer|layer!=ui.layer_id());
+                        let blocked=door_marker_pressed || covered || lck_popup_hover || self.marquee_enabled ||
+                            self.marquee_chord || self.editor_modal.is_some() ||
+                            self.editor_rename.is_some() ||
+                            self.editor_context_menu.is_some() ||
+                            self.ground_context_menu.is_some() ||
+                            self.editor_asset_drag.is_some() ||
+                            self.form_drag.is_some() ||
+                            self.global_repository_drag.is_some();
+                        let missed=if self.ground_edit_mode {
+                            self.native_collision_wire_visible &&
+                            self.native_collision_grid.is_some() &&
+                            !self.collision_edit.pointer_on_wall
+                        } else {
+                            // All visible native objects, NPCs, textured meshes
+                            // and duplicates use WorldModel's DrawInfo picking.
+                            !picked.and_then(|id|world.by_id(id))
+                                .is_some_and(|d|!d.hidden &&
+                                    d.vertex_start<d.vertex_end &&
+                                    !lck_is_imported_floor(world,(d.terrain,d.index)))
+                        };
+                        if plain && !blocked && missed {
+                            self.lck_empty_viewport_press=ui.input(|i|
+                                i.pointer.interact_pos())
+                                .filter(|pos|view_rect.contains(*pos))
+                                .map(|pos|(scene.name.clone(),pos,self.ground_edit_mode));
+                        }
+                    }
+                    // LCK_GROUND_RMB_PROPERTIES
+                    if self.ground_edit_mode && !lck_popup_hover
+                        && !(self.marquee_enabled || self.marquee_chord)
+                        && ui.input(|i|i.pointer.secondary_pressed())
+                    {
+                        if let Some(pos)=ui.input(|i|i.pointer.interact_pos())
+                            .filter(|p|view_rect.contains(*p))
+                        {
+                            let mut claimed=false;
+
+                            if self.native_collision_wire_visible {
+                                if let Some(grid)=self.native_collision_grid.as_ref(){
+                                    if let Some(cell)=self.collision_edit.context_hit(
+                                        ui,view_rect,&self.native_view,model,grid,pos
+                                    ){
+                                        self.collision_edit.context_select(cell);
+                                        if let Some(group)=authoring_group::group_for(
+                                            &world.groups,&authoring_group::Member::Wall([cell.0,cell.1])
+                                        ) {
+                                            let bound=group.members.iter().filter_map(|member|match member {
+                                                authoring_group::Member::Wall([x,z])=>Some((*x,*z)),
+                                                _=>None,
+                                            }).collect::<std::collections::BTreeSet<_>>();
+                                            self.collision_edit.include_selected(&bound);
+                                        }
+                                        let members=self.collision_edit.selected_cells();
+                                        let current=members.iter().copied().map(|c|(c,c)).collect();
+                                        self.ground_right_gesture=Some(GroundRightGesture{
+                                            start:pos,kind:GroundMenu::Collision,
+                                            baselines:Vec::new(),
+                                            collision_source:Some(self.collision_edit.clone()),
+                                            collision_members:members,collision_current:current,
+                                            moved:false,turns:0,
+                                        });
+                                        claimed=true;
+                                    }
+                                }
+                            }
+
+                            if !claimed {
+                                if let Some(hf)=scene.ground.as_ref(){
+                                    let floor=self.native_view.pick_visible(
+                        view_rect,pos
+                    ).and_then(|id|
+                        ground_edit_ops::from_pick(
+                            id,hf,&self.ground_edits
+                        )
+                    );
+
+                                    if let Some(key)=floor{
+                                        let already_selected=match key {
+                                            ground_edit_ops::Key::Native(cell)=>self.ground_selected.contains(&cell),
+                                            ground_edit_ops::Key::Copy(uid)=>self.ground_edits.selected_copies.contains(&uid),
+                                        };
+                                        if !already_selected {
+                                            self.ground_selected.clear();
+                                            self.ground_edits.selected_copies.clear();
+                                        }
+
+                                        match key {
+                                            ground_edit_ops::Key::Native(cell)=>{
+                                                self.ground_selected.insert(cell);
+                                                self.ground_active=Some(cell);
+                                                self.ground_edits.active_copy=None;
+                                            },
+                                            ground_edit_ops::Key::Copy(uid)=>{
+                                                self.ground_active=None;
+                                                self.ground_edits.selected_copies.insert(uid);
+                                                self.ground_edits.active_copy=Some(uid);
+                                            },
+                                        }
+
+                                        // RMB on any saved group floor activates the rest
+                                        // of that group's floor members before capture.
+                                        {
+                                            let scene_world=world.as_ref();
+                                            let member=match key {
+                                                ground_edit_ops::Key::Native(cell)=>
+                                                    authoring_group::Member::NativeFloor(cell),
+                                                ground_edit_ops::Key::Copy(uid)=>
+                                                    authoring_group::Member::CopiedFloor(uid),
+                                            };
+                                            if let Some(group)=authoring_group::group_for(
+                                                &scene_world.groups,&member
+                                            ) {
+                                                for item in &group.members {
+                                                    match item {
+                                                        authoring_group::Member::NativeFloor(cell)=>{
+                                                            self.ground_selected.insert(*cell);
+                                                        },
+                                                        authoring_group::Member::CopiedFloor(uid)=>{
+                                                            if self.ground_edits.copies.iter().any(|p|p.uid==*uid){
+                                                                self.ground_edits.selected_copies.insert(*uid);
+                                                            }
+                                                        },
+                                                        _=>{},
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let baselines=self.ground_edits.all_selected(
+                                            &self.ground_selected
+                                        ).into_iter().filter_map(|key|
+                                            self.ground_edits.transform(key)
+                                                .map(|transform|(key,transform))
+                                        ).collect();
+                                        self.ground_right_gesture=Some(GroundRightGesture{
+                                            start:pos,kind:GroundMenu::Floor,
+                                            baselines,
+                                            collision_source:None,
+                                            collision_members:Default::default(),
+                                            collision_current:Vec::new(),
+                                            moved:false,turns:0,
+                                        });
+                                        ui.ctx().request_repaint();
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // RMB release opens floor/collision menus. A held floor
+                    // drag instead rotates selected tiles in 90-degree steps.
+                    // Tracking movement separately prevents a menu opening if
+                    // the pointer moves away and returns before release.
+                    if let Some(mut gesture)=self.ground_right_gesture.take() {
+                        if !self.marquee_chord && ui.input(|i|i.pointer.secondary_down()) {
+                            if let Some(now)=ui.input(|i|i.pointer.interact_pos()) {
+                                let delta=now-gesture.start;
+                                if delta.length_sq()>36.0 {gesture.moved=true;}
+                                if gesture.moved && gesture.kind==GroundMenu::Collision {
+                                    let turns=(delta.x/45.0).round() as i32;
+                                    if turns!=gesture.turns {
+                                        if let (Some(grid),Some(snapshot))=(
+                                            self.native_collision_grid.as_ref(),
+                                            gesture.collision_source.as_ref()
+                                        ) {
+                                            match self.collision_edit.rotate_from_snapshot(
+                                                grid,snapshot,&gesture.collision_members,turns
+                                            ) {
+                                                Ok(pairs)=>{
+                                                    let previous=gesture.collision_current.iter()
+                                                        .map(|(_,current)|*current).collect::<Vec<_>>();
+                                                    pending_collision_rotation_remap.extend(
+                                                        previous.into_iter().zip(pairs.iter().map(|(_,to)|*to))
+                                                    );
+                                                    gesture.collision_current=pairs;
+                                                    gesture.turns=turns;
+                                                    self.native_view.version=self.native_view.version.wrapping_add(1);
+                                                    ui.ctx().request_repaint();
+                                                },
+                                                Err(error)=>self.studio.error=Some(format!(
+                                                    "Collision group rotation: {error}"
+                                                )),
+                                            }
+                                        }
+                                    }
+                                }
+                                if gesture.moved && gesture.kind==GroundMenu::Floor {
+                                    let turns=(delta.x/45.0).round() as i32;
+                                    if turns!=gesture.turns {
+                                        gesture.turns=turns;
+                                        match ground_edit_ops::rotate_group_snapshot(
+                                            &mut self.ground_edits,&gesture.baselines,turns
+                                        ) {
+                                            Ok(true)=>{
+                                                self.native_view.version=self.native_view.version.wrapping_add(1);
+                                                ui.ctx().request_repaint();
+                                            },
+                                            Ok(false)=>{},
+                                            Err(error)=>{
+                                                self.studio.error=Some(format!(
+                                                    "Floor group rotation: {error}"
+                                                ));
+                                            },
+                                        }
+                                    }
+                                }
+                            }
+                            self.ground_right_gesture=Some(gesture);
+                        } else if !self.marquee_chord && ui.input(|i|i.pointer.secondary_released()) {
+                            let released=ui.input(|i|i.pointer.interact_pos())
+                                .unwrap_or(gesture.start);
+                            if !gesture.moved && (released-gesture.start).length_sq()<=36.0 {
+                                self.ground_context_menu=Some((released,gesture.kind));
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                    }
+
+                    // C3: the toggle controls only LMB rectangle selection.
+                    // Native object, floor and collision edits are unchanged.
+                    let marquee_request=self.marquee_state.update(
+                        ui,view_rect,(self.marquee_enabled || self.marquee_chord),
+                        self.editor_asset_drag.is_some()
+                            ||self.form_drag.is_some()
+                            ||self.global_repository_drag.is_some()
+                            ||lck_popup_hover,
+                        self.marquee_chord
+                    );
+
+                                        // LCK_C3_SHORTCIRCUIT_FIX
+if let Some((selection,mods))=marquee_request {
+                        let c3_cached_ids=if self.ground_edit_mode && self.native_collision_wire_visible {
+                            None
+                        }else{
+                            Some(marquee_selection::intersecting_ids(ui,model,&self.native_view,view_rect,selection))
+                        };
+                        // Preserve the actual selection from before
+                        // this rectangle was applied.
+                        let c3_before_objects=multi_selection::keys(
+                            self.native_selected,&self.native_selection
+                        );
+                        let c3_before_floors=self.ground_selected.clone();
+                        let c3_before_copies=
+                            self.ground_edits.selected_copies.clone();
+
+
+                        if self.ground_edit_mode
+                            && self.native_collision_wire_visible
+                        {
+                            if let Some(grid)=self.native_collision_grid.as_ref(){
+                                self.collision_edit.apply_marquee(
+                                    ui,view_rect,&self.native_view,
+                                    model,grid,selection,mods
+                                );
+                                self.ground_selected.clear();
+                                self.ground_active=None;
+                                self.ground_edits.selected_copies.clear();
+                                self.ground_edits.active_copy=None;
+                            }
+                        }else{
+                            let ids=c3_cached_ids.as_ref().expect("marquee cache missing").clone();
+
+                            self.studio.status=Some(format!(
+                                "C3 Marquee: {} mesh IDs detected in {} mode",
+                                ids.len(),
+                                if self.ground_edit_mode {
+                                    "floor"
+                                }else{
+                                    "object"
+                                }
+                            ));
+
+
+                            if self.ground_edit_mode {
+                                if let Some(hf)=scene.ground.as_ref(){
+                                    let mut floors=
+                                        std::collections::BTreeSet::new();
+                                    let mut copies=
+                                        std::collections::BTreeSet::new();
+
+                                    for id in ids{
+                                        if let Some(hit)=ground_edit_ops::from_pick(
+                                            id,hf,&self.ground_edits
+                                        ){
+                                            match hit{
+                                                ground_edit_ops::Key::Native(cell)=>{
+                                                    floors.insert(cell);
+                                                },
+                                                ground_edit_ops::Key::Copy(uid)=>{
+                                                    copies.insert(uid);
+                                                },
+                                            }
+                                        }
+                                    }
+
+                                    if !mods.shift && !mods.ctrl{
+                                        self.ground_selected.clear();
+                                        self.ground_edits.selected_copies.clear();
+                                    }
+
+                                    for cell in floors{
+                                        if !self.ground_selected.insert(cell) && mods.ctrl
+                                        {
+                                            self.ground_selected.remove(&cell);
+                                        }
+                                    }
+
+                                    for uid in copies{
+                                        if !self.ground_edits.selected_copies.insert(uid) && mods.ctrl
+                                        {
+                                            self.ground_edits.selected_copies.remove(&uid);
+                                        }
+                                    }
+
+                                    self.ground_active=
+                                        self.ground_selected.iter().next_back().copied();
+                                    self.ground_edits.active_copy=
+                                        self.ground_edits.selected_copies.iter()
+                                            .next_back().copied();
+
+                                    self.ground_hierarchy_reveal=self.ground_active;
+                                }
+                            }else{
+                                let mut hits=std::collections::BTreeSet::new();
+
+                                for id in ids{
+                                    if id>=ground_edit_ops::ORIGINAL_BASE{
+                                        continue;
+                                    }
+
+                                    if let Some(draw)=world.by_id(id){
+                                        if !draw.hidden{
+                                            hits.insert((draw.terrain,draw.index));
+                                        }
+                                    }
+                                }
+
+                                let mut selected=multi_selection::keys(
+                                    self.native_selected,&self.native_selection
+                                );
+
+                                if !mods.shift && !mods.ctrl{
+                                    selected.clear();
+                                }
+
+                                for key in hits{
+                                    if !selected.insert(key) && mods.ctrl{
+                                        selected.remove(&key);
+                                    }
+                                }
+
+                                self.native_selected=
+                                    selected.iter().next_back().copied();
+                                self.native_selection=selected;
+                                self.native_hierarchy_anchor=self.native_selected;
+                            }
+                        }
+
+                        // LCK_C3_SELECTION_HANDOFF_DIAGNOSTIC
+                        // Apply the committed selection to the
+                        // viewport immediately after marquee release.
+                        // Do not modify collision selections or MAP data.
+                        if !(self.ground_edit_mode
+                            && self.native_collision_wire_visible)
+                        {
+                            let confirmed_ids=if self.ground_edit_mode {
+                                scene.ground.as_ref()
+                                    .map(|hf|
+                                        ground_edit_ops::highlighted_ids(
+                                            &self.ground_edits,
+                                            hf,
+                                            &self.ground_selected
+                                        )
+                                    )
+                                    .unwrap_or_default()
+                            }else{
+                                multi_selection::keys(
+                                    self.native_selected,
+                                    &self.native_selection
+                                )
+                                .iter()
+                                .filter_map(|key|
+                                    world.at(key.0,key.1)
+                                        .filter(|d|!d.hidden)
+                                        .map(|d|d.id)
+                                )
+                                .collect::<Vec<_>>()
+                            };
+
+                            let highlighted=confirmed_ids.len();
+
+                            self.native_view.world_selected=confirmed_ids;
+
+                            let objects=multi_selection::keys(
+                                self.native_selected,
+                                &self.native_selection
+                            ).len();
+
+                            self.studio.status=Some(format!(
+                                "C3 committed: {} objects | {} floor cells | {} floor copies | {} highlight IDs",
+                                objects,
+                                self.ground_selected.len(),
+                                self.ground_edits.selected_copies.len(),
+                                highlighted
+                            ));
+                        }
+
+
+                        // LCK_C3_DIRECT_SELECTION_MAPPING
+                        // Collision marquee remains on its proven path.
+                        if !(self.ground_edit_mode
+                            && self.native_collision_wire_visible)
+                        {
+                            let c3_ids=c3_cached_ids.as_ref().expect("marquee cache missing");
+
+                            let mut c3_object_matches=0usize;
+                            let mut c3_floor_matches=0usize;
+                            let mut c3_copy_matches=0usize;
+
+                            if self.ground_edit_mode {
+                                if let Some(hf)=scene.ground.as_ref(){
+                                    let mut floor_hits=
+                                        std::collections::BTreeSet::new();
+
+                                    // Map rendered original floor IDs
+                                    // directly to native 128-unit cells.
+                                    for (q,quad) in hf.positions
+                                        .chunks_exact(4).enumerate()
+                                    {
+                                        let id=
+                                            ground_edit_ops::ORIGINAL_BASE
+                                            +q as u32;
+
+                                        if !c3_ids.contains(&id){
+                                            continue;
+                                        }
+
+                                        let p=quad[0];
+                                        let cell=[
+                                            (p[0]/128.0).round() as u8,
+                                            (p[2]/128.0).round() as u8,
+                                        ];
+
+                                        if !self.ground_edits.deleted
+                                            .contains(&cell)
+                                        {
+                                            floor_hits.insert(cell);
+                                        }
+                                    }
+
+                                    let mut copy_hits=
+                                        std::collections::BTreeSet::new();
+
+                                    // The composite renderer assigns
+                                    // floor-copy IDs by vector index.
+                                    for (index,copy) in self.ground_edits
+                                        .copies.iter().enumerate()
+                                    {
+                                        let id=ground_edit_ops::COPY_BASE
+                                            +index as u32;
+
+                                        if c3_ids.contains(&id){
+                                            copy_hits.insert(copy.uid);
+                                        }
+                                    }
+
+                                    c3_floor_matches=floor_hits.len();
+                                    c3_copy_matches=copy_hits.len();
+
+                                    let mut selected_floors=
+                                        if mods.shift || mods.ctrl {
+                                            c3_before_floors.clone()
+                                        }else{
+                                            std::collections::BTreeSet::new()
+                                        };
+
+                                    let mut selected_copies=
+                                        if mods.shift || mods.ctrl {
+                                            c3_before_copies.clone()
+                                        }else{
+                                            std::collections::BTreeSet::new()
+                                        };
+
+                                    for cell in floor_hits {
+                                        if !selected_floors.insert(cell) && mods.ctrl
+                                        {
+                                            selected_floors.remove(&cell);
+                                        }
+                                    }
+
+                                    for uid in copy_hits {
+                                        if !selected_copies.insert(uid) && mods.ctrl
+                                        {
+                                            selected_copies.remove(&uid);
+                                        }
+                                    }
+
+                                    self.ground_selected=selected_floors;
+                                    self.ground_edits.selected_copies=
+                                        selected_copies;
+
+                                    self.ground_active=self.ground_selected
+                                        .iter().next_back().copied();
+
+                                    self.ground_edits.active_copy=
+                                        self.ground_edits.selected_copies
+                                        .iter().next_back().copied();
+
+                                    self.ground_hierarchy_reveal=
+                                        self.ground_active;
+                                }
+                            }else{
+                                // Match real scene draws directly.
+                                // This includes native objects,
+                                // duplicated instances and NPC draws.
+                                let hits=world.draws.iter()
+                                    .filter(|draw|
+                                        !draw.hidden
+                                            && draw.vertex_start
+                                                <draw.vertex_end
+                                            && c3_ids.contains(&draw.id)
+                                    )
+                                    .map(|draw|
+                                        (draw.terrain,draw.index)
+                                    )
+                                    .collect::<
+                                        std::collections::BTreeSet<_>
+                                    >();
+
+                                c3_object_matches=hits.len();
+
+                                let mut selected=
+                                    if mods.shift || mods.ctrl{
+                                        c3_before_objects.clone()
+                                    }else{
+                                        std::collections::BTreeSet::new()
+                                    };
+
+                                for key in hits{
+                                    if !selected.insert(key) && mods.ctrl{
+                                        selected.remove(&key);
+                                    }
+                                }
+
+                                self.native_selected=
+                                    selected.iter().next_back().copied();
+
+                                self.native_selection=selected;
+                                self.native_hierarchy_anchor=
+                                    self.native_selected;
+                            }
+
+                            // Refresh selection highlights immediately.
+                            self.native_view.world_selected=
+                                if self.ground_edit_mode {
+                                    scene.ground.as_ref()
+                                        .map(|hf|
+                                            ground_edit_ops::highlighted_ids(
+                                                &self.ground_edits,
+                                                hf,
+                                                &self.ground_selected
+                                            )
+                                        )
+                                        .unwrap_or_default()
+                                }else{
+                                    multi_selection::keys(
+                                        self.native_selected,
+                                        &self.native_selection
+                                    )
+                                    .iter()
+                                    .filter_map(|key|
+                                        world.at(key.0,key.1)
+                                            .filter(|d|!d.hidden)
+                                            .map(|d|d.id)
+                                    )
+                                    .collect()
+                                };
+
+                            self.studio.status=Some(format!(
+                                "C3: {} raw IDs | matched {} objects, {} floor cells, {} copies | committed {} highlights",
+                                c3_ids.len(),
+                                c3_object_matches,
+                                c3_floor_matches,
+                                c3_copy_matches,
+                                self.native_view.world_selected.len()
+                            ));
+                        }
+
+self.native_view.version=
+                            self.native_view.version.wrapping_add(1);
+                        ui.ctx().request_repaint();
+                    }
+                                        if self.ground_edit_mode &&
+                        !(self.marquee_enabled || self.marquee_chord) {
+                        if let Some(draw)=picked.and_then(|id|world.by_id(id))
+                            .filter(|d|lck_is_imported_floor(
+                                world,(d.terrain,d.index))) {
+
+                            let key=(draw.terrain,draw.index);
+                            self.ground_selected.clear();
+                            self.ground_active=None;
+                            self.ground_edits.selected_copies.clear();
+                            self.ground_edits.active_copy=None;
+                            self.ground_edits.clear_drag();
+
+                            multi_selection::single(
+                                &mut self.native_selected,
+                                &mut self.native_selection,key
+                            );
+                            self.native_hierarchy_anchor=Some(key);
+                            self.native_view.version=
+                                self.native_view.version.wrapping_add(1);
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                    if !self.ground_edit_mode && !lck_popup_hover && !(self.marquee_enabled || self.marquee_chord) {
+                    if let Some(draw)=picked.and_then(|id|world.by_id(id)).filter(|d|!lck_is_imported_floor(world,(d.terrain,d.index))) {
                         let key=(draw.terrain,draw.index);
                         let modifiers=ui.input(|i|i.modifiers);
                         let was_selected=multi_selection::keys(self.native_selected,&self.native_selection).contains(&key);
@@ -4127,7 +5888,16 @@ impl App {
                         ui.ctx().request_repaint();
                     }
                     }
-                    if self.ground_edit_mode && self.native_ground_visible && !(self.native_collision_wire_visible && self.collision_edit.pointer_on_wall) {
+                                        let lck_floor_pointer=
+                        picked.and_then(|id|world.by_id(id))
+                            .is_some_and(|d|lck_is_imported_floor(
+                                world,(d.terrain,d.index))) ||
+                        self.native_view.world_left_drag_selected
+                            .and_then(|id|world.by_id(id))
+                            .is_some_and(|d|lck_is_imported_floor(
+                                world,(d.terrain,d.index)));
+                    if self.ground_edit_mode && !lck_popup_hover && !lck_floor_pointer && self.native_ground_visible && !(self.marquee_enabled || self.marquee_chord)
+                        && !(self.native_collision_wire_visible && self.collision_edit.pointer_on_wall) {
                         if let Some(hf)=scene.ground.as_ref() {
                             let dropping=self.global_repository_drag.is_some() ||
                                 self.editor_asset_drag.is_some() || self.form_drag.is_some();
@@ -4137,13 +5907,16 @@ impl App {
                                 i.modifiers.shift,i.modifiers.ctrl,i.modifiers.alt));
                             if !dropping && !alt && pressed {
                                 if let Some(pos)=pointer.filter(|p|view_rect.contains(*p)) {
-                                    let px=placement_drop::viewport_pixels(view_rect,
-                                        ui.ctx().pixels_per_point(),[900,680]);
-                                    let screen=placement_drop::viewport_pixel(view_rect,pos,px,
-                                        self.native_view.world_mirrored);
-                                    let hit=crate::raster::pick_instance(model,self.native_view.cam,
-                                        px[0],px[1],screen).and_then(|id|
-                                        ground_edit_ops::from_pick(id,hf,&self.ground_edits));
+                                    let hit=self.native_view.pick_visible(
+                                        view_rect,pos
+                                    ).and_then(|id|
+                                        ground_edit_ops::from_pick(
+                                            id,hf,&self.ground_edits
+                                        )
+                                    );
+                                    self.native_selected=None;
+                                    self.native_selection.clear();
+                                    self.native_hierarchy_anchor=None;
                                     ground_edit_ops::press(&mut self.ground_edits,
                                         &mut self.ground_selected,&mut self.ground_active,
                                         hit,pos,shift,ctrl);
@@ -4154,9 +5927,29 @@ impl App {
                             }
                             if down && !alt && !dropping {
                                 if let Some(pos)=pointer {
-                                    if ground_edit_ops::drag(&mut self.ground_edits,
+                                    let active_key=self.ground_edits.active(self.ground_active);
+                                    let before=active_key.and_then(|key|self.ground_edits.transform(key));
+                                    if ground_edit_ops::drag(
+                                        &mut self.ground_edits,ui,
                                         self.native_view.cam,model,view_rect,pos,ctrl,
-                                        self.native_view.world_mirrored) {
+                                        self.native_view.world_mirrored,
+                                        (self.floor_move_mode==EditorMoveMode::Grid)
+                                            .then_some(self.floor_grid_size)
+                                    ) {
+                                        if let (Some(key),Some(start))=(active_key,before){
+                                            if let Some(end)=self.ground_edits.transform(key){
+                                                let member=match key {
+                                                    ground_edit_ops::Key::Native(cell)=>authoring_group::Member::NativeFloor(cell),
+                                                    ground_edit_ops::Key::Copy(uid)=>authoring_group::Member::CopiedFloor(uid),
+                                                };
+                                                if let Some(group)=authoring_group::group_for(&world.groups,&member){
+                                                    let delta=[0,1,2].map(|a|end.offset[a]-start.offset[a]);
+                                                    if delta.iter().any(|v|v.abs()>0.0001){
+                                                        pending_group_translation=Some((group.id,authoring_group::Mover::Floor,delta,Vec::new()));
+                                                    }
+                                                }
+                                            }
+                                        }
                                         self.native_view.version=self.native_view.version.wrapping_add(1);
                                         ui.ctx().request_repaint();
                                     }
@@ -4255,23 +6048,69 @@ impl App {
                     }
                     if self.ground_edit_mode && self.native_collision_wire_visible {
                         if let Some(grid)=self.native_collision_grid.as_ref(){
-                            self.collision_edit.finish(ui,view_rect,&self.native_view,model,grid);
-                            if self.collision_edit.has_selection(){
-                                self.ground_selected.clear();self.ground_active=None;
+                            let old_cells=self.collision_edit.selected_cells();
+                            let owner=old_cells.iter().find_map(|&(x,z)|{
+                                authoring_group::group_for(&world.groups,&authoring_group::Member::Wall([x,z])).map(|g|g.id)
+                            });
+                            self.collision_edit.finish(
+                                ui,view_rect,&self.native_view,model,grid,
+                                (self.collision_move_mode==EditorMoveMode::Grid)
+                                    .then_some(self.collision_grid_size)
+                            );
+                            match self.collision_edit.take_edit() {
+                                Some(collision_edit::EditEvent::Duplicated(pairs))=>{
+                                    pending_collision_group_links.extend(pairs);
+                                },
+                                Some(collision_edit::EditEvent::Rotated(pairs))=>{
+                                    pending_collision_rotation_remap.extend(pairs);
+                                },
+                                Some(collision_edit::EditEvent::Moved(_))=>{
+                                    if let Some(group_id)=owner {
+                                        let new_cells=self.collision_edit.selected_cells();
+                                        // Current preview movement is based on the original
+                                        // drag snapshot, so use the actual selection displacement
+                                        // rather than zipping sorted source and destination IDs.
+                                        if let (Some(&(x,z)),Some(&(nx,nz)))=(
+                                            old_cells.iter().next(),new_cells.iter().next()
+                                        ) {
+                                            let (dx,dz)=(nx-x,nz-z);
+                                            let pairs=old_cells.iter().copied().map(|c|
+                                                (c,(c.0+dx,c.1+dz))
+                                            ).collect::<Vec<_>>();
+                                            if (dx!=0 || dz!=0) &&
+                                                pairs.iter().all(|(_,to)|new_cells.contains(to)) {
+                                                pending_group_translation=Some((group_id,
+                                                    authoring_group::Mover::Wall,
+                                                    [dx as f32*64.,0.,dz as f32*64.],pairs));
+                                            }
+                                        }
+                                    }
+                                },
+                                None=>{},
                             }
+                            // Preserve floor selection when building mixed-category groups.
                         }
                     }
                     if self.object_collision_draft_visible {
-                        let preview=match &self.generated_collision_target {
+                        let active_imported_floor=self.native_selected.filter(|&(terrain,index)|{
+                            world.at(terrain,index)
+                                .and_then(|d|d.editor_uid)
+                                .and_then(|uid|world.foreign.iter().find(|f|f.uid==uid))
+                                .is_some_and(|f|floor_tiles::decode_floor_kind(&f.kind).is_some())
+                        });
+                        let preview=active_imported_floor.or_else(||match &self.generated_collision_target {
                             Some((name,target)) if name==&scene.name=>editor_history_selected(world,target),
                             Some(_)=>None,None=>self.native_selected,
-                        };
+                        });
                         if let Some((terrain,index))=preview {
                             if let Some(draw)=world.at(terrain,index) {
                                 // Use live transformed mesh vertices: native originals,
                                 // duplicates, and imported game-wide draws all follow
                                 // the same non-destructive editor transforms.
-                                if let Some(generated)=collision_recipes::generated_for(world,(terrain,index)) {
+                                if active_imported_floor==Some((terrain,index)) {
+                                    // Exact live vertices follow move/rotate/scale.
+                                    object_collision::paint(ui,view_rect,&self.native_view,model,draw);
+                                } else if let Some(generated)=collision_recipes::generated_for(world,(terrain,index)) {
                                     object_collision::paint_generated(ui,view_rect,&self.native_view,model,draw,generated);
                                 } else if self.generated_collision_target.is_none() {
                                     object_collision::paint(ui,view_rect,&self.native_view,model,draw);
@@ -4324,58 +6163,80 @@ impl App {
                     // MMB/Alt+LMB camera orbit and hierarchy RMB remain untouched.
                     let (right_down,right_pressed)=ui.input(|inp|
                         (inp.pointer.secondary_down(),inp.pointer.secondary_pressed()));
-                    if self.native_rotate.is_some() && !right_down {
+                    if self.native_rotate.is_some() && ui.input(|i|i.pointer.secondary_released()) {
                         if let Some(gesture)=self.native_rotate.take() {
                             let released_at=pointer.unwrap_or(gesture.pointer_start);
-                            if (released_at-gesture.pointer_start).length_sq() <= 36.0 &&
-                                !gesture.pitch_axis {
+                            let moved=self.native_rotate_moved ||
+                                (released_at-gesture.pointer_start).length_sq()>36.0;
+                            self.native_rotate_moved=false;
+                            if !moved && !gesture.pitch_axis {
                                 self.editor_context_menu=Some((released_at,gesture.key));
-                            } else {
+                            } else if moved {
                                 finish_rotate=Some(gesture);
                             }
                         }
                     }
-                    if right_pressed && self.editor_modal.is_none() && self.editor_rename.is_none() {
-                        if let (Some(key),Some(pos))=(self.native_selected,pointer) {
-                            if view_rect.contains(pos) {
-                                if let Some(draw)=world.at(key.0,key.1) {
-                                    if !draw.hidden && draw.vertex_start < draw.vertex_end {
-                                        // Match the raster viewport's pixel scale and
-                                        // optional horizontal display-only mirroring.
-                                        let scale=ui.ctx().pixels_per_point();
-                                        let px=[((view_rect.width()*scale) as usize).clamp(16,900),
-                                                ((view_rect.height()*scale) as usize).clamp(16,680)];
-                                        let x=(pos.x-view_rect.left())*px[0] as f32/view_rect.width().max(1.0);
-                                        let y=(pos.y-view_rect.top())*px[1] as f32/view_rect.height().max(1.0);
-                                        let hit_x=if self.native_view.world_mirrored {
-                                            (px[0] as f32 - 1.0 - x).max(0.0)
-                                        } else { x };
-                                        let id=crate::raster::pick_instance(model,self.native_view.cam,
-                                            px[0],px[1],[hit_x,y]);
-                                        if id==Some(draw.id) {
-                                            self.native_rotate=Some(EditorRotateDrag {
-                                                key,pointer_start:pos,rotation_start:draw.rotation,
-                                                pitch_axis:alt,
-                                            });
+                    if right_pressed && !(self.doors.show_markers && self.doors.marker_right_consumed) && !self.marquee_chord && !lck_popup_hover
+                        && self.editor_modal.is_none() && self.editor_rename.is_none() {
+                        if let Some(pos)=pointer.filter(|p|view_rect.contains(*p)) {
+                            let hit=self.native_view.pick_visible(view_rect,pos);
+                            if let Some(draw)=hit.and_then(|id|world.by_id(id))
+                                .filter(|d|!d.hidden && d.vertex_start<d.vertex_end)
+                                .filter(|d|self.ground_edit_mode ==
+                                    lck_is_imported_floor(world,(d.terrain,d.index))) {
+                                let key=(draw.terrain,draw.index);
+                                let additive=ui.input(|i|i.modifiers.ctrl || i.modifiers.shift);
+                                let selected=multi_selection::keys(self.native_selected,&self.native_selection);
+                                if !additive && !selected.contains(&key) {
+                                    self.native_selection.clear();
+                                    self.ground_selected.clear();
+                                    self.ground_edits.selected_copies.clear();
+                                    self.collision_edit.replace_selected(Default::default());
+                                }
+                                if let Some(member)=authoring_group::draw_member(world,key) {
+                                    if let Some(group)=authoring_group::group_for(&world.groups,&member) {
+                                        let mut walls=std::collections::BTreeSet::new();
+                                        for part in &group.members {
+                                            if let Some(object)=authoring_group::member_draw(world,part) {
+                                                self.native_selection.insert(object);
+                                            } else {match part {
+                                                authoring_group::Member::NativeFloor(cell)=>{self.ground_selected.insert(*cell);},
+                                                authoring_group::Member::CopiedFloor(uid)=>{self.ground_edits.selected_copies.insert(*uid);},
+                                                authoring_group::Member::Wall([x,z])=>{walls.insert((*x,*z));},
+                                                _=>{},
+                                            }}
                                         }
+                                        self.collision_edit.include_selected(&walls);
                                     }
                                 }
+                                self.native_selection.insert(key);
+                                self.native_selected=Some(key);
+                                self.native_rotate_moved=false;
+                                self.native_rotate_orbit=authoring_group::ObjectOrbit::capture(
+                                    world,&multi_selection::keys(self.native_selected,&self.native_selection));
+                                self.native_rotate=Some(EditorRotateDrag {
+                                    key,pointer_start:pos,rotation_start:draw.rotation,pitch_axis:alt,
+                                });
                             }
                         }
                     }
-                    if right_down {
+                    if right_down && !self.marquee_chord {
                         if let (Some(drag),Some(pos))=(self.native_rotate,pointer) {
                             if self.native_selected==Some(drag.key) &&
                                 (pos-drag.pointer_start).length_sq()>36.0 {
+                                self.native_rotate_moved=true;
                                 let rotation=editor_rotate_drag(drag.rotation_start,
                                     pos-drag.pointer_start,drag.pitch_axis,self.native_view.world_mirrored);
                                 let rotation=geck_snap_euler_axis(rotation,
                                     if drag.pitch_axis {0} else {1}, self.geck_angle_snap);
-                                pending_rotation=Some((drag.key,rotation,false));
+                                pending_orbit=Some((if drag.pitch_axis {0}else{1},rotation[if drag.pitch_axis {0}else{1}]-drag.rotation_start[if drag.pitch_axis {0}else{1}]));
                             }
                         }
                     }
-                    if down && !alt && self.form_drag.is_none() && self.editor_asset_drag.is_none() && self.global_repository_drag.is_none() {
+                    if down && !alt && !(self.marquee_enabled || self.marquee_chord)
+                        && self.form_drag.is_none()
+                        && self.editor_asset_drag.is_none()
+                        && self.global_repository_drag.is_none() {
                         if let (Some(key), Some(pos)) = (self.native_selected, pointer) {
                             // A previously selected *visible* mesh must be hit at mouse-down.
                             // Never start moving an object when a drag begins over ground,
@@ -4388,17 +6249,33 @@ impl App {
                                             .filter_map(|k|world.at(k.0,k.1).filter(|d|!d.hidden).map(|d|(k,d.offset))).collect();
                                         self.native_drag = Some(EditorDrag {
                                             key, pointer_start: pos, offset_start: draw.offset,
+                                            grab:draw.center,
                                         });
                                     }
                                 }
                             }
                             if let Some(drag) = self.native_drag.filter(|d| d.key == key) {
-                                let mut desired = editor_drag_offset(drag.offset_start, pos - drag.pointer_start,
-                                    self.native_view.cam, model.radius, view_rect.height(),
-                                    self.native_view.world_mirrored, ctrl);
-                                if self.native_move_mode == EditorMoveMode::Grid {
-                                    desired = world_view::quantize_offset(desired, self.native_grid_size);
-                                }
+                                let displacement=if ctrl {
+                                    [0.0,drag_anchor::vertical_delta(
+                                        ui,view_rect,model,self.native_view.cam,
+                                        drag.pointer_start,pos,drag.grab,
+                                        self.native_view.world_mirrored
+                                    ),0.0]
+                                }else{
+                                    drag_anchor::horizontal_delta(
+                                        ui,view_rect,model,self.native_view.cam,
+                                        drag.pointer_start,pos,drag.grab,
+                                        self.native_view.world_mirrored
+                                    )
+                                };
+
+                                let snap=(self.native_move_mode==EditorMoveMode::Grid)
+                                    .then_some(self.native_grid_size);
+
+                                let mut desired=[0,1,2].map(|axis|
+                                    drag.offset_start[axis]
+                                    +drag_anchor::snapped(displacement[axis],snap)
+                                );
                                 if self.native_anchor_snap {
                                     desired = world.snap_nearby_anchor(key, desired, self.native_grid_size * 0.5);
                                 }
@@ -4412,6 +6289,83 @@ impl App {
                                     }
                                 }
                                 pending_transform = Some((key, desired, false));
+                            }
+                        }
+                    }
+                    // LCK_IMPORTED_GROUND_V41_DRAG
+                    if self.ground_edit_mode && !lck_popup_hover &&
+                        !(self.marquee_enabled || self.marquee_chord) &&
+                        self.editor_asset_drag.is_none() &&
+                        self.global_repository_drag.is_none() {
+
+                        let (pos,down,pressed,ctrl,alt)=ui.input(|i|(
+                            i.pointer.interact_pos(),
+                            i.pointer.primary_down(),
+                            i.pointer.primary_pressed(),
+                            i.modifiers.ctrl,
+                            i.modifiers.alt
+                        ));
+
+                        if down && !alt {
+                            if let (Some(key),Some(pos))=
+                                (self.native_selected,pos) {
+
+                                if lck_is_imported_floor(world,key) {
+                                    if let Some(draw)=world.at(key.0,key.1) {
+                                        if pressed && view_rect.contains(pos) &&
+                                            self.native_view.world_left_drag_selected==
+                                                Some(draw.id) {
+
+                                            self.native_drag_group=
+                                                vec![(key,draw.offset)];
+
+                                            self.native_drag=Some(EditorDrag{
+                                                key,
+                                                pointer_start:pos,
+                                                offset_start:draw.offset,
+                                                grab:draw.center,
+                                            });
+                                        }
+
+                                        if let Some(drag)=self.native_drag
+                                            .filter(|d|d.key==key) {
+
+                                            let displacement=if ctrl {
+                                                [0.0,
+                                                 drag_anchor::vertical_delta(
+                                                    ui,view_rect,model,
+                                                    self.native_view.cam,
+                                                    drag.pointer_start,pos,
+                                                    drag.grab,
+                                                    self.native_view.world_mirrored
+                                                 ),0.0]
+                                            } else {
+                                                drag_anchor::horizontal_delta(
+                                                    ui,view_rect,model,
+                                                    self.native_view.cam,
+                                                    drag.pointer_start,pos,
+                                                    drag.grab,
+                                                    self.native_view.world_mirrored
+                                                )
+                                            };
+
+                                            let snap=
+                                                (self.floor_move_mode==
+                                                    EditorMoveMode::Grid)
+                                                .then_some(self.floor_grid_size);
+
+                                            let desired=[0,1,2].map(|axis|
+                                                drag.offset_start[axis]+
+                                                drag_anchor::snapped(
+                                                    displacement[axis],snap
+                                                )
+                                            );
+
+                                            pending_transform=
+                                                Some((key,desired,false));
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -4434,7 +6388,7 @@ impl App {
                                     if compatible.is_some() {"Release: create destination-native instance"}
                                     else if !matches!(asset.kind,global_repository::Kind::Npc(_)) {
                                         "Release: create static architecture copy (donor scripts detached)"
-                                    } else {"Foreign MAN actors need script/animation importing"},
+                                    } else {"Release: stage experimental native NPC import"},
                                     egui::FontId::proportional(14.0),Color32::YELLOW);
                             }
                             if released {
@@ -4454,14 +6408,12 @@ impl App {
                                             Err(error)=>self.studio.error=Some(format!(
                                                 "Global asset placement: {error}")),
                                         }
-                                    } else if !matches!(asset.kind,global_repository::Kind::Npc(_)) {
+                                    } else {
                                         let px=placement_drop::viewport_pixels(view_rect,
                                             ui.ctx().pixels_per_point(),[900,680]);
                                         let pixel=placement_drop::viewport_pixel(view_rect,pointer,
                                             px,self.native_view.world_mirrored);
                                         pending_foreign=Some((global_id,pixel,px,ui.input(|i|i.modifiers.shift)));
-                                    } else {
-                                        self.studio.error=Some("Cross-cell MAN actors need resource, animation and script relocation before staging as functioning NPCs. Original actor preview remains available.".into());
                                     }
                                 }
                                 self.global_repository_drag=None;
@@ -4498,10 +6450,55 @@ impl App {
                             }
                         }
                     }
+                    // Apply only after every controller had its chance to
+                    // handle a floor/object/collision selection or drag.
+                    if ui.input(|i|i.pointer.primary_released()) {
+                        if let Some((press_scene,start,collision_mode))=
+                            self.lck_empty_viewport_press.take() {
+                            // Floating Properties, dialogs and menus are separate
+                            // layers; a click on them must not clear scene selection.
+                            let covered=ui.input(|i|i.pointer.interact_pos())
+                                .and_then(|pos|ctx.layer_id_at(pos))
+                                .is_some_and(|layer|layer!=ui.layer_id());
+                            let blocked=covered || self.marquee_enabled || self.marquee_chord ||
+                                self.editor_asset_drag.is_some() ||
+                                self.form_drag.is_some() ||
+                                self.global_repository_drag.is_some() ||
+                                self.editor_context_menu.is_some() ||
+                                self.ground_context_menu.is_some() ||
+                                lck_pointer_over_foreground(ctx);
+                            let released=ui.input(|i|i.pointer.interact_pos());
+                            if press_scene==scene.name &&
+                                collision_mode==self.ground_edit_mode &&
+                                lck_empty_click_released(start,released,view_rect,
+                                    self.native_view.world_pan_dragged,blocked) {
+                                self.native_selected=None;
+                                self.native_selection.clear();
+                                self.native_hierarchy_anchor=None;
+                                self.native_selection_click=None;
+                                self.editor_properties_target=None;
+                                self.native_drag=None;
+                                self.native_rotate=None;
+                                self.collision_edit.replace_selected(Default::default());
+                                if !collision_mode {
+                                    self.ground_selected.clear();
+                                    self.ground_active=None;
+                                    self.ground_edits.selected_copies.clear();
+                                    self.ground_edits.active_copy=None;
+                                    self.ground_hierarchy_reveal=None;
+                                }
+                                self.native_view.world_selected.clear();
+                                self.native_view.version=
+                                    self.native_view.version.wrapping_add(1);
+                                ctx.request_repaint();
+                            }
+                        }
+                    }
                 } else {
                     ui.label("The native scene assembled, but no drawable TMD triangles were resolved.");
                 }
             } else {
+                ui.heading("World Viewport");
                 ui.small("Select a cell on the left to load its original PS1 geometry.");
                 ui.separator();
                 self.preview(ui);
@@ -4555,6 +6552,40 @@ impl App {
             self.editor_asset_drag=None;
             self.global_repository_drag=None;
         }
+        if ctx.input(|i|i.pointer.primary_pressed()) {self.group_wall_remainder=[0.;2];}
+        // LCK_PERSISTENT_MIXED_GROUP_SELECTION_V1
+        if ctx.input(|i|i.pointer.primary_released()) && !lck_pointer_over_foreground(ctx) {
+            if let Some((_,NativeSceneSlot::Ready(_,model)))=self.native_scene.as_ref() {
+                let clicked=if !self.ground_edit_mode || self.native_selected.is_some_and(|key|lck_is_imported_floor(model,key)) {
+                    self.native_selected.and_then(|key|authoring_group::draw_member(model,key))
+                }else if self.native_collision_wire_visible && self.collision_edit.has_selection(){
+                    self.collision_edit.selected_cells().iter().next_back().copied().map(|(x,z)|authoring_group::Member::Wall([x,z]))
+                }else if let Some(uid)=self.ground_edits.active_copy {
+                    Some(authoring_group::Member::CopiedFloor(uid))
+                }else{
+                    self.ground_active.map(authoring_group::Member::NativeFloor)
+                };
+                if let Some(group)=clicked.as_ref().and_then(|m|authoring_group::group_for(&model.groups,m)) {
+                    let members=group.members.clone();
+                    let mut collision=std::collections::BTreeSet::new();
+                    for member in &members {
+                        if let Some(key)=authoring_group::member_draw(model,member){
+                            self.native_selection.insert(key);
+                            if self.native_selected.is_none(){self.native_selected=Some(key);}
+                        }else{match member{
+                            authoring_group::Member::NativeFloor(cell)=>{self.ground_selected.insert(*cell);},
+                            authoring_group::Member::CopiedFloor(uid)=>{self.ground_edits.selected_copies.insert(*uid);},
+                            authoring_group::Member::Wall([x,z])=>{collision.insert((*x,*z));},
+                            _=>{},
+                        }}
+                    }
+                    self.collision_edit.include_selected(&collision);
+                    self.native_view.version=self.native_view.version.wrapping_add(1);
+                    ctx.request_repaint();
+                }
+            }
+        }
+
         // RMB click (without moving) opens a context dropdown on the selected
         // mesh. RMB drag continues to rotate Y; Alt+RMB drag tilts X.
         // Keeping the menu outside the viewport allocation prevents resizing
@@ -4576,13 +6607,283 @@ impl App {
                             self.editor_rename=Some(EditorRename{key,text:self.editor_name_for(ready.as_deref(),EditorCatalogItem::Draw(key.0,key.1))});
                             self.editor_context_menu=None;
                         }
+                        ui.separator();
+                        ui.menu_button("Mirror Together",|ui|{
+                            for (axis,name) in [(0,"Mirror X"),(2,"Mirror Z")] {
+                                if ui.button(name).clicked(){pending_mirror_action=Some((axis,true));self.editor_context_menu=None;ui.close();}
+                            }
+                        });
+                        ui.menu_button("Mirror Individually",|ui|{
+                            for (axis,name) in [(0,"Mirror X"),(2,"Mirror Z")] {
+                                if ui.button(name).clicked(){pending_mirror_action=Some((axis,false));self.editor_context_menu=None;ui.close();}
+                            }
+                        });
+                        if ui.button("Add Selection to Group Set").clicked(){pending_add_group_basket=true;self.editor_context_menu=None;}
+                        if ui.button("Group Selected").clicked(){pending_group_action=Some(true);self.editor_context_menu=None;}
+                        if ui.button("Ungroup").clicked(){pending_group_action=Some(false);self.editor_context_menu=None;}
                     });
                 });
-            if self.editor_context_menu.is_some() && ctx.input(|i|i.pointer.any_pressed()) &&
+            if self.editor_context_menu.is_some() && ctx.input(|i|i.pointer.primary_pressed())
+                && !lck_pointer_over_foreground(ctx) &&
                 !panel.response.rect.contains(ctx.input(|i|i.pointer.interact_pos())
                     .unwrap_or(egui::Pos2::ZERO)) {
                 self.editor_context_menu=None;
             }
+        }
+
+        // LCK floor/collision right-click context menus.
+        if let Some((position,kind))=self.ground_context_menu {
+            let response=egui::Area::new(
+                egui::Id::new("lck_ground_movement_context")
+            )
+            .order(egui::Order::Foreground)
+            .fixed_pos(position)
+            .interactable(true)
+            .show(ctx,|ui|{
+                egui::Frame::popup(ui.style()).show(ui,|ui|{
+                    ui.set_min_width(190.0);
+                    if ui.button("Properties...").clicked(){
+                        match kind {
+                            GroundMenu::Floor=>self.floor_properties_open=true,
+                            GroundMenu::Collision=>self.collision_properties_open=true,
+                        }
+                        self.ground_context_menu=None;
+                    }
+                    ui.separator();
+                    ui.menu_button("Mirror Together",|ui|{
+                        for (axis,name) in [(0,"Mirror X"),(2,"Mirror Z")] {
+                            if ui.button(name).clicked(){pending_mirror_action=Some((axis,true));self.ground_context_menu=None;ui.close();}
+                        }
+                    });
+                    ui.menu_button("Mirror Individually",|ui|{
+                        for (axis,name) in [(0,"Mirror X"),(2,"Mirror Z")] {
+                            if ui.button(name).clicked(){pending_mirror_action=Some((axis,false));self.ground_context_menu=None;ui.close();}
+                        }
+                    });
+                    if ui.button("Add Selection to Group Set").clicked(){pending_add_group_basket=true;self.ground_context_menu=None;}
+                    if ui.button("Group Selected").clicked(){pending_group_action=Some(true);self.ground_context_menu=None;}
+                    if ui.button("Ungroup").clicked(){pending_group_action=Some(false);self.ground_context_menu=None;}
+                    ui.separator();
+                    let (mode,size,native)=match kind {
+                        GroundMenu::Floor=>(
+                            &mut self.floor_move_mode,
+                            &mut self.floor_grid_size,128.0
+                        ),
+                        GroundMenu::Collision=>(
+                            &mut self.collision_move_mode,
+                            &mut self.collision_grid_size,64.0
+                        ),
+                    };
+                    if ui.button("Fluid movement").clicked(){
+                        *mode=EditorMoveMode::Fluid;
+                        self.ground_context_menu=None;
+                    }
+                    if ui.button("Grid snapping").clicked(){
+                        *mode=EditorMoveMode::Grid;
+                        self.ground_context_menu=None;
+                    }
+                    if ui.button("Restore native snap").clicked(){
+                        *mode=EditorMoveMode::Grid;
+                        *size=native;
+                        self.ground_context_menu=None;
+                    }
+                });
+            });
+
+            if self.ground_context_menu.is_some()
+                && ctx.input(|i|i.pointer.primary_pressed())
+                && !lck_pointer_over_foreground(ctx)
+                && !response.response.rect.contains(
+                    ctx.input(|i|i.pointer.interact_pos())
+                        .unwrap_or(egui::Pos2::ZERO)
+                )
+            {
+                self.ground_context_menu=None;
+            }
+        }
+
+        if self.floor_properties_open {
+            let mut open=true;
+            egui::Window::new("Floor Properties")
+                .id(egui::Id::new("lck_floor_properties"))
+                .open(&mut open)
+                .resizable(true)
+                .show(ctx,|ui|{
+                    lck_movement_ui(
+                        ui,&mut self.floor_move_mode,
+                        &mut self.floor_grid_size,128.0,"Floor"
+                    );
+                    // LCK_F12_NATIVE_GRID_ALIGN
+                    // Absolute PS1 ground grid alignment.
+                    // Does not change normal object or floor movement.
+
+                    if self.ground_edit_mode {
+                        if let Some(w) = world.as_deref() {
+                            if let Some(key) = self.native_selected {
+                                if let Some(draw) = w.at(key.0,key.1) {
+
+                                    let is_floor = draw.editor_uid
+                                        .and_then(|uid|w.foreign.iter()
+                                            .find(|f|f.uid==uid))
+                                        .is_some_and(|f|
+                                            floor_tiles::decode_floor_kind(
+                                                &f.kind
+                                            ).is_some());
+
+                                    if is_floor {
+                                        if let Some(points) = w.model.as_ref()
+                                            .and_then(|m|m.positions.get(
+                                                draw.vertex_start..draw.vertex_end
+                                            )) {
+
+                                            if points.len() >= 3 {
+
+                                                let min_x = points.iter()
+                                                    .map(|p|p[0])
+                                                    .fold(f32::INFINITY,f32::min);
+
+                                                let min_z = points.iter()
+                                                    .map(|p|p[2])
+                                                    .fold(f32::INFINITY,f32::min);
+
+                                                if min_x.is_finite() && min_z.is_finite() {
+
+                                                    let dx =
+                                                        (min_x/128.0).round()*128.0-min_x;
+
+                                                    let dz =
+                                                        (min_z/128.0).round()*128.0-min_z;
+
+                                                    let needs_alignment =
+                                                        dx.abs()>0.01 || dz.abs()>0.01;
+
+                                                    ui.separator();
+                                                    ui.strong("Native PS1 grid alignment");
+
+                                                    ui.label(format!(
+                                                        "X correction: {dx:.3}   Z correction: {dz:.3}"
+                                                    ));
+
+                                                    if ui.add_enabled(
+                                                        needs_alignment,
+                                                        egui::Button::new(
+                                                            "Align selected imported floor"
+                                                        )
+                                                    ).clicked() {
+
+                                                        pending_transform=Some((
+                                                            key,
+                                                            [
+                                                                draw.offset[0]+dx,
+                                                                draw.offset[1],
+                                                                draw.offset[2]+dz
+                                                            ],
+                                                            true
+                                                        ));
+                                                    }
+
+                                                    if !needs_alignment {
+                                                        ui.small(
+                                                            "Aligned to native 128-unit grid."
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    ui.separator();
+                    if let Some(key)=self.native_selected.filter(|&key|
+                        world.as_deref().is_some_and(|w|
+                            lck_is_imported_floor(w,key))) {
+
+                        if let Some(draw)=world.as_deref()
+                            .and_then(|w|w.at(key.0,key.1)) {
+
+                            ui.strong(format!(
+                                "Imported floor UID {}",
+                                draw.editor_uid.unwrap_or(0)
+                            ));
+
+                            if ui.button("Duplicate imported floor (Ctrl+D)").clicked() {
+                                pending_duplicate=world.as_deref()
+                                    .and_then(|w|
+                                        editor_duplicate_request(w,Some(key)));
+                            }
+
+                            let mut offset=draw.offset;
+                            let mut changed=false;
+
+                            ui.horizontal_wrapped(|ui|{
+                                ui.label("Floor X / Y / Z");
+
+                                for axis in 0..3 {
+                                    changed|=ui.add(
+                                        egui::DragValue::new(
+                                            &mut offset[axis]
+                                        ).speed(1.0)
+                                    ).changed();
+                                }
+                            });
+
+                            if changed {
+                                pending_transform=Some((key,offset,true));
+                            }
+
+                            ui.small(
+                                "Independent floor instance. Native PS1 walkability remains unverified."
+                            );
+                            ui.separator();
+                        }
+                    }
+                    if let Some(hf)=ready.as_deref()
+                        .and_then(|scene|scene.ground.as_ref())
+                    {
+                        if ground_edit_ops::controls(
+                            ui,&mut self.ground_edits,
+                            &mut self.ground_selected,&mut self.ground_active,hf,
+                            &mut pending_floor_group_links
+                        ){
+                            self.native_view.version=
+                                self.native_view.version.wrapping_add(1);
+                        }
+                    }
+                });
+            self.floor_properties_open=open;
+        }
+
+        if self.collision_properties_open {
+            let mut open=true;
+            egui::Window::new("Collision Properties")
+                .id(egui::Id::new("lck_collision_properties"))
+                .open(&mut open)
+                .resizable(true)
+                .show(ctx,|ui|{
+                    lck_movement_ui(
+                        ui,&mut self.collision_move_mode,
+                        &mut self.collision_grid_size,64.0,"Collision"
+                    );
+                    ui.separator();
+                    self.collision_edit.controls(
+                        ui,self.native_collision_grid.as_ref()
+                    );
+                    ui.small(
+                        "Collision X/Z occupies native 64-unit cells. \
+                         Height changes are editor previews only."
+                    );
+                });
+            self.collision_properties_open=open;
+        }
+
+        if self.marquee_chord && ctx.input(|i|
+            !i.pointer.primary_down()
+                && !i.pointer.secondary_down()
+        ){
+            self.marquee_chord=false;
         }
         self.editor_catalog_popup(ctx, ready.as_deref(), world.as_deref());
         self.editor_global_repository_dialog(ctx);
@@ -4591,10 +6892,22 @@ impl App {
            !ctx.wants_keyboard_input() {
             if ctx.input_mut(|i|i.consume_shortcut(&egui::KeyboardShortcut::new(
                 egui::Modifiers::COMMAND,egui::Key::D))) {
-                if let Some(hf)=ready.as_deref().and_then(|s|s.ground.as_ref()) {
-                    let n=ground_edit_ops::duplicate(&mut self.ground_edits,
+                if let Some(key)=self.native_selected.filter(|&key|
+                    world.as_deref().is_some_and(|w|
+                        lck_is_imported_floor(w,key))) {
+
+                    pending_duplicate=world.as_deref()
+                        .and_then(|w|editor_duplicate_request(w,Some(key)));
+
+                } else if let Some(hf)=ready.as_deref()
+                    .and_then(|s|s.ground.as_ref()) {
+                    let links=ground_edit_ops::duplicate_linked(&mut self.ground_edits,
                         &mut self.ground_selected,&mut self.ground_active,hf);
-                    if n>0 {self.native_view.version=self.native_view.version.wrapping_add(1);ctx.request_repaint();}
+                    if !links.is_empty() {
+                        pending_floor_group_links.extend(links);
+                        self.native_view.version=self.native_view.version.wrapping_add(1);
+                        ctx.request_repaint();
+                    }
                 }
             }
             for (key,turn) in [(egui::Key::Q,-1),(egui::Key::E,1)] {
@@ -4616,7 +6929,9 @@ impl App {
                 egui::Modifiers::COMMAND, egui::Key::D))) {
             if let Some(key)=self.native_selected {
                 pending_duplicate=world.as_deref().and_then(|w|
-                    editor_duplicate_request(w, Some(key)));
+                    (!lck_is_imported_floor(w,key))
+                        .then(||editor_duplicate_request(w,Some(key)))
+                        .flatten());
             } else if let Some(cell)=self.editor_cell_selected.clone() {
                 self.duplicate_editor_cell(cell);
             }
@@ -4652,15 +6967,16 @@ impl App {
         // vertices per frame. One mouse gesture becomes one undo operation.
         let editor_changed_this_frame = pending_form.as_ref().is_some_and(|a|a.is_authoring()) || pending_name.is_some() || pending_restore.is_some() ||
             pending_delete.is_some() || pending_duplicate.is_some() || pending_foreign.is_some() ||
-            pending_transform.is_some() || pending_rotation.is_some() ||
+            pending_transform.is_some() || pending_rotation.is_some() || pending_orbit.is_some() ||
             pending_scale.is_some() || pending_import.is_some() ||
+            pending_group_action.is_some() || pending_mirror_action.is_some() || pending_add_group_basket ||
             pending_npc_animation.as_ref().is_some_and(|item|item.3) ||
             pending_npc_model.is_some() ||
             pending_project.is_some() || pending_collision_edit.is_some() || pending_static_architecture.is_some() || self.editor_gesture_start.is_some();
         let mut before_frame=if editor_changed_this_frame {
             match (self.native_scene.as_ref(),world.as_deref()) {
                 (Some((name,NativeSceneSlot::Ready(_, _))),Some(w))=>
-                    Some(editor_history_capture_group(w,name,self.native_selected,&self.native_selection)),
+                    Some(editor_history_capture_with_layers(w,name,self.native_selected,&self.native_selection,&self.ground_edits,&self.collision_edit)),
                 _=>None,
             }
         } else {None};
@@ -4677,6 +6993,130 @@ impl App {
         // Arc::get_mut keeps one writable world, without cloning thousands
         // of vertices on every mouse frame. The original scene remains intact.
         drop(world);
+        // Copy membership into new persistent group IDs after all UI Arc clones
+        // have been released. This covers Ctrl+D, the menu and floor Properties.
+        if !pending_floor_group_links.is_empty() {
+            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut() {
+                if let Some(world)=Arc::get_mut(world) {
+                    let links=pending_floor_group_links.iter().map(|(old,new)|{
+                        let member=|key:&ground_edit_ops::Key|match key {
+                            ground_edit_ops::Key::Native(cell)=>authoring_group::Member::NativeFloor(*cell),
+                            ground_edit_ops::Key::Copy(uid)=>authoring_group::Member::CopiedFloor(*uid),
+                        };
+                        (member(old),member(new))
+                    }).collect::<Vec<_>>();
+                    match authoring_group::duplicate_complete_groups(&mut world.groups,&links) {
+                        Ok(n)=>{
+                            self.studio.status=Some(format!(
+                                "Duplicated {} floor(s) into {} new group(s); save the LCK project",
+                                links.len(),n
+                            ));
+                            self.native_view.version=self.native_view.version.wrapping_add(1);
+                            ctx.request_repaint();
+                        },
+                        Err(error)=>self.studio.error=Some(format!(
+                            "Duplicated floors, but group links failed: {error}"
+                        )),
+                    }
+                }
+            }
+        }
+        // Duplication creates independent group records. It must never
+        // rewrite the original collision box coordinates or original group ID.
+        if !pending_collision_group_links.is_empty() {
+            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut() {
+                if let Some(world)=Arc::get_mut(world) {
+                    let links=pending_collision_group_links.iter().map(|(from,to)|(
+                        authoring_group::Member::Wall([from.0,from.1]),
+                        authoring_group::Member::Wall([to.0,to.1])
+                    )).collect::<Vec<_>>();
+                    match authoring_group::duplicate_complete_groups(&mut world.groups,&links) {
+                        Ok(n)=>self.studio.status=Some(format!(
+                            "Collision duplicate: {} copied, {} independent group(s); original groups retained",
+                            links.len(),n
+                        )),
+                        Err(error)=>self.studio.error=Some(format!(
+                            "Collision group copy failed: {error}"
+                        )),
+                    }
+                    self.native_view.version=self.native_view.version.wrapping_add(1);
+                }
+            }
+        }
+        // Coordinate-bearing collision members track rotations of the selected
+        // grid cells, but the same persistent group ID remains associated with them.
+        if !pending_collision_rotation_remap.is_empty() {
+            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut() {
+                if let Some(world)=Arc::get_mut(world) {
+                    authoring_group::remap_walls(
+                        &mut world.groups,&pending_collision_rotation_remap
+                    );
+                    self.native_view.version=self.native_view.version.wrapping_add(1);
+                }
+            }
+        }
+        // LCK_CROSS_CATEGORY_GROUP_MOTION_V1
+        if let Some((id,mover,delta,wall_pairs))=pending_group_translation {
+            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut(){
+                if let Some(world)=Arc::get_mut(world) {
+                    if !wall_pairs.is_empty(){authoring_group::remap_walls(&mut world.groups,&wall_pairs);}
+                    match authoring_group::translate_companions(
+                        world,&mut self.ground_edits,&mut self.collision_edit,
+                        self.native_collision_grid.as_ref(),id,mover,delta,&mut self.group_wall_remainder
+                    ) {
+                        Ok(())=>{self.native_view.version=self.native_view.version.wrapping_add(1);ctx.request_repaint();},
+                        Err(error)=>self.studio.error=Some(format!("Grouped movement: {error}")),
+                    }
+                }
+            }
+        }
+        // LCK_MIRROR_GROUP_TRANSACTION_V1
+        if pending_add_group_basket || pending_group_action.is_some() || pending_mirror_action.is_some(){
+            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut(){
+                if let Some(world)=Arc::get_mut(world){
+                    let members=authoring_group::selected(
+                        world,self.native_selected,&self.native_selection,
+                        &self.ground_selected,&self.ground_edits.selected_copies,
+                        &self.collision_edit.selected_cells()
+                    );
+                    if pending_add_group_basket {
+                        if members.is_empty(){self.studio.error=Some("No components selected for group set".into());}
+                        else{self.group_basket.extend(members.iter().cloned());self.studio.status=Some(format!("{} pieces accumulated for Group Selected; select other editing modes and add more",self.group_basket.len()));}
+                    }
+                    let mut expanded=members.clone();
+                    if pending_group_action==Some(true){expanded.extend(self.group_basket.iter().cloned());}
+                    for member in &members{
+                        if let Some(group)=authoring_group::group_for(&world.groups,member){
+                            expanded.extend(group.members.iter().cloned());
+                        }
+                    }
+                    let outcome=if let Some(group)=pending_group_action {
+                        if group {
+                            authoring_group::create(&mut world.groups,expanded.clone()).map(|id|format!("Group #{id}: {} components bound together",expanded.len()))
+                        }else{
+                            let before=world.groups.len();
+                            world.groups.retain(|g|!g.members.iter().any(|m|expanded.contains(m)));
+                            if before==world.groups.len(){Err("No selected group to ungroup".into())}
+                            else{Ok(format!("Ungrouped {} group(s)",before-world.groups.len()))}
+                        }
+                    }else if let Some((axis,together))=pending_mirror_action {
+                        authoring_group::mirror(
+                            world,&mut self.ground_edits,&mut self.collision_edit,
+                            self.native_collision_grid.as_ref(),&expanded,axis,together
+                        ).map(|()|format!("Mirrored {} selected pieces on {} axis ({}) - editor geometry; native mirrored TMD export remains unverified",
+                            expanded.len(),if axis==0{"X"}else{"Z"},if together{"together"}else{"individually"}))
+                    }else{Ok(String::new())};
+                    match outcome {
+                        Ok(message)=>{
+                            if pending_group_action==Some(true){self.group_basket.clear();}
+                            if !message.is_empty(){self.studio.status=Some(message);}
+                            self.native_view.version=self.native_view.version.wrapping_add(1);ctx.request_repaint();
+                        },
+                        Err(error)=>self.studio.error=Some(format!("Mirror/Group: {error}")),
+                    }
+                }
+            }
+        }
         if let Some((uid,enabled))=pending_static_architecture {
             if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut(){if let Some(world)=Arc::get_mut(world){
                 if let Some(foreign)=world.foreign.iter_mut().find(|f|f.uid==uid){foreign.static_architecture=enabled;self.studio.status=Some("Copy behavior mode updated. Save LCK scene to persist; native visibility and collision still require manual verification.".into());ctx.request_repaint();}
@@ -4751,7 +7191,7 @@ impl App {
                             global_repository::Kind::Placement(i)=>("placement",i),
                             global_repository::Kind::Terrain(i)=>("terrain",i),
                             global_repository::Kind::Mesh(i)=>("mesh",i),
-                            global_repository::Kind::Npc(_)=>("unsupported",0),
+                            global_repository::Kind::Npc(i)=>("npc",i),
                         };
                         let floor_kind=match asset.kind {
                             global_repository::Kind::Mesh(slot) =>
@@ -4762,7 +7202,12 @@ impl App {
                             _=>None,
                         };
                         let kind=floor_kind.as_deref().unwrap_or(kind);
-                        let result=world_view::foreign_size(&donor,kind,record).and_then(|(radius,bottom)|{
+                        let dimensions=if kind=="npc" {
+                            Ok((128.0_f32,-96.0_f32))
+                        } else {
+                            world_view::foreign_size(&donor,kind,record)
+                        };
+                        let result=dimensions.and_then(|(radius,bottom)|{
                             if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut(){
                                 let world=Arc::get_mut(world).ok_or("Destination world is borrowed")?;
                                 let center=placement_drop::foreign_drop_center(world,
@@ -4775,11 +7220,28 @@ impl App {
                         match result {
                             Ok(key)=>{
                                 self.native_selected=Some(key);
+                                if floor_kind.is_some() {
+                                    self.ground_edit_mode=true;
+                                    self.native_ground_visible=true;
+                                    self.ground_selected.clear();
+                                    self.ground_active=None;
+                                    self.ground_edits.selected_copies.clear();
+                                    self.ground_edits.active_copy=None;
+                                    self.native_view.world_ground_edit=true;
+                                }
                                 if let Some((_,NativeSceneSlot::Ready(scene,world)))=self.native_scene.as_ref() {
                                     frame_world_selection(&mut self.native_view,world,scene,Some(key));
                                 }
                                 self.native_view.version=self.native_view.version.wrapping_add(1);
-                                self.studio.status=Some(format!("Foreign original {} staged as independent editor mesh. Save .lckscene to persist. Geometry and source VRAM materials are displayed; native collision and IMG export are not imported.",asset.label));
+                                if kind=="npc" {
+                                    if let (Some(session),Some(lib),Some((_,NativeSceneSlot::Ready(scene,current)))) =
+                                        (&mut self.form_session,&self.studio.library,&self.native_scene) {
+                                        if let Err(error)=session.synchronize_gesture(scene,&lib.index,current) {
+                                            self.studio.error=Some(format!("NPC project registration failed: {error:#}"));
+                                        }
+                                    }
+                                }
+                                self.studio.status=Some(format!("Staged {}. Native NPC resources/animation are experimental; donor dialogue and story scripts are NOT imported. Save the LCK project.",asset.label));
                                 ctx.request_repaint();
                             }
                             Err(error)=>self.studio.error=Some(format!("Cross-cell placement: {error}")),
@@ -4794,14 +7256,59 @@ impl App {
             let keys=multi_selection::keys(self.native_selected,&self.native_selection);
             if let Some((_,NativeSceneSlot::Ready(scene,world)))=self.native_scene.as_mut() {
                 if let Some(world)=Arc::get_mut(world) {
-                    let result=if let(Some(session),Some(lib))=(&mut self.form_session,&self.studio.library){( ||->Result<Vec<(bool,usize)>,String>{let forms=keys.iter().map(|k|session.reference_at(world,*k).ok_or("Selection is not mapped to a persistent Reference".to_owned())).collect::<Result<Vec<_>,_>>()?;let mut draft=session.clone();let created=draft.duplicate(&forms).map_err(|e|format!("{e:#}"))?;let preview=draft.render(scene,&lib.index).map_err(|e|format!("{e:#}"))?;draft.synchronize_gesture(scene,&lib.index,&preview).map_err(|e|format!("{e:#}"))?;let keys=created.iter().filter_map(|k|draft.reference_draws.get(k).copied()).collect();*session=draft;*world=preview;Ok(keys)})()}else{multi_selection::duplicate(world,&keys,scene.placements.len())};
+                    let previous_groups=world.groups.clone();
+                    let previous_members=keys.iter().filter_map(|&key|
+                        authoring_group::draw_member(world,key).map(|member|(key,member))).collect::<Vec<_>>();
+                    let result=if let(Some(session),Some(lib))=(&mut self.form_session,&self.studio.library){( ||->Result<Vec<(bool,usize)>,String>{let forms=keys.iter().map(|k|session.reference_at(world,*k).ok_or("Selection is not mapped to a persistent Reference".to_owned())).collect::<Result<Vec<_>,_>>()?;let mut draft=session.clone();let created=draft.duplicate(&forms).map_err(|e|format!("{e:#}"))?;
+                        // LCK_FLOOR_ADJACENT_DUP_V1
+                        let mut floor_indices=Vec::new();
+                        let mut min_x=f32::INFINITY;
+                        let mut max_x=f32::NEG_INFINITY;
+                        for (which,&key) in keys.iter().enumerate() {
+                            let Some(draw)=world.at(key.0,key.1) else {continue};
+                            let floor=draw.editor_uid.and_then(|uid|world.foreign.iter().find(|f|f.uid==uid))
+                                .is_some_and(|f|floor_tiles::decode_floor_kind(&f.kind).is_some());
+                            if !floor {continue;}
+                            let mesh=world.model.as_ref().ok_or("Floor mesh missing".to_owned())?;
+                            let vertices=mesh.positions.get(draw.vertex_start..draw.vertex_end)
+                                .ok_or("Floor vertex range missing".to_owned())?;
+                            if vertices.is_empty() {return Err("Selected floor has no vertices".into());}
+                            for p in vertices {min_x=min_x.min(p[0]);max_x=max_x.max(p[0]);}
+                            floor_indices.push(which);
+                        }
+                        if !floor_indices.is_empty() {
+                            let width=(max_x-min_x).max(1.);
+                            let step=(width/128.).ceil().max(1.)*128.;
+                            for which in floor_indices {
+                                let copy=&created[which];
+                                let mut transform=draft.project.database.reference(copy)
+                                    .ok_or("Copied floor Reference missing".to_owned())?.transform;
+                                transform.position[0]+=step;
+                                draft.project.database.move_reference(copy,transform)
+                                    .map_err(|e|format!("{e:#}"))?;
+                            }
+                        }
+                        let preview=draft.render(scene,&lib.index).map_err(|e|format!("{e:#}"))?;draft.synchronize_gesture(scene,&lib.index,&preview).map_err(|e|format!("{e:#}"))?;let keys=created.iter().filter_map(|k|draft.reference_draws.get(k).copied()).collect();*session=draft;*world=preview;Ok(keys)})()}else{multi_selection::duplicate(world,&keys,scene.placements.len())};
                     match result {
                         Ok(created)=>{
+                            world.groups=previous_groups;
+                            let pairs=keys.iter().zip(created.iter()).filter_map(|(old,new)|{
+                                let before=previous_members.iter().find(|(key,_)|key==old)?.1.clone();
+                                let after=authoring_group::draw_member(world,*new)?;
+                                Some((before,after))
+                            }).collect::<Vec<_>>();
+                            let copied_groups=match authoring_group::duplicate_complete_groups(&mut world.groups,&pairs) {
+                                Ok(n)=>n,
+                                Err(error)=>{
+                                    self.studio.error=Some(format!("Group duplication: {error}"));
+                                    0
+                                },
+                            };
                             self.native_selected=keys.iter().zip(&created).find_map(|(old,new)|(Some(*old)==old_primary).then_some(*new));
                             self.native_selection=created.into_iter().collect();
                             if self.editor_properties_target.is_some() {self.editor_properties_target=self.native_selected;}
                             self.native_view.version=self.native_view.version.wrapping_add(1);
-                            self.studio.status=Some(format!("{} independent editor copies created and selected; save LCK scene to persist.",self.native_selection.len()));
+                            self.studio.status=Some(format!("{} editor copies created; {} complete group(s) inherited fresh identities. Save LCK scene to persist.",self.native_selection.len(),copied_groups));
                             ctx.request_repaint();
                         }
                         Err(error)=>self.studio.error=Some(format!("Could not duplicate selection: {error}")),
@@ -4884,9 +7391,21 @@ impl App {
                                 (k,[0,1,2].map(|a|start[a]+delta[a]))
                             }).collect()
                         };
+                        let group_id=authoring_group::draw_member(world,key)
+                            .and_then(|m|authoring_group::group_for(&world.groups,&m).map(|g|g.id));
                         let moved=if before!=desired {multi_selection::move_offsets(world,&group)}else{Ok(())};
                         if let Err(error)=moved {self.studio.error=Some(error);}
                         else if before != desired {
+                            if let Some(group_id)=group_id {
+                                let delta=[0,1,2].map(|a|desired[a]-before[a]);
+                                if let Err(error)=authoring_group::translate_companions(
+                                    world,&mut self.ground_edits,&mut self.collision_edit,
+                                    self.native_collision_grid.as_ref(),group_id,authoring_group::Mover::Object,
+                                    delta,&mut self.group_wall_remainder
+                                ){
+                                    self.studio.error=Some(format!("Grouped movement: {error}"));
+                                }
+                            }
                             self.native_view.version = self.native_view.version.wrapping_add(1);
                             ctx.request_repaint();
                             if record {
@@ -4913,6 +7432,19 @@ impl App {
                                 self.native_rotate_redo.clear();
                             }
                         }
+                    }
+                }
+            }
+        }
+        if let Some((axis,delta))=pending_orbit {
+            if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut() {
+                if let Some(world)=Arc::get_mut(world) {
+                    match self.native_rotate_orbit.apply(world,axis,delta) {
+                        Ok(())=>{
+                            self.native_view.version=self.native_view.version.wrapping_add(1);
+                            ctx.request_repaint();
+                        },
+                        Err(error)=>self.studio.error=Some(format!("Shared-pivot rotation: {error}")),
                     }
                 }
             }
@@ -5041,7 +7573,7 @@ impl App {
         if let Some(action)=pending_form{if let Err(error)=self.apply_form_action(action){self.studio.error=Some(format!("Project operation failed: {error:#}"));}ctx.request_repaint();}
         let mut after_frame=if editor_changed_this_frame || pending_history_undo || pending_history_redo {
             self.native_scene.as_ref().and_then(|(name,state)|match state {
-                NativeSceneSlot::Ready(_,w)=>Some(editor_history_capture_group(w,name,self.native_selected,&self.native_selection)),
+                NativeSceneSlot::Ready(_,w)=>Some(editor_history_capture_with_layers(w,name,self.native_selected,&self.native_selection,&self.ground_edits,&self.collision_edit)),
                 _=>None,
             })
         } else {None};
@@ -5079,10 +7611,23 @@ impl App {
                             let Some(world)=Arc::get_mut(world) else {
                                 return Err("Scene is still borrowed".into());
                             };
-                            if let(Some(project),Some(session))=(&target.project,&mut self.form_session){session.restore_project((**project).clone()).map_err(|e|format!("{e:#}"))?;let index=index.as_ref().ok_or("Original disc index unavailable")?;*world=session.render(scene,index).map_err(|e|format!("{e:#}"))?;self.native_selection=target.form_selection.iter().filter_map(|r|session.reference_draws.get(r).copied()).collect();self.native_selected=target.form_primary.as_ref().and_then(|r|session.reference_draws.get(r).copied());self.native_hierarchy_anchor=self.native_selected;return Ok(());}
+                            if let(Some(project),Some(session))=(&target.project,&mut self.form_session){
+                                session.restore_project((**project).clone()).map_err(|e|format!("{e:#}"))?;
+                                let index=index.as_ref().ok_or("Original disc index unavailable")?;
+                                *world=session.render(scene,index).map_err(|e|format!("{e:#}"))?;
+                                let doc=scene_instances::parse(&target.overlay,name,world)?;
+                                world.groups=doc.groups;
+                                self.ground_edits=ground_edit_ops::parse(&target.overlay,scene.ground.as_ref(),name)?;
+                                self.collision_edit=collision_edit::State::from_embedded_record(&target.overlay,name)?;
+                                self.native_selection=target.form_selection.iter().filter_map(|r|session.reference_draws.get(r).copied()).collect();
+                                self.native_selected=target.form_primary.as_ref().and_then(|r|session.reference_draws.get(r).copied());
+                                self.native_hierarchy_anchor=self.native_selected;return Ok(());
+                            }
                             let doc=scene_instances::parse(&target.overlay,name,world)?;
                             let index=index.as_ref().ok_or("Original disc index unavailable")?;
                             scene_instances::apply(&doc,world,scene.placements.len(),index)?;
+                            self.ground_edits=ground_edit_ops::parse(&target.overlay,scene.ground.as_ref(),name)?;
+                            self.collision_edit=collision_edit::State::from_embedded_record(&target.overlay,name)?;
                             self.native_selected=target.selected.as_ref()
                                 .and_then(|id|editor_history_selected(world,id));
                             self.native_selection=target.selection.iter().filter_map(|id|editor_history_selected(world,id)).collect();
@@ -5110,53 +7655,469 @@ impl App {
             }
         }
     }
+    fn lck_menus(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("File", |ui| {
+            ui.add_enabled(false,
+                egui::Button::new("New Project... (planned)"));
+
+            if ui.add_enabled(
+                self.studio.library.is_some(),
+                egui::Button::new("Open Project...    Ctrl+O")
+            ).clicked() {
+                self.lck_menu_project=Some(form_ui::Action::Open);
+                ui.close();
+            }
+
+            ui.separator();
+
+            if ui.add_enabled(self.form_session.is_some(),
+                egui::Button::new("Save Project    Ctrl+S")
+            ).clicked() {
+                self.lck_menu_project=Some(form_ui::Action::Save);
+                ui.close();
+            }
+
+            if ui.add_enabled(self.form_session.is_some(),
+                egui::Button::new("Save Project As...    Ctrl+Shift+S")
+            ).clicked() {
+                self.lck_menu_project=Some(form_ui::Action::SaveAs);
+                ui.close();
+            }
+
+            ui.separator();
+            ui.add_enabled(false,
+                egui::Button::new("Import Assets... (planned)"));
+
+            let ready=self.native_scene.as_ref().is_some_and(
+                |(_,state)|matches!(state,NativeSceneSlot::Ready(..))
+            ) && self.ps1_export_job.is_none();
+
+            if ui.add_enabled(ready,
+                egui::Button::new("Export Native PS1 IMG...")
+            ).clicked() {
+                self.lck_menu_export=true;
+                ui.close();
+            }
+
+            if ui.add_enabled(
+                ready && !self.ground_edits.has_edits(),
+                egui::Button::new("Check IMG Export")
+            ).clicked() {
+                self.lck_menu_check=true;
+                ui.close();
+            }
+
+            ui.separator();
+
+            if ui.button("Open source IMG...").clicked() {
+                self.pick_disc();
+                ui.close();
+            }
+
+            if ui.button("Exit").clicked() {
+                ui.ctx().send_viewport_cmd(
+                    egui::ViewportCommand::Close
+                );
+                ui.close();
+            }
+        });
+        ui.menu_button("Edit", |ui| {
+            if ui.add_enabled(
+                !self.editor_undo.is_empty(),
+                egui::Button::new("Undo    Ctrl+Z")
+            ).clicked() {
+                self.lck_menu_undo = true;
+                ui.close();
+            }
+
+            if ui.add_enabled(
+                !self.editor_redo.is_empty(),
+                egui::Button::new("Redo    Ctrl+Y")
+            ).clicked() {
+                self.lck_menu_redo = true;
+                ui.close();
+            }
+
+            ui.separator();
+
+            let selected = if self.ground_edit_mode {
+                !self.ground_selected.is_empty()
+            } else {
+                self.native_selected.is_some()
+            };
+
+            if ui.add_enabled(
+                selected || (!self.ground_edit_mode &&
+                    self.editor_cell_selected.is_some()),
+                egui::Button::new("Duplicate selected    Ctrl+D")
+            ).clicked() {
+                self.lck_menu_duplicate = true;
+                ui.close();
+            }
+
+            if ui.add_enabled(
+                selected,
+                egui::Button::new("Delete selected    Del")
+            ).clicked() {
+                self.lck_menu_delete = true;
+                ui.close();
+            }
+
+            ui.separator();
+
+            if ui.button("Clear selection    Esc").clicked() {
+                self.native_selected = None;
+                self.native_selection.clear();
+                self.native_hierarchy_anchor = None;
+                self.native_selection_click = None;
+                self.lck_empty_viewport_press = None;
+                self.ground_selected.clear();
+                self.ground_active = None;
+                self.ground_edits.selected_copies.clear();
+                self.ground_edits.active_copy = None;
+                self.collision_edit.replace_selected(Default::default());
+                self.editor_properties_target = None;
+                self.native_view.world_selected.clear();
+                self.native_view.version =
+                    self.native_view.version.wrapping_add(1);
+                ui.close();
+            }
+
+            if ui.add_enabled(
+                self.native_selected.is_some(),
+                egui::Button::new("Selected object properties")
+            ).clicked() {
+                self.editor_properties_target = self.native_selected;
+                ui.close();
+            }
+        });
+
+        ui.menu_button("View", |ui| {
+            // LCK_R57_NATIVE_WARPS
+            if ui.checkbox(
+                &mut self.native_warp_editor.open,
+                "Native MAP Warps (same-cell)"
+            ).clicked(){
+                ui.close();
+            }
+            ui.separator();
+            // LCK_R52_STARTUP_CAMERA_BUTTON_BEGIN
+            if ui.add_enabled(
+                self.native_scene.as_ref().is_some_and(
+                    |(_,slot)|matches!(
+                        slot,NativeSceneSlot::Ready(..)
+                    )
+                ),
+                egui::Button::new(
+                    "Save Startup Camera for This Cell"
+                )
+            ).on_hover_text(
+                "Remember this cell's current camera position, pan, rotation and zoom across editor restarts."
+            ).clicked() {
+                if let Some((source, NativeSceneSlot::Ready(..))) =
+                    self.native_scene.as_ref()
+                {
+                    let key=lck_cell_camera::key(
+                        source,
+                        self.editor_cell_active.as_ref()
+                    );
+
+                    match lck_cell_camera::save(
+                        &key,self.native_view.cam
+                    ) {
+                        Ok(path)=>{
+                            self.studio.status=Some(format!(
+                                "Startup camera saved for {key}: {}",
+                                path.display()
+                            ));
+                        }
+                        Err(error)=>{
+                            self.studio.error=Some(format!(
+                                "Startup camera save failed: {error}"
+                            ));
+                        }
+                    }
+                }
+
+                ui.close();
+            }
+            // LCK_R52_STARTUP_CAMERA_BUTTON_END
+
+            ui.separator();
+            // LCK_R49_WORLD_FIXED_GRID
+            ui.menu_button("Native Grid",|ui|{
+                ui.set_min_width(300.0);
+
+                let mut changed=false;
+
+                changed |= ui.checkbox(
+                    &mut self.native_map_grid_visible,
+                    "Show Native MAP Grid"
+                ).changed();
+
+                ui.separator();
+
+                ui.label("Grid capacity");
+
+                ui.horizontal(|ui|{
+                    if ui.add_enabled(
+                        self.native_map_extension_side>128,
+                        egui::Button::new("-")
+                    ).on_hover_text(
+                        "Reduce grid by 32 tiles per axis"
+                    ).clicked(){
+                        self.native_map_extension_side=
+                            self.native_map_extension_side
+                                .saturating_sub(32)
+                                .max(128);
+                        changed=true;
+                    }
+
+                    ui.strong(format!(
+                        "{} x {}",
+                        self.native_map_extension_side,
+                        self.native_map_extension_side
+                    ));
+
+                    if ui.add_enabled(
+                        self.native_map_extension_side<256,
+                        egui::Button::new("+")
+                    ).on_hover_text(
+                        "Increase grid by 32 tiles per axis"
+                    ).clicked(){
+                        self.native_map_extension_side=
+                            (self.native_map_extension_side+32)
+                                .min(256);
+                        changed=true;
+                    }
+                });
+
+                ui.small(format!(
+                    "{} total authoring cells (+{} beyond retail)",
+                    self.native_map_extension_side
+                        *self.native_map_extension_side,
+                    self.native_map_extension_side
+                        *self.native_map_extension_side
+                        -16384
+                ));
+
+                ui.separator();
+
+                changed |= ui.add(
+                    egui::Slider::new(
+                        &mut self.native_map_grid_step,
+                        1..=32
+                    ).text("Line spacing (tiles)")
+                ).changed();
+
+                changed |= ui.add(
+                    egui::DragValue::new(
+                        &mut self.native_map_grid_y
+                    ).speed(16.0).prefix("Display height Y: ")
+                ).changed();
+
+                if ui.button("Reset grid height").clicked(){
+                    self.native_map_grid_y=0.0;
+                    changed=true;
+                }
+
+                ui.separator();
+
+                let scene_name=self.native_scene.as_ref()
+                    .and_then(|(_,slot)|match slot {
+                        NativeSceneSlot::Ready(scene,_)=>
+                            Some(scene.name.clone()),
+                        _=>None,
+                    })
+                    .unwrap_or_default();
+
+                self.native_map_extension.stage(
+                    &scene_name,
+                    &self.ground_edits,
+                    self.native_map_extension_side
+                );
+
+                ui.small(format!(
+                    "Staged extended floor cells: {}",
+                    self.native_map_extension.staged_tiles
+                ));
+
+                ui.small(format!(
+                    "Outside original MAP: {}",
+                    self.native_map_extension.outside_original
+                ));
+
+                ui.small(format!(
+                    "Clipped / unstaged pieces: {} / {}",
+                    self.native_map_extension.clipped_pieces,
+                    self.native_map_extension.skipped_pieces
+                ));
+
+                if ui.button("Save extended authoring JSON").clicked(){
+                    self.native_map_extension.status=
+                        match self.native_map_extension.save(){
+                            Ok(path)=>format!(
+                                "Saved: {}",path.display()
+                            ),
+                            Err(error)=>format!(
+                                "Save failed: {error}"
+                            ),
+                        };
+                }
+
+                if !self.native_map_extension.status.is_empty(){
+                    ui.small(&self.native_map_extension.status);
+                }
+
+                if let Some((
+                    _,
+                    NativeSceneSlot::Ready(_,world)
+                ))=self.native_scene.as_ref(){
+                    ui.separator();
+
+                    native_map_bounds::inline_grid_report(
+                        ui,
+                        world.as_ref(),
+                        &self.ground_edits,
+                        self.native_selected,
+                        self.native_map_grid_step
+                    );
+                }
+
+                ui.separator();
+
+                ui.small(
+                    "Grid lines are rendered as world-space meshes with depth testing. Red: original MAP; cyan: extended authoring boundary."
+                );
+
+                ui.small(
+                    "Extra cells are editor-authoring data only until the PS1 runtime loader, terrain renderer and collision sampler are extended."
+                );
+
+                if changed {
+                    self.native_view.version=
+                        self.native_view.version.wrapping_add(1);
+                    ui.ctx().request_repaint();
+                }
+            });
+
+            ui.separator();
+
+            if ui.button("Frame selected    F").clicked() {
+                if let Some((_, NativeSceneSlot::Ready(scene, world))) =
+                    self.native_scene.as_ref()
+                {
+                    frame_editor_selection(
+                        &mut self.native_view,
+                        world.as_ref(),
+                        scene.as_ref(),
+                        self.native_selected,
+                        if self.ground_edit_mode {
+                            self.ground_active
+                        } else {
+                            None
+                        },
+                        &self.ground_edits,
+                    );
+                    ui.ctx().request_repaint();
+                }
+                ui.close();
+            }
+
+            ui.separator();
+
+            ui.checkbox(
+                &mut self.native_ground_visible,
+                "Show walkable ground"
+            );
+
+            if ui.checkbox(
+                &mut self.ground_edit_mode,
+                "Floor editing"
+            ).changed() {
+                self.ground_click = None;
+
+                if self.ground_edit_mode {
+                    self.native_ground_visible = true;
+                    self.native_selected = None;
+                    self.native_selection.clear();
+                    self.native_selection_click = None;
+                    self.native_drag = None;
+                    self.native_view.world_selected.clear();
+                }
+
+                self.native_view.version =
+                    self.native_view.version.wrapping_add(1);
+                ui.ctx().request_repaint();
+            }
+
+            ui.checkbox(
+                &mut self.native_collision_wire_visible,
+                "Collision wireframe"
+            );
+
+
+            ui.checkbox(
+                &mut self.native_view.world_mirrored,
+                "Mirror view (X)"
+            );
+        });
+
+        ui.menu_button("Help", |ui| {
+            if ui.button("Keyboard & Mouse Controls").clicked() {
+                self.lck_shortcuts_open = true;
+                ui.close();
+            }
+
+            if ui.button("About Legaia Creation Kit").clicked() {
+                self.about_open = true;
+                ui.close();
+            }
+        });
+
+        ui.menu_button("Settings", |ui| {
+            self.view_menu(ui);
+
+            ui.separator();
+
+            ui.checkbox(
+                &mut self.native_anchor_snap,
+                "Snap to object centers"
+            );
+        });
+    }
+
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Legaia Studio")
-                    .heading()
-                    .color(crate::theme::accent(ui)),
+            let width = ui.available_width();
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(width, 36.0),
+                egui::Sense::hover(),
             );
-            ui.separator();
-            for (mode, label, key) in [
-                (Mode::Browse, "Browse", "Ctrl+1"),
-                (Mode::Actors, "Characters & monsters", "Ctrl+2"),
-                (Mode::Media, "Movies & voice", "Ctrl+3"),
-                (Mode::Extract, "Extract", "Ctrl+4"),
-                (Mode::Editor, "World Editor", "Ctrl+5"),
+            let painter = ui.painter_at(rect);
+            let pos = rect.left_center() + egui::vec2(12.0, 0.0);
+            let font = egui::FontId::proportional(26.0);
+            let title = "Legaia Creation Kit";
+
+            for (offset, color) in [
+                (egui::vec2(2.0, 2.0), Color32::from_rgb(38, 23, 10)),
+                (egui::vec2(-1.0, 0.0), Color32::from_rgb(75, 43, 12)),
+                (egui::vec2(1.0, 0.0), Color32::from_rgb(75, 43, 12)),
+                (egui::vec2(0.0, 1.0), Color32::from_rgb(155, 99, 29)),
+                (egui::vec2(0.0, -1.0), Color32::from_rgb(255, 231, 153)),
+                (egui::vec2(0.0, 0.0), Color32::from_rgb(226, 173, 65)),
             ] {
-                ui.selectable_value(&mut self.mode, mode, label)
-                    .on_hover_text(key);
+                painter.text(
+                    pos + offset,
+                    egui::Align2::LEFT_CENTER,
+                    title,
+                    font.clone(),
+                    color,
+                );
             }
-            ui.separator();
-            if ui
-                .button("Open disc image...")
-                .on_hover_text("Ctrl+O")
-                .clicked()
-            {
-                self.pick_disc();
-            }
-            if ui.button("Open extracted folder...").clicked() {
-                self.pick_folder();
-            }
-            ui.add_enabled_ui(!self.studio.settings.recent.is_empty(), |ui| {
-                ui.menu_button("Recent", |ui| {
-                    if let Some(p) = self.recent_list(ui) {
-                        ui.close();
-                        self.open_path(&p);
-                    }
-                })
-                .response
-                .on_disabled_hover_text("Discs and folders you open are listed here.");
-            });
-            ui.separator();
-            self.play_button(ui);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("About").on_hover_text("F1").clicked() {
-                    self.about_open = !self.about_open;
-                }
-                ui.menu_button("View", |ui| self.view_menu(ui));
-            });
+        });
+        ui.horizontal(|ui| {
+            self.lck_menus(ui);
         });
         ui.horizontal(|ui| {
             ui.label("Path:");
@@ -6692,6 +9653,19 @@ impl App {
     }
 }
 
+// LCK_R55_VIEWPORT_SPLIT
+// Reserve rendering room and never derive controls height
+// from their changing contents.
+fn lck_r55_controls_height(requested:f32,available:f32)->f32 {
+    let maximum=(available-185.0).max(108.0);
+    let value=if requested.is_finite() {
+        requested
+    }else{
+        238.0
+    };
+    value.clamp(108.0,maximum)
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.sync_appearance(ctx);
@@ -6709,6 +9683,10 @@ impl eframe::App for App {
                     let details=if result.skipped.is_empty(){String::new()}else{format!(" Not updated: {}",result.skipped.join(" | "))};
                     self.studio.status=Some(format!("Native PS1 image saved: {}. Patched: {}.{} In DuckStation: boot THIS IMG (not an old CUE or save state), then reload Rim Elm. Native writes were read back. Original walls/floors and scripts are preserved unless an explicit supported plan changes them; gameplay verification remains required.",result.path.display(),result.patched.join(", "),details));
                     if result.skipped.iter().any(|s|s.starts_with("UNRESTRICTED EXPERIMENT")) {
+                        self.studio.status=Some(result.experimental_summary());
+                        self.studio.error=result.verification_warning();
+                    }
+                    if result.skipped.iter().any(|s|s.starts_with("FAILED NATIVE GROUND:")||s.starts_with("FAILED NATIVE FLOOR TEXTURES:")) {
                         self.studio.status=Some(result.experimental_summary());
                         self.studio.error=result.verification_warning();
                     }
@@ -6795,6 +9773,20 @@ impl eframe::App for App {
         }
         self.poll_game(ctx);
         self.shortcuts(ctx);
+        if !ctx.wants_keyboard_input() {
+            let cmd=egui::Modifiers::COMMAND;
+            if ctx.input_mut(|i|i.consume_shortcut(
+                &egui::KeyboardShortcut::new(
+                    egui::Modifiers{shift:true,..cmd},egui::Key::S
+                )
+            )) {
+                self.lck_menu_project=Some(form_ui::Action::SaveAs);
+            } else if ctx.input_mut(|i|i.consume_shortcut(
+                &egui::KeyboardShortcut::new(cmd,egui::Key::S)
+            )) {
+                self.lck_menu_project=Some(form_ui::Action::Save);
+            }
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
             self.about_open = !self.about_open;
         }
@@ -6818,6 +9810,54 @@ impl eframe::App for App {
         }
         egui::TopBottomPanel::top("top").show(ctx, |ui| self.top_bar(ui));
         self.about_window(ctx);
+        if self.lck_shortcuts_open {
+            let mut open = self.lck_shortcuts_open;
+
+            egui::Window::new("LCK Keyboard & Mouse Controls")
+                .open(&mut open)
+                .resizable(true)
+                .default_width(540.0)
+                .default_height(380.0)
+                .show(ctx, |ui| {
+                    // LCK_R55_VIEWPORT_SPLIT
+                    ui.strong("Render Window - Mouse Controls");
+
+                    ui.label("LMB click: Select visible object, floor or collision box according to active selection mode.");
+                    ui.label("Shift+LMB: Add to selection.");
+                    ui.label("Ctrl+LMB click: Toggle selection.");
+                    ui.label("LMB drag selected: Move X/Z.");
+                    ui.label("Ctrl+LMB drag selected: Move Y.");
+                    ui.label("LMB drag empty space: Pan the camera.");
+                    ui.label("RMB drag selected: Rotate the selected item or group.");
+                    ui.label("Alt+RMB drag: Alternate rotation axis where supported.");
+                    ui.label("MMB or Alt+LMB drag: Orbit camera.");
+                    ui.label("LMB+RMB drag: Marquee selection.");
+                    ui.label("Double-click: Frame a visible item in builds supporting double-click framing.");
+
+                    ui.separator();
+
+                    ui.strong("Viewport Layout");
+                    ui.label("Drag the horizontal divider to resize World Viewport controls and the Render Window independently.");
+                    ui.label("Scroll inside the controls pane to see more information without moving the Render Window.");
+
+                    ui.separator();
+
+                    ui.strong("Keyboard Shortcuts");
+                    ui.label("Ctrl+Z: Undo");
+                    ui.label("Ctrl+Y: Redo");
+                    ui.label("Ctrl+D: Duplicate selected");
+                    ui.label("Delete: Delete selected");
+                    ui.label("Esc: Clear selection");
+                    ui.label("F: Frame selected");
+                    ui.label("Tab: Toggle floor editing");
+                    ui.label("Shift+click: Add to selection");
+                    ui.label("Ctrl+click: Toggle selection");
+                    ui.label("RMB drag: Rotate");
+                    ui.label("MMB or Alt+LMB: Orbit");
+                });
+
+            self.lck_shortcuts_open = open;
+        }
         match self.mode {
             // Nothing open yet: the start page takes the whole window, in
             // every view that needs a disc to show anything (a view restored
@@ -6885,13 +9925,13 @@ fn third_party_licenses() -> Option<PathBuf> {
 impl App {
     fn about_window(&mut self, ctx: &egui::Context) {
         let mut open = self.about_open;
-        egui::Window::new("About Legaia Studio")
+        egui::Window::new("About Legaia Creation Kit")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .show(ctx, |ui| {
-                ui.heading(format!("Legaia Studio {}", env!("CARGO_PKG_VERSION")));
+                ui.heading(format!("Legaia Creation Kit {}", env!("CARGO_PKG_VERSION")));
                 ui.label(
                     "Browse, preview and extract the assets on your own Legend of Legaia disc.",
                 );
@@ -7194,6 +10234,7 @@ mod catalog_ui_tests {
         let mut world=collision_recipes::properties_fixture();
         let alias=naming::visual_key(&[1,2,3],&collision_recipes::digest(&[4,5])).unwrap();
         world.naming.assets.insert((false,0),alias.clone());world.naming.native.insert((false,0),"stable-original".into());
+        world.naming.descriptions.insert(alias.clone(),"Cupboard".into());
         app.editor_names.records.insert(alias.clone(),Record{name:"Lantern".into(),aliases:"lamp".into(),..Default::default()});
         app.native_scene=Some(("synthetic".into(),NativeSceneSlot::Ready(Arc::new(scene),Arc::new(world))));
         let scene=match &app.native_scene {Some((_,NativeSceneSlot::Ready(s,_)))=>s.clone(),_=>unreachable!()};
@@ -7214,6 +10255,9 @@ mod catalog_ui_tests {
         assert_eq!(app.editor_name_for(Some(&scene),EditorCatalogItem::Draw(false,1)),"Side entrance lamp");
         if let Some((_,NativeSceneSlot::Ready(_,world)))=&mut app.native_scene {Arc::get_mut(world).unwrap().set_display_name((false,1),None);}
         assert_eq!(app.editor_name_for(Some(&scene),EditorCatalogItem::Draw(false,1)),"New global alias");
+        app.editor_names.records.remove(&alias);
+        assert_eq!(app.editor_name_for(Some(&scene),EditorCatalogItem::Draw(false,1)),"Cupboard");
+        assert!(app.editor_item_matches(Some(&scene),EditorCatalogItem::Draw(false,1),"cupboard"));
     }
     #[test]
     fn right_click_properties_shows_collision_without_library_and_preview_does_not_edit() {
@@ -7319,7 +10363,7 @@ mod catalog_ui_tests {
         let mut world = WorldModel {
             model: None, instances: 2, unavailable: 0, unique_models: 1,
             ground_triangles: 0, ground_vram_covered: 0, ground_textured: 0,
-            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),naming:Default::default(),collision:Default::default(),foreign_vram:std::collections::HashMap::new(),
+            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),naming:Default::default(),collision:Default::default(),foreign_vram:std::collections::HashMap::new(),groups:Vec::new(),
             draws: vec![original, copy],
         };
         assert_eq!(editor_duplicate_request(&world, Some((false, 2))),
@@ -7488,5 +10532,158 @@ mod source_asset_upright_preview_tests {
         assert!(editor_preview_positions(&mut mesh, vec![[0.0,0.0,0.0];2]).is_none());
         assert!(editor_preview_positions(&mut mesh, vec![[0.0,f32::NAN,0.0]]).is_none());
         assert_eq!(mesh.positions, before);
+    }
+}
+
+/// Only an actual click in the viewport, never a camera pan or UI gesture,
+/// is allowed to clear the current selection.
+fn lck_empty_click_released(
+    start:egui::Pos2,
+    end:Option<egui::Pos2>,
+    viewport:egui::Rect,
+    camera_panned:bool,
+    blocked:bool,
+)->bool{
+    !camera_panned && !blocked && end.is_some_and(|p|
+        viewport.contains(p) && (p-start).length_sq()<=36.0)
+}
+
+#[cfg(test)]
+mod lck_empty_click_tests {
+    use super::*;
+
+    #[test]
+    fn only_short_unblocked_viewport_click_clears() {
+        let rect=egui::Rect::from_min_size(egui::pos2(10.,10.),egui::vec2(100.,100.));
+        let start=egui::pos2(50.,50.);
+        assert!(lck_empty_click_released(start,Some(start),rect,false,false));
+        assert!(lck_empty_click_released(start,Some(egui::pos2(53.,53.)),rect,false,false));
+        assert!(!lck_empty_click_released(start,Some(egui::pos2(65.,50.)),rect,false,false));
+        assert!(!lck_empty_click_released(start,Some(start),rect,true,false));
+        assert!(!lck_empty_click_released(start,Some(start),rect,false,true));
+        assert!(!lck_empty_click_released(start,Some(egui::pos2(110.,50.)),rect,false,false));
+        assert!(!lck_empty_click_released(start,None,rect,false,false));
+    }
+}
+
+/// Pointer capture for viewport and popup interactions.
+fn lck_pointer_over_foreground(ctx:&egui::Context)->bool {
+    ctx.input(|i|i.pointer.interact_pos())
+        .and_then(|pos|ctx.layer_id_at(pos))
+        .is_some_and(|layer|layer.order==egui::Order::Foreground)
+}
+
+
+// LCK_R55_VIEWPORT_SPLIT
+#[cfg(test)]
+mod lck_r55_layout_tests {
+    use super::*;
+
+    #[test]
+    fn selection_information_cannot_change_panel_height() {
+        let available=740.0;
+
+        let without_selection=
+            lck_r55_controls_height(238.0,available);
+
+        let with_selection=
+            lck_r55_controls_height(238.0,available);
+
+        assert_eq!(without_selection,with_selection);
+        assert_eq!(without_selection,238.0);
+    }
+
+    #[test]
+    fn splitter_respects_render_window_space() {
+        assert_eq!(
+            lck_r55_controls_height(900.0,600.0),
+            415.0
+        );
+
+        assert_eq!(
+            lck_r55_controls_height(20.0,600.0),
+            108.0
+        );
+
+        assert_eq!(
+            lck_r55_controls_height(f32::NAN,700.0),
+            238.0
+        );
+    }
+}
+
+// LCK_R56_FIXED_CONTROLS
+#[cfg(test)]
+mod lck_r56_fixed_pane_tests {
+    use super::*;
+
+    #[test]
+    fn overflowing_selection_text_cannot_move_render_origin(){
+        let ctx=egui::Context::default();
+        let mut checked=false;
+
+        let input=egui::RawInput {
+            screen_rect:Some(
+                egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0,800.0)
+                )
+            ),
+            ..Default::default()
+        };
+
+        let _=ctx.run(input,|ctx|{
+            egui::CentralPanel::default().show(ctx,|ui|{
+                let (fixed_rect,_)=ui.allocate_exact_size(
+                    egui::vec2(
+                        ui.available_width(),160.0
+                    ),
+                    egui::Sense::hover()
+                );
+
+                let parent_cursor=
+                    ui.available_rect_before_wrap().min;
+
+                {
+                    let mut child=ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(fixed_rect)
+                    );
+
+                    child.set_clip_rect(fixed_rect);
+                    child.set_width(fixed_rect.width());
+
+                    child.style_mut().wrap_mode=
+                        Some(egui::TextWrapMode::Wrap);
+
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false,false])
+                        .show(&mut child,|ui|{
+                            ui.set_width(
+                                (fixed_rect.width()-20.0).max(64.0)
+                            );
+
+                            for _ in 0..80 {
+                                ui.label(
+                                    "Selected world object with a very long \
+                                     descriptive name and additional native \
+                                     resource information that must wrap."
+                                );
+                            }
+                        });
+                }
+
+                // Selection details must not change the
+                // parent cursor, regardless of line count.
+                assert_eq!(
+                    ui.available_rect_before_wrap().min,
+                    parent_cursor
+                );
+
+                checked=true;
+            });
+        });
+
+        assert!(checked);
     }
 }

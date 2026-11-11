@@ -110,6 +110,60 @@ pub(in crate::app) struct MultiPlan {
     reference_diagnostics:Vec<String>,
 }
 impl MultiPlan {
+    /// Native floor mirroring registers image-only 4bpp TIMs while keeping all
+    /// existing model selectors, CLUTs, and resident texture bytes unchanged.
+    pub(in crate::app) fn native_floor_overlays(
+        inventory:&NativeAssetPlan,before:&Vram,
+        incoming:&[(Rect,ResourceId)],
+    )->Result<Self>{
+        ensure!(!incoming.is_empty(),"No mirrored ground texture images");
+        let mut result=before.clone();let mut uploads=Vec::new();
+        for &(rect,ref id) in incoming {
+            let raw=inventory.resources.get(id).and_then(|r|r.payload.as_deref())
+                .context("Mirrored floor TIM not registered")?;
+            let tim=legaia_tim::parse_native_upload(raw)?;
+            ensure!(matches!(tim.mode,PixelMode::Bpp4) && tim.clut.is_none(),
+                "Mirrored floor must retain a resident CLUT, no new CLUT upload");
+            ensure!([tim.image.fb_x,tim.image.fb_y,tim.image.fb_w,tim.image.h]==
+                [rect.x,rect.y,rect.w,rect.h] && rect.w==8 && rect.h==32,
+                "Mirrored native ground tile TIM dimensions mismatch");
+            ensure!((rect.y as usize..rect.y as usize+rect.h as usize).all(|y|
+                (rect.x as usize..rect.x as usize+rect.w as usize).all(|x|
+                    !result.is_written(x,y))),
+                "Mirrored floor would overwrite an existing native VRAM upload");
+            result.upload_tim(&tim);
+            uploads.push(UploadBlock{rect,bytes:tim.image.data,depth:0,
+                source:id.clone(),origins:inventory.resources[id].origins.clone(),
+                flags:tim.flags,contributors:BTreeSet::from([id.clone()])});
+        }
+        Ok(Self{uploads,tmds:BTreeMap::new(),
+            source_vram:super::super::super::naming::material_key(before),
+            output:result,evidence:"Independent native floor 4bpp tiles".into(),
+            reference_diagnostics:vec!["Floor-only TIM registration; native models and CLUT preserved".into()]})
+    }
+    // LCK_NATIVE_MIRROR_RESIDENT_TMD_V1
+    // Mirror only the geometry; preserve source-native texture allocations.
+    pub(in crate::app) fn existing_material_tmd(
+        inventory:&NativeAssetPlan,before:&Vram,model:&ResourceId
+    )->Result<Self>{
+        ensure!(model.kind==ResourceKind::Tmd,"Native mirror requires a TMD");
+        let raw=inventory.resources.get(model)
+            .and_then(|r|r.payload.as_deref())
+            .context("Mirrored TMD resource missing")?;
+        ensure!(super::super::digest(raw)==model.sha256,
+            "Mirrored native TMD fingerprint changed");
+        references(raw)?;
+        Ok(Self{
+            uploads:Vec::new(),
+            tmds:BTreeMap::from([(model.clone(),raw.to_vec())]),
+            source_vram:super::super::super::naming::material_key(before),
+            output:before.clone(),
+            evidence:"Resident texture words preserved for mirror".into(),
+            reference_diagnostics:vec![
+                "Native mirror registers a private TMD without TIM/CLUT changes".into()
+            ],
+        })
+    }
     pub(in crate::app) fn resource_diagnostics(&self)->Vec<String>{
         self.uploads.iter().map(|u|format!("TIM {:?} {} -> native VRAM {:?}, {} bytes",u.source,if u.depth==3{"CLUT words"}else{"IMAGE"},u.rect,u.bytes.len()))
             .chain(self.uploads.iter().map(|u|format!("Native word contribution closure: sampled depth/role {}, actual source resources {:?}; upload metadata is not GPU sampling depth",u.depth,u.contributors)))

@@ -73,7 +73,8 @@ fn triangle_hit(origin:[f32;3],dir:[f32;3],a:[f32;3],b:[f32;3],c:[f32;3])->Optio
 /// Exactly invert the CPU rasterizer's scene-camera yaw/pitch projection.
 /// `pixel` is already horizontally unmirrored. The eye origin is the
 /// scene-centered virtual camera, not the near plane or the PSX origin.
-fn camera_ray(model:&Model,cam:Camera,pixel:[f32;2],px:[usize;2])
+// LCK_R51_ALIGNMENT
+pub(super) fn camera_ray(model:&Model,cam:Camera,pixel:[f32;2],px:[usize;2])
     ->Option<([f32;3],[f32;3])>{
     if px[0]==0 || px[1]==0{return None;}
     let fov=45f32.to_radians();
@@ -223,3 +224,119 @@ pub(super) fn foreign_drop_center(world:&world_view::WorldModel,cam:Camera,
 
 /// Object Window placement creates a reference to an existing shared definition.
 pub(super) fn place_form(session:&mut super::form_bridge::Session,base:super::form_database::FormKey,center:[f32;3])->anyhow::Result<super::form_database::FormKey>{session.place(base,super::form_database::Transform{position:center,..Default::default()})}
+
+
+#[cfg(test)]
+mod lck_r51_alignment_tests {
+    use super::*;
+
+    #[test]
+    fn viewport_pointer_alignment_at_edges_and_center() {
+        let rect=egui::Rect::from_min_size(
+            egui::pos2(100.0,45.0),
+            egui::vec2(900.0,680.0)
+        );
+
+        let dims=viewport_pixels(rect,1.0,[900,680]);
+
+        for (u,v) in [
+            (0.02f32,0.03f32),
+            (0.25,0.75),
+            (0.50,0.50),
+            (0.75,0.25),
+            (0.98,0.97)
+        ] {
+            let pointer=egui::pos2(
+                rect.left()+u*rect.width(),
+                rect.top()+v*rect.height()
+            );
+
+            let normal=viewport_pixel(
+                rect,pointer,dims,false
+            );
+
+            let mirrored=viewport_pixel(
+                rect,pointer,dims,true
+            );
+
+            assert!(
+                (normal[0]+mirrored[0]
+                -(dims[0] as f32-1.0)).abs()<0.02
+            );
+
+            assert!((normal[1]-mirrored[1]).abs()<0.02);
+
+            assert!(
+                (normal[0]/dims[0] as f32-u).abs()<0.001
+            );
+
+            assert!(
+                (normal[1]/dims[1] as f32-v).abs()<0.001
+            );
+        }
+    }
+
+    #[test]
+    fn camera_rays_invert_off_center_raster_projection() {
+        let model=Model{
+            positions:Vec::new(),
+            rest:Vec::new(),
+            object_ids:Vec::new(),
+            uvs:Vec::new(),
+            cba_tsb:Vec::new(),
+            modulation:Vec::new(),
+            fill:Vec::new(),
+            textured:Vec::new(),
+            indices:Vec::new(),
+            center:[400.0,80.0,900.0],
+            radius:1500.0,
+        };
+
+        let cam=Camera{
+            yaw:1.1,
+            pitch:2.6,
+            zoom:1.2,
+            target_offset:[50.0,-25.0,75.0],
+        };
+
+        let dims=[900usize,680usize];
+        let fov=45f32.to_radians();
+        let f=(dims[1] as f32*0.5)/(fov*0.5).tan();
+        let dist=model.radius/(fov*0.5).sin()*cam.zoom;
+        let (sy,cy)=cam.yaw.sin_cos();
+        let (sp,cp)=cam.pitch.sin_cos();
+
+        for pixel in [
+            [40.0,40.0],
+            [450.0,340.0],
+            [875.0,620.0]
+        ] {
+            let (eye,dir)=camera_ray(
+                &model,cam,pixel,dims
+            ).unwrap();
+
+            let point=[
+                eye[0]+dir[0]*8000.0,
+                eye[1]+dir[1]*8000.0,
+                eye[2]+dir[2]*8000.0,
+            ];
+
+            let x=point[0]-model.center[0]-cam.target_offset[0];
+            let y=point[1]-model.center[1]-cam.target_offset[1];
+            let z=point[2]-model.center[2]-cam.target_offset[2];
+
+            let x1=x*cy+z*sy;
+            let z1=-x*sy+z*cy;
+            let y2=y*cp-z1*sp;
+            let z2=y*sp+z1*cp+dist;
+
+            let screen=[
+                dims[0] as f32*0.5+f*x1/z2,
+                dims[1] as f32*0.5+f*y2/z2
+            ];
+
+            assert!((screen[0]-pixel[0]).abs()<0.05);
+            assert!((screen[1]-pixel[1]).abs()<0.05);
+        }
+    }
+}

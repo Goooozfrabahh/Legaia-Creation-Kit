@@ -64,11 +64,13 @@ pub(super) fn catalog_one(index:&ProtIndex,name:&str)->Result<Vec<Asset>,String>
     let scene=legaia_engine_world_views::scene_staging::assemble_field_scene(index,name)?;
     let display_source=crate::place_name(name).unwrap_or(name).to_owned();
     let visual_keys=super::naming::visual_keys(&scene);
+    let descriptions=super::descriptive_names::for_scene(&scene,index,&visual_keys);
+    let description=|resource:usize|visual_keys.get(resource).and_then(Option::as_ref)
+        .and_then(|key|descriptions.get(key)).cloned().unwrap_or_else(||"Scene model".into());
     let mut found=Vec::with_capacity(scene.placements.len()+scene.terrain.len()+scene.env_tmds.len());
     for (i,d) in scene.placements.iter().enumerate() {
         found.push(Asset {
-            source:name.to_string(),source_label:display_source.clone(),label:format!("Unidentified world object #{i:03} [TMD {} / x{} y{} z{}]",
-                d.env_slot,d.world_x,d.world_y,d.world_z),
+            source:name.to_string(),source_label:display_source.clone(),label:description(d.res_tmd),
             key:format!("cell:{name}|placed:{i}|mesh:{}|anchor:{},{}|pos:{},{},{}",
                 d.env_slot,d.anchor.0,d.anchor.1,d.world_x,d.world_y,d.world_z),
             alias_key:visual_keys.get(d.res_tmd).cloned().flatten(),kind:Kind::Placement(i),mesh_fingerprint:mesh_hash(&scene,d.res_tmd),floor_faces:Vec::new(),
@@ -76,7 +78,7 @@ pub(super) fn catalog_one(index:&ProtIndex,name:&str)->Result<Vec<Asset>,String>
     }
     for (i,d) in scene.terrain.iter().enumerate() {
         found.push(Asset {
-            source:name.to_string(),source_label:display_source.clone(),label:format!("Terrain / decoration #{i:03} [TMD {}]",d.env_slot),
+            source:name.to_string(),source_label:display_source.clone(),label:description(d.res_tmd),
             key:format!("cell:{name}|terrain:{i}|mesh:{}|anchor:{},{}|pos:{},{},{}",
                 d.env_slot,d.anchor.0,d.anchor.1,d.world_x,d.world_y,d.world_z),
             alias_key:visual_keys.get(d.res_tmd).cloned().flatten(),kind:Kind::Terrain(i),mesh_fingerprint:mesh_hash(&scene,d.res_tmd),floor_faces:Vec::new(),
@@ -84,7 +86,7 @@ pub(super) fn catalog_one(index:&ProtIndex,name:&str)->Result<Vec<Asset>,String>
     }
     for (slot,&res_tmd) in scene.env_tmds.iter().enumerate() {
         found.push(Asset {
-            source:name.to_string(),source_label:display_source.clone(),label:format!("Reusable original TMD #{slot:03} / resource {res_tmd}"),
+            source:name.to_string(),source_label:display_source.clone(),label:description(res_tmd),
             key:format!("cell:{name}|mesh:{slot}|resource:{res_tmd}"),
             alias_key:visual_keys.get(res_tmd).cloned().flatten(),kind:Kind::Mesh(slot),mesh_fingerprint:mesh_hash(&scene,res_tmd),floor_faces:scene.res.tmds.get(res_tmd).map(|t|super::floor_tiles::scan_faces(&t.tmd,&t.raw,&scene.res.vram)).unwrap_or_default(),
         });

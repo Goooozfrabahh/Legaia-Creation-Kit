@@ -40,6 +40,8 @@ pub(super) struct SceneDocument {
     /// Appearance override using another real TMD from the same scene pool.
     pub models: Vec<(NameTarget, u8)>,
     pub hidden: Vec<(bool, usize)>,
+    /// LCK editor-only multi-category binding records.
+    pub groups: Vec<super::authoring_group::Group>,
 }
 
 pub(super) fn valid_name(name: &str) -> Result<Option<String>, String> {
@@ -160,6 +162,11 @@ pub(super) fn serialize(scene_name: &str, world: &WorldModel) -> String {
         out.push_str(&serde_json::to_string(assignment).expect("Serializable collision recipe"));
         out.push('\n');
     }
+    for group in &world.groups {
+        out.push_str("EDITOR_GROUP\t");
+        out.push_str(&serde_json::to_string(group).expect("Serializable editor group"));
+        out.push('\n');
+    }
     out
 }
 
@@ -186,6 +193,20 @@ pub(super) fn parse(text: &str, scene_name: &str, world: &WorldModel) -> Result<
         let items: Vec<_> = line.split('\t').collect();
         let at = line_index + 2;
         match items.first().copied() {
+            Some("GROUND_EDIT")=>{
+                if items.len()!=2{return Err(format!("Incorrect GROUND_EDIT record at line {at}"));}
+            }
+            Some("COLLISION_EDIT")=>{
+                // The collision authoring layer is restored by collision_edit::State.
+                if items.len()!=2 {return Err(format!("Incorrect COLLISION_EDIT record at line {at}"));}
+            }
+            Some("EDITOR_GROUP")=>{
+                if items.len()!=2{return Err(format!("Invalid EDITOR_GROUP fields at line {at}"));}
+                let group:super::authoring_group::Group=serde_json::from_str(items[1])
+                    .map_err(|e|format!("Invalid editor group at line {at}: {e}"))?;
+                doc.groups.push(group);
+                super::authoring_group::validate(&doc.groups)?;
+            }
             Some("NATIVE_NAME")=>{
                 if items.len()!=3 {return Err(format!("Incorrect NATIVE_NAME fields at line {at}"));}
                 let (terrain,index)=stable_names.get(items[1]).copied().flatten().ok_or_else(||format!("Native name identity missing or ambiguous at line {at}"))?;
@@ -275,7 +296,7 @@ pub(super) fn parse(text: &str, scene_name: &str, world: &WorldModel) -> Result<
                 for (axis,text) in items[start..].iter().enumerate() {
                     scale[axis]=text.parse::<f32>().map_err(|_|format!("Invalid scale at line {at}"))?;
                 }
-                if !scale.iter().all(|v|v.is_finite() && (0.05..=20.0).contains(v)) {
+                if !scale.iter().all(|v|v.is_finite() && (0.05..=20.0).contains(&v.abs())) {
                     return Err(format!("Scale out of range (0.05..20) at line {at}"));
                 }
                 doc.scales.push((target,scale));
@@ -365,7 +386,7 @@ pub(super) fn parse(text: &str, scene_name: &str, world: &WorldModel) -> Result<
             }
             _ => return Err(format!("Unrecognized record at line {at}")),
         }
-        if doc.moves.len()+doc.created.len()+doc.foreign.len()+doc.names.len()+doc.rotations.len()+doc.scales.len()+doc.animations.len()+doc.models.len()+doc.hidden.len()+doc.collision_recipes.len()+doc.mesh_collision.len()>10_000 {
+        if doc.moves.len()+doc.created.len()+doc.foreign.len()+doc.names.len()+doc.rotations.len()+doc.scales.len()+doc.animations.len()+doc.models.len()+doc.hidden.len()+doc.collision_recipes.len()+doc.mesh_collision.len()+doc.groups.len()>10_000 {
             return Err("Project overlay has too many records".into());
         }
     }
@@ -588,6 +609,8 @@ fn apply_staged(doc:&SceneDocument, world:&mut WorldModel, native_placements:usi
         }).ok_or("Collision recipe owner is missing")?;
         world.set_collision_recipe(key,assignment.recipe.clone())?;
     }
+    super::authoring_group::validate(&doc.groups)?;
+    world.groups=doc.groups.clone();
     world.collision.restoring=false;
     Ok(())
 }
@@ -651,7 +674,7 @@ mod tests {
         WorldModel {
             model: None, instances: 1, unavailable: 0, unique_models: 1,
             ground_triangles: 0, ground_vram_covered: 0, ground_textured: 0,
-            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),naming:Default::default(),collision:Default::default(),foreign_vram:std::collections::HashMap::new(),
+            npcs:Vec::new(),npc_issue:None,foreign:Vec::new(),naming:Default::default(),collision:Default::default(),foreign_vram:std::collections::HashMap::new(),groups:Vec::new(),
             draws: vec![DrawInfo {
                 id: 0, terrain: false, index: 0, center:[0.0;3], radius: 1.0,
                 original_center:[0.0;3], offset:[0.0;3], rotation:[0.0;3],scale:[1.0;3], vertex_start:0,vertex_end:3,

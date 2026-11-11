@@ -19,10 +19,18 @@ pub(crate) struct Viewport {
     // Sticky until the next mouse-down, including the release frame.
     pub world_pan_dragged: bool,
     pub world_ground_edit: bool,
+    pub world_marquee_enabled: bool,
     pub world_selected: Vec<u32>,
     rendered_selection: Vec<u32>,
+    // LCK_R54_VISIBLE_PICK
+    pick_ids:Vec<u32>,
+    pick_dimensions:[usize;2],
     rendered: Option<(Camera, Shading, [usize; 2], u64, Option<u32>, bool, bool)>,
     tex: Option<TextureHandle>,
+    /// Actual rectangle and pixel dimensions used to paint the world image.
+    pub world_image: Option<(egui::Rect,[usize;2])>,
+    /// A technical marker owns LMB until release; do not pan through it.
+    pub world_marker_drag_capture: bool,
 }
 
 /// The raster camera's default Euler branch renders scene-up down on screen.
@@ -37,25 +45,331 @@ fn upright_default_camera() -> Camera {
     cam
 }
 
+// LCK_PREVIEW_LEFT_RIGHT_CAMERA_V1
+// Camera-only rotation, never modifies a model, project, or IMG.
+fn lck_rotate_preview_camera(cam:&mut Camera,direction:i32) {
+    if direction==0 {return;}
+    let angle=(direction.signum() as f32)
+        *std::f32::consts::PI/12.0;
+    cam.yaw=(cam.yaw+angle)
+        .rem_euclid(std::f32::consts::TAU);
+}
+
+#[cfg(test)]
+mod lck_preview_left_right_tests {
+    use super::*;
+
+    #[test]
+    fn arrows_rotate_only_the_preview_yaw() {
+        let mut cam=Camera::default();
+        let original=cam;
+
+        lck_rotate_preview_camera(&mut cam,1);
+
+        let expected=(original.yaw+
+            std::f32::consts::PI/12.0)
+            .rem_euclid(std::f32::consts::TAU);
+
+        assert!((cam.yaw-expected).abs()<0.00001);
+        assert_eq!(cam.pitch,original.pitch);
+        assert_eq!(cam.zoom,original.zoom);
+        assert_eq!(cam.target_offset,original.target_offset);
+
+        lck_rotate_preview_camera(&mut cam,-1);
+        assert!((cam.yaw-original.yaw).abs()<0.00001);
+    }
+
+    #[test]
+    fn complete_rotation_returns_to_start() {
+        let mut cam=Camera::default();
+        let start=cam.yaw;
+        for _ in 0..24 {
+            lck_rotate_preview_camera(&mut cam,1);
+        }
+        let difference=(cam.yaw-start).abs();
+        assert!(difference<0.0001 ||
+            (difference-std::f32::consts::TAU).abs()<0.0001);
+    }
+}
+/// Convert a PS1/world-space point to the exact displayed raster pixel.
+/// The CPU rasterizer renders at capped (possibly nonuniformly scaled)
+/// dimensions. The World Editor can vertically mirror the finished image.
+fn project_native_world_marker(
+    cam:Camera,
+    center:[f32;3],
+    radius:f32,
+    rect:egui::Rect,
+    pixels:[usize;2],
+    mirrored:bool,
+    point:[f32;3],
+)->Option<egui::Pos2>{
+    if pixels[0]==0 || pixels[1]==0 ||
+       rect.width()<=0.0 || rect.height()<=0.0 {
+        return None;
+    }
+
+    let (sy,cy)=cam.yaw.sin_cos();
+    let (sp,cp)=cam.pitch.sin_cos();
+
+    let x=point[0]-(center[0]+cam.target_offset[0]);
+    let y=point[1]-(center[1]+cam.target_offset[1]);
+    let z=point[2]-(center[2]+cam.target_offset[2]);
+
+    // Exactly the same yaw / pitch order as raster::render_highlights.
+    let x1=x*cy+z*sy;
+    let z1=-x*sy+z*cy;
+    let y2=y*cp-z1*sp;
+
+    let half_fov=22.5f32.to_radians();
+    let dist=radius/half_fov.sin()*cam.zoom.max(0.0000001);
+    let depth=y*sp+z1*cp+dist;
+    let near=(dist*0.003).max(0.0001);
+
+    if depth<=near || !depth.is_finite() {
+        return None;
+    }
+
+    let w=pixels[0] as f32;
+    let h=pixels[1] as f32;
+    let focal=(h*0.5)/half_fov.tan();
+
+    let raster_x=w*0.5+focal*x1/depth;
+    let raster_y=h*0.5+focal*y2/depth;
+
+    // flip_rgba_rows() in the World Editor mirrors vertically,
+    // AFTER the 3D projection.
+    // LCK's flip_rgba_rows reverses pixels horizontally.
+    // The marker must use the same X mirror as the rendered image.
+    let displayed_x=if mirrored {
+        w-1.0-raster_x
+    }else{
+        raster_x
+    };
+
+    // The native raster can be capped independently on X and Y.
+    // Convert its pixel coordinates to the egui image rectangle.
+    let screen=rect.min+egui::vec2(
+        displayed_x*rect.width()/w,
+        raster_y*rect.height()/h,
+    );
+
+    if !screen.x.is_finite() || !screen.y.is_finite() {
+        return None;
+    }
+
+    rect.contains(screen).then_some(screen)
+}
+
+#[cfg(test)]
+mod door_marker_projection_tests {
+    use super::*;
+
+    #[test]
+    fn raster_capping_and_horizontal_flip_match_display(){
+        let rect=egui::Rect::from_min_size(
+            egui::pos2(10.0,20.0),
+            egui::vec2(1200.0,500.0)
+        );
+        let cam=Camera{
+            yaw:0.0,
+            pitch:0.0,
+            zoom:1.0,
+            target_offset:[0.0;3],
+        };
+        let point=[100.0,30.0,0.0];
+        let pixels=[900,680];
+
+        let normal=project_native_world_marker(
+            cam,[0.0;3],150.0,rect,pixels,false,point
+        ).unwrap();
+
+        let flipped=project_native_world_marker(
+            cam,[0.0;3],150.0,rect,pixels,true,point
+        ).unwrap();
+
+        assert!((normal.y-flipped.y).abs()<0.01);
+        assert!(
+            (normal.x+flipped.x-
+             (rect.left()+rect.right()-rect.width()/pixels[0] as f32)).abs()<0.01
+        );
+
+        let dist=150.0/22.5f32.to_radians().sin();
+        let focal=340.0/22.5f32.to_radians().tan();
+        let expected_x=rect.left()+
+            (450.0+focal*100.0/dist)*1200.0/900.0;
+
+        assert!((normal.x-expected_x).abs()<0.02);
+    }
+
+    #[test]
+    fn panning_and_zoom_preserve_world_point_identity(){
+        let rect=egui::Rect::from_min_size(
+            egui::pos2(0.0,0.0),
+            egui::vec2(900.0,680.0)
+        );
+        let mut cam=Camera{
+            yaw:0.0,
+            pitch:0.0,
+            zoom:1.0,
+            target_offset:[0.0;3],
+        };
+
+        let original=project_native_world_marker(
+            cam,[0.0;3],150.0,rect,[900,680],true,
+            [100.0,0.0,0.0]
+        ).unwrap();
+
+        cam.zoom=2.0;
+        let zoomed=project_native_world_marker(
+            cam,[0.0;3],150.0,rect,[900,680],true,
+            [100.0,0.0,0.0]
+        ).unwrap();
+
+        assert!(
+            (zoomed.x-rect.center().x).abs() <
+            (original.x-rect.center().x).abs()
+        );
+
+        cam.target_offset=[100.0,0.0,0.0];
+        let centered=project_native_world_marker(
+            cam,[0.0;3],150.0,rect,[900,680],true,
+            [100.0,0.0,0.0]
+        ).unwrap();
+
+        assert!((centered.x-(rect.center().x-rect.width()/900.0)).abs()<0.01);
+    }
+}
+/// LCK_R43B_ASPECT_RATIO
+/// Preserve the displayed aspect ratio when limiting CPU raster workload.
+/// Both the renderer and hit tester consume exactly these dimensions.
+fn lck_preview_raster_size(
+    width_points: f32,
+    height_points: f32,
+    pixels_per_point: f32,
+    max_w: usize,
+    max_h: usize,
+) -> [usize; 2] {
+    let cap_w = max_w.max(16);
+    let cap_h = max_h.max(16);
+
+    let ppp = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    };
+
+    let width = (width_points * ppp).max(16.0);
+    let height = (height_points * ppp).max(16.0);
+
+    // A single scale prevents the raster from becoming stretched when
+    // its texture is displayed across the full egui viewport rectangle.
+    let factor = (cap_w as f32 / width)
+        .min(cap_h as f32 / height)
+        .min(1.0);
+
+    [
+        (width * factor).round().clamp(16.0, cap_w as f32) as usize,
+        (height * factor).round().clamp(16.0, cap_h as f32) as usize,
+    ]
+}
 impl Viewport {
+    // LCK_R54_VISIBLE_PICK
+    // Read the exact ID painted at the pointer's pixel.
+    // Mirror is presentation-only: invert X once.
+    pub fn pick_visible(
+        &self,
+        rect:egui::Rect,
+        pos:egui::Pos2
+    )->Option<u32>{
+        let [w,h]=self.pick_dimensions;
+
+        if w==0 || h==0 || !rect.contains(pos) {
+            return None;
+        }
+
+        let pixel=world_screen_pick_point(
+            rect,pos,[w,h],self.world_mirrored
+        );
+
+        if !pixel[0].is_finite() || !pixel[1].is_finite() {
+            return None;
+        }
+
+        let x=pixel[0].floor()
+            .clamp(0.0,(w-1) as f32) as usize;
+
+        let y=pixel[1].floor()
+            .clamp(0.0,(h-1) as f32) as usize;
+
+        let index=y.checked_mul(w)?.checked_add(x)?;
+
+        self.pick_ids.get(index)
+            .copied()
+            .filter(|&id|id!=u32::MAX)
+    }
     pub fn new(shading: Shading) -> Self {
         Self {
             cam: upright_default_camera(), shading, version: 0,
             world_mirrored: true,
             world_orbit_anchor: None,
             world_left_drag_selected: None,
-            world_pan_dragged: false,world_ground_edit:false,
+            world_pan_dragged: false,world_ground_edit:false,world_marquee_enabled:false,
             world_selected: Vec::new(), rendered_selection: Vec::new(),
+            pick_ids:Vec::new(), pick_dimensions:[0,0],
             rendered: None, tex: None,
+            world_image: None,
+            world_marker_drag_capture: false,
         }
     }
 
+    /// World point projection using the exact most recent world image.
+    pub(super) fn project_world_marker(
+        &self,
+        model:&Model,
+        point:[f32;3],
+    )->Option<egui::Pos2>{
+        let (rect,pixels)=self.world_image?;
+        project_native_world_marker(
+            self.cam,
+            model.center,
+            model.radius,
+            rect,
+            pixels,
+            self.world_mirrored,
+            point
+        )
+    }
     pub fn show(&mut self, ui: &mut egui::Ui, model: &Model, vram: &Vram) {
         self.show_limited(ui, model, vram, 1600, 1200);
     }
 
     /// Existing per-asset preview behavior; left-drag orbits, wheel zooms.
     pub fn show_limited(&mut self, ui: &mut egui::Ui, model: &Model, vram: &Vram, max_w: usize, max_h: usize) {
+        // Preview-only keyboard orbit. Up/Down remains owned by the
+        // repository's item-selection navigation.
+        if !ui.ctx().wants_keyboard_input() {
+            let direction=ui.ctx().input_mut(|input| {
+                if input.consume_key(
+                    egui::Modifiers::NONE,
+                    egui::Key::ArrowLeft
+                ) {
+                    -1
+                } else if input.consume_key(
+                    egui::Modifiers::NONE,
+                    egui::Key::ArrowRight
+                ) {
+                    1
+                } else {
+                    0
+                }
+            });
+
+            if direction!=0 {
+                lck_rotate_preview_camera(&mut self.cam,direction);
+                ui.ctx().request_repaint();
+            }
+        }
+
         let _ = self.show_internal(ui, model, vram, max_w, max_h, false, None, true, false);
     }
 
@@ -108,10 +422,15 @@ impl Viewport {
         // Calculate the exact same pixel resolution used by both the renderer
         // and the hit tester (no new GPU readbacks or per-frame picks).
         let ppp = ui.ctx().pixels_per_point();
-        let px = [
-            ((rect.width() * ppp) as usize).clamp(16, max_w.max(16)),
-            ((rect.height() * ppp) as usize).clamp(16, max_h.max(16)),
-        ];
+        // LCK_R43B_ASPECT_RATIO
+        // Render and picking use one uniformly scaled resolution.
+        // Never squeeze width and height independently.
+        let px = lck_preview_raster_size(
+            rect.width(), rect.height(), ppp, max_w, max_h
+        );
+        // Markers must use THIS rendered image rectangle and THIS
+        // capped raster resolution, not a guessed UI viewport size.
+        self.world_image = if world {Some((rect,px))} else {None};
         if world {
             if ui.input(|i|i.pointer.primary_pressed()) {
                 self.world_pan_dragged=false;
@@ -121,14 +440,14 @@ impl Viewport {
             // gesture immediately so the camera never jumps at drag start.
             if !ui.input(|i| i.pointer.primary_down()) {
                 self.world_left_drag_selected = None;
+                self.world_marker_drag_capture = false;
             } else if ui.input(|i| i.pointer.primary_pressed()) {
                 let alt = ui.input(|i| i.modifiers.alt);
-                self.world_left_drag_selected = if !repository_drag && !alt && resp.hovered() {
+                self.world_left_drag_selected = if !repository_drag && !alt && !self.world_marquee_enabled && resp.hovered() {
                     resp.interact_pointer_pos().and_then(|pos| {
-                        let point = world_screen_pick_point(rect, pos, px, mirror);
-                        let hit = raster::pick_instance(model, self.cam, px[0], px[1], point);
+                        let hit = self.pick_visible(rect,pos);
                         hit.filter(|id|if self.world_ground_edit {
-                            *id>=0xE000_0000 && self.world_selected.contains(id)
+                            self.world_selected.contains(id)
                         }else{
                             selected==Some(*id)||self.world_selected.contains(id)
                         })
@@ -144,10 +463,10 @@ impl Viewport {
             let left = resp.dragged_by(PointerButton::Primary);
             let delta = ui.input(|i| i.pointer.delta());
             let drag_x = if mirror { -delta.x } else { delta.x };
-            if repository_drag {
+            if repository_drag || self.world_marker_drag_capture {
                 // An asset held from All Objects owns the pointer until release;
                 // do not pan/orbit/dolly a scene while placing it.
-            } else if (middle && shift) || (left && !alt && self.world_left_drag_selected.is_none()) {
+            } else if (middle && shift) || (left && !alt && !self.world_marquee_enabled && self.world_left_drag_selected.is_none()) {
                 if left && !alt && self.world_left_drag_selected.is_none() {
                     self.world_pan_dragged=true;
                 }
@@ -209,11 +528,29 @@ impl Viewport {
         let highlight = if world { selected } else { None };
         let state = (self.cam, self.shading, px, self.version, highlight, show_ground, mirror);
         if self.rendered != Some(state) || self.rendered_selection!=self.world_selected || self.tex.is_none() {
+            // LCK_R54_VISIBLE_PICK
+            // The color image and ID image are generated together.
+            // No second triangle pass when selecting.
+            self.pick_dimensions=px;
+
             let mut rgba = if world {
-                raster::render_highlights_with_sources(model, vram, self.cam, self.shading, px[0], px[1],
-                    if self.world_selected.is_empty() {highlight.as_slice()} else {&self.world_selected}, show_ground, donor_vram)
+                let (rgba,ids)=raster::render_highlights_with_sources_and_ids(
+                    model,vram,self.cam,self.shading,px[0],px[1],
+                    if self.world_selected.is_empty(){
+                        highlight.as_slice()
+                    }else{
+                        &self.world_selected
+                    },
+                    show_ground,donor_vram
+                );
+
+                self.pick_ids=ids;
+                rgba
             } else {
-                raster::render(model, vram, self.cam, self.shading, px[0], px[1])
+                self.pick_ids.clear();
+                raster::render(
+                    model,vram,self.cam,self.shading,px[0],px[1]
+                )
             };
             if mirror {
                 flip_rgba_rows(&mut rgba, px[0]);
@@ -233,8 +570,7 @@ impl Viewport {
         }
         if world && !repository_drag && resp.hovered() && ui.input(|i|i.pointer.primary_pressed() && !i.modifiers.alt) {
             if let Some(pos) = resp.interact_pointer_pos() {
-                let screen_point = world_screen_pick_point(rect, pos, px, mirror);
-                picked = raster::pick_instance(model, self.cam, px[0], px[1], screen_point);
+                picked = self.pick_visible(rect,pos);
             }
         }
         picked
@@ -252,11 +588,16 @@ impl Viewport {
 
 /// Convert egui logical pointer coordinates to the rasterizer's native
 /// pixel coordinates. The editor's optional mirror is presentation-only.
-fn world_screen_pick_point(rect: egui::Rect, pos: egui::Pos2,
-                           px: [usize;2], mirror: bool) -> [f32;2] {
-    let screen_x = (pos.x - rect.left()) * px[0] as f32 / rect.width().max(1.0);
-    [if mirror { (px[0] as f32 - 1.0 - screen_x).max(0.0) } else { screen_x },
-     (pos.y - rect.top()) * px[1] as f32 / rect.height().max(1.0)]
+// LCK_R51_ALIGNMENT
+fn world_screen_pick_point(
+    rect: egui::Rect,
+    pos: egui::Pos2,
+    px: [usize;2],
+    mirror: bool
+) -> [f32;2] {
+    super::placement_drop::viewport_pixel(
+        rect,pos,px,mirror
+    )
 }
 
 /// Flip RGBA8 rows horizontally, without touching the native model or VRAM.
@@ -750,5 +1091,106 @@ mod upright_defaults_regression_tests {
         let cam = upright_default_camera();
         assert!(cam.pitch > std::f32::consts::FRAC_PI_2 + 0.02);
         assert!(cam.pitch < std::f32::consts::PI * 1.5 - 0.02);
+    }
+}
+
+
+#[cfg(test)]
+mod lck_r43b_aspect_tests {
+    use super::*;
+
+    fn check_aspect(
+        width: f32,
+        height: f32,
+        ppp: f32,
+        max_w: usize,
+        max_h: usize,
+    ) {
+        let px = lck_preview_raster_size(
+            width, height, ppp, max_w, max_h
+        );
+
+        assert!(px[0] >= 16 && px[0] <= max_w.max(16));
+        assert!(px[1] >= 16 && px[1] <= max_h.max(16));
+
+        let desired = width / height;
+        let actual = px[0] as f32 / px[1] as f32;
+
+        assert!(
+            (desired - actual).abs() < 0.02,
+            "Viewport aspect {desired} became {actual}: {px:?}"
+        );
+    }
+
+    #[test]
+    fn wide_world_view_keeps_its_original_aspect() {
+        let px = lck_preview_raster_size(
+            1035.0, 450.0, 1.0, 900, 680
+        );
+
+        assert_eq!(px, [900, 391]);
+
+        check_aspect(1035.0, 450.0, 1.0, 900, 680);
+    }
+
+    #[test]
+    fn tall_world_view_keeps_its_original_aspect() {
+        let px = lck_preview_raster_size(
+            800.0, 1800.0, 1.0, 900, 680
+        );
+
+        assert_eq!(px, [302, 680]);
+
+        check_aspect(800.0, 1800.0, 1.0, 900, 680);
+    }
+
+    #[test]
+    fn uncapped_view_and_high_dpi_are_proportional() {
+        assert_eq!(
+            lck_preview_raster_size(600.0, 400.0, 1.0, 900, 680),
+            [600, 400]
+        );
+
+        check_aspect(1035.0, 450.0, 2.0, 900, 680);
+        check_aspect(700.0, 500.0, 1.0, 900, 680);
+    }
+}
+
+// LCK_R54_VISIBLE_PICK
+#[cfg(test)]
+mod lck_r54_pointer_tests {
+    use super::*;
+
+    #[test]
+    fn visible_id_uses_viewport_position_and_mirror(){
+        let mut view=Viewport::new(Shading::Textured);
+
+        view.pick_dimensions=[3,3];
+        view.pick_ids=vec![u32::MAX;9];
+        view.pick_ids[3]=71337;
+
+        let rect=egui::Rect::from_min_size(
+            egui::pos2(10.0,20.0),
+            egui::vec2(30.0,30.0)
+        );
+
+        view.world_mirrored=false;
+
+        assert_eq!(
+            view.pick_visible(rect,egui::pos2(15.0,35.0)),
+            Some(71337)
+        );
+
+        view.world_mirrored=true;
+
+        assert_eq!(
+            view.pick_visible(rect,egui::pos2(35.0,35.0)),
+            Some(71337)
+        );
+
+        assert_eq!(
+            view.pick_visible(rect,egui::pos2(100.0,35.0)),
+            None
+        );
     }
 }

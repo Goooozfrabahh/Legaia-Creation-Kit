@@ -228,3 +228,12 @@ codegen-units = 1
 inherits = "release"
 lto = false
 codegen-units = 16
+
+# LCK_FAST_PROFILE_V1
+# Optimized development builds with incremental compilation.
+[profile.lck-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+opt-level = 2
+incremental = true

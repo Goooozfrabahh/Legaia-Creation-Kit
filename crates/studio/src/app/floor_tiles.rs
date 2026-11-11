@@ -20,6 +20,24 @@ pub(super) struct Face {
     pub rise: i32,
 }
 
+pub(super) fn face_name(face: Face) -> &'static str {
+    if face.span_x == 0 || face.span_z == 0 { "Vertical surface" }
+    else if face.rise != 0 { "Sloped floor tile" }
+    else if face.shape == "Flat Triangles" { "Triangular floor tile" }
+    else if face.shape.starts_with("Flat Squares") { "Square floor tile" }
+    else if face.shape == "Flat Rectangles / Strips" { "Floor strip" }
+    else { "Irregular floor tile" }
+}
+
+pub(super) fn face_name_key(base: &str, object: usize, primitive: usize) -> String {
+    format!("floor-face-v1:{base}:{object}:{primitive}")
+}
+
+pub(super) fn display_name(asset: &Asset, face: Face, names: &crate::asset_catalog::Catalog) -> String {
+    let key = face_name_key(&asset.name_key(), face.object, face.primitive);
+    names.get(&key).cloned().unwrap_or_else(|| face_name(face).to_owned())
+}
+
 pub(super) fn scan_faces(
     tmd: &legaia_tmd::Tmd,
     bytes: &[u8],
@@ -136,7 +154,7 @@ fn category(source: &str) -> (&'static str, &'static str) {
     }
 }
 
-fn matches_search(asset: &Asset, face: Face, query: &str) -> bool {
+fn matches_search(asset: &Asset, face: Face, query: &str, names: &crate::asset_catalog::Catalog) -> bool {
     if query.trim().is_empty() { return true; }
     let (area, style) = category(&asset.source);
 
@@ -161,7 +179,7 @@ fn matches_search(asset: &Asset, face: Face, query: &str) -> bool {
     let searchable = format!("{} {} {} {} {}",
         identity.replace("stone wood metal nature interior exterior", "")
             .replace("floor square flat", "floor candidate"),
-        face.shape, face.span_x, face.span_z, face.rise);
+        format!("{} {}", face.shape, display_name(asset,face,names)), face.span_x, face.span_z, face.rise).to_lowercase();
 
     query.split_whitespace().all(|word|
         searchable.contains(&word.to_lowercase())
@@ -171,42 +189,41 @@ fn matches_search(asset: &Asset, face: Face, query: &str) -> bool {
 
 /// Step through the same floor candidates shown in one source-cell
 /// Flat Squares list. Wrap around at either end.
+/// Navigate only the current leaf subgroup, clamped at the ends.
+// LCK_FLOOR_SUBGROUP_CLAMPED_V1
 pub(super) fn adjacent(
-    assets: &[Asset],
-    search: &str,
-    current: (usize, Face),
-    step: i32,
-) -> Option<(usize, Face)> {
-    let source = assets.get(current.0)?.source.as_str();
-    let mut rows = Vec::new();
+    assets:&[Asset],
+    names:&crate::asset_catalog::Catalog,
+    search:&str,
+    current:(usize,Face),
+    step:i32,
+)->Option<(usize,Face)>{
+    let source=assets.get(current.0)?.source.as_str();
+    let shape=current.1.shape;
+    let area=category(source).0;
+    let mut rows=Vec::new();
 
-    for (id, asset) in assets.iter().enumerate() {
-        if asset.source.as_str() != source ||
-           !matches!(asset.kind, Kind::Mesh(_)) {
+    for (id,asset) in assets.iter().enumerate(){
+        if asset.source!=source ||
+            !matches!(asset.kind,Kind::Mesh(_)) ||
+            category(&asset.source).0!=area {
             continue;
         }
 
         for &face in &asset.floor_faces {
-            if matches_search(asset, face, search) {
-                rows.push((id, face));
-                if rows.len() >= 150 {
-                    break;
-                }
+            if face.shape==shape && matches_search(asset,face,search,names){
+                rows.push((id,face));
             }
-        }
-
-        if rows.len() >= 150 {
-            break;
         }
     }
 
-    let index = rows.iter().position(|&row| row == current)?;
-    let next = if step > 0 {
-        (index + 1) % rows.len()
-    } else if step < 0 {
-        (index + rows.len() - 1) % rows.len()
-    } else {
-        index
+    let position=rows.iter().position(|&row|row==current)?;
+    let next=if step>0 {
+        (position+1).min(rows.len()-1)
+    }else if step<0 {
+        position.saturating_sub(1)
+    }else{
+        position
     };
 
     rows.get(next).copied()
@@ -264,6 +281,7 @@ fn floor_master(source:&str)->Option<&'static str> {
 pub(super) fn browser(
     ui: &mut egui::Ui,
     assets: &[Asset],
+    names: &crate::asset_catalog::Catalog,
     search: &str,
     selected: Option<(usize, Face)>,
     scroll_target: Option<(usize, Face)>,
@@ -278,7 +296,7 @@ pub(super) fn browser(
         }
 
         for &face in &asset.floor_faces {
-            if matches_search(asset, face, search) {
+            if matches_search(asset, face, search,names) {
                 indexed.entry((
                     asset.source_label.clone(),
                     asset.source.clone(),
@@ -373,8 +391,8 @@ pub(super) fn browser(
                                 };
 
                                 let label = format!(
-                                    "{}x{} rise {} | TMD {:03} / OBJ {} / Face {:03}{}",
-                                    face.span_x, face.span_z, face.rise,
+                                    "{} | {}x{} rise {} | TMD {:03} / OBJ {} / Face {:03}{}",
+                                    display_name(asset,*face,names), face.span_x, face.span_z, face.rise,
                                     slot,
                                     face.object,
                                     face.primitive,
@@ -545,12 +563,96 @@ pub(super) fn preview_model(
     Some(model)
 }
 
+// LCK_IMPORTED_FLOOR_NATIVE_V1
+/// Build a native TMD containing exactly the selected donor primitive.
+/// Preserve original polygon bytes, vertices, normals, UV, CLUT and TPAGE.
+pub(super) fn isolate_native_face(
+    raw:&[u8], chosen:(usize,usize)
+)->Result<Vec<u8>,String>{
+    let parsed=legaia_tmd::parse(raw)
+        .map_err(|e|format!("Parse donor TMD: {e:#}"))?;
+    let object=parsed.objects.get(chosen.0)
+        .ok_or("Donor TMD object absent")?;
+    let groups=legaia_tmd::legaia_prims::iter_groups(
+        raw,object.primitives_byte_offset,object.primitives_byte_size
+    ).map_err(|e|format!("Read original primitive: {e:#}"))?;
+    let (group,primitive)=groups.iter()
+        .flat_map(|g|g.prims.iter().map(move |p|(g,p)))
+        .nth(chosen.1)
+        .ok_or("Original TMD polygon no longer exists")?;
+    if !matches!(primitive.uvs.len(),3|4) {
+        return Err("Selected polygon is not textured".into());
+    }
+
+    let stride=primitive.bytes_size;
+    let header=raw.get(group.header_offset..group.header_offset+8)
+        .ok_or("Original group header truncated")?;
+    let prim=raw.get(primitive.bytes_offset..primitive.bytes_offset+stride)
+        .ok_or("Original primitive bytes truncated")?;
+    let foot=group.header_offset.checked_add(8)
+        .and_then(|x|x.checked_add(group.header.count as usize*stride))
+        .ok_or("Original group footer overflow")?;
+    let footer=raw.get(foot..foot+stride)
+        .ok_or("Original primitive footer truncated")?;
+
+    let prim_len=8+stride*2+4;
+    let vert_len=object.vertices.len()*8;
+    let vert_top=28u32
+        .checked_add(u32::try_from(prim_len).map_err(|e|e.to_string())?)
+        .ok_or("TMD vertex offset overflow")?;
+    let norm_top=vert_top
+        .checked_add(u32::try_from(vert_len).map_err(|e|e.to_string())?)
+        .ok_or("TMD normal offset overflow")?;
+
+    let mut out=raw.get(0..12)
+        .ok_or("TMD header missing")?.to_vec();
+    out[8..12].copy_from_slice(&1u32.to_le_bytes());
+
+    out.extend_from_slice(&vert_top.to_le_bytes());
+    out.extend_from_slice(&(object.vertices.len() as u32).to_le_bytes());
+    out.extend_from_slice(&norm_top.to_le_bytes());
+    out.extend_from_slice(&(object.normals.len() as u32).to_le_bytes());
+    out.extend_from_slice(&28u32.to_le_bytes());
+    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&object.header.scale.to_le_bytes());
+
+    let mut h=header.to_vec();
+    h[..2].copy_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&h);
+    out.extend_from_slice(prim);
+    out.extend_from_slice(footer);
+    out.extend_from_slice(&[0;4]);
+
+    for v in &object.vertices {
+        for n in [v.x,v.y,v.z,v._pad] {
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+    }
+    for v in &object.normals {
+        for n in [v.x,v.y,v.z,v._pad] {
+            out.extend_from_slice(&n.to_le_bytes());
+        }
+    }
+
+    let check=legaia_tmd::parse(&out)
+        .map_err(|e|format!("Isolated TMD invalid: {e:#}"))?;
+    let first=check.objects.first()
+        .ok_or("Isolated model empty")?;
+    let groups=legaia_tmd::legaia_prims::iter_groups(
+        &out,first.primitives_byte_offset,first.primitives_byte_size
+    ).map_err(|e|format!("Isolated primitive parse failed: {e:#}"))?;
+    if groups.iter().map(|g|g.prims.len()).sum::<usize>()!=1 {
+        return Err("TMD does not contain exactly one polygon".into());
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn arrows_follow_source_list_and_wrap() {
+    fn arrows_stop_at_source_subgroup_ends() {
         let make_face = |n| Face { shape: "Flat Squares / 128 x 128", span_x: 128, span_z: 128, rise: 0,
             object: 0,
             primitive: n,
@@ -578,23 +680,23 @@ mod tests {
         ];
 
         assert_eq!(
-            adjacent(&rows, "", (0, make_face(1)), 1),
+            adjacent(&rows, &crate::asset_catalog::Catalog::default(), "", (0, make_face(1)), 1),
             Some((0, make_face(2)))
         );
         assert_eq!(
-            adjacent(&rows, "", (0, make_face(2)), 1),
+            adjacent(&rows, &crate::asset_catalog::Catalog::default(), "", (0, make_face(2)), 1),
             Some((1, make_face(3)))
         );
         assert_eq!(
-            adjacent(&rows, "", (1, make_face(3)), 1),
+            adjacent(&rows, &crate::asset_catalog::Catalog::default(), "", (1, make_face(3)), 1),
+            Some((1, make_face(3)))
+        );
+        assert_eq!(
+            adjacent(&rows, &crate::asset_catalog::Catalog::default(), "", (0, make_face(1)), -1),
             Some((0, make_face(1)))
         );
         assert_eq!(
-            adjacent(&rows, "", (0, make_face(1)), -1),
-            Some((1, make_face(3)))
-        );
-        assert_eq!(
-            adjacent(&rows, "no-such-texture", (0, make_face(1)), 1),
+            adjacent(&rows, &crate::asset_catalog::Catalog::default(), "no-such-texture", (0, make_face(1)), 1),
             None
         );
     }
@@ -604,5 +706,29 @@ mod tests {
         assert_eq!(category("bylon").0, "Interior");
         assert_eq!(category("geremi").0, "Exterior");
         assert_eq!(category("unknown").0, "Unclassified");
+    }
+
+    #[test]
+    fn floor_names_are_shared_by_face_and_do_not_rename_the_parent_model() {
+        use crate::asset_catalog::{Catalog, Record};
+        let face = Face { object: 0, primitive: 2, y: 0, cba: 0, tsb: 0,
+            source_texture_present: true, shape: "Flat Squares / 128 x 128",
+            span_x: 128, span_z: 128, rise: 0 };
+        let asset = Asset { source: "bylon".into(), source_label: "Byron".into(),
+            label: "Doorway".into(), key: "donor".into(), alias_key: Some("visual-v1:model:palette".into()),
+            kind: Kind::Mesh(0), mesh_fingerprint: Some(1), floor_faces: vec![face] };
+        let mut names = Catalog::default();
+        names.records.insert(asset.name_key(), Record { name: "Biron Doorway".into(), ..Default::default() });
+        assert_eq!(display_name(&asset, face, &names), "Square floor tile");
+        names.records.insert(face_name_key(&asset.name_key(), 0, 2),
+            Record { name: "Carved stone floor tile".into(), ..Default::default() });
+        assert_eq!(display_name(&asset, face, &names), "Carved stone floor tile");
+        assert_eq!(asset.display_name(&names), "Biron Doorway");
+        assert!(matches_search(&asset, face, "carved floor", &names));
+        let other = Face { primitive: 3, ..face };
+        assert_eq!(display_name(&asset, other, &names), "Square floor tile");
+        assert!(!matches_search(&asset, other, "carved", &names));
+        let irregular = Face { shape: "Flat Irregular Quads", ..face };
+        assert_eq!(face_name(irregular), "Irregular floor tile");
     }
 }

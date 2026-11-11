@@ -62,6 +62,9 @@ pub(super) struct RenderUid {
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(super) struct LckProject {
+    // LCK_R57_NATIVE_WARPS
+    #[serde(default)]
+    pub native_warps: Vec<super::native_warps::SceneWarps>,
     #[serde(default)]
     pub render_uids: Vec<RenderUid>,
     #[serde(default)]
@@ -78,6 +81,8 @@ pub(super) struct LckProject {
     pub sidecars: Vec<SidecarSnapshot>,
     /// Original text is retained losslessly for rollback/compatibility, not the
     /// authority for new authoring. The database is saved in the same transaction.
+    #[serde(default)]
+    pub cell_snapshots: BTreeMap<String, String>,
     pub legacy_documents: BTreeMap<FormKey, String>,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -138,6 +143,7 @@ impl LckProject {
             format: "LCK_PROJECT_V1".into(),
             render_uids: vec![],
             next_render_uid: Default::default(),
+            native_warps: Vec::new(),
             schema_version: 1,
             file_id,
             master,
@@ -147,6 +153,7 @@ impl LckProject {
             base_adapters: Default::default(),
             collision_associations: vec![],
             sidecars: vec![],
+            cell_snapshots: Default::default(),
             legacy_documents: Default::default(),
             diagnostics: vec![],
         };
@@ -181,6 +188,18 @@ impl LckProject {
                         .resolve_base(&c.key)
                         .is_some_and(|b| b.kind == FormKind::Cell),
                 "Invalid/duplicate cell binding"
+            );
+        }
+        for (identity, raw) in &self.cell_snapshots {
+            let binding = self.cells.iter()
+                .find(|cell| &cell.identity == identity)
+                .context("Scene snapshot has no matching cell")?;
+            ensure!(
+                raw.len() <= 2_200_000 &&
+                raw.starts_with(&format!(
+                    "LCK_SCENE_V1\t{}\n", binding.source_scene
+                )),
+                "Invalid project scene snapshot"
             );
         }
         let mut identities = BTreeSet::new();

@@ -701,13 +701,64 @@ struct MovedRecord {
 
 /// Allocate only zeroed descriptors that no native grid reference uses.
 /// The search order is fixed so preflight and serialization stay deterministic.
+// LCK_R45_EXPERIMENTAL_SLOT_REUSE
+// Strict normal exports preserve original zeroed-descriptor allocation.
+// Explicit unrestricted exports may recycle a nonzero descriptor only
+// when no native MAP grid entry references its 9-bit descriptor ID.
+//
+// This is a capacity workaround, NOT proof of gameplay compatibility.
+// Script references outside the MAP grid are not proved absent.
 fn blank_object_record(map:&[u8]) -> Result<usize> {
-    let mut used=[false;512];
-    for word in map[GRID_OFF..GRID_OFF+GRID_DIM*GRID_DIM*2].chunks_exact(2) {
-        used[(u16::from_le_bytes([word[0],word[1]])&field_objects::OBJECT_INDEX_MASK) as usize]=true;
+    anyhow::ensure!(
+        map.len() >= GRID_OFF + GRID_DIM * GRID_DIM * 2
+            && map.len() >= 512 * 32,
+        "Native MAP descriptor/grid storage truncated"
+    );
+
+    let mut used = [false;512];
+
+    for word in map[
+        GRID_OFF..GRID_OFF + GRID_DIM * GRID_DIM * 2
+    ].chunks_exact(2) {
+        let id = (
+            u16::from_le_bytes([word[0],word[1]])
+            & field_objects::OBJECT_INDEX_MASK
+        ) as usize;
+        used[id] = true;
     }
-    (4..512).rev().find(|&id|!used[id] && map[id*32..id*32+32].iter().all(|&b|b==0))
-        .context("No completely blank and unreferenced 32-byte native object slot remains")
+
+    // First preference: original strict allocation.
+    if let Some(id) = (4..512).rev().find(|&id| {
+        !used[id]
+            && map[id*32..id*32+32].iter().all(|&b|b==0)
+    }) {
+        return Ok(id);
+    }
+
+    // R4.5 experimental fallback. The selected slot can contain stale
+    // native bytes but has no references in the MAP object-index grid.
+    // Its complete 32-byte descriptor is replaced by the new object.
+    if unrestricted::active() {
+        if let Some(id) = (4..512).rev().find(|&id|!used[id]) {
+            unrestricted::diagnostic(format!(
+                "LCK R4.5 EXPERIMENTAL DESCRIPTOR REUSE: \
+                 slot {id} was nonzero but has no MAP grid references. \
+                 Overwriting its 32 bytes in the NEW output IMG. \
+                 External MAN/script references are not verified absent; \
+                 native visibility, collision, walkability and runtime \
+                 behavior require DuckStation testing."
+            ));
+            return Ok(id);
+        }
+    }
+
+    // Every representable descriptor is already referenced, or this
+    // is a strict export. The 9-bit native ID cannot encode slot 512.
+    anyhow::bail!(
+        "No completely blank and unreferenced 32-byte native object \
+         slot remains; unrestricted reuse also found no grid-unreferenced \
+         descriptor. Native 9-bit capacity is exhausted."
+    )
 }
 
 fn move_originals(map:&mut [u8], edits:&[MoveEdit]) -> Result<Vec<MovedRecord>> {
@@ -1172,9 +1223,132 @@ fn compile_man_npcs(original:&[u8],edits:&[NpcEdit])->Result<Vec<u8>> {
     Ok(updated)
 }
 
+/// LCK_NPC_SLOT_PRESERVING_V5
+/// Experimental *slot-preserving disable*, not record compaction.
+/// P1 indices, offsets, N1, every other actor record, and all sections stay fixed.
+/// Retail's off-map (0x7f,0x7f) tile parks conditional/despawned actors.
+/// The two first spawn-script bytes are made 0x21 (end/stop) to block a
+/// cold-load relocation back into view; original script tail remains intact.
+/// This may suppress story side effects of the selected actor. Gameplay unverified.
+fn lck_park_native_npc_slots(decoded: &[u8], records: &[usize]) -> Result<Vec<u8>> {
+    use std::collections::BTreeSet;
+    ensure!(!records.is_empty(), "No MAN actor disable request");
+    let mf = man_section::parse(decoded).map_err(anyhow::Error::msg)?;
+    let old_count = mf.partitions[1].len();
+    let selected = records.iter().copied().collect::<BTreeSet<_>>();
+    ensure!(selected.len() == records.len(), "Duplicate MAN actor disable request");
+    let mut rewritten = decoded.to_vec();
+    let mut allowed = BTreeSet::new();
+    for &actor in &selected {
+        ensure!(actor > 0 && actor < old_count,
+            "MAN actor #{actor} is invalid or is the protected scene controller");
+        let p = mf.actor_placement(decoded, actor)
+            .with_context(||format!("MAN actor #{actor} has no valid placement"))?;
+        let count = mf.partitions.iter().flat_map(|part|part.iter())
+            .filter(|&&relative| mf.data_region_offset + relative as usize == p.record_offset)
+            .count();
+        ensure!(count == 1,
+            "MAN actor #{actor} shares a record body; disabling would affect another script");
+        let header = p.record_offset + 1 + p.local_count * 2;
+        let pc = p.record_offset + p.script_pc0;
+        let end = man_actor_record_end(&mf, decoded.len(), p.record_offset);
+        ensure!(header + 4 == pc && pc + 1 < end,
+            "MAN actor #{actor} lacks two writable spawn-script bytes");
+        // Keep model and animation selectors unchanged. Only park X and Z.
+        rewritten[header + 2] = 0x7f;
+        rewritten[header + 3] = 0x7f;
+        // 0x21 terminates the spawn section in the verified field VM.
+        // A second stop makes the interaction continuation stop too.
+        rewritten[pc] = 0x21;
+        rewritten[pc + 1] = 0x21;
+        allowed.extend([header + 2, header + 3, pc, pc + 1]);
+    }
+    let after = man_section::parse(&rewritten).map_err(anyhow::Error::msg)?;
+    ensure!(after.header.partition_counts == mf.header.partition_counts
+            && after.partitions == mf.partitions
+            && after.data_region_offset == mf.data_region_offset,
+        "Slot disable changed MAN counts, table, or actor identities");
+    ensure!(after.sections.iter().zip(mf.sections.iter()).all(|(a,b)|
+            a.offset == b.offset && a.length == b.length),
+        "Slot disable changed MAN section addresses");
+    for (at, (&was, &now)) in decoded.iter().zip(rewritten.iter()).enumerate() {
+        ensure!(was == now || allowed.contains(&at),
+            "Slot disable unexpectedly modified unrelated MAN byte {at:#x}");
+    }
+    for &actor in &selected {
+        let p = after.actor_placement(&rewritten, actor)
+            .context("Parked actor vanished from fixed MAN table")?;
+        ensure!(p.tile_x == 0x7f && p.tile_z == 0x7f,
+            "Parked actor tile failed readback");
+    }
+    Ok(rewritten)
+}
+
+pub(super) fn experimental_remove_native_npcs(
+    disc: &mut DiscPatcher,
+    map_entry: usize,
+    records: &[usize],
+) -> Result<String> {
+    let (entry, offset, budget, _slot, decoded) = find_native_man(disc, map_entry)?;
+    let rewritten = lck_park_native_npc_slots(&decoded, records)?;
+    ensure!(rewritten.len() == decoded.len(),
+        "Slot-preserving disable must not resize the MAN payload");
+    let compressed = compress_within(&rewritten, budget)
+        .context("Parked MAN could not fit original compressed carrier budget")?;
+    let mut candidate = DiscPatcher::open(disc.image().to_vec())?;
+    // Same decoded byte count: DO NOT change MAN size descriptor, P1 count,
+    // bundle total, following actor indices, or scene section offsets.
+    candidate.patch_prot_entry(entry, offset as u64, &compressed)?;
+    let readback = candidate.read_entry_footprint(entry)?;
+    let (again, _) = legaia_lzs::decompress_tracked(&readback[offset..], rewritten.len())?;
+    ensure!(again == rewritten, "MAN parking failed physical IMG readback");
+    *disc = candidate;
+    Ok(format!(
+        "WRITTEN MAN ACTOR SLOT DISABLE {:?}: P1 count unchanged; preserved all actor IDs and sections. Selected actors parked at (0x7f,0x7f), spawn prologue stopped; behavior/gameplay unverified",
+        records
+    ))
+}
+
+#[cfg(test)]
+#[test]
+fn lck_slot_preserving_park_roundtrip() {
+    let records: [&[u8]; 4] = [
+        &[0, 0, 0, 0, 0, 0x21],
+        &[0, 2, 1, 3, 4, 0x23, 3, 4, 0x21, 0x21],
+        &[0, 3, 1, 5, 6, 0x21, 0x21],
+        &[0, 4, 1, 7, 8, 0x23, 7, 8, 0x21],
+    ];
+    let mut man = vec![0u8; man_section::RECORDS_BEGIN_OFFSET];
+    man[0x24..0x26].copy_from_slice(&4i16.to_le_bytes());
+    let mut relative = 0u32;
+    for body in &records {
+        man.extend_from_slice(&relative.to_le_bytes()[..3]);
+        relative += body.len() as u32;
+    }
+    man[0x28..0x2b].copy_from_slice(&relative.to_le_bytes()[..3]);
+    for body in &records { man.extend_from_slice(body); }
+    man.extend_from_slice(&[0; 18]); // Six zero-length MAN sections.
+    let before = man_section::parse(&man).expect("Synthetic MAN is valid");
+    let result = lck_park_native_npc_slots(&man, &[1,3]).expect("Park actors 1 and 3");
+    let after = man_section::parse(&result).expect("Parked MAN must reparse");
+    assert_eq!(result.len(), man.len());
+    assert_eq!(before.partitions, after.partitions);
+    assert_eq!(before.header.partition_counts, after.header.partition_counts);
+    assert_eq!(&result[..before.data_region_offset], &man[..before.data_region_offset]);
+    assert_eq!(&result[before.sections[0].offset..], &man[before.sections[0].offset..]);
+    for id in [1usize, 3] {
+        let p = after.actor_placement(&result, id).expect("Actor ID survives");
+        assert_eq!((p.tile_x, p.tile_z), (0x7f, 0x7f));
+        assert_eq!(&result[p.record_offset + p.script_pc0..][..2], &[0x21, 0x21]);
+    }
+    let intact = before.actor_placement(&man, 2).expect("Untouched actor");
+    let unchanged_end = man_actor_record_end(&before, man.len(), intact.record_offset);
+    assert_eq!(&result[intact.record_offset..unchanged_end],
+        &man[intact.record_offset..unchanged_end]);
+}
 /// Find the selected scene's native MAN-bearing bundle, which is a separate
 /// PROT entry from the MAP. Validate exactly one bundle in the nearby block.
-fn find_native_man(disc:&DiscPatcher,map_entry:usize)->Result<(usize,usize,usize,usize,Vec<u8>)> {
+pub(in crate::app) fn find_native_man(disc:&DiscPatcher,map_entry:usize)->Result<(usize,usize,usize,usize,Vec<u8>)> {
     let mut options=Vec::new();
     for idx in map_entry+1..map_entry+7 {
         let Ok(entry)=disc.read_entry_footprint(idx) else {break};
@@ -1452,7 +1626,18 @@ pub(super) fn prepare_project(source:&Path, scene:&AssembledScene,
     world.npcs.retain(|n|!removed.contains(&n.key));world.foreign.retain(|f|!animated_uids.contains(&f.uid));
     world.collision.mesh_recipes.retain(|uid,_|!animated_uids.contains(uid));
     let mut gaps=session.export_gaps();
-    if let Some(warning)=&world.collision.ownership_warning {gaps.push(warning.clone());}
+    if let Some(warning)=&world.collision.ownership_warning {
+        let stale_sidecar =
+            warning.contains("Collision sidecar belongs to another IMG revision");
+
+        if !unrestricted || !stale_sidecar {
+            gaps.push(warning.clone());
+        }
+        // Unrestricted stale-sidecar handling is performed by
+        // native_wall_export::capture_with_metadata.
+        // Its debug report records the discarded journal and
+        // does not claim that previous collision is recovered.
+    }
     if !unrestricted {ensure!(gaps.is_empty(), "Project native serializers unresolved: {}",gaps.join("; "));}
     let metadata=session.preserved_collision_metadata()?;
     let mut plan=if unrestricted {unrestricted::prepare_with_metadata(source,scene,&world,index,metadata.as_deref())?}
@@ -1660,13 +1845,13 @@ impl NativeExportPlan {
         if unrestricted::active(){unrestricted::diagnostic(format!("VRAM allocation protects {} runtime/CLUT-walk rectangles, existing ordered uploads, assembled destination resources and boot-resident uploads; unrestricted object export remains enabled",reservations.len()));}
         if let Some(observed)=observations {planner.reserve_observations(observed)?;}
         for foreign in foreign {
-            export_check!(foreign.kind=="placement" || foreign.kind=="mesh" || (unrestricted::active()&&foreign.kind=="terrain"),"Foreign UID {} category {} requires a native actor/terrain/behavior writer",foreign.uid,foreign.kind);
+            export_check!(foreign.kind=="placement" || foreign.kind=="mesh" || super::floor_tiles::decode_floor_kind(&foreign.kind).is_some() || (unrestricted::active()&&foreign.kind=="terrain"),"Foreign UID {} category {} requires a native actor/terrain/behavior writer",foreign.uid,foreign.kind);
             let cached=world.foreign.iter().find(|f|f.uid==foreign.uid).context("Persisted foreign UID has no provenance")?;
             export_check!(cached.source==foreign.source&&cached.kind==foreign.kind&&cached.record==foreign.record,"Foreign provenance identity mismatch");
             let native=Scene::load(index,&foreign.source)?;
             let assembled=legaia_engine_world_views::scene_staging::assemble_field_scene(index,&foreign.source).map_err(anyhow::Error::msg)?;
-            let terrain=foreign.kind=="terrain";
-            let mesh=foreign.kind=="mesh";
+            let terrain=foreign.kind=="terrain";let floor_face=super::floor_tiles::decode_floor_kind(&foreign.kind);
+            let mesh=foreign.kind=="mesh" || floor_face.is_some();
             let placed=if mesh {None}else if terrain {assembled.terrain.get(foreign.record)}else{assembled.placements.get(foreign.record)};
             export_check!(mesh || placed.is_some(),"Persisted donor native MAP draw missing");
             let donor_map=native.field_map_index(index).context("No donor native MAP")? as usize;
@@ -1691,7 +1876,7 @@ impl NativeExportPlan {
             let model_entry=match source {
                 legaia_engine_scene::model_bank::ModelSource::BundlePack{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::BundleSingle{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::StreamPack{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::StreamSingle{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::WalkedPack{entry_idx,..}|legaia_engine_scene::model_bank::ModelSource::WalkedSingle{entry_idx,..}=>entry_idx,
             };
-            let mut inventory=NativeAssetPlan::default();let id=inventory.register(ResourceKind::Tmd,model,Origin{scene:foreign.source.clone(),entry:Some(model_entry),offset:None},false)?;
+            let selected_model=if let Some(face)=floor_face {super::floor_tiles::isolate_native_face(model,face).map_err(anyhow::Error::msg)?}else{model.to_vec()};let mut inventory=NativeAssetPlan::default();let id=inventory.register(ResourceKind::Tmd,&selected_model,Origin{scene:foreign.source.clone(),entry:Some(model_entry),offset:None},false)?;
             let context=super::native_asset_plan::static_resources::resolve_context(index,&native)?;
             let canonical=context.dependencies(&native,u16::try_from(selector)?,model)?;
             if unrestricted::active(){unrestricted::diagnostic(format!("NATIVE DONOR RESOLVED UID {}: selector {} -> {source:?}; exact TMD {} bytes SHA256 {}; canonical static dependencies {}",foreign.uid,selector,model.len(),id.sha256,serde_json::to_string(&canonical)?));}
@@ -2148,7 +2333,7 @@ pub(super) mod tests {
         let world=WorldModel {model:None, instances:1, unavailable:0, unique_models:0,
             ground_triangles:0, ground_vram_covered:0, ground_textured:0,
             draws:vec![draw], npcs:vec![npc], npc_issue:None, foreign:vec![],
-            naming:Default::default(),collision:Default::default(),foreign_vram:Default::default()};
+            naming:Default::default(),collision:Default::default(),foreign_vram:Default::default(),groups:Vec::new()};
         (scene,world)
     }
 
@@ -2916,3 +3101,76 @@ mod stage_a_export_repair_tests;
 #[cfg(test)]
 #[path="static_placement_tests.rs"]
 mod static_placement_tests;
+
+
+// LCK_R45_EXPERIMENTAL_SLOT_REUSE regression coverage.
+#[cfg(test)]
+mod lck_r45_unrestricted_slot_tests {
+    use super::*;
+
+    #[test]
+    fn strict_export_rejects_nonblank_unreferenced_records() {
+        let mut map=vec![0u8;MAP_LEN];
+
+        // No descriptor in the allocatable range is blank.
+        for id in 4..512 {
+            map[id*32]=0xA5;
+        }
+
+        assert!(blank_object_record(&map).is_err());
+    }
+
+    #[test]
+    fn unrestricted_export_recycles_only_grid_unreferenced_id() {
+        let mut map=vec![0u8;MAP_LEN];
+
+        for id in 4..512 {
+            map[id*32]=0xA5;
+        }
+
+        // Reserve descriptor 511 in the grid.
+        let at=GRID_OFF+128;
+        map[at..at+2].copy_from_slice(&511u16.to_le_bytes());
+
+        unrestricted::with_test_scope(||{
+            let allocated=blank_object_record(&map).unwrap();
+
+            // 511 is referenced; 510 is next available.
+            assert_eq!(allocated,510);
+        });
+    }
+
+    #[test]
+    fn unrestricted_export_does_not_overwrite_referenced_ids() {
+        let mut map=vec![0u8;MAP_LEN];
+
+        // Occupy every allocatable descriptor in the actual MAP grid.
+        for id in 4..512 {
+            map[id*32]=0xA5;
+
+            let at=GRID_OFF+(id-4)*2;
+            map[at..at+2].copy_from_slice(
+                &(id as u16).to_le_bytes()
+            );
+        }
+
+        unrestricted::with_test_scope(||{
+            assert!(blank_object_record(&map).is_err());
+        });
+    }
+
+    #[test]
+    fn blank_unreferenced_slot_is_preferred_to_recycled_nonblank() {
+        let mut map=vec![0u8;MAP_LEN];
+
+        for id in 4..512 {
+            map[id*32]=0xA5;
+        }
+
+        map[42*32]=0;
+
+        unrestricted::with_test_scope(||{
+            assert_eq!(blank_object_record(&map).unwrap(),42);
+        });
+    }
+}

@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+encoding_rs.workspace = true
 dirs.workspace = true
 eframe.workspace = true
 log.workspace = true
