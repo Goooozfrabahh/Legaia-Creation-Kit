@@ -420,12 +420,67 @@ mod lck_trigger_inspector_tests {
         );
     }
 }
+#[derive(Clone)]
+struct R604MarkerDrag {
+    uid:u64,
+    start:egui::Pos2,
+    anchor:[f32;3],
+    source:[u8;2],
+    changed:bool,
+}
+// LCK_R605_OTHER_TRIGGERS
+// Read-only provenance for kind-1 gate-0 and kind-2 MAP records.
+// These are not automatically doorway teleports.
+#[derive(Clone,Debug,Hash)]
+struct R605NativeTrigger {
+    kind:u8,
+    gate:u8,
+    tile:[u8;2],
+    record:u8,
+    extra:u8,
+    fallback:bool,
+    row:usize,
+    // Descriptor, object-world X/Z, contact-world X/Z.
+    objects:Vec<(u16,[i16;2],[i16;2])>,
+}
+
+fn lck_r605_kind2(block:&[u8])->Vec<[u8;4]> {
+    if block.len()<14 {
+        return Vec::new();
+    }
+
+    let offset=i16::from_le_bytes([block[10],block[11]]);
+    let count=i16::from_le_bytes([block[12],block[13]]);
+
+    if offset<14 || count<=0 {
+        return Vec::new();
+    }
+
+    let start=offset as usize;
+
+    let Some(end)=start.checked_add(count as usize*4)
+    else {
+        return Vec::new();
+    };
+
+    if end>block.len() {
+        return Vec::new();
+    }
+
+    block[start..end]
+        .chunks_exact(4)
+        .map(|b|[b[0],b[1],b[2],b[3]])
+        .collect()
+}
 #[derive(Clone,Default)]
 pub(super) struct State {
     pub scene:String,
     inspector_scripts:BTreeMap<u8,ScriptSummary>,
+    other_triggers:Vec<R605NativeTrigger>,
     marker_menu:Option<(u64,egui::Pos2)>,
     marker_properties:Option<u64>,
+    r604_marker_drag:Option<R604MarkerDrag>,
+    r604_marker_focus:bool,
     pub marker_right_consumed:bool,
     records:Vec<Door>,
     original:Vec<Door>,
@@ -556,6 +611,11 @@ impl State {
             legaia_engine_field::field_regions::
                 parse_tile_triggers(&fallback);
 
+        // Keep actual MAP objects separate from trigger lookup tiles.
+        let native_objects=
+            legaia_engine_field::field_regions::
+                parse_map_objects(&map);
+
         let mut sites=
             BTreeMap::<u8,Vec<man_edit::SceneChangeSite>>::new();
 
@@ -602,6 +662,32 @@ impl State {
         ] {
             for (row,d) in rows.into_iter().enumerate() {
                 if d.gate!=1 {
+                    let objects=if d.gate==0 {
+                        native_objects.iter()
+                            .filter(|o|
+                                o.key_tile==(d.tile_x,d.tile_z)
+                            )
+                            .map(|o|(
+                                o.descriptor,
+                                [o.world.0,o.world.1],
+                                [o.contact.0,o.contact.1]
+                            ))
+                            .collect()
+                    }else{
+                        Vec::new()
+                    };
+
+                    state.other_triggers.push(R605NativeTrigger{
+                        kind:1,
+                        gate:d.gate,
+                        tile:[d.tile_x,d.tile_z],
+                        record:d.record,
+                        extra:0,
+                        fallback,
+                        row,
+                        objects,
+                    });
+
                     continue;
                 }
 
@@ -636,6 +722,28 @@ impl State {
                         op_pc:site.map(|s|s.op_pc),
                         destination,
                     },
+                });
+            }
+        }
+
+        // Native kind-2 records are retained as read-only diagnostics.
+        // No serializer or behavioral meaning is invented.
+        for (fallback,block) in [
+            (false,&map[0x10000..0x12000]),
+            (true,&fallback[..])
+        ] {
+            for (row,raw) in lck_r605_kind2(block)
+                .into_iter().enumerate()
+            {
+                state.other_triggers.push(R605NativeTrigger{
+                    kind:2,
+                    gate:255,
+                    tile:[raw[0],raw[1]],
+                    record:raw[2],
+                    extra:raw[3],
+                    fallback,
+                    row,
+                    objects:Vec::new(),
                 });
             }
         }
@@ -1436,6 +1544,301 @@ impl State {
 
         names.into_iter().collect()
     }
+    // LCK_R606_NAMED_EVENT_HIERARCHY
+    // Native names are evidence, not proof that the record represents
+    // a physical door mesh. Never replace an original identifier.
+    fn r606_man_name(record:&ScriptSummary)->String {
+        match record.native_name.as_deref() {
+            Some(raw) if !raw.trim().is_empty()=>{
+                match super::descriptive_names::description(raw) {
+                    Some(noun)=>format!("{noun} — {raw}"),
+                    None=>raw.to_owned(),
+                }
+            },
+            _=>format!(
+                "Unlabeled MAN record #{} (P{})",
+                record.flat_index,record.partition
+            ),
+        }
+    }
+
+    fn r606_script_for(&self,door:&Door)->Option<&ScriptSummary> {
+        let Kind::Script{slot,op_pc,..}=&door.kind else {
+            return None
+        };
+
+        if let Some(pc)=op_pc {
+            return self.inspector_scripts.values().find(|s|
+                s.script_start<=*pc && *pc<s.record_end
+            );
+        }
+
+        slot.and_then(|id|self.inspector_scripts.get(&id))
+            .filter(|s|s.partition==2)
+    }
+
+    fn r606_door_label(&self,door:&Door)->String {
+        if !door.label.trim().is_empty(){
+            return format!("{} [editor name]",door.label.trim());
+        }
+
+        match &door.kind {
+            Kind::Local{half_x,half_z}=>format!(
+                "Unnamed interior warp → landing ({half_x},{half_z}) [half-tiles]"
+            ),
+
+            Kind::Script{slot,op_pc,destination}=>{
+                let native=self.r606_script_for(door)
+                    .map(Self::r606_man_name)
+                    .unwrap_or_else(||format!(
+                        "Unnamed MAN trigger (operand {:?}, opcode {:?})",
+                        slot,op_pc
+                    ));
+
+                let verified=op_pc.and_then(|pc|
+                    self.inspector_scripts.values().find(|s|
+                        s.script_start<=pc && pc<s.record_end
+                    )
+                ).is_some();
+
+                if verified {
+                    if let Some(dest)=destination {
+                        let friendly=crate::place_name(&dest.name)
+                            .unwrap_or(dest.name.as_str());
+
+                        return format!(
+                            "{native} → {friendly} [{}]",
+                            dest.name
+                        );
+                    }
+                }
+
+                native
+            }
+        }
+    }
+
+    fn r606_door_group(door:&Door)->usize {
+        if !door.enabled {return 5;}
+
+        if matches!(&door.origin,Origin::New) {
+            return 4;
+        }
+
+        if matches!(&door.origin,Origin::ScriptOnly{..}) {
+            return 3;
+        }
+
+        match &door.kind {
+            Kind::Local{..}=>0,
+            Kind::Script{slot:Some(_),..}=>1,
+            Kind::Script{..}=>2,
+        }
+    }
+
+    pub(super) fn named_hierarchy(
+        &mut self,
+        ui:&mut egui::Ui,
+        filter:&str
+    ){
+        ui.small(
+            "Native MAN names first; verified descriptive translations appear alongside Japanese labels. MAP-only records may have no native name."
+        );
+
+        let mut select=None;
+
+        let groups=[
+            "Local / Interior Warps",
+            "Walk-on MAN Triggers",
+            "Other Script-bound Triggers",
+            "Standalone MAN Scene Changes",
+            "New Editor Triggers",
+            "Disabled / Removed Triggers",
+        ];
+
+        for (category,title) in groups.iter().enumerate() {
+            let count=self.records.iter()
+                .filter(|d|Self::r606_door_group(d)==category)
+                .count();
+
+            egui::CollapsingHeader::new(format!("{title} ({count})"))
+                .default_open(false)
+                .show(ui,|ui|{
+                    for door in self.records.iter()
+                        .filter(|d|Self::r606_door_group(d)==category)
+                    {
+                        let name=self.r606_door_label(door);
+
+                        let label=format!(
+                            "{name} | UID {} | MAP tile ({},{}) | {:?}",
+                            door.uid,
+                            door.source[0],
+                            door.source[1],
+                            door.origin
+                        );
+
+                        if !filter.is_empty()
+                            && !label.to_lowercase().contains(filter)
+                        {
+                            continue;
+                        }
+
+                        if ui.selectable_label(
+                            self.selected==Some(door.uid),label
+                        ).clicked(){
+                            select=Some(door.uid);
+                        }
+                    }
+                });
+        }
+
+        if let Some(uid)=select {
+            self.selected=Some(uid);
+            self.marker_properties=Some(uid);
+        }
+
+        let extra_groups=[
+            "Object-bound Script Contacts (MAP gate 0)",
+            "MAP Kind-2 Records (unverified function)",
+            "Other MAP Trigger Gates",
+        ];
+
+        for (category,title) in extra_groups.iter().enumerate(){
+            let matches_kind=|t:&R605NativeTrigger|match category {
+                0=>t.kind==1 && t.gate==0,
+                1=>t.kind==2,
+                _=>t.kind==1 && t.gate!=0 && t.gate!=1,
+            };
+
+            let count=self.other_triggers.iter()
+                .filter(|t|matches_kind(t))
+                .count();
+
+            egui::CollapsingHeader::new(format!("{title} ({count})"))
+                .default_open(false)
+                .show(ui,|ui|{
+                    for t in self.other_triggers.iter()
+                        .filter(|t|matches_kind(t))
+                    {
+                        // MAP gate-0's operand identifies a P0 object
+                        // binding. Do not use it as a P2 script name.
+                        let native=if t.kind==1 && t.gate==0 {
+                            self.inspector_scripts.get(&t.record)
+                                .filter(|s|s.partition==0)
+                                .map(Self::r606_man_name)
+                        }else{
+                            None
+                        };
+
+                        let name=native.unwrap_or_else(||match category {
+                            0=>"Unnamed object-binding trigger".into(),
+                            1=>"Unnamed MAP kind-2 record".into(),
+                            _=>"Unknown MAP gate record".into(),
+                        });
+
+                        let bank=if t.fallback {
+                            "fallback"
+                        }else{
+                            "primary"
+                        };
+
+                        let label=format!(
+                            "{name} | {bank} row {} | tile ({},{}) | native operand {} | gate {} | raw {}",
+                            t.row,
+                            t.tile[0],
+                            t.tile[1],
+                            t.record,
+                            t.gate,
+                            t.extra
+                        );
+
+                        if !filter.is_empty()
+                            && !label.to_lowercase().contains(filter)
+                        {
+                            continue;
+                        }
+
+                        ui.label(label);
+
+                        for (descriptor,world,contact) in &t.objects {
+                            ui.small(format!(
+                                "MAP descriptor {descriptor} | object X/Z ({},{}) | contact X/Z ({},{})",
+                                world[0],world[1],
+                                contact[0],contact[1]
+                            ));
+                        }
+                    }
+                });
+        }
+
+        let partitions=[
+            "MAN P0 — Named Objects / Bindings",
+            "MAN P1 — Field Actors",
+            "MAN P2 — Script / Event Records",
+        ];
+
+        for (partition,title) in partitions.iter().enumerate(){
+            let count=self.inspector_scripts.values()
+                .filter(|s|s.partition==partition)
+                .count();
+
+            egui::CollapsingHeader::new(format!("{title} ({count})"))
+                .default_open(false)
+                .show(ui,|ui|{
+                    for script in self.inspector_scripts.values()
+                        .filter(|s|s.partition==partition)
+                    {
+                        let name=Self::r606_man_name(script);
+
+                        let label=format!(
+                            "{name} | flat MAN #{} | +0x{:X}..+0x{:X}",
+                            script.flat_index,
+                            script.script_start,
+                            script.record_end
+                        );
+
+                        if !filter.is_empty()
+                            && !label.to_lowercase().contains(filter)
+                        {
+                            continue;
+                        }
+
+                        ui.label(label);
+                    }
+                });
+        }
+
+        let refs=self.inspector_scripts.values()
+            .map(|s|s.flags.len())
+            .sum::<usize>();
+
+        egui::CollapsingHeader::new(
+            format!("Story / Condition Flag References ({refs})")
+        )
+        .default_open(false)
+        .show(ui,|ui|{
+            ui.small(
+                "Read-only references, not evaluated runtime story conditions."
+            );
+
+            for script in self.inspector_scripts.values(){
+                let name=Self::r606_man_name(script);
+
+                for reference in &script.flags {
+                    let label=format!(
+                        "{name} | MAN #{} | {reference}",
+                        script.flat_index
+                    );
+
+                    if filter.is_empty()
+                        || label.to_lowercase().contains(filter)
+                    {
+                        ui.label(label);
+                    }
+                }
+            }
+        });
+    }
     pub fn ui(
         &mut self,
         ui:&mut egui::Ui,
@@ -1483,6 +1886,51 @@ impl State {
 
                 if ui.button("Redo door edit").clicked() {
                     self.redo();
+                }
+            });
+
+            ui.separator();
+
+            egui::CollapsingHeader::new(format!(
+                "Additional MAP Triggers ({})",
+                self.other_triggers.len()
+            ))
+            .default_open(false)
+            .show(ui,|ui|{
+                ui.small(
+                    "Read-only native records. Object binds and kind-2 records are not automatically player teleports."
+                );
+
+                for trigger in &self.other_triggers {
+                    let bank=if trigger.fallback {
+                        "fallback"
+                    }else{
+                        "primary"
+                    };
+
+                    let category=match (trigger.kind,trigger.gate) {
+                        (1,0)=>"Object script binding",
+                        (2,_)=>"MAP kind-2 record",
+                        _=>"Other gate value",
+                    };
+
+                    ui.label(format!(
+                        "{category} | {bank} row {} | tile ({},{}) | MAN/record {} | gate {} | raw extra {}",
+                        trigger.row,
+                        trigger.tile[0],
+                        trigger.tile[1],
+                        trigger.record,
+                        trigger.gate,
+                        trigger.extra
+                    ));
+
+                    for (descriptor,world,contact) in &trigger.objects {
+                        ui.small(format!(
+                            "    MAP descriptor {descriptor} | object ({},{}) | contact ({},{})",
+                            world[0],world[1],
+                            contact[0],contact[1]
+                        ));
+                    }
                 }
             });
 
@@ -1840,7 +2288,7 @@ impl State {
                 continue;
             };
 
-            let radius=9.0;
+            let radius=18.0;
 
             let hover=pointer.is_some_and(|p|
                 p.distance(pos)<radius
@@ -1864,12 +2312,95 @@ impl State {
             // LCK_R58_WORLD_MARKERS: visual geometry is rendered in 3D above.
         }
 
+        if ui.input(|i|i.pointer.primary_pressed()) && click.is_none(){
+            self.r604_marker_focus=false;
+            self.r604_marker_drag=None;
+        }
+
         if let Some(uid)=click {
             self.selected=Some(uid);
+            self.r604_marker_focus=true;
+
+            if let (Some(start),Some(d))=(
+                pointer,
+                self.records.iter().find(|d|d.uid==uid)
+            ){
+                let x=(d.source[0] as f32+d.size[0] as f32*0.5)*128.0;
+                let z=(d.source[1] as f32+d.size[1] as f32*0.5)*128.0;
+
+                self.r604_marker_drag=Some(R604MarkerDrag{
+                    uid,
+                    start,
+                    anchor:[
+                        x,native_door_floor_y(ground,x,z)+LCK_R58_GIZMO_LIFT,z
+                    ],
+                    source:d.source,
+                    changed:false
+                });
+            }
+        }
+
+        if let Some(drag)=self.r604_marker_drag.clone(){
+            if !ui.input(|i|i.pointer.primary_down()){
+                self.r604_marker_drag=None;
+            }else if let Some(pos)=pointer {
+                if (pos-drag.start).length_sq()>36.0 {
+                    let delta=super::drag_anchor::horizontal_delta(
+                        ui,rect,model,view.cam,
+                        drag.start,pos,drag.anchor,view.world_mirrored
+                    );
+
+                    if let Some(current)=self.records.iter()
+                        .find(|d|d.uid==drag.uid)
+                    {
+                        let max_x=(128-current.size[0] as i32).max(0);
+                        let max_z=(128-current.size[1] as i32).max(0);
+
+                        let next=[
+                            (drag.source[0] as i32
+                                +(delta[0]/128.0).round() as i32)
+                                .clamp(0,max_x) as u8,
+                            (drag.source[1] as i32
+                                +(delta[2]/128.0).round() as i32)
+                                .clamp(0,max_z) as u8
+                        ];
+
+                        if next!=current.source {
+                            if !drag.changed {
+                                self.remember();
+                            }
+
+                            if let Some(d)=self.records.iter_mut()
+                                .find(|d|d.uid==drag.uid)
+                            {
+                                d.source=next;
+                            }
+
+                            if let Some(active)=self.r604_marker_drag.as_mut(){
+                                active.changed=true;
+                            }
+
+                            hit=true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.r604_marker_focus
+            && !ui.ctx().wants_keyboard_input()
+            && ui.input_mut(|i|i.consume_key(
+                egui::Modifiers::NONE,egui::Key::Delete
+            ))
+        {
+            self.delete_selected();
+            self.r604_marker_drag=None;
+            self.r604_marker_focus=false;
+            hit=true;
         }
 
         self.native_marker_context_ui(ui.ctx());
-        hit
+        hit || self.r604_marker_drag.is_some()
     }
 
     fn collect_man_edits(
@@ -2976,6 +3507,7 @@ impl State {
         self.scene.hash(&mut hash);
         self.show_markers.hash(&mut hash);
         self.selected.hash(&mut hash);
+        self.other_triggers.hash(&mut hash);
 
         for d in &self.records {
             d.uid.hash(&mut hash);
@@ -3037,35 +3569,77 @@ impl State {
             lck_r58_glyph(
                 &mut model,
                 center,
-                24.0,
+                48.0,
                 color
             );
 
             // Same-cell arrival is independent of the source.
             // Display its actual world location using the same
             // Y convention and raster as every other marker.
-            if self.selected==Some(d.uid) {
-                if let Kind::Local{half_x,half_z}=&d.kind {
-                    let dx=*half_x as f32*64.0+64.0;
-                    let dz=(*half_z as f32+1.0)*64.0;
+            // Same-cell arrival is visible even without selecting
+            // the corresponding activation trigger.
+            if let Kind::Local{half_x,half_z}=&d.kind {
+                let dx=*half_x as f32*64.0+64.0;
+                let dz=(*half_z as f32+1.0)*64.0;
 
-                    let dy=native_door_floor_y(
-                        ground,dx,dz
-                    )+LCK_R58_GIZMO_LIFT;
+                let dy=native_door_floor_y(
+                    ground,dx,dz
+                )+LCK_R58_GIZMO_LIFT;
 
-                    let arrival=[dx,dy,dz];
+                let arrival=[dx,dy,dz];
+                let selected=self.selected==Some(d.uid);
 
+                if selected {
                     lck_r58_ribbon(
                         &mut model,center,arrival,4.0,color
                     );
-
-                    lck_r58_glyph(
-                        &mut model,arrival,16.0,color
-                    );
                 }
+
+                lck_r58_glyph(
+                    &mut model,
+                    arrival,
+                    32.0,
+                    if selected {color}else{[65,235,125]}
+                );
             }
         }
 
+        // R6.0.5: place auxiliary markers in the original world raster.
+        // Gate-0 markers use verified native object contacts when known.
+        for trigger in &self.other_triggers {
+            let positions:Vec<(f32,f32)>=
+                if trigger.kind==1
+                    && trigger.gate==0
+                    && !trigger.objects.is_empty()
+                {
+                    trigger.objects.iter().map(
+                        |(_,_,contact)|(
+                            contact[0] as f32,
+                            contact[1] as f32
+                        )
+                    ).collect()
+                }else{
+                    vec![(
+                        (trigger.tile[0] as f32+0.5)*128.0,
+                        (trigger.tile[1] as f32+0.5)*128.0
+                    )]
+                };
+
+            let color=if trigger.kind==2 {
+                [255,168,65]
+            }else{
+                [211,143,255]
+            };
+
+            for (x,z) in positions {
+                let y=native_door_floor_y(ground,x,z)
+                    +LCK_R58_GIZMO_LIFT;
+
+                lck_r58_glyph(
+                    &mut model,[x,y,z],30.0,color
+                );
+            }
+        }
         // CRITICAL: do not call refit().
         // Gizmos must not move the scene's camera center/radius.
         model.center=original.center;
@@ -3207,6 +3781,115 @@ mod lck_r58_world_marker_tests {
         assert_eq!(
             hidden.indices.len(),
             original.indices.len()
+        );
+    }
+}
+#[cfg(test)]
+mod lck_r605_visibility_tests {
+    use super::*;
+
+    #[test]
+    fn kind2_records_are_not_silently_dropped() {
+        let mut block=vec![0u8;0x2000];
+
+        block[10..12].copy_from_slice(&14i16.to_le_bytes());
+        block[12..14].copy_from_slice(&2i16.to_le_bytes());
+
+        block[14..22].copy_from_slice(&[
+            10,20,30,40,
+            11,21,31,41
+        ]);
+
+        assert_eq!(
+            lck_r605_kind2(&block),
+            vec![
+                [10,20,30,40],
+                [11,21,31,41]
+            ]
+        );
+
+        assert!(lck_r605_kind2(&[]).is_empty());
+    }
+}
+#[cfg(test)]
+mod lck_r606_hierarchy_tests {
+    use super::*;
+
+    fn sample()->(State,Door) {
+        let mut state=State::default();
+
+        state.inspector_scripts.insert(
+            3,
+            ScriptSummary{
+                flat_index:3,
+                partition:2,
+                native_name:Some("女王ドア".into()),
+                script_start:0x100,
+                record_end:0x200,
+                ..Default::default()
+            }
+        );
+
+        let door=Door{
+            uid:42,
+            label:String::new(),
+            origin:Origin::Walk{
+                fallback:false,row:2
+            },
+            source:[10,20],
+            size:[1,1],
+            enabled:true,
+            kind:Kind::Script{
+                slot:Some(3),
+                op_pc:Some(0x105),
+                destination:Some(Destination{
+                    name:"town02".into(),
+                    index:0,
+                    entry_x:0,
+                    entry_z:0,
+                    facing:0,
+                })
+            }
+        };
+
+        (state,door)
+    }
+
+    #[test]
+    fn verified_native_name_precedes_technical_fallback(){
+        let (state,door)=sample();
+
+        let label=state.r606_door_label(&door);
+
+        assert!(label.contains("Doorway"));
+        assert!(label.contains("女王ドア"));
+        assert!(label.contains("town02"));
+    }
+
+    #[test]
+    fn editor_alias_precedes_native_name(){
+        let (state,mut door)=sample();
+
+        door.label="Custom named entrance".into();
+
+        assert_eq!(
+            state.r606_door_label(&door),
+            "Custom named entrance [editor name]"
+        );
+    }
+
+    #[test]
+    fn unnamed_map_warp_is_not_falsely_named(){
+        let (state,mut door)=sample();
+
+        door.kind=Kind::Local{
+            half_x:31,
+            half_z:42
+        };
+
+        assert!(
+            state.r606_door_label(&door)
+                .contains("Unnamed interior warp")
         );
     }
 }

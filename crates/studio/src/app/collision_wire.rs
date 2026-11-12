@@ -277,8 +277,8 @@ pub(super) fn paint(
         Ok(edited) => (edited, None),
         Err(err) => (grid.bytes.clone(), Some(err.to_string())),
     };
-    let original = Color32::from_rgb(255, 138, 64);
-    let added = Color32::from_rgb(56, 235, 236);
+    let original = Color32::from_rgb(238, 164, 96);
+    let added = Color32::from_rgb(83, 211, 225);
     let p = Projector::new(ui, rect, view, model);
     let painter = ui.painter().with_clip_rect(rect);
     let viewport_margin = rect.expand(115.0);
@@ -324,7 +324,45 @@ pub(super) fn paint(
                     }
                 }
                 if !valid { continue; }
-                let line = Stroke::new(if is_added { 1.8 } else { 1.15 }, color);
+                // LCK_R612B_COLLISION_TINT
+                // Subtle see-through shading for native wall boxes.
+                let face_tint=if is_added {
+                    Color32::from_rgba_unmultiplied(83,211,225,25)
+                }else{
+                    Color32::from_rgba_unmultiplied(238,164,96,25)
+                };
+
+                let roof_tint=if is_added {
+                    Color32::from_rgba_unmultiplied(83,211,225,39)
+                }else{
+                    Color32::from_rgba_unmultiplied(238,164,96,39)
+                };
+
+                painter.add(egui::Shape::convex_polygon(
+                    roof_pos.to_vec(),
+                    roof_tint,
+                    Stroke::NONE
+                ));
+
+                for i in 0..4 {
+                    let next=(i+1)%4;
+
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![
+                            floor_pos[i],
+                            floor_pos[next],
+                            roof_pos[next],
+                            roof_pos[i]
+                        ],
+                        face_tint,
+                        Stroke::NONE
+                    ));
+                }
+
+                let line = Stroke::new(
+                    if is_added { 2.55 } else { 1.95 },
+                    color
+                );
                 for i in 0..4 {
                     let next = (i+1)%4;
                     painter.line_segment([floor_pos[i], floor_pos[next]], line);
@@ -368,7 +406,23 @@ pub(super) fn paint(
                 projected_rect = projected_rect.union(Rect::from_min_max(*pt, *pt));
             }
             if !projected_rect.intersects(viewport_margin) { continue; }
-            let stroke = Stroke::new(if is_added { 1.65 } else { 1.1 }, color);
+            // Light tint helps distant collision remain visible.
+            let overview_tint=if is_added {
+                Color32::from_rgba_unmultiplied(83,211,225,29)
+            }else{
+                Color32::from_rgba_unmultiplied(238,164,96,29)
+            };
+
+            painter.add(egui::Shape::convex_polygon(
+                points.to_vec(),
+                overview_tint,
+                Stroke::NONE
+            ));
+
+            let stroke = Stroke::new(
+                if is_added { 2.35 } else { 1.85 },
+                color
+            );
             for i in 0..4 {
                 painter.line_segment([points[i], points[(i+1)%4]], stroke);
             }
@@ -378,7 +432,7 @@ pub(super) fn paint(
                 p.project([x, y+48.0, z+32.0]),
                 p.project([end_x, y+48.0, z+32.0]),
             ) {
-                painter.line_segment([a, b], Stroke::new(1.6, color));
+                painter.line_segment([a, b], Stroke::new(2.15, color));
             }
             overview_strips += 1;
             represented += count;

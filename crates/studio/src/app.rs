@@ -63,6 +63,7 @@ mod marquee_selection;
 mod drag_anchor;
 mod native_ground_delete;
 mod unified_ground_export;
+mod native_unified_export; // LCK_R60_UNIFIED_EXPORT
 pub mod ps1_original_guard;
 
 use std::collections::HashMap;
@@ -3167,6 +3168,30 @@ impl App {
     /// Native PS1 data browser: lists the original instance draws and their transforms.
     /// Editable scene preview with non-destructive mesh transforms.
     fn editor_workspace(&mut self, ctx: &egui::Context) {
+        // R6.0.7 height overlay is editor display state only.
+        let r607_display_id=egui::Id::new("lck_r607_height_overlay");
+        let r607_step_id=egui::Id::new("lck_r607_height_step");
+
+        let mut r607_show=ctx.data_mut(|data|
+            data.get_persisted::<bool>(r607_display_id)
+                .unwrap_or(false)
+        );
+
+        let mut r607_step=ctx.data_mut(|data|
+            data.get_persisted::<f32>(r607_step_id)
+                .unwrap_or(16.0)
+        );
+
+        // R608: automatic palette scaling is enabled by default.
+        let r608_auto_id=egui::Id::new(
+            "lck_r608_automatic_height_range"
+        );
+
+        let mut r608_auto=ctx.data_mut(|data|
+            data.get_persisted::<bool>(r608_auto_id)
+                .unwrap_or(true)
+        );
+
         let mut pending_form=self.form_record_panel(ctx);
         if pending_form.is_none() {
             pending_form = self.lck_menu_project.take();
@@ -3441,6 +3466,52 @@ impl App {
                                     ui.ctx().request_repaint();
                                 }
                             }
+                            // R6.0.4: collision boxes as actual scene hierarchy items.
+                            if let Some(lib)=self.studio.library.as_ref(){
+                                let source_key=lib.source.path().display().to_string();
+                                if self.native_collision_grid.as_ref().is_none_or(|grid|
+                                    grid.scene!=scene.name || grid.source_key!=source_key
+                                ){
+                                    self.native_collision_grid=collision_wire::CollisionGrid::load(
+                                        lib.index.as_ref(),&scene.name,&source_key
+                                    ).ok();
+                                }
+                            }
+
+                            if let Some(grid)=self.native_collision_grid.as_ref(){
+                                let previous=self.collision_edit.native_edit_snapshot();
+                                let history=world.as_deref().map(|world|
+                                    editor_history_capture_with_layers(
+                                        world,&scene.name,
+                                        self.native_selected,&self.native_selection,
+                                        &self.ground_edits,&self.collision_edit
+                                    )
+                                );
+
+                                if self.collision_edit.hierarchy(
+                                    ui,grid,&hierarchy_filter
+                                ){
+                                    self.ground_edit_mode=true;
+                                    self.native_collision_wire_visible=true;
+                                    self.native_selected=None;
+                                    self.native_selection.clear();
+
+                                    if previous!=self.collision_edit.native_edit_snapshot(){
+                                        if let Some(history)=history{
+                                            self.editor_undo.push(history);
+                                            if self.editor_undo.len()>100{
+                                                self.editor_undo.remove(0);
+                                            }
+                                            self.editor_redo.clear();
+                                        }
+                                    }
+
+                                    self.native_view.version=
+                                        self.native_view.version.wrapping_add(1);
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+
                             egui::CollapsingHeader::new(format!("Placements ({})", scene.placements.len()))
                                 .default_open(false).show(ui, |ui| {
                                     for (i, d) in scene.placements.iter().enumerate() {
@@ -3509,19 +3580,95 @@ impl App {
                                         }
                                     });
                                 }
-                                // LCK R2: real MAP and MAN door/teleport records, separate from editor groups.
+                                // LCK_R606_NAMED_EVENT_HIERARCHY
+                                // Event records are categorized independently
+                                // of object/terrain/floor hierarchy entries.
                                 if let Some(lib)=&self.studio.library {
-                                    if let Some(position)=self.doors.ui(ui,lib.index.as_ref(),lib.source.path()) {
-                                        if let Some(model)=world.model.as_ref() {
-                                            self.native_view.cam.target_offset=[
-                                                position[0]-model.center[0],
-                                                position[1]-model.center[1],
-                                                position[2]-model.center[2],
-                                            ];
-                                            self.native_view.version=self.native_view.version.wrapping_add(1);
-                                            ui.ctx().request_repaint();
-                                        }
-                                    }
+                                    egui::CollapsingHeader::new(
+                                        "Events, Triggers & Warps"
+                                    )
+                                    .default_open(false)
+                                    .show(ui,|ui|{
+                                        self.doors.named_hierarchy(
+                                            ui,&hierarchy_filter
+                                        );
+
+                                        let saved=self.form_session.as_ref()
+                                            .and_then(|session|
+                                                session.project.native_warps.iter()
+                                                    .find(|entry|entry.scene==scene.name)
+                                            );
+
+                                        let count=saved
+                                            .map(|entry|entry.records.len())
+                                            .unwrap_or(0);
+
+                                        egui::CollapsingHeader::new(
+                                            format!(
+                                                "Project Warp Overrides ({count})"
+                                            )
+                                        )
+                                        .default_open(false)
+                                        .show(ui,|ui|{
+                                            ui.small(
+                                                "Saved MAP kind-0 replacements. The original native warps are shown above under Local / Interior Warps."
+                                            );
+
+                                            if let Some(saved)=saved {
+                                                for (i,row) in saved.records.iter().enumerate(){
+                                                    let label=format!(
+                                                        "Warp #{i}: source ({},{}) → arrival ({},{}) [half-tiles]",
+                                                        row.source[0],
+                                                        row.source[1],
+                                                        row.arrival[0],
+                                                        row.arrival[1]
+                                                    );
+
+                                                    if hierarchy_filter.is_empty()
+                                                        || label.to_lowercase()
+                                                            .contains(&hierarchy_filter)
+                                                    {
+                                                        ui.label(label);
+                                                    }
+                                                }
+                                            }else{
+                                                ui.small(
+                                                    "No separate warp override saved for this cell."
+                                                );
+                                            }
+
+                                            if ui.button(
+                                                "Open Native Warp Editor"
+                                            ).clicked(){
+                                                self.native_warp_editor.open=true;
+                                            }
+                                        });
+
+                                        egui::CollapsingHeader::new(
+                                            "Door / Trigger Editor and Native Actions"
+                                        )
+                                        .default_open(false)
+                                        .show(ui,|ui|{
+                                            if let Some(position)=self.doors.ui(
+                                                ui,
+                                                lib.index.as_ref(),
+                                                lib.source.path()
+                                            ){
+                                                if let Some(model)=world.model.as_ref(){
+                                                    self.native_view.cam.target_offset=[
+                                                        position[0]-model.center[0],
+                                                        position[1]-model.center[1],
+                                                        position[2]-model.center[2],
+                                                    ];
+
+                                                    self.native_view.version=
+                                                        self.native_view.version.wrapping_add(1);
+
+                                                    ui.ctx().request_repaint();
+                                                }
+                                            }
+                                        });
+                                    });
                                 }
                                 egui::CollapsingHeader::new(format!("NPCs / field actors ({})",world.npcs.iter().filter(|n|!n.is_copy).count()))
                                     .default_open(false).show(ui, |ui| {
@@ -4024,13 +4171,48 @@ impl App {
                             ui.style_mut().wrap_mode=
                                 Some(egui::TextWrapMode::Wrap);
 
-                            ui.heading("World Viewport");
-                ui.small(format!("Native '{}' | {} environmental instances | {} unique TMDs | {} unavailable",
-                    scene.name, world.instances, world.unique_models, world.unavailable));
-                ui.small(format!("MAN field actors: {} catalogued | {} initially rendered | {} conditional",
-                    world.npcs.iter().filter(|n|!n.is_copy).count(),
-                    world.npcs.iter().filter(|n|!n.is_copy && n.drawable).count(),
-                    world.npcs.iter().filter(|n|!n.is_copy && n.conditional).count()));
+                            // R608: compact scene information with accurate labels.
+                ui.heading("World Viewport");
+
+                ui.horizontal_wrapped(|ui|{
+                    ui.strong(format!("Cell: {}",scene.name));
+                    ui.separator();
+                    ui.small(format!(
+                        "{} environmental instances",
+                        world.instances
+                    ));
+                    ui.small(format!(
+                        "{} unique TMDs",
+                        world.unique_models
+                    ));
+
+                    if world.unavailable>0 {
+                        ui.colored_label(
+                            Color32::YELLOW,
+                            format!("{} unresolved resources",world.unavailable)
+                        );
+                    }
+                });
+
+                ui.horizontal_wrapped(|ui|{
+                    ui.small(format!(
+                        "MAN actors: {} records",
+                        world.npcs.iter()
+                            .filter(|n|!n.is_copy).count()
+                    ));
+                    ui.small(format!(
+                        "{} drawable",
+                        world.npcs.iter()
+                            .filter(|n|!n.is_copy && n.drawable)
+                            .count()
+                    ));
+                    ui.small(format!(
+                        "{} conditional",
+                        world.npcs.iter()
+                            .filter(|n|!n.is_copy && n.conditional)
+                            .count()
+                    ));
+                });
                 // Stage Q7: collision sources are different for visible terrain,
                 // walls, NPCs and walkable floor. A yellow/tan TMD preview must
                 // never be represented as having native PS1 collision merely
@@ -4053,14 +4235,16 @@ impl App {
                     ui.small("Copies the visible raw mesh. Elevator movement, interactions and story behavior are detached; collision remains separately reported. New foreign drops use this mode.");
                 }
                 self.unrestricted_img_export=true;
-                ui.label("IMG export: BEST EFFORT (default). Predictive compatibility checks cannot block export.");
+                ui.small("IMG export: R6.0 unified native staging | Best-effort operations reported | PS1 gameplay not yet verified.");
                 if let Some(path)=self.ps1_export_output.clone(){ui.horizontal_wrapped(|ui|{
                     if ui.button("Open IMG output folder").clicked(){if let Some(parent)=path.parent(){self.show_folder(parent);}}
                     ui.label(format!("IMG output: {}",path.display()));
                 });}
                 if let Some(coverage)=self.ps1_export_imports {if let Some(message)=coverage.failure_message(){ui.colored_label(Color32::from_rgb(255,90,70),egui::RichText::new(message).strong());}}
                 // LCK_R4_STORY_FLAG_TOOLBAR
-                ui.horizontal(|ui| {
+                // R608: independent tool and story navigation rows.
+                ui.vertical(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                     let mut select_floors=self.ground_edit_mode && !self.native_collision_wire_visible;
                     if ui.checkbox(&mut select_floors,"Select Floors").changed() {
                         self.ground_edit_mode=select_floors;
@@ -4098,7 +4282,9 @@ impl App {
                     ui.checkbox(&mut self.doors.show_markers,"Triggers / Scenes / Warps")
                         .on_hover_text("View and inspect native MAP/MAN markers. Right-click a marker for Properties. No story flags are changed.");
 
+                    });
                     ui.separator();
+                    ui.horizontal_wrapped(|ui| {
 
                     // R43A_STORY_BUTTONS: source-native flag state preview.
                     if self.story_flag_scene!=scene.name {
@@ -4145,20 +4331,41 @@ impl App {
                     );
 
                     let mut requested=self.story_flag_index;
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {
-                        if ui.add_enabled(requested+1<count,
-                            egui::Button::new("Next Flag")).clicked(){requested+=1;}
-                        ui.label(format!("{}/{}",self.story_flag_index+1,count));
-                        if ui.add_enabled(requested>0,
-                            egui::Button::new("Last Flag")).clicked(){requested=requested.saturating_sub(1);}
-                        // Fixed-width ID; the full title is in its tooltip.
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Story preview");
+
                         let flag_name=if self.story_flag_index==0 {
                             "Start"
                         }else{
                             self.story_flag_stages[self.story_flag_index]
                                 .label.split_whitespace().next().unwrap_or("Flag")
                         };
-                        ui.add_sized([86.0,22.0],egui::Label::new(flag_name))
+
+                        ui.add_sized(
+                            [98.0,22.0],
+                            egui::Label::new(flag_name)
+                        ).on_hover_text(story_tooltip.as_str());
+
+                        if ui.add_enabled(
+                            requested>0,
+                            egui::Button::new("Previous")
+                        ).clicked(){
+                            requested=requested.saturating_sub(1);
+                        }
+
+                        ui.label(format!(
+                            "{}/{}",
+                            self.story_flag_index+1,count
+                        ));
+
+                        if ui.add_enabled(
+                            requested+1<count,
+                            egui::Button::new("Next")
+                        ).clicked(){
+                            requested+=1;
+                        }
+
+                        ui.small("(read-only)")
                             .on_hover_text(story_tooltip.as_str());
                     });
                     if requested!=self.story_flag_index {
@@ -4194,6 +4401,7 @@ impl App {
                     }
                     // Variable-length per-state status stays in the tooltip
                     // so the central viewport has a constant layout footprint.
+                    });
                 });
                 ui.horizontal_wrapped(|ui| {
                     self.native_view.controls(ui, "Sample original PS1 TIM/CLUT atlas from assembled scene VRAM");
@@ -4292,9 +4500,9 @@ impl App {
                     let lck_u1b_manifest=export_manifest::capture(
                         &scene.name,world,&self.ground_edits,&self.collision_edit
                     );
-                    ui.collapsing("U1B.1 - Pending edit manifest",|ui|{
+                    ui.collapsing("R6.0 - Unified pending edits",|ui|{
                         ui.small(lck_u1b_manifest.summary());
-                        ui.small("Audit only: current U1A export routing is unchanged.");
+                        ui.small("R6.0 unified coordinator manages staged native IMG exports.");
                         for notice in lck_u1b_manifest.notices.iter().take(5){
                             ui.label(notice);
                         }
@@ -4320,42 +4528,22 @@ impl App {
                     let lck_native_edits=
                         collision_edit::scene_has_instance_edits(&scene.name,world);
 
-                    // Native door-only exports do not need a dummy mesh edit.
-                    if lck_export_pressed && self.doors.has_native_changes()
-                        && !self.ground_edits.has_edits() && !self.collision_edit.has_edits()
-                        && !lck_native_edits {
-                        let exported=(|| -> anyhow::Result<Option<String>> {
-                            let lib=self.studio.library.as_ref().ok_or_else(||anyhow::anyhow!("Open an original PS1 IMG"))?;
-                            let source=lib.source.path();
-                            let name=format!("LCK_{}_DOORS_EXPERIMENTAL.img",scene.name);
-                            let Some(path)=rfd::FileDialog::new().set_file_name(name)
-                                .add_filter("Raw PS1 IMG", &["img"]).save_file()
-                            else {return Ok(None);};
-                            Ok(Some(self.doors.export_new(source,&path,lib.index.as_ref())?))
-                        })();
-                        match exported {
-                            Ok(Some(report))=>self.studio.status=Some(report),
-                            Ok(None)=>{},
-                            Err(error)=>self.studio.error=Some(format!("Native door export: {error:#}")),
-                        }
-                        lck_export_pressed=false;
-                    }
-
-                    if lck_export_pressed
-                        && self.ground_edits.has_edits()
-                        && (lck_native_edits || self.collision_edit.has_edits())
-                    {
-                        let result=(||->anyhow::Result<Option<()>>{
+                    // LCK_R60_UNIFIED_EXPORT
+                    // All native export families now use one coordinator.
+                    if lck_export_pressed {
+                        let started=(||->anyhow::Result<Option<()>>{
                             let lib=self.studio.library.as_ref()
-                                .ok_or_else(||anyhow::anyhow!("Open a native PS1 IMG"))?;
+                                .ok_or_else(||anyhow::anyhow!("Open a raw PS1 IMG"))?;
 
                             let source=match &lib.source {
                                 Source::Disc(path)=>path.clone(),
-                                _=>anyhow::bail!("Open the raw PS1 IMG"),
+                                Source::Extracted(_)=>anyhow::bail!(
+                                    "Open a raw 2352-byte IMG"
+                                ),
                             };
 
-                            let suggestion=format!(
-                                "{}_{}_U1B2_MIXED.img",
+                            let proposal=format!(
+                                "{}_LCK_R60_{}.img",
                                 source.file_stem()
                                     .and_then(|s|s.to_str())
                                     .unwrap_or("Legaia"),
@@ -4363,387 +4551,144 @@ impl App {
                             );
 
                             let mut dialog=rfd::FileDialog::new()
-                                .set_file_name(&suggestion)
+                                .set_file_name(&proposal)
                                 .add_filter("Raw PS1 IMG",&["img"]);
 
-                            dialog=dialog.set_directory(r"D:\AstraRimElmProject\1TestImgfiles");
+                            dialog=dialog.set_directory(r#"D:\AstraRimElmProject\1TestImgfiles"#);
 
                             let Some(output)=dialog.save_file()
-                            else {return Ok(None);};
+                            else {return Ok(None)};
 
-                            let export_scene=Arc::clone(scene);
-                            let export_world=world.as_ref().clone();
-                            let export_index=Arc::clone(&lib.index);
+                            let selected_scene=Arc::clone(scene);
+                            let selected_world=world.as_ref().clone();
+                            let selected_index=Arc::clone(&lib.index);
 
-                            let ground_snapshot=self.ground_edits.clone();
-                            let collision_snapshot=self.collision_edit.clone();
-                            let door_snapshot=self.doors.clone();
-                            let export_session=self.form_session.clone();
-                            let native_grid_side=self.native_map_extension_side;
+                            let floors=self.ground_edits.clone();
+                            let collision=self.collision_edit.clone();
+                            let doors=self.doors.clone();
+                            let project=self.form_session.clone();
+
+                            let warps=self.form_session.as_ref()
+                                .and_then(|s|
+                                    s.project.native_warps.iter()
+                                        .find(|w|w.scene==scene.name)
+                                ).cloned();
 
                             let unrestricted=self.unrestricted_img_export;
-                            let native_edits=lck_native_edits;
-                            let output_label=output.display().to_string();
+                            let extension_side=self.native_map_extension_side;
+                            let cell_name=scene.name.clone();
+
+                            let overlay=scene_instances::serialize(
+                                &cell_name,world
+                            );
+
+                            let report=export_integration::render_report(
+                                &cell_name,&overlay,Some(&source)
+                            );
 
                             let (tx,rx)=std::sync::mpsc::channel();
                             let repaint=ctx.clone();
+                            let display=output.display().to_string();
+                            // R6.0.2: preserve a GUI-owned output path.
+                            let output_for_ui=output.clone();
 
                             std::thread::spawn(move||{
                                 let result=std::panic::catch_unwind(
                                     std::panic::AssertUnwindSafe(||{
-                                        let mut done=unified_ground_export::execute(
-                                            &source,
-                                            &output,
-                                            &export_scene,
-                                            &export_world,
-                                            &export_index,
-                                            &ground_snapshot,
-                                            &collision_snapshot,
-                                            native_edits,
-                                            unrestricted,
-                                            export_session,
-                                            native_grid_side,
-                                        )?;
-                                        if door_snapshot.has_native_changes(){
-                                            let report=door_snapshot.overlay_existing(&done.path,&export_index)?;
-                                            done.patched.push(report);
-                                        }
-                                        Ok(done)
+                                        native_unified_export::execute(
+                                            native_unified_export::Request{
+                                                source:&source,
+                                                output:&output,
+                                                scene:&selected_scene,
+                                                world:&selected_world,
+                                                index:&selected_index,
+                                                floors:&floors,
+                                                collision:&collision,
+                                                doors:&doors,
+                                                warps:warps.as_ref(),
+                                                project,
+                                                unrestricted,
+                                                extension_side,
+                                            }
+                                        )
                                     })
-                                ).unwrap_or_else(|_|
-                                    Err(anyhow::anyhow!(
-                                        "U1B.2 worker panicked. No completed export claimed."
-                                    ))
-                                );
+                                ).unwrap_or_else(|_|Err(anyhow::anyhow!(
+                                    "R6.0 exporter panicked; no verified output claimed"
+                                )))
+                                .map_err(|e|{
+                                    let message=format!(
+                                        "R6.0 {}: {e:#}",output.display()
+                                    );
+
+                                    let diagnostic=
+                                        ps1_export::unrestricted::failure_log(
+                                            &output,&overlay,&message
+                                        )
+                                        .map(|p|p.display().to_string())
+                                        .unwrap_or_else(|e|
+                                            format!("Diagnostic failure: {e:#}")
+                                        );
+
+                                    anyhow::anyhow!(
+                                        "{message}; {diagnostic}"
+                                    )
+                                });
+
+                                let outcome=match &result {
+                                    Ok(ok)=>format!(
+                                        "Published {}\nPatched: {}\nSkipped: {}",
+                                        ok.path.display(),
+                                        ok.patched.join(" | "),
+                                        ok.skipped.join(" | ")
+                                    ),
+                                    Err(e)=>format!(
+                                        "R6.0 failed: {e:#}"
+                                    ),
+                                };
+
+                                if let Err(e)=export_integration::write_log(
+                                    &cell_name,&report,&outcome
+                                ){
+                                    log::warn!(
+                                        "R6.0 export log unavailable: {e}"
+                                    );
+                                }
 
                                 let _=tx.send(result);
                                 repaint.request_repaint();
                             });
 
                             self.ps1_export_job=Some(rx);
+                            self.ps1_export_output=Some(output_for_ui);
+                            self.ps1_export_imports=None;
                             self.studio.error=None;
+
                             self.studio.status=Some(format!(
-                                "U1B.2 mixed export running: {output_label}.                                  Final IMG will be published only after all stages pass."
+                                "R6.0 unified native export running: {display}"
                             ));
 
                             Ok(Some(()))
                         })();
 
-                        if let Err(error)=result {
+                        if let Err(e)=started {
                             self.studio.error=Some(format!(
-                                "U1B.2 mixed export failed to start: {error:#}"
+                                "R6.0 export did not start: {e:#}"
                             ));
                         }
                     }
-                    if lck_export_pressed && self.collision_edit.has_edits()
-                        && !lck_has_floor_edits && !lck_has_floor_deletions
-                        && !collision_edit::scene_has_instance_edits(&scene.name,world) {
-                        if self.ps1_export_job.is_some() {
-                            self.studio.error=Some("Native export already running".into());
-                        } else {
-                            let result=(||->anyhow::Result<Option<String>>{
-                                let lib=self.studio.library.as_ref().ok_or_else(||anyhow::anyhow!("Open source IMG"))?;
-                                let source=match &lib.source { Source::Disc(path)=>path, _=>anyhow::bail!("Open raw PS1 IMG") };
-                                let proposed=format!("{}_{}_COLLISION_TEST.img",source.file_stem().and_then(|s|s.to_str()).unwrap_or("Legaia"),scene.name);
-                                let mut dialog=rfd::FileDialog::new().set_file_name(&proposed).add_filter("Raw PS1 IMG", &["img"]);
-                                dialog=dialog.set_directory(r"D:\AstraRimElmProject\1TestImgfiles");
-                                let Some(output)=dialog.save_file() else {return Ok(None);};
-                                let mut result=self.collision_edit.export(source,&output,&scene.name,lib.index.as_ref())?;
-                                if self.doors.has_native_changes(){
-                                    result.push_str(&format!("; {}",self.doors.overlay_existing(&output,lib.index.as_ref())?));
-                                }
-                                Ok(Some(result))
-                            })();
-                            match result {Ok(Some(s))=>self.studio.status=Some(s),Ok(None)=>{},Err(e)=>self.studio.error=Some(format!("Collision IMG export failed: {e:#}"))}
-                        }
-                    }
-                    if lck_export_pressed && !self.collision_edit.has_edits() && !lck_native_edits && lck_has_floor_edits {
-                        let result=(||->anyhow::Result<Option<String>>{
-                            let lib=self.studio.library.as_ref()
-                                .ok_or_else(||anyhow::anyhow!("Open a disc"))?;
 
-                            let source=match &lib.source{
-                                Source::Disc(path)=>path.clone(),
-                                _=>anyhow::bail!("Open a raw PS1 IMG")
-                            };
+                    if std::mem::take(&mut self.lck_menu_check) {
+                        let summary=lck_u1b_manifest.summary();
 
-                            let name=scene.name.as_str();
-
-                            let suggestion=format!(
-                                "{}_{}_W1_GROUND_TEST.img",
-                                source.file_stem()
-                                    .and_then(|s|s.to_str())
-                                    .unwrap_or("Legaia"),
-                                name
-                            );
-
-                            let mut dialog=rfd::FileDialog::new()
-                                .set_file_name(&suggestion)
-                                .add_filter("Raw PS1 IMG",&["img"]);
-
-                            dialog=dialog.set_directory(r"D:\AstraRimElmProject\1TestImgfiles");
-
-                            let Some(output)=dialog.save_file()
-                            else {return Ok(None);};
-
-                            ps1_original_guard::ensure_new_output(&source,&output)?;
-                            anyhow::ensure!(!output.exists(),"Choose a NEW output IMG filename");
-                            let stamp=std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)?.as_nanos();
-                            let staging=output.with_file_name(format!(
-                                "LCK_GROUND_MIRROR_STAGE_{}_{}.img",std::process::id(),stamp));
-                            anyhow::ensure!(!staging.exists(),"Floor mirror staging IMG already exists");
-                            let published=(||->anyhow::Result<String>{
-                                let pure=ground_edit_ops::native_128_plan(&self.ground_edits)
-                                    .ok().is_some_and(|(a,b)|a.is_empty()&&b.is_empty());
-                                let note=if pure{
-                                    std::fs::copy(&source,&staging)?;
-                                    "Native floor grid unchanged; reflected texture export follows".to_string()
-                                }else{
-                                    native_ground_delete::export_ground(
-                                        &source,&staging,name,&lib.index,&self.ground_edits,
-                                        self.unrestricted_img_export)?
-                                };
-                                let mirror=native_floor_mirror::overlay_existing(
-                                    &staging,name,&lib.index,&self.ground_edits)?;
-                                if self.doors.has_native_changes(){
-                                    self.doors.overlay_existing(&staging,lib.index.as_ref())?;
-                                }
-                                ps1_export::verify_output_file(
-                                    &staging,Some(std::fs::metadata(&source)?.len()))?;
-                                std::fs::hard_link(&staging,&output)?;
-                                Ok(format!("{note}. {}. Native gameplay not yet verified.",
-                                    mirror.unwrap_or_else(||"No mirrored ground textures".into())))
-                            })();
-                            let _=std::fs::remove_file(&staging);
-                            Ok(Some(published?))
-                        })();
-
-                        match result {
-                            Ok(Some(message))=>{
-                                self.studio.status=Some(message);
-                            },
-                            Ok(None)=>{},
-                            Err(error)=>{
-                                self.studio.error=Some(format!(
-                                    "Floor export failed: {error:#}"
-                                ));
-                            },
-                        }
+                        self.studio.status=Some(format!(
+                            "R6.0 pending-edit manifest: {summary}. Native readback runs on Export IMG; gameplay must be tested manually."
+                        ));
                     }
 
-                    if lck_export_pressed && !self.collision_edit.has_edits() && !lck_native_edits && !lck_has_floor_edits && lck_has_floor_deletions {
-                        let result=(|| -> anyhow::Result<Option<String>> {
-                            let lib=self.studio.library.as_ref()
-                                .ok_or_else(||anyhow::anyhow!("Open original disc"))?;
-                            let source=match &lib.source {
-                                Source::Disc(p)=>p.clone(),
-                                _=>anyhow::bail!("Open a raw PS1 disc image")
-                            };
-                            let name=scene.name.as_str();
-                            let suggestion=format!(
-                                "{}_{}_GROUND_DELETE_TEST.img",
-                                source.file_stem()
-                                    .and_then(|s|s.to_str())
-                                    .unwrap_or("Legaia"),
-                                name
-                            );
-                            let mut dialog=rfd::FileDialog::new()
-                                .set_file_name(&suggestion)
-                                .add_filter("Raw PlayStation image",&["img"]);
-
-                            dialog=dialog.set_directory(r"D:\AstraRimElmProject\1TestImgfiles");
-
-                            let Some(output)=dialog.save_file() else {
-                                return Ok(None);
-                            };
-
-                            let message=native_ground_delete::export_ground(
-                                &source,&output,name,&lib.index,&self.ground_edits,true
-                            )?;
-                            Ok(Some(message))
-                        })();
-
-                        match result {
-                            Ok(Some(message))=>self.studio.status=Some(message),
-                            Ok(None)=>{},
-                            Err(error)=>self.studio.error=Some(format!(
-                                "Ground deletion export FAILED: {error:#}"
-                            )),
-                        }
-                    }
                     if self.ground_edits.has_edits() {
                         ui.label(
-                            "U1B.2: aligned native floor edits can export with objects and collision. Unsupported floor transforms require further native work.");
-                    }
-                    if std::mem::take(&mut self.lck_menu_check)
-                        && !self.ground_edits.has_edits() {
-                        let result = (|| -> anyhow::Result<String> {
-                            let lib = self.studio.library.as_ref()
-                                .ok_or_else(||anyhow::anyhow!("No disc image loaded"))?;
-                            let Source::Disc(source)=&lib.source else {
-                                anyhow::bail!("Open the native PS1 disc source first");
-                            };
-                            if self.unrestricted_img_export {return Ok("Compatibility preflight disabled. Export attempts all manifest operations; debug.txt records written fields and exact failures.".into());}
-                            let plan=ps1_export::plan_export(source,scene,world,lib.index.as_ref())?;
-                            Ok(plan.summary())
-                        })();
-                        match result {
-                            Ok(summary) if self.unrestricted_img_export => self.studio.status=Some(summary),
-                            Ok(summary) => self.studio.status = Some(format!(
-                                "PS1 serialization preflight PASSED for {}: {summary}. No IMG written; PS1 runtime behavior remains unverified.", scene.name)),
-                            Err(e) => self.studio.error = Some(format!(
-                                "PS1 export preflight BLOCKED for {}: {e:#}", scene.name)),
-                        }
-                    }
-                    if lck_export_pressed && !lck_has_floor_edits
-                        && !lck_has_floor_deletions
-                        && (!self.collision_edit.has_edits()
-                            || collision_edit::scene_has_instance_edits(&scene.name,world)) {
-                        let prepared = (|| -> anyhow::Result<(PathBuf,String)> {
-                            let lib=self.studio.library.as_ref().ok_or_else(||anyhow::anyhow!("No disc image loaded"))?;
-                            let source=match &lib.source {
-                                Source::Disc(path) => path.clone(),
-                                Source::Extracted(_) => anyhow::bail!("Open the actual 2352-byte test .img, not extracted assets"),
-                            };
-                            let name=&scene.name;
-                            // Integration V1: capture the COMPLETE editor change manifest
-                            // before native preflight. Names remain editor-side metadata.
-                            let overlay=scene_instances::serialize(name,world);
-                            if !self.unrestricted_img_export && self.form_session.as_ref().is_none_or(|s|s.export_gaps().is_empty()) && export_integration::only_editor_labels(&overlay) {
-                                let report=export_integration::render_report(name,&overlay,Some(&source));
-                                let note="Only hierarchy labels changed: no native PS1 data needs writing. Save the .lckscene to preserve the labels; IMG unchanged.";
-                                let log_path=export_integration::write_log(name,&report,note)
-                                    .map(|p|p.display().to_string()).unwrap_or_else(|e|e);
-                                anyhow::bail!("{note} Integration V1 log: {log_path}");
-                            }
-                            Ok((source,name.to_string()))
-                        })();
-                        match prepared {
-                            Ok((source,cell_name)) => {
-                                let suggestion=format!("{}_LCK_{}.img",
-                                    source.file_stem().and_then(|s|s.to_str()).unwrap_or("LegaiaTest"),cell_name);
-                                let mut dialog=rfd::FileDialog::new().set_file_name(&suggestion)
-                                    .add_filter("Raw PS1 test image", &["img"]);
-                                dialog=dialog.set_directory(r"D:\AstraRimElmProject\1TestImgfiles");
-                                if let Some(destination)=dialog.save_file() {
-                                    self.ps1_export_output=Some(destination.clone());
-                                    self.ps1_export_imports=None;
-                                    self.studio.error=None;
-                                    let output_message=destination.display().to_string();
-                                    let overlay=scene_instances::serialize(&cell_name,world);
-                                    let report=export_integration::render_report(&cell_name,&overlay,Some(&source));
-                                    let (tx,rx)=std::sync::mpsc::channel();
-                                    let repaint=ctx.clone();
-                                    let export_scene=Arc::clone(scene);let export_world=world.as_ref().clone();
-                                    let export_index=Arc::clone(&self.studio.library.as_ref().unwrap().index);
-                                    let unrestricted=self.unrestricted_img_export;
-                                    let mut export_session=self.form_session.clone();
-                                    // LCK_U1A_WORKER_MERGE
-                                    // Snapshot wall edits at export-start.
-                                    let collision_snapshot=self.collision_edit.clone();
-                                    // LCK_R57_NATIVE_WARPS
-                                    let warp_snapshot=self.form_session.as_ref()
-                                        .and_then(|session|
-                                            session.project.native_warps.iter()
-                                                .find(|edit|edit.scene==cell_name)
-                                        ).cloned();
-                                     let door_snapshot=self.doors.clone();
-                                    std::thread::spawn(move|| {
-                                        let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||->anyhow::Result<ps1_export::ExportResult>{
-                                            // LCK_R57_NATIVE_WARPS
-                                            let planned=if let Some(session)=&mut export_session {
-                                                ps1_export::prepare_project(
-                                                    &source,&export_scene,session,
-                                                    &export_index,unrestricted
-                                                )
-                                            }else if unrestricted {
-                                                ps1_export::unrestricted::prepare(
-                                                    &source,&export_scene,&export_world,&export_index
-                                                )
-                                            }else{
-                                                ps1_export::plan_export(
-                                                    &source,&export_scene,&export_world,&export_index
-                                                )
-                                            };
-
-                                            let warp_only=planned.as_ref().err().is_some_and(|error|{
-                                                let message=format!("{error:#}").to_lowercase();
-                                                message.contains("nothing to export")
-                                                    || message.contains("no native edits")
-                                            });
-
-                                            let mut warp_already_written=false;
-
-                                            let mut done=match planned {
-                                                Ok(plan)=>ps1_export::export(plan,&destination)?,
-                                                Err(error) if warp_only && warp_snapshot.is_some()=>{
-                                                    warp_already_written=true;
-                                                    native_warps::publish_warp_only(
-                                                        &source,&destination,&export_index,
-                                                        warp_snapshot.as_ref().unwrap()
-                                                    )?
-                                                },
-                                                Err(error)=>return Err(error),
-                                            };
-
-                                            if collision_snapshot.has_edits() {
-                                                // Patch the IMG returned by the normal
-                                                // writer, NOT the original source IMG.
-                                                let note=collision_snapshot.overlay_existing(
-                                                    &done.path,
-                                                    &cell_name,
-                                                    &export_index
-                                                )?;
-                                                done.patched.push(note);
-                                            }
-
-                                            if door_snapshot.has_native_changes() {
-                                                let note=door_snapshot.overlay_existing(&done.path,&export_index)?;
-                                                done.patched.push(note);
-                                            }
-                                            // LCK_R57_NATIVE_WARPS
-                                            if !warp_already_written {
-                                                if let Some(edit)=&warp_snapshot {
-                                                    let note=native_warps::overlay_existing(
-                                                        &done.path,&export_index,edit
-                                                    )?;
-                                                    done.patched.push(note);
-                                                }
-                                            }
-
-                                            Ok(done)
-                                        })).unwrap_or_else(|_|Err(anyhow::anyhow!("Native export worker panicked; no completed output claimed"))).map_err(|error|{
-                                            let message=format!("Output {}: {error:#}",destination.display());
-                                            let debug=ps1_export::unrestricted::failure_log(&destination,&overlay,&message)
-                                                .map(|p|p.display().to_string()).unwrap_or_else(|e|format!("debug.txt could not be written: {e:#}"));
-                                            anyhow::anyhow!("{message}. {debug}")
-                                        });
-                                        let outcome=match &result {
-                                            Ok(done)=>format!("{}\nPatched: {}\nSkipped: {}",if done.imports.is_some(){done.experimental_summary()}else{format!("Native IMG file verified: {}",done.path.display())},done.patched.join(" | "),done.skipped.join(" | ")),
-                                            Err(error)=>format!("NATIVE EXPORT FAILED: {}: {error:#}",destination.display()),
-                                        };
-                                        if let Err(error)=export_integration::write_log(&cell_name,&report,&outcome) {
-                                            log::warn!("Export Integration V1 diagnostic log unavailable: {error}");
-                                        }
-                                        let _=tx.send(result);
-                                        repaint.request_repaint();
-                                    });
-                                    self.ps1_export_job=Some(rx);
-                                    self.studio.status=Some(format!("Writing IMG to {output_message}. Completion requires file existence, length and disk readback verification; native operation failures remain in debug.txt."));
-                                }
-                            }
-                            Err(error) => {
-                                if error.to_string().starts_with("Only hierarchy labels changed:") {
-                                    self.studio.error=None;
-                                    // An editor-only rename is not an invalid IMG. No native
-                                    // changes exist to compile; the LCK scene keeps the name.
-                                    self.studio.status=Some(format!("Editor-only rename: IMG export skipped (no native bytes changed). Save .lckscene. {error:#}"));
-                                } else {
-                                    self.studio.error=Some(format!("Cannot export native PS1 placement: {error:#}"));
-                                }
-                            },
-                        }
+                            "R6.0: floor donors remain immutable; native limitations are reported per operation."
+                        );
                     }
                     if false && ui.button("Open LCK scene...").on_hover_text("Rebuild the preview from an editor-only .lckscene file. Does NOT write the game disc.").clicked() {
                         if let Some((name, _)) = &self.native_scene {
@@ -4887,6 +4832,35 @@ impl App {
                     });
                     let model=ground_composite.as_ref().unwrap_or(base_model);
 
+                    // R6.0.7: world-space height colors are derived from
+                    // the live render model on EVERY repaint, including
+                    // active mouse-held floor translation.
+                    // LCK_R609_PER_PIXEL_HEIGHT
+                    // The previous vertex tint is replaced by a
+                    // continuous raster-height overlay.
+                    // Use the CURRENT composed model, so changes made
+                    // while the mouse is held appear immediately.
+                    let r609_height_overlay=
+                        if r607_show {
+                            scene.ground.as_ref().and_then(|hf|
+                                ground_edit_ops::r609_height_overlay(
+                                    model,
+                                    base_model.positions.len(),
+                                    hf,
+                                    &self.ground_edits,
+                                    world.as_ref(),
+                                    self.native_view.cam,
+                                    r608_auto,
+                                    r607_step
+                                )
+                            )
+                        }else{
+                            None
+                        };
+
+                    self.native_view.set_height_overlay(
+                        r609_height_overlay
+                    );
                     // LCK_R49_WORLD_FIXED_GRID
                     // Build the authoring grid from world coordinates BEFORE
                     // the viewport render. No post-render floating overlay.
@@ -4953,6 +4927,20 @@ impl App {
                         );
 
                     let model=marker_world_model
+                        .as_ref().unwrap_or(model);
+
+                    // R6.0.4: collision boxes share the actual world raster.
+                    let collision_world_model=
+                        if self.native_collision_wire_visible {
+                            self.native_collision_grid.as_ref().map(|grid|
+                                self.collision_edit.world_box_model(
+                                    model,grid,self.native_view.cam
+                                )
+                            )
+                        }else{
+                            None
+                        };
+                    let model=collision_world_model
                         .as_ref().unwrap_or(model);
                     // F works from Scene Hierarchy, Render Window, or toolbar.
                     // Never steal the F key from text fields or modal editors.
@@ -5095,6 +5083,8 @@ impl App {
                         self.lck_empty_viewport_press=None;
                         self.native_view.world_left_drag_selected=None;
                         self.native_view.world_marker_drag_capture=true;
+                        self.native_selected=None;
+                        self.native_selection.clear();
                     }
                     let picked=if door_marker_pressed {None} else {picked};
 
@@ -6007,7 +5997,7 @@ self.native_view.version=
                             let owned_preview=native_wall_export::preview(world);
                             if let Some(warning)=&world.collision.ownership_warning{ui.colored_label(egui::Color32::YELLOW,warning);}
                             if let Ok(Some(map))=&owned_preview {
-                                if let Ok(live)=grid.with_owned_map(map){collision_wire::paint(ui,view_rect,&self.native_view,model,&self.collision_edit.composite(&live),Ok(ps1_export::ExportEdits::default()));}
+                                let _=grid.with_owned_map(map); // R604 world-raster collision replaces 2D paint
                             } else {
                             if let Err(error)=owned_preview{ui.colored_label(egui::Color32::YELLOW,format!("Owned collision preview incomplete: {error:#}"));}
                             // The overlay is drawn AFTER the raster image using the
@@ -6041,8 +6031,7 @@ self.native_view.version=
                                     result.clone().map_err(anyhow::Error::msg),
                                 _ => ps1_export::prepare_collision_preview(scene,world),
                             };
-                            collision_wire::paint(ui, view_rect, &self.native_view, model,
-                                &self.collision_edit.composite(grid), edits);
+                            let _=edits; // R604 collision geometry already rendered in 3D
                             }
                         }
                     }
@@ -6052,6 +6041,7 @@ self.native_view.version=
                             let owner=old_cells.iter().find_map(|&(x,z)|{
                                 authoring_group::group_for(&world.groups,&authoring_group::Member::Wall([x,z])).map(|g|g.id)
                             });
+                            let r604_old_collision=(self.collision_edit.native_edit_snapshot(),self.collision_edit.selected_cells());
                             self.collision_edit.finish(
                                 ui,view_rect,&self.native_view,model,grid,
                                 (self.collision_move_mode==EditorMoveMode::Grid)
@@ -6087,6 +6077,14 @@ self.native_view.version=
                                     }
                                 },
                                 None=>{},
+                            }
+                            if r604_old_collision!=(
+                                self.collision_edit.native_edit_snapshot(),
+                                self.collision_edit.selected_cells()
+                            ){
+                                self.native_view.version=
+                                    self.native_view.version.wrapping_add(1);
+                                ui.ctx().request_repaint();
                             }
                             // Preserve floor selection when building mixed-category groups.
                         }
@@ -7793,6 +7791,94 @@ self.native_view.version=
         });
 
         ui.menu_button("View", |ui| {
+            // LCK_TERRAIN_HEIGHT_VIEW_MENU
+            ui.menu_button("Terrain Height", |ui| {
+                ui.set_min_width(230.0);
+
+                let display_id=egui::Id::new(
+                    "lck_r607_height_overlay"
+                );
+                let auto_id=egui::Id::new(
+                    "lck_r608_automatic_height_range"
+                );
+                let step_id=egui::Id::new(
+                    "lck_r607_height_step"
+                );
+
+                let mut visible=ui.ctx().data_mut(|data|
+                    data.get_persisted::<bool>(display_id)
+                        .unwrap_or(false)
+                );
+
+                let mut automatic=ui.ctx().data_mut(|data|
+                    data.get_persisted::<bool>(auto_id)
+                        .unwrap_or(true)
+                );
+
+                let mut step=ui.ctx().data_mut(|data|
+                    data.get_persisted::<f32>(step_id)
+                        .unwrap_or(16.0)
+                );
+
+                let mut changed=false;
+
+                changed |= ui.checkbox(
+                    &mut visible,
+                    "Height & Walkability"
+                ).on_hover_text(
+                    "Show live elevation colors on floor geometry."
+                ).changed();
+
+                changed |= ui.add_enabled(
+                    visible,
+                    egui::Checkbox::new(
+                        &mut automatic,
+                        "Auto range"
+                    )
+                ).on_hover_text(
+                    "Automatically scale colors to the terrain elevation range."
+                ).changed();
+
+                if visible && !automatic {
+                    ui.separator();
+                    changed |= ui.add(
+                        egui::DragValue::new(&mut step)
+                            .range(1.0..=1024.0)
+                            .speed(1.0)
+                            .prefix("Color step: ")
+                    ).changed();
+                }
+
+                if visible {
+                    ui.separator();
+                    ui.small("Purple: low | Red: high");
+                    ui.small("Smooth continuous gradient");
+                }
+
+                if changed {
+                    step=step.clamp(1.0,1024.0);
+
+                    ui.ctx().data_mut(|data|{
+                        data.insert_persisted(
+                            display_id,visible
+                        );
+                        data.insert_persisted(
+                            auto_id,automatic
+                        );
+                        data.insert_persisted(
+                            step_id,step
+                        );
+                    });
+
+                    self.native_view.version=
+                        self.native_view.version
+                            .wrapping_add(1);
+
+                    ui.ctx().request_repaint();
+                }
+            });
+
+            ui.separator();
             // LCK_R57_NATIVE_WARPS
             if ui.checkbox(
                 &mut self.native_warp_editor.open,
@@ -8099,6 +8185,41 @@ self.native_view.version=
             let font = egui::FontId::proportional(26.0);
             let title = "Legaia Creation Kit";
 
+            // LCK_R612C_HEADER_VERSION
+            // Cached on first render. Read from the installed
+            // build marker; fall back to Cargo package version.
+            static LCK_HEADER_VERSION: std::sync::OnceLock<String> =
+                std::sync::OnceLock::new();
+
+            let current_version = LCK_HEADER_VERSION.get_or_init(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|exe| {
+                        exe.parent().map(|dir|
+                            dir.join("LCK_VERSION.txt")
+                        )
+                    })
+                    .and_then(|path| {
+                        std::fs::read_to_string(path).ok()
+                    })
+                    .and_then(|text| {
+                        text.lines()
+                            .next()
+                            .map(str::trim)
+                            .filter(|value|
+                                !value.is_empty()
+                                && value.len() <= 32
+                                && value.is_ascii()
+                            )
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| {
+                        format!("v{}", env!("CARGO_PKG_VERSION"))
+                    })
+            });
+
+            let mut logo_right = pos.x;
+
             for (offset, color) in [
                 (egui::vec2(2.0, 2.0), Color32::from_rgb(38, 23, 10)),
                 (egui::vec2(-1.0, 0.0), Color32::from_rgb(75, 43, 12)),
@@ -8107,14 +8228,24 @@ self.native_view.version=
                 (egui::vec2(0.0, -1.0), Color32::from_rgb(255, 231, 153)),
                 (egui::vec2(0.0, 0.0), Color32::from_rgb(226, 173, 65)),
             ] {
-                painter.text(
+                logo_right = painter.text(
                     pos + offset,
                     egui::Align2::LEFT_CENTER,
                     title,
                     font.clone(),
                     color,
-                );
+                ).right();
             }
+
+            // Place the version immediately after the
+            // measured logo width, without changing its style.
+            painter.text(
+                egui::pos2(logo_right + 14.0, pos.y + 1.0),
+                egui::Align2::LEFT_CENTER,
+                current_version,
+                egui::FontId::proportional(13.0),
+                Color32::from_rgb(135, 143, 155),
+            );
         });
         ui.horizontal(|ui| {
             self.lck_menus(ui);

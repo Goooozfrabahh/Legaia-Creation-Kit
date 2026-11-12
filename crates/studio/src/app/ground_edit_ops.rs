@@ -635,7 +635,414 @@ pub(super) fn compose(base:&Model,hf:&WalkHeightfield,state:&State,interactive:b
     // Preserve the native world camera scale when the user moves a tile.
     m
 }
-pub(super) fn from_pick(id:u32,hf:&WalkHeightfield,state:&State)->Option<Key>{
+// LCK_R607_LIVE_HEIGHT
+// A live world-space material overlay. The vertex identities,
+// pick IDs, original model, native ground data and camera basis
+// remain unchanged. This is recomputed from live transforms.
+const R607_PALETTE:[[u8;3];7]=[
+    [141,69,193],   // Purple
+    [62,98,218],    // Blue
+    [38,170,198],   // Cyan
+    [54,180,110],   // Green
+    [214,197,52],   // Yellow
+    [240,146,49],   // Orange
+    [225,63,67],    // Red
+];
+
+fn r607_height_color(y:f32,origin:f32,step:f32)->[u8;3]{
+    let t=((y-origin)/step.max(0.001)).clamp(0.0,6.0);
+    let i=(t.floor() as usize).min(5);
+    let k=t-i as f32;
+
+    if t>=6.0 {
+        return R607_PALETTE[6];
+    }
+
+    [0usize,1,2].map(|c|{
+        let a=R607_PALETTE[i][c] as f32;
+        let b=R607_PALETTE[i+1][c] as f32;
+        (a+(b-a)*k).round().clamp(0.0,255.0) as u8
+    })
+}
+
+// LCK_R608_ADAPTIVE_HEIGHT
+// Derive a stable palette from the unedited native surface.
+// Using percentile bounds avoids one extreme floor forcing
+// every other tile into the final red palette band.
+fn r608_scene_height_range(
+    hf:&WalkHeightfield
+)->(f32,f32){
+    let mut heights=hf.positions.chunks_exact(4)
+        .filter_map(|quad|{
+            let y=quad.iter().map(|p|p[1]).sum::<f32>()/4.0;
+            y.is_finite().then_some(y)
+        })
+        .collect::<Vec<_>>();
+
+    if heights.is_empty(){
+        return (0.0,16.0);
+    }
+
+    heights.sort_by(|a,b|a.total_cmp(b));
+
+    let n=heights.len()-1;
+    let low=heights[n*10/100];
+    let high=heights[n*90/100];
+
+    let step=((high-low)/6.0).max(1.0);
+
+    (low,step)
+}
+fn r607_tint(m:&mut Model,i:usize,origin:f32,step:f32){
+    let Some(position)=m.positions.get(i) else{return;};
+
+    let color=r607_height_color(position[1],origin,step);
+
+    if m.textured.get(i)==Some(&1){
+        // Preserve the original VRAM texture, tinting it instead
+        // of adding an independent screen-space paint layer.
+        if let Some(modulation)=m.modulation.get_mut(i){
+            // Material modulation must remain near neutral
+            // so the PS1 texture remains readable underneath.
+            *modulation=[0usize,1,2].map(|c|{
+                let neutral=modulation[c] as f32;
+                let overlay=128.0
+                    +(color[c] as f32-128.0)*0.65;
+                (neutral*0.60+overlay*0.40)
+                    .round().clamp(0.0,255.0) as u8
+            });
+        }
+    }else if let Some(fill)=m.fill.get_mut(i){
+        *fill=[0usize,1,2].map(|c|
+            ((fill[c] as f32)*0.55
+                +(color[c] as f32)*0.45)
+                .round().clamp(0.0,255.0) as u8
+        );
+    }
+}
+
+pub(super) fn live_height_model(
+    source:&Model,
+    hf:&WalkHeightfield,
+    state:&State,
+    world:&super::world_view::WorldModel,
+    step:f32
+)->Model {
+    let mut m=source.clone();
+
+    // Automatic mode passes step=0. Manual mode uses the user's
+    // chosen step, but both share a stable native scene baseline.
+    let (origin,automatic_step)=r608_scene_height_range(hf);
+    let step=if step<=0.0 {automatic_step}else{step};
+
+    // Native tiles: use already transformed vertices, not original MAP
+    // coordinates. This updates on every cursor-driven transform.
+    for (q,quad) in hf.positions.chunks_exact(4).enumerate(){
+        let c=[
+            (quad[0][0]/128.0).round() as u8,
+            (quad[0][2]/128.0).round() as u8
+        ];
+
+        if state.deleted.contains(&c){
+            continue;
+        }
+
+        for i in q*4..q*4+4 {
+            r607_tint(&mut m,i,origin,step);
+        }
+    }
+
+    // Copied floors: stable render identities follow the current
+    // cursor transform regardless of the source tile's position.
+    for copy_index in 0..state.copies.len(){
+        let id=COPY_BASE+copy_index as u32;
+
+        let indices=m.object_ids.iter()
+            .enumerate()
+            .filter_map(|(i,&candidate)|
+                (candidate==id).then_some(i)
+            )
+            .collect::<Vec<_>>();
+
+        for i in indices {
+            r607_tint(&mut m,i,origin,step);
+        }
+    }
+
+    // Foreign imported floor assets retain their independent
+    // source textures and authored world transforms.
+    for draw in &world.draws {
+        let is_floor=draw.editor_uid
+            .and_then(|uid|
+                world.foreign.iter().find(|asset|asset.uid==uid)
+            )
+            .is_some_and(|asset|
+                super::floor_tiles::decode_floor_kind(
+                    &asset.kind
+                ).is_some()
+            );
+
+        if !is_floor || draw.hidden {
+            continue;
+        }
+
+        for i in draw.vertex_start..draw.vertex_end {
+            r607_tint(&mut m,i,origin,step);
+        }
+    }
+
+    // Never refit. Camera pose, zoom, and orbit scale must not move
+    // merely because height colors are visible.
+    m.center=source.center;
+    m.radius=source.radius;
+
+    m
+}
+
+#[cfg(test)]
+mod lck_r607_live_height_tests {
+    use super::*;
+
+    #[test]
+    fn colors_change_continuously_with_height(){
+        let a=r607_height_color(5.0,0.0,1.0);
+        let b=r607_height_color(8.0,0.0,1.0);
+        assert_ne!(a,b);
+    }
+
+    #[test]
+    fn palette_is_stable_for_fixed_height(){
+        assert_eq!(
+            r607_height_color(48.0,0.0,16.0),
+            R607_PALETTE[3]
+        );
+    }
+
+    #[test]
+    fn palette_clamps_out_of_range(){
+        assert_eq!(
+            r607_height_color(-10000.0,0.0,16.0),
+            R607_PALETTE[0]
+        );
+        assert_eq!(
+            r607_height_color(10000.0,0.0,16.0),
+            R607_PALETTE[6]
+        );
+    }
+}
+#[cfg(test)]
+mod lck_r608_overlay_tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_range_ignores_single_extreme_low_tile(){
+        let mut hf=WalkHeightfield::default();
+
+        hf.positions.extend_from_slice(
+            &[[0.0,-9000.0,0.0];4]
+        );
+
+        for i in 0..20 {
+            hf.positions.extend_from_slice(
+                &[[0.0,i as f32*8.0,0.0];4]
+            );
+        }
+
+        let (origin,step)=r608_scene_height_range(&hf);
+
+        assert!(origin>=0.0);
+        assert!(step>=1.0);
+        assert!(step.is_finite());
+    }
+
+    #[test]
+    fn live_palette_changes_with_vertex_elevation(){
+        let a=r607_height_color(5.0,0.0,1.0);
+        let b=r607_height_color(8.0,0.0,1.0);
+
+        assert_ne!(a,b);
+    }
+
+    #[test]
+    fn empty_scene_has_finite_default(){
+        let hf=WalkHeightfield::default();
+        assert_eq!(r608_scene_height_range(&hf),(0.0,16.0));
+    }
+}
+// LCK_R609_DYNAMIC_HEIGHT_RANGE
+// Height normalization follows the current rendered geometry,
+// including active drag transforms. The camera-local range reveals
+// ramps without forcing an entire scene into the red band.
+fn r609_domain(
+    heights:&[f32],
+    automatic:bool,
+    manual_step:f32
+)->(f32,f32) {
+    let mut valid=heights.iter().copied()
+        .filter(|h|h.is_finite())
+        .collect::<Vec<_>>();
+
+    if valid.is_empty() {
+        return (0.0,96.0);
+    }
+
+    valid.sort_by(|a,b|a.total_cmp(b));
+
+    let low=valid[0];
+    let high=*valid.last().unwrap_or(&low);
+
+    let span=(high-low).max(32.0);
+    let center=low+(high-low)*0.5;
+
+    if automatic {
+        let padding=(span*0.06).max(8.0);
+
+        (
+            center-span*0.5-padding,
+            center+span*0.5+padding
+        )
+    }else{
+        let total=manual_step.max(1.0)*6.0;
+        (
+            center-total*0.5,
+            center+total*0.5
+        )
+    }
+}
+
+pub(super) fn r609_height_overlay(
+    model:&Model,
+    base_vertex_count:usize,
+    hf:&WalkHeightfield,
+    state:&State,
+    world:&super::world_view::WorldModel,
+    cam:crate::raster::Camera,
+    automatic:bool,
+    manual_step:f32
+)->Option<crate::raster::HeightOverlay> {
+    let native_limit=hf.positions.len().min(model.positions.len());
+
+    if native_limit==0 {
+        return None;
+    }
+
+    // R610: scene-stable elevation range.
+    // Camera movement must never change the palette.
+    let _=cam;
+    let mut all=Vec::<f32>::new();
+
+    let mut add=|position:[f32;3]|{
+        if position.iter().all(|v|v.is_finite()){
+            all.push(position[1]);
+        }
+    };
+
+    // Native floors occupy the first four vertices per ground tile.
+    // Exclude deleted pieces from the automatic height range.
+    for (q,quad) in hf.positions.chunks_exact(4).enumerate(){
+        let cell=[
+            (quad[0][0]/128.0).round() as u8,
+            (quad[0][2]/128.0).round() as u8
+        ];
+
+        if state.deleted.contains(&cell) {
+            continue;
+        }
+
+        let first=q*4;
+
+        if let Some(points)=model.positions.get(first..first+4){
+            for &position in points {
+                add(position);
+            }
+        }
+    }
+
+    // Editor floor copies are appended to the world model.
+    let copy_start=base_vertex_count.min(model.positions.len());
+
+    for &position in &model.positions[copy_start..] {
+        add(position);
+    }
+
+    // Independently imported floor assets retain their own draw IDs.
+    let mut imported_ids=Vec::<u32>::new();
+
+    for draw in &world.draws {
+        if draw.hidden {
+            continue;
+        }
+
+        let is_floor=draw.editor_uid
+            .and_then(|uid|
+                world.foreign.iter().find(|asset|asset.uid==uid)
+            )
+            .is_some_and(|asset|
+                super::floor_tiles::decode_floor_kind(
+                    &asset.kind
+                ).is_some()
+            );
+
+        if !is_floor {
+            continue;
+        }
+
+        imported_ids.push(draw.id);
+
+        if let Some(points)=model.positions.get(
+            draw.vertex_start..draw.vertex_end
+        ){
+            for &position in points {
+                add(position);
+            }
+        }
+    }
+
+    imported_ids.sort_unstable();
+    imported_ids.dedup();
+
+    let heights=&all;
+
+    let (min_y,max_y)=r609_domain(
+        heights,
+        automatic,
+        manual_step
+    );
+
+    Some(crate::raster::HeightOverlay{
+        min_y,
+        max_y,
+        contour_step:16.0,
+        native_vertex_limit:native_limit,
+        copied_start:copy_start,
+        copied_end:model.positions.len(),
+        imported_floor_ids:imported_ids,
+    })
+}
+
+#[cfg(test)]
+mod lck_r609_height_domain_tests {
+    use super::*;
+
+    #[test]
+    fn automatic_range_does_not_clip_ramp_top(){
+        let heights=[0.0,32.0,64.0,96.0,128.0];
+
+        let (low,high)=r609_domain(&heights,true,16.0);
+
+        assert!(low<0.0);
+        assert!(high>128.0);
+    }
+
+    #[test]
+    fn local_range_changes_when_floor_is_raised(){
+        let first=r609_domain(&[0.0,16.0,32.0],true,16.0);
+        let raised=r609_domain(&[0.0,16.0,96.0],true,16.0);
+
+        assert_ne!(first,raised);
+        assert!(raised.1>first.1);
+    }
+}pub(super) fn from_pick(id:u32,hf:&WalkHeightfield,state:&State)->Option<Key>{
     if id>=COPY_BASE {
         return state.copies.get((id-COPY_BASE) as usize).map(|p|Key::Copy(p.uid));
     }

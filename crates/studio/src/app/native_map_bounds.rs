@@ -1251,10 +1251,10 @@ pub(super) fn render_fixed_grid(
 
     // Lift the lines slightly above the requested plane.
     // This reduces coplanar Z fighting without changing walkability.
-    let y=height+2.0;
+    let y=height+3.0; // LCK_R612B_VISUAL_STYLE
 
-    let minor=[58,126,155];
-    let major=[75,183,218];
+    let minor=[89,166,196];
+    let major=[117,208,231];
     let cyan=[50,225,245];
     let red=[255,88,78];
 
@@ -1263,7 +1263,7 @@ pub(super) fn render_fixed_grid(
 
         let strong=i%32==0;
         let rgb=if strong {major}else{minor};
-        let width=if strong {5.0}else{2.5};
+        let width=if strong {6.5}else{3.6};
 
         r49_ribbon(
             &mut model,

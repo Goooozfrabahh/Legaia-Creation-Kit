@@ -1,6 +1,3 @@
-> **LCK development:** [Current status](STATUS.md) |
-> [Workstreams](docs/LCK_WORKSTREAMS.md) |
-> [Standalone World Editor plan](docs/LCK_STANDALONE_WORLD_EDITOR_PLAN.md)
 # legend-of-legaia-re
 
 **Legend of Legaia** (PlayStation, 1998, NA `SCUS-94254`), running as a from-scratch Rust port you can play today - in a native window or in your browser - from your own disc image. Around the port sit a full asset extractor, a disc patcher (randomizer, translation packs, content mods), interactive viewers, and byte-level documentation of every format on the disc.

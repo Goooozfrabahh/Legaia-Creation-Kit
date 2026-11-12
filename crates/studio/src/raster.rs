@@ -313,10 +313,201 @@ pub fn render_highlights_with_sources(model:&Model,vram:&Vram,cam:Camera,shading
 
 // The visible ID is written only when the same pixel passes
 // texture transparency and depth testing as the color renderer.
+// LCK_R609_PER_PIXEL_HEIGHT
+// The overlay uses the interpolated world-space Y at every raster
+// pixel. It does not alter native MAP data, textures or pick IDs.
+#[derive(Clone,Debug,PartialEq)]
+pub struct HeightOverlay {
+    pub min_y:f32,
+    pub max_y:f32,
+    pub contour_step:f32,
+    pub native_vertex_limit:usize,
+    pub copied_start:usize,
+    pub copied_end:usize,
+    pub imported_floor_ids:Vec<u32>,
+}
+
+const R609_COLORS:[[f32;3];7]=[
+    [141.0,69.0,193.0],
+    [62.0,98.0,218.0],
+    [38.0,170.0,198.0],
+    [54.0,180.0,110.0],
+    [214.0,197.0,52.0],
+    [240.0,146.0,49.0],
+    [225.0,63.0,67.0],
+];
+
+fn r609_surface_color(
+    height:f32,
+    overlay:&HeightOverlay
+)->[f32;3] {
+    let range=(overlay.max_y-overlay.min_y).max(0.001);
+    let t=((height-overlay.min_y)/range)
+        .clamp(0.0,1.0)*6.0;
+
+    let index=(t.floor() as usize).min(5);
+    let factor=if t>=6.0 {1.0}else{t-index as f32};
+
+    let mut rgb=[0.0;3];
+
+    for channel in 0..3 {
+        rgb[channel]=R609_COLORS[index][channel]
+            +(R609_COLORS[index+1][channel]
+                -R609_COLORS[index][channel])*factor;
+    }
+
+    // Contour lines remain visible even when a scene's total
+    // elevation range is much larger than one ramp.
+    let step=overlay.contour_step.max(1.0);
+
+    let phase=height.rem_euclid(step)/step;
+
+    if phase<0.075 {
+        for channel in 0..3 {
+            rgb[channel]*=0.53;
+        }
+    }
+
+    rgb
+}
+
+// LCK_R610_EVEN_SLOPE_BANDS
+// Sloped surfaces use seven equally spaced elevation bands.
+// Flat surfaces continue to use the absolute scene palette.
+// Dark contour lines still use actual world-space Y.
+fn r610_even_slope_color(
+    height:f32,
+    low:f32,
+    high:f32,
+    contour_step:f32,
+)->[f32;3]{
+    let span=(high-low).max(0.001);
+    let normalized=((height-low)/span).clamp(0.0,1.0);
+
+    // Seven equal intervals, not six point-to-point intervals.
+    let scaled=(normalized*7.0).min(6.999999);
+    let index=(scaled.floor() as usize).min(6);
+    let progress=scaled-index as f32;
+
+    // Each color occupies an equal-height zone.
+    // The last 35% transitions smoothly to the next color.
+    let fade=((progress-0.65)/0.35).clamp(0.0,1.0);
+    let fade=fade*fade*(3.0-2.0*fade);
+    let next=(index+1).min(6);
+
+    let mut rgb=[0.0f32;3];
+
+    for c in 0..3 {
+        rgb[c]=R609_COLORS[index][c]*(1.0-fade)
+            +R609_COLORS[next][c]*fade;
+    }
+
+    // LCK_R611A_SMOOTH_GRADIENT
+    // Keep a continuous terrain-height gradient with no contour breaks.
+    let _=contour_step;
+    rgb
+}
+// LCK_R611_GLOBAL_HEIGHT
+// Every floor uses ONE scene-wide absolute elevation range.
+// No per-tile or per-object rainbow resets.
+// The height overlay is based on world-space Y, independent of
+// camera angle, pan and zoom.
+fn r611_absolute_height_color(
+    y:f32,
+    overlay:&HeightOverlay,
+)->[f32;3] {
+    r610_even_slope_color(
+        y,
+        overlay.min_y,
+        overlay.max_y,
+        overlay.contour_step
+    )
+}
+
+#[cfg(test)]
+mod lck_r611_global_height_tests {
+    use super::*;
+
+    fn test_overlay()->HeightOverlay {
+        HeightOverlay{
+            min_y:0.0,
+            max_y:140.0,
+            contour_step:16.0,
+            native_vertex_limit:4,
+            copied_start:4,
+            copied_end:4,
+            imported_floor_ids:Vec::new(),
+        }
+    }
+
+    #[test]
+    fn seven_equal_scene_height_intervals_have_seven_colors(){
+        let overlay=test_overlay();
+
+        for band in 0..7usize {
+            // Each band occupies 20 native height units.
+            // Sample its midpoint, away from contour lines.
+            let y=(band as f32+0.5)*20.0;
+
+            let color=r611_absolute_height_color(y,&overlay);
+
+            for channel in 0..3 {
+                assert!(
+                    (color[channel]-R609_COLORS[band][channel])
+                        .abs()<0.01,
+                    "Band {} channel {} has incorrect color",
+                    band,channel
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn equal_world_height_always_has_equal_color(){
+        let overlay=test_overlay();
+
+        let first=r611_absolute_height_color(54.0,&overlay);
+        let second=r611_absolute_height_color(54.0,&overlay);
+
+        assert_eq!(first,second);
+    }
+
+    #[test]
+    fn different_absolute_heights_do_not_restart_rainbow(){
+        let overlay=test_overlay();
+
+        let low=r611_absolute_height_color(10.0,&overlay);
+        let high=r611_absolute_height_color(130.0,&overlay);
+
+        assert_ne!(low,high);
+    }
+
+    #[test]
+    fn changing_height_changes_color_with_fixed_scene_range(){
+        let overlay=test_overlay();
+
+        let before=r611_absolute_height_color(25.0,&overlay);
+        let after=r611_absolute_height_color(65.0,&overlay);
+
+        assert_ne!(before,after);
+    }
+}
 pub fn render_highlights_with_sources_and_ids(
     model:&Model,vram:&Vram,cam:Camera,shading:Shading,
     w:usize,h:usize,selected:&[u32],show_ground:bool,
     donor_vram:Option<&std::collections::HashMap<u32,std::sync::Arc<Vram>>>
+) -> (Vec<u8>,Vec<u32>) {
+    render_highlights_with_sources_and_ids_r609(
+        model,vram,cam,shading,w,h,selected,show_ground,
+        donor_vram,None
+    )
+}
+
+pub fn render_highlights_with_sources_and_ids_r609(
+    model:&Model,vram:&Vram,cam:Camera,shading:Shading,
+    w:usize,h:usize,selected:&[u32],show_ground:bool,
+    donor_vram:Option<&std::collections::HashMap<u32,std::sync::Arc<Vram>>>,
+    height_overlay:Option<&HeightOverlay>
 ) -> (Vec<u8>,Vec<u32>) {
     let mut rgba = vec![0u8; w * h * 4];
     let mut visible_ids = vec![u32::MAX; w * h];
@@ -327,6 +518,7 @@ pub fn render_highlights_with_sources_and_ids(
         return (rgba,visible_ids);
     }
     let mut depth = vec![f32::INFINITY; w * h];
+
 
     let (sy, cy) = cam.yaw.sin_cos();
     let (sp, cp) = cam.pitch.sin_cos();
@@ -365,6 +557,27 @@ pub fn render_highlights_with_sources_and_ids(
 
     for tri in model.indices.as_chunks::<3>().0 {
         let i = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+
+        let r609_floor_triangle=height_overlay.is_some_and(|overlay|{
+            let native=i.iter().all(|&vertex|
+                vertex<overlay.native_vertex_limit
+            );
+
+            let copied=i.iter().all(|&vertex|
+                vertex>=overlay.copied_start
+                    && vertex<overlay.copied_end
+            );
+
+            let imported=model.object_ids.get(i[0])
+                .is_some_and(|id|
+                    overlay.imported_floor_ids
+                        .binary_search(id).is_ok()
+                );
+
+            native||copied||imported
+        });
+
+
         if !show_ground && model.object_ids.get(i[0]) == Some(&u32::MAX) {
             continue;
         }
@@ -501,6 +714,41 @@ pub fn render_highlights_with_sources_and_ids(
                      rgb[1] * 0.50 + 190.0 * 0.50,
                      rgb[2] * 0.50 + 42.0 * 0.50]
                 } else { rgb };
+
+                // Pixel elevation uses the SAME barycentric weights
+                // used for texture, depth and visible-ID rendering.
+                // This resolves slopes inside a single floor tile.
+                let rgb=if r609_floor_triangle {
+                    if let Some(overlay)=height_overlay {
+                        let y=w0*model.positions[i[0]][1]
+                            +w1*model.positions[i[1]][1]
+                            +w2*model.positions[i[2]][1];
+
+                        // A genuinely sloped surface receives the
+                        // full seven-band gradient at equal height
+                        // intervals. Flat tiles retain absolute colors.
+                        let height_color=r611_absolute_height_color(y,overlay);
+
+                        [0usize,1,2].map(|channel|{
+                            let base=rgb[channel]*0.38;
+                            let terrain=height_color[channel]*0.62;
+
+                            let selected_accent=if highlighted {
+                                [255.0,205.0,75.0][channel]*0.08
+                            }else{
+                                0.0
+                            };
+
+                            (base+terrain)*(if highlighted {0.92}else{1.0})
+                                +selected_accent
+                        })
+                    }else{
+                        rgb
+                    }
+                }else{
+                    rgb
+                };
+
                 let o = di * 4;
                 rgba[o] = rgb[0].clamp(0.0, 255.0) as u8;
                 rgba[o + 1] = rgb[1].clamp(0.0, 255.0) as u8;
@@ -715,5 +963,114 @@ mod lck_r54_visible_pick_tests {
         );
 
         assert!(ids.iter().all(|&id|id==u32::MAX));
+    }
+}
+// LCK_R609_PER_PIXEL_HEIGHT_TESTS
+#[cfg(test)]
+mod lck_r609_raster_tests {
+    use super::*;
+
+    fn overlay()->HeightOverlay {
+        HeightOverlay{
+            min_y:0.0,
+            max_y:160.0,
+            contour_step:16.0,
+            native_vertex_limit:4,
+            copied_start:10,
+            copied_end:14,
+            imported_floor_ids:Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ramp_has_distinct_low_middle_and_high_colors(){
+        let o=overlay();
+
+        let low=r609_surface_color(20.0,&o);
+        let middle=r609_surface_color(80.0,&o);
+        let high=r609_surface_color(140.0,&o);
+
+        assert_ne!(low,middle);
+        assert_ne!(middle,high);
+        assert_ne!(low,high);
+    }
+
+    #[test]
+    fn every_fractional_height_can_change_gradient(){
+        let o=overlay();
+
+        let a=r609_surface_color(54.0,&o);
+        let b=r609_surface_color(55.0,&o);
+
+        assert_ne!(a,b);
+    }
+
+    #[test]
+    fn contour_lines_are_present(){
+        let o=overlay();
+
+        let line=r609_surface_color(64.0,&o);
+        let nearby=r609_surface_color(68.0,&o);
+
+        assert!(
+            line.iter().sum::<f32>()
+                <nearby.iter().sum::<f32>()
+        );
+    }
+}
+// LCK_R610_EVEN_BANDS_TESTS
+#[cfg(test)]
+mod lck_r610_tests {
+    use super::*;
+
+    #[test]
+    fn all_seven_colors_have_equal_height_intervals(){
+        for i in 0..7usize {
+            let y=(i as f32+0.5)*20.0;
+            let rgb=r610_even_slope_color(y,0.0,140.0,16.0);
+
+            for channel in 0..3 {
+                assert!(
+                    (rgb[channel]-R609_COLORS[i][channel]).abs()<0.1,
+                    "Incorrect band {} channel {}",
+                    i,channel
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slope_gradient_interpolates_between_color_bands(){
+        let lower=r610_even_slope_color(15.0,0.0,140.0,16.0);
+        let upper=r610_even_slope_color(19.0,0.0,140.0,16.0);
+        assert_ne!(lower,upper);
+    }
+
+    #[test]
+    fn same_elevation_always_has_same_relative_slope_color(){
+        let first=r610_even_slope_color(60.0,0.0,140.0,16.0);
+        let second=r610_even_slope_color(60.0,0.0,140.0,16.0);
+        assert_eq!(first,second);
+    }
+}
+// LCK_R611A_SMOOTH_GRADIENT_TESTS
+#[cfg(test)]
+mod lck_r611a_smooth_gradient_tests {
+    use super::*;
+
+    #[test]
+    fn contour_step_no_longer_changes_color() {
+        let a=r610_even_slope_color(64.0,0.0,140.0,16.0);
+        let b=r610_even_slope_color(64.0,0.0,140.0,32.0);
+        assert_eq!(a,b);
+    }
+
+    #[test]
+    fn nearby_heights_transition_smoothly() {
+        let a=r610_even_slope_color(63.9,0.0,140.0,16.0);
+        let b=r610_even_slope_color(64.1,0.0,140.0,16.0);
+
+        let delta=(0..3).map(|i|(a[i]-b[i]).abs()).sum::<f32>();
+        assert!(delta < 30.0);
     }
 }

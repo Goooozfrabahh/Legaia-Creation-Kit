@@ -94,6 +94,20 @@ pub(super) fn source_map(
     Ok(index.entry_bytes(entry)?.as_ref().clone())
 }
 
+// R6.0: unchanged saved warp snapshots are not native edits.
+pub(super) fn has_effective_changes(
+    index:&ProtIndex,
+    edited:&SceneWarps
+)->Result<bool>{
+    let original=source_map(index,&edited.scene)?;
+
+    ensure!(
+        native_hash(&original)?==edited.original_hash,
+        "Saved warp source differs from the opened retail disc"
+    );
+
+    Ok(parse(&original)?!=edited.records)
+}
 fn validate_records(records:&[Warp])->Result<()> {
     ensure!(records.len()<=i16::MAX as usize,
         "Native trigger count exceeds i16 capacity");
@@ -704,7 +718,7 @@ pub(super) fn interact(
         editor.dragging=None;
         if let Some(pointer)=pointer.filter(|p|rect.contains(*p)){
             let mut nearest=None;
-            let mut distance=144.0f32;
+            let mut distance=576.0f32;
 
             for (i,row) in editor.draft.iter().enumerate(){
                 for arrival in [false,true]{
@@ -814,7 +828,7 @@ pub(super) fn paint(
         ]{
             if let Some(pos)=p.filter(|p|rect.contains(*p)){
                 painter.circle_filled(
-                    pos,if i==editor.selected {7.0}else{5.0},color
+                    pos,if i==editor.selected {14.0}else{10.0},color
                 );
 
                 if i==editor.selected {

@@ -1,0 +1,322 @@
+{
+  "format": "LCK_NATIVE_GRID_AUDIT",
+  "version": 1,
+  "runtime_patch_installed": false,
+  "gameplay_verified": false,
+  "scus": {
+    "path": "D:\\AstraRimElmProject\\assets\\SCUS_942.54",
+    "sha256": "292256e2e66db42727f613406785e444254d3f699569e611f65fcf1c6d2f3482",
+    "bytes": 442368,
+    "map_pointer_offset_candidates_not_exhaustive": [
+      {
+        "address": "0x80017bf8",
+        "word": "0x8c8200d8"
+      },
+      {
+        "address": "0x80017c4c",
+        "word": "0x8d2300d8"
+      },
+      {
+        "address": "0x80017c8c",
+        "word": "0x8d2300d8"
+      },
+      {
+        "address": "0x80017d08",
+        "word": "0x8c6303ec"
+      },
+      {
+        "address": "0x80017d1c",
+        "word": "0x8d8300d8"
+      },
+      {
+        "address": "0x80017d44",
+        "word": "0x8d8200d8"
+      },
+      {
+        "address": "0x80017e50",
+        "word": "0x8c6303ec"
+      },
+      {
+        "address": "0x80017f44",
+        "word": "0x8c6303ec"
+      },
+      {
+        "address": "0x80017fcc",
+        "word": "0x8c8403ec"
+      },
+      {
+        "address": "0x800192a8",
+        "word": "0x8c8403ec"
+      },
+      {
+        "address": "0x8001936c",
+        "word": "0x8c6303ec"
+      },
+      {
+        "address": "0x8001f850",
+        "word": "0x8e6200d8"
+      },
+      {
+        "address": "0x8001f900",
+        "word": "0x8e6400d8"
+      },
+      {
+        "address": "0x80020200",
+        "word": "0x8c6303ec"
+      },
+      {
+        "address": "0x80020fb4",
+        "word": "0x8c8300d8"
+      },
+      {
+        "address": "0x80020fd0",
+        "word": "0x8c8300d8"
+      },
+      {
+        "address": "0x80020ff8",
+        "word": "0x8c8300d8"
+      },
+      {
+        "address": "0x80021058",
+        "word": "0x8c8300d8"
+      },
+      {
+        "address": "0x800210b4",
+        "word": "0x8c8300d8"
+      },
+      {
+        "address": "0x800210dc",
+        "word": "0x8c8300d8"
+      },
+      {
+        "address": "0x800210f8",
+        "word": "0x8c8300d8"
+      },
+      {
+        "address": "0x8003a578",
+        "word": "0x8c6303ec"
+      },
+      {
+        "address": "0x8003a5b4",
+        "word": "0x8ec500d8"
+      },
+      {
+        "address": "0x8003a6a4",
+        "word": "0x8c6303ec"
+      },
+      {
+        "address": "0x8003a714",
+        "word": "0x8ec300d8"
+      },
+      {
+        "address": "0x8003a740",
+        "word": "0x8ec200d8"
+      },
+      {
+        "address": "0x8003a780",
+        "word": "0x8ec200d8"
+      },
+      {
+        "address": "0x8003a798",
+        "word": "0x8ec200d8"
+      },
+      {
+        "address": "0x8003a7b0",
+        "word": "0x8ec200d8"
+      },
+      {
+        "address": "0x8003afb4",
+        "word": "0x8c4203ec"
+      },
+      {
+        "address": "0x8003afe8",
+        "word": "0x8c8403ec"
+      }
+    ]
+  },
+  "field_overlay": {
+    "path": "D:\\AstraRimElmProject\\assets\\PROT\\0897_xxx_dat.BIN",
+    "sha256": "0b39d892d783ffcc89dac06ee395540be0a7392c5cbc79fb9ba3442daccc09f6",
+    "bytes": 151552,
+    "map_pointer_offset_candidates_not_exhaustive": [
+      {
+        "address": "0x801cf7c8",
+        "word": "0x8c6303ec"
+      },
+      {
+        "address": "0x801cf8dc",
+        "word": "0x8c6303ec"
+      },
+      {
+        "address": "0x801cfa6c",
+        "word": "0x8c6303ec"
+      },
+      {
+        "address": "0x801cfbd8",
+        "word": "0x8c8403ec"
+      },
+      {
+        "address": "0x801cfcfc",
+        "word": "0x8c6303ec"
+      },
+      {
+        "address": "0x801cff68",
+        "word": "0x8c8403ec"
+      },
+      {
+        "address": "0x801d0044",
+        "word": "0x8c8403ec"
+      },
+      {
+        "address": "0x801d0120",
+        "word": "0x8c8403ec"
+      },
+      {
+        "address": "0x801d0578",
+        "word": "0x8ca400d8"
+      },
+      {
+        "address": "0x801d1930",
+        "word": "0x8c8403ec"
+      },
+      {
+        "address": "0x801d1a08",
+        "word": "0x8c8403ec"
+      },
+      {
+        "address": "0x801d2124",
+        "word": "0x8ca200d8"
+      },
+      {
+        "address": "0x801d5674",
+        "word": "0x8e6200d8"
+      },
+      {
+        "address": "0x801d5698",
+        "word": "0x8e6700d8"
+      },
+      {
+        "address": "0x801d5724",
+        "word": "0x8c8403ec"
+      },
+      {
+        "address": "0x801d6a00",
+        "word": "0xae2200d8"
+      },
+      {
+        "address": "0x801d6ae0",
+        "word": "0x8c8403ec"
+      },
+      {
+        "address": "0x801d7c50",
+        "word": "0x8e2600d8"
+      },
+      {
+        "address": "0x801d7d5c",
+        "word": "0x8e2300d8"
+      },
+      {
+        "address": "0x801d7d88",
+        "word": "0x8e2200d8"
+      },
+      {
+        "address": "0x801d7db8",
+        "word": "0x8e2200d8"
+      },
+      {
+        "address": "0x801d7dec",
+        "word": "0x8e2200d8"
+      },
+      {
+        "address": "0x801d7e04",
+        "word": "0x8e2200d8"
+      },
+      {
+        "address": "0x801d7e1c",
+        "word": "0x8e2300d8"
+      },
+      {
+        "address": "0x801e1ce8",
+        "word": "0x8d0300d8"
+      },
+      {
+        "address": "0x801e1d5c",
+        "word": "0x8d0300d8"
+      },
+      {
+        "address": "0x801e1ddc",
+        "word": "0x8d2400d8"
+      },
+      {
+        "address": "0x801e1e60",
+        "word": "0x8d2400d8"
+      },
+      {
+        "address": "0x801e2bac",
+        "word": "0x8fa600d8"
+      }
+    ]
+  },
+  "historical_heaps": [
+    {
+      "path": "D:\\AstraRimElmProject\\Backups\\LCK_Run3_Runtime\\town01_settled_ram.bin",
+      "sha256": "c79b1dd9f22de4f00c297eac2c671f80990b50091a77042bbfdd514a35eff248",
+      "historical_only": true,
+      "free_bytes": 17780,
+      "largest_free_block": 17780,
+      "blocks": [
+        {
+          "address": "0x80091808",
+          "bytes": 17780
+        }
+      ]
+    },
+    {
+      "path": "D:\\AstraRimElmProject\\Backups\\LCK_Run3_Runtime\\town01_arena_return_ram.bin",
+      "sha256": "b87e2aed9281729b8620b58544429a95922ddd971b4e338d823d1890d3960e3f",
+      "historical_only": true,
+      "free_bytes": 832432,
+      "largest_free_block": 832432,
+      "blocks": [
+        {
+          "address": "0x80091808",
+          "bytes": 832432
+        }
+      ]
+    }
+  ],
+  "dense_256_extra_bytes": 147456,
+  "integration_required": [
+    "per-scene payload selection, allocation, loading, freeing and reload after battle",
+    "all native grid readers and MAN grid writers, with unchanged legacy-scene behavior",
+    "height interpolation and wall half-tile quadrant/bias semantics",
+    "object creation plus region-window visibility and camera boundaries",
+    "floor geometry/textures, shared descriptor capacity, and resource budgets",
+    "trigger/warp/region signed coordinates without byte overflow",
+    "existing Stage E and extended-floor hook composition",
+    "native runtime and user gameplay verification"
+  ],
+  "project": {
+    "path": "D:\\AstraRimElmProject\\1TestImgfiles\\DOORROOM.lckproject",
+    "sha256": "197f2e9c50a70be479c6ed388bc77210ac025d95f2392a687c91e1935e71be55",
+    "cells": [
+      {
+        "scene": "original:town01",
+        "ground_requests": 2217,
+        "external_grid_tiles": 2169,
+        "external_pages": 12,
+        "sparse_grid_bytes": 9744,
+        "requests_crossing_256_bounds": 0,
+        "invalid_requests": 0,
+        "excludes": [
+          "geometry",
+          "textures",
+          "runtime code",
+          "allocator overhead",
+          "new descriptors",
+          "slope data"
+        ]
+      }
+    ]
+  }
+}

@@ -22,6 +22,7 @@ pub(crate) struct Viewport {
     pub world_marquee_enabled: bool,
     pub world_selected: Vec<u32>,
     rendered_selection: Vec<u32>,
+    height_overlay: Option<raster::HeightOverlay>,
     // LCK_R54_VISIBLE_PICK
     pick_ids:Vec<u32>,
     pick_dimensions:[usize;2],
@@ -273,6 +274,16 @@ fn lck_preview_raster_size(
     ]
 }
 impl Viewport {
+    pub(super) fn set_height_overlay(
+        &mut self,
+        next:Option<raster::HeightOverlay>
+    ){
+        if self.height_overlay!=next {
+            self.height_overlay=next;
+            self.version=self.version.wrapping_add(1);
+        }
+    }
+
     // LCK_R54_VISIBLE_PICK
     // Read the exact ID painted at the pointer's pixel.
     // Mirror is presentation-only: invert X once.
@@ -316,7 +327,7 @@ impl Viewport {
             world_pan_dragged: false,world_ground_edit:false,world_marquee_enabled:false,
             world_selected: Vec::new(), rendered_selection: Vec::new(),
             pick_ids:Vec::new(), pick_dimensions:[0,0],
-            rendered: None, tex: None,
+            rendered: None, tex: None, height_overlay: None,
             world_image: None,
             world_marker_drag_capture: false,
         }
@@ -534,14 +545,15 @@ impl Viewport {
             self.pick_dimensions=px;
 
             let mut rgba = if world {
-                let (rgba,ids)=raster::render_highlights_with_sources_and_ids(
+                let (rgba,ids)=raster::render_highlights_with_sources_and_ids_r609(
                     model,vram,self.cam,self.shading,px[0],px[1],
                     if self.world_selected.is_empty(){
                         highlight.as_slice()
                     }else{
                         &self.world_selected
                     },
-                    show_ground,donor_vram
+                    show_ground,donor_vram,
+                    self.height_overlay.as_ref()
                 );
 
                 self.pick_ids=ids;

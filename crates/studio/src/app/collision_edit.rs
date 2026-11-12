@@ -67,6 +67,294 @@ pub(super) struct State {
 }
 #[derive(serde::Serialize,serde::Deserialize)]
 struct Document {version:u32,scene:String,walls:Vec<(i32,i32,bool)>,heights:Vec<(i32,i32,i32)>}
+// LCK_R604_WORLD_COLLISION
+// Native MAP wall boxes are editor geometry. Their vertices live
+// in world coordinates, and the raster camera projects them once.
+const LCK_R604_COLLISION_ID:u32=u32::MAX-3;
+
+fn lck_r604_edge(
+    model:&mut Model,
+    a:[f32;3],
+    b:[f32;3],
+    color:[u8;3],
+) {
+    let vertical=(b[1]-a[1]).abs()>
+        (b[0]-a[0]).abs().max((b[2]-a[2]).abs());
+
+    let o=if vertical {[2.2,0.0,0.0]}
+          else {[0.0,2.2,0.0]};
+
+    let p=[
+        [a[0]-o[0],a[1]-o[1],a[2]-o[2]],
+        [a[0]+o[0],a[1]+o[1],a[2]+o[2]],
+        [b[0]+o[0],b[1]+o[1],b[2]+o[2]],
+        [b[0]-o[0],b[1]-o[1],b[2]-o[2]],
+    ];
+
+    for tri in [[0usize,1,2],[0,2,3]] {
+        let Ok(base)=u32::try_from(model.positions.len()) else {
+            return;
+        };
+
+        for &i in &tri {
+            model.positions.push(p[i]);
+            model.rest.push(p[i]);
+            model.object_ids.push(LCK_R604_COLLISION_ID);
+            model.uvs.push([0,0]);
+            model.cba_tsb.push([0,0]);
+            model.modulation.push([128,128,128]);
+            model.fill.push(color);
+            model.textured.push(0u8);
+        }
+
+        model.indices.extend([base,base+1,base+2]);
+    }
+}
+
+fn lck_r604_box(
+    model:&mut Model,
+    grid:&CollisionGrid,
+    cell:Cell,
+    height:i32,
+    color:[u8;3],
+) {
+    let x=cell.0 as f32*64.0;
+    let z=(cell.1-2) as f32*64.0;
+    let y=grid.ground_y(x+32.0,z+32.0)+height as f32;
+
+    let p=[
+        [x,y,z],[x+64.0,y,z],
+        [x+64.0,y,z+64.0],[x,y,z+64.0],
+        [x,y+108.0,z],[x+64.0,y+108.0,z],
+        [x+64.0,y+108.0,z+64.0],[x,y+108.0,z+64.0],
+    ];
+
+    for (a,b) in [
+        (0usize,1usize),(1,2),(2,3),(3,0),
+        (4,5),(5,6),(6,7),(7,4),
+        (0,4),(1,5),(2,6),(3,7)
+    ] {
+        lck_r604_edge(model,p[a],p[b],color);
+    }
+}
+
+impl State {
+    pub(super) fn world_box_model(
+        &self,
+        original:&Model,
+        grid:&CollisionGrid,
+        cam:crate::raster::Camera,
+    )->Model{
+        let mut result=original.clone();
+
+        let (sy,cy)=cam.yaw.sin_cos();
+        let (sp,cp)=cam.pitch.sin_cos();
+
+        let distance=original.radius.max(1.0)
+            /22.5f32.to_radians().sin()
+            *cam.zoom.max(0.0000001);
+
+        let mut visible=Vec::<(f32,Cell)>::new();
+
+        for z in 0..256i32 {
+            for x in 0..256i32 {
+                let cell=(x,z);
+
+                if !self.occupied(grid,cell) {
+                    continue;
+                }
+
+                let wx=x as f32*64.0+32.0;
+                let wz=(z-2) as f32*64.0+32.0;
+                let wy=grid.ground_y(wx,wz)+54.0
+                    +self.heights.get(&cell).copied().unwrap_or(0) as f32;
+
+                let rx=wx-original.center[0]-cam.target_offset[0];
+                let ry=wy-original.center[1]-cam.target_offset[1];
+                let rz=wz-original.center[2]-cam.target_offset[2];
+
+                let sx=rx*cy+rz*sy;
+                let sz=-rx*sy+rz*cy;
+
+                let sy2=ry*cp-sz*sp;
+                let depth=ry*sp+sz*cp+distance;
+
+                if !depth.is_finite() ||
+                    depth<=distance*0.003 ||
+                    sx.abs()>depth*1.5 ||
+                    sy2.abs()>depth*0.9
+                {
+                    continue;
+                }
+
+                visible.push((depth,cell));
+            }
+        }
+
+        visible.sort_by(|a,b|a.0.total_cmp(&b.0));
+
+        // Selected boxes are never dropped by the rendering budget.
+        let mut drawn=BTreeSet::<Cell>::new();
+
+        for &cell in &self.selected {
+            if self.occupied(grid,cell) {
+                lck_r604_box(
+                    &mut result,grid,cell,
+                    self.heights.get(&cell).copied().unwrap_or(0),
+                    [255,225,60]
+                );
+                drawn.insert(cell);
+            }
+        }
+
+        // Bounded visible geometry for CPU raster performance.
+        // Hierarchy and native MAP data remain complete.
+        for (_,cell) in visible {
+            if drawn.len()>=1800 {
+                break;
+            }
+
+            if !drawn.insert(cell) {
+                continue;
+            }
+
+            let color=if grid.native_wall(cell.0,cell.1) {
+                [255,138,64]
+            }else{
+                [56,235,236]
+            };
+
+            lck_r604_box(
+                &mut result,grid,cell,
+                self.heights.get(&cell).copied().unwrap_or(0),
+                color
+            );
+        }
+
+        // Never refit: adding editor markers must not move the camera.
+        result.center=original.center;
+        result.radius=original.radius;
+
+        result
+    }
+
+    pub(super) fn hierarchy(
+        &mut self,
+        ui:&mut Ui,
+        grid:&CollisionGrid,
+        filter:&str
+    )->bool{
+        let count=(0..256i32).map(|z|
+            (0..256i32).filter(|&x|self.occupied(grid,(x,z))).count()
+        ).sum::<usize>();
+
+        let mut changed=false;
+
+        egui::CollapsingHeader::new(
+            format!("Native Collision Boxes ({count})")
+        )
+        .default_open(false)
+        .show(ui,|ui|{
+            ui.small(
+                "Select, Ctrl-add/toggle, or delete. X/Z edits export to native MAP. Y is preview-only."
+            );
+
+            for z in 0..256i32 {
+                let xs=(0..256i32)
+                    .filter(|&x|self.occupied(grid,(x,z)))
+                    .collect::<Vec<_>>();
+
+                if xs.is_empty() {
+                    continue;
+                }
+
+                egui::CollapsingHeader::new(
+                    format!("Row Z={z} ({} boxes)",xs.len())
+                )
+                .id_salt(("r604_collision_row",z))
+                .default_open(false)
+                .show(ui,|ui|{
+                    for x in xs {
+                        let cell=(x,z);
+                        let label=format!("Collision X={x} Z={z}");
+
+                        if !filter.is_empty()
+                            && !label.to_lowercase().contains(filter)
+                        {
+                            continue;
+                        }
+
+                        ui.horizontal(|ui|{
+                            let selected=self.selected.contains(&cell);
+
+                            if ui.selectable_label(selected,&label).clicked(){
+                                let ctrl=ui.input(|i|i.modifiers.ctrl);
+                                let shift=ui.input(|i|i.modifiers.shift);
+
+                                if !ctrl && !shift {
+                                    self.selected.clear();
+                                }
+
+                                if ctrl && !self.selected.insert(cell) {
+                                    self.selected.remove(&cell);
+                                }else if !ctrl{
+                                    self.selected.insert(cell);
+                                }
+
+                                changed=true;
+                            }
+
+                            if ui.small_button("Delete").clicked(){
+                                self.set(grid,cell,false);
+                                self.selected.remove(&cell);
+                                changed=true;
+                            }
+                        });
+                    }
+                });
+            }
+        });
+
+        changed
+    }
+}
+
+#[cfg(test)]
+mod lck_r604_tests {
+    use super::*;
+
+    #[test]
+    fn collision_edge_is_world_geometry(){
+        let mut model=Model{
+            positions:vec![],
+            rest:vec![],
+            object_ids:vec![],
+            uvs:vec![],
+            cba_tsb:vec![],
+            modulation:vec![],
+            fill:vec![],
+            textured:vec![],
+            indices:vec![],
+            center:[1000.0,0.0,1000.0],
+            radius:4000.0,
+        };
+
+        lck_r604_edge(
+            &mut model,
+            [100.0,20.0,300.0],
+            [164.0,20.0,300.0],
+            [255,138,64]
+        );
+
+        assert_eq!(model.positions.len(),6);
+        assert_eq!(model.indices.len(),6);
+        assert_eq!(model.center,[1000.0,0.0,1000.0]);
+        assert_eq!(model.radius,4000.0);
+        assert!(model.object_ids.iter().all(
+            |&id|id==LCK_R604_COLLISION_ID
+        ));
+    }
+}
 impl State {
     pub(super) fn native_edit_snapshot(
         &self
@@ -195,7 +483,7 @@ impl State {
             if !self.occupied(grid,c){continue;}
             let wx=x as f32*64.0+32.0;let wz=(z-2) as f32*64.0+32.0;
             let y=grid.ground_y(wx,wz)+54.0+*self.heights.get(&c).unwrap_or(&0) as f32;
-            if let Some(p)=proj.project([wx,y,wz]){
+            if let Some(p)=view.project_world_marker(model,[wx,y,wz]){
                 let d=(p-pos).length_sq();if d<best{best=d;candidate=Some(c);}
             }
         }} candidate
@@ -239,7 +527,7 @@ impl State {
                 }
             }
         }
-        self.press.as_ref().is_some_and(|p|p.selected_before)
+        self.pointer_on_wall
     }
     fn shifted(&mut self,grid:&CollisionGrid,group:&BTreeSet<Cell>,dx:i32,dz:i32)->bool{
         let original:Vec<Cell>=group.iter().copied().collect();
@@ -340,43 +628,7 @@ impl State {
                 }
             }
         }
-        let painter=ui.painter().with_clip_rect(rect);
-        let proj=Projector::new(ui,rect,view,model);
-        for &c in &self.selected{
-            if !self.occupied(grid,c){continue;}
-            let x0=c.0 as f32*64.;
-            let z0=(c.1-2) as f32*64.;
-            let y0=grid.ground_y(x0+32.,z0+32.)+self.heights.get(&c).copied().unwrap_or(0) as f32;
-            let y1=y0+108.0;
-
-            let corners=[
-                [x0,y0,z0],
-                [x0+64.0,y0,z0],
-                [x0+64.0,y0,z0+64.0],
-                [x0,y0,z0+64.0],
-                [x0,y1,z0],
-                [x0+64.0,y1,z0],
-                [x0+64.0,y1,z0+64.0],
-                [x0,y1,z0+64.0],
-            ];
-            let pts=corners.map(|point|proj.project(point));
-            if pts.iter().all(|p| p.is_some()){
-                let p=pts.map(|q| q.unwrap());
-                for (a,b) in [
-                    (0usize,1usize),(1,2),(2,3),(3,0),
-                    (4,5),(5,6),(6,7),(7,4),
-                    (0,4),(1,5),(2,6),(3,7),
-                ]{
-                    painter.line_segment([p[a],p[b]],Stroke::new(3.0,Color32::YELLOW));
-                }
-            }
-        }
-        // Cyan outline for user-added cells; deletions are omitted from the composite overlay.
-        for (&c,&v) in &self.walls{
-            if !v || grid.native_wall(c.0,c.1){continue;}
-            let x=c.0 as f32*64.+32.;let z=(c.1-2) as f32*64.+32.;let y=grid.ground_y(x,z)+54.;
-            if let Some(p)=proj.project([x,y,z]){painter.circle_stroke(p,7.,Stroke::new(2.,Color32::from_rgb(55,225,240)));}
-        }
+        // R6.0.4: box highlights are now native world-space raster geometry.
     }
     pub fn composite(&self,grid:&CollisionGrid)->CollisionGrid {grid.with_wall_overrides(&self.walls)}
     pub fn controls(&mut self,ui:&mut Ui,grid:Option<&CollisionGrid>){

@@ -515,6 +515,388 @@ fn remove_replaced_overrides(map:&mut [u8],cells:&BTreeSet<Cell>)->Result<usize>
     Ok(removed)
 }
 
+// LCK_R607_NATIVE_HEIGHT_AUTHORING
+// The retail engine supports:
+//   (a) bilinear 16-level native floor heights
+//   (b) kind-2 coarse + four 2-bit stepped subcell heights
+//
+// Native height must be representable at every relevant sample.
+// Unencodable edited surfaces MUST fail, not silently round and
+// report successful walkability.
+
+fn r607_fit_kind2(
+    base:f32,
+    target:[f32;4]
+)->Result<(i8,u8)>{
+    let mut best:Option<(f32,i8,u8)>=None;
+
+    for coarse in -128i32..=127 {
+        let mut packed=0u8;
+        let mut maximum=0.0f32;
+
+        for quadrant in 0..4usize {
+            let shift=match quadrant {
+                0=>0,
+                1=>2,
+                2=>4,
+                _=>6,
+            };
+
+            let (fine,error)=(0u8..=3)
+                .map(|fine|{
+                    let elevation=base
+                        -(coarse as f32)*32.0
+                        -(fine as f32)*16.0;
+
+                    (fine,(elevation-target[quadrant]).abs())
+                })
+                .min_by(|a,b|a.1.total_cmp(&b.1))
+                .context("No native subcell height")?;
+
+            packed|=fine<<shift;
+            maximum=maximum.max(error);
+        }
+
+        if best.as_ref().is_none_or(|(old,_,_)|maximum<*old){
+            best=Some((maximum,coarse as i8,packed));
+        }
+    }
+
+    let (error,coarse,packed)=best.context(
+        "Native kind-2 height fit unavailable"
+    )?;
+
+    ensure!(
+        error<=0.5,
+        "Desired height is not exactly encodable in 16-unit kind-2 steps (error {:.2})",
+        error
+    );
+
+    Ok((coarse,packed))
+}
+
+fn r607_native_heights(
+    donor:&[u8],
+    mut map:Vec<u8>,
+    stamps:&[super::ground_edit_ops::W46Stamp],
+    lut:&[i16;16]
+)->Result<(Vec<u8>,Vec<String>)>{
+    use std::collections::BTreeMap;
+    use legaia_scene_formats::field_map;
+
+    ensure!(
+        donor.len()>=0x12000 && map.len()==donor.len(),
+        "R607 native height MAP is incomplete"
+    );
+
+    let mut final_stamps=BTreeMap::<
+        Cell,super::ground_edit_ops::W46Stamp
+    >::new();
+
+    for &stamp in stamps {
+        final_stamps.insert(stamp.target,stamp);
+    }
+
+    if final_stamps.is_empty() {
+        return Ok((map,Vec::new()));
+    }
+
+    let parsed=field_map::detect(&map[..0x12000])
+        .context("R607 cannot parse native MAP height tables")?;
+
+    let header=parsed.trigger_block()
+        .context("Native MAP has no kind-2 table")?;
+
+    let region=0x10000usize;
+    let original=map[region..region+0x2000].to_vec();
+
+    let old_end=header.end_offset;
+
+    ensure!(
+        old_end<=original.len(),
+        "Native trigger table extends outside MAP"
+    );
+
+    let old_kind2=&original[
+        header.tables[2].body_range()
+    ];
+
+    let touched=final_stamps.keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+
+    let mut rows=old_kind2.chunks_exact(4)
+        .filter(|r|!touched.contains(&[r[0],r[1]]))
+        .map(|r|[r[0],r[1],r[2],r[3]])
+        .collect::<Vec<_>>();
+
+    let mut inserted=0usize;
+    let mut bilinear=0usize;
+
+    for (target,stamp) in final_stamps {
+        ensure!(
+            native_word(donor,stamp.source)?&0x0800==0,
+            "Source floor {:?} already uses a kind-2 override; exact transformed donor override support is required",
+            stamp.source
+        );
+
+        ensure!(
+            target[0]<127 && target[1]<127,
+            "Native height corner outside 128-tile grid"
+        );
+
+        let x=target[0] as f32*128.0;
+        let z=target[1] as f32*128.0;
+
+        let tiers=four_tiers(&map,target)?;
+
+        let corner_heights=tiers.map(|tier|
+            lut[tier as usize] as f32
+        );
+
+        let mut exact_bilinear=true;
+
+        for (q,(dx,dz)) in [
+            (0.0f32,0.0f32),
+            (128.0,0.0),
+            (0.0,128.0),
+            (128.0,128.0)
+        ].into_iter().enumerate(){
+            let requested=w46_height(
+                donor,stamp,x+dx,z+dz,lut
+            )?;
+
+            if (requested-corner_heights[q]).abs()>0.5 {
+                exact_bilinear=false;
+            }
+        }
+
+        if exact_bilinear {
+            bilinear+=1;
+            continue;
+        }
+
+        let sum=tiers.iter()
+            .map(|&tier|lut[tier as usize] as i32)
+            .sum::<i32>();
+
+        let base=(sum>>2) as f32;
+        let mut expected=[0.0f32;4];
+
+        // Retail kind-2 records are constant inside each 64x64
+        // quadrant. A sloped authored quadrant cannot be replaced
+        // by a discontinuous step without changing gameplay.
+        for q in 0..4usize {
+            let dx=(q%2) as f32*64.0;
+            let dz=(q/2) as f32*64.0;
+
+            let center=w46_height(
+                donor,stamp,
+                x+dx+32.0,z+dz+32.0,lut
+            )?;
+
+            for (ox,oz) in [
+                (8.0f32,8.0f32),
+                (56.0,8.0),
+                (8.0,56.0),
+                (56.0,56.0)
+            ] {
+                let sample=w46_height(
+                    donor,stamp,
+                    x+dx+ox,z+dz+oz,lut
+                )?;
+
+                ensure!(
+                    (sample-center).abs()<=0.5,
+                    "Floor {:?} is sloped within a native kind-2 quadrant; no exact stepped surface encoding",
+                    target
+                );
+            }
+
+            expected[q]=center;
+        }
+
+        let (coarse,packed)=r607_fit_kind2(base,expected)
+            .with_context(||format!(
+                "Native floor {:?} cannot encode its authored Y",
+                target
+            ))?;
+
+        rows.push([
+            target[0],
+            target[1],
+            coarse as u8,
+            packed
+        ]);
+
+        inserted+=1;
+    }
+
+    // Preserve native trigger kinds 0, 1 and 3 byte-for-byte.
+    // The fourth table uses an 8-byte stride.
+    let retained=[0u8,1,3].map(|kind|
+        parsed.trigger_records(kind)
+            .into_iter()
+            .map(|record|record.to_vec())
+            .collect::<Vec<_>>()
+    );
+
+    let mut replacement=vec![0u8;18];
+
+    for kind in 0..4usize {
+        let table=&header.tables[kind];
+
+        let body=if kind==2 {
+            rows.iter()
+                .flat_map(|record|record.iter().copied())
+                .collect::<Vec<_>>()
+        }else{
+            original[table.body_range()].to_vec()
+        };
+
+        let start=replacement.len();
+
+        ensure!(
+            start<=u16::MAX as usize,
+            "Native trigger offset overflow"
+        );
+
+        ensure!(
+            body.len()%table.stride==0,
+            "Native trigger table has invalid stride"
+        );
+
+        let count=body.len()/table.stride;
+
+        ensure!(
+            count<=u16::MAX as usize,
+            "Native trigger count overflow"
+        );
+
+        replacement[kind*4+2..kind*4+4]
+            .copy_from_slice(&(start as u16).to_le_bytes());
+
+        replacement[kind*4+4..kind*4+6]
+            .copy_from_slice(&(count as u16).to_le_bytes());
+
+        replacement.extend_from_slice(&body);
+
+        let old_gap=table.offset+table.count*table.stride;
+
+        replacement.extend_from_slice(
+            original.get(old_gap..old_gap+2)
+                .context("Native trigger table gap truncated")?
+        );
+    }
+
+    let end=replacement.len();
+
+    ensure!(
+        end<=0x2000 && end<=u16::MAX as usize,
+        "Native MAP kind-2 record capacity exceeded"
+    );
+
+    // Do not overwrite unknown nonzero tail data when growing.
+    if end>old_end {
+        ensure!(
+            original[old_end..end].iter().all(|&b|b==0),
+            "Native MAP kind-2 table requires occupied trigger-tail space"
+        );
+    }
+
+    replacement[0..2]
+        .copy_from_slice(&(end as u16).to_le_bytes());
+
+    map[region..region+old_end.max(end)].fill(0);
+    map[region..region+end].copy_from_slice(&replacement);
+
+    // Runtime initialization regenerates 0x0800 from the kind-2 table.
+    // Clear stale marks from changed cells, then prove the regenerated
+    // mark matches the new table.
+    for &cell in &touched {
+        let p=offset(cell);
+        let word=native_word(&map,cell)?&!0x0800;
+
+        map[p..p+2].copy_from_slice(
+            &word.to_le_bytes()
+        );
+    }
+
+    let verified=field_map::detect(&map[..0x12000])
+        .context("R607 native MAP table failed readback parsing")?;
+
+    for (i,kind) in [0u8,1,3].into_iter().enumerate(){
+        ensure!(
+            verified.trigger_records(kind)==retained[i],
+            "R607 modified unrelated native trigger kind {kind}"
+        );
+    }
+
+    let authored=verified.trigger_records(2)
+        .into_iter()
+        .map(|record|[record[0],record[1]])
+        .collect::<BTreeSet<_>>();
+
+    let mut runtime=map.clone();
+
+    legaia_engine_field::field_regions::refresh_object_grid_marks(
+        &mut runtime
+    );
+
+    for cell in touched {
+        let word=native_word(&runtime,cell)?;
+
+        ensure!(
+            word&CELL_WALK_VISIBLE!=0,
+            "Native runtime removed walkability from floor {:?}",
+            cell
+        );
+
+        ensure!(
+            (word&0x0800!=0)==authored.contains(&cell),
+            "Native kind-2 initialization disagrees with exported floor {:?}",
+            cell
+        );
+    }
+
+    Ok((
+        map,
+        vec![format!(
+            "R607 NATIVE HEIGHTS: {} exact bilinear cells; {} exact kind-2 records; 0 accepted height approximations. Gameplay requires DuckStation verification.",
+            bilinear,inserted
+        )]
+    ))
+}
+
+#[cfg(test)]
+mod lck_r607_native_height_tests {
+    use super::*;
+
+    #[test]
+    fn stepped_height_encodes_exact_native_values()->Result<()> {
+        let (coarse,packed)=r607_fit_kind2(
+            0.0,[32.0,32.0,32.0,32.0]
+        )?;
+
+        for quadrant in 0..4usize {
+            let fine=((packed>>(quadrant*2))&3) as f32;
+            let actual=-(coarse as f32)*32.0-fine*16.0;
+
+            assert_eq!(actual,32.0);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn unrepresentable_height_is_rejected(){
+        assert!(
+            r607_fit_kind2(
+                0.0,[5.0,5.0,5.0,5.0]
+            ).is_err()
+        );
+    }
+}
 fn verify_runtime_surfaces(map:&[u8],deleted:&BTreeSet<Cell>,stamps:&[(Cell,Cell)])->Result<()> {
     let replaced=stamps.iter().map(|&(_,c)|c).collect::<BTreeSet<_>>();
     let mut initialized=map.to_vec();
@@ -533,10 +915,14 @@ fn verify_runtime_surfaces(map:&[u8],deleted:&BTreeSet<Cell>,stamps:&[(Cell,Cell
 
 // Unrestricted native projection. Occupied cells use last-wins
 // semantics. Exact source geometry is NOT serialized.
+// R60: immutable donor and current working MAP must be separate.
 fn w2b_compile(map:&[u8],deleted:&BTreeSet<Cell>,stamps:&[(Cell,Cell)])
     ->Result<(Vec<u8>,Vec<String>)>{
-
-    ensure!(map.len()>=0x12000,"Invalid native MAP size");
+    w2b_compile_dual(map,map,deleted,stamps)
+}
+fn w2b_compile_dual(donor:&[u8],map:&[u8],deleted:&BTreeSet<Cell>,stamps:&[(Cell,Cell)])
+    ->Result<(Vec<u8>,Vec<String>)>{
+    ensure!(map.len()>=0x12000 && donor.len()==map.len(),"Invalid dual native MAP size");
     let mut out=map.to_vec();
     let mut notes=Vec::new();
     let mut owners=BTreeSet::new();
@@ -553,7 +939,7 @@ fn w2b_compile(map:&[u8],deleted:&BTreeSet<Cell>,stamps:&[(Cell,Cell)])
     }
 
     for &(source,target) in stamps {
-        let before=native_word(map,source)?;
+        let before=native_word(donor,source)?;
         let displaced=native_word(&out,target)?;
 
         if !owners.insert(target){
@@ -581,7 +967,7 @@ fn w2b_compile(map:&[u8],deleted:&BTreeSet<Cell>,stamps:&[(Cell,Cell)])
         out[at..at+2].copy_from_slice(&word.to_le_bytes());
 
         if source[0]<127&&source[1]<127&&target[0]<127&&target[1]<127 {
-            let tiers=four_tiers(map,source)?;
+            let tiers=four_tiers(donor,source)?;
             let old_tiers=four_tiers(&out,target)?;
 
             if tiers!=old_tiers {
@@ -607,9 +993,11 @@ fn w2b_compile(map:&[u8],deleted:&BTreeSet<Cell>,stamps:&[(Cell,Cell)])
         .map(|&(_,target)|target)
         .collect::<BTreeSet<_>>();
 
-    let allocated=visual_delete(
-        map,&mut out,deleted,&replaced
-    )?;
+    // Object deletion may already have cleared some ground ownership.
+    let live_deleted=deleted.iter().copied().filter(|&c|
+        native_word(map,c).is_ok_and(|v|v&CELL_WALK_VISIBLE!=0)
+    ).collect::<BTreeSet<_>>();
+    let allocated=visual_delete(map,&mut out,&live_deleted,&replaced)?;
 
     if !allocated.is_empty(){
         notes.push(format!(
@@ -677,13 +1065,152 @@ fn w46_height(
     Ok(mid+(y-mid)*t.scale[1]+t.offset[1])
 }
 
+// LCK_R60_IMMUTABLE_GROUND
+// A replacement walk tile cannot borrow a mutable placed-object
+// descriptor. A shared immutable ground-only descriptor is allowed.
+fn r60_isolate_ground(
+    donor:&[u8],
+    working:&[u8],
+    out:&mut [u8],
+    stamps:&[super::ground_edit_ops::W46Stamp]
+)->Result<Vec<String>> {
+    use std::collections::BTreeMap;
+
+    ensure!(
+        donor.len()>=0x12000 &&
+        donor.len()==working.len() &&
+        out.len()==donor.len(),
+        "R6.0 native MAP footprints differ"
+    );
+
+    let mut latest=BTreeMap::<
+        Cell,super::ground_edit_ops::W46Stamp
+    >::new();
+
+    for &stamp in stamps {
+        latest.insert(stamp.target,stamp);
+    }
+
+    let mut reserved=BTreeSet::<usize>::new();
+
+    // Include retail, post-object and final references to prevent
+    // allocating an ID still needed by another subsystem.
+    for image in [donor,working,&*out] {
+        for at in (0x8000..0x10000).step_by(2) {
+            reserved.insert(
+                (u16::from_le_bytes([
+                    image[at],image[at+1]
+                ])&511) as usize
+            );
+        }
+    }
+
+    let mut copies=BTreeMap::<usize,usize>::new();
+    let mut notes=Vec::new();
+
+    for (target,stamp) in latest {
+        let old=native_word(out,target)?;
+
+        if old&legaia_scene_formats::field_objects::CELL_BIND_OWNED!=0 {
+            let id=(old&511) as usize;
+            let flags=u16::from_le_bytes(
+                out[id*32+18..id*32+20].try_into()?
+            );
+
+            ensure!(
+                flags&1!=0,
+                "Destination {:?} is script-owned without native ground",
+                target
+            );
+
+            // Preserve MAN ownership instead of inventing a new binding.
+            continue;
+        }
+
+        let src=(native_word(donor,stamp.source)?&511) as usize;
+        let src_at=src*32;
+        let donor_rec=&donor[src_at..src_at+32];
+
+        let donor_flags=u16::from_le_bytes(
+            donor_rec[18..20].try_into()?
+        );
+
+        ensure!(
+            (native_word(donor,stamp.source)?&CELL_WALK_VISIBLE)!=0
+                || donor_flags&1!=0,
+            "Donor {:?} is not a native walk surface",
+            stamp.source
+        );
+
+        let current=(old&511) as usize;
+
+        let current_flags=u16::from_le_bytes(
+            out[current*32+18..current*32+20].try_into()?
+        );
+
+        let safe=current==src
+            && donor_flags&4==0
+            && current_flags&4==0
+            && out[src_at..src_at+32]==donor_rec[..];
+
+        if safe {
+            continue;
+        }
+
+        let id=if let Some(&id)=copies.get(&src) {
+            id
+        } else {
+            let id=(4usize..512).find(|&id| {
+                let at=id*32;
+
+                !reserved.contains(&id)
+                    && donor[at..at+32].iter().all(|&b|b==0)
+                    && working[at..at+32].iter().all(|&b|b==0)
+                    && out[at..at+32].iter().all(|&b|b==0)
+            }).context(
+                "R6.0 no unowned ground-only descriptor slot"
+            )?;
+
+            out[id*32..id*32+32].fill(0);
+
+            // Ground-only flags. No placed object or actor flag.
+            out[id*32+18..id*32+20]
+                .copy_from_slice(&1u16.to_le_bytes());
+
+            // Preserve the donor's actual native terrain atlas data.
+            out[id*32+20..id*32+24]
+                .copy_from_slice(&donor_rec[20..24]);
+
+            reserved.insert(id);
+            copies.insert(src,id);
+
+            notes.push(format!(
+                "R6.0 ground descriptor {src} -> independent ground-only {id}"
+            ));
+
+            id
+        };
+
+        let at=offset(target);
+
+        out[at..at+2].copy_from_slice(
+            &((old&!511)|(id as u16)|CELL_WALK_VISIBLE).to_le_bytes()
+        );
+    }
+
+    Ok(notes)
+}
+
 fn w46_reconcile(
-    original:&[u8],
-    mut out:Vec<u8>,
-    stamps:&[super::ground_edit_ops::W46Stamp],
-    lut:&[i16;16]
-)->Result<(Vec<u8>,Vec<String>)>
-{
+    original:&[u8],out:Vec<u8>,
+    stamps:&[super::ground_edit_ops::W46Stamp],lut:&[i16;16]
+)->Result<(Vec<u8>,Vec<String>)>{
+    w46_reconcile_dual(original,original,out,stamps,lut)
+}
+fn w46_reconcile_dual(
+    original:&[u8],working:&[u8],mut out:Vec<u8>,
+    stamps:&[super::ground_edit_ops::W46Stamp],lut:&[i16;16]
+)->Result<(Vec<u8>,Vec<String>)>{
     let mut last=std::collections::BTreeMap::<
         Cell,
         super::ground_edit_ops::W46Stamp
@@ -706,7 +1233,7 @@ fn w46_reconcile(
         last.into_iter().enumerate()
     {
         let word=native_word(original,stamp.source)?;
-        let previous=native_word(original,target)?;
+        let previous=native_word(working,target)?;
         let at=offset(target);
 
         let desc=if previous
@@ -805,6 +1332,7 @@ fn w46_reconcile(
         ));
     }
 
+    notes.extend(r60_isolate_ground(original,working,&mut out,stamps)?);
     Ok((out,notes))
 }
 
@@ -1037,6 +1565,13 @@ pub(super) fn export_ground(
 
     let mut disc=DiscPatcher::open(original)?;
     let before=disc.read_entry_footprint(entry)?;
+    // Read immutable donor data from the mounted original retail MAP,
+    // never the IMG after object deletion or placement.
+    let immutable=index.entry_bytes(entry as u32)?;
+    ensure!(
+        immutable.len()==before.len(),
+        "R6.0 immutable retail donor MAP size mismatch"
+    );
 
     // Preserve exact walking heights on resized native floors.
     if !unrestricted {
@@ -1047,7 +1582,7 @@ pub(super) fn export_ground(
         }
     }
     let after=if unrestricted {
-        let (bytes,extra)=w2b_compile(&before,&deleted,&stamps)?;
+        let (bytes,extra)=w2b_compile_dual(&immutable,&before,&deleted,&stamps)?;
         notes.extend(extra);
 
         let (_,detailed,_)=super::ground_edit_ops::
@@ -1057,7 +1592,8 @@ pub(super) fn export_ground(
         let lut=scene.field_floor_height_lut(index)?
             .context("Selected scene has no native height ladder")?;
 
-        let (bytes,extra)=w46_reconcile(
+        let (bytes,extra)=w46_reconcile_dual(
+            &immutable,
             &before,
             bytes,
             &detailed,
@@ -1066,7 +1602,23 @@ pub(super) fn export_ground(
 
         notes.extend(extra);
         verify_runtime_surfaces(&bytes,&deleted,&stamps)?;
-        notes.push("RUNTIME FLOOR CHECK: deleted surfaces stay absent; replacement surfaces remain walkable; replaced elevation overrides are absent after initialization".into());
+
+        // W46 first composes native floor descriptors. R607 then
+        // encodes the resulting authored heights as bilinear tiers
+        // or exact kind-2 overrides. Unsupported heights fail.
+        let (bytes,height_notes)=r607_native_heights(
+            &immutable,
+            bytes,
+            &detailed,
+            &lut
+        )?;
+
+        notes.extend(height_notes);
+
+        notes.push(
+            "R607: native walkability and kind-2 table verified after initialization; gameplay not yet tested".into()
+        );
+
         bytes
     }else{
         compile_stamps(&before,&deleted,&stamps)?
@@ -1497,6 +2049,86 @@ mod lowering_regression {
             }
         }
         println!("Retail MIPS height routine matched {checked} exported floor samples");
+        Ok(())
+    }
+}
+
+// R6.0 ground regression. UID 105 and descriptor 290 are examples,
+// not special-cased rules. The allocator works in arbitrary cells.
+#[cfg(test)]
+mod lck_r60_ground_tests {
+    use super::*;
+
+    #[test]
+    fn deleted_placed_105_does_not_reown_floor_290()->Result<()> {
+        let donor_cell=[31u8,31u8];
+        let target=[37u8,37u8];
+
+        let mut retail=vec![0u8;0x12000];
+
+        let old_id=290usize;
+        let rec=old_id*32;
+
+        retail[rec+18..rec+20]
+            .copy_from_slice(&5u16.to_le_bytes());
+
+        retail[rec+20..rec+24]
+            .copy_from_slice(&[7,26,10,0]);
+
+        retail[offset(donor_cell)..offset(donor_cell)+2]
+            .copy_from_slice(
+                &(CELL_WALK_VISIBLE|old_id as u16).to_le_bytes()
+            );
+
+        let old_target=CELL_WALK_VISIBLE|0x0800u16|7u16;
+
+        retail[offset(target)..offset(target)+2]
+            .copy_from_slice(&old_target.to_le_bytes());
+
+        // Simulate object export removing the source placement.
+        let mut working=retail.clone();
+        working[rec..rec+32].fill(0);
+        working[offset(donor_cell)..offset(donor_cell)+2].fill(0);
+
+        let deleted=BTreeSet::from([target]);
+        let stamps=vec![(donor_cell,target)];
+
+        let (out,_)=w2b_compile_dual(
+            &retail,&working,&deleted,&stamps
+        )?;
+
+        let edited=super::super::ground_edit_ops::W46Stamp {
+            source:donor_cell,
+            target,
+            transform:super::super::ground_edit_ops::Transform::default(),
+            uid:Some(105)
+        };
+
+        let (out,_)=w46_reconcile_dual(
+            &retail,&working,out,&[edited],&[0i16;16]
+        )?;
+
+        let id=(native_word(&out,target)?&511) as usize;
+
+        ensure!(
+            id!=old_id,
+            "Replacement floor reused deleted object descriptor 290"
+        );
+
+        ensure!(
+            out[rec..rec+32]==working[rec..rec+32],
+            "Deleted object descriptor was restored"
+        );
+
+        ensure!(
+            u16::from_le_bytes(
+                out[id*32+18..id*32+20].try_into()?
+            )==1,
+            "Ground-only record retained placed-object flags"
+        );
+
+        verify_runtime_surfaces(&out,&deleted,&stamps)?;
+
         Ok(())
     }
 }
