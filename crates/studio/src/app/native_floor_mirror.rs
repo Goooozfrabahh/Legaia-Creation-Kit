@@ -204,10 +204,400 @@ fn record_at(map:&[u8],cell:[u8;2])->Result<(usize,ObjectRecord)>{
     Ok((id,record))
 }
 
+
+// LCK_R614_FIXED_DESCRIPTOR_POOL
+// Preserve native nine-bit IDs while reducing duplicate
+// descriptor allocation for transformed ground textures.
+//
+// Exact material reuse is permitted only for unbound
+// native ground records. Full descriptor capacity remains 512.
+
+#[derive(Default)]
+struct R614Stats {
+    requested:usize,
+    groups:usize,
+    reused:usize,
+    inplace:usize,
+    allocated:usize,
+    reclaimed:usize,
+}
+
+fn r614_grid(cell:[u8;2])->usize {
+    MAP_GRID+(cell[1] as usize*128+cell[0] as usize)*2
+}
+
+fn r614_id(map:&[u8],cell:[u8;2])->Result<usize> {
+    let at=r614_grid(cell);
+    ensure!(at+2<=map.len(),"R614: MAP grid truncated");
+
+    Ok((u16::from_le_bytes([map[at],map[at+1]])&511) as usize)
+}
+
+fn r614_counts(map:&[u8])->Result<[usize;512]> {
+    ensure!(map.len()>=0x12000,"R614: native MAP truncated");
+
+    let mut refs=[0usize;512];
+
+    for word in map[MAP_GRID..0x10000].chunks_exact(2) {
+        let id=(u16::from_le_bytes([word[0],word[1]])&511) as usize;
+        refs[id]+=1;
+    }
+
+    Ok(refs)
+}
+
+fn r614_safe_floor_id(map:&[u8],id:usize)->bool {
+    if id<4 || id>=512 {
+        return false;
+    }
+
+    let Some(record)=ObjectRecord::parse(map,id) else {
+        return false;
+    };
+
+    if record.is_placed() {
+        return false;
+    }
+
+    let mut found=false;
+
+    for word in map[MAP_GRID..0x10000].chunks_exact(2) {
+        let value=u16::from_le_bytes([word[0],word[1]]);
+
+        if (value&511) as usize != id {
+            continue;
+        }
+
+        found=true;
+
+        if value&CELL_WALK_VISIBLE==0 ||
+            value&CELL_BIND_OWNED!=0
+        {
+            return false;
+        }
+    }
+
+    found
+}
+
+fn r614_free_slot(map:&[u8],unrestricted:bool)
+    ->Result<Option<usize>>
+{
+    let refs=r614_counts(map)?;
+
+    if let Some(id)=(4..512).rev().find(|&id|
+        refs[id]==0 &&
+        map[id*32..id*32+32].iter().all(|&b|b==0)
+    ){
+        return Ok(Some(id));
+    }
+
+    if unrestricted {
+        if let Some(id)=(4..512).rev().find(|&id|refs[id]==0){
+            return Ok(Some(id));
+        }
+    }
+
+    Ok(None)
+}
+
+// Experimental unrestricted-only optimization.
+// Merge byte-identical floor-only descriptors with no
+// native grid binds or placed-object behavior.
+// External MAN references cannot be ruled out here.
+fn r614_reclaim_twins(map:&mut [u8])->Result<usize> {
+    let mut signatures=BTreeMap::<[u8;32],usize>::new();
+    let mut reclaimed=0usize;
+
+    for id in 4..512usize {
+        if !r614_safe_floor_id(map,id) {
+            continue;
+        }
+
+        let raw:[u8;32]=map[id*32..id*32+32].try_into()?;
+
+        if let Some(&canonical)=signatures.get(&raw) {
+            for word in map[MAP_GRID..0x10000].chunks_exact_mut(2) {
+                let original=u16::from_le_bytes([word[0],word[1]]);
+
+                if (original&511) as usize==id {
+                    let replacement=
+                        (original&!511)|(canonical as u16);
+
+                    word.copy_from_slice(&replacement.to_le_bytes());
+                }
+            }
+
+            map[id*32..id*32+32].fill(0);
+            reclaimed+=1;
+        }else{
+            signatures.insert(raw,id);
+        }
+    }
+
+    Ok(reclaimed)
+}
+
+fn r614_pool_rewrites(
+    map:&mut [u8],
+    rewrites:&[([u8;2],u8,u8,u16)],
+    unrestricted:bool,
+)->Result<R614Stats> {
+    ensure!(map.len()>=0x12000,"R614: incomplete MAP");
+
+    let mut groups=BTreeMap::<[u8;32],Vec<[u8;2]>>::new();
+    let mut owned=BTreeSet::<[u8;2]>::new();
+
+    // Snapshot every requested material before modifying MAP.
+    for &(cell,page,tile,clut) in rewrites {
+        ensure!(
+            owned.insert(cell),
+            "R614: conflicting texture target {:?}",
+            cell
+        );
+
+        let (id,_) = record_at(map,cell)?;
+
+        let mut desired:[u8;32]=map[id*32..id*32+32]
+            .try_into()?;
+
+        desired[0x14]=tile;
+        desired[0x15]=page;
+        desired[0x16..0x18]
+            .copy_from_slice(&clut.to_le_bytes());
+
+        groups.entry(desired).or_default().push(cell);
+    }
+
+    let mut stats=R614Stats::default();
+
+    stats.requested=rewrites.len();
+    stats.groups=groups.len();
+
+    for (desired,cells) in groups {
+        let refs=r614_counts(map)?;
+
+        // Reuse a record only when all of its existing
+        // grid references are safe, unbound ground cells.
+        let existing=(4..512usize).find(|&id|
+            r614_safe_floor_id(map,id) &&
+            map[id*32..id*32+32]==desired[..]
+        );
+
+        let id=if let Some(id)=existing {
+            stats.reused+=1;
+            id
+        }else{
+            let mut group_refs=[0usize;512];
+
+            for &cell in &cells {
+                group_refs[r614_id(map,cell)?]+=1;
+            }
+
+            // Update in place if the entire old descriptor
+            // belongs exclusively to this desired material group.
+            let inplace=(4..512usize).find(|&id|
+                refs[id]>0 &&
+                refs[id]==group_refs[id] &&
+                r614_safe_floor_id(map,id)
+            );
+
+            if let Some(id)=inplace {
+                map[id*32..id*32+32]
+                    .copy_from_slice(&desired);
+
+                stats.inplace+=1;
+                id
+            }else{
+                let mut slot=r614_free_slot(map,unrestricted)?;
+
+                if slot.is_none() && unrestricted {
+                    stats.reclaimed+=r614_reclaim_twins(map)?;
+                    slot=r614_free_slot(map,unrestricted)?;
+                }
+
+                let id=slot.with_context(||{
+                    let counts=r614_counts(map)
+                        .unwrap_or([1usize;512]);
+
+                    let used=counts.iter()
+                        .filter(|&&count|count>0)
+                        .count();
+
+                    format!(
+                        "R614: native floor descriptor exhaustion; {used}/512 IDs referenced, {} identical floor-only slots reclaimed; no safe available descriptor remains",
+                        stats.reclaimed
+                    )
+                })?;
+
+                map[id*32..id*32+32]
+                    .copy_from_slice(&desired);
+
+                stats.allocated+=1;
+                id
+            }
+        };
+
+        // Only the low nine bits change.
+        // Preserve every cell's other native flags.
+        for &cell in &cells {
+            let at=r614_grid(cell);
+
+            let previous=u16::from_le_bytes([
+                map[at],map[at+1]
+            ]);
+
+            let next=(previous&!511)|(id as u16);
+
+            map[at..at+2].copy_from_slice(
+                &next.to_le_bytes()
+            );
+        }
+
+        for &cell in &cells {
+            let actual=r614_id(map,cell)?;
+
+            ensure!(
+                actual==id &&
+                map[actual*32..actual*32+32]==desired[..],
+                "R614: descriptor readback mismatch at {:?}",
+                cell
+            );
+        }
+    }
+
+    Ok(stats)
+}
+
+#[cfg(test)]
+mod lck_r614_fixed_pool_tests {
+    use super::*;
+
+    fn fixture()->Vec<u8> {
+        vec![0u8;0x12000]
+    }
+
+    fn set(map:&mut [u8],cell:[u8;2],id:usize) {
+        let at=r614_grid(cell);
+        let word=CELL_WALK_VISIBLE|(id as u16);
+        map[at..at+2].copy_from_slice(&word.to_le_bytes());
+    }
+
+    #[test]
+    fn identical_floor_materials_share_descriptor()->Result<()> {
+        let mut map=fixture();
+
+        set(&mut map,[1,1],4);
+        set(&mut map,[2,1],4);
+
+        let stats=r614_pool_rewrites(
+            &mut map,
+            &[([1,1],2,5,17),([2,1],2,5,17)],
+            false
+        )?;
+
+        assert_eq!(r614_id(&map,[1,1])?,4);
+        assert_eq!(r614_id(&map,[2,1])?,4);
+        assert_eq!(stats.allocated,0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_shared_neighbor_is_preserved()->Result<()> {
+        let mut map=fixture();
+
+        set(&mut map,[1,1],4);
+        set(&mut map,[2,1],4);
+
+        let before=map[4*32..5*32].to_vec();
+
+        let stats=r614_pool_rewrites(
+            &mut map,
+            &[([1,1],3,7,11)],
+            false
+        )?;
+
+        assert_eq!(r614_id(&map,[2,1])?,4);
+        assert_eq!(map[4*32..5*32],before[..]);
+        assert_ne!(r614_id(&map,[1,1])?,4);
+        assert_eq!(stats.allocated,1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn independent_source_ids_can_pool()->Result<()> {
+        let mut map=fixture();
+
+        set(&mut map,[1,1],4);
+        set(&mut map,[2,1],5);
+
+        let stats=r614_pool_rewrites(
+            &mut map,
+            &[([1,1],3,8,12),([2,1],3,8,12)],
+            false
+        )?;
+
+        assert_eq!(
+            r614_id(&map,[1,1])?,
+            r614_id(&map,[2,1])?
+        );
+
+        assert_eq!(stats.allocated,0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn unrestricted_identical_twins_recover_one_slot()->Result<()> {
+        let mut map=fixture();
+
+        for id in 0..512usize {
+            let cell=[(id%128) as u8,(id/128) as u8];
+            let at=r614_grid(cell);
+
+            let flags=if id==4 || id==5 {
+                CELL_WALK_VISIBLE
+            }else{
+                0
+            };
+
+            let word=(id as u16)|flags;
+
+            map[at..at+2].copy_from_slice(
+                &word.to_le_bytes()
+            );
+
+            map[id*32]=(id&255) as u8;
+            map[id*32+1]=(id>>8) as u8;
+        }
+
+        let twin=map[4*32..5*32].to_vec();
+
+        map[5*32..6*32].copy_from_slice(&twin);
+
+        set(&mut map,[0,5],4);
+
+        assert!(r614_free_slot(&map,true)?.is_none());
+
+        let stats=r614_pool_rewrites(
+            &mut map,
+            &[([4,0],3,9,17)],
+            true
+        )?;
+
+        assert!(stats.reclaimed>=1);
+        assert_eq!(r614_id(&map,[0,5])?,4);
+        assert_ne!(r614_id(&map,[4,0])?,4);
+
+        Ok(())
+    }
+}
 /// Rewrite the STAGING image only. A registration or verification failure never
 /// replaces the source retail image or publishes a partially mirrored IMG.
 pub(super) fn overlay_existing(target:&Path,scene:&str,index:&ProtIndex,
-    state:&State)->Result<Option<String>>{
+    state:&State,unrestricted:bool)->Result<Option<String>>{
     let targets=ground_edit_ops::w46_texture_targets(state).map_err(anyhow::Error::msg)?;
     if targets.is_empty(){return Ok(None);}
     ensure!(target.exists(),"Staged native floor IMG is missing");
@@ -260,18 +650,11 @@ pub(super) fn overlay_existing(target:&Path,scene:&str,index:&ProtIndex,
     let (mut encoded,_)=ps1_export::NativeExportPlan::compile_scene_resources(
         &disc,entry,&resources,&scene_vram,&plan,limits)?;
     map=encoded.read_entry_footprint(entry)?;
-    for &(cell,page,tile,clut) in &rewrites {
-        let id=ps1_export::unrestricted::detach(&mut map,(cell[0],cell[1]))?;
-        ensure!(id>=4,"Reflected floor requires independently owned MAP descriptor");
-        let at=id*32;
-        ensure!(at+32<=map.len(),"Reflected MAP descriptor outside buffer");
-        map[at+0x14]=tile;
-        map[at+0x15]=page;
-        map[at+0x16..at+0x18].copy_from_slice(&clut.to_le_bytes());
-        let parsed=ObjectRecord::parse(&map,id).context("Reflected floor record missing after edit")?;
-        ensure!(parsed.terrain_tile==tile && parsed.terrain_tpage==page as u16 &&
-            parsed.terrain_clut==clut,"Reflected native terrain texture record readback failed");
-    }
+    let r614_stats=r614_pool_rewrites(
+        &mut map,
+        &rewrites,
+        unrestricted
+    )?;
     encoded.patch_prot_entry(entry,0,&map)?;
     ensure!(encoded.read_entry_footprint(entry)?==map,
         "Reflected floor MAP physical readback failed");
@@ -295,8 +678,16 @@ pub(super) fn overlay_existing(target:&Path,scene:&str,index:&ProtIndex,
     let reloaded=DiscPatcher::open(fs::read(target)?)?;
     ensure!(reloaded.read_entry_footprint(entry)?==map,
         "Reflected staging IMG MAP reread failed");
-    Ok(Some(format!("NATIVE GROUND MIRROR: {} floor cells, {} independent 4bpp tile uploads and MAP descriptors; physical IMG reread passed; runtime not verified",
-        rewrites.len(),new_uploads.len())))
+    Ok(Some(format!(
+        "NATIVE GROUND MIRROR R614: floor_cells={} material_groups={} texture_uploads={} existing_descriptors_reused={} modified_in_place={} new_descriptors={} exact_twins_reclaimed={}; physical IMG reread passed; PS1 gameplay unverified",
+        r614_stats.requested,
+        r614_stats.groups,
+        new_uploads.len(),
+        r614_stats.reused,
+        r614_stats.inplace,
+        r614_stats.allocated,
+        r614_stats.reclaimed
+    )))
 }
 
 #[cfg(test)]mod tests{

@@ -3092,7 +3092,7 @@ dependencies = [
 
 [[package]]
 name = "legaia-studio"
-version = "0.1.0"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -3108,6 +3108,7 @@ dependencies = [
  "legaia-disc-patch",
  "legaia-engine-audio",
  "legaia-engine-field",
+ "legaia-engine-motion-vm",
  "legaia-engine-scene",
  "legaia-engine-world-views",
  "legaia-extract",

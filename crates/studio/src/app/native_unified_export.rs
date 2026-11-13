@@ -27,6 +27,7 @@ use super::{
     native_floor_mirror,
     native_ground_delete,
     native_warps,
+    native_gameplay_camera,
     ps1_export,
     ps1_original_guard,
     world_view,
@@ -35,6 +36,8 @@ use super::{
 
 #[path = "native128_region_unlock.rs"]
 mod native128_region_unlock;
+#[path = "native128_r615.rs"]
+mod native128_r615;
 
 pub(super) struct Request<'a> {
     pub source:&'a Path,
@@ -110,14 +113,43 @@ fn verify_stage(path:&Path,id:usize,len:u64)->Result<()> {
     Ok(())
 }
 
+// LCK_R618B_WRITABLE_STAGE
+// Source IMG stays immutable. Independent temporary copies
+// may need their Windows read-only attribute cleared.
 fn copy_stage(src:&Path,dst:&Path)->Result<()> {
     ensure!(
         !dst.exists(),
-        "Staging path already exists: {}",
+        "IMG stage already exists: {}",
         dst.display()
     );
 
-    fs::copy(src,dst)?;
+    fs::copy(src,dst).with_context(||format!(
+        "STAGE COPY FAILED: source={} destination={}",
+        src.display(),
+        dst.display()
+    ))?;
+
+    let metadata=fs::metadata(dst).with_context(||format!(
+        "STAGE METADATA FAILED: {}",
+        dst.display()
+    ))?;
+
+    if metadata.permissions().readonly() {
+        let mut permissions=metadata.permissions();
+        permissions.set_readonly(false);
+
+        fs::set_permissions(dst,permissions).with_context(||format!(
+            "STAGE WRITABLE PERMISSION FAILED: stage={} original={}",
+            dst.display(),
+            src.display()
+        ))?;
+    }
+
+    ensure!(
+        !fs::metadata(dst)?.permissions().readonly(),
+        "STAGE STILL READ-ONLY: {}",
+        dst.display()
+    );
 
     Ok(())
 }
@@ -199,6 +231,15 @@ pub(super) fn execute(
         );
     }
 
+    // LCK_R616D_CAMERA_EXPORT_SELECTION
+    let camera_changes=request.project.as_ref()
+        .and_then(|s|
+            s.project.native_cameras.iter()
+                .find(|c|c.scene==request.scene.name)
+        ).cloned();
+
+    let has_cameras=camera_changes.as_ref()
+        .is_some_and(|c|c.changed());
     let has_objects=
         collision_edit::scene_has_instance_edits(
             &request.scene.name,request.world
@@ -223,7 +264,7 @@ pub(super) fn execute(
     };
 
     ensure!(
-        has_objects || has_floors || has_collision
+        has_objects || has_floors || has_collision || has_cameras
             || has_doors || has_warps,
         "Only editor metadata changed; save project instead"
     );
@@ -263,6 +304,12 @@ pub(super) fn execute(
     let mut skipped=Vec::<String>::new();
     let mut imports=None;
     let mut native128_summary=None;
+
+    let r613_full_requested=std::env::current_exe()
+        .ok()
+        .and_then(|p|p.parent().map(|d|
+            d.join("LCK_NATIVE128_FULL.enabled").exists()))
+        .unwrap_or(false);
 
     patched.push(format!(
         "R6.0 manifest: {}",manifest.summary()
@@ -381,7 +428,8 @@ pub(super) fn execute(
             &target,
             &request.scene.name,
             request.index,
-            request.floors
+            request.floors,
+            request.unrestricted
         ) {
             Ok(Some(message))=>{
                 patched.push(message);
@@ -541,6 +589,32 @@ pub(super) fn execute(
     }
 
     // ========================================================
+    // LCK_R616D_NATIVE_MAN_CAMERA_EXPORT
+    if let Some(camera)=camera_changes.as_ref()
+        .filter(|c|c.changed())
+    {
+        let destination=temps.add(
+            dir.join(format!("{prefix}_camera.img"))
+        )?;
+
+        copy_stage(&current,&destination)?;
+
+        // Hard failure: never claim a successful camera export
+        // if MAN encoding, compression or readback fails.
+        let report=native_gameplay_camera::overlay_existing(
+            &destination,
+            request.source,
+            request.index,
+            &request.scene.name,
+            camera
+        )?;
+
+        verify_stage(&destination,entry,source_len)?;
+
+        current=destination;
+        wrote=true;
+        patched.push(report);
+    }
     // LCK_R612A_NATIVE_128_REGIONS
     // Modify only an independent export-stage copy.
 
@@ -575,6 +649,10 @@ pub(super) fn execute(
             Ok(None) => {
                 let _ = fs::remove_file(&target);
 
+                if full {
+                    bail!("R613: full native 128 was requested, but no activation regions were created");
+                }
+
                 skipped.push(
                     "R6.1.2A: no eligible new native MAP cells; no additional regions needed".into()
                 );
@@ -583,11 +661,80 @@ pub(super) fn execute(
             Err(error) => {
                 let _ = fs::remove_file(&target);
 
+                if full {
+                    return Err(error.context(
+                        "R613: full native 128 region activation failed"
+                    ));
+                }
+
                 skipped.push(format!(
                     "R6.1.2A region stage skipped: {error:#}"
                 ));
             }
         }
+    }
+    // R613: inspect serialized native MAP before publication.
+    // A successful audit does not assert PS1 runtime gameplay success.
+    let r613_coverage=if wrote &&
+        request.scene.name.eq_ignore_ascii_case("town01")
+    {
+        Some(native128_region_unlock::r613_coverage_report(
+            &retail,
+            &read_map(&current,entry)?,
+            r613_full_requested
+        )?)
+    }else{
+        None
+    };
+    // LCK_R615_NATIVE128_EXPERIMENTAL_WIDE_EXTERIOR
+    // The original 128x128 native grid stays unchanged.
+    // This option changes the retail region selection window.
+    // It does not install MIPS runtime hooks.
+    let r615_wide_enabled = std::env::current_exe()
+        .ok()
+        .and_then(|p|p.parent().map(|d|
+            d.join("LCK_R615_WIDE_EXTERIOR.enabled").exists()
+        ))
+        .unwrap_or(false);
+    let mut r615_wide_used = false;
+
+    if r615_wide_enabled &&
+        request.scene.name.eq_ignore_ascii_case("town01")
+    {
+        ensure!(native128_summary.is_some(),
+            "R615 wide-window mode requires successful R6.1.2A region activation; enable LCK_NATIVE128_FULL.enabled and inspect the region report");
+
+        let target=temps.add(
+            dir.join(format!("{prefix}_r615_wide.img"))
+        )?;
+
+        copy_stage(&current,&target)?;
+
+                // v2.0.8.5 opt-in native MAP region experiment.
+        let unified_requested=std::env::current_exe()
+            .ok()
+            .and_then(|p|
+                p.parent().map(|d|
+                    d.join("LCK_V2085_UNIFIED128.enabled").exists()
+                )
+            )
+            .unwrap_or(false);
+
+        let message=if unified_requested {
+            native128_r615::patch_unified(
+                &target,entry,&retail
+            )?
+        } else {
+            native128_r615::patch_wide(
+                &target,entry,&retail
+            )?
+        };
+
+        verify_stage(&target,entry,source_len)?;
+
+        current=target;
+        patched.push(message);
+        r615_wide_used=true;
     }
     // Final validation and atomic publication
     // ========================================================
@@ -599,12 +746,42 @@ pub(super) fn execute(
 
     verify_stage(&current,entry,source_len)?;
 
+    // LCK_R615_NATIVE_MAP_CONTRACT_AUDIT
+    // Report native MAP categories, including zero-byte evidence.
+    // Do not misidentify kind-2 elevation overrides (0x0800)
+    // as walk ground (0x1000).
+    let r615_audit=if request.scene.name.eq_ignore_ascii_case("town01") {
+        native128_r615::audit(
+            &retail,
+            &read_map(&current,entry)?,
+            &manifest,
+            r615_wide_used
+        )?
+    } else {
+        match native128_r615::audit(
+            &retail,
+            &read_map(&current,entry)?,
+            &manifest,
+            false
+        ) {
+            Ok(report)=>report,
+            Err(e)=>format!(
+                "R615: no compatible region audit for {}: {e:#}; native export unchanged",
+                request.scene.name
+            ),
+        }
+    };
     // Both paths are in the destination directory and therefore
     // on the same volume. An existing output is never replaced.
+        // LCK_R618B_PUBLISH_DIAGNOSTICS
     fs::hard_link(
         &current,
         request.output
-    ).context("Publish staged IMG atomically")?;
+    ).with_context(||format!(
+        "IMG PUBLICATION FAILED: staged={} output={}",
+        current.display(),
+        request.output.display()
+    ))?;
 
     let verified=(||->Result<()>{
         verify_stage(
@@ -628,12 +805,31 @@ pub(super) fn execute(
         return Err(error);
     }
 
+    let r615_path=request.output.with_extension(
+        "r615_native_128_audit.txt"
+    );
+
+    let r615_detail=format!(
+        "{r615_audit}\nENCODED / ATTEMPTED NATIVE EXPORT STAGES\n{}\n\nSKIPPED / FAILED NATIVE OPERATIONS\n{}\n",
+        patched.join("\n"),
+        skipped.join("\n")
+    );
+
+    match fs::write(&r615_path,r615_detail) {
+        Ok(())=>patched.push(format!(
+            "R615 native map/spawn audit: {}",
+            r615_path.display()
+        )),
+        Err(e)=>skipped.push(format!(
+            "R615 audit report could not be saved: {e}"
+        )),
+    }
     if let Some(summary) = native128_summary {
         let report = request.output.with_extension(
             "r612_native128_regions.txt"
         );
 
-        match fs::write(&report, summary.report()) {
+        match fs::write(&report, format!("{}\n{}",summary.report(),r613_coverage.as_deref().unwrap_or(""))) {
             Ok(()) => {
                 patched.push(format!(
                     "R6.1.2A report: {}",
@@ -760,6 +956,100 @@ mod lck_r60_coordinator_tests {
 
         assert!(
             copy_stage(&source,&copy).is_err()
+        );
+
+        Ok(())
+    }
+}
+
+// LCK_R618B_STAGE_REGRESSION
+#[cfg(test)]
+mod r618b_stage_tests {
+    use super::*;
+
+    #[test]
+    fn readonly_master_produces_writable_stage()->Result<()> {
+        let dir=tempfile::tempdir()?;
+        let original=dir.path().join("source.img");
+        let stage=dir.path().join("stage.img");
+
+        fs::write(&original,[1u8,2,3,4,5,6])?;
+
+        let mut p=fs::metadata(&original)?.permissions();
+        p.set_readonly(true);
+        fs::set_permissions(&original,p)?;
+
+        copy_stage(&original,&stage)?;
+
+        assert_eq!(
+            fs::read(&stage)?,
+            vec![1u8,2,3,4,5,6]
+        );
+
+        assert!(
+            !fs::metadata(&stage)?.permissions().readonly()
+        );
+
+        assert!(
+            fs::metadata(&original)?.permissions().readonly()
+        );
+
+        let mut p=fs::metadata(&original)?.permissions();
+        p.set_readonly(false);
+        fs::set_permissions(&original,p)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn readonly_master_supports_new_img_publication()->Result<()> {
+        let dir=tempfile::tempdir()?;
+        let original=dir.path().join("master.img");
+        let stage=dir.path().join("stage.img");
+        let output=dir.path().join("output.img");
+
+        let master=vec![0x33u8;4096];
+        let updated=vec![0x55u8;4096];
+
+        fs::write(&original,&master)?;
+
+        let mut p=fs::metadata(&original)?.permissions();
+        p.set_readonly(true);
+        fs::set_permissions(&original,p)?;
+
+        copy_stage(&original,&stage)?;
+
+        fs::write(&stage,&updated)?;
+        fs::hard_link(&stage,&output)?;
+
+        assert_eq!(fs::read(&output)?,updated);
+        assert_eq!(fs::read(&original)?,master);
+
+        assert!(
+            fs::metadata(&original)?.permissions().readonly()
+        );
+
+        let mut p=fs::metadata(&original)?.permissions();
+        p.set_readonly(false);
+        fs::set_permissions(&original,p)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn staging_never_overwrites_existing_files()->Result<()> {
+        let dir=tempfile::tempdir()?;
+        let source=dir.path().join("source.img");
+        let destination=dir.path().join("existing.img");
+
+        fs::write(&source,[1u8,2,3])?;
+        fs::write(&destination,[9u8,8,7])?;
+
+        assert!(copy_stage(&source,&destination).is_err());
+
+        assert_eq!(
+            fs::read(&destination)?,
+            vec![9u8,8,7]
         );
 
         Ok(())

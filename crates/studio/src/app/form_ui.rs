@@ -32,13 +32,115 @@ impl Action {
         )
     }
 }
+#[cfg(test)]
+mod lck_collision_save_r1_tests {
+    use super::*;
+
+    #[test]
+    fn collision_walls_and_heights_survive_serialization(){
+        let source="COLLISION_EDIT\t{\"version\":1,\"scene\":\"town01\",\"walls\":[[10,10,true],[12,13,false]],\"heights\":[[10,10,64]]}\n";
+
+        let before=
+            super::super::collision_edit::State::from_embedded_record(
+                source,"town01"
+            ).unwrap();
+
+        assert!(before.has_edits());
+
+        let encoded=before.embedded_record("town01");
+
+        let after=
+            super::super::collision_edit::State::from_embedded_record(
+                &encoded,"town01"
+            ).unwrap();
+
+        assert_eq!(
+            before.native_edit_snapshot(),
+            after.native_edit_snapshot()
+        );
+
+        assert_eq!(
+            after.native_edit_snapshot().1,
+            vec![(10,10,64)]
+        );
+    }
+
+    #[test]
+    fn missing_collision_record_resets_to_clean_layer(){
+        let layer=
+            super::super::collision_edit::State::from_embedded_record(
+                "LCK_SCENE_V1\ttown01\n",
+                "town01"
+            ).unwrap();
+
+        assert!(!layer.has_edits());
+    }
+
+    #[test]
+    fn collision_record_rejects_wrong_native_scene(){
+        let source="COLLISION_EDIT\t{\"version\":1,\"scene\":\"town01\",\"walls\":[[10,10,true]],\"heights\":[]}\n";
+
+        assert!(
+            super::super::collision_edit::State::from_embedded_record(
+                source,"town0b"
+            ).is_err()
+        );
+    }
+}
 impl App {
+    // LCK_COLLISION_SAVE_R1
+    // A project save must never silently omit an
+    // authored native collision wall or height.
+    fn lck_collision_verify_project_snapshot(
+        &self,
+        project:&super::lck_project::LckProject
+    )->Result<()> {
+        if !self.collision_edit.has_edits() {
+            return Ok(());
+        }
+
+        let source=match self.native_scene.as_ref(){
+            Some((name,NativeSceneSlot::Ready(..)))=>name,
+            _=>anyhow::bail!(
+                "Collision edits cannot be saved without a loaded native cell"
+            ),
+        };
+
+        let identity=self.editor_cell_active.as_ref()
+            .map(|cell|cell.form_identity(source))
+            .context(
+                "Collision edits have no active cell identity"
+            )?;
+
+        let raw=project.cell_snapshots.get(&identity)
+            .context(format!(
+                "Collision edits were not captured for cell {identity}; project was not saved"
+            ))?;
+
+        let restored=
+            super::collision_edit::State::from_embedded_record(
+                raw,source
+            ).map_err(anyhow::Error::msg)?;
+
+        anyhow::ensure!(
+            restored.native_edit_snapshot()
+                ==self.collision_edit.native_edit_snapshot(),
+            "Collision wall/height snapshot differs from the live editor; project was not saved"
+        );
+
+        Ok(())
+    }
     fn save_unified_project(&mut self, save_as: bool) -> Result<()> {
+        self.lck_v2082f_commit_pending_warps()?;
         self.save_active_editor_cell();
 
         let project=self.form_session.as_ref()
             .context("Open a source cell before saving")?
             .project.clone();
+
+        self.lck_collision_verify_project_snapshot(
+            &project
+        )?;
 
         let existing=if save_as {
             None
@@ -68,6 +170,21 @@ impl App {
         let file=self.form_file.as_mut().unwrap();
         file.project=project;
         file.save()?;
+        // Validate the collision layer from bytes actually
+        // written to the .lckproject file, not merely memory.
+        if self.collision_edit.has_edits(){
+            let written=std::fs::read(&file.path)
+                .context("Read saved project for collision verification")?;
+
+            let disk_project:super::lck_project::LckProject=
+                serde_json::from_slice(&written)
+                    .context("Reparse saved collision project")?;
+
+            self.lck_collision_verify_project_snapshot(
+                &disk_project
+            )?;
+        }
+
 
         self.studio.status=Some(format!(
             "Saved LCK project: {}",path.display()
@@ -97,7 +214,12 @@ impl App {
 
         let Some(raw)=snapshot else {
             self.ground_edits=super::ground_edit_ops::State::default();
-            self.ground_edits.scene=name;
+            self.ground_edits.scene=name.clone();
+
+            self.collision_edit=
+                super::collision_edit::State::from_embedded_record(
+                    "",&name
+                ).map_err(anyhow::Error::msg)?;
             return Ok(());
         };
 
@@ -119,6 +241,13 @@ impl App {
             &raw,scene.ground.as_ref(),&name
         ).map_err(anyhow::Error::msg)?;
 
+        // LCK_COLLISION_SAVE_R1
+        // Restore the exact native wall and height
+        // overrides serialized by Save Project.
+        let collision=
+            super::collision_edit::State::from_embedded_record(
+                &raw,&name
+            ).map_err(anyhow::Error::msg)?;
         if let Some((_,NativeSceneSlot::Ready(_,current)))=
             self.native_scene.as_mut()
         {
@@ -126,6 +255,7 @@ impl App {
         }
 
         self.ground_edits=ground;
+        self.collision_edit=collision;
         self.native_view.version=
             self.native_view.version.wrapping_add(1);
         Ok(())

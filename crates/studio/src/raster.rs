@@ -503,11 +503,540 @@ pub fn render_highlights_with_sources_and_ids(
     )
 }
 
+// LCK_V204_DEPTH_LOCKED_GRID
+//
+// Each displayed grid pixel is reconstructed from the SAME
+// camera projection and Z-buffer as the native scene.
+//
+// The grid never moves in world space. Panning and orbiting
+// change only the image projection.
+//
+// Unlike a 2D foreground overlay, native geometry obscures
+// the grid whenever it is closer to the camera.
+
+#[derive(Clone,Copy,Debug)]
+pub struct V204GridSettings {
+    pub height:f32,
+    pub step:usize,
+    pub side:usize,
+    pub color:[u8;3],
+    pub major_color:[u8;3],
+    pub opacity:f32,
+}
+
+struct V204GridRay {
+    w:f32,
+    h:f32,
+    f:f32,
+    dist:f32,
+    near:f32,
+    sy:f32,
+    cy:f32,
+    sp:f32,
+    cp:f32,
+    target:[f32;3],
+}
+
+impl V204GridRay {
+    fn new(
+        cam:Camera,
+        center:[f32;3],
+        radius:f32,
+        w:usize,
+        h:usize,
+    )->Option<Self> {
+        if w==0 || h==0 || radius<=0.0 {
+            return None;
+        }
+
+        let half=22.5f32.to_radians();
+
+        let dist=radius/half.sin()
+            *cam.zoom.max(0.0000001);
+
+        if !dist.is_finite() || dist<=0.0 {
+            return None;
+        }
+
+        let (sy,cy)=cam.yaw.sin_cos();
+        let (sp,cp)=cam.pitch.sin_cos();
+
+        Some(Self{
+            w:w as f32,
+            h:h as f32,
+            f:(h as f32*0.5)/half.tan(),
+            dist,
+            near:(dist*0.003).max(0.0001),
+            sy,cy,sp,cp,
+            target:[
+                center[0]+cam.target_offset[0],
+                center[1]+cam.target_offset[1],
+                center[2]+cam.target_offset[2],
+            ],
+        })
+    }
+
+    // Invert the exact projection equations of the
+    // LCK native CPU rasterizer.
+    //
+    // Returns world X/Z and the same depth used by
+    // the rasterizer's opaque Z-buffer.
+    fn at(
+        &self,
+        pixel_x:f32,
+        pixel_y:f32,
+        plane_y:f32,
+    )->Option<([f32;2],f32)> {
+        let u=(
+            pixel_x+0.5-self.w*0.5
+        )/self.f;
+
+        let v=(
+            pixel_y+0.5-self.h*0.5
+        )/self.f;
+
+        let denominator=v*self.cp+self.sp;
+
+        if denominator.abs()<0.0000001 {
+            return None;
+        }
+
+        let relative_y=plane_y-self.target[1];
+
+        let depth=(
+            relative_y+self.dist*self.sp
+        )/denominator;
+
+        if !depth.is_finite() || depth<=self.near {
+            return None;
+        }
+
+        let x1=u*depth;
+
+        let z1=-(v*depth)*self.sp
+            +(depth-self.dist)*self.cp;
+
+        let x=x1*self.cy-z1*self.sy
+            +self.target[0];
+
+        let z=x1*self.sy+z1*self.cy
+            +self.target[2];
+
+        if !x.is_finite() || !z.is_finite() {
+            return None;
+        }
+
+        Some(([x,z],depth))
+    }
+}
+
+fn v204_grid_visible(
+    plane_depth:f32,
+    opaque_depth:f32
+)->bool {
+    if !opaque_depth.is_finite() {
+        return true;
+    }
+
+    // Tiny numerical tolerance for nearly coplanar floor
+    // triangles. Solid buildings and raised terrain remain
+    // capable of occluding the grid correctly.
+    let tolerance=(
+        opaque_depth.abs()*0.000005
+    ).max(0.002);
+
+    plane_depth<=opaque_depth+tolerance
+}
+
+fn v204_blend(
+    pixels:&mut [u8],
+    offset:usize,
+    color:[u8;3],
+    alpha:f32,
+){
+    let a=alpha.clamp(0.0,1.0);
+    let behind=1.0-a;
+
+    for channel in 0..3 {
+        pixels[offset+channel]=(
+            color[channel] as f32*a
+            +pixels[offset+channel] as f32*behind
+        ).clamp(0.0,255.0) as u8;
+    }
+}
+
+fn v204_coverage(
+    distance_pixels:f32,
+    half_width:f32,
+)->f32 {
+    (half_width+0.7-distance_pixels)
+        .clamp(0.0,1.0)
+}
+
+fn v204_draw_grid(
+    rgba:&mut [u8],
+    depth:&[f32],
+    model:&Model,
+    cam:Camera,
+    w:usize,
+    h:usize,
+    grid:V204GridSettings,
+){
+    if w==0 || h==0
+        || rgba.len()<w*h*4
+        || depth.len()<w*h
+    {
+        return;
+    }
+
+    let opacity=grid.opacity.clamp(0.0,1.0);
+
+    if opacity<=0.00001 {
+        return;
+    }
+
+    let Some(ray)=V204GridRay::new(
+        cam,model.center,model.radius,w,h
+    )else{
+        return;
+    };
+
+    let side=match grid.side {
+        160|192|224|256=>grid.side,
+        _=>128,
+    };
+
+    let step=grid.step.clamp(1,32);
+
+    let half=(side-128) as f32*64.0;
+
+    // Absolute original world coordinates.
+    // Neither value depends on camera position.
+    let minimum=-half;
+    let maximum=16384.0+half;
+
+    let spacing=step as f32*128.0;
+    let line_count=(side/step) as i32;
+
+    let plane_y=grid.height+3.0;
+
+    for py in 0..h {
+        for px in 0..w {
+            let Some(([wx,wz],plane_depth))=
+                ray.at(px as f32,py as f32,plane_y)
+            else {
+                continue;
+            };
+
+            if wx<minimum || wx>maximum
+                || wz<minimum || wz>maximum
+            {
+                continue;
+            }
+
+            let di=py*w+px;
+
+            if !v204_grid_visible(
+                plane_depth,depth[di]
+            ){
+                continue;
+            }
+
+            // Evaluate the world-space ray intersection at
+            // adjacent screen pixels to obtain true local
+            // grid-line width in SCREEN pixels.
+            //
+            // This prevents lines shrinking into dashes
+            // with changing distance or camera angle.
+            let right=ray.at(
+                px as f32+1.0,
+                py as f32,
+                plane_y
+            ).map(|v|v.0)
+                .unwrap_or([wx,wz]);
+
+            let down=ray.at(
+                px as f32,
+                py as f32+1.0,
+                plane_y
+            ).map(|v|v.0)
+                .unwrap_or([wx,wz]);
+
+            let x_per_pixel=(
+                (right[0]-wx).powi(2)
+                +(down[0]-wx).powi(2)
+            ).sqrt().max(0.00001);
+
+            let z_per_pixel=(
+                (right[1]-wz).powi(2)
+                +(down[1]-wz).powi(2)
+            ).sqrt().max(0.00001);
+
+            let ix=(
+                (wx-minimum)/spacing
+            ).round() as i32;
+
+            let iz=(
+                (wz-minimum)/spacing
+            ).round() as i32;
+
+            let mut best_coverage=0.0f32;
+            let mut best_color=grid.color;
+            let mut best_alpha=0.0f32;
+
+            if (0..=line_count).contains(&ix) {
+                let line_x=minimum
+                    +ix as f32*spacing;
+
+                let pixels_from_line=(
+                    wx-line_x
+                ).abs()/x_per_pixel;
+
+                let major=(ix*step as i32)%32==0;
+
+                let width=if major {1.4}else{0.95};
+
+                let coverage=v204_coverage(
+                    pixels_from_line,width
+                );
+
+                if coverage>best_coverage {
+                    best_coverage=coverage;
+                    best_color=if major {
+                        grid.major_color
+                    }else{
+                        grid.color
+                    };
+
+                    best_alpha=if major {3.2}else{2.8};
+                }
+            }
+
+            if (0..=line_count).contains(&iz) {
+                let line_z=minimum
+                    +iz as f32*spacing;
+
+                let pixels_from_line=(
+                    wz-line_z
+                ).abs()/z_per_pixel;
+
+                let major=(iz*step as i32)%32==0;
+
+                let width=if major {1.4}else{0.95};
+
+                let coverage=v204_coverage(
+                    pixels_from_line,width
+                );
+
+                if coverage>best_coverage {
+                    best_coverage=coverage;
+                    best_color=if major {
+                        grid.major_color
+                    }else{
+                        grid.color
+                    };
+
+                    best_alpha=if major {3.2}else{2.8};
+                }
+            }
+
+            // Red always identifies the original
+            // 128x128 native MAP boundary.
+            let retail_x=wx.abs()
+                .min((wx-16384.0).abs())
+                /x_per_pixel;
+
+            let retail_z=wz.abs()
+                .min((wz-16384.0).abs())
+                /z_per_pixel;
+
+            let retail_cov=v204_coverage(
+                retail_x.min(retail_z),1.45
+            );
+
+            if retail_cov>0.0 {
+                best_color=[255,91,86];
+                best_coverage=best_coverage.max(retail_cov);
+                best_alpha=3.3;
+            }
+
+            // Cyan outlines the chosen enlarged
+            // authoring capacity, if above 128.
+            if side>128 {
+                let outer_x=(
+                    (wx-minimum).abs()
+                        .min((wx-maximum).abs())
+                )/x_per_pixel;
+
+                let outer_z=(
+                    (wz-minimum).abs()
+                        .min((wz-maximum).abs())
+                )/z_per_pixel;
+
+                let outer_cov=v204_coverage(
+                    outer_x.min(outer_z),1.45
+                );
+
+                if outer_cov>retail_cov
+                    && outer_cov>best_coverage
+                {
+                    best_color=[50,225,245];
+                    best_coverage=outer_cov;
+                    best_alpha=3.3;
+                }
+            }
+
+            let pixel=di*4;
+
+            // The shaded grid plane is rendered only
+            // where it is not hidden by native geometry.
+            v204_blend(
+                rgba,pixel,grid.color,
+                opacity*0.36
+            );
+
+            // Continuous, anti-aliased line strokes.
+            if best_coverage>0.0 {
+                v204_blend(
+                    rgba,pixel,best_color,
+                    (opacity*best_alpha*best_coverage)
+                        .min(0.95)
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod v204_grid_depth_tests {
+    use super::*;
+
+    fn project(
+        ray:&V204GridRay,
+        world:[f32;3],
+    )->(f32,f32){
+        let x=world[0]-ray.target[0];
+        let y=world[1]-ray.target[1];
+        let z=world[2]-ray.target[2];
+
+        let x1=x*ray.cy+z*ray.sy;
+        let z1=-x*ray.sy+z*ray.cy;
+
+        let y2=y*ray.cp-z1*ray.sp;
+        let depth=y*ray.sp+z1*ray.cp+ray.dist;
+
+        (
+            ray.w*0.5+ray.f*x1/depth-0.5,
+            ray.h*0.5+ray.f*y2/depth-0.5,
+        )
+    }
+
+    #[test]
+    fn v204_inverse_projection_matches_world(){
+        let mut camera=Camera::default();
+
+        camera.yaw=0.43;
+        camera.pitch=1.20;
+        camera.zoom=0.70;
+
+        camera.target_offset=[150.0,10.0,-230.0];
+
+        let ray=V204GridRay::new(
+            camera,[500.0,100.0,800.0],
+            7000.0,900,500
+        ).unwrap();
+
+        let world=[1000.0,40.0,900.0];
+        let (px,py)=project(&ray,world);
+
+        let (hit,_)=ray.at(
+            px,py,world[1]
+        ).unwrap();
+
+        assert!((hit[0]-world[0]).abs()<0.1);
+        assert!((hit[1]-world[2]).abs()<0.1);
+    }
+
+    #[test]
+    fn v204_camera_pan_keeps_world_coordinates(){
+        let mut camera=Camera::default();
+
+        camera.yaw=0.32;
+        camera.pitch=1.18;
+        camera.zoom=0.62;
+
+        let world=[2300.0,15.0,3400.0];
+
+        for offset in [
+            [0.0,0.0,0.0],
+            [500.0,100.0,-200.0],
+            [-800.0,-50.0,700.0],
+        ]{
+            camera.target_offset=offset;
+
+            let ray=V204GridRay::new(
+                camera,[1500.0,0.0,2500.0],
+                6000.0,900,500
+            ).unwrap();
+
+            let (px,py)=project(&ray,world);
+
+            let (hit,_)=ray.at(
+                px,py,world[1]
+            ).unwrap();
+
+            assert!(
+                (hit[0]-world[0]).abs()<0.2
+            );
+
+            assert!(
+                (hit[1]-world[2]).abs()<0.2
+            );
+        }
+    }
+
+    #[test]
+    fn v204_opaque_geometry_occludes_grid(){
+        assert!(!v204_grid_visible(100.0,20.0));
+        assert!(v204_grid_visible(20.0,100.0));
+        assert!(v204_grid_visible(
+            100.0,f32::INFINITY
+        ));
+    }
+
+    #[test]
+    fn v204_line_coverage_is_continuous(){
+        assert_eq!(
+            v204_coverage(0.0,1.0),1.0
+        );
+
+        assert!(
+            v204_coverage(1.2,1.0)>0.0
+        );
+
+        assert_eq!(
+            v204_coverage(3.0,1.0),0.0
+        );
+    }
+}
 pub fn render_highlights_with_sources_and_ids_r609(
     model:&Model,vram:&Vram,cam:Camera,shading:Shading,
     w:usize,h:usize,selected:&[u32],show_ground:bool,
     donor_vram:Option<&std::collections::HashMap<u32,std::sync::Arc<Vram>>>,
     height_overlay:Option<&HeightOverlay>
+) -> (Vec<u8>,Vec<u32>) {
+    render_highlights_with_sources_and_ids_r609_v204(
+        model,vram,cam,shading,w,h,selected,
+        show_ground,donor_vram,height_overlay,None
+    )
+}
+
+pub fn render_highlights_with_sources_and_ids_r609_v204(
+    model:&Model,vram:&Vram,cam:Camera,shading:Shading,
+    w:usize,h:usize,selected:&[u32],show_ground:bool,
+    donor_vram:Option<&std::collections::HashMap<u32,std::sync::Arc<Vram>>>,
+    height_overlay:Option<&HeightOverlay>,
+    grid:Option<V204GridSettings>
 ) -> (Vec<u8>,Vec<u32>) {
     let mut rgba = vec![0u8; w * h * 4];
     let mut visible_ids = vec![u32::MAX; w * h];
@@ -518,6 +1047,9 @@ pub fn render_highlights_with_sources_and_ids_r609(
         return (rgba,visible_ids);
     }
     let mut depth = vec![f32::INFINITY; w * h];
+
+    // V2.0.1: one immutable overlay style per raster frame.
+    let v201_style=crate::app::overlay_style::snapshot();
 
 
     let (sy, cy) = cam.yaw.sin_cos();
@@ -622,6 +1154,15 @@ pub fn render_highlights_with_sources_and_ids_r609(
         }
         let (max_x, max_y) = (max_x as usize, max_y as usize);
 
+        let v201_overlay_id=model.object_ids
+            .get(i[0])
+            .copied()
+            .unwrap_or(u32::MAX);
+
+        let v201_alpha=v201_style.alpha_for_id(
+            v201_overlay_id
+        );
+
         let tex =
             model.textured.get(i[0]).copied().unwrap_or(0) != 0 && shading == Shading::Textured;
         let material_vram = donor_vram.and_then(|sources|
@@ -703,10 +1244,20 @@ pub fn render_highlights_with_sources_and_ids_r609(
                 } else {
                     lerp3(&model.fill)
                 };
+                // Fully transparent overlays cannot block the
+                // geometry or object-selection buffer underneath.
+                if v201_alpha==Some(0.0) {
+                    continue;
+                }
+
                 depth[di] = display_depth;
-                // LCK_R54_VISIBLE_PICK
-                visible_ids[di] =
-                    model.object_ids.get(i[0]).copied().unwrap_or(u32::MAX);
+
+                // Editor-only overlay faces must never replace
+                // the native object's picking identifier.
+                if v201_alpha.is_none() {
+                    visible_ids[di] =
+                        model.object_ids.get(i[0]).copied().unwrap_or(u32::MAX);
+                }
                 let rgb = if highlighted {
                     // Gold instance highlight: keep enough of the underlying
                     // original texture to recognize the selected mesh.
@@ -750,13 +1301,43 @@ pub fn render_highlights_with_sources_and_ids_r609(
                 };
 
                 let o = di * 4;
-                rgba[o] = rgb[0].clamp(0.0, 255.0) as u8;
-                rgba[o + 1] = rgb[1].clamp(0.0, 255.0) as u8;
-                rgba[o + 2] = rgb[2].clamp(0.0, 255.0) as u8;
+
+                if let Some(alpha)=v201_alpha {
+                    // LCK V2.0.1:
+                    // Blend editor-only geometry over the
+                    // already depth-tested world image.
+                    let alpha=alpha.clamp(0.0,1.0);
+                    let background=1.0-alpha;
+
+                    for channel in 0..3 {
+                        let foreground=rgb[channel]
+                            .clamp(0.0,255.0);
+
+                        let behind=rgba[o+channel] as f32;
+
+                        rgba[o+channel]=(
+                            foreground*alpha
+                            +behind*background
+                        ).clamp(0.0,255.0) as u8;
+                    }
+                }else{
+                    rgba[o] = rgb[0].clamp(0.0, 255.0) as u8;
+                    rgba[o + 1] = rgb[1].clamp(0.0, 255.0) as u8;
+                    rgba[o + 2] = rgb[2].clamp(0.0, 255.0) as u8;
+                }
+
                 rgba[o + 3] = 255;
             }
         }
     }
+    // V2.0.4: shade the grid using this exact frame's
+    // camera and opaque scene Z-buffer, before mirroring.
+    if let Some(grid)=grid {
+        v204_draw_grid(
+            &mut rgba,&depth,model,cam,w,h,grid
+        );
+    }
+
     (rgba,visible_ids)
 }
 
@@ -792,7 +1373,7 @@ fn pick_instance_depth(model: &Model, cam: Camera, w: usize, h: usize, pixel: [f
         let i = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
         if i.iter().any(|&k| k >= projected.len()) { continue; }
         let id = model.object_ids.get(i[0]).copied().unwrap_or(u32::MAX);
-        if id >= u32::MAX-1 || only.is_some_and(|requested|requested != id) { continue; } // LCK_R49_WORLD_FIXED_GRID
+        if (id >= u32::MAX-1 || crate::app::overlay_style::is_overlay_id(id)) || only.is_some_and(|requested|requested != id) { continue; } // LCK_R49_WORLD_FIXED_GRID
         let s = [projected[i[0]], projected[i[1]], projected[i[2]]];
         if s.iter().any(|p| !p[2].is_finite() || p[2] < near) { continue; }
         let area = (s[1][0] - s[0][0]) * (s[2][1] - s[0][1])

@@ -66,6 +66,8 @@ pub(super) struct LckProject {
     #[serde(default)]
     pub native_warps: Vec<super::native_warps::SceneWarps>,
     #[serde(default)]
+    pub native_cameras: Vec<super::native_gameplay_camera::SceneCameras>,
+    #[serde(default)]
     pub render_uids: Vec<RenderUid>,
     #[serde(default)]
     pub next_render_uid: BTreeMap<FormKey, u64>,
@@ -144,6 +146,7 @@ impl LckProject {
             render_uids: vec![],
             next_render_uid: Default::default(),
             native_warps: Vec::new(),
+            native_cameras: Vec::new(),
             schema_version: 1,
             file_id,
             master,

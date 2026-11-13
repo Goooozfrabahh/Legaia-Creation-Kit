@@ -390,7 +390,7 @@ pub(super) fn execute(
     };
 
     let mirror_note=match native_floor_mirror::overlay_existing(
-        &stage_ground,&scene.name,index,floors
+        &stage_ground,&scene.name,index,floors,unrestricted
     ){
         Ok(note)=>note,
 

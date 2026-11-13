@@ -23,6 +23,7 @@ pub(crate) struct Viewport {
     pub world_selected: Vec<u32>,
     rendered_selection: Vec<u32>,
     height_overlay: Option<raster::HeightOverlay>,
+    pub world_grid: Option<raster::V204GridSettings>,
     // LCK_R54_VISIBLE_PICK
     pick_ids:Vec<u32>,
     pick_dimensions:[usize;2],
@@ -327,13 +328,20 @@ impl Viewport {
             world_pan_dragged: false,world_ground_edit:false,world_marquee_enabled:false,
             world_selected: Vec::new(), rendered_selection: Vec::new(),
             pick_ids:Vec::new(), pick_dimensions:[0,0],
-            rendered: None, tex: None, height_overlay: None,
+            rendered: None, tex: None, height_overlay: None, world_grid: None,
             world_image: None,
             world_marker_drag_capture: false,
         }
     }
 
     /// World point projection using the exact most recent world image.
+    // V2.0.3: actual rendered image rectangle and
+    // raster dimensions for anchored vector overlays.
+    pub(super) fn overlay_projection(
+        &self
+    )->Option<(egui::Rect,[usize;2])>{
+        self.world_image
+    }
     pub(super) fn project_world_marker(
         &self,
         model:&Model,
@@ -545,7 +553,7 @@ impl Viewport {
             self.pick_dimensions=px;
 
             let mut rgba = if world {
-                let (rgba,ids)=raster::render_highlights_with_sources_and_ids_r609(
+                let (rgba,ids)=raster::render_highlights_with_sources_and_ids_r609_v204(
                     model,vram,self.cam,self.shading,px[0],px[1],
                     if self.world_selected.is_empty(){
                         highlight.as_slice()
@@ -553,7 +561,8 @@ impl Viewport {
                         &self.world_selected
                     },
                     show_ground,donor_vram,
-                    self.height_overlay.as_ref()
+                    self.height_overlay.as_ref(),
+                    self.world_grid
                 );
 
                 self.pick_ids=ids;

@@ -1181,6 +1181,7 @@ mod lck_r48_extended_grid_tests {
 // Reserved ID MAX-1 is never pickable and is not a native MAP ID.
 
 const R49_GRID_ID:u32=u32::MAX-1;
+const V201_GRID_FILL_ID:u32=u32::MAX-5;
 
 fn r49_ribbon(
     model:&mut Model,
@@ -1230,6 +1231,99 @@ fn r49_ribbon(
     ]);
 }
 
+fn v201_grid_panel(
+    model: &mut Model,
+    x0: f32,
+    z0: f32,
+    x1: f32,
+    z1: f32,
+    y: f32,
+    color: [u8; 3],
+) {
+    let Ok(base) = u32::try_from(model.positions.len()) else {
+        return;
+    };
+
+    let points = [
+        [x0, y, z0],
+        [x1, y, z0],
+        [x1, y, z1],
+        [x0, y, z1],
+    ];
+
+    model.positions.extend(points);
+    model.rest.extend(points);
+    model.object_ids.extend([V201_GRID_FILL_ID; 4]);
+    model.uvs.extend([[0, 0]; 4]);
+    model.cba_tsb.extend([[0, 0]; 4]);
+    model.modulation.extend([[128, 128, 128]; 4]);
+    model.fill.extend([color; 4]);
+    model.textured.extend([0u8; 4]);
+
+    model.indices.extend([
+        base, base + 1, base + 2,
+        base, base + 2, base + 3,
+    ]);
+}
+
+// The original 3D grid remains fixed to world coordinates.
+// Surface panels are bounded into 8-tile-or-larger sections
+// to avoid one draw primitive for every native tile.
+// LCK_V202_FIXED_GRID_SEGMENTS
+// Grid vertices remain in absolute world coordinates.
+// Camera position, angle and zoom never change their positions.
+//
+// A long line is split into fixed 512-unit segments.
+// The segmentation is deterministic and camera-independent.
+
+const V202_GRID_SEGMENT_LENGTH:f32=512.0;
+
+fn v202_segmented_line(
+    model:&mut Model,
+    a:[f32;3],
+    b:[f32;3],
+    width:f32,
+    color:[u8;3],
+){
+    let delta=[
+        b[0]-a[0],
+        b[1]-a[1],
+        b[2]-a[2],
+    ];
+
+    let length=(
+        delta[0]*delta[0]
+        +delta[1]*delta[1]
+        +delta[2]*delta[2]
+    ).sqrt();
+
+    if !length.is_finite() || length<0.001 {
+        return;
+    }
+
+    let count=(length/V202_GRID_SEGMENT_LENGTH)
+        .ceil()
+        .max(1.0) as usize;
+
+    for segment in 0..count {
+        let t0=segment as f32/count as f32;
+        let t1=(segment+1) as f32/count as f32;
+
+        let p0=[
+            a[0]+delta[0]*t0,
+            a[1]+delta[1]*t0,
+            a[2]+delta[2]*t0,
+        ];
+
+        let p1=[
+            a[0]+delta[0]*t1,
+            a[1]+delta[1]*t1,
+            a[2]+delta[2]*t1,
+        ];
+
+        r49_ribbon(model,p0,p1,width,color);
+    }
+}
 pub(super) fn render_fixed_grid(
     original:&Model,
     height:f32,
@@ -1253,26 +1347,49 @@ pub(super) fn render_fixed_grid(
     // This reduces coplanar Z fighting without changing walkability.
     let y=height+3.0; // LCK_R612B_VISUAL_STYLE
 
-    let minor=[89,166,196];
-    let major=[117,208,231];
+    let style=super::overlay_style::snapshot();
+
+    let minor=style.grid_color;
+    let major=style.grid_major_color();
     let cyan=[50,225,245];
     let red=[255,88,78];
 
+    // V2.0.1: world-space shaded grid cells.
+    // Draw panels first, then outlines above them.
+    let panel_step=(side/64).max(2);
+    let panel_color=style.grid_color;
+
+    for gz in (0..side).step_by(panel_step) {
+        for gx in (0..side).step_by(panel_step) {
+            let next_x=(gx+panel_step).min(side);
+            let next_z=(gz+panel_step).min(side);
+
+            v201_grid_panel(
+                &mut model,
+                outer_min+gx as f32*128.0,
+                outer_min+gz as f32*128.0,
+                outer_min+next_x as f32*128.0,
+                outer_min+next_z as f32*128.0,
+                y-1.0,
+                panel_color,
+            );
+        }
+    }
     for i in (0..=side).step_by(stride) {
         let coordinate=outer_min+i as f32*128.;
 
         let strong=i%32==0;
         let rgb=if strong {major}else{minor};
-        let width=if strong {6.5}else{3.6};
+        let width=if strong {8.4}else{5.4};
 
-        r49_ribbon(
+        v202_segmented_line(
             &mut model,
             [coordinate,y,outer_min],
             [coordinate,y,outer_max],
             width,rgb
         );
 
-        r49_ribbon(
+        v202_segmented_line(
             &mut model,
             [outer_min,y,coordinate],
             [outer_max,y,coordinate],
@@ -1289,7 +1406,7 @@ pub(super) fn render_fixed_grid(
     ];
 
     for i in 0..4 {
-        r49_ribbon(
+        v202_segmented_line(
             &mut model,
             retail[i],
             retail[(i+1)%4],
@@ -1306,7 +1423,7 @@ pub(super) fn render_fixed_grid(
         ];
 
         for i in 0..4 {
-            r49_ribbon(
+            v202_segmented_line(
                 &mut model,
                 outer[i],
                 outer[(i+1)%4],
@@ -1371,6 +1488,73 @@ pub(super) fn inline_grid_report(
 #[cfg(test)]
 mod lck_r49_world_fixed_grid_tests {
     use super::*;
+    #[test]
+    fn v202_long_line_is_split_into_fixed_segments(){
+        let mut model=empty();
+
+        v202_segmented_line(
+            &mut model,
+            [0.0,10.0,0.0],
+            [0.0,10.0,2048.0],
+            5.4,
+            [90,170,200],
+        );
+
+        // Four 512-unit ribbons, two triangles each.
+        assert_eq!(model.positions.len(),16);
+        assert_eq!(model.indices.len(),24);
+        assert!(model.positions.iter().all(|p|
+            (p[1]-10.0).abs()<0.001
+        ));
+        assert!(model.object_ids.iter().all(|&id|
+            id==R49_GRID_ID
+        ));
+    }
+
+    #[test]
+    fn v202_grid_mesh_is_deterministic(){
+        let original=empty();
+
+        for side in [128usize,160,192,224,256] {
+            let a=render_fixed_grid(
+                &original,128.0,8,side
+            );
+
+            let b=render_fixed_grid(
+                &original,128.0,8,side
+            );
+
+            assert_eq!(a.positions,b.positions);
+            assert_eq!(a.indices,b.indices);
+            assert_eq!(a.fill,b.fill);
+
+            assert_eq!(a.center,original.center);
+            assert_eq!(a.radius,original.radius);
+        }
+    }
+
+    #[test]
+    fn v202_line_thickness_is_preserved(){
+        let original=empty();
+
+        let grid=render_fixed_grid(
+            &original,0.0,32,128
+        );
+
+        // The first line after the shaded panels
+        // is a strong division with 8.4-unit width.
+        let fill_count=(128usize/2).pow(2)*4;
+        let a=grid.positions[fill_count];
+        let b=grid.positions[fill_count+1];
+
+        let width=(
+            (a[0]-b[0]).powi(2)
+            +(a[2]-b[2]).powi(2)
+        ).sqrt();
+
+        assert!((width-8.4).abs()<0.02);
+    }
+
 
     fn empty()->Model {
         Model {

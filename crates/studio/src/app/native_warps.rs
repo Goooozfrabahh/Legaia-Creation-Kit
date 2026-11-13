@@ -33,6 +33,8 @@ pub(super) struct SceneWarps {
 #[derive(Default)]
 pub(super) struct Editor {
     pub open:bool,
+    pub marker_overlay_visible:bool,
+    pub marker_right_captured:bool,
     scene:String,
     original_hash:String,
     draft:Vec<Warp>,
@@ -373,6 +375,41 @@ pub(super) fn publish_warp_only(
 // regular editor already uses. Draft edits are not committed
 // until the user clicks Apply to Project.
 
+// LCK_V2082F_AUTOMATIC_WARP_COMMIT
+//
+// The warp dialog owns a working draft.
+// Explicit Save Project or Export IMG validates and
+// stages this draft without an extra Apply click.
+
+pub(super) fn pending_snapshot(
+    editor:&Editor,
+    index:&ProtIndex,
+    scene:&str
+)->Result<Option<SceneWarps>> {
+    if !editor.dirty || editor.scene!=scene {
+        return Ok(None);
+    }
+
+    let source=source_map(index,scene)?;
+
+    ensure!(
+        native_hash(&source)?==editor.original_hash,
+        "Pending warp draft belongs to a different native MAP revision"
+    );
+
+    validate_records(&editor.draft)?;
+
+    Ok(Some(SceneWarps {
+        scene:scene.to_owned(),
+        original_hash:editor.original_hash.clone(),
+        records:editor.draft.clone(),
+    }))
+}
+
+pub(super) fn mark_committed(editor:&mut Editor){
+    editor.dirty=false;
+    editor.error=None;
+}
 pub(super) fn window(
     ctx:&egui::Context,
     editor:&mut Editor,
@@ -380,8 +417,6 @@ pub(super) fn window(
     scene:&str,
     saved:Option<&SceneWarps>
 )->Option<SceneWarps>{
-    if !editor.open {return None;}
-
     if editor.scene!=scene {
         editor.scene=scene.to_owned();
         editor.selected=0;
@@ -405,6 +440,8 @@ pub(super) fn window(
             }
         }
     }
+
+    if !editor.open {return None;}
 
     let mut output=None;
     let mut open=editor.open;
@@ -552,14 +589,13 @@ pub(super) fn window(
             }
 
             if editor.dirty {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "Unapplied edits - click Apply to Project before saving or exporting."
+                ui.weak(
+                    "Pending warp edits will be included automatically when you Save Project or Export IMG."
                 );
             }
 
             ui.small(
-                "Then Save Project (Ctrl+S). Export Native PS1 IMG writes verified native MAP changes."
+                "Save Project (Ctrl+S) stores the edits. Export Native PS1 IMG compiles verified MAP changes."
             );
         });
 
@@ -707,12 +743,62 @@ pub(super) fn interact(
     hf:Option<&legaia_scene_formats::field_objects::WalkHeightfield>,
     editor:&mut Editor,
 )->bool{
-    if !editor.open || editor.error.is_some(){return false;}
+    if !editor.marker_overlay_visible || editor.error.is_some(){
+        editor.dragging=None;
+        editor.marker_right_captured=false;
+        return false;
+    }
 
     let pointer=ui.input(|i|i.pointer.interact_pos());
     let pressed=ui.input(|i|i.pointer.primary_pressed());
     let down=ui.input(|i|i.pointer.primary_down());
     let released=ui.input(|i|i.pointer.primary_released());
+    // V2.0.8.3: original source and arrival circles.
+    // Right-click selects the corresponding native warp,
+    // opening the existing Native MAP Warp Properties.
+    editor.marker_right_captured=false;
+
+    if ui.input(|i|i.pointer.secondary_pressed()) {
+        let topmost=pointer
+            .and_then(|p|ui.ctx().layer_id_at(p))
+            .is_none_or(|layer|layer==ui.layer_id());
+
+        if topmost {
+            if let Some(pos)=pointer.filter(|p|
+                rect.contains(*p)
+            ){
+                let mut best_distance=400.0f32;
+                let mut selected=None;
+
+                for (i,row) in editor.draft.iter().enumerate(){
+                    for arrival in [false,true] {
+                        let world=marker_world(row,arrival,hf);
+
+                        if let Some(marker)=projected(
+                            world,rect,model,cam,mirror
+                        ){
+                            let distance=(pos-marker).length_sq();
+
+                            if distance<best_distance {
+                                best_distance=distance;
+                                selected=Some(i);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(index)=selected {
+                    editor.selected=index;
+                    editor.open=true;
+                    editor.dragging=None;
+                    editor.marker_right_captured=true;
+
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+    }
+
 
     if pressed {
         editor.dragging=None;
@@ -788,7 +874,7 @@ pub(super) fn interact(
     }
 
     if released {editor.dragging=None;}
-    editor.dragging.is_some()
+    editor.dragging.is_some() || editor.marker_right_captured
 }
 
 pub(super) fn paint(
@@ -800,7 +886,9 @@ pub(super) fn paint(
     hf:Option<&legaia_scene_formats::field_objects::WalkHeightfield>,
     editor:&Editor
 ){
-    if !editor.open || editor.error.is_some(){return;}
+    if !editor.marker_overlay_visible || editor.error.is_some(){
+        return;
+    }
 
     let painter=ui.painter();
     for (i,row) in editor.draft.iter().enumerate(){
@@ -841,7 +929,7 @@ pub(super) fn paint(
                             format!("Warp {i} source")
                         },
                         egui::FontId::proportional(12.0),
-                        color
+                        ui.visuals().text_color()
                     );
                 }
             }
@@ -849,6 +937,41 @@ pub(super) fn paint(
     }
 }
 
+#[cfg(test)]
+mod lck_v2083_warp_view_tests {
+    use super::*;
+
+    #[test]
+    fn marker_overlay_does_not_require_window(){
+        let editor=Editor{
+            open:false,
+            marker_overlay_visible:true,
+            ..Default::default()
+        };
+
+        assert!(!editor.open);
+        assert!(editor.marker_overlay_visible);
+    }
+
+    #[test]
+    fn original_source_and_arrival_coordinates(){
+        let row=Warp{
+            source:[10,20],
+            arrival:[33,41],
+        };
+
+        let source=marker_world(&row,false,None);
+        let arrival=marker_world(&row,true,None);
+
+        assert_eq!(source[0],1344.0);
+        assert_eq!(source[2],2624.0);
+
+        assert_eq!(arrival[0],2176.0);
+        assert_eq!(arrival[2],2688.0);
+
+        assert_ne!(source,arrival);
+    }
+}
 #[cfg(test)]
 mod lck_r57_native_warp_tests {
     use super::*;

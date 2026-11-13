@@ -71,6 +71,9 @@ struct Document {version:u32,scene:String,walls:Vec<(i32,i32,bool)>,heights:Vec<
 // Native MAP wall boxes are editor geometry. Their vertices live
 // in world coordinates, and the raster camera projects them once.
 const LCK_R604_COLLISION_ID:u32=u32::MAX-3;
+const V201_COLLISION_FILL_ID:u32=u32::MAX-4;
+const V201_SELECTED_EDGE_ID:u32=u32::MAX-7;
+const V201_SELECTED_FILL_ID:u32=u32::MAX-8;
 
 fn lck_r604_edge(
     model:&mut Model,
@@ -99,7 +102,13 @@ fn lck_r604_edge(
         for &i in &tri {
             model.positions.push(p[i]);
             model.rest.push(p[i]);
-            model.object_ids.push(LCK_R604_COLLISION_ID);
+                        model.object_ids.push(
+                if color == [255,225,60] {
+                    V201_SELECTED_EDGE_ID
+                } else {
+                    LCK_R604_COLLISION_ID
+                }
+            );
             model.uvs.push([0,0]);
             model.cba_tsb.push([0,0]);
             model.modulation.push([128,128,128]);
@@ -111,6 +120,40 @@ fn lck_r604_edge(
     }
 }
 
+fn v201_collision_face(
+    model: &mut Model,
+    corners: [[f32; 3]; 4],
+    color: [u8; 3],
+    selected: bool,
+) {
+    let Ok(base) = u32::try_from(model.positions.len()) else {
+        return;
+    };
+
+    let id = if selected {
+        V201_SELECTED_FILL_ID
+    } else {
+        V201_COLLISION_FILL_ID
+    };
+
+    model.positions.extend(corners);
+    model.rest.extend(corners);
+    model.object_ids.extend([id; 4]);
+    model.uvs.extend([[0, 0]; 4]);
+    model.cba_tsb.extend([[0, 0]; 4]);
+    model.modulation.extend([[128, 128, 128]; 4]);
+    model.fill.extend([color; 4]);
+    model.textured.extend([0u8; 4]);
+
+    model.indices.extend([
+        base, base + 1, base + 2,
+        base, base + 2, base + 3,
+    ]);
+}
+
+// Collision faces and edges are both rendered in world space.
+// Source MAP collision bits, box coordinates, and selection
+// logic are not modified.
 fn lck_r604_box(
     model:&mut Model,
     grid:&CollisionGrid,
@@ -129,6 +172,35 @@ fn lck_r604_box(
         [x+64.0,y+108.0,z+64.0],[x,y+108.0,z+64.0],
     ];
 
+    // V2.0.1: softly shaded cube faces.
+    // Faces are generated before edges so outlines
+    // remain clearly distinguishable in the rasterizer.
+    let selected=color==[255,225,60];
+
+    for (indices,shade) in [
+        ([4usize,5,6,7],1.10f32),
+        ([0,1,5,4],0.80),
+        ([1,2,6,5],0.94),
+        ([2,3,7,6],0.70),
+        ([3,0,4,7],0.87),
+    ] {
+        let tinted=color.map(|channel| {
+            ((channel as f32)*shade).clamp(0.0,255.0) as u8
+        });
+
+        v201_collision_face(
+            model,
+            [
+                p[indices[0]],
+                p[indices[1]],
+                p[indices[2]],
+                p[indices[3]],
+            ],
+            tinted,
+            selected,
+        );
+    }
+
     for (a,b) in [
         (0usize,1usize),(1,2),(2,3),(3,0),
         (4,5),(5,6),(6,7),(7,4),
@@ -139,6 +211,25 @@ fn lck_r604_box(
 }
 
 impl State {
+    // V2.0.3: all native occupied cells are eligible.
+    // Display is not capped by depth or a fixed box count.
+    pub(super) fn paint_all_distances(
+        &self,
+        ui:&Ui,
+        view:&Viewport,
+        model:&Model,
+        grid:&CollisionGrid,
+    ){
+        super::stable_overlays::paint_collision(
+            ui,
+            view,
+            model,
+            grid,
+            &self.walls,
+            &self.heights,
+            &self.selected,
+        );
+    }
     pub(super) fn world_box_model(
         &self,
         original:&Model,
@@ -146,6 +237,7 @@ impl State {
         cam:crate::raster::Camera,
     )->Model{
         let mut result=original.clone();
+        let v201_style=super::overlay_style::snapshot();
 
         let (sy,cy)=cam.yaw.sin_cos();
         let (sp,cp)=cam.pitch.sin_cos();
@@ -219,9 +311,9 @@ impl State {
             }
 
             let color=if grid.native_wall(cell.0,cell.1) {
-                [255,138,64]
+                v201_style.collision_color
             }else{
-                [56,235,236]
+                v201_style.added_collision_color()
             };
 
             lck_r604_box(

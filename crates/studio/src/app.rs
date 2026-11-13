@@ -19,10 +19,70 @@ mod multi_selection_workspace_tests;
 mod media_ui;
 mod viewport;
 mod native_warps; // LCK_R57_NATIVE_WARPS
+mod native_gameplay_camera; // LCK_R616D
 mod lck_cell_camera; // LCK_R52_CELL_CAMERA
 mod native_map_bounds;
+mod stable_overlays;
+pub(crate) mod overlay_style; // LCK_V201_OVERLAY_STYLE
 mod native_extended_manifest; // LCK_R50A_EXPORT_MANIFEST // LCK_R47_NATIVE_MAP_BOUNDS
 mod world_view;
+// LCK V2.0.8 - stable source revision for a story preview.
+// Changes when the cell, selected stage, or serialized
+// shared editor scene changes.
+
+fn lck_v208_story_revision(
+    scene:&str,
+    stage:usize,
+    shared_scene:&str,
+)->String {
+    format!(
+        "LCK_STORY_EDIT_V208\n{scene}\n{stage}\n{shared_scene}"
+    )
+}
+
+#[cfg(test)]
+mod v208_story_revision_tests {
+    use super::*;
+
+    #[test]
+    fn changing_story_stage_invalidates_preview(){
+        let a=lck_v208_story_revision(
+            "town01",1,"LCK_SCENE_V1"
+        );
+
+        let b=lck_v208_story_revision(
+            "town01",2,"LCK_SCENE_V1"
+        );
+
+        assert_ne!(a,b);
+    }
+
+    #[test]
+    fn changing_shared_scene_invalidates_preview(){
+        let a=lck_v208_story_revision(
+            "town01",1,"MOVE 0"
+        );
+
+        let b=lck_v208_story_revision(
+            "town01",1,"MOVE 128"
+        );
+
+        assert_ne!(a,b);
+    }
+
+    #[test]
+    fn another_cell_cannot_reuse_story_preview(){
+        let a=lck_v208_story_revision(
+            "town01",1,"same"
+        );
+
+        let b=lck_v208_story_revision(
+            "town0b",1,"same"
+        );
+
+        assert_ne!(a,b);
+    }
+}
 mod story_preview;
 mod scene_instances;
 mod collision_recipes;
@@ -935,7 +995,12 @@ pub struct App {
     story_flag_scene: String,
     story_flag_stages: Vec<story_preview::Stage>,
     story_preview: Option<story_preview::Preview>,
+    story_preview_source_revision: Option<String>,
     story_flag_camera_restore: Option<crate::raster::Camera>,
+    // LCK_V206_STORY_ANIMATION
+    story_animation_playing: bool,
+    story_animation_frame: usize,
+    story_animation_next_tick: f64,
     native_view: Viewport,
     native_ground_visible: bool,
     native_map_grid_visible: bool,
@@ -1042,6 +1107,7 @@ pub struct App {
     ps1_export_output: Option<PathBuf>,
     // LCK_R57_NATIVE_WARPS
     native_warp_editor: native_warps::Editor,
+    native_camera_editor: native_gameplay_camera::Editor,
     ps1_export_imports:Option<ps1_export::ImportCoverage>,
     unrestricted_img_export: bool,
     /// Source being dragged across the panels (no mouse-driven text selection).
@@ -1195,7 +1261,11 @@ impl App {
             story_flag_scene: String::new(),
             story_flag_stages: Vec::new(),
             story_preview: None,
+            story_preview_source_revision: None,
             story_flag_camera_restore: None,
+            story_animation_playing: false,
+            story_animation_frame: 0,
+            story_animation_next_tick: 0.0,
             native_view: Viewport::new(Shading::Textured),
             native_ground_visible: true,
             native_map_grid_visible: false,
@@ -1283,6 +1353,7 @@ impl App {
             ps1_export_job: None,
             ps1_export_output: None,
             native_warp_editor: native_warps::Editor::default(),
+            native_camera_editor: native_gameplay_camera::Editor::default(),
             ps1_export_imports:None,
             unrestricted_img_export: true,
             editor_asset_drag: None,
@@ -1767,6 +1838,9 @@ impl App {
         self.story_flag_stages.clear();
         self.story_preview=None;
         self.story_flag_camera_restore=None;
+        self.story_animation_playing=false;
+        self.story_animation_frame=0;
+        self.story_animation_next_tick=0.0;
         self.ground_selected.clear();
         self.ground_active=None;
         self.ground_hierarchy_reveal=None;
@@ -2075,6 +2149,49 @@ impl App {
     /// Persist a copied cell's overlay without writing to the PS1 disc.
     /// Invoked when changing cells, closing the application and periodically
     /// while editing a project copy (avoids losing unsaved scene changes).
+    // LCK_V2082F_AUTOMATIC_WARP_COMMIT
+    // Save and export share this native warp draft validation.
+    fn lck_v2082f_commit_pending_warps(
+        &mut self
+    )->anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let Some((_,NativeSceneSlot::Ready(scene,_)))=
+            self.native_scene.as_ref()
+        else{
+            return Ok(());
+        };
+
+        let Some(lib)=self.studio.library.as_ref()
+        else{
+            return Ok(());
+        };
+
+        let snapshot=native_warps::pending_snapshot(
+            &self.native_warp_editor,
+            lib.index.as_ref(),
+            &scene.name
+        )?;
+
+        let Some(snapshot)=snapshot else {
+            return Ok(());
+        };
+
+        let session=self.form_session.as_mut()
+            .context("Open an LCK project before saving warp edits")?;
+
+        session.project.native_warps.retain(
+            |entry|entry.scene!=snapshot.scene
+        );
+
+        session.project.native_warps.push(snapshot);
+
+        native_warps::mark_committed(
+            &mut self.native_warp_editor
+        );
+
+        Ok(())
+    }
     fn save_active_editor_cell(&mut self) {
         if let (
             Some(cell),
@@ -3282,7 +3399,61 @@ impl App {
             _ => None,
         });
         // LCK_R57_NATIVE_WARPS
-        if self.native_warp_editor.open {
+        // LCK_R616D_GAMEPLAY_CAMERA_WINDOW
+        if self.native_camera_editor.open {
+            if let (Some(scene),Some(lib))=(
+                ready.as_deref(),
+                self.studio.library.as_ref()
+            ) {
+                let saved=self.form_session.as_ref()
+                    .and_then(|s|
+                        s.project.native_cameras.iter()
+                            .find(|c|c.scene==scene.name)
+                    ).cloned();
+
+                match native_gameplay_camera::window(
+                    ctx,
+                    &mut self.native_camera_editor,
+                    lib.source.path(),
+                    lib.index.as_ref(),
+                    &scene.name,
+                    saved.as_ref(),
+                    self.form_session.is_some()
+                ) {
+                    Ok(Some(record))=>{
+                        if let Some(session)=self.form_session.as_mut(){
+                            session.project.native_cameras.retain(
+                                |c|c.scene!=scene.name
+                            );
+
+                            session.project.native_cameras.push(record);
+
+                            self.studio.status=Some(format!(
+                                "Gameplay cameras updated for {}. Save Project before IMG export.",
+                                scene.name
+                            ));
+                        }
+                    },
+                    Ok(None)=>{},
+                    Err(error)=>{
+                        self.studio.error=Some(format!(
+                            "Native camera editor: {error:#}"
+                        ));
+
+                        self.native_camera_editor.open=false;
+                    }
+                }
+            }
+        }
+        // LCK_V2083_WARP_INITIALIZATION
+        // View > Triggers > Local Warps controls the
+        // ORIGINAL round marker and line renderer.
+        self.native_warp_editor.marker_overlay_visible=
+            self.doors.v2083_local_warps_visible();
+
+        if self.native_warp_editor.open
+            || self.native_warp_editor.marker_overlay_visible
+        {
             if let (Some(scene),Some(lib))=(
                 ready.as_deref(),
                 self.studio.library.as_ref()
@@ -3592,6 +3763,38 @@ impl App {
                                         self.doors.named_hierarchy(
                                             ui,&hierarchy_filter
                                         );
+                                        // LCK_R616D_GAMEPLAY_CAMERA_HIERARCHY
+                                        egui::CollapsingHeader::new(
+                                            "Gameplay Cameras"
+                                        )
+                                        .default_open(false)
+                                        .show(ui,|ui|{
+                                            if ui.button(
+                                                "Open Gameplay Camera Editor"
+                                            ).clicked(){
+                                                self.native_camera_editor.open=true;
+                                                self.native_camera_editor.show_markers=true;
+                                            }
+
+                                            let saved=self.form_session.as_ref()
+                                                .and_then(|s|
+                                                    s.project.native_cameras.iter()
+                                                        .find(|c|c.scene==scene.name)
+                                                );
+
+                                            if let Some(data)=saved {
+                                                for (i,row) in data.rows.iter().enumerate(){
+                                                    ui.label(format!(
+                                                        "Camera #{i}: {}",
+                                                        row.name
+                                                    ));
+                                                }
+                                            }else{
+                                                ui.small(
+                                                    "Open editor to load original MAN camera zones."
+                                                );
+                                            }
+                                        });
 
                                         let saved=self.form_session.as_ref()
                                             .and_then(|session|
@@ -4279,18 +4482,28 @@ impl App {
                         ui.ctx().request_repaint();
                     }
 
-                    ui.checkbox(&mut self.doors.show_markers,"Triggers / Scenes / Warps")
-                        .on_hover_text("View and inspect native MAP/MAN markers. Right-click a marker for Properties. No story flags are changed.");
+                    // Trigger visibility is controlled by View > Triggers.
 
                     });
                     ui.separator();
                     ui.horizontal_wrapped(|ui| {
 
                     // R43A_STORY_BUTTONS: source-native flag state preview.
-                    if self.story_flag_scene!=scene.name {
-                        self.story_flag_scene=scene.name.clone();
+                    // LCK_V2084_CELL_VARIANT_KEY
+                    // Project cell copies keep independent story
+                    // navigation even when their native CDNAME matches.
+                    let story_variant_key=self.editor_cell_active
+                        .as_ref()
+                        .map(|cell|cell.form_identity(&scene.name))
+                        .unwrap_or_else(||format!("original:{}",scene.name));
+
+                    if self.story_flag_scene!=story_variant_key {
+                        self.story_flag_scene=story_variant_key;
                         self.story_flag_index=0;
                         self.story_preview=None;
+                        self.story_animation_playing=false;
+                        self.story_animation_frame=0;
+                        self.story_animation_next_tick=0.0;
                         self.story_flag_stages=self.studio.library.as_ref()
                             .map(|lib|story_preview::stages_for(&scene.name,lib.index.as_ref()))
                             .unwrap_or_else(||vec![story_preview::Stage::start()]);
@@ -4304,7 +4517,7 @@ impl App {
                         self.story_flag_stages[self.story_flag_index].label.clone();
 
                     let story_door_description=
-                        if matches!(scene.name.as_str(),"town01"|"town0b"|"town0c") {
+                        if scene.name=="town01" {
                             story_preview::vahn_door_status(
                                 &self.story_flag_stages[self.story_flag_index].flags
                             )
@@ -4324,7 +4537,7 @@ impl App {
                         );
 
                     let story_tooltip=format!(
-                        "{}\n{}\n{}\nRead-only scene-entry preview.",
+                        "{}\n{}\n{}\nEditable shared scene. Shared changes export through the native cell serializers; story-specific MAN branches require their own serializer.",
                         story_stage_description,
                         story_door_description,
                         story_npc_description
@@ -4334,17 +4547,20 @@ impl App {
                     ui.horizontal_wrapped(|ui| {
                         ui.label("Story preview");
 
-                        let flag_name=if self.story_flag_index==0 {
-                            "Start"
-                        }else{
-                            self.story_flag_stages[self.story_flag_index]
-                                .label.split_whitespace().next().unwrap_or("Flag")
-                        };
+                        // V2.0.6: show the actual full event
+                        // description whenever the flag changes.
+                        let flag_name=&self.story_flag_stages[
+                            self.story_flag_index
+                        ].label;
 
                         ui.add_sized(
-                            [98.0,22.0],
-                            egui::Label::new(flag_name)
-                        ).on_hover_text(story_tooltip.as_str());
+                            [340.0,22.0],
+                            egui::Label::new(
+                                flag_name.as_str()
+                            ).truncate()
+                        ).on_hover_text(
+                            story_tooltip.as_str()
+                        );
 
                         if ui.add_enabled(
                             requested>0,
@@ -4365,10 +4581,13 @@ impl App {
                             requested+=1;
                         }
 
-                        ui.small("(read-only)")
+                        ui.small("(shared edits)")
                             .on_hover_text(story_tooltip.as_str());
                     });
                     if requested!=self.story_flag_index {
+                        self.story_animation_playing=false;
+                        self.story_animation_frame=0;
+                        self.story_animation_next_tick=0.0;
                         self.story_flag_camera_restore=Some(self.native_view.cam);
                         if requested==0 {
                             self.story_preview=None;
@@ -4387,18 +4606,141 @@ impl App {
                         self.native_view.version=self.native_view.version.wrapping_add(1);
                         ui.ctx().request_repaint();
                     }
-                    if self.story_flag_index>0 {
-                        // Prevent base-scene object editing while a derived
-                        // story state is on screen. Project/export data is not changed.
-                        self.native_selected=None;
-                        self.native_selection.clear();
-                        self.native_drag=None;
-                        self.native_rotate=None;
-                        self.ground_edit_mode=false;
-                        self.native_collision_wire_visible=false;
-                        self.native_view.world_selected.clear();
-                        // Read-only status lives in the flag tooltip.
+                    // LCK V2.0.6: animation transport controls.
+                    // This loops verified native ANM actor clips.
+                    // It does not execute MAN choreography.
+                    let available=self.story_preview
+                        .as_ref()
+                        .filter(|p|p.scene==scene.name)
+                        .map(|p|p.animation_actor_count())
+                        .unwrap_or(0);
+
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Story animation");
+
+                        if ui.add_enabled(
+                            self.story_flag_index>0
+                                && available>0
+                                && !self.story_animation_playing,
+                            egui::Button::new("Play")
+                        ).on_hover_text(
+                            "Play available scene-native actor ANM frames. Does not execute full scripted cutscenes."
+                        ).clicked(){
+                            self.story_animation_playing=true;
+                            self.story_animation_next_tick=
+                                ui.ctx().input(|i|i.time)+1.0/15.0;
+                        }
+
+                        if ui.add_enabled(
+                            self.story_animation_playing,
+                            egui::Button::new("Pause")
+                        ).clicked(){
+                            self.story_animation_playing=false;
+                        }
+
+                        if ui.add_enabled(
+                            self.story_flag_index>0
+                                && self.story_preview.is_some(),
+                            egui::Button::new("Reset")
+                        ).clicked(){
+                            self.story_animation_playing=false;
+                            self.story_animation_frame=0;
+
+                            if let Some(preview)=self.story_preview.as_mut(){
+                                let _=story_preview::pose_frame(
+                                    preview,0
+                                );
+                            }
+
+                            self.native_view.version=
+                                self.native_view.version.wrapping_add(1);
+
+                            ui.ctx().request_repaint();
+                        }
+
+                        ui.small(format!(
+                            "Frame {} | {} preview actor(s)",
+                            self.story_animation_frame,
+                            available
+                        )).on_hover_text(
+                            "Animation preview is limited to decoded native actor clips. Scripted movements, camera paths, dialogue and effects are not yet simulated."
+                        );
+                    });
+
+                    if self.story_animation_playing {
+                        let now=ui.ctx().input(|i|i.time);
+
+                        if now>=self.story_animation_next_tick {
+                            let steps=(
+                                ((now-self.story_animation_next_tick)
+                                    .max(0.0)*15.0).floor()
+                                as usize+1
+                            ).min(8);
+
+                            self.story_animation_frame=
+                                self.story_animation_frame
+                                    .wrapping_add(steps);
+
+                            let changed=self.story_preview
+                                .as_mut()
+                                .map(|preview|
+                                    story_preview::pose_frame(
+                                        preview,
+                                        self.story_animation_frame
+                                    )
+                                )
+                                .unwrap_or(0);
+
+                            if changed==0 {
+                                self.story_animation_playing=false;
+                                self.studio.status=Some(
+                                    "No compatible native ANM frames available for this story stage."
+                                    .into()
+                                );
+                            }else{
+                                self.native_view.version=
+                                    self.native_view.version
+                                        .wrapping_add(1);
+                            }
+
+                            self.story_animation_next_tick=
+                                now+1.0/15.0;
+                        }
+
+                        if self.story_animation_playing {
+                            ui.ctx().request_repaint_after(
+                                std::time::Duration::from_millis(67)
+                            );
+                        }
                     }
+                    // LCK_V208_EDITABLE_STORY_STATES
+                    //
+                    // The selected story flag changes the visual
+                    // state, not whether the native cell is editable.
+                    //
+                    // Selection, dragging, group editing, floors,
+                    // collision, triggers, doors, and normal properties
+                    // retain their regular handlers.
+                    //
+                    // Shared editor edits remain owned by the active
+                    // WorldModel and its existing native serializers.
+                    // LCK_V2084_SYNC_STORY_TRIGGERS
+                    // The original view shows unfiltered native
+                    // records. Derived story states use the same
+                    // selected flags as NPC relocation.
+                    let story_marker_flags=
+                        if self.story_flag_index==0 {
+                            None
+                        }else{
+                            self.story_flag_stages
+                                .get(self.story_flag_index)
+                                .map(|stage|stage.flags.as_slice())
+                        };
+
+                    self.doors.v2084_set_story_flags(
+                        story_marker_flags
+                    );
+
                     // Variable-length per-state status stays in the tooltip
                     // so the central viewport has a constant layout footprint.
                     });
@@ -4512,7 +4854,16 @@ impl App {
                     // both controls, without nesting a clipping row.
                     let mut lck_export_pressed =
                         std::mem::take(&mut self.lck_menu_export)
-                        && self.ps1_export_job.is_none();                    // Freeze an audit snapshot at the exact export click.
+                        && self.ps1_export_job.is_none();
+
+                    if lck_export_pressed {
+                        if let Err(error)=self.lck_v2082f_commit_pending_warps(){
+                            self.studio.error=Some(format!(
+                                "Cannot export pending native warp edits: {error:#}"
+                            ));
+                            lck_export_pressed=false;
+                        }
+                    }                    // Freeze an audit snapshot at the exact export click.
                     // This does not yet replace U1A's native compiler.
                     if lck_export_pressed {
                         if let Err(error)=export_manifest::write_report(
@@ -4825,12 +5176,106 @@ impl App {
                 ui.strong("Render Window");
 
                 if let Some(base_model) = &world.model {
+                    // V2.0.8: keep the visible story stage
+                    // synchronized with the editable source.
+                    //
+                    // The source WorldModel remains the only
+                    // owner of project/native export edits.
+                    //
+                    // This preview is automatically rebuilt when
+                    // source object transforms or properties change.
+
+                    if self.story_flag_index>0
+                        && self.story_flag_scene==scene.name
+                    {
+                        let serialized=scene_instances::serialize(
+                            &scene.name,
+                            world
+                        );
+
+                        let revision=lck_v208_story_revision(
+                            &scene.name,
+                            self.story_flag_index,
+                            &serialized
+                        );
+
+                        if self.story_preview_source_revision
+                            .as_deref()!=Some(revision.as_str())
+                        {
+                            if let (
+                                Some(lib),
+                                Some(stage)
+                            )=(
+                                self.studio.library.as_ref(),
+                                self.story_flag_stages.get(
+                                    self.story_flag_index
+                                )
+                            ){
+                                match story_preview::build_model(
+                                    world,
+                                    scene,
+                                    lib.index.as_ref(),
+                                    &stage.flags
+                                ){
+                                    Ok(preview)=>{
+                                        self.story_preview=Some(preview);
+
+                                        // Editing an animated actor must
+                                        // not leave a stale animation pose
+                                        // over the newly edited geometry.
+                                        self.story_animation_playing=false;
+                                        self.story_animation_frame=0;
+                                        self.story_animation_next_tick=0.0;
+                                    },
+
+                                    Err(error)=>{
+                                        self.story_preview=None;
+                                        self.studio.error=Some(
+                                            format!(
+                                                "Story preview rebuild: {error}"
+                                            )
+                                        );
+                                    }
+                                }
+
+                                self.story_preview_source_revision=
+                                    Some(revision);
+
+                                self.native_view.version=
+                                    self.native_view.version
+                                        .wrapping_add(1);
+
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                    }
+
+                    // Use the story-variant visual scene as
+                    // the base for live ground/grid composition.
+                    //
+                    // The actual mutable authoring data remains
+                    // in WorldModel, not inside this snapshot.
+
+                    let lck_story_model=self.story_preview
+                        .as_ref()
+                        .filter(|preview|
+                            preview.scene==scene.name
+                                && self.story_flag_index>0
+                        )
+                        .map(|preview|
+                            std::sync::Arc::clone(&preview.model)
+                        );
+
+                    let story_base_model=lck_story_model
+                        .as_deref()
+                        .unwrap_or(base_model);
+
                     let ground_composite=scene.ground.as_ref().and_then(|hf| {
                         (self.ground_edit_mode || self.ground_edits.has_edits()).then(||
-                            ground_edit_ops::compose(base_model,hf,&self.ground_edits,self.ground_edit_mode)
+                            ground_edit_ops::compose(story_base_model,hf,&self.ground_edits,self.ground_edit_mode)
                         )
                     });
-                    let model=ground_composite.as_ref().unwrap_or(base_model);
+                    let model=ground_composite.as_ref().unwrap_or(story_base_model);
 
                     // R6.0.7: world-space height colors are derived from
                     // the live render model on EVERY repaint, including
@@ -4845,7 +5290,7 @@ impl App {
                             scene.ground.as_ref().and_then(|hf|
                                 ground_edit_ops::r609_height_overlay(
                                     model,
-                                    base_model.positions.len(),
+                                    story_base_model.positions.len(),
                                     hf,
                                     &self.ground_edits,
                                     world.as_ref(),
@@ -4872,22 +5317,15 @@ impl App {
                         );
                     }
 
-                    let r49_render_grid=self.native_map_grid_visible.then(||{
-                        native_map_bounds::render_fixed_grid(
-                            model,
-                            self.native_map_grid_y,
-                            self.native_map_grid_step,
-                            self.native_map_extension_side
-                        )
-                    });
-
-                    let model=r49_render_grid.as_ref().unwrap_or(model);
-                    // R43A_PREVIEW_RENDER: an independent raster snapshot;
-                    // original WorldModel and native export remain untouched.
-                    let lck_story_model=self.story_preview.as_ref()
-                        .filter(|p|p.scene==scene.name && self.story_flag_index>0)
-                        .map(|p|std::sync::Arc::clone(&p.model));
-                    let model=lck_story_model.as_deref().unwrap_or(model);
+                    // LCK_V204_DEPTH_LOCKED_GRID
+                    // Do not inject grid mesh panels into the world.
+                    // The grid is composited using the native raster
+                    // camera and opaque scene depth after rendering.
+                    // V2.0.8: no late replacement of the
+                    // editable and ground-composed render model.
+                    //
+                    // Story appearance was applied before ground,
+                    // grid, door and collision composition.
 
                     // LCK_R58_WORLD_MARKERS
                     // Insert trigger geometry into the SAME scene
@@ -4918,30 +5356,31 @@ impl App {
                         ui.ctx().request_repaint();
                     }
 
-                    let marker_world_model=
-                        self.doors.show_markers.then(||
-                            self.doors.world_marker_model(
-                                model,
-                                scene.ground.as_ref()
-                            )
-                        );
+                    // V2.0.8.1: marker visuals are projected
+                    // above the raster. Do not duplicate them
+                    // in the depth-tested world geometry.
 
-                    let model=marker_world_model
-                        .as_ref().unwrap_or(model);
+                    // LCK_V203_CONTINUOUS_OVERLAYS
+                    // Native collision boxes are painted after
+                    // the world image, using identical projection.
+                    // Do not apply the old 1800-mesh visibility cap.
+                    // V2.0.4: one immutable grid style is
+                    // shared with the upcoming raster frame.
+                    self.native_view.world_grid=
+                        if self.native_map_grid_visible {
+                            let style=overlay_style::snapshot();
 
-                    // R6.0.4: collision boxes share the actual world raster.
-                    let collision_world_model=
-                        if self.native_collision_wire_visible {
-                            self.native_collision_grid.as_ref().map(|grid|
-                                self.collision_edit.world_box_model(
-                                    model,grid,self.native_view.cam
-                                )
-                            )
+                            Some(crate::raster::V204GridSettings{
+                                height:self.native_map_grid_y,
+                                step:self.native_map_grid_step,
+                                side:self.native_map_extension_side,
+                                color:style.grid_color,
+                                major_color:style.grid_major_color(),
+                                opacity:style.grid_opacity(),
+                            })
                         }else{
                             None
                         };
-                    let model=collision_world_model
-                        .as_ref().unwrap_or(model);
                     // F works from Scene Hierarchy, Render Window, or toolbar.
                     // Never steal the F key from text fields or modal editors.
                     let frame_key = !ctx.wants_keyboard_input()
@@ -5035,7 +5474,13 @@ impl App {
                         self.marquee_enabled || self.marquee_chord;
 
                     // LCK_R57_NATIVE_WARPS
-                    let warp_capture=native_warps::interact(
+                    // LCK_R616D_CAMERA_SELECTION
+                    let camera_capture=native_gameplay_camera::interact(
+                        ui,view_rect,model,
+                        &self.native_view,
+                        &mut self.native_camera_editor,
+                        &scene.name
+                    );                    let warp_capture=native_warps::interact(
                         ui,view_rect,model,self.native_view.cam,
                         self.native_view.world_mirrored,
                         scene.ground.as_ref(),
@@ -5058,8 +5503,41 @@ impl App {
                     }else{false};
                     let picked = self.native_view.show_world_limited_with_sources(ui, model, &scene.res.vram,
                         900, 680, selected_id, self.native_ground_visible,
-                        (self.editor_asset_drag.is_some() || self.form_drag.is_some() || collision_capture || warp_capture || lck_popup_hover), &world.foreign_vram);
+                        (self.editor_asset_drag.is_some() || self.form_drag.is_some() || collision_capture || warp_capture || camera_capture || lck_popup_hover), &world.foreign_vram);
 
+                    // V2.0.3 continuous grid and distance-independent
+                    // collision visualization. Both are editor-only.
+                    // Projection uses the exact rendered image rectangle.
+
+                    // V2.0.4: grid drawn inside the rasterizer.
+                    // No foreground 2D grid painter is needed.
+
+                    if self.native_collision_wire_visible {
+                        if let Some(grid)=self.native_collision_grid.as_ref(){
+                            self.collision_edit.paint_all_distances(
+                                ui,
+                                &self.native_view,
+                                model,
+                                grid,
+                            );
+                        }
+                    }
+                    // V2.0.8: identify an unbound conditional
+                    // preview actor rather than pretending that
+                    // editing it will write a MAN branch.
+                    if self.story_flag_index>0
+                        && ui.input(|i|i.pointer.primary_pressed())
+                    {
+                        if let Some(id)=picked {
+                            if let Some(draw)=world.by_id(id) {
+                                if draw.vertex_start==draw.vertex_end {
+                                    self.studio.status=Some(
+                                        "This story-only actor has no editable base mesh span. Flag-specific MAN actor authoring requires a native branch serializer.".into()
+                                    );
+                                }
+                            }
+                        }
+                    }
                     // Exact camera-pose invariant for Last Flag / Next Flag.
                     // No yaw, pitch, zoom, or target offset may carry over
                     // from an unintended input/viewport interaction.
@@ -5072,9 +5550,18 @@ impl App {
                         }
                     }
 
+                    // V2.0.8.1: draw markers after the 3D scene.
+                    // Works on Start and all story-preview stages.
+                    self.doors.lck_v2081_paint(
+                        ui,
+                        &self.native_view,
+                        model,
+                        scene.ground.as_ref()
+                    );
+
                     // Native teleports are technical markers, not geometry meshes.
                     // A marker click captures the event before empty-space deselection.
-                    let door_marker_pressed=if self.ground_edit_mode {false} else {
+                    let door_marker_pressed=if self.native_warp_editor.marker_right_captured || self.ground_edit_mode {false} else {
                         self.doors.viewport(ui,&self.native_view,model,scene.ground.as_ref())
                     };
                     if door_marker_pressed {
@@ -5228,6 +5715,13 @@ impl App {
                         self.native_view.world_mirrored,
                         scene.ground.as_ref(),
                         &self.native_warp_editor
+                    );
+                    // LCK_R616D_CAMERA_RENDER_INDICATORS
+                    native_gameplay_camera::paint(
+                        ui,view_rect,model,
+                        &self.native_view,
+                        &self.native_camera_editor,
+                        &scene.name
                     );
 
                     // Empty-click deselection shares the normal picking path.
@@ -6174,7 +6668,7 @@ self.native_view.version=
                             }
                         }
                     }
-                    if right_pressed && !(self.doors.show_markers && self.doors.marker_right_consumed) && !self.marquee_chord && !lck_popup_hover
+                    if right_pressed && !self.native_warp_editor.marker_right_captured && !(self.doors.show_markers && self.doors.marker_right_consumed) && !self.marquee_chord && !lck_popup_hover
                         && self.editor_modal.is_none() && self.editor_rename.is_none() {
                         if let Some(pos)=pointer.filter(|p|view_rect.contains(*p)) {
                             let hit=self.native_view.pick_visible(view_rect,pos);
@@ -7790,9 +8284,47 @@ self.native_view.version=
             }
         });
 
-        ui.menu_button("View", |ui| {
+        egui::containers::menu::MenuButton::new("View")
+            // LCK_V205_PERSISTENT_VIEW_MENU
+            .config(
+                egui::containers::menu::MenuConfig::new()
+                    .close_behavior(
+                        egui::containers::PopupCloseBehavior::CloseOnClickOutside
+                    )
+            )
+            .ui(ui, |ui| {
+            // LCK_R617E_VIEW_MENU
+            ui.menu_button("Gameplay Cameras", |ui| {
+                if ui.button("Camera Properties & Settings...")
+                    .on_hover_text("Open the native gameplay camera editor for this cell.")
+                    .clicked(){
+                    self.native_camera_editor.open=true;
+                    self.native_camera_editor.show_markers=true;
+                    ui.close();
+                }
+
+                if ui.checkbox(
+                    &mut self.native_camera_editor.show_markers,
+                    "Show camera indicators"
+                )
+                    .on_hover_text("Turn camera anchors and zones on/off in the Render Window.")
+                    .changed(){
+                    ui.ctx().request_repaint();
+                }
+
+                ui.separator();
+                ui.small("These are in-game cameras, not the free-look editor camera.");
+            });
+            ui.separator();
             // LCK_TERRAIN_HEIGHT_VIEW_MENU
-            ui.menu_button("Terrain Height", |ui| {
+            egui::containers::menu::SubMenuButton::new("Terrain Height")
+                .config(
+                    egui::containers::menu::MenuConfig::new()
+                        .close_behavior(
+                            egui::containers::PopupCloseBehavior::CloseOnClickOutside
+                        )
+                )
+                .ui(ui, |ui| {
                 ui.set_min_width(230.0);
 
                 let display_id=egui::Id::new(
@@ -7879,13 +8411,23 @@ self.native_view.version=
             });
 
             ui.separator();
-            // LCK_R57_NATIVE_WARPS
-            if ui.checkbox(
-                &mut self.native_warp_editor.open,
-                "Native MAP Warps (same-cell)"
-            ).clicked(){
-                ui.close();
-            }
+            // LCK_V2082F_VIEW_TRIGGER_MENU
+            ui.menu_button("Triggers",|ui|{
+                let (changed,open_warps)=
+                    self.doors.v2082_menu(ui);
+
+                if open_warps {
+                    self.native_warp_editor.open=true;
+                }
+
+                if changed {
+                    self.native_view.version=
+                        self.native_view.version
+                            .wrapping_add(1);
+
+                    ui.ctx().request_repaint();
+                }
+            });
             ui.separator();
             // LCK_R52_STARTUP_CAMERA_BUTTON_BEGIN
             if ui.add_enabled(
@@ -7931,7 +8473,14 @@ self.native_view.version=
 
             ui.separator();
             // LCK_R49_WORLD_FIXED_GRID
-            ui.menu_button("Native Grid",|ui|{
+            egui::containers::menu::SubMenuButton::new("Native Grid")
+                .config(
+                    egui::containers::menu::MenuConfig::new()
+                        .close_behavior(
+                            egui::containers::PopupCloseBehavior::CloseOnClickOutside
+                        )
+                )
+                .ui(ui, |ui| {
                 ui.set_min_width(300.0);
 
                 let mut changed=false;
@@ -7940,6 +8489,9 @@ self.native_view.version=
                     &mut self.native_map_grid_visible,
                     "Show Native MAP Grid"
                 ).changed();
+
+                // V2.0.1: color and transparency controls.
+                changed |= overlay_style::grid_controls(ui);
 
                 ui.separator();
 
@@ -8137,10 +8689,31 @@ self.native_view.version=
                 ui.ctx().request_repaint();
             }
 
-            ui.checkbox(
-                &mut self.native_collision_wire_visible,
-                "Collision wireframe"
-            );
+            // LCK V2.0.1: collision appearance menu.
+            egui::containers::menu::SubMenuButton::new("Collision Boxes")
+                .config(
+                    egui::containers::menu::MenuConfig::new()
+                        .close_behavior(
+                            egui::containers::PopupCloseBehavior::CloseOnClickOutside
+                        )
+                )
+                .ui(ui, |ui| {
+                ui.set_min_width(260.0);
+
+                let mut changed = ui.checkbox(
+                    &mut self.native_collision_wire_visible,
+                    "Show Collision Boxes"
+                ).changed();
+
+                changed |= overlay_style::collision_controls(ui);
+
+                if changed {
+                    self.native_view.version =
+                        self.native_view.version.wrapping_add(1);
+
+                    ui.ctx().request_repaint();
+                }
+            });
 
 
             ui.checkbox(

@@ -71,7 +71,7 @@ impl GeneratedCollision {
         let triangles=self.transformed(offset,rotation,scale)?;
         let bottom=triangles.iter().flatten().map(|p|p[1]).fold(f32::INFINITY,f32::min);
         let top=bottom+self.band_height*scale[1];
-        let mut cells=BTreeSet::new();let mut work=0usize;
+        let mut cells=BTreeSet::new();let mut work=0usize;let mut wall_faces=0usize;let mut clipped_faces=0usize;
         for tri in triangles {
             let Some((area,vertical))=face_measure(tri) else {continue;};
             if area<self.min_face_area || !vertical {continue;}
@@ -84,7 +84,19 @@ impl GeneratedCollision {
             let maxz=poly.iter().map(|p|p[1]).fold(f32::NEG_INFINITY,f32::max);
             let x0=(minx/64.0).floor() as i32;let x1=(maxx/64.0).floor() as i32;
             let z0=(minz/64.0).floor() as i32+2;let z1=(maxz/64.0).floor() as i32+2;
-            if x0<0 || z0<0 || x1>255 || z1>255 {return Err("Generated collision crosses native MAP boundaries".into());}
+            wall_faces+=1;
+            if x0<0 || z0<0 || x1>255 || z1>255 {
+                clipped_faces+=1;
+            }
+
+            let x0=x0.max(0);
+            let z0=z0.max(0);
+            let x1=x1.min(255);
+            let z1=z1.min(255);
+
+            if x0>x1 || z0>z1 {
+                continue;
+            }
             work+=(x1-x0+1) as usize*(z1-z0+1) as usize;
             if work>2_000_000 {return Err("Generated collision exceeds triangle/grid intersection budget".into());}
             for z in z0..=z1 {for x in x0..=x1 {
@@ -92,8 +104,21 @@ impl GeneratedCollision {
                 if polygon_hits_cell(&poly,min,max) {cells.insert([x,z]);}
             }}
         }
+                if clipped_faces>0 {
+            log::warn!(
+                "v2.0.8.5: {clipped_faces}/{wall_faces} wall faces crossed native MAP; only valid in-bounds collision retained"
+            );
+
+            if cells.is_empty() {
+                return Err(
+                    "Generated collision has no in-bounds wall subcells; nothing encoded".into()
+                );
+            }
+        }
+
         Ok(cells)
     }
+
     pub fn surface_counts(&self)->(usize,usize,usize) {
         let mut floor=0;let mut wall=0;let mut decorative=0;
         for tri in &self.triangles {match face_measure(*tri) {
@@ -261,5 +286,57 @@ mod tests {
         g.triangles[0][0][0]=f32::NAN;assert!(g.validate().is_err());
         let g=definition(vec![[[0.0,0.0,0.0],[0.0,64.0,0.0],[0.0,0.0,64.0]]]);
         assert!(g.wall_cells([-128.0,0.0,0.0],[0.0;3],[1.0;3]).is_err());
+    }
+}
+
+
+#[cfg(test)]
+mod v2085_collision_clip_tests {
+    use super::*;
+
+    #[test]
+    fn partially_outside_generated_wall_is_clipped_not_wrapped() {
+        let tri=vec![
+            [
+                [-32.0,0.0,64.0],
+                [-32.0,120.0,64.0],
+                [32.0,0.0,64.0]
+            ]
+        ];
+
+        let g=GeneratedCollision {
+            version:1,
+            mesh_sha256:digest(
+                &serde_json::to_vec(&tri).unwrap()
+            ),
+            triangles:tri,
+            pivot:[0.0;3],
+            band_height:128.0,
+            min_face_area:0.0,
+            native_inspection:"Synthetic edge test".into()
+        };
+
+        let cells=g.wall_cells(
+            [0.0;3],
+            [0.0;3],
+            [1.0;3]
+        ).unwrap();
+
+        assert!(cells.contains(&[0,3]));
+
+        assert!(
+            cells.iter().all(|[x,z]|
+                (0..256).contains(x) &&
+                (0..256).contains(z)
+            )
+        );
+
+        assert!(
+            g.wall_cells(
+                [-1024.0,0.0,0.0],
+                [0.0;3],
+                [1.0;3]
+            ).is_err()
+        );
     }
 }

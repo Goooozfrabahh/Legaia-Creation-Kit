@@ -126,6 +126,8 @@ struct Saved {
     fallback_fingerprint:String,
     man_fingerprint:String,
     records:Vec<Door>,
+    #[serde(default)]
+    auxiliary:Vec<R605NativeTrigger>,
     next_uid:u64,
 }
 
@@ -428,10 +430,180 @@ struct R604MarkerDrag {
     source:[u8;2],
     changed:bool,
 }
+// LCK_V2084_STORY_TRIGGER_PREVIEW
+//
+// These fields affect the editor preview only.
+// Neither project records nor IMG export are
+// rewritten when a user changes story stages.
+
+impl State {
+    fn v2084_p2_allowed(
+        gates:&(Vec<u16>,Vec<u16>),
+        flags:&[u16]
+    )->bool {
+        let (blocked,required)=gates;
+
+        !blocked.iter().any(|f|flags.contains(f))
+            && required.iter().all(|f|flags.contains(f))
+    }
+
+    pub(super) fn v2084_set_story_flags(
+        &mut self,
+        flags:Option<&[u16]>
+    ){
+        if self.v2084_stage_flags.as_deref()==flags {
+            return;
+        }
+
+        self.v2084_stage_flags=flags.map(|v|v.to_vec());
+        self.v2084_paths.clear();
+
+        let Some(flags)=flags else{return;};
+        let Some(man)=self.v2084_man.as_deref()
+        else{return;};
+
+        let Ok(parsed)=
+            legaia_scene_formats::man_section::parse(man)
+        else{return;};
+
+        for door in &self.records {
+            let Kind::Script{slot:Some(slot),..}=&door.kind
+            else{continue;};
+
+            if self.v2084_paths.contains_key(slot){
+                continue;
+            }
+
+            if let Some((outcome,_))=
+                legaia_engine_field::man_field_scripts::
+                    flat_record_path_walk(
+                        &parsed,
+                        man,
+                        usize::from(*slot),
+                        &|flag|flags.contains(&flag)
+                    )
+            {
+                self.v2084_paths.insert(*slot,outcome);
+            }
+        }
+    }
+
+    fn v2084_story_door_visible(&self,d:&Door)->bool {
+        let Some(flags)=self.v2084_stage_flags.as_deref()
+        else{return true;};
+
+        let Kind::Script{slot:Some(slot),..}=&d.kind
+        else{return true;};
+
+        if let Some(gates)=self.v2084_p2_gates.get(slot){
+            if !Self::v2084_p2_allowed(gates,flags){
+                return false;
+            }
+        }
+
+        !matches!(
+            self.v2084_paths.get(slot),
+            Some(
+                legaia_engine_field::man_field_scripts::
+                    RecordPathEnd::Closed
+            )
+        )
+    }
+
+    fn v2084_stage_outcome(&self,d:&Door)->Option<String>{
+        self.v2084_stage_flags.as_ref()?;
+
+        let Kind::Script{slot:Some(slot),..}=&d.kind
+        else{return None;};
+
+        if !self.v2084_story_door_visible(d){
+            return Some(
+                "Story preview: this scripted transition is inactive in the selected flag state."
+                    .into()
+            );
+        }
+
+        use legaia_engine_field::man_field_scripts::RecordPathEnd;
+
+        match self.v2084_paths.get(slot) {
+            Some(RecordPathEnd::SceneChange(
+                (index,name,x,z,facing)
+            ))=>Some(format!(
+                "Story preview target: {} | index {} | arrival ({},{}) | facing {}",
+                name,index,x,z,facing
+            )),
+
+            Some(RecordPathEnd::Closed)=>Some(
+                "Story preview: this path does not reach a scene transition."
+                    .into()
+            ),
+
+            Some(RecordPathEnd::Undecided)=>Some(
+                "Story preview: this script uses additional runtime conditions; its destination cannot be established from story flags alone."
+                    .into()
+            ),
+
+            None=>Some(
+                "Story preview: no verified transition path for this native record."
+                    .into()
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod lck_v2084_trigger_tests {
+    use super::*;
+
+    #[test]
+    fn p2_c1_blocks_if_any_flag_is_set(){
+        let gates=(vec![0x225],vec![]);
+
+        assert!(State::v2084_p2_allowed(&gates,&[]));
+
+        assert!(!State::v2084_p2_allowed(
+            &gates,&[0x225]
+        ));
+    }
+
+    #[test]
+    fn p2_c2_requires_every_flag(){
+        let gates=(vec![],vec![0x226,0x227]);
+
+        assert!(!State::v2084_p2_allowed(
+            &gates,&[0x226]
+        ));
+
+        assert!(State::v2084_p2_allowed(
+            &gates,&[0x226,0x227]
+        ));
+    }
+
+    #[test]
+    fn original_unfiltered_view_remains_available(){
+        let state=State::default();
+
+        let door=Door{
+            uid:1,
+            label:String::new(),
+            origin:Origin::New,
+            source:[10,10],
+            size:[1,1],
+            enabled:true,
+            kind:Kind::Script{
+                slot:Some(1),
+                op_pc:None,
+                destination:None,
+            },
+        };
+
+        assert!(state.v2084_story_door_visible(&door));
+    }
+}
 // LCK_R605_OTHER_TRIGGERS
 // Read-only provenance for kind-1 gate-0 and kind-2 MAP records.
 // These are not automatically doorway teleports.
-#[derive(Clone,Debug,Hash)]
+#[derive(Clone,Debug,Hash,PartialEq,Eq,Serialize,Deserialize)]
 struct R605NativeTrigger {
     kind:u8,
     gate:u8,
@@ -477,6 +649,9 @@ pub(super) struct State {
     pub scene:String,
     inspector_scripts:BTreeMap<u8,ScriptSummary>,
     other_triggers:Vec<R605NativeTrigger>,
+    original_auxiliary:Vec<R605NativeTrigger>,
+    aux_properties:Option<usize>,
+    trigger_mask:Option<u8>,
     marker_menu:Option<(u64,egui::Pos2)>,
     marker_properties:Option<u64>,
     r604_marker_drag:Option<R604MarkerDrag>,
@@ -490,6 +665,13 @@ pub(super) struct State {
     next_uid:u64,
     selected:Option<u64>,
     pub show_markers:bool,
+    v2084_man:Option<Vec<u8>>,
+    v2084_stage_flags:Option<Vec<u16>>,
+    v2084_p2_gates:BTreeMap<u8,(Vec<u16>,Vec<u16>)>,
+    v2084_paths:BTreeMap<
+        u8,
+        legaia_engine_field::man_field_scripts::RecordPathEnd
+    >,
     donor:String,
     donor_row:usize,
     message:String,
@@ -590,7 +772,30 @@ impl State {
         state.man_fingerprint=man.as_ref()
             .map(|x|collision_recipes::digest(x))
             .unwrap_or_default();
-        if let Some(man)=man.as_ref(){state.inspector_scripts=lck_script_summaries(man);}
+        if let Some(man)=man.as_ref(){
+            state.inspector_scripts=lck_script_summaries(man);
+
+            state.v2084_man=Some(man.to_vec());
+
+            if let Ok(parsed)=legaia_scene_formats::man_section::parse(man){
+                let p2base=parsed.partitions[0].len()
+                    +parsed.partitions[1].len();
+
+                for record in 0..parsed.partitions[2].len(){
+                    let Ok(flat)=u8::try_from(p2base+record)
+                    else{continue;};
+
+                    if let Some(gates)=
+                        legaia_engine_field::man_field_scripts::
+                            partition2_record_gates(
+                                &parsed,man,record
+                            )
+                    {
+                        state.v2084_p2_gates.insert(flat,gates);
+                    }
+                }
+            }
+        }
 
         // Parse BOTH trigger banks from the exact physical load.
         // This also preserves fallback rows when its PROT entry is
@@ -779,6 +984,7 @@ impl State {
         }
 
         state.original=state.records.clone();
+        state.original_auxiliary=state.other_triggers.clone();
         Ok(state)
     }
 
@@ -800,6 +1006,7 @@ impl State {
             fallback_fingerprint:self.fallback_fingerprint.clone(),
             man_fingerprint:self.man_fingerprint.clone(),
             records:self.records.clone(),
+            auxiliary:self.other_triggers.clone(),
             next_uid:self.next_uid,
         };
 
@@ -880,6 +1087,33 @@ impl State {
 
         if saved.next_uid<=*uids.iter().max().unwrap_or(&0) {
             return Err("Door UID allocation collision".into());
+        }
+
+        if !saved.auxiliary.is_empty(){
+            if saved.auxiliary.len()!=self.other_triggers.len(){
+                return Err(
+                    "Saved auxiliary count differs from native MAP".into()
+                );
+            }
+
+            for (a,b) in saved.auxiliary.iter()
+                .zip(self.other_triggers.iter())
+            {
+                if a.kind!=b.kind
+                    || a.gate!=b.gate
+                    || a.row!=b.row
+                    || a.fallback!=b.fallback
+                    || a.objects!=b.objects
+                    || a.tile[0]>=128
+                    || a.tile[1]>=128
+                {
+                    return Err(
+                        "Saved auxiliary record changed native identity or coordinates".into()
+                    );
+                }
+            }
+
+            self.other_triggers=saved.auxiliary;
         }
 
         self.records=saved.records;
@@ -1107,7 +1341,7 @@ impl State {
             r.label.clear();
         }
 
-        live!=old
+        live!=old || self.other_triggers!=self.original_auxiliary
     }
 
     // RMB over a marker opens this menu, not an object rotation.
@@ -1161,6 +1395,8 @@ impl State {
             };
 
             let door=self.records[i].clone();
+            let v2084_stage_outcome=
+                self.v2084_stage_outcome(&door);
 
             let summary=match &door.kind {
                 Kind::Script{slot:Some(s),..}=>{
@@ -1284,6 +1520,14 @@ impl State {
 
                     ui.separator();
                     ui.strong("Destination / MAN link");
+
+                    if let Some(outcome)=v2084_stage_outcome.as_ref(){
+                        ui.label(outcome);
+                        ui.small(
+                            "This is a preview result, not an exported script modification."
+                        );
+                        ui.separator();
+                    }
 
                     match &door.kind {
                         Kind::Local{half_x,half_z}=>{
@@ -2269,8 +2513,7 @@ impl State {
         let mut click=None;
 
         for d in &self.records {
-            if !d.enabled ||
-               matches!(&d.origin,Origin::ScriptOnly{..}) {
+            if !self.v2082_door_visible(d){
                 continue;
             }
 
@@ -2312,6 +2555,47 @@ impl State {
             // LCK_R58_WORLD_MARKERS: visual geometry is rendered in 3D above.
         }
 
+        // V2.0.8.2F: auxiliary records have independent
+        // right-click Properties selection.
+        if right && !self.marker_right_consumed {
+            let uncovered=pointer
+                .and_then(|p|ui.ctx().layer_id_at(p))
+                .is_none_or(|layer|layer==ui.layer_id());
+
+            let mut chosen=None;
+
+            if uncovered {
+                'aux: for (index,t) in
+                    self.other_triggers.iter().enumerate()
+                {
+                    if !self.v2082_aux_visible(t){
+                        continue;
+                    }
+
+                    for (x,z) in self.v2082_aux_points(index,t){
+                        let y=native_door_floor_y(
+                            ground,x,z
+                        )+LCK_R58_GIZMO_LIFT;
+
+                        let Some(pos)=project([x,y,z])
+                        else{continue;};
+
+                        if pointer.is_some_and(|p|
+                            p.distance(pos)<16.0
+                        ){
+                            chosen=Some(index);
+                            break 'aux;
+                        }
+                    }
+                }
+            }
+
+            if let Some(index)=chosen {
+                self.aux_properties=Some(index);
+                self.marker_right_consumed=true;
+                self.marker_menu=None;
+            }
+        }
         if ui.input(|i|i.pointer.primary_pressed()) && click.is_none(){
             self.r604_marker_focus=false;
             self.r604_marker_drag=None;
@@ -2400,6 +2684,7 @@ impl State {
         }
 
         self.native_marker_context_ui(ui.ctx());
+        self.v2082_aux_properties_ui(ui.ctx());
         hit || self.r604_marker_drag.is_some()
     }
 
@@ -2628,7 +2913,7 @@ impl State {
 
         for block in 0..2 {
             for kind in 0..2usize {
-                let old=table(
+                let original_rows=table(
                     &blocks[block],
                     kind
                 )?
@@ -2638,11 +2923,23 @@ impl State {
                 )
                 .collect::<Vec<_>>();
 
+                let mut edited_rows=original_rows.clone();
+
+                if kind==1 {
+                    self.v2082_apply_aux_rows(
+                        &mut edited_rows,
+                        block==1,
+                        1
+                    )?;
+                }
+
                 let next=self.build_kind(
                     block==1,
                     kind as u8,
-                    &old
+                    &edited_rows
                 )?;
+
+                let old=original_rows;
 
                 expected[block][kind]=next.clone();
 
@@ -2657,6 +2954,50 @@ impl State {
             }
         }
 
+        // V2.0.8.2F: serialize existing native kind-2
+        // rows without changing their identities,
+        // counts or table addresses.
+        for bank in 0..2 {
+            let old=lck_r605_kind2(&blocks[bank]);
+            let mut next=old.clone();
+
+            self.v2082_apply_aux_rows(
+                &mut next,
+                bank==1,
+                2
+            )?;
+
+            if next!=old {
+                let begin=i16::from_le_bytes([
+                    blocks[bank][10],
+                    blocks[bank][11]
+                ]);
+
+                ensure!(
+                    begin>=14,
+                    "Invalid kind-2 MAP table offset"
+                );
+
+                for (row,data) in next.iter().enumerate(){
+                    let at=begin as usize+row*4;
+
+                    ensure!(
+                        at+4<=blocks[bank].len(),
+                        "Native kind-2 MAP row out of bounds"
+                    );
+
+                    blocks[bank][at..at+4]
+                        .copy_from_slice(data);
+                }
+
+                ensure!(
+                    lck_r605_kind2(&blocks[bank])==next,
+                    "Native kind-2 MAP readback differs"
+                );
+
+                changed+=1;
+            }
+        }
         let old_primary_0=
             table(&map[0x10000..0x12000],0)?;
         let old_primary_1=
@@ -3380,6 +3721,611 @@ mod lck_r4_2_cell_flag_tests {
 // Does not alter MAP, MAN, player position or exported IMG.
 // ============================================================
 
+// LCK_V2081_SCREEN_MARKERS
+//
+// Render native MAP/MAN markers above the scene image.
+// Original marker coordinates and source records remain
+// unchanged. No gameplay or IMG bytes are edited.
+
+fn lck_v2081_diamond(
+    center:egui::Pos2,
+    radius:f32,
+)->[egui::Pos2;4] {
+    [
+        egui::pos2(center.x-radius,center.y),
+        egui::pos2(center.x,center.y-radius),
+        egui::pos2(center.x+radius,center.y),
+        egui::pos2(center.x,center.y+radius),
+    ]
+}
+
+fn lck_v2081_draw(
+    painter:&egui::Painter,
+    center:egui::Pos2,
+    radius:f32,
+    color:egui::Color32,
+) {
+    let points=lck_v2081_diamond(center,radius);
+    let stroke=egui::Stroke::new(2.0,color);
+
+    for i in 0..4 {
+        painter.line_segment(
+            [points[i],points[(i+1)%4]],
+            stroke
+        );
+    }
+
+    painter.line_segment(
+        [
+            egui::pos2(center.x-radius*0.6,center.y),
+            egui::pos2(center.x+radius*0.6,center.y)
+        ],
+        stroke
+    );
+
+    painter.line_segment(
+        [
+            egui::pos2(center.x,center.y-radius*0.6),
+            egui::pos2(center.x,center.y+radius*0.6)
+        ],
+        stroke
+    );
+
+    painter.circle_filled(center,2.5,color);
+}
+
+impl State {
+    pub(super) fn lck_v2081_counts(&self)->(usize,usize){
+        let doors=self.records.iter()
+            .filter(|d|
+                d.enabled &&
+                !matches!(&d.origin,Origin::ScriptOnly{..})
+            )
+            .count();
+
+        (doors,self.other_triggers.len())
+    }
+
+    pub(super) fn lck_v2081_paint(
+        &self,
+        ui:&egui::Ui,
+        view:&super::viewport::Viewport,
+        model:&crate::raster::Model,
+        ground:Option<
+            &legaia_scene_formats::field_objects::WalkHeightfield
+        >,
+    ){
+        if !self.show_markers {
+            return;
+        }
+
+        let Some((rect,_))=view.world_image else {
+            return;
+        };
+
+        let painter=ui.painter_at(rect);
+
+        let marker=|
+            x:f32,
+            z:f32,
+            radius:f32,
+            color:egui::Color32
+        |{
+            let y=native_door_floor_y(ground,x,z)
+                +LCK_R58_GIZMO_LIFT;
+
+            if let Some(pos)=view.project_world_marker(
+                model,[x,y,z]
+            ){
+                if rect.contains(pos){
+                    lck_v2081_draw(
+                        &painter,pos,radius,color
+                    );
+                }
+            }
+        };
+
+        // Native local doors and scene transitions.
+        for d in &self.records {
+            if !self.v2082_door_visible(d){
+                continue;
+            }
+
+            let x=(
+                d.source[0] as f32+
+                d.size[0] as f32*0.5
+            )*128.0;
+
+            let z=(
+                d.source[1] as f32+
+                d.size[1] as f32*0.5
+            )*128.0;
+
+            let color=if self.selected==Some(d.uid){
+                egui::Color32::from_rgb(255,220,75)
+            }else if matches!(&d.kind,Kind::Local{..}){
+                egui::Color32::from_rgb(95,238,135)
+            }else{
+                egui::Color32::from_rgb(110,205,255)
+            };
+
+            marker(x,z,10.0,color);
+
+            if let Kind::Local{half_x,half_z}=&d.kind{
+                let dx=*half_x as f32*64.0+64.0;
+                let dz=(*half_z as f32+1.0)*64.0;
+
+                marker(
+                    dx,dz,8.0,
+                    if self.selected==Some(d.uid){
+                        color
+                    }else{
+                        egui::Color32::from_rgb(65,235,125)
+                    }
+                );
+            }
+        }
+
+        // MAP auxiliary triggers.
+        // Gate-0 object bindings use actual contacts.
+        for (index,trigger) in self.other_triggers.iter().enumerate(){
+            if !self.v2082_aux_visible(trigger){
+                continue;
+            }
+            let color=if trigger.kind==2 {
+                egui::Color32::from_rgb(255,168,65)
+            }else{
+                egui::Color32::from_rgb(211,143,255)
+            };
+
+            for (x,z) in self.v2082_aux_points(index,trigger){
+                marker(x,z,7.0,color);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod lck_v2081_marker_tests {
+    use super::*;
+
+    #[test]
+    fn marker_geometry_is_centered(){
+        let p=lck_v2081_diamond(
+            egui::pos2(100.0,80.0),10.0
+        );
+
+        assert_eq!(p[0],egui::pos2(90.0,80.0));
+        assert_eq!(p[1],egui::pos2(100.0,70.0));
+        assert_eq!(p[2],egui::pos2(110.0,80.0));
+        assert_eq!(p[3],egui::pos2(100.0,90.0));
+    }
+
+    #[test]
+    fn empty_marker_inventory_is_safe(){
+        let state=State::default();
+        assert_eq!(state.lck_v2081_counts(),(0,0));
+    }
+}
+// LCK_V2082F_TRIGGER_FILTERS
+
+const V2082_LOCAL:u8=1;
+const V2082_SCRIPT:u8=2;
+const V2082_BIND:u8=4;
+const V2082_KIND2:u8=8;
+const V2082_OTHER:u8=16;
+const V2082_ALL:u8=31;
+
+// LCK_V2083_ORIGINAL_WARP_CATEGORY
+impl State {
+    pub(super) fn v2083_local_warps_visible(&self)->bool {
+        self.show_markers
+            && self.v2082_mask()&V2082_LOCAL!=0
+    }
+
+    fn v2082_mask(&self)->u8 {
+        self.trigger_mask.unwrap_or(V2082_ALL)
+    }
+
+    fn v2082_door_visible(&self,d:&Door)->bool {
+        if !self.v2084_story_door_visible(d){return false;}
+
+        if !self.show_markers ||
+            !d.enabled ||
+            matches!(&d.origin,Origin::ScriptOnly{..})
+        {
+            return false;
+        }
+
+        // Native local warps use the original circle
+        // and connecting-line renderer, not diamonds.
+        matches!(&d.kind,Kind::Script{..})
+            && self.v2082_mask()&V2082_SCRIPT!=0
+    }
+
+    fn v2082_aux_bit(t:&R605NativeTrigger)->u8 {
+        match (t.kind,t.gate){
+            (1,0)=>V2082_BIND,
+            (2,_)=>V2082_KIND2,
+            _=>V2082_OTHER,
+        }
+    }
+
+    fn v2082_aux_visible(&self,t:&R605NativeTrigger)->bool {
+        self.show_markers &&
+            self.v2082_mask()&Self::v2082_aux_bit(t)!=0
+    }
+
+    fn v2082_aux_points(
+        &self,
+        index:usize,
+        t:&R605NativeTrigger
+    )->Vec<(f32,f32)>{
+        let original=self.original_auxiliary
+            .get(index);
+
+        if t.kind==1
+            && t.gate==0
+            && !t.objects.is_empty()
+            && original.is_some_and(|old|old.tile==t.tile)
+        {
+            return t.objects.iter().map(
+                |(_,_,contact)|(
+                    contact[0] as f32,
+                    contact[1] as f32
+                )
+            ).collect();
+        }
+
+        vec![(
+            (t.tile[0] as f32+0.5)*128.0,
+            (t.tile[1] as f32+0.5)*128.0
+        )]
+    }
+
+    pub(super) fn v2082_menu(
+        &mut self,
+        ui:&mut egui::Ui
+    )->(bool,bool){
+        ui.set_min_width(310.0);
+
+        let previous=(
+            self.show_markers,
+            self.v2082_mask()
+        );
+
+        let mut open_warps=false;
+        let mut all=self.show_markers
+            && self.v2082_mask()==V2082_ALL;
+
+        if ui.checkbox(&mut all,"All").changed(){
+            self.show_markers=all;
+            self.trigger_mask=Some(
+                if all {V2082_ALL}else{0}
+            );
+        }
+
+        ui.separator();
+
+        for (bit,name) in [
+            (V2082_LOCAL,"Local Warps"),
+            (V2082_SCRIPT,"Scripted Transitions"),
+            (V2082_BIND,"Object Bindings"),
+            (V2082_KIND2,"Kind-2 Records"),
+            (V2082_OTHER,"Other Trigger Gates"),
+        ]{
+            let mut checked=self.show_markers
+                && self.v2082_mask()&bit!=0;
+
+            ui.horizontal(|ui|{
+                if ui.checkbox(&mut checked,name).changed(){
+                    let mut mask=self.v2082_mask();
+
+                    if checked {
+                        mask|=bit;
+                    }else{
+                        mask&=!bit;
+                    }
+
+                    self.trigger_mask=Some(mask);
+                    self.show_markers=mask!=0;
+                }
+
+                if ui.small_button("Properties").clicked(){
+                    if bit==V2082_LOCAL {
+                        open_warps=true;
+                    }else if bit==V2082_SCRIPT {
+                        let uid=self.records.iter()
+                            .find(|d|
+                                d.enabled &&
+                                matches!(&d.kind,Kind::Script{..})
+                            )
+                            .map(|d|d.uid);
+
+                        if let Some(uid)=uid {
+                            self.selected=Some(uid);
+                            self.marker_properties=Some(uid);
+                        }
+                    }else{
+                        self.aux_properties=
+                            self.other_triggers.iter()
+                            .position(|t|
+                                Self::v2082_aux_bit(t)==bit
+                            );
+                    }
+                }
+            });
+        }
+
+        ui.separator();
+
+        ui.small(
+            "Enabled categories determine both marker visibility and right-click selection."
+        );
+
+        (
+            previous!=(self.show_markers,self.v2082_mask()),
+            open_warps
+        )
+    }
+
+    fn v2082_aux_properties_ui(
+        &mut self,
+        ctx:&egui::Context
+    ){
+        let Some(index)=self.aux_properties
+        else{return;};
+
+        let Some(record)=self.other_triggers.get(index).cloned()
+        else{
+            self.aux_properties=None;
+            return;
+        };
+
+        let category=Self::v2082_aux_bit(&record);
+        let mut open=true;
+        let mut selected=index;
+
+        egui::Window::new("Native Trigger Properties")
+            .id(egui::Id::new("lck_v2082_aux_properties"))
+            .open(&mut open)
+            .resizable(true)
+            .default_width(440.0)
+            .show(ctx,|ui|{
+                ui.strong(match category {
+                    V2082_BIND=>"Object Script Bindings",
+                    V2082_KIND2=>"MAP Kind-2 Records",
+                    _=>"Other MAP Trigger Gates",
+                });
+
+                ui.small(format!(
+                    "Cell: {} | Existing native records",
+                    self.scene
+                ));
+
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .max_height(155.0)
+                    .show(ui,|ui|{
+                        for (j,t) in self.other_triggers.iter()
+                            .enumerate()
+                            .filter(|(_,t)|
+                                Self::v2082_aux_bit(t)==category
+                            )
+                        {
+                            if ui.selectable_label(
+                                selected==j,
+                                format!(
+                                    "{} row {} | tile ({},{}) | operand {}",
+                                    if t.fallback {"Fallback"}else{"Primary"},
+                                    t.row,
+                                    t.tile[0],
+                                    t.tile[1],
+                                    t.record
+                                )
+                            ).clicked(){
+                                selected=j;
+                            }
+                        }
+                    });
+
+                ui.separator();
+
+                if let Some(t)=self.other_triggers.get_mut(selected){
+                    ui.label(format!(
+                        "Native kind {} | gate {} | {} bank | row {}",
+                        t.kind,t.gate,
+                        if t.fallback {"fallback"}else{"primary"},
+                        t.row
+                    ));
+
+                    ui.horizontal(|ui|{
+                        ui.label("Tile X");
+                        ui.add(
+                            egui::DragValue::new(&mut t.tile[0])
+                                .range(0..=127)
+                        );
+                        ui.label("Tile Z");
+                        ui.add(
+                            egui::DragValue::new(&mut t.tile[1])
+                                .range(0..=127)
+                        );
+                    });
+
+                    ui.horizontal(|ui|{
+                        ui.label("Record operand");
+                        ui.add(
+                            egui::DragValue::new(&mut t.record)
+                                .range(0..=255)
+                        );
+                    });
+
+                    if t.kind==2 {
+                        ui.horizontal(|ui|{
+                            ui.label("Raw extra operand");
+                            ui.add(
+                                egui::DragValue::new(&mut t.extra)
+                                    .range(0..=255)
+                            );
+                        });
+                    }
+
+                    ui.separator();
+
+                    ui.small(
+                        "Native kind, bank, row and gate are fixed. Existing MAP coordinate and operand bytes are editable."
+                    );
+
+                    if t.kind==2 {
+                        ui.weak(
+                            "Kind-2 gameplay behavior is not established. Byte-level editing does not imply a verified gameplay effect."
+                        );
+                    }else{
+                        ui.weak(
+                            "Changing an operand may change its MAN binding. Verify the destination and test gameplay."
+                        );
+                    }
+
+                    if !t.objects.is_empty(){
+                        ui.collapsing(
+                            "Object contact evidence",
+                            |ui|{
+                                for (descriptor,world,contact) in &t.objects {
+                                    ui.label(format!(
+                                        "Descriptor {descriptor} | object ({},{}) | contact ({},{})",
+                                        world[0],world[1],
+                                        contact[0],contact[1]
+                                    ));
+                                }
+                            }
+                        );
+                    }
+                }
+            });
+
+        self.aux_properties=if open {
+            Some(selected)
+        }else{
+            None
+        };
+    }
+
+    fn v2082_apply_aux_rows(
+        &self,
+        rows:&mut [[u8;4]],
+        fallback:bool,
+        kind:u8
+    )->Result<()> {
+        for t in self.other_triggers.iter()
+            .filter(|t|t.fallback==fallback && t.kind==kind)
+        {
+            let old=self.original_auxiliary.iter()
+                .find(|old|
+                    old.kind==t.kind
+                    && old.fallback==t.fallback
+                    && old.row==t.row
+                )
+                .context("Original native trigger record missing")?;
+
+            ensure!(
+                t.gate==old.gate
+                    && t.kind==old.kind
+                    && t.tile[0]<128
+                    && t.tile[1]<128,
+                "Native trigger identity or coordinates invalid"
+            );
+
+            let row=rows.get_mut(t.row)
+                .context("Native MAP trigger row missing")?;
+
+            let expected=[
+                old.tile[0],
+                old.tile[1],
+                old.record,
+                if kind==2 {old.extra}else{old.gate}
+            ];
+
+            ensure!(
+                *row==expected,
+                "Native MAP trigger row differs from the loaded source"
+            );
+
+            *row=[
+                t.tile[0],
+                t.tile[1],
+                t.record,
+                if kind==2 {t.extra}else{t.gate}
+            ];
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lck_v2082f_trigger_tests {
+    use super::*;
+
+    #[test]
+    fn category_filters_are_independent(){
+        let mut state=State::default();
+        state.show_markers=true;
+        state.trigger_mask=Some(V2082_KIND2);
+
+        let t=R605NativeTrigger {
+            kind:2,
+            gate:255,
+            tile:[10,20],
+            record:1,
+            extra:2,
+            fallback:false,
+            row:0,
+            objects:vec![],
+        };
+
+        assert!(state.v2082_aux_visible(&t));
+
+        state.trigger_mask=Some(V2082_BIND);
+
+        assert!(!state.v2082_aux_visible(&t));
+    }
+
+    #[test]
+    fn native_kind2_row_roundtrips()->Result<()>{
+        let before=R605NativeTrigger {
+            kind:2,
+            gate:255,
+            tile:[10,20],
+            record:5,
+            extra:7,
+            fallback:false,
+            row:0,
+            objects:vec![],
+        };
+
+        let mut after=before.clone();
+        after.tile=[12,21];
+        after.record=9;
+        after.extra=11;
+
+        let state=State {
+            original_auxiliary:vec![before],
+            other_triggers:vec![after],
+            ..Default::default()
+        };
+
+        let mut rows=[[10,20,5,7]];
+
+        state.v2082_apply_aux_rows(
+            &mut rows,false,2
+        )?;
+
+        assert_eq!(rows,[[12,21,9,11]]);
+
+        Ok(())
+    }
+}
 const LCK_R58_GIZMO_ID:u32=u32::MAX-1;
 const LCK_R58_GIZMO_LIFT:f32=26.0;
 
@@ -3506,6 +4452,7 @@ impl State {
 
         self.scene.hash(&mut hash);
         self.show_markers.hash(&mut hash);
+        self.v2084_stage_flags.hash(&mut hash);
         self.selected.hash(&mut hash);
         self.other_triggers.hash(&mut hash);
 

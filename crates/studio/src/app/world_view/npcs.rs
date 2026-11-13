@@ -206,7 +206,7 @@ impl NpcInfo {
         }
     }
 
-    fn action(&self, clip: u8) -> Result<Arc<legaia_actor_formats::monster_archive::MonsterAnimation>,String> {
+    pub(crate) fn action(&self, clip: u8) -> Result<Arc<legaia_actor_formats::monster_archive::MonsterAnimation>,String> {
         if clip==0 {return Err("Zero is rest, not an ANM clip".into());}
         let mut cache=self.animation_cache.lock().map_err(|_|"Animation cache lock was poisoned")?;
         if let Some(action)=cache.get(&clip) {return Ok(action.clone());}

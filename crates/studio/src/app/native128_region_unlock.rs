@@ -14,7 +14,7 @@ use std::{
 
 const MAP_LENGTH: usize = 0x12000;
 const BLOCK: usize = 0x10000;
-const BODY: usize = 0x484;
+const BODY: usize = 0x488;
 const ORIGINAL_REGIONS: usize = 14;
 const STRIDE: usize = 8;
 const CELL_COUNT: usize = 128 * 128;
@@ -77,41 +77,62 @@ impl Summary {
 }
 
 struct Plan {
+    table_start: usize,
+    append_offset: usize,
     appended: Vec<u8>,
     count: i16,
     summary: Summary,
 }
 
-fn read_count(map: &[u8]) -> Result<usize> {
+#[derive(Debug, Clone, Copy)]
+struct RegionLayout {
+    body: usize,
+    count: usize,
+}
+
+// Read the actual region-table metadata from this MAP.
+// No retail-specific offset or fixed record count.
+fn read_layout(map: &[u8]) -> Result<RegionLayout> {
     ensure!(
         map.len() >= MAP_LENGTH,
-        "Native MAP shorter than 0x12000 bytes"
+        "Native MAP shorter than expected footprint"
     );
 
-    let body = i16::from_le_bytes([
+    let raw_body = i16::from_le_bytes([
         map[BLOCK + 0x0e],
-        map[BLOCK + 0x0f]
+        map[BLOCK + 0x0f],
     ]);
 
-    let count = i16::from_le_bytes([
+    let raw_count = i16::from_le_bytes([
         map[BLOCK + 0x10],
-        map[BLOCK + 0x11]
+        map[BLOCK + 0x11],
     ]);
 
     ensure!(
-        body == BODY as i16 &&
-        count == ORIGINAL_REGIONS as i16,
-        "Unexpected town01 region table: body={body:#x}, count={count}"
+        raw_body >= 0x20 && raw_body < 0x800,
+        "Invalid native region offset: {raw_body:#x}"
     );
-
-    let main = BLOCK + BODY + 5 * STRIDE;
 
     ensure!(
-        &map[main..main + 5] == &[9, 60, 45, 0, 0],
-        "Rim Elm exterior record does not match audited data"
+        raw_count > 0 && raw_count < 256,
+        "Invalid native region count: {raw_count}"
     );
 
-    Ok(count as usize)
+    let body = raw_body as usize;
+    let count = raw_count as usize;
+
+    let end = BLOCK + body + count * STRIDE;
+
+    ensure!(
+        end <= LAST_REGION_BYTE && end <= map.len(),
+        "Region table exceeds audited native region storage: body={body:#x}, count={count}"
+    );
+
+    Ok(RegionLayout { body, count })
+}
+
+fn read_count(map: &[u8]) -> Result<usize> {
+    Ok(read_layout(map)?.count)
 }
 
 fn region_covers(rec: &[u8], x: usize, z: usize) -> bool {
@@ -143,18 +164,23 @@ fn plan(
     full: bool
 ) -> Result<Option<Plan>> {
 
-    let count = read_count(original)?;
+    let original_layout = read_layout(original)?;
+    let exported_layout = read_layout(exported)?;
 
     ensure!(
-        read_count(exported)? == count,
-        "Exported region header was already modified"
+        original_layout.body == exported_layout.body
+            && original_layout.count == exported_layout.count,
+        "Staged region header differs from retail region header"
     );
 
-    let old_end = BLOCK + BODY + count * STRIDE;
+    let body = original_layout.body;
+    let count = original_layout.count;
+
+    let old_end = BLOCK + body + count * STRIDE;
 
     ensure!(
-        original[BLOCK + BODY..old_end]
-            == exported[BLOCK + BODY..old_end],
+        original[BLOCK + body..old_end]
+            == exported[BLOCK + body..old_end],
         "Original region records were already changed"
     );
 
@@ -166,7 +192,7 @@ fn plan(
     for z in 0..128usize {
         for x in 0..128usize {
             for i in 0..count {
-                let o = BLOCK + BODY + i * STRIDE;
+                let o = BLOCK + body + i * STRIDE;
                 let rec = &original[o..o + STRIDE];
 
                 if rec[4] <= 1 && region_covers(rec, x, z) {
@@ -286,7 +312,7 @@ fn plan(
         "Native region count exceeds byte-sized runtime budget"
     );
 
-    let new_end = BLOCK + BODY + total * STRIDE;
+    let new_end = BLOCK + body + total * STRIDE;
 
     ensure!(
         new_end <= LAST_REGION_BYTE,
@@ -309,12 +335,14 @@ fn plan(
 
     for [x0, z0, x1, z1] in &rects {
         appended.extend_from_slice(&[
-            *x0, *z0, *x1, *z1,
+            *x0, *z1, *x1, *z0,
             0, 0, 0, 0
         ]);
     }
 
     Ok(Some(Plan {
+        table_start: BLOCK + body,
+        append_offset: old_end,
         appended,
         count: total as i16,
         summary: Summary {
@@ -357,7 +385,7 @@ pub(super) fn patch_image(
 
     disc.patch_prot_entry(
         entry,
-        FIRST_UNCLAIMED as u64,
+        p.append_offset as u64,
         &p.appended
     )?;
 
@@ -386,15 +414,15 @@ pub(super) fn patch_image(
 
     ensure!(
         checked[
-            FIRST_UNCLAIMED..
-            FIRST_UNCLAIMED + p.appended.len()
+            p.append_offset..
+            p.append_offset + p.appended.len()
         ] == p.appended[..],
         "Native region payload readback failed"
     );
 
     ensure!(
-        checked[BLOCK + BODY..FIRST_UNCLAIMED]
-            == staged_map[BLOCK + BODY..FIRST_UNCLAIMED],
+        checked[p.table_start..p.append_offset]
+            == staged_map[p.table_start..p.append_offset],
         "Original region records changed"
     );
 
@@ -442,7 +470,7 @@ mod r612_native128_tests {
         assert_eq!(p.summary.changed_native_tiles, 1);
         assert_eq!(p.summary.selected_chunks, 1);
         assert_eq!(p.appended.len(), STRIDE);
-        assert_eq!(&p.appended[..5], &[64, 32, 96, 64, 0]);
+        assert_eq!(&p.appended[..5], &[64, 64, 96, 32, 0]);
         assert_eq!(p.count, 15);
     }
 
@@ -484,7 +512,7 @@ mod r612_native128_tests {
             .unwrap();
 
         for r in p.appended.chunks_exact(8) {
-            for z in r[1]..r[3] {
+            for z in r[1].min(r[3])..r[1].max(r[3]) {
                 for x in r[0]..r[2] {
                     assert!(
                         !(60..72).contains(&x)
@@ -506,7 +534,7 @@ mod r612_native128_tests {
         let mut covered = [false; CELL_COUNT];
 
         for r in p.appended.chunks_exact(8) {
-            for z in r[1]..r[3] {
+            for z in r[1].min(r[3])..r[1].max(r[3]) {
                 for x in r[0]..r[2] {
                     let i = z as usize * 128 + x as usize;
                     assert!(!covered[i]);
@@ -539,6 +567,434 @@ mod r612_native128_tests {
 
         assert!(
             plan(&original, &staged, false).is_err()
+        );
+    }
+}
+// R613_NATIVE128_COVERAGE
+// Validate native MAP region coverage.
+// This does not replace runtime render/physics hooks.
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct R613Coverage {
+    final_regions:usize,
+    original_covered:usize,
+    added_covered:usize,
+    uncovered:usize,
+    changed_outside:usize,
+    changed_without_region:usize,
+    walk_flagged_outside:usize,
+    walk_flagged_without_region:usize,
+}
+
+fn r613b_verified_region_layouts(
+    original: &[u8],
+    exported: &[u8],
+) -> Result<(usize, usize, usize, usize)> {
+
+    let retail = read_layout(original)?;
+    let staged = read_layout(exported)?;
+
+    let original_body = retail.body;
+    let exported_body = staged.body;
+    let old_count = retail.count;
+    let count = staged.count;
+
+    ensure!(
+        count >= old_count,
+        "R613B: exported region count decreased"
+    );
+
+    let original_start = BLOCK + original_body;
+    let original_end = original_start + old_count * STRIDE;
+
+    let exported_start = BLOCK + exported_body;
+    let preserved_end = exported_start + old_count * STRIDE;
+
+    let final_end = exported_start + count * STRIDE;
+
+    ensure!(
+        original_end <= LAST_REGION_BYTE &&
+        final_end <= LAST_REGION_BYTE,
+        "R613B: native region storage boundary exceeded"
+    );
+
+    ensure!(
+        original[original_start..original_end]
+            == exported[exported_start..preserved_end],
+        "R613B: original region records differ across layouts (retail={original_body:#x}, exported={exported_body:#x})"
+    );
+
+    Ok((
+        original_body,
+        exported_body,
+        old_count,
+        count,
+    ))
+}
+fn r613_audit(
+    original:&[u8],
+    exported:&[u8],
+    require_full:bool
+)->Result<R613Coverage> {
+    let (
+        original_body,
+        exported_body,
+        old_count,
+        count,
+    ) = r613b_verified_region_layouts(original, exported)?;
+
+    let mut result=R613Coverage{
+        final_regions:count,
+        original_covered:0,
+        added_covered:0,
+        uncovered:0,
+        changed_outside:0,
+        changed_without_region:0,
+        walk_flagged_outside:0,
+        walk_flagged_without_region:0,
+    };
+
+    for z in 0..128usize {
+        for x in 0..128usize {
+            let original_region=(0..old_count).any(|n| {
+                let p=BLOCK+original_body+n*STRIDE;
+                original[p+4]<=1 &&
+                    region_covers(
+                        &original[p..p+STRIDE],x,z
+                    )
+            });
+
+            let final_region=(0..count).any(|n| {
+                let p=BLOCK+exported_body+n*STRIDE;
+                exported[p+4]<=1 &&
+                    region_covers(
+                        &exported[p..p+STRIDE],x,z
+                    )
+            });
+
+            if original_region {
+                result.original_covered+=1;
+                continue;
+            }
+
+            if final_region {
+                result.added_covered+=1;
+            }else{
+                result.uncovered+=1;
+            }
+
+            let at=0x8000+(z*128+x)*2;
+            let co=0x4000+z*128+x;
+
+            let changed=
+                original[at..at+2]!=exported[at..at+2] ||
+                original[co]!=exported[co];
+
+            if changed {
+                result.changed_outside+=1;
+
+                if !final_region {
+                    result.changed_without_region+=1;
+                }
+            }
+
+            let word=u16::from_le_bytes([
+                exported[at],exported[at+1]
+            ]);
+
+            if word & 0x0800 != 0 {
+                result.walk_flagged_outside+=1;
+
+                if !final_region {
+                    result.walk_flagged_without_region+=1;
+                }
+            }
+        }
+    }
+
+    ensure!(
+        result.original_covered+
+        result.added_covered+
+        result.uncovered==CELL_COUNT,
+        "R613: native tile-accounting mismatch"
+    );
+
+    if require_full {
+        ensure!(
+            result.uncovered==0,
+            "R613: full 128 requested, but {} native tiles lack type-0/1 region coverage",
+            result.uncovered
+        );
+
+        ensure!(
+            result.changed_without_region==0,
+            "R613: {} authored native tiles lack region coverage",
+            result.changed_without_region
+        );
+    }
+
+    Ok(result)
+}
+
+pub(super) fn r613_coverage_report(
+    original:&[u8],
+    exported:&[u8],
+    full:bool
+)->Result<String> {
+    let a=r613_audit(original,exported,full)?;
+
+    Ok(format!(concat!(
+        "R6.1.3 NATIVE MAP COVERAGE AUDIT\n",
+        "Region records: {}\n",
+        "Retail-covered tiles: {}\n",
+        "Newly covered native tiles: {}\n",
+        "Uncovered native tiles: {}\n",
+        "Changed native tiles outside retail regions: {}\n",
+        "Changed native tiles without active region: {}\n",
+        "Walk-flagged native tiles outside retail regions: {}\n",
+        "Walk-flagged native tiles without active region: {}\n",
+        "Full 128 coverage requested: {}\n",
+        "Coverage verifies MAP data only. ",
+        "Retail renderer, walk physics, scripts and camera ",
+        "are NOT gameplay verified.\n"
+    ),
+        a.final_regions,
+        a.original_covered,
+        a.added_covered,
+        a.uncovered,
+        a.changed_outside,
+        a.changed_without_region,
+        a.walk_flagged_outside,
+        a.walk_flagged_without_region,
+        full
+    ))
+}
+
+#[cfg(test)]
+mod r613_coverage_tests {
+    use super::*;
+
+    fn base()->Vec<u8> {
+        let mut out=vec![0u8;MAP_LENGTH];
+
+        out[BLOCK+0x0e..BLOCK+0x10]
+            .copy_from_slice(&(BODY as i16).to_le_bytes());
+
+        out[BLOCK+0x10..BLOCK+0x12]
+            .copy_from_slice(&(ORIGINAL_REGIONS as i16).to_le_bytes());
+
+        let i=BLOCK+BODY+5*STRIDE;
+
+        out[i..i+8].copy_from_slice(
+            &[9,60,45,0,0,0,0,0]
+        );
+
+        out
+    }
+
+    fn with_plan(mut out:Vec<u8>,p:&Plan)->Vec<u8> {
+        out[BLOCK+0x10..BLOCK+0x12]
+            .copy_from_slice(&p.count.to_le_bytes());
+
+        out[FIRST_UNCLAIMED..FIRST_UNCLAIMED+p.appended.len()]
+            .copy_from_slice(&p.appended);
+
+        out
+    }
+
+    #[test]
+    fn full_mode_has_coverage_for_all_16384_cells() {
+        let old=base();
+        let p=plan(&old,&old,true).unwrap().unwrap();
+        let next=with_plan(old.clone(),&p);
+
+        let a=r613_audit(&old,&next,true).unwrap();
+
+        assert_eq!(a.uncovered,0);
+
+        assert_eq!(
+            a.original_covered+a.added_covered,
+            CELL_COUNT
+        );
+    }
+
+    #[test]
+    fn changed_floor_without_region_is_detected() {
+        let old=base();
+        let mut next=old.clone();
+
+        next[0x4000+33*128+64]=0x71;
+
+        assert!(r613_audit(&old,&next,true).is_err());
+
+        let a=r613_audit(&old,&next,false).unwrap();
+
+        assert_eq!(a.changed_without_region,1);
+    }
+
+    #[test]
+    fn authored_region_activates_changed_native_tile() {
+        let old=base();
+        let mut next=old.clone();
+
+        next[0x4000+33*128+64]=0x71;
+
+        let p=plan(&old,&next,false).unwrap().unwrap();
+        let fixed=with_plan(next,&p);
+
+        assert_eq!(
+            r613_audit(&old,&fixed,false)
+                .unwrap()
+                .changed_without_region,
+            0
+        );
+    }
+
+    #[test]
+    fn retail_region_tampering_is_rejected() {
+        let old=base();
+        let mut changed=old.clone();
+
+        changed[BLOCK+BODY+5*STRIDE]=10;
+
+        assert!(
+            r613_audit(&old,&changed,false).is_err()
+        );
+    }
+}
+
+
+
+
+#[cfg(test)]
+#[test]
+fn r614_dynamic_region_layouts() {
+    // Different valid tables must all be accepted.
+    for &(body, count) in &[
+        (0x484usize, 14usize),
+        (0x488usize, 14usize),
+        (0x580usize, 16usize),
+    ] {
+        let mut map = vec![0u8; MAP_LENGTH];
+
+        map[BLOCK + 0x0e..BLOCK + 0x10]
+            .copy_from_slice(&(body as i16).to_le_bytes());
+
+        map[BLOCK + 0x10..BLOCK + 0x12]
+            .copy_from_slice(&(count as i16).to_le_bytes());
+
+        let main = BLOCK + body + 5 * STRIDE;
+
+        map[main..main + 5]
+            .copy_from_slice(&[9, 60, 45, 0, 0]);
+
+        let layout = read_layout(&map).unwrap();
+
+        assert_eq!(layout.body, body);
+        assert_eq!(layout.count, count);
+
+        let plan = plan(&map, &map, true)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(plan.table_start, BLOCK + body);
+        assert_eq!(
+            plan.append_offset,
+            BLOCK + body + count * STRIDE
+        );
+
+        assert!(plan.count as usize > count);
+        assert!(!plan.appended.is_empty());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn r614_invalid_table_bounds_rejected() {
+    let mut map = vec![0u8; MAP_LENGTH];
+
+    map[BLOCK + 0x0e..BLOCK + 0x10]
+        .copy_from_slice(&0x7f8_i16.to_le_bytes());
+
+    map[BLOCK + 0x10..BLOCK + 0x12]
+        .copy_from_slice(&14_i16.to_le_bytes());
+
+    assert!(read_layout(&map).is_err());
+}
+
+
+#[cfg(test)]
+mod r613b_adaptive_audit_tests {
+    use super::*;
+
+    fn region_map(body: usize, count: usize) -> Vec<u8> {
+        let mut map = vec![0u8; MAP_LENGTH];
+
+        map[BLOCK + 0x0e..BLOCK + 0x10]
+            .copy_from_slice(&(body as i16).to_le_bytes());
+
+        map[BLOCK + 0x10..BLOCK + 0x12]
+            .copy_from_slice(&(count as i16).to_le_bytes());
+
+        let exterior = BLOCK + body + 5 * STRIDE;
+
+        map[exterior..exterior + 5]
+            .copy_from_slice(&[9, 60, 45, 0, 0]);
+
+        if count > 14 {
+            let extra = BLOCK + body + 14 * STRIDE;
+
+            map[extra..extra + STRIDE]
+                .copy_from_slice(&[0, 0, 32, 32, 0, 0, 0, 0]);
+        }
+
+        map
+    }
+
+    #[test]
+    fn accepts_original_and_relocated_tables() {
+        for &(retail_body, staged_body) in &[
+            (0x484usize, 0x484usize),
+            (0x488usize, 0x488usize),
+            (0x484usize, 0x488usize),
+            (0x488usize, 0x484usize),
+        ] {
+            let original = region_map(retail_body, 14);
+            let staged = region_map(staged_body, 15);
+
+            let actual = r613b_verified_region_layouts(
+                &original,
+                &staged,
+            ).unwrap();
+
+            assert_eq!(
+                actual,
+                (retail_body, staged_body, 14, 15)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_corrupted_or_lost_original_regions() {
+        let original = region_map(0x484, 14);
+        let mut staged = region_map(0x488, 15);
+
+        // Changing a retail region must remain an error.
+        staged[BLOCK + 0x488 + 5 * STRIDE] ^= 1;
+
+        assert!(
+            r613b_verified_region_layouts(
+                &original, &staged
+            ).is_err()
+        );
+
+        // Losing original records must also remain an error.
+        let smaller = region_map(0x488, 13);
+
+        assert!(
+            r613b_verified_region_layouts(
+                &original, &smaller
+            ).is_err()
         );
     }
 }

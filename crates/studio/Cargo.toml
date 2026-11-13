@@ -1,6 +1,6 @@
 [package]
 name = "legaia-studio"
-version.workspace = true
+version = "2.1.0"
 edition.workspace = true
 license.workspace = true
 description = "Desktop GUI for browsing, previewing and extracting Legend of Legaia disc assets"
@@ -35,6 +35,7 @@ legaia-code-hooks.workspace = true
 legaia-disc-audit.workspace = true
 legaia-engine-audio.workspace = true
 legaia-engine-field.workspace = true
+legaia-engine-motion-vm.workspace = true
 legaia-engine-scene.workspace = true
 legaia-engine-world-views.workspace = true
 legaia-extract.workspace = true
