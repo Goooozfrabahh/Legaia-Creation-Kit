@@ -236,7 +236,7 @@ fn bgr555(c: u16) -> [u8; 3] {
 }
 
 /// The 16-bit VRAM word a textured prim samples at page-local `(u, v)`.
-fn texel(vram: &Vram, cba: u16, tsb: u16, u: usize, v: usize) -> u16 {
+pub(crate) fn texel(vram: &Vram, cba: u16, tsb: u16, u: usize, v: usize) -> u16 {
     let tpage_x = ((tsb & 0xF) as usize) * 64;
     let tpage_y = (((tsb >> 4) & 1) as usize) * 256;
     let clut_x = ((cba & 0x3F) as usize) * 16;

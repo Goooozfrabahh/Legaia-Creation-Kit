@@ -58,7 +58,7 @@ fn main() -> eframe::Result {
         .map(|[w, h]| [w.max(720.0), h.max(480.0)])
         .unwrap_or([1280.0, 820.0]);
     let mut viewport = eframe::egui::ViewportBuilder::default()
-        .with_title("Legaia Creation Kit 2.1")
+        .with_title("Legaia Creation Kit 2.2.0")
         .with_app_id("legaia-studio")
         .with_inner_size(size)
         .with_min_inner_size([720.0, 480.0])
@@ -93,7 +93,7 @@ fn main() -> eframe::Result {
         .build()
         .map_err(eframe::Error::WinitEventLoop)?;
     let app = eframe::create_native(
-        "Legaia Creation Kit 2.1",
+        "Legaia Creation Kit 2.2.0",
         options,
         Box::new(move |_cc| Ok(Box::new(App::new(studio, initial, auto)))),
         &event_loop,

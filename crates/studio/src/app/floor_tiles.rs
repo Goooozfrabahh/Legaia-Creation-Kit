@@ -234,7 +234,7 @@ pub(super) fn adjacent(
 
 // LCK_C2_FLOOR_MASTER_DRAG_V3
 // Group only verified original scene-family IDs.
-fn floor_master(source:&str)->Option<&'static str> {
+pub(super) fn floor_master(source:&str)->Option<&'static str> {
     match source {
         "town01"|"town0b"|"town0c"|"town0d"|"town0e"|
         "jou"|"urudre1" => Some("Rim Elm"),
@@ -285,6 +285,8 @@ pub(super) fn browser(
     search: &str,
     selected: Option<(usize, Face)>,
     scroll_target: Option<(usize, Face)>,
+    favorites:&super::favorites::Store,
+    focus: Option<(usize, Face)>,
 ) -> (Option<(usize, Face)>, bool) {
     let mut indexed:
         BTreeMap<(String, String), Vec<(usize, Face)>> =
@@ -307,6 +309,7 @@ pub(super) fn browser(
         }
     }
 
+    let focus = focus.or(scroll_target);
     let count: usize = indexed.values().map(Vec::len).sum();
     let mut choice = None;
     let mut scrolled = false;
@@ -316,6 +319,7 @@ pub(super) fn browser(
     )
     .id_salt("lck_c2_floors")
     .default_open(false)
+    .open(focus.is_some().then_some(true))
     .show(ui, |ui| {
         ui.small(
             "Original TMD polygons, not fabricated textures. \
@@ -340,6 +344,9 @@ pub(super) fn browser(
             )
             .id_salt(("lck_c2_floor_cell", source.as_str()))
             .default_open(false)
+            .open(focus.is_some_and(|(id,_)|
+                assets.get(id).is_some_and(|a|a.source==*source)
+            ).then_some(true))
             .show(ui, |ui| {
                 for area in ["Interior", "Exterior", "Unclassified"] {
                     let local: Vec<_> = entries.iter()
@@ -357,6 +364,11 @@ pub(super) fn browser(
                     )
                     .id_salt(("lck_c2_floor_area", source.as_str(), area))
                     .default_open(false)
+                    .open(focus.is_some_and(|(id,_)|
+                        assets.get(id).is_some_and(|a|
+                            a.source==*source && category(&a.source).0==area
+                        )
+                    ).then_some(true))
                     .show(ui, |ui| {
                         for shape in [
                             "Flat Squares / 128 x 128",
@@ -376,6 +388,11 @@ pub(super) fn browser(
                         )
                         .id_salt(("lck_c2_floor_type", source.as_str(), area, shape))
                         .default_open(false)
+                        .open(focus.is_some_and(|(id,f)|
+                            assets.get(id).is_some_and(|a|
+                                a.source==*source && f.shape==shape
+                            )
+                        ).then_some(true))
                         .show(ui, |ui| {
                             // Avoid thousands of GUI rows in one frame.
                             for (id, face) in bucket.iter() {
@@ -423,19 +440,41 @@ pub(super) fn browser(
                                 );
 
                                 let row = (*id, *face);
-                                let response = ui.add(
-                                    egui::Button::new(label)
+                                let favorite=super::favorites::Favorite::new(
+                                    asset,Some(*face),names
+                                );
+                                let favored=favorites.has(&favorite);
+                                let response = ui.add_sized(
+                                    egui::vec2(ui.available_width().max(40.0),24.0),
+                                    egui::Button::new(if favored {
+                                        format!("★ {label}")
+                                    }else{label})
                                         .selected(selected == Some(row))
                                         .sense(egui::Sense::click_and_drag())
                                 ).on_hover_text(tip);
 
+                                response.context_menu(|ui|{
+                                    if ui.button(if favored {
+                                        "Remove from Favorites"
+                                    }else{
+                                        "Add to Favorites"
+                                    }).clicked(){
+                                        ui.ctx().data_mut(|data|{
+                                            data.insert_temp(
+                                                egui::Id::new("r622_floor_toggle"),
+                                                favorite.clone()
+                                            );
+                                        });
+                                        ui.close();
+                                    }
+                                    ui.small(format!(
+                                        "Original source: {} | TMD {} | OBJ {} | Face {}",
+                                        asset.source,slot,face.object,face.primitive
+                                    ));
+                                });
+
                                 // Actual per-face drag, not parent TMD drag.
-                                if response.drag_started() ||
-                                    ui.input(|i| i.pointer.primary_pressed() &&
-                                        i.pointer.interact_pos().is_some_and(
-                                            |p| response.rect.contains(p)
-                                        )
-                                    ) {
+                                if response.drag_started() {
                                     ui.ctx().data_mut(|data| {
                                         data.insert_temp(
                                             egui::Id::new("lck_c2_floor_drag_face"),
@@ -451,8 +490,15 @@ pub(super) fn browser(
                                     scrolled = true;
                                 }
 
-                                if response.clicked() {
+                                if response.double_clicked() {
                                     choice = Some(row);
+                                } else if response.clicked() {
+                                    ui.ctx().data_mut(|data| {
+                                        data.insert_temp(
+                                            egui::Id::new("lck_r644d_floor_click"),
+                                            row
+                                        );
+                                    });
                                 }
                             }
 
@@ -474,6 +520,13 @@ pub(super) fn browser(
                 )
                 .id_salt(("lck_c2_floor_master",family.as_str()))
                 .default_open(false)
+                .open(focus.is_some_and(|(id,_)|
+                    assets.get(id).is_some_and(|a|
+                        floor_master(&a.source).is_some_and(|f|
+                            f==family.as_str()
+                        )
+                    )
+                ).then_some(true))
                 .show(ui,|ui| render_variants(ui));
             } else {
                 render_variants(ui);

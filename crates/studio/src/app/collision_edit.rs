@@ -379,7 +379,7 @@ impl State {
                         ui.horizontal(|ui|{
                             let selected=self.selected.contains(&cell);
 
-                            if ui.selectable_label(selected,&label).clicked(){
+                            let response=ui.selectable_label(selected,&label);if response.clicked(){
                                 let ctrl=ui.input(|i|i.modifiers.ctrl);
                                 let shift=ui.input(|i|i.modifiers.shift);
 
@@ -395,6 +395,15 @@ impl State {
 
                                 changed=true;
                             }
+                            response.context_menu(|ui|{
+                                if ui.button("Show in World Repository").clicked(){
+                                    super::repo_jump::request(
+                                        ui.ctx(),
+                                        super::repo_jump::Target::Collision(x,z)
+                                    );
+                                    ui.close();
+                                }
+                            });
 
                             if ui.small_button("Delete").clicked(){
                                 self.set(grid,cell,false);

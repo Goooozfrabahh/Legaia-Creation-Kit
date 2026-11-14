@@ -1,6 +1,6 @@
 [package]
 name = "legaia-studio"
-version = "2.1.0"
+version = "2.2.0"
 edition.workspace = true
 license.workspace = true
 description = "Desktop GUI for browsing, previewing and extracting Legend of Legaia disc assets"

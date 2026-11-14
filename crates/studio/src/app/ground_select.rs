@@ -329,6 +329,16 @@ pub(super) fn hierarchy(
                                             ui.ctx().request_repaint();
                                         }
 
+                                                                                response.context_menu(|ui|{
+                                            if ui.button("Show in World Repository").clicked(){
+                                                super::repo_jump::request(
+                                                    ui.ctx(),
+                                                    super::repo_jump::Target::Ground(cell)
+                                                );
+                                                ui.close();
+                                            }
+                                        });
+
                                         // Only scroll when a new viewport selection requests it.
                                         if *reveal==Some(cell) {
                                             response.scroll_to_me(

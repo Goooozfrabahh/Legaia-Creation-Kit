@@ -668,7 +668,15 @@ fn compile(disc:&mut DiscPatcher,entry:usize,scene:&AssembledScene,world:&WorldM
                 let cell = source(scene, key)?;
                 let at = grid(cell);
                 let word = u16::from_le_bytes(map[at..at+2].try_into()?);
-                map[at..at+2].copy_from_slice(&(word & !511).to_le_bytes());
+                // Remove the descriptor and native rendering gates.
+                // Preserve unrelated upper MAP bits.
+                let gates=field_objects::OBJECT_INDEX_MASK |
+                    field_objects::CELL_VISIBLE |
+                    field_objects::CELL_WALK_VISIBLE;
+
+                map[at..at+2].copy_from_slice(
+                    &(word & !gates).to_le_bytes()
+                );
                 Ok(())
             });
             log.push(format!("WARNING {label}: MAP reference removed; unrelated collision/scripts retained"));

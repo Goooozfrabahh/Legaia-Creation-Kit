@@ -164,25 +164,17 @@ fn plan(
     full: bool
 ) -> Result<Option<Plan>> {
 
+    // LCK_R625B_REGION_RELOCATION
+    // An earlier native export stage may relocate or extend
+    // the region table. Verify the retail prefix through
+    // the already-established adaptive R613B audit.
     let original_layout = read_layout(original)?;
     let exported_layout = read_layout(exported)?;
 
-    ensure!(
-        original_layout.body == exported_layout.body
-            && original_layout.count == exported_layout.count,
-        "Staged region header differs from retail region header"
-    );
-
-    let body = original_layout.body;
-    let count = original_layout.count;
+    let (_retail_body, body, _retail_count, count) =
+        r613b_verified_region_layouts(original, exported)?;
 
     let old_end = BLOCK + body + count * STRIDE;
-
-    ensure!(
-        original[BLOCK + body..old_end]
-            == exported[BLOCK + body..old_end],
-        "Original region records were already changed"
-    );
 
     // Tiles already inside retail type-0 or type-1
     // regions are excluded from newly added regions.
@@ -193,7 +185,7 @@ fn plan(
         for x in 0..128usize {
             for i in 0..count {
                 let o = BLOCK + body + i * STRIDE;
-                let rec = &original[o..o + STRIDE];
+                let rec = &exported[o..o + STRIDE];
 
                 if rec[4] <= 1 && region_covers(rec, x, z) {
                     protected[z * 128 + x] = true;
@@ -320,14 +312,47 @@ fn plan(
     );
 
     ensure!(
-        original[old_end..new_end]
+        exported[old_end..new_end]
             .iter()
             .all(|b| *b == 0)
         &&
+        (
+            original_layout.body != exported_layout.body
+            || original_layout.count != exported_layout.count
+            || original[old_end..new_end]
+                .iter()
+                .all(|b| *b == 0)
+        ),
+        "R632 REGION CONFLICT - EXPORT BLOCKED, NO OVERWRITE: retail_body=0x{:X}, staged_body=0x{:X}, retail_regions={}, staged_regions={}, adding_regions={}, append_MAP_offsets=0x{:X}..0x{:X}, retail_nonzero={}, staged_nonzero={}, first_retail_bytes={:?}, first_staged_bytes={:?}. CAUSE: an earlier IMG export stage occupies bytes required for additional native region records. SUGGESTED FIX: identify the stage that owns the occupied offsets and relocate the region table into verified free storage while preserving both operations. For warp-only exports, avoid including unnecessary geometry edits that request full-region expansion.",
+        original_layout.body,
+        body,
+        original_layout.count,
+        count,
+        rects.len(),
+        old_end,
+        new_end,
+        original[old_end..new_end]
+            .iter()
+            .filter(|&&b|b!=0)
+            .count(),
         exported[old_end..new_end]
             .iter()
-            .all(|b| *b == 0),
-        "MAP region padding is occupied"
+            .filter(|&&b|b!=0)
+            .count(),
+        original[old_end..new_end]
+            .iter()
+            .enumerate()
+            .filter(|(_,b)|**b!=0)
+            .take(12)
+            .map(|(i,&b)|(old_end+i,b))
+            .collect::<Vec<_>>(),
+        exported[old_end..new_end]
+            .iter()
+            .enumerate()
+            .filter(|(_,b)|**b!=0)
+            .take(12)
+            .map(|(i,&b)|(old_end+i,b))
+            .collect::<Vec<_>>()
     );
 
     let mut appended =
@@ -996,5 +1021,88 @@ mod r613b_adaptive_audit_tests {
                 &original, &smaller
             ).is_err()
         );
+    }
+}
+
+
+// LCK_R625B_REGION_RELOCATION
+#[cfg(test)]
+mod lck_r625b_region_tests {
+    use super::*;
+
+    fn test_map()->Vec<u8> {
+        let mut map=vec![0u8;MAP_LENGTH];
+
+        map[BLOCK+0x0e..BLOCK+0x10]
+            .copy_from_slice(&0x484i16.to_le_bytes());
+
+        map[BLOCK+0x10..BLOCK+0x12]
+            .copy_from_slice(&14i16.to_le_bytes());
+
+        let row=BLOCK+0x484+5*STRIDE;
+
+        map[row..row+8]
+            .copy_from_slice(&[9,60,45,0,0,0,0,0]);
+
+        map
+    }
+
+    #[test]
+    fn accepts_relocated_extended_region_table(){
+        let original=test_map();
+        let mut staged=original.clone();
+
+        let old_start=BLOCK+0x484;
+        let new_start=BLOCK+0x488;
+        let length=14*STRIDE;
+
+        staged[new_start..new_start+length]
+            .copy_from_slice(
+                &original[old_start..old_start+length]
+            );
+
+        staged[BLOCK+0x0e..BLOCK+0x10]
+            .copy_from_slice(&0x488i16.to_le_bytes());
+
+        staged[BLOCK+0x10..BLOCK+0x12]
+            .copy_from_slice(&15i16.to_le_bytes());
+
+        staged[new_start+length..new_start+length+8]
+            .copy_from_slice(&[0,0,16,16,0,0,0,0]);
+
+        staged[0x4000+88*128+88]=1;
+
+        let p=plan(&original,&staged,false)
+            .unwrap()
+            .expect("New region required");
+
+        assert_eq!(p.table_start,new_start);
+        assert_eq!(
+            p.append_offset,
+            new_start+15*STRIDE
+        );
+        assert!(p.count>15);
+    }
+
+    #[test]
+    fn rejects_corrupted_retail_region(){
+        let original=test_map();
+        let mut staged=original.clone();
+
+        let old_start=BLOCK+0x484;
+        let new_start=BLOCK+0x488;
+        let length=14*STRIDE;
+
+        staged[new_start..new_start+length]
+            .copy_from_slice(
+                &original[old_start..old_start+length]
+            );
+
+        staged[BLOCK+0x0e..BLOCK+0x10]
+            .copy_from_slice(&0x488i16.to_le_bytes());
+
+        staged[new_start+5*STRIDE]^=1;
+
+        assert!(plan(&original,&staged,false).is_err());
     }
 }

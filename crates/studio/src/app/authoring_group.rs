@@ -52,6 +52,14 @@ pub(super) fn create(groups:&mut Vec<Group>,requested:BTreeSet<Member>)->Result<
     groups.push(Group{id:next,members:all.into_iter().collect()});
     Ok(next)
 }
+/// Remove deleted members without leaving invalid orphan groups.
+pub(super) fn prune_deleted(groups:&mut Vec<Group>,deleted:&BTreeSet<Member>){
+    for group in groups.iter_mut(){
+        group.members.retain(|member|!deleted.contains(member));
+    }
+    groups.retain(|group|group.members.len()>=2);
+}
+
 pub(super) fn ungroup(groups:&mut Vec<Group>,member:&Member)->bool{
     let n=groups.len();groups.retain(|g|!g.members.contains(member));n!=groups.len()
 }

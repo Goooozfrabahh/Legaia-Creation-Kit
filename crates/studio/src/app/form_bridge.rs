@@ -607,6 +607,7 @@ impl Session {
                 .insert(cache_key, std::sync::Arc::new(native.clone()));
             native
         };
+        let r641_map=r641_map_identity(scene,index)?;
         let references = self
             .project
             .database
@@ -631,7 +632,7 @@ impl Session {
         for r in references.iter().filter(|r| context.contains(&r.key)) {
             if let Some(origin) = &r.origin {
                 if origin.scene.as_deref() == Some(&scene.name) {
-                    if let Some(key) = native_key(scene, &world, origin) {
+                    if let Some(key) = r641_native_key(scene, &world, origin, r641_map.as_ref()) {
                         claimed.insert(key);
                         let same = self
                             .project
@@ -662,7 +663,7 @@ impl Session {
                 .origin
                 .as_ref()
                 .filter(|o| o.scene.as_deref() == Some(&scene.name))
-                .and_then(|o| native_key(scene, &world, o));
+                .and_then(|o| r641_native_key(scene, &world, o, r641_map.as_ref()));
             let reusable = native.filter(|_| context.contains(&r.key)).filter(|_| {
                 adapter
                     .as_ref()
@@ -1424,6 +1425,156 @@ mod tests {
             text.contains(&format!("FOREIGN_STATIC\t{uid}\n")),
             "Static flag did not reach native writer manifest"
         );
+        Ok(())
+    }
+}
+
+// R641_NATIVE_DRAW_IDENTITY
+// Native identity belongs to MAP data; collision metadata is optional.
+struct R641MapIdentity {entry:u32,bytes:std::sync::Arc<Vec<u8>>}
+
+fn r641_map_identity(scene:&AssembledScene,index:&ProtIndex)->Result<Option<R641MapIdentity>> {
+    let native=legaia_engine_scene::scene::Scene::load(index,&scene.name)?;
+    native.field_map_index(index).map(|entry|
+        index.entry_bytes(entry).map(|bytes|R641MapIdentity{entry,bytes})
+    ).transpose()
+}
+
+fn r641_origin_matches(scene:&str,origin:&NativeOrigin,map:&R641MapIdentity)->bool {
+    if origin.scene.as_deref()!=Some(scene) || origin.prot_entry!=Some(map.entry) {return false;}
+    let Some([x,z])=origin.cell else{return false;};
+    if x>=128 || z>=128 {return false;}
+    let at=0x8000+(z as usize*128+x as usize)*2;
+    let Some(bytes)=map.bytes.get(at..at+2) else{return false;};
+    Some(u16::from_le_bytes([bytes[0],bytes[1]])&511)==origin.descriptor
+}
+
+fn r641_native_key(scene:&AssembledScene,world:&WorldModel,origin:&NativeOrigin,
+    map:Option<&R641MapIdentity>)->Option<DrawKey> {
+    if let Some(key)=native_key(scene,world,origin) {return Some(key);}
+    if origin.man_record.is_some() || origin.source_identity.contains(":terrain-cell:") {return None;}
+    if !r641_origin_matches(&scene.name,origin,map?) {return None;}
+    let cell=origin.cell?;
+    let mut matches=scene.placements.iter().enumerate().filter(|(_,draw)|[draw.cell.0,draw.cell.1]==cell);
+    let (ordinal,_)=matches.next()?;
+    if matches.next().is_some() {return None;}
+    world.at(false,ordinal).filter(|draw|draw.editor_uid.is_none())?;
+    Some((false,ordinal))
+}
+
+impl Session {
+    // Old snapshots can contain renderer-generated HIDE/INSTANCE pairs for
+    // native references without collision provenance. Remove only pairs proven
+    // to represent the same authoritative native Reference and transform.
+    pub(super) fn r641_repair_projection_snapshot(&self,scene:&AssembledScene,index:&ProtIndex,
+        world:&WorldModel,document:&mut scene_instances::SceneDocument)->Result<usize> {
+        if !document.moves.is_empty() || !document.foreign.is_empty() ||
+            !document.names.is_empty() || !document.rotations.is_empty() ||
+            !document.scales.is_empty() || !document.animations.is_empty() ||
+            !document.models.is_empty() || !document.groups.is_empty() ||
+            !document.mesh_collision.is_empty() || !document.collision_recipes.is_empty() {
+            return Ok(0);
+        }
+        let cell=self.cell.as_ref().context("Active project cell missing")?;
+        let map=r641_map_identity(scene,index)?;
+        let mut pairs=BTreeMap::new();
+        for created in &document.created {
+            let Some(uid)=self.project.render_uids.iter().find(|uid|&uid.cell==cell && uid.uid==created.uid) else {continue;};
+            if !self.project.legacy_bindings.iter().any(|b|&b.cell==cell && b.uid.is_none() && b.reference==uid.reference) {continue;}
+            let Some(reference)=self.project.database.reference(&uid.reference) else{continue;};
+            if &reference.cell!=cell || reference.deleted || reference.disabled {continue;}
+            let Some(origin)=reference.origin.as_ref() else{continue;};
+            if !self.project.base_adapters.get(&reference.base).and_then(|a|a.origin.as_ref())
+                .is_some_and(|a|a.source_identity==origin.source_identity) {continue;}
+            let Some(key)=r641_native_key(scene,world,origin,map.as_ref()) else{continue;};
+            if !document.hidden.contains(&key) {continue;}
+            let Some(source)=world.at(created.source.0,created.source.1).filter(|d|d.editor_uid.is_none()) else{continue;};
+            if (0..3).any(|a|(source.original_center[a]+created.offset[a]-reference.transform.position[a]).abs()>0.01) {continue;}
+            // A deleted original can only be repaired when its emitted clone
+            // uses the same native Base geometry, never a user substitution.
+            let Some(adapter)=self.project.base_adapters.get(&reference.base) else{continue;};
+            let ordinal=resolve_ordinal(scene,adapter)?;
+            if created.source!=(false,ordinal) {continue;}
+            pairs.insert(created.uid,key);
+        }
+        if pairs.is_empty() {return Ok(0);}
+        let keys=pairs.values().copied().collect::<BTreeSet<_>>();
+        document.created.retain(|created|!pairs.contains_key(&created.uid));
+        document.hidden.retain(|key|!keys.contains(key));
+        Ok(pairs.len())
+    }
+}
+
+#[cfg(test)]
+mod r641_identity_unit_tests {
+    use super::*;
+    #[test]
+    fn map_identity_requires_scene_entry_cell_and_descriptor_agreement() {
+        let mut origin=NativeOrigin{source_identity:"map03:MAP:Some(389):descriptor:Some(7)".into(),
+            scene:Some("map03".into()),prot_entry:Some(389),descriptor:Some(7),
+            man_record:None,anchor:None,cell:Some([9,10]),fingerprints:Default::default()};
+        let mut map=R641MapIdentity{entry:389,bytes:std::sync::Arc::new(vec![0;0x10000])};
+        let at=0x8000+(10*128+9)*2;std::sync::Arc::make_mut(&mut map.bytes)[at..at+2].copy_from_slice(&7u16.to_le_bytes());
+        assert!(r641_origin_matches("map03",&origin,&map));
+        assert!(!r641_origin_matches("town01",&origin,&map));
+        origin.descriptor=Some(8);assert!(!r641_origin_matches("map03",&origin,&map));
+        origin.descriptor=Some(7);origin.prot_entry=Some(390);assert!(!r641_origin_matches("map03",&origin,&map));
+        origin.prot_entry=Some(389);origin.cell=Some([128,10]);assert!(!r641_origin_matches("map03",&origin,&map));
+    }
+}
+
+#[cfg(test)]
+mod r641_projection_tests {
+    use super::*;
+    #[test]
+    #[ignore="requires the user's retail source image; headless read-only native projection"]
+    fn untouched_map03_keeps_native_objects_instead_of_creating_export_copies()->Result<()> {
+        let source=Path::new(r"D:\Emulators\Games\Legend of Legaia\LegendOfLegaia.img");
+        let lib=crate::library::Library::open(source)?;
+        let scene=legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,"map03")
+            .map_err(anyhow::Error::msg)?;
+        let mut native=world_view::build_world(&scene,&lib.index);
+        super::super::native_wall_export::attach_preview(source,&scene,&mut native,&lib.index);
+        let before=scene_instances::serialize("map03",&native);
+        let mut session=Session::temporary(source,&lib.index)?;
+        let projected=session.enter(&scene,&lib.index,&native,"original:map03".into(),"Karisto".into(),None)?;
+        let after=scene_instances::serialize("map03",&projected);
+        let hides=after.lines().filter(|l|l.starts_with("HIDE\t")).count();
+        let copies=after.lines().filter(|l|l.starts_with("INSTANCE\t")).count();
+        println!("map03 native placements={} collision identities={} export HIDE={} INSTANCE={}",scene.placements.len(),native.collision.sources.len(),hides,copies);
+        ensure!(after==before,"Untouched map03 projection fabricated {hides} hides and {copies} copies");
+        Ok(())
+    }
+    #[test]
+    #[ignore="requires retail image and existing saved project; read-only repair acceptance"]
+    fn existing_map03_snapshot_repairs_phantoms_and_preserves_real_duplication()->Result<()> {
+        let source=Path::new(r"D:\Emulators\Games\Legend of Legaia\LegendOfLegaia.img");
+        let lib=crate::library::Library::open(source)?;
+        let scene=legaia_engine_world_views::scene_staging::assemble_field_scene(&lib.index,"map03")
+            .map_err(anyhow::Error::msg)?;
+        let mut native=world_view::build_world(&scene,&lib.index);
+        super::super::native_wall_export::attach_preview(source,&scene,&mut native,&lib.index);
+        let project:LckProject=serde_json::from_slice(&std::fs::read(r"D:\AstraRimElmProject\1TestImgfiles\Legaia.lckproject")?)?;
+        let raw=project.cell_snapshots.get("original:map03").context("Existing map03 snapshot missing")?.clone();
+        let mut session=Session::temporary(source,&lib.index)?;
+        session.mount_project(project)?;
+        let mut projected=session.enter(&scene,&lib.index,&native,"original:map03".into(),"Karisto".into(),None)?;
+        let overlay=super::super::ground_edit_ops::strip(&raw);
+        let mut document=scene_instances::parse(&overlay,"map03",&projected).map_err(anyhow::Error::msg)?;
+        let count=session.r641_repair_projection_snapshot(&scene,&lib.index,&projected,&mut document)?;
+        println!("Existing saved map03 repaired {count} derived native replacements; retained {} user copies",document.created.len());
+        ensure!(count==218,"Expected the known 218 original-reference shadows, got {count}");
+        ensure!(document.hidden.is_empty() && document.created.is_empty(),"Phantom object operations remain");
+        scene_instances::apply(&document,&mut projected,scene.placements.len(),&lib.index).map_err(anyhow::Error::msg)?;
+        ensure!(scene_instances::serialize("map03",&projected)==scene_instances::serialize("map03",&native),"Saved repair altered the original map objects");
+        let reference=session.reference_at(&projected,(false,25)).context("Native reference missing")?;
+        session.duplicate(&[reference])?;
+        let duplicated=session.render(&scene,&lib.index)?;
+        let text=scene_instances::serialize("map03",&duplicated);
+        let mut real=scene_instances::parse(&text,"map03",&duplicated).map_err(anyhow::Error::msg)?;
+        ensure!(real.created.len()==1,"Explicit user duplication was not retained");
+        ensure!(session.r641_repair_projection_snapshot(&scene,&lib.index,&duplicated,&mut real)?==0,"Explicit copy was incorrectly repaired away");
+        ensure!(real.created.len()==1,"Explicit user copy was lost");
         Ok(())
     }
 }

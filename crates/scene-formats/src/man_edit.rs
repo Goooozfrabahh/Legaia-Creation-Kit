@@ -1183,3 +1183,7 @@ fn write_u16_le(buf: &mut [u8], at: usize, v: u16) {
 
 #[cfg(test)]
 mod tests;
+
+// LCK_R620_INDEPENDENT_CROSS_CELL
+mod warp_author;
+pub use warp_author::{IndependentWarp,append_independent_warps};

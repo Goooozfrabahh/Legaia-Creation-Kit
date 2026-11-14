@@ -116,7 +116,10 @@ mod collision_edit;
 mod floor_debug;
 mod object_collision;
 mod global_repository;
+mod repo_jump;
 mod floor_tiles;
+mod favorites;
+mod native_floor_repository;
 mod ground_select;
 mod ground_edit_ops;
 mod marquee_selection;
@@ -795,6 +798,12 @@ fn editor_hierarchy_row(ui: &mut egui::Ui, label: String,
         if ui.button("Preview").clicked() {
             *chosen=Some((EditorCatalogItem::Draw(key.0,key.1),true)); ui.close();
         }
+        if ui.button("Show in World Repository").clicked() {
+            repo_jump::request(
+                ui.ctx(),repo_jump::Target::Draw(key.0,key.1)
+            );
+            ui.close();
+        }
         if ui.button("Rename").clicked() { *rename=Some(key); ui.close(); }
     });
     response.rect
@@ -802,16 +811,104 @@ fn editor_hierarchy_row(ui: &mut egui::Ui, label: String,
 
 /// One editor cell is selected at a time; context menu operations are
 /// deferred so they never mutate or invalidate the catalog while iterating.
+// LCK_R627_SHARED_CELL_FAMILIES
+// Shared by Original PS1 Cells and Warp Properties.
+// This function changes display labels only, never CDNAME.
+fn lck_r627_cell_family(name:&str)->String {
+    match name {
+                                "town01"|"town0b"|"town0c"|"town0d"|"town0e"|"jou" => "Rim Elm".to_owned(),
+                                "conc"|"conc2"|"conc3"|"concnow"|"concend" => "Conkram".to_owned(),
+                                "rayman"|"rayman2"|"ropeway"|"ropeway2"|"station" => "Octam".to_owned(),
+                                "bubu1"|"bubu2"|"edbubu" => "Buma".to_owned(),
+                                "balden"|"balden2"|"edbalden" => "Vidna".to_owned(),
+                                "retock"|"retockin"|"edretoin" => "Ratayu".to_owned(),
+                                "bylon"|"edbylon" => "Biron Monastery".to_owned(),
+                                "dolk"|"dolk2" => "Drake Castle".to_owned(),
+                                "kor"|"kor3"|"kor4"|"kor5"|"korb2"|"korb3"|"korout"|
+                                "koin1"|"koin1b"|"koin2"|"koin3"|"koin4"|"koin6"|"edkorout" => "Sol Tower".to_owned(),
+                                "jouina"|"jouinb"|"jouinc"|"jouind"|"jouine"|"juui1"|"juui2" => "Bio Castle".to_owned(),
+                                "deroa"|"chitei2" => "Jette's Fortress".to_owned(),
+                                "taiku"|"taiku2" => "Zora's Floating Castle".to_owned(),
+                                "nilboa"|"nilboa2" => "Nivora Ravine".to_owned(),
+                                "uru"|"uru2" => "Uru Mais".to_owned(),
+                                "tunnelb"|"tunnelc" => "Fire Path".to_owned(),
+                                "teien"|"edteien" => "Sky Gardens".to_owned(),
+                                "doman"|"eddoman" => "Usha Research Center".to_owned(),
+                                "son"|"edson" => "Soren Camp".to_owned(),
+                                _ => {let native=crate::place_name(name).unwrap_or(name);native.split(" (").next().unwrap_or(native).trim().to_owned()},
+    }
+}
+// LCK_R642C_SECONDARY_CELL
+// Editor navigation only. No native exporter or project schema changes.
+#[derive(Default)]
+struct R642CellPair {
+    primary: Option<CellSelection>,
+    secondary: Option<CellSelection>,
+}
+
+impl R642CellPair {
+    fn is_secondary(&self, active: &Option<CellSelection>) -> bool {
+        self.secondary.as_ref().is_some_and(|c| active.as_ref()==Some(c))
+    }
+
+    fn target(&self, active: &Option<CellSelection>) -> Option<CellSelection> {
+        if self.is_secondary(active) {
+            self.primary.clone()
+        } else {
+            self.secondary.clone()
+        }
+    }
+}
+
+#[cfg(test)]
+mod r642_secondary_cell_tests {
+    use super::*;
+
+    #[test]
+    fn original_variants_switch_both_directions() {
+        let a=CellSelection::Original("town01".into());
+        let b=CellSelection::Original("town0b".into());
+        let pair=R642CellPair{primary:Some(a.clone()),secondary:Some(b.clone())};
+        assert_eq!(pair.target(&Some(a.clone())),Some(b.clone()));
+        assert_eq!(pair.target(&Some(b)),Some(a));
+    }
+
+    #[test]
+    fn project_copy_is_independent_secondary() {
+        let a=CellSelection::Original("town01".into());
+        let b=CellSelection::Copy(42);
+        let pair=R642CellPair{primary:Some(a.clone()),secondary:Some(b.clone())};
+        assert_eq!(pair.target(&Some(a)),Some(b));
+    }
+}
 fn editor_cell_row(ui: &mut egui::Ui, id: CellSelection, label: String,
     selected: &mut Option<CellSelection>, focus_cell: &mut bool,
     choose: &mut Option<CellSelection>, duplicate: &mut Option<CellSelection>,
-    rename: &mut Option<CellSelection>, properties: &mut Option<CellSelection>) {
+    rename: &mut Option<CellSelection>, properties: &mut Option<CellSelection>,
+    repository:&mut Option<CellSelection>,
+    primary:&Option<CellSelection>,
+    secondary:&Option<CellSelection>,
+    request_secondary:&mut Option<CellSelection>) {
+    let label=if primary.as_ref()==Some(&id) {
+        format!("{label} [Primary]")
+    } else if secondary.as_ref()==Some(&id) {
+        format!("{label} [Secondary]")
+    } else {label};
     let response=ui.selectable_label(selected.as_ref()==Some(&id),label);
     if response.clicked() { *selected=Some(id.clone()); *choose=Some(id.clone()); *focus_cell=true; }
-    if response.secondary_clicked() { *selected=Some(id.clone()); *focus_cell=true; }
     response.context_menu(|ui| {
+        if primary.is_some() && primary.as_ref()!=Some(&id) {
+            if ui.button("Enable Secondary Cell").clicked() {
+                *request_secondary=Some(id.clone());
+                ui.close();
+            }
+        }
         if ui.button("Properties").clicked() { *properties=Some(id.clone()); ui.close(); }
         if ui.button("Duplicate (Ctrl+D)").clicked() { *duplicate=Some(id.clone()); ui.close(); }
+        if ui.button("Show in World Repository").clicked() {
+            *repository=Some(id.clone());
+            ui.close();
+        }
         if ui.button("Rename").clicked() { *rename=Some(id); ui.close(); }
     });
 }
@@ -1079,6 +1176,12 @@ pub struct App {
     global_repository_failures: usize,
     global_repository_drag: Option<usize>,
     global_repository_selected: Option<usize>,
+    native_floor_tiles:Vec<native_floor_repository::Tile>,
+    native_floor_selected:Option<native_floor_repository::Key>,
+    native_floor_reveal:Option<native_floor_repository::Key>,
+    native_floor_jump_cell:Option<(String,[u8;2])>,
+    native_floor_drag:Option<native_floor_repository::Key>,
+    favorites_store: favorites::Store,
     /// (global ID, preview=true / properties=false)
     global_repository_dialog: Option<(usize,bool)>,
     global_repository_preview: Option<GlobalAssetPreview>,
@@ -1093,12 +1196,20 @@ pub struct App {
     global_floor_face: Option<(String,usize,floor_tiles::Face)>,
     global_floor_scroll_target: Option<(usize,floor_tiles::Face)>,
     global_repository_scroll_target: Option<usize>,
+    repo_jump_focus_id: Option<usize>,
+    repo_jump_pending: Option<repo_jump::Target>,
+    r625_pending_source:Option<String>,
+    repo_jump_native: Option<repo_jump::SourcePreview>,
+    repo_jump_reveal: bool,
+    repo_jump_view: Viewport,
     /// Independent left-pane cell browser (separate scroll and drag-to-resize splitter).
     editor_tree_generation: u64,
     editor_cell_search: String,
     editor_cells: CellStore,
     editor_cell_selected: Option<CellSelection>,
     editor_cell_active: Option<CellSelection>,
+    r642_pair: R642CellPair,
+    r642_toggle_requested: bool,
     editor_cell_rename: Option<(CellSelection, String)>,
     editor_cell_properties: Option<CellSelection>,
     editor_cell_last_autosave: f64,
@@ -1330,6 +1441,12 @@ impl App {
             global_repository_failures: 0,
             global_repository_drag: None,
             global_repository_selected: None,
+            native_floor_tiles:Vec::new(),
+            native_floor_selected:None,
+            native_floor_reveal:None,
+            native_floor_jump_cell:None,
+            native_floor_drag:None,
+            favorites_store: favorites::Store::load(),
             global_repository_dialog: None,
             global_repository_preview: None,
             global_repository_preview_view: Viewport::new(Shading::Textured),
@@ -1342,11 +1459,19 @@ impl App {
             global_floor_face: None,
             global_floor_scroll_target: None,
             global_repository_scroll_target: None,
+            repo_jump_focus_id: None,
+            repo_jump_pending: None,
+            r625_pending_source:None,
+            repo_jump_native: None,
+            repo_jump_reveal: false,
+            repo_jump_view: Viewport::new(Shading::Textured),
             editor_tree_generation: 0,
             editor_cell_search: String::new(),
             editor_cells,
             editor_cell_selected: None,
             editor_cell_active: None,
+            r642_pair: R642CellPair::default(),
+            r642_toggle_requested: false,
             editor_cell_rename: None,
             editor_cell_properties: None,
             editor_cell_last_autosave: 0.0,
@@ -1447,6 +1572,8 @@ impl App {
 
     fn open_path(&mut self, p: &Path) {
         self.save_active_editor_cell();
+        self.r642_pair=R642CellPair::default();
+        self.r642_toggle_requested=false;
         match CellStore::open(Some(p)) {
             Ok(cells)=>{self.editor_cells=cells;self.editor_cell_selected=None;self.editor_cell_active=None;
                 self.editor_cell_rename=None;self.editor_cell_properties=None;},
@@ -1462,6 +1589,15 @@ impl App {
         // A newly opened disc has a different asset identity / index.
         // Dropping the receiver cancels the old scan on its next send.
         self.global_repository.clear();
+        self.native_floor_tiles.clear();
+        self.native_floor_selected=None;
+        self.native_floor_reveal=None;
+        self.native_floor_jump_cell=None;
+        self.native_floor_drag=None;
+        self.repo_jump_pending=None;
+        self.r625_pending_source=None;
+        self.repo_jump_focus_id=None;
+        self.repo_jump_native=None;
         self.global_floor_face=None;
         self.global_floor_scroll_target=None;
         self.global_repository_scroll_target=None;
@@ -1705,7 +1841,134 @@ impl App {
 
     /// The app-wide shortcuts that are not tied to a widget: Ctrl+O, F5
     /// (Play), Ctrl+1..4 (the views).
+    // LCK_R643_EDITOR_HOTKEYS
+    fn r643_floor_mode(&mut self, enable:bool) {
+        self.ground_edit_mode=enable;
+        self.native_collision_wire_visible=false;
+        self.ground_click=None;
+        self.ground_active=None;
+
+        if enable {
+            self.native_ground_visible=true;
+            self.native_selected=None;
+            self.native_selection.clear();
+            self.native_selection_click=None;
+            self.native_drag=None;
+            self.native_view.world_selected.clear();
+        }
+
+        self.native_view.version=self.native_view.version.wrapping_add(1);
+    }
+
+    fn r643_collision_mode(&mut self, enable:bool) {
+        self.ground_edit_mode=enable;
+        self.native_collision_wire_visible=enable;
+        self.ground_click=None;
+        self.ground_active=None;
+
+        if enable {
+            self.native_ground_visible=true;
+            self.native_selected=None;
+            self.native_selection.clear();
+            self.native_selection_click=None;
+            self.native_drag=None;
+            self.native_view.world_selected.clear();
+        }
+
+        self.native_view.version=self.native_view.version.wrapping_add(1);
+    }
+
+    fn r643_hotkeys(&mut self, ctx:&egui::Context) {
+        if self.mode!=Mode::Editor
+            || ctx.wants_keyboard_input()
+            || self.editor_modal.is_some()
+            || self.global_repository_dialog.is_some()
+            || self.editor_rename.is_some()
+            || self.editor_cell_rename.is_some()
+            || self.editor_cell_properties.is_some()
+            || self.pending_native_scene.is_some()
+            || !self.native_scene.as_ref().is_some_and(
+                |(_,slot)|matches!(slot,NativeSceneSlot::Ready(..))
+            )
+        {
+            return;
+        }
+
+        let modifiers=ctx.input(|i|i.modifiers);
+
+        if modifiers.matches_exact(egui::Modifiers::SHIFT)
+            && ctx.input_mut(|i|i.consume_key(
+                egui::Modifiers::SHIFT,egui::Key::W
+            ))
+        {
+            let enabled=self.doors.r643_toggle_local_warps();
+
+            // Keep the native overlay's existing runtime visibility rules.
+            self.native_warp_editor.marker_overlay_visible=
+                self.doors.v2083_local_warps_visible();
+
+            self.native_view.version=
+                self.native_view.version.wrapping_add(1);
+
+            self.studio.status=Some(format!(
+                "Local Warps category: {}",
+                if enabled {"ON"}else{"OFF"}
+            ));
+
+            ctx.request_repaint();
+            return;
+        }
+
+        let alt_space=(
+            modifiers.matches_exact(egui::Modifiers::ALT)
+            && ctx.input_mut(|i|i.consume_key(
+                egui::Modifiers::ALT,egui::Key::Space
+            ))
+        ) || (
+            modifiers.matches_exact(
+                egui::Modifiers::CTRL | egui::Modifiers::ALT
+            )
+            && ctx.input_mut(|i|i.consume_key(
+                egui::Modifiers::CTRL | egui::Modifiers::ALT,
+                egui::Key::Space
+            ))
+        );
+
+        if alt_space {
+            let active=self.ground_edit_mode
+                && self.native_collision_wire_visible;
+
+            self.r643_collision_mode(!active);
+
+            self.studio.status=Some(format!(
+                "Select Collision: {}",
+                if !active {"ON"}else{"OFF"}
+            ));
+
+            ctx.request_repaint();
+            return;
+        }
+
+        if modifiers.matches_exact(egui::Modifiers::NONE)
+            && ctx.input_mut(|i|i.consume_key(
+                egui::Modifiers::NONE,egui::Key::Space
+            ))
+        {
+            let active=self.ground_edit_mode
+                && !self.native_collision_wire_visible;
+
+            self.r643_floor_mode(!active);
+
+            self.studio.status=Some(format!(
+                "Select Floors: {}",
+                if !active {"ON"}else{"OFF"}
+            ));
+
+            ctx.request_repaint();
+        }
+    }
     fn shortcuts(&mut self, ctx: &egui::Context) {
+        self.r643_hotkeys(ctx);
         let cmd = |k| egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, k);
         if ctx.input_mut(|i| i.consume_shortcut(&cmd(egui::Key::O))) {
             self.lck_menu_project=Some(form_ui::Action::Open);
@@ -1780,9 +2043,12 @@ impl App {
 
                     if let Some(raw)=snapshot {
                         let overlay=ground_edit_ops::strip(&raw);
-                        let document=scene_instances::parse(
+                        let mut document=scene_instances::parse(
                             &overlay,&source,&preview
                         ).map_err(anyhow::Error::msg)?;
+                        session.r641_repair_projection_snapshot(
+                            &scene,&lib.index,&preview,&mut document
+                        )?;
                         scene_instances::apply(
                             &document,&mut preview,
                             scene.placements.len(),&lib.index
@@ -2223,6 +2489,76 @@ impl App {
         }
     }
 
+    fn r642_assign_secondary(&mut self, cell: CellSelection) {
+        if self.pending_native_scene.is_some() {
+            self.studio.error=Some("Finish loading the current cell first".into());
+            return;
+        }
+
+        let Some(active)=self.editor_cell_active.clone() else {
+            self.studio.error=Some("Select a primary cell first".into());
+            return;
+        };
+
+        let primary=self.r642_pair.primary.clone()
+            .unwrap_or_else(||active.clone());
+
+        if active!=primary {
+            self.studio.error=Some(
+                "Return to Primary before assigning a different secondary cell".into()
+            );
+            return;
+        }
+
+        if primary==cell {
+            self.studio.error=Some("Primary and secondary must differ".into());
+            return;
+        }
+
+        if self.editor_cells.source(&cell).is_none() {
+            self.studio.error=Some("Secondary cell is unavailable".into());
+            return;
+        }
+
+        let label=self.editor_cells.label(&cell)
+            .unwrap_or_else(||format!("{cell:?}"));
+
+        self.r642_pair=R642CellPair{
+            primary:Some(primary.clone()),
+            secondary:Some(cell),
+        };
+
+        self.editor_cell_selected=Some(primary);
+        self.studio.status=Some(format!("Secondary cell assigned: {label}"));
+    }
+
+    fn r642_toggle_secondary(&mut self) {
+        if self.pending_native_scene.is_some() {return;}
+
+        let Some(target)=self.r642_pair.target(&self.editor_cell_active)
+        else {return;};
+
+        if self.editor_cells.source(&target).is_none() {
+            self.r642_pair=R642CellPair::default();
+            self.studio.error=Some("Assigned cell no longer exists".into());
+            return;
+        }
+
+        // Use normal navigation, including its scene snapshot path.
+        self.select_editor_cell(target);
+    }
+
+    fn r642_reconcile_secondary(&mut self) {
+        if self.pending_native_scene.is_some() {return;}
+        if self.r642_pair.secondary.is_none() {return;}
+
+        if let Some(active)=self.editor_cell_active.as_ref() {
+            if self.r642_pair.primary.as_ref()!=Some(active)
+                && self.r642_pair.secondary.as_ref()!=Some(active) {
+                self.r642_pair=R642CellPair::default();
+            }
+        }
+    }
     fn select_editor_cell(&mut self, cell: CellSelection) {
         if self.editor_cell_active.as_ref()==Some(&cell) &&
             self.native_scene.as_ref().is_some_and(|(_,slot)|matches!(slot,NativeSceneSlot::Ready(..)|NativeSceneSlot::Loading(..))) {
@@ -2286,6 +2622,11 @@ impl App {
         let mut duplicate=None;
         let mut rename=None;
         let mut properties=None;
+        let mut repository=None;
+        let mut request_secondary=None;
+        let primary_cell=self.r642_pair.primary.clone()
+            .or_else(||self.editor_cell_active.clone());
+        let secondary_cell=self.r642_pair.secondary.clone();
         let mut focus_cell=false;
         let term=self.editor_cell_search.trim().to_lowercase();
         let copies=self.editor_cells.copies.values().cloned().collect::<Vec<_>>();
@@ -2304,28 +2645,7 @@ impl App {
                             let id=CellSelection::Original(cell.name.clone());
                             let label=self.editor_cells.label(&id).unwrap_or_else(||cell.name.clone());
                             let row=format!("{label}  ({})",cell.name);
-                            let family=match cell.name.as_str() {
-                                "town01"|"town0b"|"town0c"|"town0d"|"town0e"|"jou" => "Rim Elm".to_owned(),
-                                "conc"|"conc2"|"conc3"|"concnow"|"concend" => "Conkram".to_owned(),
-                                "rayman"|"rayman2"|"ropeway"|"ropeway2"|"station" => "Octam".to_owned(),
-                                "bubu1"|"bubu2"|"edbubu" => "Buma".to_owned(),
-                                "balden"|"balden2"|"edbalden" => "Vidna".to_owned(),
-                                "retock"|"retockin"|"edretoin" => "Ratayu".to_owned(),
-                                "bylon"|"edbylon" => "Biron Monastery".to_owned(),
-                                "dolk"|"dolk2" => "Drake Castle".to_owned(),
-                                "kor"|"kor3"|"kor4"|"kor5"|"korb2"|"korb3"|"korout"|
-                                "koin1"|"koin1b"|"koin2"|"koin3"|"koin4"|"koin6"|"edkorout" => "Sol Tower".to_owned(),
-                                "jouina"|"jouinb"|"jouinc"|"jouind"|"jouine"|"juui1"|"juui2" => "Bio Castle".to_owned(),
-                                "deroa"|"chitei2" => "Jette's Fortress".to_owned(),
-                                "taiku"|"taiku2" => "Zora's Floating Castle".to_owned(),
-                                "nilboa"|"nilboa2" => "Nivora Ravine".to_owned(),
-                                "uru"|"uru2" => "Uru Mais".to_owned(),
-                                "tunnelb"|"tunnelc" => "Fire Path".to_owned(),
-                                "teien"|"edteien" => "Sky Gardens".to_owned(),
-                                "doman"|"eddoman" => "Usha Research Center".to_owned(),
-                                "son"|"edson" => "Soren Camp".to_owned(),
-                                _ => {let native=crate::place_name(&cell.name).unwrap_or(&cell.name);native.split(" (").next().unwrap_or(native).trim().to_owned()},
-                            };
+                            let family=lck_r627_cell_family(&cell.name);
                             if let Some((_,entries))=families.iter_mut().find(|(key,_)|*key==family) {
                                 entries.push((id,row));
                             } else {
@@ -2346,7 +2666,8 @@ impl App {
                                 .show(ui,|ui| {
                                     for (id,row) in entries {
                                         editor_cell_row(ui,id,row,&mut self.editor_cell_selected,&mut focus_cell,
-                                            &mut choose,&mut duplicate,&mut rename,&mut properties);
+                                            &mut choose,&mut duplicate,&mut rename,&mut properties,&mut repository,
+                                            &primary_cell,&secondary_cell,&mut request_secondary);
                                     }
                                 });
                         }
@@ -2360,7 +2681,8 @@ impl App {
                                 .show(ui,|ui| {
                                     for (id,row) in singles {
                                         editor_cell_row(ui,id,row,&mut self.editor_cell_selected,&mut focus_cell,
-                                            &mut choose,&mut duplicate,&mut rename,&mut properties);
+                                            &mut choose,&mut duplicate,&mut rename,&mut properties,&mut repository,
+                                            &primary_cell,&secondary_cell,&mut request_secondary);
                                     }
                                 });
                         }
@@ -2372,20 +2694,39 @@ impl App {
                             let label=format!("{}  [copy #{} of {}]",cell.name,cell.id,cell.source);
                             if !label.to_lowercase().contains(&term) {continue;}
                             editor_cell_row(ui,id,label,&mut self.editor_cell_selected,&mut focus_cell,
-                                &mut choose,&mut duplicate,&mut rename,&mut properties);
+                                &mut choose,&mut duplicate,&mut rename,&mut properties,&mut repository,
+                                            &primary_cell,&secondary_cell,&mut request_secondary);
                         }
                     });
             });
         if focus_cell || duplicate.is_some() || rename.is_some() || properties.is_some() {
             self.native_selected=None; self.native_selection.clear();
         }
-        if let Some(cell)=choose {self.select_editor_cell(cell);}
+        if let Some(cell)=choose {
+            self.r642_pair=R642CellPair::default();
+            self.r642_toggle_requested=false;
+            self.select_editor_cell(cell);
+        }
+        if let Some(cell)=request_secondary {
+            self.r642_assign_secondary(cell);
+        }
         if let Some(cell)=duplicate {self.duplicate_editor_cell(cell);}
         if let Some(cell)=rename {
             let name=self.editor_cells.label(&cell).unwrap_or_default();
             self.editor_cell_rename=Some((cell,name));
         }
         if let Some(cell)=properties {self.editor_cell_properties=Some(cell);}
+        if let Some(cell)=repository {
+            if let Some(source)=self.editor_cells.source(&cell)
+                .map(str::to_owned)
+            {
+                self.r625_open_cell_source(source,ui.ctx());
+            }else{
+                self.studio.error=Some(
+                    "Original source for this project cell could not be resolved.".into()
+                );
+            }
+        }
     }
 
     fn editor_cell_dialogs(&mut self,ctx:&egui::Context) {
@@ -2503,14 +2844,28 @@ impl App {
         self.global_repository_preview=Some(preview);
     }
 
+// LCK_R644D_UNIFIED_REPOSITORY
     /// The *only* left-hand repository. The current cell's independent
     /// hierarchy remains on the right; the cell tree stays below this pane.
     fn editor_global_repository(&mut self, ui: &mut egui::Ui,
         scene: Option<&legaia_engine_scene::scene_assembly::AssembledScene>) {
+        if let Some(source)=self.r625_pending_source.clone(){
+            if self.global_repository_started &&
+                (
+                    self.global_repository_completed>=self.global_repository_total ||
+                    self.global_repository.iter().any(|a|a.source==source) ||
+                    self.native_floor_tiles.iter().any(|t|t.key.source==source)
+                )
+            {
+                self.r625_open_cell_source(source,ui.ctx());
+            }
+        }
         ui.heading("Game-wide Asset Repository");
+        let mut favorite_toggle:Option<favorites::Favorite>=None;
+        self.repo_jump_source_panel(ui);
         let total=self.global_repository_total;
         ui.small(if self.global_repository_started {
-            format!("{} original assets | {} / {} cells scanned ({} unavailable)",
+            format!("{} original source records | {} / {} cells scanned ({} unavailable)",
                 self.global_repository.len(),self.global_repository_completed,total,
                 self.global_repository_failures)
         } else {"Open a disc to scan original game content.".into()});
@@ -2519,33 +2874,160 @@ impl App {
         if let Some(error)=&self.editor_catalog_error {
             ui.colored_label(Color32::LIGHT_RED,format!("Identification catalog: {error}"));
         }
-        if let Some(id)=self.global_repository_selected {
-            if let Some(asset)=self.global_repository.get(id) {
-                let display=asset.display_name(&self.editor_names);
-                let label=display.to_string();
-                let source=asset.source.clone();
-                let kind=asset.kind_label();
-                let selected_key=asset.name_key();
-                ui.group(|ui| {
-                    ui.small("Selected original asset");
-                    ui.label(egui::RichText::new(label).strong());
-                    ui.small(format!("{kind} Â· {source}"));
-                    if let Some(record)=self.editor_names.records.get(&selected_key) {
-                        if !record.category.trim().is_empty() {
-                            ui.small(format!("Identification category: {}",record.category));
-                        }
+        if let Some(action)=favorites::draw(
+            ui,&self.favorites_store,
+            &self.global_repository,&self.editor_names,
+            &self.native_floor_tiles
+        ){
+            match action {
+                favorites::Action::NativePreview(key)=>{
+                    if let Err(e)=self.r623_open_floor(key){
+                        self.studio.error=Some(e);
                     }
-                    ui.horizontal(|ui| {
-                        if ui.button("Preview 3D").clicked() {
-                            self.global_repository_dialog=Some((id,true));
-                        }
-                        if ui.button("Properties / Name").clicked() {
-                            self.global_repository_dialog=Some((id,false));
-                        }
-                    });
-                });
+                }
+                favorites::Action::NativeDrag(key)=>{
+                    self.native_floor_drag=Some(key);
+                    ui.ctx().request_repaint();
+                }
+                favorites::Action::Remove(entry)=>{
+                    match self.favorites_store.toggle(entry){
+                        Ok(_)=>self.studio.status=Some(
+                            "Removed from Favorites".into()
+                        ),
+                        Err(e)=>self.studio.error=Some(e),
+                    }
+                }
+
+                favorites::Action::Open(id,face,preview)=>{
+                    if let Some(asset)=self.global_repository.get(id){
+                        self.global_repository_selected=Some(id);
+                        self.global_floor_face=match(face,asset.kind){
+                            (Some(f),global_repository::Kind::Mesh(slot))=>
+                                Some((asset.source.clone(),slot,f)),
+                            _=>None
+                        };
+                        self.global_repository_preview=None;
+                        self.global_repository_dialog=Some((id,preview));
+                        self.global_repository_scroll_target=Some(id);
+                        self.global_floor_scroll_target=face.map(|f|(id,f));
+                        ui.ctx().request_repaint();
+                    }
+                }
+                favorites::Action::Drag(id,face)=>{
+                    if let Some(asset)=self.global_repository.get(id){
+                        self.global_repository_selected=Some(id);
+                        self.global_floor_face=match(face,asset.kind){
+                            (Some(f),global_repository::Kind::Mesh(slot))=>
+                                Some((asset.source.clone(),slot,f)),
+                            _=>None
+                        };
+                        self.global_repository_drag=Some(id);
+                        self.editor_asset_drag=None;
+                        self.global_repository_dialog=None;
+                        self.global_repository_preview=None;
+                        ui.ctx().request_repaint();
+                    }
+                }
             }
         }
+
+        if let Some((source,cell))=self.native_floor_jump_cell.clone(){
+            if let Some(tile)=self.native_floor_tiles.iter().find(|t|
+                t.key.source==source && t.cells.contains(&cell)
+            ){
+                self.native_floor_selected=Some(tile.key.clone());
+                self.native_floor_reveal=Some(tile.key.clone());
+                self.native_floor_jump_cell=None;
+                self.editor_search.clear();
+            }
+        }
+
+        let (native_action,native_scrolled)=
+            native_floor_repository::browser(
+                ui,
+                &self.native_floor_tiles,
+                &self.favorites_store,
+                self.editor_search.trim(),
+                self.native_floor_selected.as_ref(),
+                self.native_floor_reveal.as_ref(),
+            );
+
+        if native_scrolled{
+            self.native_floor_reveal=None;
+        }
+
+        if let Some(action)=native_action{
+            match action{
+                native_floor_repository::Action::Preview(key)=>{
+                    if let Err(e)=self.r623_open_floor(key){
+                        self.studio.error=Some(e);
+                    }
+                }
+                native_floor_repository::Action::ToggleFavorite(key)=>{
+                    if let Some(tile)=self.native_floor_tiles.iter()
+                        .find(|t|t.key==key)
+                    {
+                        let favorite=favorites::Favorite::native(tile);
+                        match self.favorites_store.toggle(favorite){
+                            Ok(added)=>self.studio.status=Some(
+                                if added{
+                                    "Native floor added to Favorites"
+                                }else{
+                                    "Native floor removed from Favorites"
+                                }.into()
+                            ),
+                            Err(e)=>self.studio.error=Some(e),
+                        }
+                    }
+                }
+                native_floor_repository::Action::Drag(key)=>{
+                    self.native_floor_drag=Some(key);
+                    ui.ctx().request_repaint();
+                }
+                native_floor_repository::Action::Place(key)=>{
+                    if let (Some(current),Some(tile))=(
+                        scene,
+                        self.native_floor_tiles.iter().find(|t|t.key==key)
+                    ){
+                        if current.name!=key.source{
+                            self.studio.error=Some(
+                                "Cross-cell MAP floor textures require native donor resource relocation. Original-source placement is supported.".into()
+                            );
+                        }else if let Some(hf)=current.ground.as_ref(){
+                            self.ground_edits.clear_for_scene(&current.name);
+                            self.ground_selected.clear();
+                            self.ground_selected.insert(tile.sample);
+                            self.ground_active=Some(tile.sample);
+                            self.ground_edits.selected_copies.clear();
+
+                            let count=ground_edit_ops::duplicate(
+                                &mut self.ground_edits,
+                                &mut self.ground_selected,
+                                &mut self.ground_active,
+                                hf
+                            );
+
+                            if count>0{
+                                self.ground_edit_mode=true;
+                                self.native_ground_visible=true;
+                                self.native_view.version=
+                                    self.native_view.version.wrapping_add(1);
+                                self.studio.status=Some(
+                                    "Native MAP floor copy created in original scene".into()
+                                );
+                                ui.ctx().request_repaint();
+                            }else{
+                                self.studio.error=Some(
+                                    "Could not duplicate native source floor".into()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // LCK_R645B_PANEL_REMOVED
         // Drag the selected original floor face as its own instance.
         if let (Some(id),Some((source,slot,face))) =
             (self.global_repository_selected,self.global_floor_face.as_ref()) {
@@ -2558,8 +3040,7 @@ impl App {
                         "Drag selected floor face {} into scene",face.primitive
                     )).sense(egui::Sense::click_and_drag())
                 );
-                if response.drag_started() ||
-                    catalog_pointer_pressed_on(ui,response.rect) {
+                if response.drag_started() {
                     self.global_repository_drag=Some(id);
                     ui.ctx().request_repaint();
                 }
@@ -2567,66 +3048,73 @@ impl App {
         }
         if self.global_repository.is_empty() {return;}
         let term=self.editor_search.trim().to_lowercase();
+        // R646A: keep every source record; render only one representative
+        // for each verified visual identity.
+        let r646_matches:Vec<bool>=self.global_repository.iter()
+            .map(|asset|self.repository_matches(asset,&term))
+            .collect();
+
+        let r646_visible=global_repository::r646d_unique_matches(
+            &self.global_repository,
+            &r646_matches,
+            self.repo_jump_focus_id.or(self.global_repository_selected)
+        );
+
+        let r646_total=r646_visible.iter().filter(|&&shown|shown).count();
+
+        ui.small(format!(
+            "{} unique entries shown; {} original source records retained",
+            r646_total,self.global_repository.len()
+        ));
+
         let mut counts=[0usize;4];
-        // Count the entire 40K+ catalog without materializing GUI rows.
-        for asset in &self.global_repository {
-            if self.repository_matches(asset,&term) { counts[asset.group()]+=1; }
+        for (id,asset) in self.global_repository.iter().enumerate() {
+            if r646_visible[id] {
+                counts[asset.group()]+=1;
+            }
         }
         let titles=["World Objects", "Terrain / decoration", "Reusable geometry / TMD", "Field NPCs / MAN"];
         let mut dragging=None;
         let mut selection=None;
         let mut open_dialog=None;
-        let mut floor_choice=None;
+        let floor_choice:Option<(usize,floor_tiles::Face)>=None;
+        // R646D selection shortcuts.
+        let r646d_escape=ui.input(|i|
+            i.key_pressed(egui::Key::Escape)
+        );
+        let mut r646d_collapsed=false;
+
+        // Auto-expand source jumps once; never lock an opened group.
+        let r646d_focus=self.repo_jump_focus_id.take();
+
         let mut category=self.global_open_category;
         let mut branch=self.global_open_branch;
         let mut open_scene=self.global_open_scene.clone();
         for group in 0..4 {
             if counts[group]==0 {continue;}
-            let expanded=egui::CollapsingHeader::new(
+            let r646d_group_response=egui::CollapsingHeader::new(
                 format!("{} ({})",titles[group],counts[group])
             )
             .id_salt(("lck_repo_group",group))
             .default_open(false)
-            .show(ui, |_| {})
-            .body_response.is_some();
+            .open((r646d_focus.and_then(|id|self.global_repository.get(id))
+                .is_some_and(|a|a.group()==group) ||
+                (group==0 && self.global_floor_scroll_target.is_some())).then_some(true))
+            .show(ui, |_| {});
+                    let expanded=r646d_group_response.body_response.is_some();
+                    if r646d_group_response.header_response.clicked() && !expanded {
+                        r646d_collapsed=true;
+                    }
 
             if !expanded {continue;}
 
             ui.indent(("lck_repo_contents",group), |ui| {
-            if group==0 {
-                let selected_floor = self.global_repository_selected
-                    .and_then(|id| {
-                        let asset = self.global_repository.get(id)?;
-                        let (source,slot,face) =
-                            self.global_floor_face.as_ref()?;
-
-                        match asset.kind {
-                            global_repository::Kind::Mesh(s)
-                                if s == *slot && asset.source == *source =>
-                                    Some((id,*face)),
-                            _ => None,
-                        }
-                    });
-
-                let (clicked,scrolled) = floor_tiles::browser(
-                    ui,
-                    &self.global_repository,
-                    &self.editor_names,
-                    &term,
-                    selected_floor,
-                    self.global_floor_scroll_target,
-                );
-
-                floor_choice = clicked;
-                if scrolled {
-                    self.global_floor_scroll_target = None;
-                }
-            }
+            // R623: Legacy TMD polygon browser retired from UI.
             // One tier per original source cell; none depends on the loaded destination.
             // Grouping source provenance keeps similarly numbered TMDs distinct.
             let mut indexed:std::collections::BTreeMap<(String,String),Vec<usize>>=std::collections::BTreeMap::new();
             for (id,asset) in self.global_repository.iter().enumerate() {
-                if asset.group()==group && self.repository_matches(asset,&term) {
+                if asset.group()==group && r646_visible[id] {
                     let place=self.editor_cells.label(&CellSelection::Original(asset.source.clone())).unwrap_or(asset.source_label.clone());
                     indexed.entry((place,asset.source.clone())).or_default().push(id);
                 }
@@ -2638,13 +3126,20 @@ impl App {
                         global_repository::is_verified_town(source)==is_town).count();
                     if n==0 { continue; }
                     let title=if is_town {"Towns & settlements"} else {"Other original locations"};
-                    let active=egui::CollapsingHeader::new(
+                    let r646d_branch_response=egui::CollapsingHeader::new(
                         format!("{} ({} scenes)",title,n)
                     )
                     .id_salt(("lck_repo_branch",is_town))
                     .default_open(false)
-                    .show(ui, |_| {})
-                    .body_response.is_some();
+                    .open(r646d_focus.and_then(|id|self.global_repository.get(id))
+                        .is_some_and(|a|a.group()==0 &&
+                            global_repository::is_verified_town(&a.source)==is_town
+                        ).then_some(true))
+                    .show(ui, |_| {});
+                    let active=r646d_branch_response.body_response.is_some();
+                    if r646d_branch_response.header_response.clicked() && !active {
+                        r646d_collapsed=true;
+                    }
 
                     if !active {continue;}
                 }
@@ -2747,13 +3242,20 @@ impl App {
                 for (family,variants) in &families {
                     let mut show_variants=|ui: &mut egui::Ui| {
                         for ((place,source),items) in variants {
-                    let active=egui::CollapsingHeader::new(
+                    let r646d_scene_response=egui::CollapsingHeader::new(
                         format!("{} ({}) [{}]",place,items.len(),source)
                     )
                     .id_salt(("lck_repo_scene",group,source.as_str()))
                     .default_open(false)
-                    .show(ui, |_| {})
-                    .body_response.is_some();
+                    .open(r646d_focus.and_then(|id|self.global_repository.get(id))
+                        .is_some_and(|a|a.group()==group &&
+                            a.source==*source
+                        ).then_some(true))
+                    .show(ui, |_| {});
+                    let active=r646d_scene_response.body_response.is_some();
+                    if r646d_scene_response.header_response.clicked() && !active {
+                        r646d_collapsed=true;
+                    }
 
                     if !active {continue;}
                     let list_start=if items.len()>125 {
@@ -2773,26 +3275,44 @@ impl App {
                         let asset=&self.global_repository[id];
                         let usable=scene.is_some_and(|s|global_repository::local_source(s,asset).is_some());
                         let name=asset.display_name(&self.editor_names);
-                        let text=format!("[{place}] {name}");
+                        let favorite=favorites::Favorite::new(
+                            asset,None,&self.editor_names
+                        );
+                        let favored=self.favorites_store.has(&favorite);
+                        let text=format!(
+                            "{}[{place}] {name}",
+                            if favored {"★ "}else{""}
+                        );
                         let active=self.global_repository_selected==Some(id);
-                        let response=ui.add_sized(egui::vec2(ui.available_width().max(40.0),24.0),
-                            egui::Label::new(text).selectable(false).sense(egui::Sense::click_and_drag()));
-                        if active || response.hovered() {
-                            let color=if active {Color32::from_rgb(255,196,66)}
-                                else if usable {Color32::from_rgb(96,210,180)}
-                                else {Color32::from_rgb(160,164,180)};
-                            ui.painter().rect_stroke(response.rect,egui::CornerRadius::same(3),
-                                egui::Stroke::new(if active {2.0}else{1.0},color),egui::StrokeKind::Inside);
-                        }
-                        if response.drag_started() || catalog_pointer_pressed_on(ui,response.rect) {
+                        let response=ui.add_sized(
+                            egui::vec2(ui.available_width().max(40.0),24.0),
+                            egui::Button::new(text)
+                                .selected(active)
+                                .sense(egui::Sense::click_and_drag())
+                        );
+                        if response.drag_started() {
                             dragging=Some(id);
                         }
-                        if response.clicked() {selection=Some(id);}
+                        if response.clicked() || response.double_clicked() {
+                            selection=Some(id);
+                        }
+                        if response.double_clicked() {
+                            open_dialog=Some((id,true));
+                        }
                         if self.global_repository_scroll_target==Some(id) {
                             response.scroll_to_me(Some(egui::Align::Center));
                             self.global_repository_scroll_target=None;
                         }
                         response.context_menu(|ui| {
+                            if ui.button(if favored {
+                                "Remove from Favorites"
+                            }else{
+                                "Add to Favorites"
+                            }).clicked(){
+                                favorite_toggle=Some(favorite.clone());
+                                ui.close();
+                            }
+                            ui.separator();
                             if ui.button("Preview original 3D model...").clicked() {
                                 selection=Some(id);open_dialog=Some((id,true));ui.close();
                             }
@@ -2817,7 +3337,7 @@ impl App {
                     };
 
                     if variants.len()>1 {
-                        egui::CollapsingHeader::new(
+                        let r646d_family_response=egui::CollapsingHeader::new(
                             format!("{} ({} variants)",family,variants.len())
                         )
                         .id_salt((
@@ -2827,7 +3347,17 @@ impl App {
                             family.as_str()
                         ))
                         .default_open(false)
+                        .open(r646d_focus.and_then(|id|self.global_repository.get(id))
+                            .is_some_and(|a|variants.iter().any(|(key,_)|
+                                key.1==a.source
+                            )).then_some(true))
                         .show(ui,|ui| show_variants(ui));
+
+                        if r646d_family_response.header_response.clicked()
+                            && r646d_family_response.body_response.is_none()
+                        {
+                            r646d_collapsed=true;
+                        }
                     } else {
                         show_variants(ui);
                     }
@@ -2835,6 +3365,48 @@ impl App {
             }
             });
         }
+        if favorite_toggle.is_none() {
+            favorite_toggle=ui.ctx().data_mut(|data|{
+                let id=egui::Id::new("r622_floor_toggle");
+                let value=data.get_temp::<favorites::Favorite>(id);
+                data.remove::<favorites::Favorite>(id);
+                value
+            });
+        }
+
+        if let Some(favorite)=favorite_toggle {
+            match self.favorites_store.toggle(favorite){
+                Ok(added)=>self.studio.status=Some(
+                    if added {
+                        "Added to Favorites"
+                    }else{
+                        "Removed from Favorites"
+                    }.into()
+                ),
+                Err(e)=>self.studio.error=Some(e),
+            }
+            ui.ctx().request_repaint();
+        }
+
+        if r646d_escape || r646d_collapsed {
+            selection=None;
+            dragging=None;
+            open_dialog=None;
+
+            // floor_choice is immutable and already None.
+            // Do not assign to it or modify the floor browser.
+            self.global_repository_selected=None;
+            self.global_floor_face=None;
+            self.global_repository_preview=None;
+            self.global_repository_dialog=None;
+            self.global_repository_drag=None;
+            self.global_repository_scroll_target=None;
+            self.global_floor_scroll_target=None;
+            self.repo_jump_focus_id=None;
+
+            ui.ctx().request_repaint();
+        }
+
         self.global_open_category=category;
         self.global_open_branch=branch;
         self.global_open_scene=open_scene;
@@ -2856,6 +3428,23 @@ impl App {
                     self.global_repository_selected=Some(id);
                     self.global_repository_preview=None;
                     self.global_repository_dialog=Some((id,true));
+                }
+            }
+        }
+        // R644D: single-click selects a floor face without opening Preview.
+        if let Some((id,face))=ui.ctx().data_mut(|data| {
+            let key=egui::Id::new("lck_r644d_floor_click");
+            let choice=data.get_temp::<(usize,floor_tiles::Face)>(key);
+            data.remove::<(usize,floor_tiles::Face)>(key);
+            choice
+        }) {
+            if let Some(asset)=self.global_repository.get(id) {
+                if let global_repository::Kind::Mesh(slot)=asset.kind {
+                    self.global_floor_face=Some((asset.source.clone(),slot,face));
+                    self.global_repository_selected=Some(id);
+                    self.global_repository_preview=None;
+                    self.global_repository_dialog=None;
+                    ui.ctx().request_repaint();
                 }
             }
         }
@@ -2973,19 +3562,40 @@ impl App {
 
                         // Exactly the rows shown for this source and
                         // repository category, including active search.
-                        let rows:Vec<usize>=self.global_repository.iter()
+                        // R624: navigate every original repository category.
+                        // Follow the left panel's category and source order.
+                        let mut rows:Vec<usize>=self.global_repository.iter()
                             .enumerate()
                             .filter(|(_,candidate)|
-                                candidate.source==*source &&
-                                candidate.group()==group &&
                                 self.repository_matches(candidate,&term)
                             )
                             .map(|(index,_)|index)
                             .collect();
 
+                        rows.sort_by(|&left,&right|{
+                            let a=&self.global_repository[left];
+                            let b=&self.global_repository[right];
+
+                            (
+                                a.group(),
+                                !global_repository::is_verified_town(&a.source),
+                                &a.source,
+                                left
+                            ).cmp(&(
+                                b.group(),
+                                !global_repository::is_verified_town(&b.source),
+                                &b.source,
+                                right
+                            ))
+                        });
+
                         if let Some(next_id)=lck_repo_next(&rows,id,direction){
                             if next_id!=id {
                                 self.global_repository_selected=Some(next_id);
+                                self.repo_jump_focus_id=Some(next_id);
+                                self.global_floor_face=None;
+                                self.global_floor_scroll_target=None;
+                                self.global_repository_preview=None;
                                 self.global_repository_dialog=
                                     Some((next_id,true));
                                 self.global_repository_scroll_target=Some(next_id);
@@ -3285,6 +3895,14 @@ impl App {
     /// Native PS1 data browser: lists the original instance draws and their transforms.
     /// Editable scene preview with non-destructive mesh transforms.
     fn editor_workspace(&mut self, ctx: &egui::Context) {
+        // R639_NAMED_WARP_PICKER: project-local saved targets plus live active cell.
+        let named_identity=self.editor_cell_active.as_ref()
+            .map(|cell|cell.form_identity(&self.doors.scene))
+            .unwrap_or_else(||format!("original:{}",self.doors.scene));
+        self.doors.r639_refresh_named_warps(
+            self.form_session.as_ref().map(|session|&session.project.cell_snapshots),
+            &named_identity
+        );
         // R6.0.7 height overlay is editor display state only.
         let r607_display_id=egui::Id::new("lck_r607_height_overlay");
         let r607_step_id=egui::Id::new("lck_r607_height_step");
@@ -3385,6 +4003,7 @@ impl App {
         let mut pending_repository_drop = false;
         let mut pending_foreign: Option<(usize,[f32;2],[usize;2],bool)> = None;
         let mut pending_delete: Option<(bool,usize)> = None;
+        let mut pending_ground_delete=false;
         let mut pending_restore: Option<(bool,usize)> = None;
         let mut pending_name: Option<((bool,usize),Option<String>)> = None;
         let mut hierarchy_popup: Option<(EditorCatalogItem,bool)> = None;
@@ -3511,7 +4130,12 @@ impl App {
             }
         }
         if menu_duplicate {
-            if self.ground_edit_mode {
+            if self.ground_edit_mode && self.native_selected.is_some_and(|key|
+                world.as_deref().is_some_and(|w|lck_is_imported_floor(w,key))
+            ) {
+                pending_duplicate=world.as_deref().and_then(|w|
+                    editor_duplicate_request(w,self.native_selected));
+            } else if self.ground_edit_mode {
                 if let Some(hf) = ready.as_deref().and_then(|s| s.ground.as_ref()) {
                     let links = ground_edit_ops::duplicate_linked(
                         &mut self.ground_edits,
@@ -3537,17 +4161,11 @@ impl App {
 
         if menu_delete {
             if self.ground_edit_mode {
-                let count = ground_edit_ops::delete_selected(
-                    &mut self.ground_edits,
-                    &mut self.ground_selected,
-                    &mut self.ground_active,
+                pending_ground_delete=!self.ground_selected.is_empty()
+                    || !self.ground_edits.selected_copies.is_empty();
+                pending_delete=self.native_selected.filter(|&key|
+                    world.as_deref().is_some_and(|w|lck_is_imported_floor(w,key))
                 );
-                if count > 0 {
-                    self.ground_hierarchy_reveal = None;
-                    self.native_view.version =
-                        self.native_view.version.wrapping_add(1);
-                    ctx.request_repaint();
-                }
             } else {
                 pending_delete = self.native_selected;
             }
@@ -3580,6 +4198,7 @@ impl App {
                     self.editor_catalog(ui,ready.as_deref());
                 });
             });
+        let mut r625_hierarchy_source:Option<String>=None;
         egui::SidePanel::right("native_instance_tree")
             .resizable(true)
             .default_width(300.0)
@@ -3607,7 +4226,18 @@ impl App {
                         let display=self.editor_cell_active.as_ref()
                             .and_then(|id| self.editor_cells.label(id))
                             .unwrap_or_else(||crate::place_name(source).unwrap_or(source).to_owned());
-                        ui.strong(display);
+                        ui.horizontal_wrapped(|ui|{
+                            let header=ui.strong(display);
+                            header.context_menu(|ui|{
+                                if ui.button("Show in World Repository").clicked(){
+                                    r625_hierarchy_source=Some(source.to_string());
+                                    ui.close();
+                                }
+                            });
+                            if ui.small_button("Show in World Repository").clicked(){
+                                r625_hierarchy_source=Some(source.to_string());
+                            }
+                        });
                         ui.small(format!("Original scene ID: {source}"));
                         ui.label(format!("Mesh slots: {}", scene.env_tmds.len()));
                         ui.label(format!("Placed objects: {}", scene.placements.len()));
@@ -3831,7 +4461,16 @@ impl App {
                                                         || label.to_lowercase()
                                                             .contains(&hierarchy_filter)
                                                     {
-                                                        ui.label(label);
+                                                        ui.label(&label).context_menu(|ui|{
+    if ui.button("Show in World Repository").clicked(){
+        repo_jump::request(ui.ctx(),repo_jump::Target::Record{
+            kind:"Project warp override".into(),
+            title:label.clone(),
+            details:label.clone()
+        });
+        ui.close();
+    }
+});
                                                     }
                                                 }
                                             }else{
@@ -3919,7 +4558,7 @@ impl App {
                                                     }
                                                     ui.label(format!("{} #{}: {}",if d.terrain {"Terrain"} else {"Placement"},
                                                         d.index,self.editor_name_for(Some(scene),EditorCatalogItem::Draw(d.terrain,d.index))))
-                                                        .context_menu(|ui|{if ui.button("Rename").clicked(){hierarchy_rename=Some((d.terrain,d.index));ui.close();}});
+                                                        .context_menu(|ui|{if ui.button("Show in World Repository").clicked(){repo_jump::request(ui.ctx(),repo_jump::Target::Draw(d.terrain,d.index));ui.close();}if ui.button("Rename").clicked(){hierarchy_rename=Some((d.terrain,d.index));ui.close();}});
                                                 });
                                             }
                                         });
@@ -3930,7 +4569,13 @@ impl App {
                                     for (slot, idx) in scene.env_tmds.iter().enumerate() {
                                         if !self.editor_item_matches(Some(scene), EditorCatalogItem::Mesh(slot), &hierarchy_filter) { continue; }
                                         ui.label(format!("{}  [#{slot:03}]  (scene TMD {idx})",
-                                            self.editor_name_for(Some(scene), EditorCatalogItem::Mesh(slot))));
+                                            self.editor_name_for(Some(scene), EditorCatalogItem::Mesh(slot))))
+                                            .context_menu(|ui|{
+                                                if ui.button("Show in World Repository").clicked(){
+                                                    repo_jump::request(ui.ctx(),repo_jump::Target::Mesh(slot));
+                                                    ui.close();
+                                                }
+                                            });
                                     }
                                 });
                         });
@@ -3939,6 +4584,10 @@ impl App {
                     _ => { ui.label("Waiting for native scene data..."); }
                 }
             });
+        self.repo_jump_process(ctx,ready.as_deref(),world.as_deref());
+        if let Some(source)=r625_hierarchy_source.take(){
+            self.r625_open_cell_source(source,ctx);
+        }
         if hierarchy_input.apply(&mut self.native_selected,&mut self.native_selection,&mut self.native_hierarchy_anchor) {
             self.ground_edit_mode=false;
             self.ground_selected.clear();
@@ -4482,6 +5131,21 @@ impl App {
                         ui.ctx().request_repaint();
                     }
 
+                    let mut secondary_on=self.r642_pair
+                        .is_secondary(&self.editor_cell_active);
+                    let enabled=self.r642_pair.primary.is_some()
+                        && self.r642_pair.secondary.is_some()
+                        && self.pending_native_scene.is_none();
+
+                    if ui.add_enabled(
+                        enabled,
+                        egui::Checkbox::new(&mut secondary_on,"Secondary Cell")
+                    ).on_hover_text(
+                        "Switch the entire editor between Primary and Secondary"
+                    ).changed() {
+                        self.r642_toggle_requested=true;
+                        ui.ctx().request_repaint();
+                    }
                     // Trigger visibility is controlled by View > Triggers.
 
                     });
@@ -4852,8 +5516,17 @@ impl App {
                     // LCK_C3_VISIBLE_TOOLBAR_FIX
                     // Allow the existing wrapping layout to place
                     // both controls, without nesting a clipping row.
-                    let mut lck_export_pressed =
-                        std::mem::take(&mut self.lck_menu_export)
+                    // LCK_R622_EDITABLE_DESTINATIONS
+                    let requested_file_export=
+                        std::mem::take(&mut self.lck_menu_export);
+
+                    let requested_warp_export=
+                        std::mem::take(
+                            &mut self.doors.r622_export_requested
+                        );
+
+                    let mut lck_export_pressed=
+                        (requested_file_export || requested_warp_export)
                         && self.ps1_export_job.is_none();
 
                     if lck_export_pressed {
@@ -5562,7 +6235,14 @@ impl App {
                     // Native teleports are technical markers, not geometry meshes.
                     // A marker click captures the event before empty-space deselection.
                     let door_marker_pressed=if self.native_warp_editor.marker_right_captured || self.ground_edit_mode {false} else {
-                        self.doors.viewport(ui,&self.native_view,model,scene.ground.as_ref())
+                        self.doors.viewport(
+                            ui,
+                            &self.native_view,
+                            model,
+                            scene.ground.as_ref(),
+                            self.studio.library.as_ref()
+                                .map(|lib|lib.index.as_ref())
+                        )
                     };
                     if door_marker_pressed {
                         // LCK_R58_WORLD_MARKERS
@@ -5716,6 +6396,31 @@ impl App {
                         scene.ground.as_ref(),
                         &self.native_warp_editor
                     );
+
+                    // LCK_R621_WARP_CONTEXT_MENU
+                    // Process the local warp context after painting its markers.
+                    native_warps::r621_context_menu(
+                        ui,
+                        &mut self.native_warp_editor
+                    );
+
+                    if let Some(source)=self.native_warp_editor
+                        .r621_cross_request.take()
+                    {
+                        if let Err(error)=self.doors
+                            .r621_create_from_marker(None,Some(source))
+                        {
+                            self.native_warp_editor.r621_context_pos=
+                                ui.input(|i|i.pointer.interact_pos());
+
+                            self.native_warp_editor.r621_context_error=
+                                Some(format!(
+                                    "Cross-cell warp: {error:#}"
+                                ));
+                        }
+
+                        ui.ctx().request_repaint();
+                    }
                     // LCK_R616D_CAMERA_RENDER_INDICATORS
                     native_gameplay_camera::paint(
                         ui,view_rect,model,
@@ -6912,6 +7617,99 @@ self.native_view.version=
                             }
                         }
                     }
+                    // R623: Native MAP floor repository drop.
+                    // Same-source uses original MAP texture and existing
+                    // non-destructive ground-copy authoring.
+                    if let Some(floor_key)=self.native_floor_drag.clone(){
+                        let released=ui.input(|i|i.pointer.primary_released());
+                        let hovered=ui.input(|i|i.pointer.latest_pos())
+                            .filter(|p|view_rect.contains(*p));
+
+                        if let Some(pointer)=hovered{
+                            ui.painter().text(
+                                pointer+egui::vec2(12.0,15.0),
+                                egui::Align2::LEFT_TOP,
+                                if floor_key.source==scene.name {
+                                    "Release: place original MAP floor tile"
+                                }else{
+                                    "Cross-cell MAP texture import not yet available"
+                                },
+                                egui::FontId::proportional(14.0),
+                                Color32::YELLOW
+                            );
+                        }
+
+                        if released{
+                            if let Some(pointer)=hovered{
+                                if floor_key.source!=scene.name{
+                                    self.studio.error=Some(
+                                        "Cross-cell MAP floor placement requires donor texture/CLUT relocation. The original asset remains available in Favorites.".into()
+                                    );
+                                }else if let (
+                                    Some(tile),
+                                    Some(hf)
+                                )=(
+                                    self.native_floor_tiles.iter()
+                                        .find(|t|t.key==floor_key),
+                                    scene.ground.as_ref()
+                                ){
+                                    let px=placement_drop::viewport_pixels(
+                                        view_rect,
+                                        ui.ctx().pixels_per_point(),
+                                        [900,680]
+                                    );
+                                    let pixel=placement_drop::viewport_pixel(
+                                        view_rect,pointer,px,
+                                        self.native_view.world_mirrored
+                                    );
+
+                                    match placement_drop::foreign_drop_center(
+                                        world,self.native_view.cam,
+                                        pixel,px,64.0,0.0,
+                                        ui.input(|i|i.modifiers.shift)
+                                    ){
+                                        Ok(center)=>{
+                                            let history=editor_history_capture_with_layers(
+                                                world,&scene.name,
+                                                self.native_selected,
+                                                &self.native_selection,
+                                                &self.ground_edits,
+                                                &self.collision_edit
+                                            );
+
+                                            self.ground_edits.clear_for_scene(&scene.name);
+                                            match ground_edit_ops::place_native_catalog_tile(
+                                                &mut self.ground_edits,
+                                                hf,tile.sample,center
+                                            ){
+                                                Ok(_uid)=>{
+                                                    self.editor_undo.push(history);
+                                                    if self.editor_undo.len()>100{
+                                                        self.editor_undo.remove(0);
+                                                    }
+                                                    self.editor_redo.clear();
+                                                    self.ground_selected.clear();
+                                                    self.ground_active=None;
+                                                    self.ground_edit_mode=true;
+                                                    self.native_ground_visible=true;
+                                                    self.native_view.version=
+                                                        self.native_view.version.wrapping_add(1);
+                                                    self.studio.status=Some(
+                                                        "Native original MAP floor placed".into()
+                                                    );
+                                                    ui.ctx().request_repaint();
+                                                }
+                                                Err(e)=>self.studio.error=Some(e),
+                                            }
+                                        }
+                                        Err(e)=>self.studio.error=Some(e),
+                                    }
+                                }
+                            }
+                            self.native_floor_drag=None;
+                        }
+                    }
+
                     if let Some(base)=self.form_drag.clone(){let released=ui.input(|i|i.pointer.primary_released());let hovering=ui.input(|i|i.pointer.latest_pos()).filter(|p|view_rect.contains(*p));if released{if let Some(pointer)=hovering{let px=placement_drop::viewport_pixels(view_rect,ui.ctx().pixels_per_point(),[900,680]);let pixel=placement_drop::viewport_pixel(view_rect,pointer,px,self.native_view.world_mirrored);match placement_drop::foreign_drop_center(world,self.native_view.cam,pixel,px,64.,0.,ui.input(|i|i.modifiers.shift)){Ok(center)=>pending_form=Some(form_ui::Action::Place(base,center)),Err(error)=>self.studio.error=Some(error)}}self.form_drag=None;}}
                     if let Some(asset)=self.editor_asset_drag {
                         let released=ui.input(|i|i.pointer.primary_released());
@@ -7379,6 +8177,8 @@ self.native_view.version=
         }
         self.editor_catalog_popup(ctx, ready.as_deref(), world.as_deref());
         self.editor_global_repository_dialog(ctx);
+        self.r624_native_floor_arrows(ctx);
+        self.repo_jump_source_window(ctx);
         if self.ground_edit_mode && !(self.native_collision_wire_visible && self.collision_edit.has_selection()) && self.editor_modal.is_none() &&
            self.global_repository_dialog.is_none() && self.editor_rename.is_none() &&
            !ctx.wants_keyboard_input() {
@@ -7413,7 +8213,10 @@ self.native_view.version=
         // Ctrl+D and the Duplicate button share one path. Keep this shortcut
         // local to the World Editor and disable it while typing, renaming or
         // using an object properties/preview dialog.
-        if !self.ground_edit_mode && self.editor_modal.is_none() && self.global_repository_dialog.is_none() &&
+        if (!self.ground_edit_mode ||
+            self.native_selected.is_some_and(|key|world.as_deref()
+                .is_some_and(|w|lck_is_imported_floor(w,key)))) &&
+            self.editor_modal.is_none() && self.global_repository_dialog.is_none() &&
             self.editor_rename.is_none() &&
             self.editor_cell_rename.is_none() && self.editor_cell_properties.is_none() &&
             !ctx.wants_keyboard_input() &&
@@ -7421,9 +8224,7 @@ self.native_view.version=
                 egui::Modifiers::COMMAND, egui::Key::D))) {
             if let Some(key)=self.native_selected {
                 pending_duplicate=world.as_deref().and_then(|w|
-                    (!lck_is_imported_floor(w,key))
-                        .then(||editor_duplicate_request(w,Some(key)))
-                        .flatten());
+                    editor_duplicate_request(w,Some(key)));
             } else if let Some(cell)=self.editor_cell_selected.clone() {
                 self.duplicate_editor_cell(cell);
             }
@@ -7436,16 +8237,12 @@ self.native_view.version=
             && ctx.input_mut(|i|i.consume_key(
                 egui::Modifiers::NONE,egui::Key::Delete
             )) {
-            if ground_edit_ops::delete_selected(
-                &mut self.ground_edits,
-                &mut self.ground_selected,
-                &mut self.ground_active
-            )>0 {
-                self.ground_hierarchy_reveal=None;
-                self.native_view.version=
-                    self.native_view.version.wrapping_add(1);
-                ctx.request_repaint();
-            }
+            // Repository floor faces are world instances, not native tiles.
+            pending_delete=self.native_selected.filter(|&key|
+                world.as_deref().is_some_and(|w|lck_is_imported_floor(w,key))
+            );
+            pending_ground_delete=!self.ground_selected.is_empty()
+                || !self.ground_edits.selected_copies.is_empty();
         }
         // Guard Delete so text entry (hierarchy filter, rename, coordinates)
         // and preview dialogs never delete scene objects by accident.
@@ -7458,7 +8255,7 @@ self.native_view.version=
         // Capture lightweight scene metadata before edits, never clone raster
         // vertices per frame. One mouse gesture becomes one undo operation.
         let editor_changed_this_frame = pending_form.as_ref().is_some_and(|a|a.is_authoring()) || pending_name.is_some() || pending_restore.is_some() ||
-            pending_delete.is_some() || pending_duplicate.is_some() || pending_foreign.is_some() ||
+            pending_delete.is_some() || pending_ground_delete || pending_duplicate.is_some() || pending_foreign.is_some() ||
             pending_transform.is_some() || pending_rotation.is_some() || pending_orbit.is_some() ||
             pending_scale.is_some() || pending_import.is_some() ||
             pending_group_action.is_some() || pending_mirror_action.is_some() || pending_add_group_basket ||
@@ -7485,6 +8282,33 @@ self.native_view.version=
         // Arc::get_mut keeps one writable world, without cloning thousands
         // of vertices on every mouse frame. The original scene remains intact.
         drop(world);
+        if pending_ground_delete {
+            let deleted_members=self.ground_selected.iter().copied()
+                .map(authoring_group::Member::NativeFloor)
+                .chain(self.ground_edits.selected_copies.iter().copied()
+                    .map(authoring_group::Member::CopiedFloor))
+                .collect::<std::collections::BTreeSet<_>>();
+
+            let count=ground_edit_ops::delete_selected(
+                &mut self.ground_edits,
+                &mut self.ground_selected,
+                &mut self.ground_active
+            );
+
+            if count>0 {
+                if let Some((_,NativeSceneSlot::Ready(_,world)))=self.native_scene.as_mut(){
+                    if let Some(world)=Arc::get_mut(world){
+                        authoring_group::prune_deleted(
+                            &mut world.groups,
+                            &deleted_members
+                        );
+                    }
+                }
+                self.ground_hierarchy_reveal=None;
+                self.native_view.version=self.native_view.version.wrapping_add(1);
+                ctx.request_repaint();
+            }
+        }
         // Copy membership into new persistent group IDs after all UI Arc clones
         // have been released. This covers Ctrl+D, the menu and floor Properties.
         if !pending_floor_group_links.is_empty() {
@@ -7652,9 +8476,58 @@ self.native_view.version=
             if let Some((_,NativeSceneSlot::Ready(scene,world)))=self.native_scene.as_mut() {
                 if let Some(world)=Arc::get_mut(world) {
                     let keys=multi_selection::keys(Some(key),&self.native_selection);
-                    let result=if let(Some(session),Some(lib))=(&mut self.form_session,&self.studio.library){(||->Result<(),String>{let forms=keys.iter().map(|k|session.reference_at(world,*k).ok_or("Selection is not a persistent Reference".to_owned())).collect::<Result<Vec<_>,_>>()?;let mut draft=session.clone();draft.delete(&forms).map_err(|e|format!("{e:#}"))?;let preview=draft.render(scene,&lib.index).map_err(|e|format!("{e:#}"))?;draft.synchronize_gesture(scene,&lib.index,&preview).map_err(|e|format!("{e:#}"))?;*session=draft;*world=preview;Ok(())})()}else{multi_selection::delete(world,&keys)};
+                    let old_groups=world.groups.clone();
+                    let deleted_members=keys.iter().filter_map(|&key|
+                        authoring_group::draw_member(world,key)
+                    ).collect::<std::collections::BTreeSet<_>>();
+
+                    let result=if let (Some(session),Some(lib))=
+                        (&mut self.form_session,&self.studio.library) {
+                        (||->Result<(),String>{
+                            let mut draft=session.clone();
+
+                            // Register older repository drops that did not
+                            // receive persistent Form references.
+                            if keys.iter().any(|key|
+                                draft.reference_at(world,*key).is_none()
+                            ){
+                                draft.synchronize_gesture(
+                                    scene,&lib.index,world
+                                ).map_err(|e|format!("{e:#}"))?;
+                            }
+
+                            let forms=keys.iter().map(|key|
+                                draft.reference_at(world,*key)
+                                    .ok_or("Selected instance has no persistent Reference".to_owned())
+                            ).collect::<Result<Vec<_>,_>>()?;
+
+                            draft.delete(&forms)
+                                .map_err(|e|format!("{e:#}"))?;
+
+                            let preview=draft.render(scene,&lib.index)
+                                .map_err(|e|format!("{e:#}"))?;
+
+                            draft.synchronize_gesture(
+                                scene,&lib.index,&preview
+                            ).map_err(|e|format!("{e:#}"))?;
+
+                            *session=draft;
+                            *world=preview;
+                            Ok(())
+                        })()
+                    }else{
+                        multi_selection::delete(world,&keys)
+                    };
+
                     match result {
                         Ok(())=>{
+                            if self.form_session.is_some(){
+                                world.groups=old_groups;
+                                authoring_group::prune_deleted(
+                                    &mut world.groups,
+                                    &deleted_members
+                                );
+                            }
                             self.native_selected=None; self.native_selection.clear();
                             self.native_drag=None;
                             self.native_rotate=None;
@@ -10438,6 +11311,7 @@ impl eframe::App for App {
                         self.global_repository_completed+=1;
                         if batch.failed {self.global_repository_failures+=1;}
                         self.global_repository.extend(batch.assets);
+                        self.native_floor_tiles.extend(batch.floors);
                         ctx.request_repaint();
                     },
                     Err(std::sync::mpsc::TryRecvError::Empty)=>break,
@@ -10450,7 +11324,11 @@ impl eframe::App for App {
             if done {self.global_repository_rx=None;}
             else {ctx.request_repaint_after(std::time::Duration::from_millis(180));}
         }
+        if std::mem::take(&mut self.r642_toggle_requested) {
+            self.r642_toggle_secondary();
+        }
         self.poll_native_scene_load(ctx);
+        self.r642_reconcile_secondary();
         if self.studio.loading().is_some() || self.studio.is_analyzing() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
@@ -11389,5 +12267,267 @@ mod lck_r56_fixed_pane_tests {
         });
 
         assert!(checked);
+    }
+}
+
+// R624 - Universal World Repository preview arrows.
+// Original assets use lck_repo_next above; native MAP tiles use the
+// same clamped navigation behavior and their own original-source preview.
+fn r624_next_index(index:usize,count:usize,direction:i32)->Option<usize>{
+    if count==0 || index>=count {
+        return None;
+    }
+
+    Some(if direction>0 {
+        index.saturating_add(1).min(count-1)
+    }else if direction<0 {
+        index.saturating_sub(1)
+    }else{
+        index
+    })
+}
+
+impl App {
+    fn r624_native_floor_arrows(&mut self,ctx:&egui::Context){
+        // Do not steal arrows from search boxes, editors or regular previews.
+        if ctx.wants_keyboard_input() ||
+            self.global_repository_dialog.is_some() {
+            return;
+        }
+
+        let Some(current)=self.native_floor_selected.clone() else {
+            return;
+        };
+
+        // Only navigate native floor records while their source preview
+        // is open. Other native-record previews remain untouched.
+        let showing_floor=self.repo_jump_native.as_ref().is_some_and(|p|
+            p.kind=="Native MAP ground" &&
+            p.source==current.source
+        );
+
+        if !showing_floor {
+            return;
+        }
+
+        let direction=ctx.input_mut(|input|{
+            if input.consume_key(
+                egui::Modifiers::NONE,
+                egui::Key::ArrowDown
+            ){
+                1
+            }else if input.consume_key(
+                egui::Modifiers::NONE,
+                egui::Key::ArrowUp
+            ){
+                -1
+            }else{
+                0
+            }
+        });
+
+        if direction==0 {
+            return;
+        }
+
+        let term=self.editor_search.trim().to_lowercase();
+
+        // Native floors appear in location family -> source variant ->
+        // texture identity order, matching their repository hierarchy.
+        let mut rows=self.native_floor_tiles.iter()
+            .filter(|tile|{
+                if tile.key==current || term.is_empty() {
+                    return true;
+                }
+
+                let searchable=format!(
+                    "{} {} atlas {} tpage {:04x} clut {:04x} {}",
+                    tile.key.source,
+                    tile.source_label,
+                    tile.key.atlas,
+                    tile.key.tpage,
+                    tile.key.clut,
+                    tile.cells.len()
+                ).to_lowercase();
+
+                term.split_whitespace().all(|word|
+                    searchable.contains(word)
+                )
+            })
+            .collect::<Vec<_>>();
+
+        rows.sort_by(|a,b|{
+            let family_a= floor_tiles::floor_master(&a.key.source)
+                .unwrap_or(a.source_label.as_str());
+
+            let family_b= floor_tiles::floor_master(&b.key.source)
+                .unwrap_or(b.source_label.as_str());
+
+            family_a.cmp(family_b)
+                .then_with(||a.key.source.cmp(&b.key.source))
+                .then_with(||a.key.cmp(&b.key))
+        });
+
+        let Some(index)=rows.iter().position(|tile|
+            tile.key==current
+        ) else {
+            return;
+        };
+
+        let Some(next_index)=r624_next_index(
+            index,rows.len(),direction
+        ) else {
+            return;
+        };
+
+        let Some(next)=rows.get(next_index).map(|tile|
+            tile.key.clone()
+        ) else {
+            return;
+        };
+
+        if next==current {
+            return;
+        }
+
+        // This reuses R623's genuine source VRAM preview, and automatically
+        // sets native_floor_selected plus native_floor_reveal so the
+        // World Repository opens the matching family, variant and row.
+        if let Err(error)=self.r623_open_floor(next){
+            self.studio.error=Some(error);
+        }else{
+            ctx.request_repaint();
+        }
+    }
+}
+
+#[cfg(test)]
+mod r624_repo_arrow_tests {
+    use super::r624_next_index;
+
+    #[test]
+    fn arrows_stop_at_first_and_last(){
+        assert_eq!(r624_next_index(0,5,-1),Some(0));
+        assert_eq!(r624_next_index(4,5,1),Some(4));
+        assert_eq!(r624_next_index(2,5,1),Some(3));
+        assert_eq!(r624_next_index(2,5,-1),Some(1));
+    }
+
+    #[test]
+    fn empty_and_invalid_indices_are_safe(){
+        assert_eq!(r624_next_index(0,0,1),None);
+        assert_eq!(r624_next_index(5,5,-1),None);
+    }
+}
+
+// R625 - Cell-wide original source navigation.
+// Original disc scenes and project cell copies resolve to the same
+// source variant without switching or changing the edited scene.
+impl App {
+    fn r625_open_cell_source(
+        &mut self,
+        source:String,
+        ctx:&egui::Context
+    ){
+        self.editor_search.clear();
+        self.repo_jump_pending=None;
+
+        // Original indexed geometry has priority. It has a real
+        // selectable row, preview, category and donor identity.
+        if let Some(id)=self.global_repository.iter()
+            .position(|asset|asset.source==source)
+        {
+            self.r625_pending_source=None;
+            self.global_repository_selected=Some(id);
+            self.repo_jump_focus_id=Some(id);
+            self.global_repository_scroll_target=Some(id);
+            self.global_floor_face=None;
+            self.global_floor_scroll_target=None;
+            self.global_repository_preview=None;
+            self.repo_jump_native=None;
+            self.global_repository_dialog=Some((id,true));
+            self.studio.status=Some(format!(
+                "World Repository opened original source variant {source}"
+            ));
+            ctx.request_repaint();
+            return;
+        }
+
+        // A cell without separately indexed TMD assets may still
+        // contain valid first-class native MAP floor textures.
+        let native=self.native_floor_tiles.iter()
+            .find(|tile|tile.key.source==source)
+            .map(|tile|tile.key.clone());
+
+        if let Some(key)=native{
+            self.r625_pending_source=None;
+            if let Err(error)=self.r623_open_floor(key){
+                self.studio.error=Some(error);
+            }
+            ctx.request_repaint();
+            return;
+        }
+
+        // Source scans run asynchronously. Do not mistake an unfinished
+        // scan for a genuinely missing original record.
+        if !self.global_repository_started ||
+            self.global_repository_completed<self.global_repository_total
+        {
+            self.r625_pending_source=Some(source.clone());
+            self.studio.status=Some(format!(
+                "Locating original source variant {source} in World Repository..."
+            ));
+            ctx.request_repaint();
+            return;
+        }
+
+        // No manufactured repository asset and no substituted variant.
+        self.r625_pending_source=None;
+        self.r625_show_unindexed_cell(source,ctx);
+    }
+}
+
+// LCK_R627_SHARED_CELL_FAMILIES
+#[cfg(test)]
+mod lck_r627_cell_family_tests {
+    use super::*;
+
+    #[test]
+    fn grouped_towns_share_the_existing_location_names() {
+        for scene in [
+            "conc","conc2","conc3","concnow","concend"
+        ] {
+            assert_eq!(
+                lck_r627_cell_family(scene),
+                "Conkram"
+            );
+        }
+
+        for scene in [
+            "town01","town0b","town0c","town0d","town0e","jou"
+        ] {
+            assert_eq!(
+                lck_r627_cell_family(scene),
+                "Rim Elm"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_other_existing_cell_families() {
+        assert_eq!(
+            lck_r627_cell_family("bylon"),
+            "Biron Monastery"
+        );
+
+        assert_eq!(
+            lck_r627_cell_family("dolk2"),
+            "Drake Castle"
+        );
+
+        assert_eq!(
+            lck_r627_cell_family("rayman2"),
+            "Octam"
+        );
     }
 }

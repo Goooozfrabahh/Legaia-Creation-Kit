@@ -1454,6 +1454,18 @@ pub(super) fn copies_hierarchy(ui:&mut Ui,state:&mut State,originals:&mut BTreeS
                 state.active_copy=state.selected_copies.contains(&uid).then_some(uid);
                 *active=None;changed=true;
             }
+            response.context_menu(|ui|{
+                if ui.button("Show in World Repository").clicked(){
+                    super::repo_jump::request(
+                        ui.ctx(),
+                        super::repo_jump::Target::GroundCopy{
+                            source:p.source,
+                            uid:p.uid
+                        }
+                    );
+                    ui.close();
+                }
+            });
         }
     });
     changed
@@ -1898,4 +1910,53 @@ mod lck_r51_alignment_tests {
             ).is_none()
         );
     }
+}
+pub(super) fn place_native_catalog_tile(
+    state:&mut State,
+    hf:&WalkHeightfield,
+    source:Cell,
+    target:[f32;3],
+)->Result<u64,String>{
+    if state.copies.len()>=4096{
+        return Err("Native floor-copy limit reached".into());
+    }
+    if !target.iter().all(|v|v.is_finite()){
+        return Err("Non-finite floor placement position".into());
+    }
+
+    let q=quad_for(hf,source)
+        .ok_or("Original floor source cell not found")?;
+    let points=hf.positions.get(q*4..q*4+4)
+        .ok_or("Original floor quad truncated")?;
+
+    let mut origin=[0.0_f32;3];
+    for p in points{
+        origin[0]+=p[0]*0.25;
+        origin[1]+=-p[1]*0.25;
+        origin[2]+=p[2]*0.25;
+    }
+
+    let offset=[
+        target[0]-origin[0],
+        target[1]-origin[1],
+        target[2]-origin[2],
+    ];
+
+    let uid=state.next_uid.checked_add(1)
+        .ok_or("Floor-copy UID overflow")?;
+    state.next_uid=uid;
+
+    state.copies.push(CopyPiece{
+        uid,
+        source,
+        transform:Transform{
+            offset,
+            ..Transform::default()
+        }
+    });
+
+    state.selected_copies.clear();
+    state.selected_copies.insert(uid);
+    state.active_copy=Some(uid);
+    Ok(uid)
 }

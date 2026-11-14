@@ -35,6 +35,9 @@ pub(super) struct Editor {
     pub open:bool,
     pub marker_overlay_visible:bool,
     pub marker_right_captured:bool,
+    pub r621_context_pos:Option<egui::Pos2>,
+    pub r621_cross_request:Option<[u8;2]>,
+    pub r621_context_error:Option<String>,
     scene:String,
     original_hash:String,
     draft:Vec<Warp>,
@@ -130,6 +133,98 @@ fn validate_records(records:&[Warp])->Result<()> {
 // Enlargement uses a verified zero-filled free area.
 // Other MAP bytes and other trigger tables remain unchanged.
 
+// LCK_R633_TRIGGER_REGION_ISOLATION
+//
+// Offset is relative to the native 0x2000-byte MAP trigger block.
+// Reserve 0x000..0x7FF for existing tables and region expansion.
+// New trigger arrays use checked space at 0x800 or above.
+//
+// Do not select a span occupied by an active table even when
+// its current bytes happen to be zero.
+//
+// Never overwrite nonzero bytes and never exceed the block.
+fn r633_free_trigger_slot(
+    block:&[u8],
+    size:usize
+)->Result<usize>{
+    const RESERVED:usize=0x800;
+
+    ensure!(
+        block.len()==0x2000,
+        "R633: expected exact native MAP trigger block"
+    );
+
+    ensure!(
+        size>0 && size%4==0
+            && size<=block.len()-RESERVED,
+        "R633: requested trigger table does not fit available native MAP space"
+    );
+
+    let mut occupied=Vec::<(usize,usize)>::new();
+
+    for kind in 0..4usize {
+        let at=kind*4+2;
+
+        let offset=i16::from_le_bytes([
+            block[at],block[at+1]
+        ]);
+
+        let count=i16::from_le_bytes([
+            block[at+2],block[at+3]
+        ]);
+
+        ensure!(
+            count>=0,
+            "R633: native trigger count is negative"
+        );
+
+        if count==0 {
+            continue;
+        }
+
+        ensure!(
+            offset>=18,
+            "R633: native trigger table has invalid offset"
+        );
+
+        let stride=if kind==3 {8usize}else{4usize};
+
+        let length=(count as usize)
+            .checked_mul(stride)
+            .context("R633: trigger table length overflow")?;
+
+        let end=(offset as usize)
+            .checked_add(length)
+            .context("R633: trigger table boundary overflow")?;
+
+        ensure!(
+            end<=block.len(),
+            "R633: referenced trigger table exceeds MAP block"
+        );
+
+        occupied.push((offset as usize,end));
+    }
+
+    let limit=block.len()-size;
+
+    for at in (RESERVED..=limit).step_by(4) {
+        let end=at+size;
+
+        if occupied.iter().any(|&(first,last)|
+            at<last && end>first
+        ){
+            continue;
+        }
+
+        if block[at..end].iter().all(|&byte|byte==0) {
+            return Ok(at);
+        }
+    }
+
+    anyhow::bail!(
+        "R633: no free nonoverlapping native trigger storage above 0x800; preserved region and trigger records"
+    )
+}
 fn compile_map(map:&[u8],edited:&SceneWarps)->Result<Vec<u8>>{
     ensure!(map.len()>=REGION+BLOCK,"Native MAP too small");
     ensure!(
@@ -151,25 +246,8 @@ fn compile_map(map:&[u8],edited:&SceneWarps)->Result<Vec<u8>>{
     {
         old_off
     }else{
-        // Do not trample unknown non-zero resource bytes.
-        // Place an expanded table after existing data.
-        let last=b.iter()
-            .rposition(|&value|value!=0)
-            .unwrap_or(15);
-
-        let candidate=(last+4)&!3usize;
-
-        ensure!(
-            candidate>=16 && candidate+bytes_len<=BLOCK,
-            "No verified native MAP trigger-table capacity for new warp records"
-        );
-
-        ensure!(
-            b[candidate..candidate+bytes_len]
-                .iter().all(|&value|value==0),
-            "Expanded trigger-table destination is not empty"
-        );
-        candidate
+        // R633: allocate past the protected region-table area.
+        r633_free_trigger_slot(b,bytes_len)?
     };
 
     // Remove the old kind-0 payload, not the adjacent kind-1 data.
@@ -789,7 +867,9 @@ pub(super) fn interact(
 
                 if let Some(index)=selected {
                     editor.selected=index;
-                    editor.open=true;
+                    // LCK_R621_WARP_CONTEXT_MENU
+                    editor.r621_context_pos=Some(pos);
+                    editor.r621_context_error=None;
                     editor.dragging=None;
                     editor.marker_right_captured=true;
 
@@ -972,7 +1052,89 @@ mod lck_v2083_warp_view_tests {
         assert_ne!(source,arrival);
     }
 }
-#[cfg(test)]
+
+// LCK_R621_WARP_CONTEXT_MENU
+pub(super) fn r621_context_menu(
+    ui:&egui::Ui,
+    editor:&mut Editor
+){
+    let Some(position)=editor.r621_context_pos else {
+        return;
+    };
+
+    let mut properties=false;
+    let mut create=false;
+    let mut close=false;
+
+    let popup=egui::Window::new("Warp marker actions")
+        .id(egui::Id::new("lck_r621_local_warp_context"))
+        .title_bar(false)
+        .resizable(false)
+        .fixed_pos(position)
+        .show(ui.ctx(),|menu|{
+            menu.strong(format!(
+                "Local Warp #{}",editor.selected
+            ));
+
+            if menu.button("Properties...").clicked(){
+                properties=true;
+            }
+
+            menu.separator();
+
+            if menu.button("New Cross-Cell Warp").clicked(){
+                create=true;
+            }
+
+            if let Some(error)=&editor.r621_context_error {
+                menu.separator();
+                menu.colored_label(
+                    egui::Color32::RED,error
+                );
+            }
+
+            if menu.button("Cancel").clicked(){
+                close=true;
+            }
+        });
+
+    if properties {
+        editor.open=true;
+        editor.r621_context_error=None;
+        close=true;
+    }
+
+    if create {
+        if let Some(row)=editor.draft.get(editor.selected) {
+            editor.r621_cross_request=Some(row.source);
+            editor.r621_context_error=None;
+            close=true;
+        }else{
+            editor.r621_context_error=Some(
+                "Selected warp record is unavailable".into()
+            );
+        }
+    }
+
+    if ui.input(|i|i.key_pressed(egui::Key::Escape)){
+        close=true;
+    }
+
+    if let Some(response)=popup {
+        if ui.input(|i|i.pointer.primary_pressed()) &&
+            ui.input(|i|i.pointer.interact_pos())
+                .is_some_and(|p|
+                    !response.response.rect.contains(p)
+                ){
+            close=true;
+        }
+    }
+
+    if close {
+        editor.r621_context_pos=None;
+        editor.r621_context_error=None;
+    }
+}#[cfg(test)]
 mod lck_r57_native_warp_tests {
     use super::*;
 
@@ -1050,5 +1212,74 @@ mod lck_r57_native_warp_tests {
         edit.records.pop();
         edit.original_hash="stale".into();
         assert!(compile_map(&map,&edit).is_err());
+    }
+}
+
+// LCK_R633_TRIGGER_REGION_ISOLATION
+#[cfg(test)]
+mod lck_r633_warp_storage_tests {
+    use super::*;
+
+    #[test]
+    fn new_warp_table_does_not_occupy_region_padding()
+        ->Result<()>{
+        let mut map=vec![0u8;REGION+BLOCK];
+
+        let off=REGION;
+
+        map[off+2..off+4]
+            .copy_from_slice(&18i16.to_le_bytes());
+
+        map[off+4..off+6]
+            .copy_from_slice(&1i16.to_le_bytes());
+
+        map[off+18..off+22]
+            .copy_from_slice(&[2,3,10,11]);
+
+        map[off+14..off+16]
+            .copy_from_slice(&0x484i16.to_le_bytes());
+
+        map[off+16..off+18]
+            .copy_from_slice(&14i16.to_le_bytes());
+
+        let region_row=off+0x484+5*8;
+
+        map[region_row..region_row+8]
+            .copy_from_slice(&[9,60,45,0,0,0,0,0]);
+
+        let before=map[off+0x484..off+0x800]
+            .to_vec();
+
+        let edited=SceneWarps{
+            scene:"town01".into(),
+            original_hash:native_hash(&map)?,
+            records:vec![
+                Warp{
+                    source:[2,3],
+                    arrival:[10,11]
+                },
+                Warp{
+                    source:[97,52],
+                    arrival:[35,0]
+                }
+            ]
+        };
+
+        let output=compile_map(&map,&edited)?;
+
+        let new_off=read_i16(
+            &output[REGION..REGION+BLOCK],2
+        )? as usize;
+
+        assert!(new_off>=0x800);
+
+        assert_eq!(
+            &output[off+0x484..off+0x800],
+            &before
+        );
+
+        assert_eq!(parse(&output)?,edited.records);
+
+        Ok(())
     }
 }

@@ -132,11 +132,16 @@ pub(super) fn duplicate(world:&mut WorldModel, selected:&BTreeSet<Key>, first_cr
 /// native export deletion gate; created instances are removed by stable key.
 pub(super) fn delete(world:&mut WorldModel, keys:&BTreeSet<Key>)->Result<(),String> {
     let mut staged=world.clone();
+    let mut deleted_members=BTreeSet::new();
     for &key in keys {
         let draw=staged.at(key.0,key.1).ok_or("Group member no longer exists")?;
+        if let Some(member)=super::authoring_group::draw_member(&staged,key){
+            deleted_members.insert(member);
+        }
         if draw.editor_uid.is_some() {staged.delete_created(key)?;}
         else if !staged.set_hidden(key,true) {return Err("Cannot hide group member".into());}
     }
+    super::authoring_group::prune_deleted(&mut staged.groups,&deleted_members);
     *world=staged;Ok(())
 }
 

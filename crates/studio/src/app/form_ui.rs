@@ -130,6 +130,65 @@ impl App {
 
         Ok(())
     }
+    // LCK_R625B_WARP_SAVE
+    // Verify that project data matches the exact live warp
+    // and trigger records and that native restoration succeeds.
+    fn lck_r625b_verify_warp_snapshot(
+        &self,
+        project:&super::lck_project::LckProject
+    )->Result<()> {
+        let Some((scene,NativeSceneSlot::Ready(..)))=
+            self.native_scene.as_ref()
+        else{
+            return Ok(());
+        };
+
+        let cell=self.editor_cell_active.as_ref()
+            .context("Warp editor has no active project cell")?;
+
+        let identity=cell.form_identity(scene);
+        let expected=self.doors.embedded_record(scene);
+
+        anyhow::ensure!(
+            !expected.is_empty(),
+            "Warp editor belongs to another cell"
+        );
+
+        let raw=project.cell_snapshots.get(&identity)
+            .context(format!(
+                "Warp/trigger snapshot missing for {identity}"
+            ))?;
+
+        let count=raw.lines()
+            .filter(|line|line.starts_with("DOOR_EDIT\t"))
+            .count();
+
+        anyhow::ensure!(
+            count==1,
+            "Expected one DOOR_EDIT record, found {count}"
+        );
+
+        anyhow::ensure!(
+            raw.contains(&expected),
+            "Project warp records differ from live editor"
+        );
+
+        let lib=self.studio.library.as_ref()
+            .context("Native IMG unavailable for verification")?;
+
+        let mut restored=super::door_teleport::State::load(
+            lib.index.as_ref(),scene
+        ).map_err(anyhow::Error::msg)?;
+
+        restored.restore(raw).map_err(anyhow::Error::msg)?;
+
+        anyhow::ensure!(
+            restored.embedded_record(scene)==expected,
+            "Warp/trigger snapshot failed native round-trip"
+        );
+
+        Ok(())
+    }
     fn save_unified_project(&mut self, save_as: bool) -> Result<()> {
         self.lck_v2082f_commit_pending_warps()?;
         self.save_active_editor_cell();
@@ -141,6 +200,8 @@ impl App {
         self.lck_collision_verify_project_snapshot(
             &project
         )?;
+
+        self.lck_r625b_verify_warp_snapshot(&project)?;
 
         let existing=if save_as {
             None
@@ -167,13 +228,32 @@ impl App {
             ));
         }
 
-        let file=self.form_file.as_mut().unwrap();
-        file.project=project;
-        file.save()?;
+        // LCK_R625B_WARP_SAVE
+        // End the mutable file borrow before calling
+        // verification methods that borrow self immutably.
+        let saved_path={
+            let file=self.form_file.as_mut().unwrap();
+            file.project=project;
+            file.save()?;
+            file.path.clone()
+        };
+
+        // LCK_R625B_WARP_SAVE
+        // Verify bytes actually written to the project file.
+        let warp_disk_bytes=std::fs::read(&saved_path)
+            .context("Read saved project for warp verification")?;
+
+        let warp_disk_project:super::lck_project::LckProject=
+            serde_json::from_slice(&warp_disk_bytes)
+                .context("Decode saved warp project")?;
+
+        self.lck_r625b_verify_warp_snapshot(
+            &warp_disk_project
+        )?;
         // Validate the collision layer from bytes actually
         // written to the .lckproject file, not merely memory.
         if self.collision_edit.has_edits(){
-            let written=std::fs::read(&file.path)
+            let written=std::fs::read(&saved_path)
                 .context("Read saved project for collision verification")?;
 
             let disk_project:super::lck_project::LckProject=
@@ -212,6 +292,23 @@ impl App {
                 session.project.cell_snapshots.get(&identity)
             ).cloned();
 
+        // LCK_R625B_WARP_SAVE
+        // Open Project must reconstruct the native warp state
+        // and apply this cell's saved DOOR_EDIT overlay.
+        let restored_doors={
+            let lib=self.studio.library.as_ref()
+                .context("Native disc unavailable for warp restore")?;
+
+            let mut doors=super::door_teleport::State::load(
+                lib.index.as_ref(),&name
+            ).map_err(anyhow::Error::msg)?;
+
+            if let Some(raw)=snapshot.as_deref(){
+                doors.restore(raw).map_err(anyhow::Error::msg)?;
+            }
+
+            doors
+        };
         let Some(raw)=snapshot else {
             self.ground_edits=super::ground_edit_ops::State::default();
             self.ground_edits.scene=name.clone();
@@ -220,6 +317,7 @@ impl App {
                 super::collision_edit::State::from_embedded_record(
                     "",&name
                 ).map_err(anyhow::Error::msg)?;
+            self.doors=restored_doors;
             return Ok(());
         };
 
@@ -228,9 +326,14 @@ impl App {
 
         let mut restored=(*world).clone();
         let overlay=super::ground_edit_ops::strip(&raw);
-        let document=super::scene_instances::parse(
+        let mut document=super::scene_instances::parse(
             &overlay,&name,&restored
         ).map_err(anyhow::Error::msg)?;
+        if let Some(session)=self.form_session.as_ref(){
+            session.r641_repair_projection_snapshot(
+                &scene,&lib.index,&restored,&mut document
+            )?;
+        }
 
         super::scene_instances::apply(
             &document,&mut restored,
@@ -256,6 +359,7 @@ impl App {
 
         self.ground_edits=ground;
         self.collision_edit=collision;
+        self.doors=restored_doors;
         self.native_view.version=
             self.native_view.version.wrapping_add(1);
         Ok(())
@@ -397,8 +501,9 @@ ui.small("Save Project preserves FormKeys, overrides, deleted records and shared
                 } else {
                     super::cell_catalog::CellSelection::Original(cell.source_scene.clone())
                 };
-                self.editor_cell_selected = Some(selection.clone());
-                self.load_native_scene(cell.source_scene, selection);
+                self.r642_pair=Default::default();
+                self.r642_toggle_requested=false;
+                self.select_editor_cell(selection);
                 return Ok(());
             }
             Action::Save => return self.save_unified_project(false),
@@ -448,6 +553,8 @@ ui.small("Save Project preserves FormKeys, overrides, deleted records and shared
                 self.native_selected = None;
                 self.rebuild_form_preview();
                 self.restore_unified_project()?;
+                self.r642_pair=Default::default();
+                self.r642_toggle_requested=false;
                 self.studio.status = Some(format!("Opened LCK project {}", path.display()));
                 return Ok(());
             }
@@ -465,6 +572,8 @@ ui.small("Save Project preserves FormKeys, overrides, deleted records and shared
                         self.form_recovery.push((current, self.form_file.take()));
                     }
                     self.form_file = file;
+                    self.r642_pair=Default::default();
+                    self.r642_toggle_requested=false;
                     self.editor_undo.clear();
                     self.editor_redo.clear();
                     self.rebuild_form_preview();

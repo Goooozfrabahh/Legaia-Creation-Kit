@@ -38,6 +38,8 @@ use super::{
 mod native128_region_unlock;
 #[path = "native128_r615.rs"]
 mod native128_r615;
+#[path = "r636_import_relocation.rs"]
+mod r636_import_relocation;
 
 pub(super) struct Request<'a> {
     pub source:&'a Path,
@@ -102,13 +104,191 @@ fn read_map(path:&Path,id:usize)->Result<Vec<u8>> {
     )
 }
 
-fn verify_stage(path:&Path,id:usize,len:u64)->Result<()> {
-    ps1_export::verify_output_file(path,Some(len))?;
+// LCK_R624_DISC_GROWTH
+// A native writer may expand PROT.DAT and relocate following
+// disc sectors. An expanding IMG is valid only after checking
+// raw-sector alignment, monotonic stage length, the rebuilt
+// ISO/PROT index, and native MAP readability.
+//
+// Never truncate or pad a stage to the original retail length.
+fn r624_validate_length(previous:u64,actual:u64)->Result<()> {
+    ensure!(
+        actual>=previous,
+        "Native IMG stage unexpectedly shrank: previous {previous} bytes, current {actual} bytes"
+    );
 
     ensure!(
-        read_map(path,id)?.len()>=0x12000,
-        "Native MAP is truncated"
+        actual>0 && actual%2352==0,
+        "Native IMG is not aligned to whole 2352-byte raw sectors: {actual} bytes"
     );
+
+    Ok(())
+}
+
+// R626: final-stage native deletion integrity checks.
+// The last staged IMG is checked before it is published.
+
+fn r626_grid_word(map:&[u8],cell:(u8,u8))->Result<u16>{
+    let at=0x8000usize+(cell.1 as usize*128+cell.0 as usize)*2;
+    ensure!(map.len()>=0x12000,"R626: native MAP is truncated");
+    Ok(u16::from_le_bytes([map[at],map[at+1]]))
+}
+
+fn r626_verify_grid_delete(
+    retail:&[u8],
+    final_map:&[u8],
+    cell:(u8,u8)
+)->Result<()>{
+    use legaia_scene_formats::field_objects::{
+        ObjectRecord,OBJECT_INDEX_MASK,CELL_VISIBLE,CELL_WALK_VISIBLE
+    };
+
+    let old=r626_grid_word(retail,cell)?;
+    let new=r626_grid_word(final_map,cell)?;
+    let old_id=(old&OBJECT_INDEX_MASK) as usize;
+    let new_id=(new&OBJECT_INDEX_MASK) as usize;
+
+    let placed=ObjectRecord::parse(retail,old_id)
+        .is_some_and(|record|record.is_placed());
+
+    if placed {
+        ensure!(
+            new_id!=old_id,
+            "R626: deleted placed descriptor {old_id} is still linked at {cell:?}"
+        );
+    }else{
+        ensure!(
+            new_id!=old_id ||
+                new&(CELL_VISIBLE|CELL_WALK_VISIBLE)==0,
+            "R626: deleted terrain/draw flags survived at {cell:?}"
+        );
+    }
+
+    Ok(())
+}
+
+fn r626_verify_final_deletions(
+    request:&Request<'_>,
+    retail:&[u8],
+    final_map:&[u8]
+)->Result<String>{
+    use legaia_scene_formats::field_objects::CELL_WALK_VISIBLE;
+
+    ensure!(
+        retail.len()>=0x12000 && final_map.len()>=0x12000,
+        "R626: incomplete MAP for deletion verification"
+    );
+
+    let mut initialized=final_map.to_vec();
+
+    legaia_engine_field::field_regions::refresh_object_grid_marks(
+        &mut initialized
+    );
+
+    let mut objects=0usize;
+
+    for draw in request.world.draws.iter()
+        .filter(|draw|draw.hidden && draw.editor_uid.is_none())
+    {
+        if request.world.npc((draw.terrain,draw.index)).is_some(){
+            continue;
+        }
+
+        let cell=if draw.terrain {
+            request.scene.terrain.get(draw.index)
+                .map(|native|native.cell)
+        }else{
+            request.scene.placements.get(draw.index)
+                .map(|native|native.cell)
+        }.with_context(||format!(
+            "R626: hidden native draw has no original MAP identity: terrain={} index={}",
+            draw.terrain,draw.index
+        ))?;
+
+        r626_verify_grid_delete(retail,&initialized,cell)?;
+        objects+=1;
+    }
+
+    let mut floors=0usize;
+
+    if !request.floors.deleted.is_empty(){
+        let (_,stamps,_)=ground_edit_ops::w46_plan(request.floors)
+            .map_err(anyhow::Error::msg)?;
+
+        let replacements=stamps.into_iter()
+            .map(|(_,destination)|destination)
+            .collect::<BTreeSet<_>>();
+
+        for &cell in &request.floors.deleted {
+            if replacements.contains(&cell){
+                continue;
+            }
+
+            ensure!(
+                r626_grid_word(&initialized,(cell[0],cell[1]))?
+                    &CELL_WALK_VISIBLE==0,
+                "R626: deleted native floor {cell:?} returned after MAP initialization"
+            );
+
+            floors+=1;
+        }
+    }
+
+    let (walls_authored,_)=request.collision.native_edit_snapshot();
+    let mut walls=0usize;
+
+    for (x,z,occupied) in walls_authored {
+        let (at,bit)=super::collision_wire::wall_offset(x,z)
+            .with_context(||format!(
+                "R626: invalid collision cell ({x},{z})"
+            ))?;
+
+        ensure!(
+            (initialized[0x4000+at]&bit!=0)==occupied,
+            "R626: authored collision wall ({x},{z}) was overwritten"
+        );
+
+        walls+=1;
+    }
+
+    Ok(format!(
+        "R626 DELETION INTEGRITY PASSED: world objects={objects}; deleted native floors={floors}; collision overrides={walls}; final native MAP verified"
+    ))
+}
+
+fn verify_stage(
+    path:&Path,
+    id:usize,
+    expected_len:&mut u64,
+    expected_entries:usize
+)->Result<()> {
+    let actual=ps1_export::verify_output_file(
+        path,None
+    )?;
+
+    r624_validate_length(*expected_len,actual)?;
+
+    let rebuilt=DiscPatcher::open(
+        fs::read(path)?
+    ).with_context(||format!(
+        "Reopen relocated ISO/PROT image: {}",
+        path.display()
+    ))?;
+
+    ensure!(
+        rebuilt.entry_count()==expected_entries,
+        "PROT entry count changed after IMG relayout: expected {expected_entries}, found {}",
+        rebuilt.entry_count()
+    );
+
+    ensure!(
+        rebuilt.read_entry_footprint(id)?.len()>=0x12000,
+        "Native MAP is truncated after ISO/PROT relayout"
+    );
+
+    // Update the expected full-disc size only after
+    // successful structural verification.
+    *expected_len=actual;
 
     Ok(())
 }
@@ -171,6 +351,19 @@ fn failure(
     }
 }
 
+// LCK_R626_REGION_ISOLATION
+// Changing a MAN destination, MAP warp trigger, or camera
+// script is not a request to expand the authored world.
+//
+// Region expansion is retained for operations that actually
+// author placements, floors, or native collision.
+fn r626_region_work_requested(
+    objects:bool,
+    floors:bool,
+    collision:bool,
+)->bool {
+    objects || floors || collision
+}
 pub(super) fn execute(
     mut request:Request<'_>
 )->Result<ps1_export::ExportResult> {
@@ -299,11 +492,17 @@ pub(super) fn execute(
 
     let mut current=request.source.to_path_buf();
 
+    // LCK_R624_DISC_GROWTH
+    // Each stage must preserve or legitimately grow this image.
+    let mut staged_len=source_len;
+
     let mut wrote=false;
     let mut patched=Vec::<String>::new();
     let mut skipped=Vec::<String>::new();
     let mut imports=None;
     let mut native128_summary=None;
+    // LCK_R636_IMPORT_INTEGRITY
+    let mut r636_object_stage_map:Option<Vec<u8>>=None;
 
     let r613_full_requested=std::env::current_exe()
         .ok()
@@ -360,7 +559,7 @@ pub(super) fn execute(
 
         match attempt {
             Ok(result)=>{
-                verify_stage(&target,entry,source_len)?;
+                verify_stage(&target,entry,&mut staged_len,request.index.entry_count())?;
 
                 current=target;
                 wrote=true;
@@ -368,6 +567,8 @@ pub(super) fn execute(
                 patched.extend(result.patched);
                 skipped.extend(result.skipped);
                 imports=result.imports;
+                // R636: preserve all newly registered native grid identities.
+                r636_object_stage_map=Some(read_map(&current,entry)?);
             },
             Err(e)=>{
                 failure(
@@ -414,7 +615,7 @@ pub(super) fn execute(
             }
         }
 
-        verify_stage(&target,entry,source_len)?;
+        verify_stage(&target,entry,&mut staged_len,request.index.entry_count())?;
 
         // An unrestricted failed texture pass cannot corrupt the
         // successful ground changes already in this stage.
@@ -450,7 +651,7 @@ pub(super) fn execute(
             }
         }
 
-        verify_stage(&target,entry,source_len)?;
+        verify_stage(&target,entry,&mut staged_len,request.index.entry_count())?;
 
         current=target;
     }
@@ -495,7 +696,7 @@ pub(super) fn execute(
             }
         }
 
-        verify_stage(&target,entry,source_len)?;
+        verify_stage(&target,entry,&mut staged_len,request.index.entry_count())?;
 
         current=target;
     }
@@ -538,7 +739,7 @@ pub(super) fn execute(
             }
         }
 
-        verify_stage(&target,entry,source_len)?;
+        verify_stage(&target,entry,&mut staged_len,request.index.entry_count())?;
 
         current=target;
     }
@@ -583,7 +784,7 @@ pub(super) fn execute(
             }
         }
 
-        verify_stage(&target,entry,source_len)?;
+        verify_stage(&target,entry,&mut staged_len,request.index.entry_count())?;
 
         current=target;
     }
@@ -609,7 +810,7 @@ pub(super) fn execute(
             camera
         )?;
 
-        verify_stage(&destination,entry,source_len)?;
+        verify_stage(&destination,entry,&mut staged_len,request.index.entry_count())?;
 
         current=destination;
         wrote=true;
@@ -618,7 +819,26 @@ pub(super) fn execute(
     // LCK_R612A_NATIVE_128_REGIONS
     // Modify only an independent export-stage copy.
 
-    if wrote && request.scene.name.eq_ignore_ascii_case("town01") {
+    // LCK_R626_REGION_ISOLATION
+    // Warp-only or MAN-only exports must not force experimental
+    // full-native-128 expansion merely because it is enabled.
+    let r626_region_needed=r626_region_work_requested(
+        has_objects,
+        has_floors,
+        has_collision
+    );
+
+    if wrote && !r626_region_needed &&
+        request.scene.name.eq_ignore_ascii_case("town01")
+    {
+        patched.push(
+            "R626: warp/script-only export; experimental region expansion was not requested".into()
+        );
+    }
+
+    if wrote && r626_region_needed &&
+        request.scene.name.eq_ignore_ascii_case("town01")
+    {
         let target = temps.add(
             dir.join(format!("{prefix}_native128.img"))
         )?;
@@ -639,7 +859,7 @@ pub(super) fn execute(
             full
         ) {
             Ok(Some(summary)) => {
-                verify_stage(&target, entry, source_len)?;
+                verify_stage(&target,entry,&mut staged_len,request.index.entry_count())?;
 
                 current = target;
                 patched.push(summary.message());
@@ -676,6 +896,7 @@ pub(super) fn execute(
     // R613: inspect serialized native MAP before publication.
     // A successful audit does not assert PS1 runtime gameplay success.
     let r613_coverage=if wrote &&
+        r626_region_needed &&
         request.scene.name.eq_ignore_ascii_case("town01")
     {
         Some(native128_region_unlock::r613_coverage_report(
@@ -699,6 +920,7 @@ pub(super) fn execute(
     let mut r615_wide_used = false;
 
     if r615_wide_enabled &&
+        r626_region_needed &&
         request.scene.name.eq_ignore_ascii_case("town01")
     {
         ensure!(native128_summary.is_some(),
@@ -730,21 +952,100 @@ pub(super) fn execute(
             )?
         };
 
-        verify_stage(&target,entry,source_len)?;
+        verify_stage(&target,entry,&mut staged_len,request.index.entry_count())?;
 
         current=target;
         patched.push(message);
         r615_wide_used=true;
     }
+    // LCK_R636_IMPORT_INTEGRITY
+    //
+    // After all normal export stages, reconcile every newly
+    // imported MAP descriptor against its original object-stage
+    // identity. Only detached static decorations may be re-anchored.
+    // Never rewrite MAN-bound actor positions as static placements.
+    if let Some(ref object_stage)=r636_object_stage_map {
+        let final_before=read_map(&current,entry)?;
+
+        let actual_lut=scene.field_floor_height_lut(request.index)?;
+        let fallback_lut=[0i16;16];
+        let lut=actual_lut.as_ref().unwrap_or(&fallback_lut);
+
+        let (repaired,inspected,moved)=
+            r636_import_relocation::reconcile(
+                &retail,
+                object_stage,
+                &final_before,
+                lut
+            )?;
+
+        ensure!(
+            actual_lut.is_some() || repaired==final_before,
+            "R636: native floor height LUT absent; cannot safely relocate or vertically compensate imported objects"
+        );
+
+        if inspected>0 {
+            patched.push(format!(
+                "R636 FINAL IMPORT INTEGRITY: {} independent native MAP references checked; {} static references restored using re-anchoring or experimental dual-owner ground/static composition; model identity retained; runtime gameplay not yet verified",
+                inspected,moved
+            ));
+        }
+
+        if repaired!=final_before {
+            let target=temps.add(
+                dir.join(format!("{prefix}_r636_imports.img"))
+            )?;
+
+            copy_stage(&current,&target)?;
+
+            let mut disc=DiscPatcher::open(fs::read(&target)?)?;
+
+            disc.patch_prot_entry(
+                entry,0,&repaired
+            )?;
+
+            ensure!(
+                disc.read_entry_footprint(entry)?==repaired,
+                "R636: native MAP patcher readback differs"
+            );
+
+            fs::write(
+                &target,
+                disc.into_image()
+            )?;
+
+            verify_stage(
+                &target,
+                entry,
+                &mut staged_len,
+                request.index.entry_count()
+            )?;
+
+            ensure!(
+                read_map(&target,entry)?==repaired,
+                "R636: physical IMG native MAP readback differs"
+            );
+
+            current=target;
+        }
+    }
+
+    // LCK_R624_DISC_GROWTH
+    if staged_len>source_len {
+        patched.push(format!(
+            "Native ISO/PROT relayout verified: original {} bytes, rebuilt {} bytes (+{} raw sectors)",
+            source_len,
+            staged_len,
+            (staged_len-source_len)/2352
+        ));
+    }
     // Final validation and atomic publication
     // ========================================================
 
-    ensure!(
-        wrote,
-        "No native bytes encoded; no empty IMG published"
-    );
+    // R638: carry the original stage failure into the error and debug.txt.
+    r638_require_native_write(wrote,&skipped)?;
 
-    verify_stage(&current,entry,source_len)?;
+    verify_stage(&current,entry,&mut staged_len,request.index.entry_count())?;
 
     // LCK_R615_NATIVE_MAP_CONTRACT_AUDIT
     // Report native MAP categories, including zero-byte evidence.
@@ -771,6 +1072,29 @@ pub(super) fn execute(
             ),
         }
     };
+    // R626: check final native MAP after objects, floors, collisions,
+    // and runtime-region modifications.
+    let final_map=read_map(&current,entry)?;
+
+    let deletion_summary=r626_verify_final_deletions(
+        &request,&retail,&final_map
+    )?;
+
+    if request.world.draws.iter().any(|draw|
+        draw.hidden && draw.editor_uid.is_none()
+    ){
+        ensure!(
+            !skipped.iter().any(|line|
+                line.starts_with("FAILED NATIVE OBJECTS:")
+                || line.starts_with("FAILED DELETE ")
+                || line.starts_with("FAILED OWNED COLLISION RECONCILIATION:")
+            ),
+            "R626: an object deletion writer failed; incomplete IMG not published"
+        );
+    }
+
+    patched.push(deletion_summary);
+
     // Both paths are in the destination directory and therefore
     // on the same volume. An existing output is never replaced.
         // LCK_R618B_PUBLISH_DIAGNOSTICS
@@ -784,11 +1108,7 @@ pub(super) fn execute(
     ))?;
 
     let verified=(||->Result<()>{
-        verify_stage(
-            request.output,
-            entry,
-            source_len
-        )?;
+        verify_stage(request.output,entry,&mut staged_len,request.index.entry_count())?;
 
         ensure!(
             read_map(request.output,entry)?
@@ -917,6 +1237,44 @@ pub(super) fn execute(
         skipped,
         imports,
     })
+}
+
+#[cfg(test)]
+mod lck_r626_deletion_integrity_tests {
+    use super::*;
+
+    #[test]
+    fn deleted_native_grid_reference_cannot_survive()->Result<()> {
+        let mut retail=vec![0u8;0x12000];
+        let at=0x8000+(10*128+9)*2;
+
+        retail[at..at+2].copy_from_slice(
+            &(0x2000u16|17).to_le_bytes()
+        );
+
+        assert!(
+            r626_verify_grid_delete(&retail,&retail,(9,10)).is_err()
+        );
+
+        let mut removed=retail.clone();
+        removed[at..at+2].fill(0);
+
+        r626_verify_grid_delete(
+            &retail,&removed,(9,10)
+        )?;
+
+        let mut replacement=retail.clone();
+
+        replacement[at..at+2].copy_from_slice(
+            &(0x1000u16|18).to_le_bytes()
+        );
+
+        r626_verify_grid_delete(
+            &retail,&replacement,(9,10)
+        )?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1053,5 +1411,129 @@ mod r618b_stage_tests {
         );
 
         Ok(())
+    }
+}
+
+
+#[cfg(test)]
+mod lck_r624_disc_growth_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_two_sector_relayout(){
+        let original=466_714_416u64;
+        let rebuilt=466_719_120u64;
+
+        assert_eq!(
+            rebuilt-original,
+            2352*2
+        );
+
+        assert!(
+            r624_validate_length(
+                original,rebuilt
+            ).is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_truncated_stages(){
+        let original=466_719_120u64;
+        let truncated=466_714_416u64;
+
+        assert!(
+            r624_validate_length(
+                original,truncated
+            ).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_unaligned_growth(){
+        let original=466_714_416u64;
+
+        assert!(
+            r624_validate_length(
+                original,original+1
+            ).is_err()
+        );
+    }
+
+    #[test]
+    fn accepts_unchanged_sector_aligned_stage(){
+        let original=466_714_416u64;
+
+        assert!(
+            r624_validate_length(
+                original,original
+            ).is_ok()
+        );
+    }
+}
+
+
+#[cfg(test)]
+mod lck_r626_region_isolation_tests {
+    use super::*;
+
+    #[test]
+    fn warp_only_does_not_request_region_expansion(){
+        assert!(
+            !r626_region_work_requested(
+                false,false,false
+            )
+        );
+    }
+
+    #[test]
+    fn authored_geometry_still_requests_regions(){
+        assert!(r626_region_work_requested(
+            true,false,false
+        ));
+
+        assert!(r626_region_work_requested(
+            false,true,false
+        ));
+
+        assert!(r626_region_work_requested(
+            false,false,true
+        ));
+    }
+}
+
+
+// R638_EXPORT_FAILURE_CAUSE
+fn r638_require_native_write(wrote:bool,failures:&[String])->Result<()> {
+    if !wrote {
+        let detail=if failures.is_empty() {
+            "No native stage failure was recorded".to_owned()
+        } else {
+            failures.join("\n")
+        };
+        bail!("No native bytes encoded; no empty IMG published\nNative stage failures:\n{detail}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod r638_export_error_tests {
+    use super::*;
+
+    #[test]
+    fn unrestricted_warp_rejection_reaches_the_final_error() {
+        let mut failures=Vec::new();
+        failure(&mut failures,true,"DOORS",anyhow::anyhow!("test MAN rejection")).unwrap();
+        let error=r638_require_native_write(false,&failures).unwrap_err();
+        let report=format!("{error:#}");
+        assert!(report.contains("FAILED NATIVE DOORS"));
+        assert!(report.contains("test MAN rejection"));
+        assert!(report.contains("no empty IMG published"));
+    }
+
+    #[test]
+    fn successful_write_and_missing_failure_details_are_distinct() {
+        assert!(r638_require_native_write(true,&[]).is_ok());
+        let error=r638_require_native_write(false,&[]).unwrap_err();
+        assert!(error.to_string().contains("No native stage failure was recorded"));
     }
 }
